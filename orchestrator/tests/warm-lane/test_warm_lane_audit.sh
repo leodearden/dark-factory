@@ -19,6 +19,8 @@
 #    RECLAIMABLE-via-terminal, recoverable LANDED/PUSHED/ORPHAN,
 #    residue-only-dirty, LEAKED + stale, measured disk figures, --format
 #    json, the combined B1 fixture + A3 degradation, and B2 read-only.)
+#   Mount refusal and the record age clock (README.md "Delta 16") are pinned
+#   in orchestrator/tests/test_warm_lane_audit_mount_and_age.py instead.
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -1321,12 +1323,16 @@ printf '9101 pending\n9102 pending\n9103 done\n9104 pending\n9105 pending\n9106 
 #
 # `orphan-stale` builds the LEAKED predicate's EXACT shape (non-terminal status
 # + ahead-of-main with no origin => ORPHAN + aged past the default 60-minute
-# knob). Three lanes here are byte-for-byte identical in that respect and differ
-# ONLY in their assignment record -- pinned / quarantined / leaked -- which is
-# what makes "the reserved one reports PINNED, the withheld one QUARANTINED, and
-# only the unreserved one is still LEAKED" a real discrimination rather than a
-# fixture artifact. Dropping the LEAKED control would leave nothing proving the
-# predicate can still fire at all, so the two suppressions would pass vacuously.
+# knob). Aged on BOTH clocks: the lane dir is backdated and so is its record's
+# updated_at, because the audit ages a lane by its record when it has one
+# (README.md "Delta 16") and make_lane_state otherwise stamps it now, which would
+# read the LEAKED control as fresh. Three lanes here are byte-for-byte identical
+# in that respect and differ ONLY in their assignment record's state -- pinned /
+# quarantined / leaked -- which is what makes "the reserved one reports PINNED,
+# the withheld one QUARANTINED, and only the unreserved one is still LEAKED" a
+# real discrimination rather than a fixture artifact. Dropping the LEAKED control
+# would leave nothing proving the predicate can still fire at all, so the two
+# suppressions would pass vacuously.
 #
 # _lane-n-live-unknown is the LIVE x UNKNOWN partition cell: a live consumer on a
 # lane with no readable record. It is counted `live`, NOT `free`, so a warning
@@ -1349,7 +1355,11 @@ for n_case in "${N_CASES[@]}"; do
         _add_ahead_commit "$N_MOUNT/$n_lane"
     fi
     if [ -n "$n_state" ]; then
-        make_lane_state "$N_MOUNT" "$n_lane" "$n_state" "$n_task" "task/$n_task"
+        n_stamp=''
+        if [ "$n_shape" = "orphan-stale" ]; then
+            n_stamp="$(date -u -d '90 minutes ago' +%Y-%m-%dT%H:%M:%S.000000+00:00)"
+        fi
+        make_lane_state "$N_MOUNT" "$n_lane" "$n_state" "$n_task" "task/$n_task" "$n_stamp"
     fi
     if [ "$n_liveness" = "LIVE" ]; then
         _hold_lane_lock "$N_MOUNT" "$n_lane"

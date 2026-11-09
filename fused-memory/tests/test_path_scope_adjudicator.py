@@ -8,6 +8,8 @@ Test layout (mirrors the plan):
 
 from __future__ import annotations
 
+import logging
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,6 +26,7 @@ def _make_adjudicator(
     *,
     tmp_path=None,
     escalator=None,
+    clock=time.monotonic,
 ):
     """Construct a PathScopeAdjudicator with minimal wiring."""
     from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
@@ -34,7 +37,21 @@ def _make_adjudicator(
         usage_gate=None,
         cwd=tmp_path,
         scope_violation_escalator=escalator,
+        clock=clock,
     )
+
+
+class _ManualClock:
+    """A monotonic clock that moves only when a test advances it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def _agent_result(
@@ -80,6 +97,21 @@ async def _do_adjudicate(adj, **kwargs):
 
 
 _INVOKE_PATH = 'fused_memory.middleware.path_scope_adjudicator.invoke_with_cap_retry'
+_ADJUDICATOR_LOGGER = 'fused_memory.middleware.path_scope_adjudicator'
+_COOLDOWN = 60.0
+_ZOT = _agent_result(success=False, output='', timed_out=True, subtype='error')
+_OK = _agent_result(success=True, structured_output={'verdict': 'allow', 'reason': 'ok'})
+
+
+async def _adjudicate_with(adj, result):
+    """Adjudicate with the LLM answering *result*; also report whether the LLM was reached."""
+    with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)) as mock_invoke:
+        verdict = await _do_adjudicate(adj)
+    return verdict, mock_invoke.await_count == 1
+
+
+def _breaker_open_lines(caplog) -> int:
+    return sum('zero-output-breaker OPEN' in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -292,51 +324,81 @@ class TestZeroOutputBreakerCircuit:
         assert mock_probe.await_count == 0, 'Breaker must be open after threshold ZOTs'
 
     async def test_successful_call_resets_breaker(self, tmp_path):
-        """A successful LLM call resets the ZOT counter so a subsequent ZOT doesn't trip the breaker.
+        """A successful LLM call resets the ZOT counter so a later ZOT starts a fresh run.
 
-        Test setup (threshold=2):
-          1. Drive ONE ZOT → counter becomes 1, breaker stays CLOSED.
-          2. Successful call → counter resets to 0  (the code path under test).
-          3. Drive ONE more ZOT → counter becomes 1 again, still < threshold.
-          4. Assert the mock was reached (breaker did NOT open), proving the
-             success in step 2 actually cleared the accumulated count.
+        threshold=2: ZOT, success, ZOT.  Had the success not reset the run,
+        that last ZOT would have opened the breaker; instead exactly one more
+        ZOT is needed before a call short-circuits.
         """
-        threshold = 2
         cfg = PathScopeAdjudicatorConfig(
-            zero_output_breaker_threshold=threshold,
+            zero_output_breaker_threshold=2,
             zero_output_breaker_cooldown_seconds=9999,
         )
         adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
 
-        zot_result = _agent_result(
-            success=False, output='', timed_out=True, subtype='error',
-        )
-        ok_result = _agent_result(
-            success=True, structured_output={'verdict': 'allow', 'reason': 'ok'},
-        )
-
-        # Step 1: one ZOT — counter=1, breaker CLOSED (threshold=2).
-        with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)):
-            first = await _do_adjudicate(adj)
+        first, _ = await _adjudicate_with(adj, _ZOT)
         assert first.should_allow_creation is False
-        assert adj._consecutive_zero_output_timeouts == 1
 
-        # Step 2: successful call — should reset counter to 0.
-        with patch(_INVOKE_PATH, new=AsyncMock(return_value=ok_result)):
-            good = await _do_adjudicate(adj)
+        good, _ = await _adjudicate_with(adj, _OK)
         assert good.should_allow_creation is True
-        assert adj._consecutive_zero_output_timeouts == 0, (
-            'Successful call must reset the ZOT counter'
-        )
 
-        # Step 3 + 4: one more ZOT → counter=1, still < threshold; LLM IS reached.
-        with patch(_INVOKE_PATH, new=AsyncMock(return_value=zot_result)) as mock_probe:
-            after = await _do_adjudicate(adj)
-        assert after.should_allow_creation is False
-        assert mock_probe.await_count == 1, (
-            'Breaker must remain CLOSED after one ZOT when success reset the counter'
+        await _adjudicate_with(adj, _ZOT)
+
+        _, reached = await _adjudicate_with(adj, _ZOT)
+        assert reached, 'Breaker must remain CLOSED after one ZOT when success reset the counter'
+
+        blocked, reached = await _adjudicate_with(adj, _ZOT)
+        assert not reached
+        assert 'breaker' in blocked.reason.lower()
+
+    async def test_zero_output_breaker_fires_once_per_failure_run_and_rearms_after_success(
+        self, tmp_path, caplog,
+    ):
+        cfg = PathScopeAdjudicatorConfig(
+            zero_output_breaker_threshold=2,
+            zero_output_breaker_cooldown_seconds=_COOLDOWN,
         )
-        assert adj._consecutive_zero_output_timeouts == 1
+        clock = _ManualClock()
+        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path, clock=clock)
+
+        with caplog.at_level(logging.WARNING, logger=_ADJUDICATOR_LOGGER):
+            await _adjudicate_with(adj, _ZOT)
+            await _adjudicate_with(adj, _ZOT)
+            extra = [await _adjudicate_with(adj, _ZOT) for _ in range(2)]
+
+            assert _breaker_open_lines(caplog) == 1
+            assert [reached for _, reached in extra] == [False, False]
+
+            clock.advance(_COOLDOWN)
+            good, reached = await _adjudicate_with(adj, _OK)
+            assert reached and good.should_allow_creation is True
+
+            await _adjudicate_with(adj, _ZOT)
+            _, reached = await _adjudicate_with(adj, _ZOT)
+
+        assert reached, 'one ZOT after a success must not reopen the breaker'
+        assert _breaker_open_lines(caplog) == 2
+
+    async def test_failed_probe_after_cooldown_reopens(self, tmp_path, caplog):
+        cfg = PathScopeAdjudicatorConfig(
+            zero_output_breaker_threshold=2,
+            zero_output_breaker_cooldown_seconds=_COOLDOWN,
+        )
+        clock = _ManualClock()
+        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path, clock=clock)
+
+        with caplog.at_level(logging.WARNING, logger=_ADJUDICATOR_LOGGER):
+            await _adjudicate_with(adj, _ZOT)
+            await _adjudicate_with(adj, _ZOT)
+            clock.advance(_COOLDOWN)
+
+            _, probe_reached = await _adjudicate_with(adj, _ZOT)
+            blocked, reached = await _adjudicate_with(adj, _ZOT)
+
+        assert probe_reached
+        assert not reached
+        assert 'breaker' in blocked.reason.lower()
+        assert _breaker_open_lines(caplog) == 2
 
 
 # ===========================================================================
@@ -397,14 +459,15 @@ class TestBudgetMisconfigSignal:
         """Budget-misconfig path must NOT increment the ZOT breaker counter."""
         from unittest.mock import Mock
 
-        adj = _make_adjudicator(tmp_path=tmp_path, escalator=Mock())
+        cfg = PathScopeAdjudicatorConfig(zero_output_breaker_threshold=1)
+        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path, escalator=Mock())
         result = _agent_result(
             success=False, subtype='error_max_budget_usd', cost_usd=0.11, turns=2,
         )
-        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)):
-            await _do_adjudicate(adj)
+        await _adjudicate_with(adj, result)
 
-        assert adj._consecutive_zero_output_timeouts == 0, (
+        _, reached = await _adjudicate_with(adj, _ZOT)
+        assert reached, (
             'ZOT breaker must not be incremented for a deterministic budget-config defect'
         )
 
@@ -440,8 +503,12 @@ class TestBudgetMisconfigSignal:
             await _do_adjudicate(adj)
 
         mock_escalator.report_budget_misconfig.assert_not_called()
-        # ZOT counter IS incremented for a genuine hang.
-        assert adj._consecutive_zero_output_timeouts == 1
+        # The genuine hang counted: at the default threshold of 2, one more
+        # ZOT opens the breaker.
+        _, reached = await _adjudicate_with(adj, _ZOT)
+        assert reached
+        _, reached = await _adjudicate_with(adj, _ZOT)
+        assert not reached
 
     async def test_zero_cost_budget_subtype_does_not_call_escalator(self, tmp_path):
         """Edge: subtype='error_max_budget_usd' with cost_usd=0.0 → NOT a config defect."""

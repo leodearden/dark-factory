@@ -32,7 +32,7 @@
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
 const {
-  withReceipt: stampSnapshotReceipt,
+  servedDatum: servedSnapshotDatum,
   unknownDatum: unknownSnapshotDatum,
   combinedDatum: combineSnapshotDatums,
   isDatum: isSnapshotDatum,
@@ -48,8 +48,8 @@ const TASKS_ENDPOINT = '/api/v2/dashboard/tasks';
 
 const SNAPSHOT_NOT_YET_FETCHED = 'not yet fetched';
 
-function snapshotReceipt(data) {
-  return (data.__receipt || {})[TASKS_ENDPOINT] || null;
+function snapshotReceipts(data) {
+  return data.__receipt || {};
 }
 
 function snapshotEntries(data) {
@@ -58,18 +58,13 @@ function snapshotEntries(data) {
 
 // The Datum under one wire key of one project's entry — `census` or `rows`,
 // as TaskSnapshot.to_wire() names them — stamped with the /tasks receipt, or a
-// hole saying which part is missing. No receipt outranks everything else, as
-// in datum.js::plainDatum: before the first payload, nothing that is absent is
-// yet evidence of anything.
+// hole saying which part is missing. The receipt rule is datum.js::servedDatum's.
 function snapshotDatum(data, project, wireKey) {
-  const receipt = snapshotReceipt(data);
-  if (!receipt) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const entry = snapshotEntries(data)[project];
-  if (!entry) return unknownSnapshotDatum('the /tasks payload has no entry for ' + project);
-  if (!isSnapshotDatum(entry[wireKey])) {
-    return unknownSnapshotDatum('the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum');
-  }
-  return stampSnapshotReceipt(entry[wireKey], receipt);
+  const why = entry
+    ? 'the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum'
+    : 'the /tasks payload has no entry for ' + project;
+  return servedSnapshotDatum(entry && entry[wireKey], TASKS_ENDPOINT, why, snapshotReceipts(data));
 }
 
 function projectCensus(data, project) {
@@ -89,23 +84,13 @@ function snapshotRowsOver(data) {
   );
 }
 
-// Whether a fresh read renders exactly as the Datum a caller already holds:
-// the same fields, the value compared by reference. projectRows and the
-// terminal readers stamp a new object per call, so identity cannot say it; a
-// new payload or a new receipt makes it false, and so re-reads the age.
-function sameDatum(held, fresh) {
-  const keys = Object.keys(held);
-  return keys.length === Object.keys(fresh).length
-    && keys.every(key => Object.prototype.hasOwnProperty.call(fresh, key) && Object.is(held[key], fresh[key]));
-}
-
 // ── A census over several projects ──
 // `projects` null means every project the snapshot carries: task ROOTS, not
 // ORCHESTRATORS entries, so a tile's headline and its burndown history count
 // one population. A hole in any project is a hole in the total
 // (datum.js::combinedDatum).
 function censusOver(data, projects) {
-  if (!snapshotReceipt(data)) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
+  if (!snapshotReceipts(data)[TASKS_ENDPOINT]) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const scope = projects === null ? Object.keys(snapshotEntries(data)) : projects;
   return combineSnapshotDatums(
     scope.map(project => [project, projectCensus(data, project)]),
@@ -287,10 +272,11 @@ function unrequestedTerminalRows(served) {
 }
 
 // The Tasks tab's wanted set (PRD decision 5): its one filter covers every
-// project, so every one while the terminal view is selected, else each one
-// grouped by PRD.
-function terminalWindowProjects(projectIds, filter, groupedIds) {
-  return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
+// project, so every one while the terminal view is selected, else none. The
+// by-PRD lanes read /prds and never request the window
+// (plans/dashboard-prd-lanes-prd.md §4.4).
+function terminalWindowProjects(projectIds, filter) {
+  return projectIds.filter(() => filter.terminal);
 }
 
 // The projects in `wanted` that were not in `wantedBefore`: the only ones a
@@ -368,7 +354,6 @@ const TASK_SNAPSHOT_API = {
   terminalWindowEntrants,
   terminalSelectingProjects,
   createTerminalWindowHooks,
-  sameDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

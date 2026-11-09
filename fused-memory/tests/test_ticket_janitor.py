@@ -23,7 +23,10 @@ from typing import IO, Literal, overload
 
 import pytest
 import pytest_asyncio
+from _escalation_queue_probe import probe_escalation_queue_io
 from _fm_helpers import LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
+from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import ticket_janitor
@@ -37,7 +40,7 @@ from fused_memory.middleware.ticket_janitor import (
     TicketJanitor,
     curation_backlog_anchor,
 )
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 
 
 @pytest_asyncio.fixture
@@ -309,7 +312,7 @@ async def test_bad_candidate_json_falls_back_to_unparseable_group(store, tmp_pat
         assert len(files) == 1
         body = json.loads(files[0].read_text())
         # Falls back to the curator-bucket task_id rather than a real task id.
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == ticket_janitor._ANCHOR_TASK_ID
         assert 'unparseable' in body['summary']
         # Row stamped so it doesn't re-escalate.
         row = await store.get(a)
@@ -352,7 +355,8 @@ async def test_worker_dead_marks_pending_tickets_failed_worker_dead(store, tmp_p
     """When a project's curator worker is dead (no live asyncio.Task and no
     ``_worker_intent`` placeholder), pending tickets for that project must be
     terminalised as ``failed/worker_dead`` and surface as a single
-    ``ticket_failure`` escalation grouped by ``(project_id, 'task-curator', _no_escalation_)``.
+    ``ticket_failure`` escalation grouped by
+    ``(project_id, ticket_janitor._ANCHOR_TASK_ID, _no_escalation_)``.
     """
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
@@ -383,7 +387,7 @@ async def test_worker_dead_marks_pending_tickets_failed_worker_dead(store, tmp_p
         assert len(files) == 1, [f.name for f in files]
         body = json.loads(files[0].read_text())
         assert body['category'] == 'ticket_failure'
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == ticket_janitor._ANCHOR_TASK_ID
     finally:
         handle.close()
 
@@ -897,6 +901,163 @@ async def test_probe_defect_path_probes_orchestrator_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_ticket_failure_path_files_off_the_event_loop(store, tmp_path, monkeypatch):
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        probe = LoopFreedomProbe()
+        probe_escalation_queue_io(monkeypatch, probe)
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+
+        await TicketJanitor(store, primary_project_root=str(tmp_path)).tick()
+
+        probe.assert_loop_stayed_free()
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_path_files_off_the_event_loop(store, tmp_path, monkeypatch):
+    """Drives _submit_infra_escalation, the filer the dedup-outage path shares."""
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        probe = LoopFreedomProbe()
+        probe_escalation_queue_io(monkeypatch, probe)
+
+        def _raising_liveness_probe(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_raising_liveness_probe,
+            probe_defect_threshold=1,
+        )
+
+        await janitor.tick()
+
+        probe.assert_loop_stayed_free()
+        assert _escalation_categories(tmp_path) == ['infra_issue']
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
+    store, tmp_path, monkeypatch, caplog,
+):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+
+        def _unmintable(self, prefix):
+            raise OSError('counter unwritable')
+
+        with monkeypatch.context() as m:
+            m.setattr(EscalationQueue, 'make_id', _unmintable)
+            await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == []
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [OSError]
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is None
+
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(
+    store, tmp_path, caplog,
+):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        ticket_id = await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        janitor = TicketJanitor(store, primary_project_root=str(tmp_path))
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [FileExistsError]
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is None
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+        row = await store.get(ticket_id)
+        assert row is not None
+        assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_infra_escalation_whose_queue_cannot_be_opened_names_its_cause_and_is_retried(
+    store, tmp_path, caplog,
+):
+    """Drives _submit_infra_escalation, the filer the dedup-outage path shares."""
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        def _raising_liveness_probe(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_raising_liveness_probe,
+            probe_defect_threshold=1,
+        )
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        assert swallowed_causes(caplog, 'failed to submit infra escalation') == [FileExistsError]
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['infra_issue']
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_nudge_emitted_once_across_two_constructions(
     store, tmp_path, caplog, monkeypatch
 ):
@@ -1086,7 +1247,11 @@ class TestDedupOutageDetector:
         body = escalations[0]
         assert body['category'] == 'infra_issue'
         assert body['agent_role'] == 'fused-memory/ticket-janitor'
-        assert body['task_id'] == 'task-curator'
+        assert body['task_id'] == 'task-curator', (
+            "OPERATIONS.md §'Is the curator deduping, or just creating?' tells "
+            'operators this record files under task id task-curator; changing '
+            'the curator bucket id is a contract change, not a rename'
+        )
         assert body['level'] == 1
         assert body['severity'] == 'blocking'
         assert pid in body['summary']
@@ -1305,7 +1470,7 @@ class TestCurationDrain:
 
         assert requeue.calls == [(pid, oldest), (pid, middle)]
         assert [(await store.get(t))['status'] for t in (oldest, middle, newest)] == [
-            'pending', 'pending', AWAITING_CURATION,
+            'pending', 'pending', TicketStatus.AWAITING_CURATION,
         ]
 
     @pytest.mark.asyncio
@@ -1318,7 +1483,7 @@ class TestCurationDrain:
         await TicketJanitor(store, known_projects={}, requeue_ticket=requeue).tick()
 
         assert requeue.calls == [(pid, due)]
-        assert (await store.get(not_due))['status'] == AWAITING_CURATION
+        assert (await store.get(not_due))['status'] == TicketStatus.AWAITING_CURATION
 
     @pytest.mark.asyncio
     async def test_a_raising_requeue_leaves_the_row_parked_and_the_tick_running(
@@ -1344,7 +1509,7 @@ class TestCurationDrain:
         await janitor.tick()
 
         assert handed_back == [survivor]
-        assert (await store.get(doomed))['status'] == AWAITING_CURATION
+        assert (await store.get(doomed))['status'] == TicketStatus.AWAITING_CURATION
         assert probed == [pid]
 
     @pytest.mark.asyncio
@@ -1382,7 +1547,7 @@ class TestCurationDrain:
         assert sorted(signalled) == sorted([never_deferred, deferred_in_flight])
         failed, reparked = await store.get(never_deferred), await store.get(deferred_in_flight)
         assert (failed['status'], failed['reason']) == ('failed', 'worker_dead')
-        assert (reparked['status'], reparked['attempts']) == (AWAITING_CURATION, 1)
+        assert (reparked['status'], reparked['attempts']) == (TicketStatus.AWAITING_CURATION, 1)
 
 
 # scripts/sitting/inventory.py::ESC_ID_RE
@@ -1432,7 +1597,7 @@ class TestCurationBacklogEscalation:
             'max_attempts': 2,
         }
         assert {t['ticket_id'] for t in detail['tickets']} == {
-            r['ticket_id'] for r in await store.list_tickets(pid, status=AWAITING_CURATION)
+            r['ticket_id'] for r in await store.list_tickets(pid, status=TicketStatus.AWAITING_CURATION)
         }
 
     @pytest.mark.asyncio

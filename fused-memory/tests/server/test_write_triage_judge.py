@@ -23,6 +23,7 @@ No test in this file needs an API key, a network, or Qdrant.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -30,12 +31,17 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
+import openai
 import pytest
+from _mock_openai_server import mock_openai_server
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -72,7 +78,6 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_PROVIDER,
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
-    _ELIDED_MARKER,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     CANDIDATE_ID_KEY,
@@ -99,7 +104,7 @@ from fused_memory.server.write_triage_judge import (
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
-from fused_memory.utils.clip_disclosure import TruncationFact
+from fused_memory.utils.clip_disclosure import TruncationFact, elision_marker
 
 
 def _payload(word: object, candidate_id: object = None) -> str:
@@ -646,14 +651,15 @@ def _worst_case_call_chars() -> int:
     under-measures every candidate line, so the length is asserted rather
     than assumed.
 
-    THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide`` returns a
-    field of exactly the cap untouched and cuts a longer one to the cap PLUS
-    ``_ELIDED_MARKER`` — so the input that elides renders 9 chars wider per
-    field, 54 across a full slate, than the input that merely fills. A worst
-    case built at the cap is therefore not the worst case; it is the widest
-    input that never trips the behaviour the budget exists to bound.
+    THE FIELDS ARE CUT, AND BY A SIX-DIGIT COUNT. A field at the cap renders
+    untouched, so it is not the worst case. A cut field renders as the cap
+    plus a marker that counts what was cut, one char wider per digit of the
+    count. So every field here is cut by 100,000, a six-digit count, more than
+    ten times the ~9k largest canonical in the calibration fixture.
+    ``JUDGE_PROMPT_CHAR_BUDGET``'s slack covers the further digits.
     """
-    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
+    overshoot = 100_000
+    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + overshoot)
     candidates = [
         _result(str(uuid.uuid4()), 0.9, content=maximal)
         for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
@@ -665,7 +671,7 @@ def _worst_case_call_chars() -> int:
     rendered = build_judge_prompt(
         maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
     )
-    assert _ELIDED_MARKER in rendered, (
+    assert 'x' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(overshoot) in rendered, (
         'the worst case must be an ELIDED render — otherwise it misses the '
         'marker _elide appends, and under-measures the real ceiling'
     )
@@ -858,19 +864,42 @@ class TestBuildJudgePrompt:
         prompt = build_judge_prompt('new', [_result('m1', 0.9, content=long_body)])
         assert long_body not in prompt
         assert len(prompt) < 9_000
-        assert _ELIDED_MARKER in prompt
+        assert 'x' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(9_000 - _DEFAULT_JUDGE_FIELD_CHARS) in prompt
 
     def test_a_long_submitted_content_is_truncated_and_marked(self) -> None:
         """The submitted side is bounded for the same reason as the candidates."""
         long_body = 'y' * 9_000
         prompt = build_judge_prompt(long_body, [_result('m1', 0.9)])
         assert long_body not in prompt
-        assert _ELIDED_MARKER in prompt
+        assert 'y' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(9_000 - _DEFAULT_JUDGE_FIELD_CHARS) in prompt
 
     def test_short_content_is_not_marked_as_elided(self) -> None:
         """The marker means something only if it is absent when nothing was cut."""
         prompt = build_judge_prompt('short', [_result('m1', 0.9, content='also short')])
-        assert _ELIDED_MARKER not in prompt
+        lines = prompt.splitlines()
+        assert 'short' in lines
+        assert '  text: also short' in lines
+
+    def test_a_cut_field_tells_the_model_how_much_was_cut(self) -> None:
+        """Two cuts of different size must read differently to the model.
+
+        The size of the loss decides whether it mattered.
+        """
+        lines = build_judge_prompt(
+            'e' * 12, [_result('m1', 0.9, content='c' * 1_837)], field_chars=10,
+        ).splitlines()
+        assert 'e' * 10 + elision_marker(2) in lines
+        assert '  text: ' + 'c' * 10 + elision_marker(1_827) in lines
+
+    def test_a_non_string_field_is_rendered_as_its_text_then_cut(self) -> None:
+        """A field that is not a string is coerced to its text before the cut."""
+        prompt = build_judge_prompt(
+            cast(Any, None),
+            [cast(Any, types.SimpleNamespace(id='m1', content=10**15))],
+            field_chars=10,
+        )
+        assert 'NEW ENTRY:\n\n' in prompt
+        assert '  text: ' + str(10**15)[:10] + elision_marker(6) in prompt.splitlines()
 
     def test_no_repo_or_task_context_reaches_the_model(self) -> None:
         """PRD C1: the judge sees CONTENT, and nothing about who wrote it.
@@ -909,9 +938,9 @@ class TestBuildJudgePrompt:
         prompt = build_judge_prompt(
             'e' * 10, [_result('m1', 0.9, content='c' * 11)], field_chars=10,
         )
-        assert 'e' * 10 + '\n' in prompt
-        assert 'e' * 10 + _ELIDED_MARKER not in prompt
-        assert 'c' * 10 + _ELIDED_MARKER in prompt
+        lines = prompt.splitlines()
+        assert 'e' * 10 in lines
+        assert '  text: ' + 'c' * 10 + elision_marker(1) in lines
         assert 'c' * 11 not in prompt
 
 
@@ -1437,25 +1466,6 @@ class TestEveryResolverReadsLive:
 # ---------------------------------------------------------------------------
 
 
-def _client_double() -> MagicMock:
-    """A client double that is its own async context manager, like the SDKs.
-
-    `AsyncOpenAI.__aenter__` and `AsyncAnthropic.__aenter__` both `return
-    self` (read off openai 2.31.0 / anthropic 0.92.0), so `async with
-    client as c` binds the SAME object. A bare `MagicMock` instead returns a
-    FRESH child from `__aenter__`, which would make every `create` assertion
-    in this file inspect a different mock than the one `_call_llm` called —
-    passing or failing for reasons that have nothing to do with the code.
-
-    `__aexit__` returns False, because the real ones do: releasing a client
-    must not suppress an in-flight exception (see `TestTheClientIsReleased`).
-    """
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
-    return client
-
-
 def _incomplete_openai_client(content: str, reason: str) -> MagicMock:
     """A Responses answer the provider marked ``incomplete`` for *reason*."""
     client = _openai_client(content, status='incomplete')
@@ -1475,7 +1485,7 @@ def _openai_client(
     unset *usage* reports none rather than an auto-generated Mock. The chat
     endpoint is a bare ``AsyncMock``, so a call on the wrong arm is visible.
     """
-    client = _client_double()
+    client = sdk_client_double()
     client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
         output_text=content, usage=usage, status=status, incomplete_details=None,
     ))
@@ -1486,7 +1496,7 @@ def _openai_client(
 def _chat_client(content: str | None, usage: object = None) -> MagicMock:
     """A fake ``AsyncOpenAI`` for an ``openai_generic`` endpoint: chat.completions only.
 
-    Same construction shape as ``test_classifier.py::_make_mock_client`` — the
+    Same construction shape as ``_sdk_client_stubs.py::completion_client`` — the
     established openai double in this repo, plus the async-CM protocol the
     client is used through. Without *usage* the response's ``usage`` is the
     unspecced Mock's own auto-attribute, which reports no usable usage.
@@ -1499,7 +1509,7 @@ def _chat_client(content: str | None, usage: object = None) -> MagicMock:
     response.choices = [choice]
     if usage is not None:
         response.usage = usage
-    client = _client_double()
+    client = sdk_client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
     client.responses.create = AsyncMock()
     return client
@@ -1522,7 +1532,7 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
     response = MagicMock()
     response.content = blocks
-    client = _client_double()
+    client = sdk_client_double()
     client.messages.create = AsyncMock(return_value=response)
     return client
 
@@ -1701,7 +1711,7 @@ class TestProviderCredentials:
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
         assert ctor.call_args.kwargs == {
-            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1', 'max_retries': 0,
         }
 
     @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
@@ -1799,7 +1809,7 @@ class TestTheJudgeEndpointOnOneRealConfig:
 
     @pytest.mark.asyncio
     async def test_the_judge_client_gets_the_judge_url_and_the_classifier_never_does(
-        self,
+        self, monkeypatch,
     ) -> None:
         cfg = _real_config(judge_api_url=_JUDGE_URL)
 
@@ -1807,16 +1817,17 @@ class TestTheJudgeEndpointOnOneRealConfig:
         assert judge_ctor.call_args.kwargs['base_url'] == _JUDGE_URL
         assert judge_ctor.call_args.kwargs['api_key'] == 'sk-main'
 
-        main_client = _chat_client(
-            '{"primary": "procedural_knowledge", "confidence": 0.9}',
-        )
-        with patch(
-            'fused_memory.routing.classifier.AsyncOpenAI', return_value=main_client,
-        ) as main_ctor:
-            result = await WriteClassifier(cfg).classify('some content')
-        assert main_ctor.called
-        assert result.primary is MemoryCategory.procedural_knowledge
-        assert _JUDGE_URL not in main_ctor.call_args.kwargs.values()
+        with mock_openai_server() as server:
+            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            server.chat_content = '{"primary": "procedural_knowledge", "confidence": 0.9}'
+            classifier = WriteClassifier(cfg)
+            try:
+                result = await classifier.classify('some content')
+            finally:
+                await classifier.close()
+
+            assert result.primary is MemoryCategory.procedural_knowledge
+            assert len(server.requests_to('/chat/completions')) == 1
 
         assert cfg.llm.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == _MAIN_URL
@@ -1882,7 +1893,7 @@ class TestTheVerdictCarriesTheCallsUsage:
         self, response_usage: dict,
     ) -> None:
         """`int(MagicMock())` is 1: the reader checks `isinstance(int)`, never coerces."""
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
             output_text=_payload('amends', 'm1'), status='completed',
             incomplete_details=None, **response_usage,
@@ -2254,8 +2265,8 @@ class TestJudgeWriteOpenAIArm:
             )
         rendered = client.responses.create.call_args.kwargs['input']
         assert candidate_text in rendered
-        assert candidate_text + _ELIDED_MARKER not in rendered
-        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + _ELIDED_MARKER in rendered
+        assert '  text: ' + candidate_text in rendered.splitlines()
+        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + elision_marker(1) in rendered
         assert 'b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1) not in rendered
 
     @pytest.mark.asyncio
@@ -2270,7 +2281,7 @@ class TestJudgeWriteOpenAIArm:
                 candidates=[_result('m1', 0.80, content='x' * 60)],
             )
         rendered = client.responses.create.call_args.kwargs['input']
-        assert 'x' * 50 + _ELIDED_MARKER in rendered
+        assert 'x' * 50 + elision_marker(10) in rendered
         assert 'x' * 51 not in rendered
 
     @pytest.mark.asyncio
@@ -2290,9 +2301,9 @@ class TestJudgeWriteOpenAIArm:
                     candidates=[_result('m1', 0.80, content='x' * 60)],
                 )
             rendered.append(client.responses.create.call_args.kwargs['input'])
-        assert 'x' * 50 + _ELIDED_MARKER in rendered[0]
+        assert 'x' * 50 + elision_marker(10) in rendered[0]
         assert 'x' * 51 not in rendered[0]
-        assert 'x' * 55 + _ELIDED_MARKER in rendered[1]
+        assert 'x' * 55 + elision_marker(5) in rendered[1]
         assert 'x' * 56 not in rendered[1]
 
 
@@ -2372,7 +2383,7 @@ class TestAReasoningEffortTheArmCannotSendRaises:
     async def test_the_call_is_refused_before_any_client_is_built(
         self, make_service, ctor: str,
     ) -> None:
-        client = _client_double()
+        client = sdk_client_double()
         client.messages.create = AsyncMock()
         client.chat.completions.create = AsyncMock()
         client.responses.create = AsyncMock()
@@ -2398,7 +2409,7 @@ class TestAReasoningEffortTheArmCannotSendRaises:
         service.config.write_triage.t_high = 0.95
         service.config.write_triage.t_low = 0.50
         service.search = AsyncMock(return_value=SearchResults([_result('m1', 0.80)]))
-        with patch(ctor, return_value=_client_double()):
+        with patch(ctor, return_value=sdk_client_double()):
             decision = await triage_write(
                 service, content='c', project_id='p',
                 counter=counter, judge=judge_write,
@@ -2495,10 +2506,14 @@ class TestTheClientIsReleased:
     """The SDK client is built per middle-band write and must not be leaked.
 
     `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
-    write. Neither defines `__del__` (verified against openai 2.31.0), so an
-    unclosed client abandons an `httpx` connection pool — sockets and TLS
-    state — to the garbage collector, on a path that runs once per write in a
-    single long-lived server process.
+    write. Neither client class defines `__del__`, but the `httpx` wrapper
+    each one holds does: `openai._base_client.AsyncHttpxClientWrapper` and its
+    anthropic twin (see `tests/_fm_helpers.py::reap_leaked_async_httpx_clients`).
+    That finaliser is no substitute for closing. It schedules `aclose()` only
+    if an event loop happens to be running when the garbage collector reaches
+    the client; otherwise the connection pool — sockets and TLS state — is
+    abandoned, on a path that runs once per write in a single long-lived
+    server process.
 
     The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
     to a config that hot-reloads would pin a stale `model`/`api_url` past a
@@ -2552,7 +2567,7 @@ class TestTheClientIsReleased:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         if provider == 'openai':
             client.responses.create = AsyncMock(side_effect=_hang)
         else:
@@ -2568,7 +2583,7 @@ class TestTheClientIsReleased:
     @pytest.mark.asyncio
     async def test_the_client_is_released_when_the_transport_raises(self) -> None:
         """A release must not depend on the call having succeeded."""
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -2625,7 +2640,7 @@ class TestJudgeWriteFailuresRaise:
 
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -2647,7 +2662,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -2671,7 +2686,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         client.messages.create = AsyncMock(side_effect=_hang)
         with patch('anthropic.AsyncAnthropic', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -2790,7 +2805,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):
@@ -2860,7 +2875,6 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheFrontierArmLive:
     """The live edge: a frontier reasoning model judges a fixture write through triage."""
 
@@ -2922,17 +2936,187 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
     )
 
 
+async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
+    """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
+
+    A budget expiry, a provider 5xx and a provider 429 each yield no verdict, so they say nothing
+    about the wording. Connection errors, SDK timeouts, other 4xx and unusable answers stay red,
+    and so does a 429 whose code is `insufficient_quota`: an account out of credit is a lasting
+    fault, and skipping it would silently retire every wording check on every run.
+    TestTheFrontierArmLive keeps a timeout red: it is the live edge for the fail-open/latency
+    dimension.
+    """
+    try:
+        return await judge_write(**judge_kwargs)
+    except TimeoutError:
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict within write_triage.judge_timeout_seconds='
+            f'{resolve_judge_timeout(service)}; production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+    except (openai.InternalServerError, openai.RateLimitError) as exc:
+        if exc.code == 'insufficient_quota':
+            raise
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict: the provider answered {type(exc).__name__} '
+            f'(status {exc.status_code}); production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+
+
+_RESPONSES_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/responses')
+
+
+@contextlib.contextmanager
+def _raises_without_skipping(
+    expected: type[BaseException],
+) -> Iterator[pytest.ExceptionInfo[BaseException]]:
+    """`pytest.raises`, except a skip fails: a skipped guard test would hide a widened `except`."""
+    try:
+        with pytest.raises(expected) as excinfo:
+            yield excinfo
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f'skipped instead of raising {expected.__name__}: {skipped}')
+
+
+class TestTheLiveWordingBudgetGuard:
+    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx or a transient 429; the rest stays red."""
+
+    @staticmethod
+    def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
+        return {
+            'memory_service': _judge_svc(**write_triage),
+            'content': 'c', 'project_id': 'p',
+            'decision': _decision('m1'), 'candidates': [_result('m1', 0.80)],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_call_past_the_judge_budget_skips_naming_the_budget(self) -> None:
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=_hang)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs(judge_timeout_seconds=0.01))
+
+        reason = str(excinfo.value)
+        assert 'test-model' in reason
+        assert '0.01' in reason
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_is_returned_as_is(self) -> None:
+        client = _openai_client(_payload('restates', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await _live_judge_verdict(**self._judge_kwargs())
+
+        assert verdict.outcome == OUTCOME_RESTATED
+        assert verdict.candidate_id == 'm1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_client',
+        [
+            lambda: _openai_client('I cannot answer that.'),
+            lambda: _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens'),
+        ],
+        ids=['unparseable', 'incomplete'],
+    )
+    async def test_an_unusable_answer_stays_red(
+        self, make_client: Callable[[], MagicMock],
+    ) -> None:
+        with patch('openai.AsyncOpenAI', return_value=make_client()), \
+                _raises_without_skipping(JudgeOutputError):
+            await _live_judge_verdict(**self._judge_kwargs())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            RuntimeError('boom'),
+            openai.APITimeoutError(request=_RESPONSES_REQUEST),
+            openai.APIConnectionError(request=_RESPONSES_REQUEST),
+        ],
+        ids=['runtime-error', 'sdk-timeout', 'sdk-connection-error'],
+    )
+    async def test_a_transport_error_stays_red(self, error: Exception) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                _raises_without_skipping(type(error)) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.InternalServerError(
+                'boom', response=httpx.Response(500, request=_RESPONSES_REQUEST), body=None,
+            ),
+            openai.RateLimitError(
+                'slow down', response=httpx.Response(429, request=_RESPONSES_REQUEST), body=None,
+            ),
+        ],
+        ids=['provider-5xx', 'provider-429'],
+    )
+    async def test_a_retryable_provider_status_skips_naming_it(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        reason = str(excinfo.value)
+        assert type(error).__name__ in reason
+        assert str(error.status_code) in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.BadRequestError(
+                'bad', response=httpx.Response(400, request=_RESPONSES_REQUEST), body=None,
+            ),
+            openai.RateLimitError(
+                'out of credit', response=httpx.Response(429, request=_RESPONSES_REQUEST),
+                body={'code': 'insufficient_quota', 'type': 'insufficient_quota'},
+            ),
+        ],
+        ids=['provider-400', 'provider-429-insufficient-quota'],
+    )
+    async def test_a_non_retryable_provider_status_stays_red(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                _raises_without_skipping(type(error)) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheShippedWordingLive:
     """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
-    the old wording too, so only Sol tells the two wordings apart.
+    the old wording too, so only Sol tells the two wordings apart. A call past
+    the judge budget, or one the provider answers with a 5xx or a transient
+    429, skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
@@ -2988,7 +3172,7 @@ class TestTheShippedWordingLive:
         write_triage.judge_reasoning_effort = 'low'
         service = types.SimpleNamespace(config=config)
 
-        verdict = await judge_write(
+        verdict = await _live_judge_verdict(
             memory_service=service, content=entry, project_id='p',
             decision=_decision(candidate_id), candidates=slate,
         )

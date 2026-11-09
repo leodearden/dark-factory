@@ -41,9 +41,8 @@ class TestPsiAdmissionConfigDefaults:
     D1/D2).
     """
 
-    def test_defaults_attached_on_orchestrator_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_attached_on_orchestrator_config(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.psi_admission, PsiAdmissionConfig)
         assert cfg.psi_admission.enabled is True
@@ -132,13 +131,12 @@ class TestMinInflightFloorValidation:
         cfg = PsiAdmissionConfig(min_inflight_floor=good_value)
         assert cfg.min_inflight_floor == good_value
 
-    def test_rejected_at_load_via_orchestrator_config(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rejected_at_load_via_orchestrator_config(self):
         """Covers the 'rejected at load' signal: load_config constructs
         OrchestratorConfig, which builds the psi_admission submodel from a
         nested dict (as YAML would deserialize into) and must raise.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(psi_admission={'min_inflight_floor': 0})  # type: ignore[arg-type]
 
@@ -184,12 +182,11 @@ class TestThresholdRangeValidation:
         with pytest.raises(ValidationError, match=field):
             load_config(cfg_path)
 
+    @pytest.mark.usefixtures("code_default_config")
     @pytest.mark.parametrize(
         ('field', 'bad_value'), [('mem_full_avg10', 101.0), ('runqueue_ratio', 0.0)]
     )
-    def test_hot_reload_rejected_and_live_kept(self, monkeypatch, tmp_path, field, bad_value):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_hot_reload_rejected_and_live_kept(self, field, bad_value):
         live = OrchestratorConfig()
         live_value = getattr(live.psi_admission, field)
         fresh = OrchestratorConfig()
@@ -214,20 +211,16 @@ class TestPsiAdmissionReloadDisposition:
             f'but is missing from RELOADABLE_FIELDS'
         )
 
-    def test_switching_an_arm_on_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_switching_an_arm_on_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(psi_admission=PsiAdmissionConfig())
         fresh = OrchestratorConfig(psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0))
         diff = diff_config(live, fresh)
         assert 'psi_admission.runqueue_ratio' in diff.applied_candidates
         assert 'psi_admission.runqueue_ratio' not in diff.restart_required
 
-    def test_apply_reload_switches_an_arm_on_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_switches_an_arm_on_in_place(self):
         live = OrchestratorConfig(psi_admission=PsiAdmissionConfig())
         fresh = OrchestratorConfig(psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0))
         report = apply_reload(live, fresh)
@@ -236,9 +229,8 @@ class TestPsiAdmissionReloadDisposition:
         assert 'psi_admission.runqueue_ratio' not in report['restart_required']
         assert live.psi_admission.runqueue_ratio == 4.0
 
-    def test_apply_reload_switches_an_arm_off_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_switches_an_arm_off_in_place(self):
         live = OrchestratorConfig(psi_admission=PsiAdmissionConfig(runqueue_ratio=4.0))
         fresh = OrchestratorConfig(psi_admission=PsiAdmissionConfig())
         report = apply_reload(live, fresh)

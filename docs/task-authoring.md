@@ -390,6 +390,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
@@ -604,7 +613,7 @@ gates):
 |---|---|---|
 | `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
 | `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
-| `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
+| `vacuous_present_comment_only` | the only matches are comments, not code; in a markdown file only an HTML `<!--` comment line counts, and a heading or bullet is content | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
 | `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
@@ -684,8 +693,11 @@ only on `broken` (a done producer whose capability is nowhere on main),
 check) and an actionable stale path (a live producer, or a done one with open
 dependents; the rest are listed report-only); `superseded` — a correct
 descriptor that later work legitimately undid — is reported and never
-actionable. A separate report-only section lists sidecar
-descriptors carrying a structural code (`vacuous_present_self_referential`,
+actionable. Grep and path descriptors both get a disposition; a grep's
+supersession is read from the commits that changed its pattern's occurrences,
+a path's from the commits that deleted it (expect: present) or created it
+(expect: absent). A separate report-only
+section lists sidecar descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
 they never affect the exit code and no gating test sweeps them.
@@ -694,7 +706,15 @@ they never affect the exit code and no gating test sweeps them.
 mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
 naming the code and a remedy. Without it a malformed check and a genuinely
 undelivered capability produce identical records, and they need opposite
-responses.
+responses. Every such escalation also names the check's OWNER, which is the
+dependency whose `metadata.delivered_checks` declares it, never the blocked
+dependent. It says where the check is declared both as data in
+`delivered_check_owner` (`escalation/src/escalation/models.py::DeliveredCheckOwner`:
+the owner task, the check name, and the owner's sidecar with whether it declares
+the check on `main`) and as the `Check owner:` / `Declared in:` / `Sidecar:`
+lines of `detail`, which are rendered from that same value. A stale or
+mis-authored check is corrected at the owner's sites (see "Stale scope paths");
+the blocked dependent is only re-pended.
 
 **Dispatch-time policy**
 
@@ -702,7 +722,7 @@ responses.
 |---|---|
 | All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
 | ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA and the check's owner and declaration sites (`delivered_check_owner`); dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
 | A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
 | `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
 
@@ -871,7 +891,7 @@ dependency gate as every other task (§3).
 {
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
-  env: {},                          # dict[str,str], default {}
+  env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
   cwd: "<project_root>",            # default: project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
@@ -885,6 +905,20 @@ against the orchestrator's **configured** `project_root` — the `project_root` 
 validates the script under — never against the orchestrator process's
 working directory. See
 `shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
+
+`env` reaches the script on every path. A predicate, no-target or
+cross-unit deploy runs the script with `env` overlaid on the
+orchestrator's own environment. A self-target deploy (`target_unit` is the
+orchestrator's own unit) runs the script in a `systemd-run` transient unit
+as `/bin/sh -c 'KEY=value … <script> <args>'`. That script starts from the
+systemd user manager's environment plus `env`, not from the
+orchestrator's, because `systemd-run` passes on none of its caller's
+environment. The assignments prefix the script alone, so the unit's RP-4
+on-failure escalation submit sees none of `env`. Keys must be portable
+environment variable names, matching `[A-Za-z_][A-Za-z0-9_]*`. A deploy
+(`target_unit` set) refuses any other key with a born-at-L2 `infra_issue`
+and does not run the script. The mechanism is
+`orchestrator/src/orchestrator/proc_supervision.py::RestartPlan`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
@@ -970,7 +1004,13 @@ satisfied:
 
 A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
-`LockCharterViolation`, so this lint never sees it.
+`LockCharterViolation`, so this lint never sees it. That rejection lists
+such paths under `unrecognised_extension_paths`, and its hint gives the same
+`task_kind='deterministic'` routing as this lint. An upper-case spelling of a
+listed extension, such as `README.MD`, is not listed there: it gets only the
+advice to lowercase the extension. Leave a gitignored path out
+of `metadata.files` whatever the `task_kind`: the lock-charter check runs
+first and classifies it as a directory either way.
 
 **Posture.** By default the lint only warns. When the submission succeeds,
 it merges a `gitignored_deliverable_warning` key into the result and logs a
@@ -1393,7 +1433,7 @@ stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
 claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
-main_health_signature
+main_health_signature, superseded_by, cancel_dispositions
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1406,10 +1446,10 @@ copy was hand-maintained prose: task 4372 had to mirror two keys across in a
 separate follow-up commit, and the frozenset's own header comment sat stale
 across two blessings.
 
-`recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
-submodel, so it is doubly exempt from the `unknown_key` scan (a registered
-key is already in `known_fields`). The blessing is deliberate
-belt-and-braces — it keeps the key suppressed if the registration is ever
+`recurrence` (§6.1) and `cancel_dispositions` are unusual for Tier-A entries:
+each is *also* a registered submodel, so each is doubly exempt from the
+`unknown_key` scan (a registered key is already in `known_fields`). The
+blessing is deliberate belt-and-braces — it keeps the key suppressed if the registration is ever
 moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
@@ -1422,6 +1462,58 @@ Tier-A blessed. Only the status writers write it: `set_task_status` and
 `update_task` and `submit_task` refuse any add, alter or removal with
 `deferral_write_authority`; an unchanged echo of the stored record passes.
 Its shapes and use are §9 "Deferring a task".
+
+`superseded_by` and `cancel_dispositions` are the cancel-with-children
+vocabulary (contract `plans/cancel-with-children-prd.md` §4.8). Their shapes
+live in `shared/src/shared/cancel_dispositions.py`; read them there. A
+cancelled parent carries `superseded_by: list[int]`, the tasks that replace
+it. Each child carries `cancel_dispositions`, a list holding one entry per
+cancelled parent. An entry's `parent` is always qualified as
+`"<project_id>:<id>"`, because an external dependent's entry lives in another
+project's store, where a bare id names a different task.
+
+`declared_scope` is the size a task declared when it was filed. It is a
+registered submodel (`shared/src/shared/declared_scope.py::DeclaredScope`,
+cardinality dict), machine-only and deliberately not Tier-A blessed. Its
+`band` is one of `undeclared`, `narrow`, `moderate`, `broad`; the thresholds
+live only in that module's `derive_declared_scope`. `submit_task` stamps it
+once, `basis='submit'`, on both creation paths (ticket and planning mode).
+`submit_task` and `update_task` refuse any add, alter or removal with
+`declared_scope_write_authority`; an unchanged echo passes, so a replace-mode
+write must carry it verbatim. The refusal's `reason` is `added`, `altered` or
+`removed` (a replace that omits the key), and its `stored` is the stamp on the
+row, or null when it has none. It is never re-derived at plan refinement or at
+`done`. The only re-stamp is a curator combine (`basis='combine'`, task
+8415). An absent key, on a task filed before the stamp existed, means no
+information, never `undeclared`. The modules allowed to import it are pinned
+by `shared/tests/test_declared_scope_readers.py`
+(`plans/follow-up-filing-shape-prd.md` §3 decisions 6–8), and no verify,
+merge-lane, triage or routing path may read it: the same test fails if one of
+those modules names the key or anything `shared.declared_scope` exports.
+
+`followup_items` is the list of observations one follow-up task was filed to
+address. It is a registered submodel
+(`shared/src/shared/followup_items.py::FollowupItem`, cardinality list),
+machine-keyed and deliberately not Tier-A blessed. Each item is `{key,
+summary, files, origin_task, origin_escalation_id}`: `summary` is one line of
+at most 300 chars and `files` is non-empty. On creation `submit_task` derives
+every R4 key server-side, on both creation paths
+(`shared/src/shared/followup_items.py::with_derived_bundle_keys`):
+`origin_task` is `spawned_from`, or `unparented` without one; each item's
+`key`; the top-level `escalation_id` `agent-followup-<parent>`, absent when
+unparented; and the top-level `suggestion_hash` over the sorted item keys. Any
+caller value for these is overwritten. It refuses, with error
+`followup_items_refused` and a `reason` of `not_a_list`, `invalid_item`,
+`item_count`, `duplicate_key` or `undeclared_files`, a bundle outside 1..5
+items, one that repeats a key, or one with an item file missing from
+`metadata.files`. A submission without the key keeps its caller-supplied R4
+keys: steward and review-cycle filings, and pre-bundle singles, which
+`legacy_item` reads as one item. `merge_items` is the one union every later
+writer uses. The architect briefing renders the list numbered, and in v1 only
+architect and implementer filers bundle (`plans/follow-up-filing-shape-prd.md`
+§4.1 and §3 decisions 1 and 3–5). As for `shared.defects`, the registration is
+an import side effect of `shared.followup_items`, so a process that never
+imports it would census the key as `unknown_key`.
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
@@ -1521,7 +1613,7 @@ ahead of the queue.
 request inherits `metadata.merge_lane`, under the precedence **`lane`
 argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
 task's *metadata* is silently normalised to `'normal'` by
-`orchestrator/src/orchestrator/merge_lane/worker.py::_normalize_lane`, so a typo
+`orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`, so a typo
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The
@@ -1655,8 +1747,9 @@ after which the resume path nonetheless closed the task.
 
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
-fixed to use the canonical spelling — with one documented exception,
-`origin_finding_id`, noted under the table.
+fixed to use the canonical spelling — with documented exceptions noted under
+the table: `origin_finding_id`, and the `x_`-prefixed aliases of
+`superseded_by`.
 
 Every key in the **Canonical** column is itself Tier-A blessed and therefore
 **silent**, so the `code=unknown_key` drift signal is **alias-only** and
@@ -1675,6 +1768,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+| `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
 <!-- /tier-b-canonical-keys -->
 
@@ -1708,6 +1802,18 @@ key in its own right, naming the Stage-1 finding specifically, and is
 deliberately **not** something to migrate to `source_finding_id` — only the
 `origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
 
+**The `superseded_by` row's `x_`-prefixed spellings emit no drift line**
+(`esc-8142-1`). They sit in the Tier-C `x_` namespace below, which the parser
+never warns on, so the row lists them only as spellings to avoid in new
+writes. Only `subsumed_by` warns, pinned by
+`test_superseded_by_tier_b_alias_still_warns`
+(`shared/tests/test_task_metadata.py`). `x_coalesced_into` keeps its legacy
+readers, and the deferral `carried_by` record stays a hold with a carrier,
+not a supersession; neither is folded into `superseded_by`. The task key
+deliberately does not reuse the Mem0 memory key `x_superseded_by`: one name
+for a different store and shape would mislead. Contract:
+`plans/cancel-with-children-prd.md` §4.8.
+
 ### Tier-C: ad-hoc keys
 
 One-off, timestamped, or id-suffixed annotation keys (e.g.
@@ -1731,6 +1837,43 @@ the suppression can go, or cite a live follow-up ticket on the marker. The
 accepted marker and declaration spellings are
 `shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
 read them there rather than from a copy here.
+
+### Gate-enforced x_ keys: x_enumeration_scope and the liveness stamp
+
+Three `x_` keys are not free-form annotations. A write-time gate on
+`recon-stage-*` `submit_task` and `update_task` calls owns them (task
+3056). They stay in the `x_` namespace, so they need no blessed-key
+registration and mint no `unknown_key` census line.
+
+- **`x_enumeration_scope`** is a structured object stating which stores
+  and categories an enumeration of Mem0 ids was drawn from, and whether
+  that sweep was exhaustive. Filing a gate that enumerates Mem0 ids
+  without one is rejected (`EnumerationScopeMissing`), and a value of any
+  other shape is rejected on every write (`EnumerationScopeMalformed`).
+- **`x_liveness_reverified_at` and `x_liveness_exceptions`** are written
+  only by the gate. Never author them. Each exception record's `outcome`
+  is an `enumeration_guard.py::EnumeratedIdOutcome` value.
+
+When you write an enumeration:
+- List full 36-char UUIDs, never fragments. A fragment is rejected on
+  filing (`EnumeratedIdTruncated`).
+- Update it with an overwriting merge: `metadata_mode='merge'` (the
+  default) or `'replace'`, never an additive one
+  (`EnumerationUpdateNotOverwriting`). Both modes replace what you send
+  wholesale. `'merge'` replaces each top-level key you supply, so read the
+  task with `get_task` and send the COMPLETE list, never only the ids being
+  added. `'replace'` replaces the whole blob, so send every stored key,
+  `x_liveness_exceptions` included as read: the gate carries forward the
+  records for ids that write did not re-check.
+- Send a `memory_hints` attach as a separate update.
+
+The rules themselves live in the module docstring of
+`fused-memory/src/fused_memory/reconciliation/enumeration_guard.py`: what
+counts as an enumeration and as a gate, how filing and updating differ,
+and the residuals the gate leaves open. The guidance Stage 2 is shown is
+rendered by `enumeration_guard.py::render_enumeration_guard_section`, and
+`enumeration_guard.py::enumeration_scope_example` returns a well-formed
+scope.
 
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 
@@ -2032,7 +2175,9 @@ than removing and resubmitting — resubmission loses the task's id (and
 anything depending on that id), history, and any escalations already
 attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
-remain resolvable by anything that referenced it.
+remain resolvable by anything that referenced it. A task with live children
+is retired with `/cancel-with-children <id>`, which decides and passes a
+disposition for every child (contract `plans/cancel-with-children-prd.md`).
 
 **Adding an escalation category.** Every filed category must be a member of
 `escalation/src/escalation/categories.py::EscalationCategory`; its module
@@ -2127,6 +2272,41 @@ within the grace window.
 a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
 releases them. A session that ends without landing its hold releases it
 first.
+
+### Amending a planned task's text
+
+When a task is planned, the orchestrator stamps a fingerprint of its
+description and details into `metadata.plan_text_fp`, with the plan's time
+in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
+`description`, `details` or `prompt` is compared against that stamp. So is
+a reconciliation write whose audit-trail rotation (§10) rewrote the
+description. If the fingerprint of the post-write description and details
+no longer matches, the result carries `amendment_advisory`:
+
+| Field | Meaning |
+|---|---|
+| `task_id` | the amended task |
+| `plan_authored_at` | when the current plan was written |
+| `fields_changed` | the text fields this write supplied, plus `description` when the rotation rewrote it |
+| `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
+| `plan_text_fp_before` | the stamped plan fingerprint |
+| `task_text_fp_after` | the fingerprint of the text now stored |
+
+A task with no stamp, a metadata-only write that rotates nothing, and a
+whitespace-only reflow get no advisory. The running agent of an
+`in-progress` task does not see the amendment. Its next dispatch takes the
+revalidation path (task 4031) and re-plans against the new text.
+
+`will_replan` True is a prediction, not an observation. It assumes the
+orchestrator's default `plan_text_fp_gate_enabled: true`, which fused-memory
+cannot read, and a later dispatch. An `in-progress` task whose running agent
+marks it done first never gets one.
+
+Every such amendment also journals a `task_text_amended` reconciliation
+event carrying the advisory plus `writer_source` (`update_task` or
+`curator_combine`) and `agent_id`. That includes a curator combine
+rewriting a planned task's text, which no caller is told about. Contract:
+`plans/task-amendment-delivery-prd.md` §9 C7.
 
 ## 10. Rotating a long-running audit-trail task
 

@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,6 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -44,6 +47,7 @@ from df_pytest_isolation import (
     read_leaked_pid,
     run_in_new_session,
     run_in_new_session_until,
+    run_in_new_session_while_progressing,
     synthetic_unit,
     wait_pid_gone,
     wait_proof_grace_secs,
@@ -93,6 +97,7 @@ does under --value: the sweep reads it to address its drain request.
 import json
 import os
 import sys
+import tempfile
 import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
@@ -104,8 +109,17 @@ def _load():
 
 
 def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
+    fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_name, STATE_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _observe_lease(args):
@@ -302,6 +316,23 @@ def _install_fixed_epoch(bin_dir, epoch):
     shim.chmod(0o755)
 
 
+def _install_spawn_latency(bin_dir, secs):
+    """Shadow `python3` with a shim that sleeps *secs*, then execs the real one.
+
+    bin_dir is first on the script's PATH, so this delays every interpreter
+    start the sweep makes: the fake systemctl (`#!/usr/bin/env python3`) and
+    `python3 drain_check.py` alike. It delegates rather than replaces, so
+    drain_check.py still runs for real. The real interpreter is resolved here,
+    before bin_dir is ever on PATH, so the shim cannot find itself.
+    """
+    real = shutil.which("python3")
+    if real is None:
+        pytest.fail("no python3 on PATH to delegate the spawn-latency shim to")
+    shim = bin_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nsleep {secs}\nexec {shlex.quote(real)} "$@"\n')
+    shim.chmod(0o755)
+
+
 def _write_heartbeat(fleet_dir, unit, **overrides):
     """Write <fleet_dir>/<unit>.json, replacing it ATOMICALLY.
 
@@ -372,6 +403,53 @@ def _run_script_until(
     """
     cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
     return run_in_new_session_until(cmd, condition=condition, env=full_env, timeout=timeout)
+
+
+class _SweepProgress(NamedTuple):
+    verdicts_seen: frozenset[tuple[str, str]]
+    systemctl_calls: int
+
+
+def _sweep_progress(state_path, trace_path) -> _SweepProgress:
+    """How far a sweep has got: every DISTINCT gate verdict it has recorded,
+    and how many systemctl commands it has issued. Distinct, not the ledger's
+    length: a gate re-polling the verdict it already had is waiting, not
+    advancing."""
+    return _SweepProgress(
+        frozenset(read_drain_poll_trace(trace_path, complete_only=True)),
+        len(_load_state(state_path)["calls"]),
+    )
+
+
+# Bounds time WITHOUT progress; a correct sweep's longest such stretch is the awaited unit's polls.
+_SWEEP_STALL_TIMEOUT_SECS = 15
+
+
+def _run_sweep_while_progressing(
+    bin_dir, state_path, fleet_dir, trace_path, *extra_args, env,
+    stall_timeout=_SWEEP_STALL_TIMEOUT_SECS,
+):
+    """`_run_script`, stopped as stalled once `_sweep_progress` has not
+    changed for *stall_timeout* seconds, however long the whole sweep takes.
+
+    On a stall the TimeoutExpired carries the last progress, the ledger and
+    the partial output as notes.
+    """
+    assert env.get("ORCH_DRAIN_POLL_TRACE_FILE") == str(trace_path), (
+        "the progress probe reads the ledger at trace_path, so the script must write it there"
+    )
+    cmd, full_env = _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env)
+    try:
+        return run_in_new_session_while_progressing(
+            cmd, progress=lambda: _sweep_progress(state_path, trace_path),
+            stall_timeout=stall_timeout, env=full_env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        exc.add_note(f"last progress={_sweep_progress(state_path, trace_path)!r}")
+        exc.add_note(f"ledger={read_drain_poll_trace(trace_path, complete_only=True)!r}")
+        exc.add_note(f"stdout={_decode(exc.stdout)!r}")
+        exc.add_note(f"stderr={_decode(exc.stderr)!r}")
+        raise
 
 
 def _script_invocation(bin_dir, state_path, fleet_dir, extra_args, env):
@@ -1869,6 +1947,31 @@ def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args
             proc.communicate(timeout=10)
 
 
+def _await_gate_poll(proc, trace_path, poll):
+    """Return once the backgrounded sweep's drain-poll ledger holds *poll*.
+
+    *poll* is a (verdict, unit) record. Fails, carrying the sweep's output, if
+    the sweep exits first, and fails at a must-not-hang deadline.
+    """
+    deadline = time.monotonic() + load_scaled_grace(
+        10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+    )
+    while poll not in read_drain_poll_trace(trace_path, complete_only=True):
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=10)
+            pytest.fail(
+                f"the sweep exited (rc={proc.returncode}) before its gate polled "
+                f"{poll!r}; ledger="
+                f"{read_drain_poll_trace(trace_path, complete_only=True)!r} "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        assert time.monotonic() < deadline, (
+            f"the sweep's gate never polled {poll!r}; ledger="
+            f"{read_drain_poll_trace(trace_path, complete_only=True)!r}"
+        )
+        time.sleep(0.05)
+
+
 def test_lease_is_held_mid_sweep_and_names_the_sweeps_own_pid(tmp_path):
     """(a) While the sweep runs, the lease records {pid, started_ts, current_unit}.
 
@@ -2035,7 +2138,13 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
+    # Fault injection, not the remedy: widens the acquire->advance window so a
+    # regression to snapshotting on the lease's first appearance fails the
+    # current_unit precondition below.
+    acquire_to_advance_latency_secs = 0.5
+    _install_spawn_latency(bin_dir, acquire_to_advance_latency_secs)
     _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+    trace_path = tmp_path / "drain-poll-trace.tsv"
 
     with _sweep_in_background(
         bin_dir, state_path, fleet_dir, lease_path, "--drain",
@@ -2047,9 +2156,18 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
                 ))
             ),
             "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        held = json.loads(lease_path.read_text())
+        # The sweep rewrites the lease once per unit before its gate parks; once
+        # parked on UNIT_R it rewrites nothing more in the lease until its grace ends.
+        _await_gate_poll(proc, trace_path, ("busy", UNIT_R))
+        held = lease_path.read_bytes()
+        assert json.loads(held)["current_unit"] == UNIT_R, (
+            f"the snapshot must be the lease the sweep holds while parked on "
+            f"{UNIT_R}; a snapshot of an earlier write is a moving target the "
+            f"sweep may still overwrite before the kill. held={held!r}"
+        )
         os.killpg(pgid, signal.SIGKILL)
         proc.communicate(timeout=30)
         assert wait_pid_gone(proc.pid), "the SIGKILLed sweep must actually be gone"
@@ -2060,7 +2178,7 @@ def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
         "deleting leases, and the reader-side max-age bound is being asked to "
         "cover a case it was never given"
     )
-    assert json.loads(lease_path.read_text()) == held, (
+    assert lease_path.read_bytes() == held, (
         "the stranded lease must be byte-equal to what the sweep held"
     )
 
@@ -2294,13 +2412,8 @@ def _three_unit_drain_sweep(tmp_path, heartbeats):
     return bin_dir, state_path, fleet_dir, trace_path, env
 
 
-def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
-    tmp_path,
-):
-    """Task 7297, the 2026-10-20 incident: the sweep waited 8009 s on reify's
-    verify while dark-factory, later in the order, sat with its merge admission
-    halted the whole time. Now a unit's request -- what halts its admission --
-    exists only from the moment the sweep reaches it until its restart."""
+def _assert_only_the_awaited_unit_is_halted(tmp_path, *, spawn_latency_secs=None) -> float:
+    """Returns how long the sweep itself ran, in seconds."""
     awaited_polls = 3
     bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
         tmp_path,
@@ -2310,6 +2423,8 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
             UNIT_SELF: _hb_drain([]),
         },
     )
+    if spawn_latency_secs is not None:
+        _install_spawn_latency(bin_dir, spawn_latency_secs)
 
     with (
         _drain_requests_seen_at_gate_poll(
@@ -2320,10 +2435,11 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
             [_Rewrite(after="verifying", to=_hb_drain([]), polls=awaited_polls)],
         ),
     ):
-        result = _run_script(
-            bin_dir, state_path, fleet_dir, "--drain", env=env,
-            timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        started = time.monotonic()
+        result = _run_sweep_while_progressing(
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env,
         )
+        sweep_secs = time.monotonic() - started
 
     polls = read_drain_poll_trace(trace_path)
     context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -2348,6 +2464,61 @@ def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_
     assert not list(fleet_dir.glob("*.drain.json")), (
         f"the sweep must release every request it wrote. {context}"
     )
+    return sweep_secs
+
+
+def test_a_later_units_admission_is_not_halted_while_an_earlier_units_verify_is_awaited(
+    tmp_path,
+):
+    """Task 7297, the 2026-10-20 incident: the sweep waited 8009 s on reify's
+    verify while dark-factory, later in the order, sat with its merge admission
+    halted the whole time. Now a unit's request -- what halts its admission --
+    exists only from the moment the sweep reaches it until its restart."""
+    _assert_only_the_awaited_unit_is_halted(tmp_path)
+
+
+_STARVED_SPAWN_LATENCY_SECS = 0.75
+
+
+def test_the_awaited_verify_sweep_completes_when_every_interpreter_start_is_starved(tmp_path):
+    sweep_secs = _assert_only_the_awaited_unit_is_halted(
+        tmp_path, spawn_latency_secs=_STARVED_SPAWN_LATENCY_SECS,
+    )
+    assert sweep_secs > _SWEEP_STALL_TIMEOUT_SECS, (
+        f"the starved sweep finished in {sweep_secs:.2f}s, inside the "
+        f"{_SWEEP_STALL_TIMEOUT_SECS}s stall bound, so a whole-run bound of that size "
+        "would not have killed it either and this guard proves nothing; raise "
+        "_STARVED_SPAWN_LATENCY_SECS"
+    )
+
+
+def test_a_sweep_that_only_repolls_the_same_verdict_is_reported_as_stalled(tmp_path):
+    bin_dir, state_path, fleet_dir, trace_path, env = _three_unit_drain_sweep(
+        tmp_path,
+        {
+            UNIT_R: _hb_drain([_verifying_entry(deadline_in=3600)]),
+            UNIT_S: _hb_drain([]),
+            UNIT_SELF: _hb_drain([]),
+        },
+    )
+    env["ORCH_DRAIN_VERIFY_MAX_WAIT_SECS"] = "20"
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _run_sweep_while_progressing(
+            bin_dir, state_path, fleet_dir, trace_path, "--drain", env=env, stall_timeout=3,
+        )
+
+    polls = read_drain_poll_trace(trace_path)
+    calls = [
+        [arg for arg in call if arg != "--user"] for call in _load_state(state_path)["calls"]
+    ]
+    assert exc_info.value.timeout == 3
+    assert polls, (
+        "the stall fired before the gate's first poll, so this run never reached the "
+        "repolling it pins: the stretch before that poll outlasted stall_timeout"
+    )
+    assert all(p == ("verifying", UNIT_R) for p in polls), polls
+    assert not [call for call in calls if call[:1] == ["restart"]], calls
 
 
 def test_each_units_verify_wait_cap_counts_from_its_own_request(tmp_path):
@@ -2738,13 +2909,7 @@ def test_sigterm_mid_sweep_removes_its_own_requests_and_leaves_another_sweeps(tm
             "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
         },
     ) as (proc, pgid):
-        deadline = time.monotonic() + load_scaled_grace(
-            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
-        )
-        while ("verifying", UNIT_R) not in read_drain_poll_trace(trace_path, complete_only=True):
-            assert proc.poll() is None, f"the sweep exited before it awaited {UNIT_R}"
-            assert time.monotonic() < deadline, f"the sweep never polled {UNIT_R} verifying"
-            time.sleep(0.05)
+        _await_gate_poll(proc, trace_path, ("verifying", UNIT_R))
         os.killpg(pgid, signal.SIGTERM)
         stdout, stderr = proc.communicate(timeout=30)
 

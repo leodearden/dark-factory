@@ -15,12 +15,15 @@ from typing import Any
 from escalation.queue import EscalationQueue
 
 
-def _record(sink, *, task_id='42', evidence_commit='abc', gate_source='test'):
+def _record(
+    sink, *, task_id='42', evidence_commit='abc', gate_source='test',
+    reopen_at='2026-07-15T00:00:00+00:00',
+):
     return sink.record(
         task_id=task_id,
         evidence_commit=evidence_commit,
         evidence_committed_at='2026-07-10T00:00:00+00:00',
-        reopen_at='2026-07-15T00:00:00+00:00',
+        reopen_at=reopen_at,
         agent_id='claude-recon-x',
         gate_source=gate_source,
     )
@@ -425,6 +428,110 @@ class TestArbitrationPendingReopenAtArm:
 
         assert sink.arbitration_pending(unfiltered, reopen_at=self._R1) is False
         assert sink.arbitration_pending(unfiltered) is False
+
+
+class TestArbitrationHoldSurvivesADedupeFold:
+    """A fold at a moved ``reopen_at`` must leave the durable record binding
+    the new value, so a cold sink holds exactly where the warm memo does.
+    """
+
+    _R1 = '2026-07-15T00:00:00+00:00'
+    _R2 = '2026-07-20T00:00:00+00:00'
+    _R3 = '2026-07-25T00:00:00+00:00'
+    _R4 = '2026-07-30T00:00:00+00:00'
+
+    def _sink(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        return ProvenanceConflictSink(escalation_queue=queue), queue
+
+    def _folded_at_r2(self, tmp_path):
+        sink, queue = self._sink(tmp_path)
+        _record(sink, reopen_at=self._R1)
+        _record(sink, reopen_at=self._R2)
+        return sink, queue, queue.get_by_task('42', status='pending')
+
+    def test_fold_after_a_second_reopen_holds_on_a_cold_sink(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink, queue, rows = self._folded_at_r2(tmp_path)
+
+        assert len(rows) == 1, rows
+        assert rows[0].dedupe_count == 1
+        assert sink.should_skip('42', reopen_at=self._R2) is True
+        assert sink.arbitration_pending(rows, reopen_at=self._R2) is True
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        assert cold.arbitration_pending(rows, reopen_at=self._R2) is True
+
+    def test_fold_after_a_second_reopen_still_releases_on_a_third_reopen(
+        self, tmp_path,
+    ):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink, queue, rows = self._folded_at_r2(tmp_path)
+
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        assert cold.arbitration_pending(rows, reopen_at=self._R3) is False
+        assert sink.should_skip('42', reopen_at=self._R3) is False
+
+    def test_only_a_moved_reopen_at_refreshes_the_record(self, tmp_path):
+        sink, queue = self._sink(tmp_path)
+
+        for _ in range(3):
+            _record(sink, reopen_at=self._R1)
+        rows = queue.get_by_task('42', status='pending')
+        assert rows[0].amendments == []
+
+        _record(sink, reopen_at=self._R2)
+        _record(sink, reopen_at=self._R2, gate_source='other')
+
+        rows = queue.get_by_task('42', status='pending')
+        assert len(rows[0].amendments) == 1, rows[0].amendments
+
+    def test_every_recorded_reopen_at_binds_across_several_refreshes(
+        self, tmp_path,
+    ):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink, queue = self._sink(tmp_path)
+        for reopen_at in (self._R1, self._R2, self._R3, self._R3):
+            _record(sink, reopen_at=reopen_at)
+        rows = queue.get_by_task('42', status='pending')
+
+        assert len(rows) == 1, rows
+        assert len(rows[0].amendments) == 2, rows[0].amendments
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        for recorded in (self._R1, self._R2, self._R3):
+            assert cold.arbitration_pending(rows, reopen_at=recorded) is True, recorded
+        assert cold.arbitration_pending(rows, reopen_at=self._R4) is False
+
+    def test_unparseable_refresh_holds(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        _sink, queue, rows = self._folded_at_r2(tmp_path)
+
+        rows[0].amendments[-1]['detail'] = 'not json'
+
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        assert cold.arbitration_pending(rows, reopen_at=self._R3) is True
+
+    def test_foreign_amendment_is_not_a_refresh(self, tmp_path):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink, queue = self._sink(tmp_path)
+        escalation_id = _record(sink, reopen_at=self._R1)
+        assert escalation_id is not None
+        amended = queue.amend(
+            escalation_id, summary='operator note', detail='looking at it',
+            agent_role='interactive',
+        )
+        assert amended['recorded'] is True, amended
+        rows = queue.get_by_task('42', status='pending')
+
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        assert cold.arbitration_pending(rows, reopen_at=self._R2) is False
+        assert cold.arbitration_pending(rows, reopen_at=self._R1) is True
 
 
 class TestArbitrationHoldLogStreak:

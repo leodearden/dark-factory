@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +21,9 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
+from shared.secret_env import agent_subprocess_env
+from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -441,7 +444,10 @@ class AgentResult:
     Fields:
     - ``success``: whether the agent completed without error
     - ``output``: the primary text response from the agent
-    - ``cost_usd``: total cost in USD (0.0 if not reported by the provider)
+    - ``cost_usd``: what THIS CLI process cost in USD (0.0 if not reported by
+      the provider).  For a resumed Claude session it is derived by
+      ``shared.process_cost.derive_process_cost`` and is never the session's
+      running total; ``cost_basis`` says how it was obtained
     - ``duration_ms``: wall-clock time in milliseconds
     - ``turns``: number of agentic turns (0 if not tracked)
     - ``session_id``: provider session identifier for resumption
@@ -474,11 +480,12 @@ class AgentResult:
       flaky candidate.  ``success`` stays False (NOT salvaged); callers should
       raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      backgrounded Bash command was still pending — launched via
-      ``run_in_background`` and never subsequently REAPED, where a reap is a
-      ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill OR a tool_use of
-      any kind whose input references the launch's id / output-file path as
-      recorded in its tool_result (task 3639; see
+      background task it started was still pending — a ``run_in_background``
+      Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
+      is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
+      of any kind whose input references the launch's id / output-file path as
+      recorded in its tool_result (task 3639), OR a delivered task-notification
+      naming the launch (task 5986; see
       ``detect_ended_awaiting_background`` for the full contract).  The headless
       one-shot ``claude --print`` session exits subtype=success and silently
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
@@ -496,20 +503,21 @@ class AgentResult:
       ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
       ``_capture_zero_output_evidence`` helper (task 1739).
     - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
-      and had to fall back to a fresh session because the resume itself failed
-      (task 3578).  Stamped by ``invoke_with_cap_retry`` at its single return
-      point from a loop-local counter — the retry loop rebinds ``result`` on
-      every pass, so a count stamped onto a discarded attempt would be lost by
-      construction.  ``shared`` has no event store, so this field is the
-      carrier the orchestrator reads to emit ``session_resume_failed``
-      (``stage='cli'``) for a resume the CLI rejected: previously that loss was
-      invisible in runs.db, because the loop retried fresh and returned a
-      SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
-      succeeded leaves it 0.
+      and fell back to a fresh session because the CLI REJECTED the resume
+      before any model turn (``is_resume_rejected``; tasks 3578, 5579).
+      Stamped by ``invoke_with_cap_retry`` at its single return point from a
+      loop-local counter — the retry loop rebinds ``result`` on every pass, so
+      a count stamped onto a discarded attempt would be lost by construction.
+      ``shared`` has no event store, so this field is the carrier the
+      orchestrator reads to emit ``session_resume_failed`` (``stage='cli'``)
+      for a resume the CLI rejected.  Counts fallbacks TAKEN, not resumes
+      armed — a resume that survived leaves it 0, and so does a resumed run
+      that did work and then ended non-success: that run is returned, not
+      retried.
 
-      READ THE PREDICATE EXACTLY: it counts every resumed attempt this loop
-      made that then failed non-cap, which includes a resume **the loop itself
-      re-armed** after a cap hit (the cap branch sets
+      READ THE PREDICATE EXACTLY: it counts every rejected resume this loop
+      made, which includes a resume **the loop itself re-armed** after a cap
+      hit (the cap branch sets
       ``invoke_kwargs['resume_session_id'] = result.session_id``).  A caller
       that never passed ``resume_session_id`` can therefore still come back
       with a non-zero count, so a consumer asking "did the resume *I* adopted
@@ -566,6 +574,16 @@ class AgentResult:
     distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
     callers record as ``model`` — that alias names the routing choice, this
     names the version that answered."""
+    cost_basis: ProcessCostBasis = ProcessCostBasis.REPORTED
+    """How ``cost_usd`` was obtained: the CLI's own figure, the delta over the
+    resumed session's prior total, or the priced usage block."""
+    reported_total_cost_usd: float | None = None
+    """The CLI's ``total_cost_usd`` verbatim, None when absent or malformed.  A
+    caller passes it back as ``resume_prior_total_cost_usd`` when it next
+    resumes this ``session_id``."""
+    cost_delta_clamped: bool = False
+    """True when a prior total was supplied for this resume and the delta over
+    it was rejected as implausible, so ``cost_usd`` fell back."""
 
 
 # The ``AgentResult.subtype`` the Claude CLI stamps when its own
@@ -790,11 +808,13 @@ def note_unreadable_transcript(
 #
 # AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
 # tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
-# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
-# whose input references the background task's id or output-file path.  That
+# on this set OR on either of two other clauses: a tool_use of ANY kind whose
+# input references the background task's id or output-file path (task 3639),
+# or a delivered task-notification naming it (task 5986).  The tool_use
 # clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
-# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
-# why correcting those prompts needed no change to this detector.  If the first
+# role wait-guidance now prescribes
+# (orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE)
+# — which is why correcting those prompts needed no change to this detector.  If the first
 # clause were the whole mechanism, only ``TaskStop`` would still fire it.
 #
 # That is an executable claim, not a comment's promise: the exact prescribed
@@ -900,7 +920,7 @@ def _is_non_empty_str(value: object) -> TypeGuard[str]:
 def _content_blocks(record: object) -> list:
     """Return *record*'s content blocks (via ``_record_field``), or an empty
     list when it carries none.  Shared by ``_iter_result_texts`` and
-    ``detect_ended_awaiting_background``."""
+    ``detect_ended_awaiting_background``'s event walk."""
     return _record_field(record, 'content', _is_list) or []
 
 
@@ -924,36 +944,33 @@ def _iter_result_texts(record: dict):
                     yield sub['text']
 
 
-def _iter_input_strings(value: object):
+def _iter_input_strings(value: object) -> Iterator[str]:
     """Yield every ``str`` reachable inside a tool_use ``input`` *value*.
 
-    Walks dict values (and str keys) and list/tuple items depth-first; scalars
-    that are not ``str`` (``int``/``float``/``bool``/``None``) yield nothing,
-    and any other object yields its ``str()`` — preserving what
-    ``json.dumps(..., default=str)`` used to expose for an exotic leaf such as
-    a ``Path``.
+    Walks dict values (and str keys) and list/tuple items; scalars that are
+    not ``str`` (``int``/``float``/``bool``/``None``) yield nothing, and any
+    other object yields its ``str()`` — what ``json.dumps(..., default=str)``
+    would expose for an exotic leaf such as a ``Path``.
 
-    Replaces serializing the whole input (reviewer_comprehensive amendment,
-    task 3639): once ``bg_tokens`` is non-empty, EVERY subsequent tool_use was
-    fully ``json.dumps``-ed, allocating a complete string copy of every
-    ``Write`` body / ``Edit`` old+new pair / ``TodoWrite`` list in the
-    transcript on each invocation-end.  Yielding the already-materialized
-    strings lets ``any()`` short-circuit on the first hit and allocates
-    nothing for the common case.
+    The walk keeps its own stack, so an input nested past the interpreter's
+    recursion limit (``json.loads`` decodes one) is walked whole and never
+    raises.  Yielding the already-materialized strings lets ``any()``
+    short-circuit on the first hit without copying a ``Write`` body or an
+    ``Edit`` pair the way serializing the whole input would.
     """
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str):
-                yield key
-            yield from _iter_input_strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_input_strings(item)
-    elif value is not None and not isinstance(value, (int, float)):
-        # bool is an int subclass, so it is covered by the isinstance above.
-        yield str(value)
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            pending.extend(key for key in item if isinstance(key, str))
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif item is not None and not isinstance(item, (int, float)):
+            # bool is an int subclass, so it is covered by the isinstance above.
+            yield str(item)
 
 
 def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
@@ -987,34 +1004,195 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
                 tokens.add(match)
 
 
+_MONITOR_TOOL = 'Monitor'
+_TASK_NOTIFICATION = 'task-notification'
+
+
+class _BackgroundEvent(enum.Enum):
+    LAUNCH = 'launch'
+    REAP = 'reap'
+
+
+def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
+    """Return True when any of *texts* contains any of *tokens* — the single
+    definition of "references a background task"."""
+    return any(token in text for text in texts for token in tokens)
+
+
+def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None:
+    """Return the armed task's id when *record* confirms a Monitor arm, else None.
+
+    A confirmation answers one of *monitor_call_ids* with a tool_result and
+    carries a structured ``toolUseResult.taskId`` that is a usable token (see
+    ``_MIN_BG_TOKEN_LEN``).  A rejected call carries no such field.  Never
+    raises.
+    """
+    tur = record.get('toolUseResult')
+    if not isinstance(tur, dict):
+        return None
+    task_id = tur.get('taskId')
+    if not isinstance(task_id, str) or len(task_id) < _MIN_BG_TOKEN_LEN:
+        return None
+    for block in _content_blocks(record):
+        if not isinstance(block, dict) or block.get('type') != 'tool_result':
+            continue
+        call_id = block.get('tool_use_id')
+        if isinstance(call_id, str) and call_id in monitor_call_ids:
+            return task_id
+    return None
+
+
+def _delivered_notification_texts(record: dict) -> list[str] | None:
+    """Return the texts of the task-notification *record* DELIVERED to the
+    model, or None when *record* is not such a delivery.
+
+    A delivery is a mid-turn ``attachment`` record (``queued_command`` with
+    ``commandMode`` ``task-notification``, text in ``prompt``) or a ``user``
+    record whose ``origin.kind`` is ``task-notification`` (text in its content,
+    a ``str`` or ``text`` sub-blocks).  ``queue-operation`` records are queue
+    bookkeeping, not delivery.  Never raises.
+    """
+    record_type = record.get('type')
+    if record_type == 'attachment':
+        attachment = record.get('attachment')
+        if not (
+            isinstance(attachment, dict)
+            and attachment.get('type') == 'queued_command'
+            and attachment.get('commandMode') == _TASK_NOTIFICATION
+        ):
+            return None
+        prompt = attachment.get('prompt')
+        return [prompt] if isinstance(prompt, str) else []
+    if record_type == 'user':
+        origin = record.get('origin')
+        if not (isinstance(origin, dict) and origin.get('kind') == _TASK_NOTIFICATION):
+            return None
+        text = _record_field(record, 'content', _is_non_empty_str)
+        if text is not None:
+            return [text]
+        return [
+            sub['text']
+            for sub in _content_blocks(record)
+            if isinstance(sub, dict) and isinstance(sub.get('text'), str)
+        ]
+    return None
+
+
+def _monitor_call_id(block: dict) -> str | None:
+    """Return the id of a ``Monitor`` tool_use *block*, else None."""
+    call_id = block.get('id')
+    if block.get('name') == _MONITOR_TOOL and isinstance(call_id, str):
+        return call_id
+    return None
+
+
+def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
+    """Classify one tool_use *block* as a launch, a reap, or neither.
+
+    Branch order is load-bearing: launch → ``Monitor`` call → named reap tool →
+    token reference.  A ``run_in_background`` Bash that mentions an earlier
+    token is a LAUNCH, and a ``Monitor`` call is neither: only its confirmed
+    arm (``_monitor_arm_task_id``) is a launch, so a Monitor naming a pending
+    launch's token does not reap it.
+    """
+    name = block.get('name')
+    if not isinstance(name, str):
+        name = ''  # a malformed name matches no tool and must not raise on lookup
+    if name == 'Bash':
+        inp = block.get('input')
+        if isinstance(inp, dict) and inp.get('run_in_background'):
+            return _BackgroundEvent.LAUNCH
+    elif name == _MONITOR_TOOL:
+        return None
+    elif name in _BACKGROUND_REAP_TOOLS or (
+        _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
+    ):
+        return _BackgroundEvent.REAP
+    if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
+        return _BackgroundEvent.REAP
+    return None
+
+
+def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
+    """Yield the background LAUNCH and REAP events of *records*, in record order.
+
+    Owns the identity tokens of the launches seen so far and the ids of the
+    Monitor calls awaiting confirmation.
+    """
+    tokens: set[str] = set()
+    monitor_call_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        texts = _delivered_notification_texts(record)
+        if texts is not None:
+            if tokens and _mentions_token(texts, tokens):
+                yield _BackgroundEvent.REAP
+            continue
+        if record.get('type') == 'user':
+            _collect_bg_tokens(record, tokens)
+            task_id = _monitor_arm_task_id(record, monitor_call_ids)
+            if task_id is not None:
+                tokens.add(task_id)
+                yield _BackgroundEvent.LAUNCH
+            continue
+        if record.get('type') != 'assistant':
+            continue
+        for block in _content_blocks(record):
+            if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                continue
+            call_id = _monitor_call_id(block)
+            if call_id is not None:
+                monitor_call_ids.add(call_id)
+            event = _classify_tool_use(block, tokens)
+            if event is not None:
+                yield event
+
+
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
-    """Return True when the transcript's final background action was an unreaped
-    launch — i.e. the agent ended its turn while a backgrounded Bash command was
-    still pending, silently abandoning the work (the Reify-5164 RCA).
+    """Return True when the transcript's final background event was an unreaped
+    launch — i.e. the agent ended its turn while a background task it started (a
+    ``run_in_background`` Bash or a confirmed Monitor arm) was still pending,
+    silently abandoning the work (the Reify-5164 RCA).
 
     Contract (high-precision, no fragile parsing).  Over the ordered transcript
     *records*:
 
-    - a **launch** = a ``Bash`` tool_use whose ``input.run_in_background`` is
-      truthy;
-    - a **reap** = either of:
+    - a **launch** = either of:
+
+      * a ``Bash`` tool_use whose ``input.run_in_background`` is truthy;
+      * a CONFIRMED ``Monitor`` arm, positioned at its confirming ``user``
+        record: a tool_result answering an earlier ``Monitor`` call, carrying a
+        structured ``toolUseResult.taskId`` of at least ``_MIN_BG_TOKEN_LEN``
+        characters.  A rejected call, or a call with no confirmed arm, is not a
+        launch, and the ``Monitor`` call itself is neither a launch nor a reap;
+
+    - a **reap** = any of:
 
       * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use, or their
         Task-tool analogues ``TaskOutput`` (collects a backgrounded
         Task/subagent's result) and ``TaskStop`` (terminates it);
-      * a tool_use of ANY kind whose input references the background task's id
-        or output-file path, as recorded in the launch's tool_result
+      * a tool_use of ANY kind whose input references a launch's identity: a
+        Bash task's id or output-file path, as recorded in its tool_result
         (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
-        written to: <path>`` sentence);
+        written to: <path>`` sentence), or an armed Monitor's task id;
+      * a task-notification DELIVERED to the model whose text contains a
+        launch's identity token — a Monitor event or expiry, or a Bash
+        completion.  Delivery is either a mid-turn ``attachment`` record
+        (``queued_command`` with ``commandMode`` ``task-notification``) or a
+        ``user`` record whose ``origin.kind`` is ``task-notification`` (the CLI
+        outlived the turn and delivered it as a new one).  Queue bookkeeping
+        (``queue-operation`` records) is not delivery: an event enqueued by a
+        process that then exited never reached the agent;
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
         finished its job and cannot still be waiting on anything.
 
-    Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
-    final background-management action was a launch never followed by a
-    poll/kill.  Any engagement with a background task (a poll or kill after it)
-    clears the verdict, keeping precision high and avoiding fragile shell-id /
+    Fire (True) iff the final background event is a launch — the session's
+    final background event was a launch never followed by a reap.  Any
+    engagement with a background task (a reap of any kind after it) clears the
+    verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
@@ -1022,7 +1200,7 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     reading the bg-log directly — ``Bash tail/cat/grep <log>``, or ``Read`` /
     ``Grep`` on that path, which the CLI's own launch message recommends ("To
     check interim output, use Read on that file path") and which
-    ``agents/roles.py``'s wait-guidance explicitly sanctions — counted as no
+    ``agents/harness_guidance.py``'s wait-guidance explicitly sanctions — counted as no
     engagement at all.  On the ``_lane-31`` specimen (four backgrounded
     ``cargo test`` runs, each tailed, zero ``BashOutput``) the detector fired
     and falsified ``success`` on a completed run; the measured false-positive
@@ -1052,66 +1230,22 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     still-running task once with ``BashOutput`` and THEN ends its turn anyway
     reaps after the launch → False.  Erring toward NOT downgrading a possibly
     complete run is the safe direction for a success→failure flip.
+
+    Its Monitor analogue (accepted on the same grounds): a streaming Monitor
+    that delivered a mid-stream event, after which the session ended awaiting
+    a later one, is reaped by that delivery → False.  Telling a terminal event
+    from a mid-stream one would need parsing of the notification text.
+
+    Reaps are positional, not per launch (accepted on the same grounds): an
+    earlier launch's delivered completion that lands after a later launch
+    clears the verdict while that later launch is still pending → False.
     """
     if not records:
         return False
-    last_launch_idx = -1
-    last_reap_idx = -1
-    pos = 0  # strictly-increasing position over tool_use blocks (record- then block-order)
-    bg_tokens: set[str] = set()  # identity tokens of the launches seen so far
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        if record.get('type') == 'user':
-            # A launch's tool_result arrives on a ``user`` record; harvest its
-            # identity tokens so later foreground references can be matched.
-            _collect_bg_tokens(record, bg_tokens)
-            continue
-        if record.get('type') != 'assistant':
-            continue
-        for block in _content_blocks(record):
-            if not isinstance(block, dict) or block.get('type') != 'tool_use':
-                continue
-            pos += 1
-            # Normalize the name to ``str`` ONCE, up front, so every membership
-            # test below is on a hashable.  A block carrying a non-scalar name
-            # (``'name': ['weird']``) previously reached ``name in
-            # _BACKGROUND_REAP_TOOLS`` and raised ``TypeError: unhashable
-            # type`` — breaking this function's "malformed blocks are skipped,
-            # never raise" contract at an unguarded call site inside
-            # ``_run_subprocess``, i.e. failing the whole agent invocation
-            # (reviewer_comprehensive amendment, task 3639).  ``''`` matches no
-            # tool name, so such a block falls through to the token check —
-            # exactly its pre-normalization classification for the non-raising
-            # shapes.
-            name = block.get('name')
-            if not isinstance(name, str):
-                name = ''
-            if name == 'Bash':
-                inp = block.get('input')
-                if isinstance(inp, dict) and inp.get('run_in_background'):
-                    last_launch_idx = pos
-                    continue
-            elif name in _BACKGROUND_REAP_TOOLS or (
-                _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
-            ):
-                last_reap_idx = pos
-                continue
-            # Branch order is load-bearing: launch → named reap tool →
-            # token reference.  A ``run_in_background`` Bash that happens to
-            # mention an earlier token is still classified as a LAUNCH.
-            if bg_tokens:
-                try:
-                    matched = any(
-                        token in text
-                        for text in _iter_input_strings(block.get('input'))
-                        for token in bg_tokens
-                    )
-                except Exception:  # pragma: no cover - the walk is total
-                    matched = False
-                if matched:
-                    last_reap_idx = pos
-    return last_launch_idx != -1 and last_launch_idx > last_reap_idx
+    final_event: _BackgroundEvent | None = None
+    for event in _background_events(records):
+        final_event = event
+    return final_event is _BackgroundEvent.LAUNCH
 
 
 # The CLI writes this in place of a model name on records it synthesised
@@ -1290,7 +1424,8 @@ def ended_awaiting_background_for_session(
     session_id: str,
 ) -> bool:
     """Return True when *session_id*'s on-disk transcript ended its turn with a
-    still-pending backgrounded Bash command.
+    still-pending background task (a run_in_background Bash or a confirmed
+    Monitor arm).
 
     Mirrors ``count_transcript_turns``' shape: delegate to
     ``read_transcript_records``; if it returns None (transcript not located or a
@@ -1478,6 +1613,14 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
+def _stderr_carries_any(stderr: str, markers: Sequence[str]) -> bool:
+    """Case-insensitive scan of *stderr* for any of the lower-case *markers*."""
+    if not stderr:
+        return False
+    stderr_lower = stderr.lower()
+    return any(marker in stderr_lower for marker in markers)
+
+
 def _stderr_has_cli_input_required(stderr: str) -> bool:
     """Case-insensitive scan of *stderr* for the CLI's input-required error.
 
@@ -1486,26 +1629,23 @@ def _stderr_has_cli_input_required(stderr: str) -> bool:
     ``_parse_claude_output`` (which only has a ``_SubprocessResult``), so the
     subtype and the predicate can never disagree about what the marker is.
     """
-    if not stderr:
-        return False
     # Lazy (function-local) import — see the identical note in
     # classify_agent_failure: invocation_outcome imports cli_invoke at module
     # top, so a module-top import here would create a circular import.
     from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
 
-    stderr_lower = stderr.lower()
-    return any(marker in stderr_lower for marker in CLI_INPUT_REQUIRED_MARKERS)
+    return _stderr_carries_any(stderr, CLI_INPUT_REQUIRED_MARKERS)
 
 
-def _cli_input_rejection_cause(stderr: str) -> str:
+def _stderr_cause_line(stderr: str, markers: Sequence[str]) -> str:
     """Extract the operator-facing CAUSE line for a pre-turn CLI rejection.
 
     The CLI's own stderr is the ONLY evidence of what actually happened, so
     this returns REAL OBSERVED TEXT or an explicit absence marker — never an
     invented explanation.  Preference order:
 
-    1. the first stderr line carrying one of ``CLI_INPUT_REQUIRED_MARKERS``
-       (the CLI's verbatim argument-validation error);
+    1. the first stderr line carrying one of the lower-case *markers* (the
+       CLI's verbatim error);
     2. the LAST non-empty stderr line (defensive: a caller stamped the subtype
        by hand, or the CLI's wording drifted off the marker table — either way
        the tail is the closest thing to a real cause we observed);
@@ -1514,18 +1654,44 @@ def _cli_input_rejection_cause(stderr: str) -> str:
        a plausible-sounding cause here would be exactly the laundering this
        task exists to remove.
     """
-    # Lazy (function-local) import — see _stderr_has_cli_input_required.
-    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
-
     lines = [line.strip() for line in (stderr or '').splitlines()]
     non_empty = [line for line in lines if line]
     for line in non_empty:
-        line_lower = line.lower()
-        if any(marker in line_lower for marker in CLI_INPUT_REQUIRED_MARKERS):
+        if _stderr_carries_any(line, markers):
             return line
     if non_empty:
         return non_empty[-1]
     return '<no stderr captured>'
+
+
+def _cli_input_rejection_cause(stderr: str) -> str:
+    """The cause line of an input-required rejection (``CLI_INPUT_REQUIRED_MARKERS``)."""
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    return _stderr_cause_line(stderr, CLI_INPUT_REQUIRED_MARKERS)
+
+
+def _resume_rejection_cause(stderr: str) -> str:
+    """The cause line of a rejected ``--resume`` (``RESUME_REJECTED_MARKERS``)."""
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import RESUME_REJECTED_MARKERS
+
+    return _stderr_cause_line(stderr, RESUME_REJECTED_MARKERS)
+
+
+def _is_pre_turn_failure(result: AgentResult) -> bool:
+    """A failed, un-killed run that took no model turn and billed nothing.
+
+    The shared precondition of every pre-turn rejection predicate; each adds
+    only the stderr evidence naming WHICH rejection it was.
+    """
+    return (
+        not result.success
+        and not result.timed_out
+        and result.turns == 0
+        and result.cost_usd == 0.0
+    )
 
 
 def is_cli_invocation_rejected(result: AgentResult) -> bool:
@@ -1590,14 +1756,33 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     with a cost, so on contradictory evidence it declines; stricter on the
     acting side is the safe direction.
     """
-    if result.success or result.timed_out:
-        return False
-    if result.turns != 0 or result.cost_usd != 0.0:
+    if not _is_pre_turn_failure(result):
         return False
     return (
         result.subtype == 'error_cli_input_rejected'
         or _stderr_has_cli_input_required(result.stderr)
     )
+
+
+def is_resume_rejected(result: AgentResult) -> bool:
+    """Return True when the CLI rejected an armed ``--resume`` before any model turn.
+
+    The signature is the CLI's own "no conversation found" statement on
+    stderr (``RESUME_REJECTED_MARKERS``; the measured payload is
+    ``shared/src/shared/testing_resume_rejection.py::measured_resume_rejection``)
+    on a run that was not a success, did not time out, and took no turn and
+    billed nothing.  Any evidence of work vetoes the marker: this gates
+    discarding the session, so on contradictory evidence it declines, as
+    ``is_cli_invocation_rejected`` does.
+    ``transcript_turns`` is deliberately not consulted: on a resume it counts
+    the PRIOR turns of the transcript being resumed, not this process's work.
+    """
+    if not _is_pre_turn_failure(result):
+        return False
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import RESUME_REJECTED_MARKERS
+
+    return _stderr_carries_any(result.stderr, RESUME_REJECTED_MARKERS)
 
 
 def require_non_blank_prompt(
@@ -1755,7 +1940,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
        (mirrors ``result.success``) → ``SUCCESS``.
     2. ``result.ended_awaiting_background`` → ``ENDED_AWAITING_BACKGROUND``
-       (the run ended its turn while a backgrounded Bash command was still
+       (the run ended its turn while a background task it started was still
        pending; ``_parse_claude_output`` already downgraded ``success`` to
        False, so this sits immediately below the OK check — it can never
        shadow a genuine success — and above the timeout rule, which it cannot
@@ -2122,13 +2307,15 @@ def _backend_window_wait_secs(resets_at: datetime | None, hits: int, now: dateti
 def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:
     """Switch the retry loop to a fresh (non-resume) invocation.
 
-    Drops the resume session, restores the real task prompt, and regenerates a
-    pre-allocated session_id *when one was set* — the prior failed attempt may have
-    already committed that UUID to disk, and reusing it on a fresh `--session-id`
-    makes the CLI exit instantly with 'Session ID … is already in use'
-    (the 2026-05-26 reify-3604 wedge). Callers that pass no session_id keep none.
+    Drops the resume session and its prior total, restores the real task
+    prompt, and regenerates a pre-allocated session_id *when one was set* — the
+    prior failed attempt may have already committed that UUID to disk, and
+    reusing it on a fresh `--session-id` makes the CLI exit instantly with
+    'Session ID … is already in use' (the 2026-05-26 reify-3604 wedge).
+    Callers that pass no session_id keep none.
     """
     invoke_kwargs.pop('resume_session_id', None)
+    invoke_kwargs.pop('resume_prior_total_cost_usd', None)
     invoke_kwargs['prompt'] = original_prompt
     if invoke_kwargs.get('session_id'):
         invoke_kwargs['session_id'] = str(uuid.uuid4())
@@ -2175,7 +2362,8 @@ class _SubprocessResult:
     transcript_turns: int | None = None
     ended_awaiting_background: bool = False
     """True when the normal-exit transcript ended its turn with a still-pending
-    backgrounded Bash command; carried into AgentResult and used by
+    background task (a run_in_background Bash or a confirmed Monitor arm);
+    carried into AgentResult and used by
     _parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
     model_id: str | None = None
@@ -2212,6 +2400,7 @@ async def invoke_claude_agent(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2245,6 +2434,11 @@ async def invoke_claude_agent(
     role charter.  A resumed session therefore gets the CURRENT role prompt —
     see ``build_claude_argv`` for the full rationale and the probed CLI
     behaviour.
+
+    *resume_prior_total_cost_usd* is the ``reported_total_cost_usd`` of the
+    result being resumed, so the resumed process is charged only its own
+    spend (see ``shared.process_cost``).  Ignored unless *resume_session_id*
+    is set.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -2308,6 +2502,7 @@ async def invoke_claude_agent(
         strict_mcp_config=strict_mcp_config,
         available_tools=available_tools,
         setting_sources=setting_sources,
+        resume_prior_total_cost_usd=resume_prior_total_cost_usd,
     )
 
 
@@ -2354,8 +2549,10 @@ async def invoke_with_cap_retry(
     retry resumes that session via ``--resume`` instead of starting fresh,
     unless the caller passes ``resume_on_cap_hit=False``.
     This preserves all agent progress (tool calls, reasoning) across
-    account switches.  If resume itself fails (non-cap-hit error), falls
-    back to a fresh invocation with the original (or rebuilt) prompt.
+    account switches.  Only a resume the CLI rejected before any model turn
+    (``is_resume_rejected``) falls back to a fresh invocation with the
+    original (or rebuilt) prompt; any other resumed non-success is returned
+    like a fresh invocation's result (task 5579).
 
     Resume eligibility is a TWO-PART rule, and both parts require a
     *config_dir* (without one there is no correct place to glob for the
@@ -2478,8 +2675,8 @@ async def invoke_with_cap_retry(
     # so that `original_prompt` captures it for fresh-fallback restoration.  We
     # immediately overwrite `invoke_kwargs['prompt']` with CRASH_RECOVERY_RESUME_PROMPT
     # so the first subprocess invocation uses the short continuation string.  The
-    # existing non-cap-hit resume-failure branch (below) then correctly restores
-    # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
+    # resume-rejection branch (below) then correctly restores `original_prompt`
+    # (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
     # this swap: its resumed session must receive the real prompt, not the short
     # crash-recovery continuation prompt.
@@ -2617,10 +2814,10 @@ async def invoke_with_cap_retry(
     #
     # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
     # this fast path will attempt the resume but cannot fall back to a fresh
-    # invocation on a general failure — the non-cap-hit resume→fresh-fallback
-    # branch in the while-loop below only runs when usage_gate is provided.  In
-    # practice the orchestrator always supplies a gate, but callers without one
-    # should be aware that a failed resume returns the failure result directly.
+    # invocation on a rejected resume — the resume-rejection branch in the
+    # while-loop below only runs when usage_gate is provided.  In practice the
+    # orchestrator always supplies a gate, but callers without one should be
+    # aware that a rejected resume returns the failure result directly.
     # A pre-turn REJECTION is the one exception, and it is not really an
     # exception to that rule: the CLI exited before contacting the API, so
     # there is no session to preserve and _reset_for_fresh_retry's switch to a
@@ -3071,6 +3268,16 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh (no resumable progress)'
                     else:
+                        prior = next_resume_prior(
+                            armed_session_id=invoke_kwargs.get('resume_session_id'),
+                            armed_prior_usd=invoke_kwargs.get('resume_prior_total_cost_usd'),
+                            result_session_id=result.session_id,
+                            result_reported_total_usd=result.reported_total_cost_usd,
+                        )
+                        if prior is None:
+                            invoke_kwargs.pop('resume_prior_total_cost_usd', None)
+                        else:
+                            invoke_kwargs['resume_prior_total_cost_usd'] = prior
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
                         # Distinguish a VERIFIED resume from an unverified one:
@@ -3122,18 +3329,19 @@ async def invoke_with_cap_retry(
                         # CliLocalError — a recognised local CLI/usage error (e.g.
                         # --session-id collision) exits zero-cost and instantly, but
                         # it is NOT a usage cap.  Counting it as a cap loops forever
-                        # (reify-3604).  Falls through: Branch C retries fresh when
-                        # resuming, else the failed result is returned for normal
-                        # verify/steward handling.
+                        # (reify-3604).  Falls through: on a resume, the
+                        # resume-rejection branch (is_resume_rejected) retries
+                        # fresh only when RESUME_REJECTED_MARKERS proves the CLI
+                        # refused the session; any other CliLocalError is returned
+                        # for normal verify/steward handling.
                         #
                         # ServerError — a fast 5xx (e.g. 529 Overloaded) has exactly
                         # the same zero-cost / <=1-turn / sub-5s shape, so without
                         # this escape the net marks a perfectly HEALTHY account
                         # CAPPED and fails over pointlessly (2026-07-29 incident).
-                        # This escape is what prevents that.  It does NOT fall
-                        # through to Branch C: the terminal ServerError branch
-                        # immediately below exits the loop first, so a 5xx never
-                        # reaches the resume-fresh fallback.
+                        # This escape is what prevents that.  It does NOT reach
+                        # the resume-rejection branch: the terminal ServerError
+                        # branch immediately below exits the loop first.
                         if isinstance(outcome, ServerError):
                             logger.warning(
                                 f'{label}: zero-cost instant exit is a server-side API '
@@ -3217,9 +3425,12 @@ async def invoke_with_cap_retry(
                 #   escape live as defence-in-depth (it, not this break, is
                 #   what stops a fast 529 from marking a healthy account
                 #   CAPPED).
-                # - BEFORE the "resume failed → retry fresh" fallback below,
-                #   which would otherwise restart the invocation on a new slot
-                #   — an implicit failover the PRD forbids.
+                # - BEFORE the resume-rejection branch below
+                #   (is_resume_rejected), so a 5xx on a resume can never be
+                #   restarted on a new slot — an implicit failover the PRD
+                #   forbids.  That branch also declines any result without the
+                #   rejection marker (task 5579), so this ordering is defence
+                #   in depth.
                 #
                 # Note: because ServerError now outranks ZeroOutputWedge, the
                 # wedge resume-guard above no longer fires for a timed-out 5xx.
@@ -3248,16 +3459,17 @@ async def invoke_with_cap_retry(
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
                 # RESUMED invocation that hit the working-regime ceiling but
-                # made real agentic progress (transcript_turns > 0) must be
-                # returned to the caller, not silently discarded into the
-                # generic non-cap-hit resume-failure branch below — that
-                # branch restarts from the ORIGINAL prompt, throwing away the
-                # transcript and all agent progress. The workflow gamma
-                # branch (is_timed_out_with_progress) owns re-resuming this
-                # session with its own continuation prompt. Mutually
-                # exclusive with the ZeroOutputWedge guard above
-                # (transcript_turns 0 vs >0), so zero-output wedges are
-                # unaffected and still take the existing fresh-fallback path.
+                # made real agentic progress (transcript_turns > 0) is
+                # returned to the caller: the workflow gamma branch
+                # (is_timed_out_with_progress) owns re-resuming this session
+                # with its own continuation prompt.  Since task 5579 the
+                # resume-rejection branch below (is_resume_rejected) declines
+                # every timed-out result too, so this guard is defence in
+                # depth plus a log line naming the γ hand-off, not the only
+                # thing stopping a discard.  Mutually exclusive with the
+                # ZeroOutputWedge guard above (transcript_turns 0 vs >0), so
+                # zero-output wedges are unaffected and still take that
+                # guard's fresh-fallback path.
                 if invoke_kwargs.get('resume_session_id') and is_timed_out_with_progress(result):
                     logger.warning(
                         f'{label}: resumed invocation timed out WITH progress '
@@ -3269,34 +3481,42 @@ async def invoke_with_cap_retry(
                     slot.confirm(result.cost_usd)
                     break
 
-                # Non-cap-hit failure while resuming → fall back to fresh invocation.
-                if not result.success and invoke_kwargs.get('resume_session_id'):
-                    # This branch — and ONLY this branch — is the population
-                    # task 3578 measured: 28 occurrences where a resume was
-                    # armed, the CLI rejected it, and the loop retried fresh
-                    # and returned a SUCCESS, leaving no runs.db event at all.
-                    # Deliberately NOT folded in with the cap-hit
-                    # 'fresh (transcript unreachable)' path above: that one is
-                    # already visible as a cap_hit event, and counting both
-                    # here would conflate two populations with different causes.
-                    #
-                    # NOTE the armed id here is not necessarily the CALLER's:
-                    # after a cap hit this loop re-arms a resume of its own
-                    # (result.session_id), and that re-armed resume can land in
-                    # this branch too.  Record WHICH session each fallback lost
-                    # so the consumer can name it instead of guessing from a
-                    # pre-allocated id the fresh retry has already replaced.
+                # The resume-rejection branch: the CLI refused the armed
+                # session before any model turn (is_resume_rejected), so
+                # there is nothing to keep and the loop retries fresh.  Any
+                # other resumed non-success did work and is returned below
+                # like a fresh invocation's result (task 5579): treating it
+                # as a rejection discarded completed runs.  Deliberately NOT
+                # folded in with the cap-hit 'fresh (transcript unreachable)'
+                # path above: that one is already visible as a cap_hit event.
+                #
+                # NOTE the armed id here is not necessarily the CALLER's:
+                # after a cap hit this loop re-arms a resume of its own
+                # (result.session_id), and that re-armed resume can land in
+                # this branch too.  Record WHICH session each fallback lost
+                # so the consumer can name it instead of guessing from a
+                # pre-allocated id the fresh retry has already replaced.
+                if invoke_kwargs.get('resume_session_id') and is_resume_rejected(result):
                     resume_fallbacks += 1
                     resume_fallback_session_ids.append(
                         str(invoke_kwargs['resume_session_id']),
                     )
                     logger.warning(
-                        f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
-                        f'retrying fresh',
+                        f'{label}: resume rejected by the CLI before any model turn '
+                        f'(session_id={invoke_kwargs["resume_session_id"]}) — retrying fresh. '
+                        f'Cause: {_resume_rejection_cause(result.stderr)}',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
+                if invoke_kwargs.get('resume_session_id') and not result.success:
+                    logger.warning(
+                        f'{label}: resumed session {invoke_kwargs["resume_session_id"]} ended '
+                        f'non-success without a resume rejection (turns={result.turns}, '
+                        f'cost_usd={result.cost_usd}, subtype={result.subtype!r}, '
+                        f'ended_awaiting_background={result.ended_awaiting_background}) '
+                        f'— returned to the caller; no fresh retry',
+                    )
                 slot.confirm(result.cost_usd)
                 break
 
@@ -3408,6 +3628,8 @@ def build_claude_argv(
     plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
     owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
+    Files a killed caller never unlinked are reclaimed by
+    ``shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
     already created during this call are unlinked before the exception
@@ -3477,7 +3699,7 @@ def build_claude_argv(
         # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
         # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
         # recon-verify is tool-list templated.
-        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        fd, sysprompt_path = SYSPROMPT_TEMP_NAME.mkstemp()
         temp_files.append(sysprompt_path)
         with open(fd, 'w') as f:
             f.write(system_prompt)
@@ -3516,7 +3738,7 @@ def build_claude_argv(
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
-            fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
+            fd, mcp_config_path = MCP_CONFIG_TEMP_NAME.mkstemp()
             temp_files.append(mcp_config_path)
             with open(fd, 'w') as f:
                 json.dump(mcp_config, f)
@@ -3627,6 +3849,7 @@ async def _invoke_claude(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3659,8 +3882,8 @@ async def _invoke_claude(
     # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
-    # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Which inherited variables the child may see: shared.secret_env.
+    env = agent_subprocess_env(os.environ)
     # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
     if env_overrides:
         env.update(env_overrides)
@@ -3720,7 +3943,11 @@ async def _invoke_claude(
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
         )
-        return _parse_claude_output(result)
+        return _parse_claude_output(
+            result,
+            resumed=bool(resume_session_id),
+            prior_total_cost_usd=resume_prior_total_cost_usd,
+        )
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
@@ -3728,11 +3955,48 @@ async def _invoke_claude(
             await bridge.stop()
 
 
-def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
+def _content_block_text(block: object) -> str | None:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict) and block.get('type') == 'text':
+        text = block.get('text')
+        return text if isinstance(text, str) else None
+    return None
+
+
+def _assistant_message_text(messages: object) -> str:
+    """Join the text blocks of a CLI result's assistant *messages* with newlines.
+
+    Skips any message, content or block that is not of the expected shape.
+    """
+    if not isinstance(messages, list):
+        return ''
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get('type') != 'assistant':
+            continue
+        content = msg.get('content')
+        if isinstance(content, list):
+            parts.extend(text for text in map(_content_block_text, content) if text is not None)
+    return '\n'.join(parts)
+
+
+def _parse_claude_output(
+    result: _SubprocessResult,
+    *,
+    resumed: bool = False,
+    prior_total_cost_usd: float | None = None,
+) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
     timed_out, transcript_turns and model_id are propagated directly from
     result on every return path.
+
+    *resumed* and *prior_total_cost_usd* must come from the argv the caller
+    actually spawned: a resumed process reports its session's running total,
+    and ``shared.process_cost.derive_process_cost`` turns that into this
+    process's cost.  Both call sites (``_invoke_claude`` and the orchestrator's
+    sandboxed sub-path) pass them.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3774,6 +4038,8 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
         return AgentResult(
             success=result.returncode == 0,
             output=result.stdout,
@@ -3786,33 +4052,35 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             model_id=result.model_id,
         )
 
-    cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
+    process_cost = derive_process_cost(
+        data,
+        resumed=resumed,
+        prior_total_usd=prior_total_cost_usd,
+        served_model_id=result.model_id,
+    )
     duration = data.get('duration_ms', 0)
     turns = data.get('num_turns', 0)
     session_id = data.get('session_id', '')
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
-    api_error_status = data.get('api_error_status')
+    raw_status = data.get('api_error_status')
+    api_error_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    )
     raw_stop_reason = data.get('stop_reason')
     stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 
-    usage = data.get('usage') or {}
+    raw_usage = data.get('usage')
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
     output_tokens = _to_token_count(usage.get('output_tokens'))
     cache_read_tokens = _to_token_count(usage.get('cache_read_input_tokens'))
     cache_create_tokens = _to_token_count(usage.get('cache_creation_input_tokens'))
 
-    output_text = data.get('result', '')
-    if not output_text and isinstance(data.get('messages'), list):
-        parts = []
-        for msg in data['messages']:
-            if msg.get('type') == 'assistant':
-                for block in msg.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        parts.append(block['text'])
-                    elif isinstance(block, str):
-                        parts.append(block)
-        output_text = '\n'.join(parts)
+    raw_result = data.get('result')
+    output_text = raw_result if isinstance(raw_result, str) else ''
+    if not output_text:
+        output_text = _assistant_message_text(data.get('messages'))
 
     # The CLI may report subtype='success' even when is_error is true (e.g.
     # usage cap hit).  Trust is_error as an authoritative override.
@@ -3820,8 +4088,8 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
     # Ended-awaiting-background downgrade (task 2761): the run exited
-    # subtype=success but its transcript tail launched a backgrounded Bash
-    # command that was never polled/killed — the headless one-shot session
+    # subtype=success but its transcript tail launched a background task that
+    # was never reaped — the headless one-shot session
     # abandoned still-pending work (Reify-5164 RCA).  Flip an otherwise-success
     # verdict to failure so existing non-success handling retries/resumes rather
     # than proceeding on a half-done tree.  Guarded on ``is_success`` so it is an
@@ -3857,7 +4125,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     return AgentResult(
         success=is_success,
         output=output_text,
-        cost_usd=cost,
+        cost_usd=process_cost.cost_usd,
         duration_ms=duration,
         turns=turns,
         session_id=session_id,
@@ -3877,6 +4145,21 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
         model_id=result.model_id,
+        cost_basis=process_cost.basis,
+        reported_total_cost_usd=process_cost.reported_total_usd,
+        cost_delta_clamped=process_cost.delta_clamped,
+    )
+
+
+def parse_claude_cli_output(*, stdout: str, stderr: str, returncode: int) -> AgentResult:
+    """Parse one finished, non-resumed ``claude --print --output-format json`` run.
+
+    The one reader of the CLI result for callers outside this module that ran
+    the CLI themselves (``shared.usage_gate.UsageGate._run_probe``). Never
+    raises, whatever *stdout* holds.
+    """
+    return _parse_claude_output(
+        _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=0)
     )
 
 
@@ -4583,8 +4866,9 @@ async def _run_subprocess(
     #     classification lost the turn-count signal (carried None); deriving it
     #     from the records we already parse here restores it at zero extra I/O.
     #   • ended_awaiting_background — a run that exited subtype=success but whose
-    #     transcript tail launched a still-pending backgrounded Bash command
-    #     silently abandoned the work.  Symmetric to the timeout path's
+    #     transcript tail launched a still-pending background task (a
+    #     run_in_background Bash or a confirmed Monitor arm) silently abandoned
+    #     the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
     #   • model_id — the exact CLI-served model id, which the caller's alias

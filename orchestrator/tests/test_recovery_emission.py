@@ -12,6 +12,12 @@ import json
 
 import pytest
 
+from orchestrator.recovery_emission import (
+    STREAK_CHARGING_SITES,
+    LeaveReason,
+    RecoverySite,
+)
+
 # ---------------------------------------------------------------------------
 # S3 — the pure payload primitives
 # ---------------------------------------------------------------------------
@@ -878,6 +884,7 @@ class _Pin:
     level: int
     severity: str = 'blocking'
     filing_claimant_run_id: str | None = None
+    members: tuple[str, ...] = ()
 
 
 class TestStreakAlarmIsPinClassAware:
@@ -1334,14 +1341,17 @@ def _ref(esc_id: str):
     )
 
 
-def _row(esc_id: str):
+def _row(
+    esc_id: str, *, level: int = 1, members: tuple[str, ...] = (), task_id: str = '3535',
+):
     """A real queue ``Escalation`` — the shape the scheduler / deterministic
     recon sites pass, since they hold raw queue rows rather than refs."""
     from escalation.models import Escalation
 
     return Escalation(
-        id=esc_id, task_id='3535', agent_role='implementer', severity='blocking',
-        category='risk_identified', summary='held', level=1,
+        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
+        category='risk_identified', summary='held', level=level,
+        members=list(members),
     )
 
 
@@ -1610,3 +1620,156 @@ class TestPinBuckets:
         pins = pin_buckets('3535', [_Pin('esc-1', 2)], store_unavailable=True)
 
         assert pins.human_parked is False
+
+    def test_a_hold_pinned_by_an_l2_and_its_member_l1_is_human_parked(self):
+        """Task 7709: the promoted hold, on the raw queue rows the scheduler and
+        the deterministic-recon streak-charging site pass.  Only the gate moves:
+        the held L1 still sits in the bucket the veto and its signature read."""
+        from orchestrator.recovery_emission import pin_buckets
+
+        rows = [_row('esc-1'), _row('esc-2', level=2, members=('esc-1',))]
+        pins = pin_buckets('3535', rows, store_unavailable=False)
+
+        assert pins.human_parked is True
+        assert sorted(pins.buckets['queue_handoff']) == ['esc-1', 'esc-2']
+
+    # -- task 7716: an L2 filed under ANOTHER task id holds this task's L1 --
+
+    def test_an_l1_an_l2_on_another_task_holds_is_human_parked(self):
+        """Only the filing gate moves: the outside L2 never enters this task's
+        buckets, so the payload and the veto signature stay byte-identical."""
+        from orchestrator.recovery_emission import LeaveReason, pin_buckets, veto_signature
+
+        outside = _row('esc-9-2', level=2, members=('esc-1',), task_id='9')
+        pins = pin_buckets(
+            '3535', [_row('esc-1')], store_unavailable=False, holder_candidates=[outside],
+        )
+        without = pin_buckets('3535', [_row('esc-1')], store_unavailable=False)
+
+        assert pins.human_parked is True
+        assert pins.buckets['queue_handoff'] == ['esc-1']
+        assert not [ids for ids in pins.buckets.values() if 'esc-9-2' in ids]
+        assert veto_signature(
+            LeaveReason.escalation_pinned, 's', pins.buckets,
+        ) == veto_signature(LeaveReason.escalation_pinned, 's', without.buckets)
+
+    def test_holder_candidates_never_park_an_unreadable_store(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        outside = _row('esc-9-2', level=2, members=('esc-1',), task_id='9')
+        pins = pin_buckets(
+            '3535', [_row('esc-1')], store_unavailable=True, holder_candidates=[outside],
+        )
+
+        assert pins.human_parked is False
+
+    def test_without_candidates_the_same_l1_is_not_human_parked(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [_row('esc-1')], store_unavailable=False)
+
+        assert pins.human_parked is False
+
+
+class TestPendingHolderCandidates:
+    """``pending_holder_candidates``: the pending queue, read only where a
+    ``human_parked`` answer gates a filing (task 7716)."""
+
+    #: An ``escalation_pinned`` hold with a readable store and the suppressed
+    #: filing switched on — the one input shape whose answer gates a filing.
+    _GATING = {
+        'reason': LeaveReason.escalation_pinned,
+        'store_unavailable': False,
+        'streak_escalation_enabled': True,
+        'suppress_human_parked': True,
+    }
+
+    class _CountingQueue:
+        """Hands back one outside holder, counting the root scans that fetch it."""
+
+        def __init__(self):
+            self.scans = 0
+
+        def get_pending(self):
+            self.scans += 1
+            return [_row('esc-9-2', level=2, members=('esc-1',), task_id='9')]
+
+    @classmethod
+    def _read(cls, queue, site=RecoverySite.reconcile_sweep, **overrides):
+        from orchestrator.recovery_emission import pending_holder_candidates
+
+        return pending_holder_candidates(queue, site, **{**cls._GATING, **overrides})
+
+    @staticmethod
+    def _seeded_queue(tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_row('esc-9-2', level=2, members=('esc-1',), task_id='9'))
+        queue.submit(_row('esc-9-3', level=2, task_id='9'))
+        queue.resolve('esc-9-3', 'done')
+        return queue
+
+    @pytest.mark.parametrize('site', sorted(STREAK_CHARGING_SITES))
+    def test_a_streak_charging_site_reads_exactly_the_pending_records(self, tmp_path, site):
+        queue = self._seeded_queue(tmp_path)
+
+        assert [esc.id for esc in self._read(queue, site)] == ['esc-9-2']
+
+    def test_the_gating_shape_scans_the_queue_once(self):
+        queue = self._CountingQueue()
+
+        assert [esc.id for esc in self._read(queue)] == ['esc-9-2']
+        assert queue.scans == 1
+
+    @pytest.mark.parametrize('site', sorted(set(RecoverySite) - STREAK_CHARGING_SITES))
+    def test_a_per_tick_site_scans_nothing(self, site):
+        queue = self._CountingQueue()
+
+        assert self._read(queue, site) == []
+        assert queue.scans == 0
+
+    @pytest.mark.parametrize(
+        'reason', [*sorted(set(LeaveReason) - {LeaveReason.escalation_pinned}), None],
+    )
+    def test_a_reason_the_suppression_never_covers_scans_nothing(self, reason):
+        queue = self._CountingQueue()
+
+        assert self._read(queue, reason=reason) == []
+        assert queue.scans == 0
+
+    @pytest.mark.parametrize('override', [
+        {'store_unavailable': True},
+        {'streak_escalation_enabled': False},
+        {'suppress_human_parked': False},
+    ], ids=['store-unavailable', 'streak-alarm-off', 'suppression-off'])
+    def test_an_answer_that_gates_no_filing_scans_nothing(self, override):
+        """``human_parked`` is never True over an unreadable store, and with
+        either switch off no filing reads it."""
+        queue = self._CountingQueue()
+
+        assert self._read(queue, **override) == []
+        assert queue.scans == 0
+
+    def test_no_queue_reads_nothing(self):
+        assert self._read(None) == []
+
+    def test_a_failed_read_fails_open_to_no_candidates_and_says_so(self, caplog):
+        """Losing the cross-task suppression only means the alarm files.  The
+        WARNING is all that tells a failed read apart from an empty queue."""
+        import logging
+
+        class _UnreadableQueue:
+            def get_pending(self):
+                raise OSError('queue root unreadable')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.recovery_emission'):
+            assert self._read(_UnreadableQueue()) == []
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.recovery_emission' and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert 'reconcile_sweep' in warnings[0]
+        assert 'queue root unreadable' in warnings[0]

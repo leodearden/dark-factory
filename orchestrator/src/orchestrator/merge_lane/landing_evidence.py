@@ -113,8 +113,9 @@ citation + effect-present policy) — and they share every observable:
 
 ``validate_landing_evidence`` is therefore best read as a MODE over that
 family rather than as a separate helper: its two arms set
-:attr:`LandingMethod.merge_marker` and :attr:`LandingMethod.citation`, and
-everything else about its public surface is unchanged.
+:attr:`LandingMethod.merge_marker` and :attr:`LandingMethod.citation` (or
+:attr:`LandingMethod.content_equivalence` when DISCOVERY's citation-miss
+fallback accepts), and everything else about its public surface is unchanged.
 :func:`validate_reported_landing` (task 4704) is a third mode,
 :attr:`LandingMethod.reported_claim`, for a commit an agent REPORTS as the
 task's work: it corroborates the report against the task's declared files or
@@ -146,7 +147,10 @@ it.
   merge commit's non-first parents' content against current main HEAD,
   correctly catching a reverted no-ff merge (the task-1175 shape). Used by
   the ancestry path, the content-equivalence fallback, and the coalesce
-  re-drive.
+  re-drive. A citation miss first tries one upgrade-only fallback
+  (:func:`_content_equivalence_anchor`, task 4862); it is inert for an
+  ancestor-of-main tip, so only the non-ancestor content-equivalence arm can
+  reach its accept.
 - **CANDIDATE** (``candidate_sha`` given) — attribution was already
   established by the caller (a merge-marker subject match, or a stranded-
   sweep ground-truth report): skip citation discovery and the lineage guard
@@ -252,6 +256,7 @@ __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
     'LANDING_GIT_ERROR_STORM_SENTINEL',
     'LANDING_TALLY',
+    'DifferentialOutcome',
     'LandingEvidenceVerdict',
     'LandingMethod',
     'LandingReason',
@@ -262,6 +267,7 @@ __all__ = [
     'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
+    'found_on_main_note',
     'is_valid_sha_40',
     'validate_landing_evidence',
     'validate_reported_landing',
@@ -332,7 +338,7 @@ class LandingMethod(enum.StrEnum):
 
     This is the explicit mode/policy discriminator the PRD's epsilon bullet
     demands in place of two separate functions: it maps one-to-one onto the
-    four production attribution paths, so any consumer can read which policy
+    production attribution paths, so any consumer can read which policy
     decided a verdict — in particular whether it came from the NON-DECAYING
     patch-id contract or from the legacy effect-present policy epsilon is
     retiring at the landing-detection sites.
@@ -347,6 +353,10 @@ class LandingMethod(enum.StrEnum):
     #: :func:`validate_landing_evidence` DISCOVERY mode — attribution by
     #: ``find_task_citation_commit`` subject-anchored citation discovery.
     citation = 'citation'
+    #: :func:`validate_landing_evidence` DISCOVERY's fallback on a citation
+    #: miss: every path the branch touched is byte-identical on main, and the
+    #: anchor is the tip's patch-id twin there (task 4862).
+    content_equivalence = 'content_equivalence'
     #: :func:`validate_reported_landing` — an agent-REPORTED commit
     #: corroborated against the task's own declared files or checks.
     reported_claim = 'reported_claim'
@@ -355,6 +365,22 @@ class LandingMethod(enum.StrEnum):
     #: build).  The default, so existing four-keyword constructions are
     #: unchanged.
     unspecified = 'unspecified'
+
+
+class DifferentialOutcome(enum.StrEnum):
+    """``probe['delivered_checks_outcome']``: what the delivered-checks differential concluded.
+
+    Genuine ``str`` members, for the same reasons as :class:`LandingReason`.
+    Absent from the probe when the differential never ran.
+    """
+
+    #: A declared check was made true by the evidence commit: the reject is
+    #: rescued (:attr:`LandingVerdict.rescued_by_delivered_checks`).
+    confirmed = 'confirmed'
+    #: No check confirmed, or the differential failed: the reject stands.
+    no_signal = 'no_signal'
+    #: ``delivered_checks.enabled`` is false, so no check ran.
+    disabled = 'disabled'
 
 
 #: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
@@ -624,11 +650,13 @@ class LandingVerdict:
     Attributes:
         accepted: Whether the evidence is attributable AND effect-present.
         evidence_sha: The commit sha to anchor provenance on when
-            ``accepted`` is True (the discovered citation, or
-            ``candidate_sha`` in CANDIDATE mode); ``None`` when rejected.
+            ``accepted`` is True (the discovered citation, the citation-miss
+            fallback's patch-id twin, or ``candidate_sha`` in CANDIDATE mode);
+            ``None`` when rejected.
         reason: Machine-readable code — ``'ok'`` when accepted, else one of
             ``'no_citation'`` (DISCOVERY only — no commit on main cites the
-            task) or ``'effect_absent'`` (FIX 1': the evidence sha's effect
+            task and the content-equivalence fallback declined, see
+            ``probe['content_fallback']``) or ``'effect_absent'`` (FIX 1': the evidence sha's effect
             is not present at current main HEAD). (Task 2870 removed the
             former ``'lineage_mismatch'`` DISCOVERY reject — a citation
             unreachable from the branch in both directions is now accepted;
@@ -683,6 +711,25 @@ class LandingVerdict:
     reason: LandingReason | str
     probe: dict[str, Any]
     method: LandingMethod = LandingMethod.unspecified
+
+    @property
+    def rescued_by_delivered_checks(self) -> bool:
+        """Accepted by the delivered-checks differential, NOT by effect survival.
+
+        The rescue discriminant for every reader in this package.  A rescued
+        accept's ``evidence_sha`` IS on main but its effect is ABSENT at main
+        HEAD — the task-1175 shape FIX 1' guards — so ``accepted``/
+        ``evidence_sha`` alone cannot tell it from a fully-guarded accept (see
+        :func:`_delivered_checks_differential`).  Equality, not truthiness:
+        ``no_signal`` and ``disabled`` are truthy yet only reach a reject.
+        ``escalation/src/escalation/git_authority.py::_evidence_verdict`` still
+        repeats the comparison inline; task 4500's call-site audit owns
+        repointing it here.
+        """
+        return (
+            self.accepted
+            and self.probe.get('delivered_checks_outcome') == DifferentialOutcome.confirmed
+        )
 
 
 #: Backward-compatible alias for the pre-rename spelling.  ``harness.py`` and
@@ -908,7 +955,7 @@ async def _delivered_checks_differential(
     this module was extracted to avoid.
 
     Writes ``delivered_checks_legs`` (every check's three-leg outcome) and
-    ``delivered_checks_outcome`` (``'confirmed'`` / ``'no_signal'``) into
+    ``delivered_checks_outcome`` (a :class:`DifferentialOutcome`) into
     *probe*, so the escalation can say "capability X was made true by this
     merge" or state plainly that there was no signal.  Returns True only on a
     confirmation; any exception is contained, recorded in
@@ -920,7 +967,7 @@ async def _delivered_checks_differential(
         # disabled the feature must be able to see in the escalation that the
         # second accept path was not merely unlucky.
         probe['delivered_checks_legs'] = []
-        probe['delivered_checks_outcome'] = 'disabled'
+        probe['delivered_checks_outcome'] = DifferentialOutcome.disabled
         return False
 
     from orchestrator.delivered_checks import (  # noqa: PLC0415
@@ -987,7 +1034,9 @@ async def _delivered_checks_differential(
             effect_check_sha, exc_info=True,
         )
     probe['delivered_checks_legs'] = legs
-    probe['delivered_checks_outcome'] = 'confirmed' if confirmed else 'no_signal'
+    probe['delivered_checks_outcome'] = (
+        DifferentialOutcome.confirmed if confirmed else DifferentialOutcome.no_signal
+    )
     return confirmed
 
 
@@ -1005,14 +1054,7 @@ async def _resolve_main_reachable_evidence(
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
        path-set predicates — see :func:`branch_work_landed`).
-    2. **Patch-id equivalent** — ``find_equivalent_commit`` over
-       ``merge-base(main, head)..HEAD`` in ``project_root``, whose HEAD is
-       main.  The map it builds is keyed on ``git patch-id --stable``, so the
-       sha it returns is the commit on main whose diff is equivalent to
-       *head*'s — the replayed twin a rebase landing produces.  It carries its
-       own refuse-to-guess posture (an ambiguous patch-id, or an ambiguous
-       subject in its tier-2 fallback, yields ``None`` rather than an
-       arbitrary pick), which is inherited here deliberately.
+    2. **Patch-id equivalent** — :func:`_patch_id_equivalent_on_main`.
 
     Returns ``None`` when NEITHER tier resolves.  The caller turns that into
     :attr:`LandingReason.no_attribution` rather than accepting: anchoring on
@@ -1037,7 +1079,25 @@ async def _resolve_main_reachable_evidence(
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
         return citation
+    return await _patch_id_equivalent_on_main(git_ops, head, probe, patch_id_only=False)
 
+
+async def _patch_id_equivalent_on_main(
+    git_ops: GitOps, head: str, probe: dict[str, Any], *, patch_id_only: bool,
+) -> str | None:
+    """The commit on main whose diff is patch-id equivalent to *head*'s, or None.
+
+    ``find_equivalent_commit`` over ``merge-base(main, head)..HEAD`` in
+    ``project_root``, whose HEAD is main.  The map it builds is keyed on
+    ``git patch-id --stable``, so the sha it returns is the commit on main
+    whose diff is equivalent to *head*'s — the replayed twin a rebase landing
+    produces.  It carries its own refuse-to-guess posture (an ambiguous
+    patch-id, or an ambiguous subject in its tier-2 fallback, yields ``None``
+    rather than an arbitrary pick), which is inherited here deliberately.
+    *patch_id_only* drops that subject tier, whose hit need not carry
+    *head*'s diff: :func:`_content_equivalence_anchor` sets it, and
+    :func:`_resolve_main_reachable_evidence` keeps both tiers.
+    """
     base = await git_ops.merge_base_with_main(head)
     probe['merge_base'] = base
     if base is None:
@@ -1047,7 +1107,9 @@ async def _resolve_main_reachable_evidence(
         probe['evidence_source'] = 'merge_base_unresolved'
         return None
 
-    equivalent = await git_ops.find_equivalent_commit(git_ops.project_root, base, head)
+    equivalent = await git_ops.find_equivalent_commit(
+        git_ops.project_root, base, head, patch_id_only=patch_id_only,
+    )
     probe['evidence_source'] = (
         'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
     )
@@ -1178,8 +1240,8 @@ def _new_probe(
 ) -> dict[str, Any]:
     """Seed the structured-facts probe every producer mode carries.
 
-    ``method`` is seeded UP FRONT rather than stamped on the accept: WHICH
-    policy answered is a property of the CALL, not of the outcome, and a
+    ``method`` is seeded UP FRONT, and :func:`_stamped_verdict` restamps the
+    method each verdict is built with, on a reject as on an accept: a
     consumer reading a REJECTED verdict is precisely the one that needs to
     know whether the answer came from the non-decaying patch-id contract or
     from the legacy effect-present policy.
@@ -1226,6 +1288,7 @@ def _stamped_verdict(
     already returned.
     """
     probe['reason'] = reason
+    probe['method'] = method
     verdict = LandingVerdict(
         accepted=accepted,
         evidence_sha=evidence_sha,
@@ -1646,6 +1709,71 @@ async def _candidate_effect_verdict(
     return _reject_verdict(LandingReason.effect_absent, probe=probe, method=method)
 
 
+async def _content_equivalence_anchor(
+    git_ops: GitOps, branch_tip_sha: str | None, probe: dict[str, Any],
+) -> str | None:
+    """An uncited tip's main-reachable anchor when its content is on main, else None.
+
+    UPGRADE-ONLY: every exit records ``probe['content_fallback']``, and any
+    failure reproduces the pre-task ``no_citation`` verdict.  It is passed the
+    TIP SHA, not the branch name, so the content check and the anchor judge one
+    tip (task 3103).  The anchor is always a main-reachable patch-id twin,
+    never main HEAD or the tip (task 2678).  Inert for an ancestor-of-main tip,
+    since ``branch_content_in_main`` is False when merge-base == tip.  Because
+    it DECAYS, only :func:`validate_landing_evidence` uses it, never
+    :func:`branch_work_landed`, whose non-decay invariant forbids
+    ``branch_content_in_main``.
+    """
+    if branch_tip_sha is None:
+        probe['content_fallback'] = 'no_branch_tip'
+        return None
+    try:
+        if not await git_ops.branch_content_in_main(branch_tip_sha):
+            probe['content_fallback'] = 'not_content_equivalent'
+            return None
+        anchor = await _patch_id_equivalent_on_main(
+            git_ops, branch_tip_sha, probe, patch_id_only=True,
+        )
+    except Exception as exc:
+        probe['content_fallback'] = 'error'
+        probe['content_fallback_error'] = repr(exc)
+        logger.warning(
+            'content-equivalence fallback failed for task %s at tip %s; '
+            'the verdict stays no_citation',
+            probe['task_id'], branch_tip_sha, exc_info=True,
+        )
+        return None
+    if not is_valid_sha_40(anchor):
+        probe['content_fallback'] = 'unanchored'
+        return None
+    probe['content_fallback'] = 'attributed'
+    return anchor
+
+
+async def _citation_miss_verdict(
+    git_ops: GitOps, branch_tip_sha: str | None, probe: dict[str, Any],
+) -> LandingVerdict:
+    """DISCOVERY's citation-miss arm: the content-equivalence fallback, else ``no_citation``.
+
+    The accept runs no effect-present check: byte-identity of every touched
+    path at main HEAD subsumes the twin's line survival.
+    """
+    anchor = await _content_equivalence_anchor(git_ops, branch_tip_sha, probe)
+    if anchor is None:
+        return _reject_verdict(
+            LandingReason.no_citation, probe=probe, method=LandingMethod.citation,
+        )
+    logger.info(
+        'task %s: no citation on main, but tip %s is content-equivalent there; '
+        'anchored on its patch-id twin %s',
+        probe['task_id'], branch_tip_sha, anchor,
+    )
+    return _accept_verdict(
+        anchor, reason=LandingReason.ok, probe=probe,
+        method=LandingMethod.content_equivalence,
+    )
+
+
 async def validate_landing_evidence(
     git_ops: GitOps,
     task_id: str,
@@ -1655,14 +1783,16 @@ async def validate_landing_evidence(
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
     delivered_checks: list[dict[str, Any]] | None = None,
+    checks_enabled: bool = True,
 ) -> LandingVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
     See the module docstring for the DISCOVERY (``candidate_sha=None``) vs
     CANDIDATE (``candidate_sha`` given) mode split, and for the
     ONE-PRODUCER-FAMILY shape this function is a MODE of: it sets
-    :attr:`LandingMethod.merge_marker` in CANDIDATE mode and
-    :attr:`LandingMethod.citation` in DISCOVERY mode, so a consumer can read
+    :attr:`LandingMethod.merge_marker` in CANDIDATE mode and, in DISCOVERY
+    mode, :attr:`LandingMethod.citation` or, when the citation-miss fallback
+    accepts, :attr:`LandingMethod.content_equivalence`, so a consumer can read
     which policy decided without inferring it from the reason code.
 
     **The reason codes it EMITS are the legacy spellings, deliberately**
@@ -1689,7 +1819,11 @@ async def validate_landing_evidence(
             ``describe_commit_effect_in_main`` for the effect_absent
             divergence diagnostics — a stand-in lacking that last method
             still decides identically; the failure is recorded in
-            ``probe['effect_probe_error']``).
+            ``probe['effect_probe_error']``).  ``branch_content_in_main`` /
+            ``merge_base_with_main`` / ``find_equivalent_commit`` /
+            ``project_root`` are consulted only on a DISCOVERY citation miss,
+            and a stand-in lacking them decides identically, with the failure
+            recorded in ``probe['content_fallback_error']``.
         task_id: Bare task id (no ``task/`` prefix).
         branch: The task's branch name (e.g. ``f'task/{task_id}'``), used
             for the FIX 2 lineage guard in DISCOVERY mode. Not consulted in
@@ -1719,14 +1853,12 @@ async def validate_landing_evidence(
             exactly).
 
             STAGING, NAMED SO IT CANNOT GO PERMANENT (amendment pass, review
-            finding — as shipped by task 3116 NO production call site passes
-            this, so the whole second accept path is unreachable and the only
-            live effect is the escalation text "this call site is unwired").
-            The call sites are owned by other tasks and are deliberately not
-            edited here — task 3116 holds no lock on them:
+            finding — task 3116 shipped this with no production caller; an
+            unwired site's only live effect is the escalation text "this call
+            site is unwired"). The call sites are owned by other tasks:
 
               task 4496  harness.py x4 (three ``_already_landed_dispatch_gate``
-                         arms + ``_reconcile_one_stranded``)
+                         arms + ``_reconcile_one_stranded``) — WIRED
               task 4497  merge_queue.py x1 (the coalesce re-drive)
               task 4498  escalation/server.py x2 (``merge_status``'s
                          git-authority arms)
@@ -1737,6 +1869,12 @@ async def validate_landing_evidence(
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
             seven sites regressed to the default.
+        checks_enabled: The project's ``delivered_checks.enabled`` leaf.
+            False disarms the second accept path, recorded as
+            ``probe['delivered_checks_outcome'] == 'disabled'``. A caller
+            holding the project config must pass it, because a real
+            ``GitOps.config`` carries no ``delivered_checks`` (see the KILL
+            SWITCH paragraph of :func:`_delivered_checks_differential`).
 
     Returns:
         A :class:`LandingVerdict`.
@@ -1774,13 +1912,14 @@ async def validate_landing_evidence(
         # apply ONLY the FIX 1' effect-present guard to candidate_sha.
         return await _candidate_effect_verdict(
             git_ops, candidate_sha, delivered_checks, probe, method=method,
+            checks_enabled=checks_enabled,
         )
 
     citation = await git_ops.find_task_citation_commit(
         task_id, pattern_template=pattern_template,
     )
     if citation is None:
-        return _reject(LandingReason.no_citation)
+        return await _citation_miss_verdict(git_ops, branch_tip_sha, probe)
     probe['citation'] = citation
 
     # Citation-anchor selection (task 2870, esc-5252-9; formerly the FIX 2
@@ -1834,7 +1973,7 @@ async def validate_landing_evidence(
         # a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
-            anchor_is_branch_tip=anchor_is_branch_tip,
+            anchor_is_branch_tip=anchor_is_branch_tip, enabled=checks_enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)
@@ -2016,7 +2155,10 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     ),
     'no_citation': (
         'No commit on main cites this task (find_task_citation_commit found '
-        'nothing) — there is no positive evidence to attribute a landing to.'
+        'nothing) AND the content-equivalence fallback did not attribute it '
+        '— there is no positive evidence to attribute a landing to. '
+        'probe.content_fallback says why the fallback declined '
+        '(not_content_equivalent / unanchored / no_branch_tip / error).'
     ),
     'effect_absent': (
         "The evidence commit's own effect did not SURVIVE to current main "
@@ -2059,7 +2201,17 @@ _METHOD_EXPLANATIONS: dict[str, str] = {
         "Attributed by subject-anchored citation discovery over main's "
         'history (find_task_citation_commit) — validate_landing_evidence '
         'DISCOVERY mode. Depends on a commit on main naming the task, so a '
-        'rebase landing that dropped the citation is invisible to it.'
+        'rebase landing that dropped the citation is invisible to the '
+        'citation search itself; DISCOVERY then tries the content_equivalence '
+        'fallback.'
+    ),
+    'content_equivalence': (
+        'No commit on main cites the task, BUT every path the branch touched '
+        'is byte-identical on main (branch_content_in_main) — the fallback '
+        'validate_landing_evidence DISCOVERY runs on a citation miss. The '
+        "evidence is the branch tip's patch-id equivalent on main. A DECAYING "
+        'policy, unlike patch_id: byte-identity is judged against main HEAD, '
+        'so later edits to those paths stop it holding.'
     ),
     'reported_claim': (
         "An agent REPORTED this commit as the task's work (e.g. the "
@@ -2177,6 +2329,27 @@ def format_unattributed_landing_detail(
         f'{disposition.closing}'
     )
     return summary, detail
+
+
+def found_on_main_note(note: str, verdict: LandingVerdict) -> str:
+    """*note* for a ``found_on_main`` provenance stamp, disclosing a rescue.
+
+    Unchanged unless *verdict* was rescued by the delivered-checks
+    differential; a rescued accept must never reach provenance reading as if
+    its effect were verified at main HEAD (advisory esc-4887-6).
+    """
+    if not verdict.rescued_by_delivered_checks:
+        return note
+    confirmed = ', '.join(
+        str(leg.get('name'))
+        for leg in verdict.probe.get('delivered_checks_legs') or []
+        if leg.get('verdict') == _DIFFERENTIAL_CONFIRMED
+    ) or '<unnamed>'
+    return (
+        f'{note} [accepted by the delivered-checks differential, not by effect '
+        f"survival: the evidence commit's added lines do not survive at main "
+        f'HEAD; confirmed check(s): {confirmed}]'
+    )
 
 
 def _survival_lines(probe: dict[str, Any]) -> list[str]:
@@ -2368,7 +2541,7 @@ def _render_delivered_checks_differential(
             'delivered-checks differential: not consulted (the effect check '
             'did not reject).\n\n'
         )
-    if outcome == 'disabled':
+    if outcome == DifferentialOutcome.disabled:
         return (
             'delivered-checks differential: NOT RUN — delivered_checks.enabled '
             'is false in this project config, so the task\'s declared checks '
@@ -2422,9 +2595,10 @@ def file_unattributed_landing_escalation(
     silently stamped done (the task-1175 clobber this task closes).
     Escalate-instead-of-stamp is deliberately non-status-blocking: the
     caller leaves the task/member row pending (or flips it to pending) and
-    it is re-evaluated next tick; the caller's own open-L1 veto naturally
-    suppresses reprocessing while this L1 stays open — no separate status
-    transition happens here.  (The workflow's reported-claim caller,
+    it is re-evaluated next tick. The caller's open-L1 veto stops it re-filing,
+    but for a pending task that veto means "dispatch normally", so nothing
+    holds the task back from an agent — no status transition happens here.
+    (The workflow's reported-claim caller,
     ``TaskWorkflow._handle_already_done_report``, is the exception: it holds
     its task blocked itself, after filing.)
 

@@ -23,6 +23,7 @@ from _merge_lane_fakes import (
     lane_scene_config,
     lane_state,
     make_lane,
+    passes,
     running_lane,
 )
 from _orch_helpers import wait_responsive
@@ -69,11 +70,12 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _request(
-    task_id: str, worktree: Path, config: OrchestratorConfig, **flags: bool,
+    task_id: str, worktree: Path, config: OrchestratorConfig, *,
+    awaited_by_workflow: bool = False,
 ) -> MergeRequest:
     return MergeRequest(
         task_id=task_id,
@@ -84,7 +86,7 @@ def _request(
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        **flags,
+        awaited_by_workflow=awaited_by_workflow,
     )
 
 
@@ -118,17 +120,6 @@ def _main_moved_under_it(advances: list[Any]) -> Any:
         )
 
     return _advance
-
-
-def _held_reverify(reverifying: asyncio.Event, release: asyncio.Event) -> Any:
-    async def _reverify(*args: Any, **kwargs: Any) -> VerifyResult:
-        reverifying.set()
-        await release.wait()
-        return VerifyResult(
-            passed=True, test_output='', lint_output='', type_output='', summary='',
-        )
-
-    return _reverify
 
 
 async def _until(predicate: Any, what: str) -> None:
@@ -223,16 +214,14 @@ class TestCancellable:
         self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         queue: asyncio.Queue[Any] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        reverifying, release = asyncio.Event(), asyncio.Event()
+        lane = make_lane(git_ops, queue, verifier=FakeVerifier(
+            sequence=[passes(), hangs_until(release, entered=reverifying)],
+        ))
         request = _request('gr', await _branch(git_ops, 'gr'), config)
         main_before = await git_ops.get_main_sha()
         advances: list[Any] = []
-        reverifying, release = asyncio.Event(), asyncio.Event()
         monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it(advances))
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_scoped_verification',
-            _held_reverify(reverifying, release),
-        )
         async with running_lane(lane):
             await queue.put(request)
             await wait_responsive(
@@ -256,14 +245,12 @@ class TestCancellable:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         queue: asyncio.Queue[Any] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
-        request = _request('gk', await _branch(git_ops, 'gk'), config)
         reverifying, release = asyncio.Event(), asyncio.Event()
+        lane = make_lane(git_ops, queue, verifier=FakeVerifier(
+            sequence=[passes(), hangs_until(release, entered=reverifying)],
+        ))
+        request = _request('gk', await _branch(git_ops, 'gk'), config)
         monkeypatch.setattr(git_ops, 'advance_main', _main_moved_under_it([]))
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.worker.run_scoped_verification',
-            _held_reverify(reverifying, release),
-        )
         server = create_server(
             EscalationQueue(tmp_path / 'esc'),
             orch_config=config,

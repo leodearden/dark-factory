@@ -41,6 +41,7 @@ pytestmark = pytest.mark.xdist_group('watcher-rearm-producer')
 _ARTIFACTS: dict[str, Callable[[], str]] = {
     'auto-skill': lambda: load_skill_system_prompt('escalation-watcher-auto'),
     'l2-skill': lambda: load_skill_system_prompt('escalation-watcher'),
+    'recon-skill': lambda: load_skill_system_prompt('recon-escalation-watcher'),
 }
 
 

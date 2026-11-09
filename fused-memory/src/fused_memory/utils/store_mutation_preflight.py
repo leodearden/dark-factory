@@ -82,15 +82,16 @@ follows is still a dated audit, not a live guarantee -- the check enforces
 the RULE, not this prose, and it is call-shaped only. See below for what
 that still misses.
 
-GUARDED, as of task 6863 -- ``amend_stale_resume_cwd_records``,
+GUARDED, as of task 7397 -- ``amend_stale_resume_cwd_records``,
 ``audit_duplicate_memories``, ``backfill_entity_standing_decision``,
 ``cleanup_count_snapshots``, ``cleanup_pin_queue_edges``,
 ``clear_false_dependency_invalidations``, ``clear_malformed_empty_memory``,
 ``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
 ``lane_dependency_probe``, ``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
 ``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
-``retro_stamp_topics``, ``sweep_orphan_flag_markers``,
-``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (18 call sites).
+``replay_failed_mem0_intents``, ``retro_stamp_topics``,
+``sweep_orphan_flag_markers``, ``sweep_toolcall_xml_leak``,
+``tag_cgl_eta_rehome_scope`` (19 call sites).
 This column IS exhaustive, because CALLING this function is what "guarded"
 MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
 --include='*.py'`` re-derives it, and re-dates it, in one line.
@@ -466,12 +467,14 @@ PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
         'load_cleanup_script().E2_BAKEOFF_PREFIX on the run\'s own config '
         "copy, and no CLI flag reaches it (--project-suffix moves only the "
         "suffix), so neither call can be pointed at a 'fused'-prefixed "
-        'production collection; seed_arm also stubs mem0\'s shared '
-        'add_history writer before the first add, so it writes no shared '
-        'SQLite history either. Measured against this file as it stands '
-        '(task 4293), not a standing exemption: it dies the moment a CLI '
-        'flag reaches the collection prefix, or seed_arm stops stubbing the '
-        'shared history writer. Does not cover the live path\'s '
+        'production collection; run_bake_off also sets '
+        'config.mem0.persist_history=False on that same copy, so every arm\'s '
+        'mem0 instance keeps its history in a private in-memory DB and writes '
+        'no shared SQLite history either. Measured against this file as it '
+        'stands (task 4293 for the collection prefix, task 6100 for the '
+        'history), not a standing exemption: it dies the moment a '
+        'CLI flag reaches the collection prefix, or run_bake_off stops turning '
+        'config.mem0.persist_history off. Does not cover the live path\'s '
         'MemoryService.initialize() call (Graphiti startup maintenance '
         'against production FalkorDB) -- that residual is unaddressed here '
         'and stays tracked by tasks 4318 and 4350.'

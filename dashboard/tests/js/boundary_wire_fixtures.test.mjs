@@ -11,7 +11,13 @@ import { loadClient, payload } from './_boundary_client.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  escalationRow,
+  escalationsPayload,
+  mergeQueueBlock,
   openEscalationItem,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
   tasksSnapshotEntry,
   wireDatum,
@@ -77,4 +83,58 @@ test('the escalation-analytics payload is built only with keys /escalation-analy
   const servedItem = served.per_project[0].lifespan.open_items[0];
   assert.ok(!('pins_recovery' in servedItem), 'this check expects the served item to carry no pins annotation');
   assertSameKeys(item, servedItem, 'an open item with no pins annotation');
+});
+
+test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
+  const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
+
+  assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {
+  const served = payload('scheduler_offline').SCHEDULER;
+  const built = schedulerSnapshot({
+    offlineProjects: ['P'],
+    rows: [schedulerLockRow({ project: 'H', taskId: '1', lockSet: ['src/m'] })],
+    modules: [schedulerModule({ project: 'H', path: 'src/m', holder: '1', holderProject: 'H', parkedBy: '2', parkedOwnerLive: true })],
+  });
+
+  assertBuiltKeysServed(built, served, 'SCHEDULER');
+});
+
+test('an /escalations payload, a check-owner row included, is built only with keys /escalations serves', () => {
+  const served = payload('escalations_check_owner').ESCALATIONS;
+  const row = escalationRow({
+    id: 'esc-3-1',
+    taskId: '3',
+    summary: 's',
+    project: 'dark-factory',
+    deliveredCheckOwner: { task_id: '4', check_name: 'c', sidecar: { path: 'p', on_main: 'declares' } },
+  });
+
+  assertBuiltKeysServed(escalationsPayload([{ project: 'dark-factory', rows: [row] }]), served, 'ESCALATIONS');
+});
+
+test("an /escalations payload's counts and views agree with the served ones for its one pending row", () => {
+  const served = payload('escalations_check_owner').ESCALATIONS;
+  const servedQueue = served.subsections.find(subsection => subsection.kind === 'orchestrator');
+  const servedRow = servedQueue.escalations[0];
+  const row = escalationRow({
+    id: servedRow.id,
+    taskId: servedRow.task_id,
+    level: servedRow.level,
+    status: servedRow.status,
+    summary: servedRow.summary,
+    project: 'dark-factory',
+  });
+  const built = escalationsPayload([{ project: 'dark-factory', rows: [row] }]);
+  const viewValues = views => Object.fromEntries(Object.entries(views).map(([name, datum]) => [name, datum.value]));
+
+  for (const [where, builtPart, servedPart] of [
+    ['ESCALATIONS', built, served],
+    ['the orchestrator subsection', built.subsections[0], servedQueue],
+  ]) {
+    assert.deepEqual(builtPart.summary, servedPart.summary, `${where}.summary`);
+    assert.deepEqual(viewValues(builtPart.views), viewValues(servedPart.views), `${where}.views`);
+  }
 });

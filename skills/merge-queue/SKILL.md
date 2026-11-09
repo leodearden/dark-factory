@@ -156,7 +156,7 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
 2. **rc=128-with-empty-marker does not mean "not landed" here — and on the `coalesce-*` arm, neither does rc=1** (see rule 3 for the mechanism: why a non-tip member's rc=1 is the common, permanent case there, not a reason to wait it out). A train merges only the tip branch, so a non-tip absorbed member's commits land under the **tip's** marker, not its own. Check two signals under **either** rc=128-with-empty-marker **or** rc=1 on the `coalesce-*` arm; this widened trigger does not extend to the `mr-*` arm, where rule 3's original rc=1 restriction still stands: (a) the **tip's** merge marker on main — run [step 1](../_shared/deriving-landed-sha.md#step-1)'s selecting search against the **tip's** subject:
    ```bash
    S="Merge task/<TIP_ID> into main"
-   git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+   git log main --fixed-strings --grep="task/<TIP_ID>" --format='%H%x09%s' \
      | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
    ```
    `<TIP_ID>` is parsed off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix and
@@ -306,7 +306,7 @@ The outcome arrives from either the submit call (terminal at submit time) or the
       "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge
       commit if `kind: "merged"` provenance is specifically wanted — and re-derive it with [step
       1](../_shared/deriving-landed-sha.md#step-1)'s selecting merge-marker search (`git log main
-      --fixed-strings --grep="$S" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s && !seen {print
+      --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s && !seen {print
       $1; seen=1}'`, `S="Merge task/<TASK_ID> into main"`), which yields only a commit whose
       **subject** is exactly the marker.
 
@@ -452,11 +452,13 @@ Reordering within the suffix is always disk-free (only recomputes the merge-tree
 ### Layer 2: Frozen verify frontier (prefix)
 
 The **frozen prefix** = {verifying} ∪ {landed}. Items in the frozen prefix are **immutable**:
-- A verify is always dispatched against the tip of the frozen prefix (`frozen_prefix_tip`).
+- A verify should be dispatched against the tip of the frozen prefix (`frozen_prefix_tip`). That rule is a dispatch-time detector, not a refusal: see `verify_base_divergences` below.
 - No reorder or re-base ever touches an in-flight verify item.
 - The suffix recompute only touches `_lane_buffers`; in-flight `_inflight` order and `base_sha` are unchanged.
 
-Health check: `two_layer_invariants(main_sha)` → `[]` when all §5.3 invariants hold.
+Health check: `two_layer_invariants(main_sha)` → `[]` when INV-3 chain-intact (no frozen entry built on a recorded dead commit), the successor chain links, frozen∩suffix disjointness and the conflict-graph consistency checks all hold. It does not compare the frozen head with current main: main moving under an in-flight verify is not a violation (task 5302).
+
+Dispatch-time detector: `verify_base_divergences()` → `()` unless a real verify was dispatched on a base that was not the frozen-prefix tip at that moment. Each record is computed once at dispatch and stamped on its in-flight entry, and each also files an L1 `merge_verify_base_divergence` unless one is already open. The verify is never refused: INV-3 voids a dead-base verdict at adoption. A hit has one of three sources: the frozen-prefix tip pointed at a requeued or dropped head (a regression of task 5302's liveness rule, PRD §5.3 class (a)); it pointed at a head that was never vacated and is stuck in `finalizing` or `gate_reverify`, including a head whose own merge commit was recorded dead on a rebased landing (a residual phantom-tip source, ticket tkt_0RWKN8Q02REA5YEFNQX4WDJRJT; the dispatched item is fine); or an item was stacked on a speculative-only base (class (d)). The detector and `two_layer_invariants` are not disjoint. When the frozen prefix already holds a real merge (depth ≥ 1), the same divergent dispatch also appears in `two_layer_invariants` as a successor chain-link break ('frozen-prefix base-chain broken at <request_id>'), for as long as its predecessor stays frozen, so expect both when triaging a `merge_verify_base_divergence` L1. At depth 0 (empty frozen prefix, head on a non-main base) only the detector reports it: the head has no predecessor and is judged by INV-3 alone, so an off-tip base that is not a recorded dead commit raises no field string (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_chain_breaks`). Triage it from the record and the PRD §5.3 recurrence bullet.
 
 ### Conflict-clique aging order and disjoint throughput bypass
 
@@ -480,7 +482,8 @@ The `snapshot()` call exposes these additive, backward-compatible keys:
 | `suffix_conflict_graph` | Current conflict-graph edges for suffix items |
 | `frozen_prefix` | `{request_ids, tip_merge_commit, verify_depth}` |
 | `metrics` | `{retries_per_landing, drift_at_detection, landings_total}` |
-| `two_layer_invariants` | `[]` when healthy; list of violation strings otherwise |
+| `two_layer_invariants` | `[]` when healthy; otherwise INV-3 dead-link, successor chain-link, disjointness or graph-consistency violation strings |
+| `verify_base_divergences` | `[]` normally; one `{request_id, task_id, base_sha, expected_tip, verify_depth, observed_at}` dict per in-flight verify that was dispatched off the frozen-prefix tip (task 5302). Non-empty pairs with an L1 `merge_verify_base_divergence` |
 | `hosts` | Per-verify-host `{name, is_local, slot_state, quarantined, quarantine_class, unavailable_since, unavailable_secs, streak, reason}` — tells RU-quarantine (`ru`) from divergence-quarantine (`divergence`) from a leaked slot (busy/parked, no occupant) from free-and-never-asked-for. An RU-tracked host with no allocator slot is appended with `slot_state: null` |
 
 When any host is quarantined the heartbeat line also carries an inline

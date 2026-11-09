@@ -284,6 +284,25 @@ class PassRecord:
     effect: Any | None
 
 
+@dataclass(frozen=True)
+class StoredPass:
+    """One pass directory as stored: its parsed record, or the *problem* that stopped the parse."""
+
+    command_key: str
+    pass_id: str
+    started_at: datetime
+    directory: Path
+    record: PassRecord | None
+    problem: str | None
+
+    def __post_init__(self) -> None:
+        if (self.record is None) == (self.problem is None):
+            raise ValueError(
+                f'{self.directory}: a stored pass carries exactly one of record or problem; '
+                f'got record is None={self.record is None}, problem={self.problem!r}',
+            )
+
+
 def _run_block(payload: Mapping[str, Any], phase: Phase) -> RunRecord | None:
     block = _get_optional(payload, phase.value, dict)
     return None if block is None else RunRecord.from_json(block)
@@ -350,6 +369,15 @@ def _read_payload(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise LookupError(f'run record at {path} is not a JSON object')
     return payload
+
+
+def _parsed_record(path: Path) -> tuple[PassRecord | None, str | None]:
+    try:
+        return _pass_from_json(_read_payload(path)), None
+    except LookupError as exc:
+        return None, str(exc)
+    except ValueError as exc:
+        return None, f'malformed run record at {path}: {exc}'
 
 
 def _write_payload(path: Path, payload: Mapping[str, Any]) -> None:
@@ -453,6 +481,21 @@ class RunRecordStore:
             record = self.load_pass(command, pass_dir.name)
             if record is not None:
                 yield record
+
+    def stored_passes_since(self, since: datetime) -> Iterator[StoredPass]:
+        """Every pass directory of every command started at or after *since*, by command directory then pass id.
+
+        Unlike :meth:`passes_since` it neither skips nor logs a record it cannot
+        parse: that problem is the caller's to report, as a well-formedness
+        check must see it.
+        """
+        for command_dir in _subdirectories(self.root):
+            for pass_dir in _subdirectories(command_dir):
+                started_at = _pass_started_at(pass_dir.name)
+                if started_at is None or started_at < since:
+                    continue
+                record, problem = _parsed_record(pass_dir / 'record.json')
+                yield StoredPass(command_dir.name, pass_dir.name, started_at, pass_dir, record, problem)
 
     def prune(self, now: datetime, pinned_pass_ids: Collection[str] = ()) -> list[str]:
         cutoff = now - RECORD_RETENTION

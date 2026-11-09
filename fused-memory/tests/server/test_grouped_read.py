@@ -37,11 +37,13 @@ from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CHILDREN_UNAVAILABLE_KEY,
     CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
     PARENT_UNAVAILABLE_KEY,
     PARENT_UNRESOLVED_KEY,
     SIGHTING_KIND,
     _suppress_child,
     build_grouped_document,
+    child_parent_id,
     group_memory_document,
     group_search_results,
     is_contested_child,
@@ -1074,6 +1076,33 @@ class TestIsContestedChild:
         assert is_contested_child(None) is False
 
 
+class TestChildParentId:
+    """The definition of 'is this Mem0 record a child' (D5)."""
+
+    @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
+    def test_a_child_kind_with_a_str_parent_returns_the_parent(self, kind):
+        assert child_parent_id({'kind': kind, PARENT_ID_KEY: 'p1'}) == 'p1'
+
+    _NOT_A_CHILD = [
+        ('no metadata', None),
+        ('empty metadata', {}),
+        ('parent without kind', {PARENT_ID_KEY: 'p1'}),
+        ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'p1'}),
+        ('kind None', {'kind': None, PARENT_ID_KEY: 'p1'}),
+        ('parent absent', {'kind': SIGHTING_KIND}),
+        ('parent None', {'kind': SIGHTING_KIND, PARENT_ID_KEY: None}),
+        ('parent empty', {'kind': SIGHTING_KIND, PARENT_ID_KEY: ''}),
+        ('parent int', {'kind': SIGHTING_KIND, PARENT_ID_KEY: 7}),
+        ('parent list', {'kind': AMENDMENT_KIND, PARENT_ID_KEY: ['p1']}),
+    ]
+
+    @pytest.mark.parametrize(
+        ('label', 'meta'), _NOT_A_CHILD, ids=[label for label, _ in _NOT_A_CHILD]
+    )
+    def test_anything_else_is_not_a_child(self, label, meta):
+        assert child_parent_id(meta) is None, label
+
+
 class TestChildReadFaultContainment:
     """A backend fault must never be reported as "this canonical has no children".
 
@@ -1791,7 +1820,7 @@ class TestDigestCarriesOriginProjectTag:
 
     @pytest.mark.asyncio
     async def test_the_projection_is_narrow_and_never_leaks_managed_keys(self):
-        """Only origin-tag keys ride along — not the body, not mem0's own keys.
+        """Only the projected keys ride along — not the body, not mem0's own keys.
 
         No member of ``MEM0_MANAGED_METADATA_KEYS`` may appear in the emitted
         projection: mem0's ``user_id`` scoping key in particular must never be

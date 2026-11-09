@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,6 +26,7 @@ from escalation.models import Escalation
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_runner import (
     LocalRunner,
@@ -543,6 +544,18 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
             seen.add(name)
             out.append(name)
     return out
+
+
+def select_failed_run_all_members(
+    test_output: str, channel_members: Sequence[str] | None,
+) -> list[str]:
+    """C3 rule 3: the channel's failed set (``VerifyResult.run_all_failed_members``)
+    when a run_all reported into a present channel, else the text marker parse
+    (rule 2). ``[]`` means the full run_all suite.
+    """
+    if channel_members is not None:
+        return list(channel_members)
+    return parse_failed_run_all_members(test_output)
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1240,9 @@ async def _run_cold_shadow_verify_suite(
             event_store=event_store,
             task_id=req.task_id,
         )
-        return await pool.dispatch(merge_commit, spec)
+        return await pool.dispatch(
+            merge_commit, spec, dispatch_facts=MergeVerifyDispatchFacts.local_only(),
+        )
     finally:
         await git_ops.cleanup_merge_worktree(wt)
 
@@ -1340,7 +1355,9 @@ async def _run_cold_shadow_verify(
                 event_store=event_store,
                 task_id=req.task_id,
             )
-            verify = await pool.dispatch(merge_commit, spec)
+            verify = await pool.dispatch(
+                merge_commit, spec, dispatch_facts=MergeVerifyDispatchFacts.local_only(),
+            )
             return parse_per_test_results(verify.test_output or '')
     finally:
         await git_ops.cleanup_merge_worktree(wt)

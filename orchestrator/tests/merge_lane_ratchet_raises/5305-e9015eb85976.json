@@ -1,0 +1,48 @@
+{
+  "task_id": "5305",
+  "reason": "Move, not growth (task 5305 review amendment, reviewer_comprehensive suggestions 1, 2 and 4, heuristics 6 and 13): each name moves to the one module that uses it, and the two helpers three modules call become public. _aging_key moves from intake.py into intake_buffers.py beside its only caller, MergeIntake.pop_next_pickable: intake_buffers.py lines 714 -> 735, prose_lines 337 -> 353 and cognitive 63 -> 64 are that function's 21 lines, 16 docstring lines and cognitive 1. _C3_DUPLICATE_IN_VERIFY_CODE moves from tip_relation.py (342 -> 335) into intake.py, where its one reader builds the reject. line_ranges_stackable and select_train_members leave intake.py, byte-identical, for a new merge_lane/train_selection.py (65 lines, 28 prose_lines, cognitive 19, which is the two functions' 11 + 8), so intake.py keeps one purpose: 1151 -> 1073 lines, prose_lines 509 -> 474, cognitive 116 -> 96. _normalize_lane and _emit_merge_coalesced are renamed normalize_lane and emit_merge_coalesced, so their keys are new (cognitive 1 and 2). halt.py lines 204 -> 205 and prose_lines 71 -> 72 come from the operator_halt docstring, which now names the is_operator_halted accessor rather than the private _operator_halt. Net total:lines 57532 -> 57534 (+2) and total:prose_lines 31658 -> 31664 (+6) are train_selection.py's module header plus that halt docstring line. total:cognitive holds at 4788, as do private_reads 6492, patch_targets 55, function_local_imports 18 and reexport_names 6.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py",
+      "baseline": 63,
+      "current": 64
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/halt.py",
+      "baseline": 204,
+      "current": 205
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py",
+      "baseline": 714,
+      "current": 735
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/halt.py",
+      "baseline": 71,
+      "current": 72
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py",
+      "baseline": 337,
+      "current": 353
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57532,
+      "current": 57534
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31658,
+      "current": 31664
+    }
+  ]
+}

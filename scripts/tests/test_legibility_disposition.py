@@ -473,6 +473,59 @@ def test_resolve_tickets_resolves_every_unresolved_row_by_its_outcome() -> None:
     assert [arguments["ticket"] for arguments in again.arguments_of("resolve_ticket")] == ["tkt_t"]
 
 
+def test_resolve_tickets_holds_an_open_ticket_pending() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_o")]))
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_o": _outcome(task_store.TicketStatus.PENDING, reason="wait_timeout"),
+    })
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    assert resolutions.pending == ("tkt_o",)
+    assert resolutions.resolved == ()
+    assert _rows(result, "entry-a")[0]["resolution"] is None
+
+
+def test_resolve_tickets_writes_a_cancelled_ticket_as_resolved_not_an_error() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_k")]))
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_k": _outcome(task_store.TicketStatus.CANCELLED, reason="user_cancelled"),
+    })
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    (row,) = _rows(result, "entry-a")
+    assert row["resolution"] == "cancelled"
+    assert row["task_id"] is None
+    assert resolutions.errors == ()
+    assert resolutions.pending == ()
+    assert [resolved.ticket for resolved in resolutions.resolved] == ["tkt_k"]
+    assert codebook.validate(result) == []
+
+    again = FakeTaskStore()
+    disposition.resolve_tickets(result, store=again, run_id=_RUN, clock=_Clock())
+    assert again.arguments_of("resolve_ticket") == []
+
+
+@pytest.mark.parametrize("status", list(task_store.TicketStatus), ids=str)
+def test_every_census_ticket_status_resolves_or_stays_pending(status: task_store.TicketStatus) -> None:
+    names_a_task = status in (task_store.TicketStatus.CREATED, task_store.TicketStatus.COMBINED)
+    outcome = _outcome(status, 7 if names_a_task else None, reason="r")
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_s")]))
+    store = FakeTaskStore(resolve_outcomes={"tkt_s": outcome})
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    (row,) = _rows(result, "entry-a")
+    assert resolutions.errors == ()
+    if outcome.undecided:
+        assert row["resolution"] is None
+        assert "tkt_s" in resolutions.pending
+    else:
+        assert row["resolution"] == status.value
+        assert codebook.validate(result) == []
+
+
 def test_resolve_tickets_stops_when_its_budget_is_spent() -> None:
     assert disposition.RESOLVE_BUDGET_SECS == 300
     assert disposition.RESOLVE_CALL_CAP_SECS == 115
@@ -2282,3 +2335,109 @@ def test_an_answered_task_says_how_it_was_answered_and_is_not_due() -> None:
     assert all(needle in cells["entry-refused"] for needle in ("tkt_7", "refused", _OLD_RUN))
     assert cells["entry-abandoned"].startswith("cancelled -> ")
     assert all(needle in cells["entry-abandoned"] for needle in ("tkt_8", "refused"))
+
+
+# ---------------------------------------------------------------------------
+# A back-linked task the entry lists in corrected_by (task 7448): its whole
+# outcome for the entry was a correction of the entry's record, so its standing
+# decides nothing, though the report still shows it
+# ---------------------------------------------------------------------------
+
+_CORRECTION_TASK = 5687
+_REMEDIATION_TASK = 6000
+
+
+def _corrected(*rows: dict, corrected_by_root: str = _ROOT, **fields: Any) -> dict:
+    return _entry(
+        "entry-a",
+        filed_tickets=list(rows),
+        corrected_by=[{"project_root": corrected_by_root, "task_id": _CORRECTION_TASK}],
+        **fields,
+    )
+
+
+def _gone(task_id: int) -> dict:
+    return {"entry-a": disposition.Reverification(
+        "entry-a", disposition.TaskRef(_ROOT, task_id), ReverifyResult.GONE, found=_parsed(verified=False),
+    )}
+
+
+def test_a_correction_only_entry_is_never_due_and_never_projected_fixed() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK)))
+    before = copy.deepcopy(cb)
+
+    outcomes = _read(cb, {str(_CORRECTION_TASK): "done"})
+    projected, changes = disposition.project(cb, outcomes, _gone(_CORRECTION_TASK), as_of_sha=_SHA)
+
+    assert outcomes.due == ()
+    assert _entry_outcome(outcomes, "entry-a").governing is None
+    assert projected == before
+    assert _state(projected["entries"][0]) == ("open", None, None)
+    assert changes == ()
+
+
+@pytest.mark.parametrize("correction_status", ["done", "pending"])
+def test_a_correction_task_neither_outranks_nor_blocks_the_remediation_task(correction_status) -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK), _task_row(_REMEDIATION_TASK)))
+    statuses = {str(_CORRECTION_TASK): correction_status, str(_REMEDIATION_TASK): "done"}
+
+    outcomes = _read(cb, statuses)
+    projected, changes = disposition.project(cb, outcomes, _gone(_REMEDIATION_TASK), as_of_sha=_SHA)
+
+    assert outcomes.due == (disposition.Reverify("entry-a", disposition.TaskRef(_ROOT, _REMEDIATION_TASK)),)
+    assert _state(projected["entries"][0]) == ("fixed", None, _SHA)
+    assert changes == (_change("open", "fixed", fixed_at_sha=_SHA),)
+
+
+def test_an_unobserved_correction_task_holds_nothing() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK), _task_row(_REMEDIATION_TASK)))
+
+    outcome = _entry_outcome(_read(cb, {str(_REMEDIATION_TASK): "pending"}), "entry-a")
+
+    assert outcome.hold is None
+    governing = outcome.governing
+    assert governing is not None
+    assert governing.ref == disposition.TaskRef(_ROOT, _REMEDIATION_TASK)
+
+
+def test_an_abandoned_correction_task_is_never_re_filed() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK)))
+    store = FakeTaskStore(tasks={_CORRECTION_TASK: _task(_CORRECTION_TASK, "cancelled")})
+
+    outcomes = _read(cb, {str(_CORRECTION_TASK): "cancelled"}, store)
+
+    assert disposition.refilings(outcomes, {}, sighted={"entry-a"}) == ()
+
+
+def test_a_corrected_by_ref_of_another_project_does_not_name_the_rows_task() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK), corrected_by_root=_HARNESS_ROOT))
+
+    outcomes = _read(cb, {str(_CORRECTION_TASK): "done"})
+    projected, changes = disposition.project(cb, outcomes, _gone(_CORRECTION_TASK), as_of_sha=_SHA)
+
+    assert outcomes.due == (disposition.Reverify("entry-a", disposition.TaskRef(_ROOT, _CORRECTION_TASK)),)
+    assert changes == (_change("open", "fixed", fixed_at_sha=_SHA),)
+    assert _state(projected["entries"][0]) == ("fixed", None, _SHA)
+
+
+def test_a_correction_task_reports_that_it_corrected_the_record_and_decides_nothing() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK), _task_row(_REMEDIATION_TASK)))
+
+    record = _outcome_record(cb, {str(_CORRECTION_TASK): "done", str(_REMEDIATION_TASK): "pending"})
+
+    outcomes = {row["task_id"]: (row["outcome"], row["detail"]) for row in record["rows"]}
+    assert outcomes == {_CORRECTION_TASK: ("corrected", None), _REMEDIATION_TASK: ("live", None)}
+    (cell,) = [row for row in _table(_dispositions(record)) if row["task_id"] == str(_CORRECTION_TASK)]
+    assert cell["task_status"] == "done"
+    assert "corrected" in cell["outcome"]
+    assert "decides no status" in cell["outcome"]
+
+
+def test_an_unobserved_correction_task_keeps_why_it_was_unobserved() -> None:
+    cb = _codebook(_corrected(_task_row(_CORRECTION_TASK)))
+
+    record = _outcome_record(cb, {})
+
+    (row,) = record["rows"]
+    assert row["outcome"] == "corrected"
+    assert row["detail"] == f"task {_CORRECTION_TASK} is not in the get_statuses snapshot"

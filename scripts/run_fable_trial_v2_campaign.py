@@ -32,7 +32,7 @@ THREE RULES A LATER READER MUST NOT UNDO
    3628), which has landed — but ``--results-dir`` still replays artifacts
    written before it, and on those, reporting ``0`` would let ``plan_quality``
    read as fully validity-bounded when nothing bounded it. Mirrors
-   ``report.py``'s own ``mean_plan_quality=None`` convention — "we measured
+   ``plan_quality_report.py::build_plan_quality_report``'s own ``mean_plan_quality=None`` convention — "we measured
    nothing" must never read as "it scored nothing".
 
    The count is SURFACED from ``build_plan_quality_report`` rather than derived
@@ -148,7 +148,7 @@ def resolve_candidates(names: list[str]) -> list[Any]:
     Two loud failures, both structural rather than advisory:
 
     * an unresolvable name exits naming itself;
-    * a RESOLVABLE config whose ``role != 'architect'`` exits too.
+    * a RESOLVABLE config whose role is not ARCHITECT exits too.
 
     The second is the load-bearing one. ``run_ofat_stage`` dispatches BY ROLE:
     an implementer candidate goes through ``run_eval``, a full agentic workflow
@@ -160,6 +160,7 @@ def resolve_candidates(names: list[str]) -> list[Any]:
     ``ofat_candidates()`` is never called anywhere in this driver.
     """
     from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.metrics import RoleUnderTest
 
     resolved = []
     for name in names:
@@ -170,9 +171,9 @@ def resolve_candidates(names: list[str]) -> list[Any]:
                 '  Architect candidates live in ARCHITECT_EVAL_CONFIGS '
                 '(orchestrator/src/orchestrator/evals/configs.py).'
             )
-        if cfg.role != 'architect':
+        if cfg.role is not RoleUnderTest.ARCHITECT:
             raise SystemExit(
-                f'Error: candidate {name!r} has role={cfg.role!r}, not \'architect\'.\n'
+                f'Error: candidate {name!r} has role={cfg.role.value!r}, not \'architect\'.\n'
                 '  run_ofat_stage dispatches BY ROLE, so this candidate would be routed '
                 'through run_eval — a full agentic workflow cell at roughly 10x the cost '
                 'of the plan-only architect cell this campaign measures. That is the spend '
@@ -259,8 +260,8 @@ MARKER_KEY = 'judged_without_reference'
 UNMEASURED_CELLS_KEY = 'judged_without_reference_unmeasured_cells'
 
 # What an unmeasured marker renders as. Deliberately a WORD, never ``0`` and
-# never the ``-`` report.py uses for an empty mean: this one has to survive
-# being skimmed.
+# never the ``-`` that ``plan_quality_report.py::format_plan_quality_table``
+# renders for an empty mean: this one has to survive being skimmed.
 UNMEASURED = 'unmeasured'
 
 # The per-candidate breakout of ``declined`` by terminal kind (task 4760).
@@ -351,10 +352,12 @@ def _architect_cells(results: list[Any]) -> list[tuple[str, str, dict[str, Any]]
     to what counts as an architect cell would otherwise have to be made twice,
     with only one of the sites carrying the argument for why it matters.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
+
     cells = []
     for result in results:
         metrics = result.metrics or {}
-        if metrics.get('role_under_test') != 'architect':
+        if metrics.get('role_under_test') != RoleUnderTest.ARCHITECT:
             continue
         cells.append((result.task_id, result.config_name, metrics))
     return cells
@@ -406,7 +409,7 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     Rows are sorted by ``config_name`` so a committed report artifact diffs
     cleanly.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
     rows = []

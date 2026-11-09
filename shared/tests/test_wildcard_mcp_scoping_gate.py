@@ -511,24 +511,126 @@ class TestRegistryFilterSites:
         assert is_violation(sites[0]), f'got {sites[0]!r}'
 
 
+class TestInjectedInvokerSites:
+    """A call through a name bound to a target callee is the same call.
+
+    A constructor-injected invoker defaults to ``invoke_with_cap_retry`` and is
+    then called as ``self._invoke(...)``. Matching callee spellings alone would
+    lose that site, and the gate would report a load-bearing caller GONE while
+    its MCP scoping went unguarded.
+    """
+
+    def test_a_constructor_injected_invoker_called_through_self_is_a_site(self) -> None:
+        sites = _scan('''
+            class Curator:
+                def __init__(self, invoke=invoke_with_cap_retry):
+                    self._invoke = invoke
+                async def _invoke_curator(self, prompt):
+                    return await self._invoke(
+                        prompt=prompt,
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        cwd=self._root,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        (site,) = sites
+        assert site.qualname == 'Curator._invoke_curator', f'got {site!r}'
+        assert site.callee == '_invoke', f'got {site!r}'
+        assert site.exemption == NOT_EXEMPT, f'got {site!r}'
+        assert is_violation(site), f'got {site!r}'
+
+    def test_a_strictly_scoped_injected_invoker_call_is_compliant(self) -> None:
+        sites = _scan('''
+            class Curator:
+                def __init__(self, invoke=invoke_with_cap_retry):
+                    self._invoke = invoke
+                async def _invoke_curator(self, prompt):
+                    return await self._invoke(
+                        prompt=prompt,
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        mcp_config=no_mcp_servers_config(),
+                        strict_mcp_config=True,
+                        cwd=self._root,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
+        assert not is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_call_through_the_defaulted_parameter_is_a_site(self) -> None:
+        """The attribute-spelled default binds the parameter just the same."""
+        sites = _scan('''
+            def ask(root, invoke=cli_invoke.invoke_claude_agent):
+                return invoke(available_tools=['Read'], cwd=root)
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].qualname == 'ask', f'got {sites[0]!r}'
+        assert sites[0].callee == 'invoke', f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_class_field_default_is_a_site(self) -> None:
+        """The dataclass-field form of the same binding."""
+        sites = _scan('''
+            @dataclass(frozen=True)
+            class Deps:
+                cap_retry: CapRetry = invoke_with_cap_retry
+
+            async def run(deps, root):
+                return await deps.cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=S,
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].qualname == 'run', f'got {sites[0]!r}'
+        assert sites[0].callee == 'cap_retry', f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    @pytest.mark.parametrize('init_signature', [
+        'def __init__(self, invoke):',
+        'def __init__(self, invoke=some_other_helper):',
+    ])
+    def test_a_name_never_bound_to_a_target_is_not_a_site(self, init_signature: str) -> None:
+        """The kwargs alone still mean nothing: an attribute that is never bound
+        to a target callee is an unrelated callee.
+        """
+        assert _scan(f'''
+            class Curator:
+                {init_signature}
+                    self._invoke = invoke
+                async def _invoke_curator(self, r):
+                    return await self._invoke(
+                        disallowed_tools=['*'],
+                        output_schema=S,
+                        cwd=r,
+                    )
+        ''') == []
+
+
 # --------------------------------------------------------------------------- #
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
 
-#: Every matching call site in the first-party tree, re-measured on 2026-10-19
-#: (task 6003): 5 matched, 0 violations, all five protected by
+#: Every matching call site in the first-party tree, re-measured on 2026-10-25
+#: (task 6706): 5 matched, 0 violations, all five protected by
 #: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``;
-#: AgentLoop._call_claude_cli matches through available_tools (task 4344).
+#: AgentLoop._call_claude_cli matches through available_tools (task 4344), and
+#: ClaudeShardAsker.__call__ and TaskCurator._invoke_curator match through
+#: their injected invokers, whose constructor default is invoke_with_cap_retry.
+#: The curator's single and batch calls share that one site.
 #: Kept as an exact SET, not a count: a new
 #: matching caller anywhere in the tree must be looked at even when it is
 #: correctly scoped, and none of these five may silently vanish.
 _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
+    ('fused-memory/src/fused_memory/maintenance/link_adjudicator.py',
+     'ClaudeShardAsker.__call__'),
     ('fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py',
      'PathScopeAdjudicator.adjudicate'),
     ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm'),
-    ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm_batch'),
+     'TaskCurator._invoke_curator'),
     ('fused-memory/src/fused_memory/reconciliation/agent_loop.py',
      'AgentLoop._call_claude_cli'),
     ('fused-memory/src/fused_memory/reconciliation/judge.py',

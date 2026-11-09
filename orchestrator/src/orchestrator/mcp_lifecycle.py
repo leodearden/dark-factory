@@ -8,7 +8,6 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,10 @@ from typing import Any
 import anyio
 import httpx
 from shared.jcodemunch_launch import jcodemunch_server_config
+from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
+    tool_error_text,
+    tool_text_blocks,
+)
 from shared.mcp_session import McpSession
 from shared.proc_group import terminate_process_group
 
@@ -96,6 +99,7 @@ def _stdio_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> dict:
     """Shared launch-dict factory for stdio MCP servers (task 2482 amendment).
@@ -133,14 +137,19 @@ def _stdio_mcp_server(
             ``--meta-root``.  When ``None`` (default), no ``--meta-root``
             flag is emitted and args are byte-identical to before this
             parameter existed.
+        task_root: Optional task-lifetime root (see
+            ``TaskArtifacts.task_root_for``), passed as ``--task-root``
+            right after the ``--meta-root`` pair; ``None`` emits nothing.
         extra_args: Additional tokens appended after the ``--worktree``/
-            ``--meta-root`` args (e.g. verdict-tools' ``--verdict-role``
-            pair).  Empty by default — exactly plan-tools' shape.
+            ``--meta-root``/``--task-root`` args (e.g. verdict-tools'
+            ``--verdict-role`` pair).  Empty by default — exactly
+            plan-tools' shape.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
+    task_root_args = ['--task-root', str(task_root)] if task_root is not None else []
     if python_executable:
         # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
         return {
@@ -148,6 +157,7 @@ def _stdio_mcp_server(
             'args': [
                 '-m', module_path, '--worktree', str(worktree),
                 *meta_root_args,
+                *task_root_args,
                 *extra_args,
             ],
             # Suppress FastMCP's banner + synchronous PyPI update-check so the
@@ -166,6 +176,7 @@ def _stdio_mcp_server(
             'python', '-m', module_path,
             '--worktree', str(worktree),
             *meta_root_args,
+            *task_root_args,
             *extra_args,
         ],
         # Same FastMCP banner/update-check suppression as the hot path above;
@@ -179,6 +190,7 @@ def plan_tools_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -231,13 +243,14 @@ def plan_tools_mcp_server(
             orchestrator (worktree-lane-lifecycle PRD task ε1). When
             ``None`` (default), no ``--meta-root`` flag is emitted and args
             are byte-identical to before this parameter existed.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.plan_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
     )
 
 
@@ -247,12 +260,13 @@ def verdict_tools_mcp_server(
     role: str,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the verdict-tools server.
 
     Launch target is α's ``orchestrator.mcp.verdict_tools`` CLI (task 2481):
     ``<interpreter> -m orchestrator.mcp.verdict_tools --worktree <wt>
-    [--meta-root <mr>] --verdict-role <role>``. *role* is the
+    [--meta-root <mr>] [--task-root <tr>] --verdict-role <role>``. *role* is the
     ``--verdict-role`` value — the authoritative selector for both which
     single tool the server registers (judge/merger/reviewer-name, see
     ``verdict_tools.create_server``) and the ``verdicts/<role>.json``
@@ -301,13 +315,14 @@ def verdict_tools_mcp_server(
             ``--meta-root``, so the agent-side verdict-tools server targets
             the same relocated artifacts root as the orchestrator. When
             ``None`` (default), no ``--meta-root`` flag is emitted.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.verdict_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
         extra_args=('--verdict-role', role),
     )
 
@@ -451,35 +466,6 @@ async def verify_plan_tools_startup(
 
     probes = await _run_all()
     return PlanToolsStartupReport(probes=probes)
-
-
-def tool_error_text(reply: Mapping[str, Any]) -> str | None:
-    """The error prose of a tool-level failure, or None if the tool succeeded.
-
-    An MCP tool reports its own failure in the response body, as a
-    well-formed envelope carrying ``isError``, not by breaking the transport.
-    Nothing about that envelope's shape says it failed, so a reader that
-    checks only the shape would take the error prose for a result.
-    """
-    if not reply.get('isError'):
-        return None
-    texts = tool_text_blocks(reply)
-    return texts[0] if texts else ''
-
-
-def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
-    """The text of each ``text`` content block of a tool result, in order.
-
-    An envelope whose ``content`` is missing, null or not a list carries no text.
-    """
-    content = reply.get('content')
-    if not isinstance(content, list):
-        return ()
-    return tuple(
-        str(block.get('text', ''))
-        for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-    )
 
 
 # The orchestrator's one self-identification spelling. clientInfo reaches only

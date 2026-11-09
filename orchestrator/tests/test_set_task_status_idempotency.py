@@ -17,6 +17,8 @@ from shared.testing_mcp_stub import StubMcpServer
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
 
+pytestmark = pytest.mark.real_mcp_session
+
 _TRANSIENT_REJECTION = {
     'error': "TimeoutError('ensure_connected timed out')",
     'error_type': 'TimeoutError',

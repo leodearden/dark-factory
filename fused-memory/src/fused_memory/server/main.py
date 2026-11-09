@@ -14,7 +14,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from dotenv import load_dotenv
 
@@ -59,7 +59,19 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+    from fused_memory.services.mem0_retry_backlog_alarm import Mem0RetryBacklogChecker
+    from fused_memory.services.mem0_write_retry import Mem0RetryRunner, OnMem0Landed
+
+    class _Mem0WriteDurabilityService(
+        Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
+    ):
+        """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
+
+        async def recover_mem0_intents(
+            self, *, on_landed: OnMem0Landed | None = None
+        ) -> object: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -573,11 +585,9 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.journal_retention import prune_every_table_at_startup
     from fused_memory.services.write_journal import WriteJournal
-    from fused_memory.services.write_ops_retention import (
-        prune_write_ops_pass,
-        run_periodic_write_ops_prune,
-    )
+    from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -589,43 +599,12 @@ async def run_server():
     # self.mem0 / self.durable_queue), so this must run here rather than inside
     # initialize(). Idempotent — no pending intents ⇒ no-op — so it is safe to
     # run on every startup; a partial dual write is thus never left SILENT.
-    _mem0_recovery = await memory_service.recover_mem0_intents()
-    logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
+    await _recover_mem0_intents_at_startup(memory_service)
 
-    # Bounded retention: age out old terminal mem0_intents so the write-ahead
-    # journal does not grow without bound (one row accrues per successful mem0
-    # write). Runs after recovery so no still-pending intent is ever pruned;
-    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
-    _mem0_pruned = await write_journal.prune_mem0_intents()
-    if _mem0_pruned:
-        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
-
-    # Bounded retention: age out old idempotent_ops so the client-idempotency
-    # key table does not grow without bound (one row accrues per mutating task
-    # write). An idempotency key only needs to outlive the transport-retry
-    # window it guards, so the default TTL is aggressive. Fire-and-forget.
-    _idempotent_pruned = await write_journal.prune_idempotent_ops()
-    if _idempotent_pruned:
-        logger.info(
-            f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
-        )
-
-    # Bounded retention: age out old write_ops so the journal does not grow
-    # without bound. UNLIKE its two siblings above this prune is BATCHED,
-    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
-    # 16 GB, and an unbounded DELETE here would hold the write lock past the
-    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
-    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
-    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. The periodic loop
-    # started below now carries the drain, not successive restarts; this pass
-    # catches up after downtime, and every partial pass discloses its backlog at
-    # WARNING. Fire-and-forget.
-    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
-    if _write_ops_pruned:
-        logger.info(
-            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
-        )
+    # Must follow mem0 intent recovery, so no still-pending intent is pruned.
+    _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
+    if any(_pruned.values()):
+        logger.info(f'write journal retention prune at startup: {_pruned}')
 
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
@@ -814,6 +793,7 @@ async def run_server():
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
+            coalesce_task_events=config.reconciliation.coalesce_task_events,
         )
         await event_buffer.initialize()
 
@@ -1167,6 +1147,8 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
+    mem0_retry_task = _start_mem0_retry_loop(memory_service)
+
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
         task_interceptor.remint_broken_recurrence_chains,
@@ -1349,6 +1331,9 @@ async def run_server():
         write_ops_prune_task.cancel()
         with contextlib.suppress(BaseException):
             await write_ops_prune_task
+        mem0_retry_task.cancel()
+        with contextlib.suppress(BaseException):
+            await mem0_retry_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1413,6 +1398,9 @@ def _collect_checkpoint_targets(
     pe = getattr(memory_service, 'planned_episode_registry', None)
     if pe is not None and hasattr(pe, 'checkpoint'):
         targets.append(('planned_episode_registry', pe.checkpoint))
+    shadow = getattr(memory_service, 'overreach_shadow', None)
+    if shadow is not None and hasattr(shadow, 'checkpoint'):
+        targets.append(('overreach_shadow', shadow.checkpoint))
     if known_projects:
         for project_id, root in known_projects.items():
             targets.append((
@@ -1624,6 +1612,60 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
         _loop_lag_monitor(threshold_ms=threshold_ms),
         name='loop_lag_monitor',
     )
+
+
+def _mark_supersedes_on_landing(memory_service: MemoryUpdater) -> OnMem0Landed:
+    """The hook every Mem0 re-issue path runs when it lands: mark the write's journaled supersedes.
+
+    Composed here because the service layer cannot import supersession_mark
+    without pulling server modules up into it.
+    """
+    from fused_memory.services.supersession_mark import mark_superseded_after_retry
+
+    return partial(mark_superseded_after_retry, memory_service)
+
+
+async def _recover_mem0_intents_at_startup(memory_service: _Mem0WriteDurabilityService) -> None:
+    summary = await memory_service.recover_mem0_intents(
+        on_landed=_mark_supersedes_on_landing(memory_service)
+    )
+    logger.info(f'mem0 intent recovery at startup: {summary}')
+
+
+def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> asyncio.Task[None]:
+    """Spawn the Mem0 write retry pass and its backlog check on the service's own policy; RETURN one handle for teardown.
+
+    Each runs in its own loop, so a failing pass never skips the check.
+    """
+    from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry
+
+    policy = memory_service.mem0_retry_policy
+
+    async def _run_both() -> None:
+        async with asyncio.TaskGroup() as loops:
+            loops.create_task(run_periodic_mem0_retry(
+                partial(
+                    memory_service.retry_due_mem0_intents,
+                    on_landed=_mark_supersedes_on_landing(memory_service),
+                ),
+                interval_seconds=policy.poll_interval_seconds,
+                what='retry pass',
+            ))
+            loops.create_task(run_periodic_mem0_retry(
+                memory_service.check_mem0_retry_backlog,
+                interval_seconds=policy.backlog_check_interval_seconds,
+                what='retry backlog check',
+            ))
+
+    task = asyncio.create_task(_run_both(), name='mem0_write_retry')
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass; '
+        'backlog age checked every %.0fs',
+        policy.poll_interval_seconds,
+        policy.batch_size,
+        policy.backlog_check_interval_seconds,
+    )
+    return task
 
 
 def _start_remint_sweep(

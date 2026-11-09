@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import threading
 import time
 import types
@@ -24,7 +25,12 @@ import pytest
 from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
 from shared.testing_virtual_clock import virtual_clock_test
 
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import (
+    TTLCache,
+    first_success,
+    log_fanout_failure,
+    note_fanout_success,
+)
 from dashboard.project_labels import ProjectLabels
 
 
@@ -59,6 +65,16 @@ def _hanging_call(hang_url: str, attempted: list[str]):
         return 'ok'
 
     return call
+
+
+def _assert_next_failure_opens_a_streak(caplog, log_label: str, url: str, why: str) -> None:
+    """The next real failure for *(log_label, url)* logs its opening WARNING, not a repeat."""
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+        log_fanout_failure(log_label, url, RuntimeError('real failure'))
+    (record,) = [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
+    assert record.levelno == logging.WARNING, why
+    assert record.getMessage().startswith(f'{log_label} failed for {url}: '), why
 
 
 @pytest.fixture(autouse=True)
@@ -348,7 +364,6 @@ class TestFirstSuccessInvalidatesOnCancellation:
     """
 
     async def test_caller_wait_for_cancels_and_session_is_invalidated(self, caplog):
-        from dashboard.data import mcp_fanout
         from dashboard.data.memory import _get_session, _sessions
 
         _get_session('http://a')
@@ -384,11 +399,6 @@ class TestFirstSuccessInvalidatesOnCancellation:
             r for r in caplog.records
             if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
         ], 'a cancellation is not an endpoint failure and must not be reported'
-        assert mcp_fanout._failure_streaks == {}, (
-            'a cancellation must leave the streak counters untouched, or it '
-            "demotes the next real failure's opening WARNING to DEBUG"
-        )
-
         assert 'http://a' not in _sessions, (
             'a cancelled in-flight url must have its wedged session '
             'invalidated, or every subsequent poll reuses it and hangs'
@@ -397,9 +407,13 @@ class TestFirstSuccessInvalidatesOnCancellation:
             'the cancellation must propagate, not be swallowed into a '
             f'fall-through to the next url, got {attempted}'
         )
+        _assert_next_failure_opens_a_streak(
+            caplog, 'test', 'http://a',
+            'a cancellation must leave no streak behind, or it demotes the '
+            "next real failure's opening WARNING to DEBUG",
+        )
 
-    async def test_direct_task_cancel_propagates_and_invalidates(self):
-        from dashboard.data import mcp_fanout
+    async def test_direct_task_cancel_propagates_and_invalidates(self, caplog):
         from dashboard.data.memory import _get_session, _sessions
 
         _get_session('http://a')
@@ -423,9 +437,10 @@ class TestFirstSuccessInvalidatesOnCancellation:
 
         assert 'http://a' not in _sessions
         assert attempted == ['http://a']
-        assert mcp_fanout._failure_streaks == {}, (
+        _assert_next_failure_opens_a_streak(
+            caplog, 'test', 'http://a',
             'a task.cancel() is not an endpoint failure either — see the '
-            'streak reasoning in the test above'
+            'streak reasoning in the test above',
         )
 
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
@@ -583,6 +598,21 @@ class TestFanoutFailureThrottling:
         )
         assert '2 consecutive' in messages[1], (
             f'recovery should report the streak length, got {messages[1]}'
+        )
+
+    def test_success_after_n_failures_logs_one_recovery_line_naming_n(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            for _ in range(3):
+                log_fanout_failure('probe', 'http://a', RuntimeError('down'))
+            caplog.clear()
+            note_fanout_success('probe', 'http://a')
+            note_fanout_success('probe', 'http://a')
+
+        messages = [
+            r.getMessage() for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert messages == ['probe recovered for http://a after 3 consecutive failure(s)'], (
+            f'one closing bracket per streak, naming its length, got {messages}'
         )
 
     async def test_reset_sessions_clears_streak_state(self, caplog):
@@ -1512,6 +1542,28 @@ async def _named_refresh() -> str:
     return 'value'
 
 
+async def _force_bypass(cache, key, refresh):
+    """Force exactly one bypass for *key*: hold its lock, call get_or_refresh, release.
+
+    Always passes ``cache_ok=False`` so the key never actually warms up —
+    a ``cache_ok=True`` bypass would store a value and let the very next
+    call take the lock-free warm fast path, never touching the lock (or
+    the bypass logging) again.
+    """
+    lock = cache._locks.setdefault(key, asyncio.Lock())
+    await lock.acquire()
+    try:
+        return await asyncio.wait_for(
+            cache.get_or_refresh(key, refresh, cache_ok=lambda v: False), 5.0
+        )
+    finally:
+        lock.release()
+
+
+def _fanout_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
+
+
 class TestTTLCacheLockBypassLogging:
     """A lock-acquisition bypass must be VISIBLE, but not a log flood.
 
@@ -1523,24 +1575,6 @@ class TestTTLCacheLockBypassLogging:
     the repeats, WARNING again on recovery.
     """
 
-    @staticmethod
-    async def _force_bypass(cache, key, refresh):
-        """Force exactly one bypass for *key*: hold its lock, call get_or_refresh, release.
-
-        Always passes ``cache_ok=False`` so the key never actually warms up —
-        a ``cache_ok=True`` bypass would store a value and let the very next
-        call take the lock-free warm fast path, never touching the lock (or
-        this logging) again.
-        """
-        lock = cache._locks.setdefault(key, asyncio.Lock())
-        await lock.acquire()
-        try:
-            return await asyncio.wait_for(
-                cache.get_or_refresh(key, refresh, cache_ok=lambda v: False), 5.0
-            )
-        finally:
-            lock.release()
-
     async def test_first_bypass_warns_naming_the_key_and_the_refresh(
         self, monkeypatch, caplog
     ):
@@ -1550,7 +1584,7 @@ class TestTTLCacheLockBypassLogging:
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
-            await self._force_bypass(cache, 'my-key', _named_refresh)
+            await _force_bypass(cache, 'my-key', _named_refresh)
 
         warnings = [
             r for r in caplog.records
@@ -1573,7 +1607,7 @@ class TestTTLCacheLockBypassLogging:
 
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
             for _ in range(5):
-                await self._force_bypass(cache, 'k', _named_refresh)
+                await _force_bypass(cache, 'k', _named_refresh)
 
         records = [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
         warnings = [r for r in records if r.levelno == logging.WARNING]
@@ -1599,7 +1633,7 @@ class TestTTLCacheLockBypassLogging:
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
             for _ in range(3):
-                await self._force_bypass(cache, 'k', _named_refresh)
+                await _force_bypass(cache, 'k', _named_refresh)
 
         warnings = [
             r for r in caplog.records
@@ -1617,9 +1651,9 @@ class TestTTLCacheLockBypassLogging:
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
-            await self._force_bypass(cache, 'a', _named_refresh)
-            await self._force_bypass(cache, 'a', _named_refresh)  # demoted to DEBUG
-            await self._force_bypass(cache, 'b', _named_refresh)  # independent streak
+            await _force_bypass(cache, 'a', _named_refresh)
+            await _force_bypass(cache, 'a', _named_refresh)  # demoted to DEBUG
+            await _force_bypass(cache, 'b', _named_refresh)  # independent streak
 
         warnings = [
             r for r in caplog.records
@@ -1640,8 +1674,8 @@ class TestTTLCacheLockBypassLogging:
         key = 'recovering-key'
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
-            await self._force_bypass(cache, key, _named_refresh)
-            await self._force_bypass(cache, key, _named_refresh)  # demoted to DEBUG
+            await _force_bypass(cache, key, _named_refresh)
+            await _force_bypass(cache, key, _named_refresh)  # demoted to DEBUG
 
             # Nobody holds the lock now, so this acquires NORMALLY. cache_ok
             # stays False so the key remains cold and the NEXT call also
@@ -1652,7 +1686,7 @@ class TestTTLCacheLockBypassLogging:
             await cache.get_or_refresh(key, _named_refresh, cache_ok=lambda v: False)
 
             # A later bypass re-arms the opening WARNING.
-            await self._force_bypass(cache, key, _named_refresh)
+            await _force_bypass(cache, key, _named_refresh)
 
         messages = [
             r.getMessage() for r in caplog.records
@@ -1663,18 +1697,39 @@ class TestTTLCacheLockBypassLogging:
             f'the streak needs a visible closing bracket naming the key, got {messages[1]}'
         )
 
+    async def test_a_normal_acquisition_after_n_bypasses_logs_one_recovery_naming_n(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        for _ in range(3):
+            await _force_bypass(cache, 'k', _named_refresh)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            await cache.get_or_refresh('k', _named_refresh, cache_ok=lambda v: False)
+            await cache.get_or_refresh('k', _named_refresh, cache_ok=lambda v: False)
+
+        recoveries = [r for r in _fanout_records(caplog) if 'recovered' in r.getMessage()]
+        assert [r.getMessage() for r in recoveries] == [
+            "lock for key 'k' recovered after 3 consecutive bypass(es)",
+        ], 'one closing bracket per streak, naming its length'
+        assert recoveries[0].levelno == logging.WARNING
+
     async def test_clear_resets_bypass_streak_state(self, monkeypatch, caplog):
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
-        await self._force_bypass(cache, 'k', _named_refresh)
+        await _force_bypass(cache, 'k', _named_refresh)
         cache.clear()
         caplog.clear()  # drop the opening WARNING captured above
 
         with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
-            await self._force_bypass(cache, 'k', _named_refresh)
+            await _force_bypass(cache, 'k', _named_refresh)
 
         warnings = [
             r for r in caplog.records
@@ -1687,51 +1742,48 @@ class TestTTLCacheLockBypassLogging:
 
 
 class TestTTLCacheBypassStreaksPruning:
-    """A bypass-streak counter must not outlive both its lock and its value.
+    """A bypass streak must not outlive both its lock and its value.
 
-    Before this, ``_bypass_streaks`` was only ever cleared wholesale by
-    ``clear()`` -- nothing pruned individual keys. ``_note_lock_acquired``
-    pops a key only on a NORMAL cold acquisition, and a key that self-heals
-    via a bypassed store is thereafter served from the warm path, so its
-    streak entry would survive indefinitely. This contradicts the class
-    docstring's "Key space is bounded by disuse, not by cardinality" claim
-    for this third per-key dict (task 3857 review, extended here).
+    ``_note_lock_acquired`` closes a streak only on a NORMAL cold
+    acquisition, and a key that self-heals via a bypassed store is thereafter
+    served from the warm path, so without a prune its streak would survive
+    indefinitely. This contradicts the class docstring's "Key space is
+    bounded by disuse, not by cardinality" claim (task 3857 review, extended
+    here). A pruned streak is observable as its re-armed opening WARNING.
     """
 
     async def test_a_bypass_streak_is_pruned_once_its_lock_and_value_are_both_gone(
-        self, monkeypatch
+        self, monkeypatch, caplog
     ):
         import dashboard.data.mcp_fanout as fanout_mod
 
         monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
 
-        # Force one bypass for 'k' (cache_ok=False so nothing is stored and
-        # the key stays cold), leaving an open streak entry behind.
-        lock = cache._locks.setdefault('k', asyncio.Lock())
-        await lock.acquire()
-        try:
-            await asyncio.wait_for(
-                cache.get_or_refresh('k', _named_refresh, cache_ok=lambda v: False),
-                5.0,
-            )
-        finally:
-            lock.release()
-
-        assert cache._bypass_streaks.get('k') == 1, 'precondition: an open streak exists'
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            await _force_bypass(cache, 'k', _named_refresh)
+        (opening,) = _fanout_records(caplog)
+        assert opening.levelno == logging.WARNING, 'precondition: a streak opened'
+        lock = cache._locks['k']
         assert not lock.locked(), 'precondition: the lock was released'
         assert not getattr(lock, '_waiters', None), 'precondition: nobody is queued'
         assert 'k' not in cache._store, 'precondition: nothing cacheable was stored'
 
         cache._evict_expired()
-
         assert 'k' not in cache._locks, 'precondition: the idle lock is reclaimed'
-        assert 'k' not in cache._bypass_streaks, (
-            'a bypass streak for a key with no live lock and no cached value '
-            'must be pruned, not left to persist forever'
-        )
 
-    async def test_a_streak_survives_while_its_lock_is_still_live(self, monkeypatch):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            await _force_bypass(cache, 'k', _named_refresh)
+        (next_bypass,) = _fanout_records(caplog)
+        assert next_bypass.levelno == logging.WARNING, (
+            'a bypass streak for a key with no live lock and no cached value '
+            'must be pruned, so the next bypass opens a fresh streak at '
+            f'WARNING rather than repeating at DEBUG; got {next_bypass.getMessage()}'
+        )
+        assert '(1 consecutive)' in next_bypass.getMessage()
+
+    async def test_a_streak_survives_while_its_lock_is_still_live(self, monkeypatch, caplog):
         """The prune must not fire early and demote an ACTIVE streak's next warning."""
         import dashboard.data.mcp_fanout as fanout_mod
 
@@ -1745,17 +1797,24 @@ class TestTTLCacheBypassStreaksPruning:
                 cache.get_or_refresh('k', _named_refresh, cache_ok=lambda v: False),
                 5.0,
             )
-            assert cache._bypass_streaks.get('k') == 1
 
             # An unrelated cold miss triggers a sweep while 'k's lock is
             # STILL held by this test.
             await cache.get_or_refresh('other', _named_refresh)
 
-            assert 'k' in cache._bypass_streaks, (
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+                await asyncio.wait_for(
+                    cache.get_or_refresh('k', _named_refresh, cache_ok=lambda v: False),
+                    5.0,
+                )
+            (next_bypass,) = _fanout_records(caplog)
+            assert next_bypass.levelno == logging.DEBUG, (
                 "a streak whose lock is still live must survive the sweep -- "
                 "pruning it here would demote the next bypass's WARNING to "
                 "DEBUG for a wedge that never actually recovered"
             )
+            assert '(2 consecutive)' in next_bypass.getMessage()
         finally:
             lock.release()
 
@@ -2095,11 +2154,15 @@ class TestTTLCacheBoundedBypassInheritance:
                 f'here, so it lands at DEBUG under the existing throttle, '
                 f'got levels {[logging.getLevelName(r.levelno) for r in rearm_records]}'
             )
-            assert cache._bypass_streaks.get('k', 0) > 2, (
+            rearm_counts = [
+                int(count)
+                for r in rearm_records
+                for count in re.findall(r'\((\d+) consecutive\)', r.getMessage())
+            ]
+            assert rearm_counts and max(rearm_counts) > 2, (
                 'the re-arm must be counted through the same per-key streak '
                 "counter as the two lock-acquisition timeouts (second's and "
-                f"third's), not a separate uncounted path; streak="
-                f"{cache._bypass_streaks.get('k')}"
+                f"third's), not a separate uncounted path; counts={rearm_counts}"
             )
         finally:
             current = cache._bypass_tasks.get('k')

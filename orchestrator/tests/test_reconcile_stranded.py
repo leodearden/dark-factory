@@ -15,21 +15,25 @@ from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from _landing_evidence_helpers import differential_confirms, landing_reject_rows
 from _orch_helpers import (
     mock_lock_table,
     pydantic_spec,
     wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
     wire_scheduler_liveness_mock,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import DeliveredChecksConfig, GitConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     DeliveredChecksVerdict,
 )
+from orchestrator.event_store import EventStore
+from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
@@ -96,25 +100,24 @@ def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None
     MergeProvenance.bind(outbox)
 
 
-def _resolver_lock_dir(worktree: Path) -> Path:
-    """The directory the stranded sweep actually READS plan.lock from.
+def _resolver_lock_dir(worktree: Path, tid: str) -> Path:
+    """The directory the stranded sweep actually READS *tid*'s plan.lock from.
 
-    ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING of the
-    worktree, derived through ``TaskArtifacts.meta_root_for`` (the single
-    owner of that path shape) rather than hand-joined, exactly as the sole
-    production writer does (``TaskWorkflow``, workflow.py) and as
-    ``TaskGroundTruth._resolve_live_claimant`` does on the read side (task
-    4028).  Mirrors ``_plan_lock_artifacts`` in test_task_ground_truth.py.
+    ``<worktree_base>/.task-meta/task-<tid>`` — plan.lock is task-scoped, so
+    it lives in the task root (``TaskArtifacts.task_root_for``), where the
+    sole production writer (``TaskWorkflow``) puts it and where
+    ``TaskGroundTruth._resolve_live_claimant`` reads it (tasks 4028, 3155).
+    Mirrors ``_plan_lock_artifacts`` in test_task_ground_truth.py.
 
     Every fixture whose lock CONTENT must be INTERPRETED — live vs dead
     ``owner_pid``, fresh vs expired ``locked_at``, malformed JSON — must
-    stage it here.  A lock under ``<worktree>/.task`` is invisible to the
-    resolver, so such a test would pass vacuously: it would assert the
-    revert-to-pending that lock ABSENCE produces, never reaching
-    ``_pid_alive`` / ``_lock_fresh`` / the ``except (ValueError, OSError)``
-    degradation arm at all.
+    stage it here.  A lock anywhere else is invisible to the resolver, so
+    such a test would pass vacuously: it would assert the revert-to-pending
+    that lock ABSENCE produces, never reaching ``_pid_alive`` /
+    ``_lock_fresh`` / the ``except (ValueError, OSError)`` degradation arm at
+    all.
     """
-    return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    return TaskArtifacts.task_root_for(worktree.parent, tid)
 
 
 def _vestigial_lock_dir(worktree: Path) -> Path:
@@ -234,6 +237,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # exercise real semantics instead of an auto-mocked (always-truthy) stub.
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -539,6 +543,202 @@ class TestReconcileOneStrandedEffectPresentGuard:
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4496 — the MARK_DONE arm's landing-evidence reject is recorded as a
+# landing_evidence_rejected event, BEFORE any revert reaps the worktree.
+# Canonical WHY: orchestrator/src/orchestrator/landing_reject_emission.py.
+# ---------------------------------------------------------------------------
+
+
+def _bind_event_store(harness: Harness, tmp_path: Path) -> EventStore:
+    store = EventStore(tmp_path / 'runs.db', 'run-test')
+    harness.event_store = store
+    return store
+
+
+_RECOVERED_SHA = 'deadbeef' + 'a' * 32
+
+
+def _on_main_effect_absent(
+    harness: Harness, tid: str, monkeypatch: pytest.MonkeyPatch,
+    *, metadata: dict | None = None,
+) -> None:
+    scheduler = cast(MagicMock, harness.scheduler)
+    scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+    scheduler.get_task = AsyncMock(
+        return_value={'status': 'in-progress', 'metadata': metadata or {}},
+    )
+    monkeypatch.setattr(harness.git_ops, 'is_ancestor', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=_RECOVERED_SHA),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
+            present=False, diverged_paths=('src/y.py',), anchor_sha=_RECOVERED_SHA,
+            failure='effect_not_survived', aggregate_survival=0.3, added_lines_total=40,
+        )),
+    )
+
+
+def _blocked_marker_effect_absent(
+    harness: Harness, tid: str, marker_sha: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = cast(MagicMock, harness.scheduler)
+    scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)
+    scheduler.get_task = AsyncMock(
+        return_value={'status': 'blocked', 'metadata': {}},
+    )
+    monkeypatch.setattr(harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=None))
+    monkeypatch.setattr(harness.git_ops, 'find_merge_marker', AsyncMock(return_value=marker_sha))
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
+            present=False, diverged_paths=('src/z.py',), anchor_sha=marker_sha,
+            failure='effect_not_survived', aggregate_survival=0.2, added_lines_total=30,
+        )),
+    )
+
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedLandingRejectEmission:
+    async def test_on_main_effect_absent_reject_is_recorded_and_still_reverts(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9020'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_awaited_once_with(
+            tid, 'pending',
+        )
+        [row] = landing_reject_rows(store)
+        assert row['task_id'] == tid
+        data = row['data']
+        assert data['site'] == 'reconcile_sweep'
+        assert data['task_status'] == 'in-progress'
+        assert data['reason'] == 'effect_absent'
+        assert data['citation'] == _RECOVERED_SHA
+        assert data['effect_check_sha'] == _RECOVERED_SHA
+        assert data['branch_tip_sha'] == _RECOVERED_SHA
+        assert data['diverged_paths'] == ['src/y.py']
+        assert data['aggregate_survival'] == 0.3
+
+    async def test_the_row_exists_before_the_revert_begins(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9021'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch)
+        scheduler = cast(MagicMock, harness.scheduler)
+        rows_at_write: list[int] = []
+
+        async def _record(*_args, **_kwargs):
+            rows_at_write.append(len(landing_reject_rows(store)))
+
+        scheduler.set_task_claimant.side_effect = _record
+        scheduler.set_task_status.side_effect = _record
+
+        await harness._reconcile_stranded_in_progress()
+
+        assert rows_at_write == [1, 1]
+
+    async def test_blocked_marker_effect_absent_reject_is_recorded(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9022'
+        marker_sha = 'c6' * 20
+        store = _bind_event_store(harness, tmp_path)
+        _blocked_marker_effect_absent(harness, tid, marker_sha, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_not_called()
+        [row] = landing_reject_rows(store)
+        assert row['data']['task_status'] == 'blocked'
+        assert row['data']['citation'] == marker_sha
+        assert row['data']['branch_tip_sha'] is None
+
+    async def test_a_second_sweep_over_the_same_blocked_task_adds_no_row(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9023'
+        store = _bind_event_store(harness, tmp_path)
+        _blocked_marker_effect_absent(harness, tid, 'c7' * 20, monkeypatch)
+
+        await harness._reconcile_stranded_in_progress()
+        await harness._reconcile_stranded_in_progress()
+
+        assert len(landing_reject_rows(store)) == 1
+
+
+    async def test_a_task_declaring_no_checks_is_recorded_as_none_declared(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9024'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={})
+
+        await harness._reconcile_stranded_in_progress()
+
+        [row] = landing_reject_rows(store)
+        assert row['data']['delivered_checks_state'] == 'none_declared'
+
+    async def test_a_differential_rescue_marks_done_and_discloses_it(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9025'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
+            {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+        ]})
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms), \
+             patch('orchestrator.harness.gate_mark_done_on_delivered_checks',
+                   AsyncMock(return_value=None)):
+            await harness._reconcile_stranded_in_progress()
+
+        set_task_status = cast(AsyncMock, harness.scheduler.set_task_status)
+        set_task_status.assert_awaited_once()
+        call = set_task_status.await_args
+        assert call is not None
+        assert call.args == (tid, 'done')
+        provenance = call.kwargs['done_provenance']
+        assert provenance['kind'] == 'found_on_main'
+        assert provenance['commit'] == _RECOVERED_SHA
+        assert 'cap-x' in provenance['note']
+        assert landing_reject_rows(store) == []
+
+    async def test_a_disarmed_kill_switch_stops_the_rescue_and_reverts(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9026'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
+            {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+        ]})
+        harness.config.delivered_checks = DeliveredChecksConfig(enabled=False)
+        runner = AsyncMock(side_effect=differential_confirms)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', runner):
+            await _reconcile_stranded(harness, tid, 'in-progress')
+
+        runner.assert_not_awaited()
+        scheduler = cast(MagicMock, harness.scheduler)
+        scheduler.mark_done.assert_not_called()
+        cast(AsyncMock, scheduler.set_task_status).assert_awaited_once_with(tid, 'pending')
+        [row] = landing_reject_rows(store)
+        assert row['data']['delivered_checks_outcome'] == 'disabled'
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +1098,7 @@ class TestReconcileStrandedInProgress:
         # premise here, so it must be visible (task 4028).
         worktree_path = harness.git_ops.worktree_base / '7'
         worktree_path.mkdir(parents=True)
-        lock_dir = _resolver_lock_dir(worktree_path)
+        lock_dir = _resolver_lock_dir(worktree_path, '7')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -983,7 +1183,7 @@ class TestReconcileStrandedInProgress:
         # actually visible to the resolver that is supposed to skip it.
         worktree_path = harness.git_ops.worktree_base / '62'
         worktree_path.mkdir(parents=True)
-        lock_dir = _resolver_lock_dir(worktree_path)
+        lock_dir = _resolver_lock_dir(worktree_path, '62')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1423,7 +1623,7 @@ class TestReconcileStrandedInProgress:
         # stale-lock premise this test names.
         worktree_path = harness.git_ops.worktree_base / str(tid)
         worktree_path.mkdir(parents=True)
-        lock_dir = _resolver_lock_dir(worktree_path)
+        lock_dir = _resolver_lock_dir(worktree_path, str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1573,7 +1773,7 @@ class TestReconcileStrandedInProgress:
         # that json.loads runs on THIS file.
         worktree_path = harness.git_ops.worktree_base / '15'
         worktree_path.mkdir(parents=True)
-        lock_dir = _resolver_lock_dir(worktree_path)
+        lock_dir = _resolver_lock_dir(worktree_path, '15')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
@@ -2709,7 +2909,7 @@ async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
     assert not hasattr(harness, '_reconcile_failure_counts')
     # Honest log mentions the error_code, not "marked done".
     assert any(
-        'failed to mark task 100 done' in r.getMessage()
+        'reconcile write refused for task 100 (unknown -> done)' in r.getMessage()
         and 'done_gate_missing_files' in r.getMessage()
         for r in caplog.records
     )
@@ -2952,7 +3152,7 @@ async def test_mid_run_alive_owner_pid_not_in_dispatch_recovers(
     # under test rather than the plain no-claimant revert.
     worktree_path = harness.git_ops.worktree_base / '400'
     worktree_path.mkdir(parents=True)
-    lock_dir = _resolver_lock_dir(worktree_path)
+    lock_dir = _resolver_lock_dir(worktree_path, '400')
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '400-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -2981,7 +3181,7 @@ async def test_startup_alive_owner_pid_left_alone(harness: Harness):
     # only "skip recovery" if the lock carrying it is actually visible.
     worktree_path = harness.git_ops.worktree_base / '401'
     worktree_path.mkdir(parents=True)
-    lock_dir = _resolver_lock_dir(worktree_path)
+    lock_dir = _resolver_lock_dir(worktree_path, '401')
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '401-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -3457,40 +3657,37 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness):
     """_reconcile_one_stranded resolves the worktree via the pool assignment.
 
     When a WarmLanePool is attached and task '42' is assigned to '_lane-0',
-    the lock-state classification must inspect the LANE's lock — which lives
-    at base/'.task-meta'/'_lane-0'/plan.lock, the meta-root SIBLING of
-    base/'_lane-0' (task 4028) — and not the one derived from the cold
-    base/'42'.  After finding it stale, cleanup_worktree must be called with
-    (base/'_lane-0', '42').
+    the lock-state classification must inspect TASK 42's lock — which lives
+    at base/'.task-meta'/'task-42'/plan.lock, whichever lane the task ran in
+    (task 3155) — and no lane-keyed address.  After finding it stale,
+    cleanup_worktree must be called with (base/'_lane-0', '42').
 
-    The two addresses are made to DISCRIMINATE, so this is not settled by the
+    The addresses are made to DISCRIMINATE, so this is not settled by the
     cleanup_worktree call args alone (those come from _resolve_task_worktree,
-    not from the lock read — a resolver that derived its meta root from the
-    cold base/'42' would still have produced the right cleanup path):
+    not from the lock read):
 
-      * the LANE lock is alive-but-EXPIRED (this process's own owner_pid,
-        locked_at far outside heartbeat_ttl) -> _lock_fresh False -> no live
-        claimant -> revert;
-      * the COLD lock is alive AND FRESH -> reading it would resolve a live
-        PLAN_LOCK claimant, classify LEAVE, and skip the revert entirely.
+      * the TASK-root lock is alive-but-EXPIRED (this process's own
+        owner_pid, locked_at far outside heartbeat_ttl) -> _lock_fresh False
+        -> no live claimant -> revert;
+      * the two lane-keyed roots — the lane's own base/'.task-meta'/'_lane-0'
+        and the cold base/'.task-meta'/'42' — each hold a lock that is alive
+        AND FRESH; reading either would resolve a live PLAN_LOCK claimant,
+        classify LEAVE, and skip the revert entirely.
 
-    So a regression to the cold address turns the set_task_status assertion
-    below red, not just the cleanup-path one.  Neither _pid_alive is patched:
-    both locks carry os.getpid(), so liveness is genuinely true on both sides
-    and locked_at is the only discriminator (no synthetic pid, no PID-reuse
-    race to defend against).
-
-    Fails today because worktree_path = worktree_base / tid computes base/'42'.
+    So a regression to any lane-keyed address turns the set_task_status
+    assertion below red, not just the cleanup-path one.  Neither _pid_alive
+    is patched: every lock carries os.getpid(), so liveness is genuinely true
+    everywhere and locked_at is the only discriminator.
     """
     pool = _attach_reconcile_pool(harness, size=2)
     base = harness.git_ops.worktree_base
     lane_path = base / '_lane-0'
     cold_path = base / '42'
 
-    # The lane's lock, at the lane's RESOLVER address: live owner_pid, but
-    # locked_at is far outside heartbeat_ttl -> stale -> no live claimant.
+    # The task's lock, at its RESOLVER address: live owner_pid, but locked_at
+    # is far outside heartbeat_ttl -> stale -> no live claimant.
     lane_path.mkdir(parents=True, exist_ok=True)
-    lock_dir = _resolver_lock_dir(lane_path)
+    lock_dir = _resolver_lock_dir(lane_path, '42')
     lock_dir.mkdir(parents=True)
     lock_path = lock_dir / 'plan.lock'
     lock_path.write_text(json.dumps({
@@ -3499,17 +3696,16 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness):
         'owner_pid': os.getpid(),
     }))
 
-    # TRIPWIRE: the cold path's resolver address, holding a lock that is both
-    # live AND fresh.  Nothing must ever read this; if the resolver derives
-    # its meta root from base/'42', it resolves a live claimant here and the
-    # revert never happens.
-    cold_lock_dir = _resolver_lock_dir(cold_path)
-    cold_lock_dir.mkdir(parents=True)
-    (cold_lock_dir / 'plan.lock').write_text(json.dumps({
-        'session_id': '42-live',
-        'locked_at': datetime.now(UTC).isoformat(),
-        'owner_pid': os.getpid(),
-    }))
+    # TRIPWIRES: both lane-keyed roots, each holding a lock that is live AND
+    # fresh.  Nothing must ever read these.
+    for worktree in (lane_path, cold_path):
+        tripwire_dir = TaskArtifacts.meta_root_for(base, worktree.name)
+        tripwire_dir.mkdir(parents=True)
+        (tripwire_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': '42-live',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
 
     # Restore the assignment so the pool knows '42' lives in '_lane-0'
     pool.restore_assignment('42', lane_path)
@@ -4677,7 +4873,7 @@ class TestMidRunPlanLockExceptionSurvives:
     def _stage_live_plan_lock(harness: Harness, tid: str) -> None:
         worktree = harness.git_ops.worktree_base / tid
         worktree.mkdir(parents=True, exist_ok=True)
-        lock_dir = _resolver_lock_dir(worktree)
+        lock_dir = _resolver_lock_dir(worktree, tid)
         lock_dir.mkdir(parents=True, exist_ok=True)
         (lock_dir / 'plan.lock').write_text(json.dumps({
             'session_id': f'{tid}-x',

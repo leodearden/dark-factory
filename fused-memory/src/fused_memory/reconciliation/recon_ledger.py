@@ -43,6 +43,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
@@ -330,24 +331,10 @@ class ReconLedgerStore:
             await db.executescript(TABLE_SQL)
 
         # Safe migration: add the nullable entity_uuid column to pre-existing
-        # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
-        # house pattern). On a fresh DB the column is already created by
-        # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
-        # harmless rollback; on an old DB it adds the column. Runs BEFORE
-        # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
-        #
-        # The catch is NARROWED to the expected "duplicate column name" case
-        # (loud-over-silent): a genuine migration failure — a locked/corrupt DB,
-        # a disk error — is re-raised here with its own message rather than
-        # swallowed and left to re-surface one statement later as a confusing
-        # "no such column: entity_uuid" from the INDEX_SQL that references it.
-        try:
-            async with self._access.write() as db:
-                await db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
-        except Exception as exc:
-            # The write unit has already rolled itself back.
-            if 'duplicate column name' not in str(exc).lower():
-                raise  # Not the benign "column already exists" case — surface it.
+        # recon_ledger tables (task 2894 α). Runs BEFORE INDEX_SQL so
+        # ix_recon_ledger_project_kind_entity can reference it.
+        async with self._access.write() as db:
+            await add_column_if_missing(db, 'recon_ledger', 'entity_uuid', 'TEXT')
 
         async with self._access.write() as db:
             await db.executescript(INDEX_SQL)

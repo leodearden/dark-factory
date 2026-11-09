@@ -1,5 +1,5 @@
 // Module-contract tests for merge_queue.js, the CLIENT reader of the served
-// /merge-queue Datums (in_queue, speculative, recent_total) whose server half is
+// /merge-queue Datums (in_queue, speculative, recent_total, depth, attempts) whose server half is
 // dashboard/src/dashboard/data/merge_queue.py, and of each queued row's enqueue
 // instant. The MergeTab tiles, its per-project pips, the live feed and the rail
 // badge all read the queue through this module, so the decisions it makes are asserted here,
@@ -35,8 +35,9 @@ function loadMergeQueue() {
 
 const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
+  projectDepth, projectAttempts, attemptCount, attemptsOver, attemptsHistory, worstP95Over,
 } = mergeQueue;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
 const { recentMergesCaption } = loadedWindow.DF_WINDOW_CHIP;
@@ -111,14 +112,48 @@ function entryReading(spec, recent, served = inQueue('fresh', 0)) {
   return { ...entryWith(served), speculative: spec, recent_total: recent };
 }
 
+// A served depth series value: data/merge_queue.py::DepthSeries, its leading
+// zero buckets trimmed by the shaper.
+function depthSeries(labels, values, bucketMinutes = 15) {
+  return { labels, values, bucket_minutes: bucketMinutes };
+}
+
+const UNTIMED = Object.freeze({ p50: null, p95: null, p99: null, mean_ms: null });
+
+// A served attempts value, as redux_api.py::_shape_attempts projects one window's
+// MergeAttempts: the colored outcome chart and the latency block. With no
+// *latency* given, the window is untimed — no centile over zero samples.
+function attemptsValue(outcomeCounts, latency) {
+  const labels = Object.keys(outcomeCounts);
+  const values = labels.map(label => outcomeCounts[label]);
+  const attempts = values.reduce((sum, n) => sum + n, 0);
+  return {
+    outcomes: { labels, values, colors: labels.map(() => '#888888') },
+    latency: latency || { ...UNTIMED, with_duration: 0, without_duration: attempts },
+  };
+}
+
+// A timed latency block whose worst centile is *p95*.
+function timedLatency(p95, withDuration, withoutDuration = 0) {
+  return { p50: p95 / 2, p95, p99: p95 + 1, mean_ms: p95 / 2, with_duration: withDuration, without_duration: withoutDuration };
+}
+
+// One MERGE_QUEUE[label] entry carrying its depth and attempts readings.
+function entryWindow(depth, attempts, served = inQueue('fresh', 0)) {
+  return { ...entryWith(served), depth, attempts };
+}
+
 // ── The module ──────────────────────────────────────────────────────────────
 
 test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
   assert.deepEqual(
     Object.keys(mergeQueue).sort(),
     [
-      'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption', 'projectInQueue',
-      'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'attemptCount', 'attemptsHistory', 'attemptsOver',
+      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption',
+      'projectAttempts', 'projectDepth',
+      'projectInQueue', 'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'worstP95Over',
     ],
   );
   for (const name of Object.keys(mergeQueue)) {
@@ -296,6 +331,31 @@ test('latencyCaption: a latency block without the split states nothing rather th
   assert.equal(latencyCaption(undefined), '');
 });
 
+// ── depthBucketCaption: the width the server counted the depth series at ────
+
+test('depthBucketCaption: each width the server ladder serves today', () => {
+  assert.equal(depthBucketCaption({ bucket_minutes: 15 }), '15-min buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 60 }), '1-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 360 }), '6-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 1440 }), '1-day buckets');
+});
+
+test('depthBucketCaption: a width outside the ladder is computed, not looked up', () => {
+  assert.equal(depthBucketCaption({ bucket_minutes: 90 }), '90-min buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 120 }), '2-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 2880 }), '2-day buckets');
+});
+
+test('depthBucketCaption: a depth naming no usable width states none', () => {
+  const holes = [
+    undefined, null, {}, { bucket_minutes: null }, { bucket_minutes: 0 },
+    { bucket_minutes: -15 }, { bucket_minutes: 7.5 }, { bucket_minutes: '15' },
+  ];
+  for (const depth of holes) {
+    assert.equal(depthBucketCaption(depth), EM_DASH, JSON.stringify(depth));
+  }
+});
+
 // ── queuedSince: when a queued row joined, from the probe instant and its age ─
 
 test('queuedSince: the probe instant minus the row\'s age', () => {
@@ -328,14 +388,17 @@ test('queuedSince: reads its inputs and alters neither', () => {
   assert.deepEqual([entry, row], pristine);
 });
 
-// ── projectSpeculative / recentTotal: one project's runs.db readings, stamped ─
+// ── projectSpeculative / recentTotal / projectDepth / projectAttempts: one
+// project's runs.db readings, stamped ─────────────────────────────────────
 
 for (const [field, reader, value] of [
   ['speculative', projectSpeculative, counts(5, 3)],
   ['recent_total', recentTotal, 228],
+  ['depth', projectDepth, depthSeries([T1, T2], [2, 0])],
+  ['attempts', projectAttempts, attemptsValue({ done: 3, conflict: 1 }, timedLatency(900, 4))],
 ]) {
   test(`${field}: the served Datum, stamped with the /merge-queue receipt as a copy`, () => {
-    const data = mqData({ a: entryReading(runsDbRead('fresh', counts(5, 3)), runsDbRead('fresh', 228)) });
+    const data = mqData({ a: { ...entryWith(inQueue('fresh', 0)), [field]: runsDbRead('fresh', value) } });
     const wire = data.MERGE_QUEUE.a[field];
     const pristine = structuredClone(wire);
 
@@ -378,7 +441,7 @@ for (const [field, reader, value] of [
 
   test(`${field}: an unread runs.db keeps the server's reason`, () => {
     const unread = runsDbRead('unknown');
-    const served = reader(mqData({ a: entryReading(unread, unread) }), 'a');
+    const served = reader(mqData({ a: { ...entryWith(inQueue('fresh', 0)), [field]: unread } }), 'a');
     assert.equal(served.state, 'unknown');
     assert.equal(served.reason, unread.reason);
   });
@@ -471,4 +534,149 @@ test('hitRateText: hits over attempts, as a whole percentage', () => {
 
 test('hitRateText: zero attempts have no rate', () => {
   assert.equal(hitRateText({ hit_count: 0, total: 0 }), EM_DASH);
+});
+
+// ── attemptCount: how many attempts one window's outcome chart holds ──────
+
+test('attemptCount: sums the outcome chart, every attempt counted once', () => {
+  assert.equal(attemptCount(attemptsValue({ done: 3, conflict: 2, blocked: 1 })), 6);
+});
+
+test('attemptCount: a measured window with no attempts counts 0', () => {
+  assert.equal(attemptCount(attemptsValue({})), 0);
+});
+
+// ── attemptsOver: the 'Merges (window)' tile ───────────────────────────────
+
+const freshAttempts = outcomeCounts => runsDbRead('fresh', attemptsValue(outcomeCounts));
+
+test('attemptsOver: sums every payload project\'s attempts, or only its scope\'s', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3, conflict: 1 })),
+    b: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'fresh');
+  assert.equal(total.value, 6);
+  assert.equal(attemptsOver(data, ['b']).value, 2);
+});
+
+test('attemptsOver: an unread project makes the total unknown and names it — never a smaller count', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'unknown');
+  assert.equal(datumView(total, { now: NOW }).text, EM_DASH);
+  assert.match(total.reason, /\bb: /);
+});
+
+test('attemptsOver: a stale part makes the total stale', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('stale', depthSeries([], [])), runsDbRead('stale', attemptsValue({ done: 1 }))),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'stale');
+  assert.equal(total.value, 4);
+  assert.match(total.reason, /\bb: /);
+});
+
+test('attemptsOver: before the first payload, the total is not yet fetched', () => {
+  const total = attemptsOver(mqData({}, null), null);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.reason, 'not yet fetched');
+});
+
+test('attemptsOver: an unprobed project is still counted — its attempts come from its runs.db', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    c: { ...unprobedEntry('c'), depth: runsDbRead('fresh', depthSeries([], [])), attempts: freshAttempts({ done: 2 }) },
+  });
+
+  assert.equal(attemptsOver(data, null).value, 5);
+});
+
+// ── attemptsHistory: the 'Merges (window)' spark ───────────────────────────
+
+test('attemptsHistory: one project is its own depth values', () => {
+  const data = mqData({ a: entryWindow(runsDbRead('fresh', depthSeries([T1, T2, T3], [4, 0, 2])), freshAttempts({})) });
+  assert.deepEqual(attemptsHistory(data, ['a']), [4, 0, 2]);
+});
+
+test('attemptsHistory: several projects sum per label over the union, a trimmed label counting 0', () => {
+  // b's trim dropped its leading empty T1 bucket: every project's buckets are
+  // epoch-aligned and end at the same bucket, so T1 is a 0 for b, not a miss.
+  const data = mqData({
+    b: entryWindow(runsDbRead('fresh', depthSeries([T2, T3], [1, 5])), freshAttempts({})),
+    a: entryWindow(runsDbRead('fresh', depthSeries([T1, T2, T3], [4, 3, 2])), freshAttempts({})),
+  });
+
+  assert.deepEqual(attemptsHistory(data, ['a', 'b']), [4, 4, 7]);
+  assert.deepEqual(attemptsHistory(data, null), [4, 4, 7]);
+});
+
+test('attemptsHistory: a project in scope whose depth is unread or absent draws no spark at all', () => {
+  // Summing the others alone would draw a dip that never happened.
+  const readable = entryWindow(runsDbRead('fresh', depthSeries([T1, T2], [4, 3])), freshAttempts({}));
+  const holes = [
+    ['an unread depth', { a: readable, b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')) }],
+    ['an entry with no depth', { a: readable, b: entryWith(inQueue('fresh', 0)) }],
+    ['an absent project', { a: readable }],
+  ];
+  for (const [label, entries] of holes) {
+    assert.deepEqual(attemptsHistory(mqData(entries), ['a', 'b']), [], label);
+  }
+});
+
+// ── worstP95Over: the 'p95 latency · worst project' tile ───────────────────
+
+const timedWindow = (p95, withDuration) => entryWindow(
+  runsDbRead('fresh', depthSeries([], [])),
+  runsDbRead('fresh', attemptsValue({ done: withDuration }, timedLatency(p95, withDuration))),
+);
+
+test('worstP95Over: the worst p95 over the timed projects in scope, and how many were timed', () => {
+  const data = mqData({
+    a: timedWindow(900, 3),
+    b: timedWindow(4200, 2),
+    c: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })),
+  });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'fresh');
+  assert.deepEqual(worst.value, { p95_ms: 4200, timed_projects: 2 });
+  assert.deepEqual(worstP95Over(data, ['a', 'c']).value, { p95_ms: 900, timed_projects: 1 });
+});
+
+test('worstP95Over: a hole in any project is a hole naming it', () => {
+  const data = mqData({ a: timedWindow(900, 3), b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')) });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'unknown');
+  assert.match(worst.reason, /\bb: /);
+});
+
+test('worstP95Over: no timed project in scope has no worst centile to show', () => {
+  const data = mqData({ a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })) });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'unknown');
+  assert.equal(worst.reason, 'no timed merges in this window');
+});
+
+test('worstP95Over: before the first payload, it is not yet fetched', () => {
+  const worst = worstP95Over(mqData({}, null), null);
+  assert.equal(worst.state, 'unknown');
+  assert.equal(worst.reason, 'not yet fetched');
 });

@@ -19,6 +19,9 @@ from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centraliz
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 from shared.invocation_outcome import CapHit
+from shared.process_cost import ProcessCostBasis
+from shared.testing_fake_claude import install_fake_claude_cli
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -249,7 +252,7 @@ class TestCapHitResume:
         assert not any(isinstance(arg, CapHit) for arg in reported)
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume returns success=False → retry with original prompt."""
+        """The CLI rejects the resume (measured payload) → retry with original prompt."""
         gate = _make_gate_yielding([
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
@@ -257,9 +260,7 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(success=False, session_id='sess-abc')
-        failed_resume = _make_result(success=False)
-        failed_resume.duration_ms = 6000
-        failed_resume.turns = 2
+        failed_resume = measured_resume_rejection('sess-abc')
         ok_result = _make_result(success=True, cost_usd=0.5)
         ok_result.duration_ms = 6000
         ok_result.turns = 2
@@ -1359,6 +1360,14 @@ class TestInvokePiFlags:
         assert env.get('ANTHROPIC_API_KEY') == 'sk-direct-key'
         assert 'ANTHROPIC_OAUTH_TOKEN' not in env
 
+    async def test_ambient_proxy_endpoint_and_client_key_do_not_reach_pi(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('ANTHROPIC_BASE_URL', 'http://127.0.0.1:8317')
+        monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'proxy-key')
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert 'ANTHROPIC_BASE_URL' not in env
+        assert 'ANTHROPIC_AUTH_TOKEN' not in env
+
     async def test_resume_session_id_uses_session_flag(self, tmp_path):
         mock_run = await self._invoke(tmp_path, resume_session_id='r1')
         cmd = mock_run.call_args.args[0]
@@ -2320,3 +2329,73 @@ class TestStdinStarvationRaceLocal:
             f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
         )
 
+
+_CUMULATIVE_COST_SESSIONS = (
+    Path(__file__).resolve().parents[2]
+    / 'shared' / 'tests' / 'fixtures' / 'cumulative_cost' / 'sessions.json'
+)
+_STEWARD_4895 = '59607ecd-9ecd-4f90-9ce6-bc71a7fb33e9'
+
+
+@pytest.mark.asyncio
+class TestClaudeResumePriorForwarding:
+    """invoke_agent hands the resumed session's prior total to both claude sub-paths.
+
+    The fake ``claude`` (``shared.testing_fake_claude``, selected through
+    ``CLAUDE_BINARY``) answers the second process of steward session 59607ecd,
+    whose reported total is cumulative; each sub-path's own parse must charge
+    only that process's spend.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_claude(self, tmp_path, monkeypatch) -> None:
+        sessions = json.loads(_CUMULATIVE_COST_SESSIONS.read_text())
+        resume = json.dumps(sessions[_STEWARD_4895][1]['stdout'])
+        fake = install_fake_claude_cli(tmp_path / 'fake-claude', [resume])
+        monkeypatch.setenv('CLAUDE_BINARY', str(fake.executable))
+        monkeypatch.delenv('DF_AGENT_CPU_GOVERN', raising=False)
+
+    @staticmethod
+    def _sandbox_active():
+        return (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
+            ),
+        )
+
+    async def test_unsandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        result = await invoke_agent(
+            prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+            resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+        )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'],
+                resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_without_prior_is_a_usage_estimate(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'], resume_session_id=_STEWARD_4895,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE

@@ -42,6 +42,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
 )
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
@@ -493,7 +494,7 @@ class TestCapRetryResume:
         assert second.kwargs.get('prompt') == 'original'
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume fails (success=False, not cap hit) -> falls back to fresh with original prompt."""
+        """The CLI rejects the resume -> falls back to fresh with original prompt."""
         gate = _mock_gate(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b', 'tok-a']),
@@ -501,7 +502,7 @@ class TestCapRetryResume:
             active_account_name='acct-a',
         )
         capped = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, resume_fail, ok]) as mock_inv,
@@ -564,7 +565,7 @@ class TestCapRetryResume:
             active_account_name='acct-b',
         )
         capped1 = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False)
+        resume_fail = measured_resume_rejection('sess-1')
         # Second cycle: cap hit again, this time without session_id
         capped2 = make_cap_result(session_id='')
         ok = make_result()
@@ -664,7 +665,7 @@ class TestCapRetryResume:
         )
 
     async def test_fresh_fallback_regenerates_session_id(self):
-        """Fresh fallback after a failed resume regenerates a fresh session_id.
+        """Fresh fallback after a rejected resume regenerates a fresh session_id.
 
         Regression for the reify-3604 wedge: the resume attempt may have already
         committed the pre-allocated UUID to disk, so reusing it on the fresh
@@ -678,9 +679,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[False, False]),
             active_account_name='acct',
         )
-        # cost_usd defaults to 0.5 in make_result, so the resume failure does NOT
-        # trip the zero-cost heuristic — it routes through the resume-fallback branch.
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-orig')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[resume_fail, ok]) as mock_inv,
@@ -1691,7 +1690,7 @@ class TestCapRetryEdgeCases:
             active_account_name='acct',
         )
         capped = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False)
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, resume_fail, ok]) as mock_inv,
@@ -1717,10 +1716,10 @@ class TestCapRetryEdgeCases:
             detect_cap_hit=MagicMock(side_effect=[True, False, True, False, False]),
             active_account_name='acct',
         )
-        # Cycle 1: cap with session -> resume fails -> fresh
+        # Cycle 1: cap with session -> resume rejected -> fresh
         # Cycle 2: cap without session -> fresh succeeds
         r1 = make_cap_result(session_id='s1')
-        r2 = make_result(success=False)  # resume fail
+        r2 = measured_resume_rejection('s1')
         r3 = make_cap_result(session_id='')  # cap hit, no session
         r4 = make_result()  # success
         with (
@@ -3799,16 +3798,16 @@ class TestCapRetryResumeDeliversPrompt:
 
 @pytest.mark.asyncio
 class TestCapRetryResumeFailureRebuildsPrompt:
-    """When a live-continuation resume (resume_delivers_prompt=True) fails
-    with a non-cap error, the fresh-fallback retry must rebuild context via
-    the caller's rebuild_prompt hook rather than reusing the stale
-    continuation original_prompt.
+    """When the CLI rejects a live-continuation resume
+    (resume_delivers_prompt=True), the fresh-fallback retry must rebuild
+    context via the caller's rebuild_prompt hook rather than reusing the
+    stale continuation original_prompt.
 
     With resume_delivers_prompt=True, original_prompt IS the continuation
     prompt (valid only inside the resumed session) — handing it back
     unchanged to a brand-new session is context-less. This mirrors the two
     existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
-    for the third, non-cap-hit resume-failure site.
+    for the third, resume-rejection site.
     """
 
     async def test_non_cap_resume_failure_rebuilds_prompt(self):
@@ -3818,10 +3817,7 @@ class TestCapRetryResumeFailureRebuildsPrompt:
             detect_cap_hit=MagicMock(side_effect=[False, False]),
             active_account_name='acct',
         )
-        # cost_usd defaults to 0.5 in make_result, so this does NOT trip the
-        # zero-cost heuristic — it routes through the non-cap resume-failure
-        # branch.
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
         with (
@@ -3851,7 +3847,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
     """The two remaining reset-to-fresh branches — zero-output-wedge
     (cli_invoke.py ~961) and auth-failure (~923) — must ALSO rebuild context
     via the caller's ``rebuild_prompt`` hook, mirroring the fix step-7 applied
-    to the non-cap resume-failure branch (``TestCapRetryResumeFailureRebuildsPrompt``).
+    to the resume-rejection branch (``TestCapRetryResumeFailureRebuildsPrompt``).
 
     With ``resume_delivers_prompt=True`` (the steward), ``original_prompt`` IS
     the per-escalation continuation prompt — valid only inside the resumed

@@ -19,7 +19,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, get_args
 
@@ -34,6 +34,8 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from shared.cancel_dispositions import CancelDispositionEntry
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
@@ -41,6 +43,7 @@ __all__ = [
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
+    'RECHECK_SECS_MIN',
     'BeforeDone',
     'DoneProvenance',
     'ExternalDep',
@@ -57,6 +60,7 @@ __all__ = [
     'apply_migrations',
     'is_known_metadata_key',
     'parse_metadata',
+    'recheck_secs_milestone_conflict',
     'register_metadata_submodel',
     'script_root_kind_conflict',
     'validate_model_overrides',
@@ -173,6 +177,11 @@ def validate_model_overrides(value: object) -> None:
             )
 
 
+# The shortest re-arm interval a predicate may declare: a "not yet" verdict
+# re-dispatches the gate no sooner than this (plans/completion-driven-triggers-prd.md C1).
+RECHECK_SECS_MIN: int = 300
+
+
 class BeforeDone(BaseModel):
     """``metadata.before_done`` — the deterministic-task pre-done action descriptor.
 
@@ -186,6 +195,11 @@ class BeforeDone(BaseModel):
     submit guard and the orchestrator's deterministic runner; only the guard
     (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
     checks the resolved file on disk — the runner joins the path and runs it.
+
+    ``recheck_secs`` declares that the predicate may answer "not yet" (exit 75),
+    and how far the runner then advances the dated ``milestone.at``. Its shape
+    and its predicate-only rule live here; its dated-milestone rule is
+    :func:`recheck_secs_milestone_conflict`, which :class:`TaskMetadata` applies.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -198,12 +212,24 @@ class BeforeDone(BaseModel):
     target_unit: str | None = None
     kind: Literal['deploy', 'predicate'] = 'deploy'
     script_root: Literal['project', 'factory'] = 'project'
+    # strict for the reason Recurrence.interval_secs gives: lax coercion would
+    # read True as a one-second interval.
+    recheck_secs: int | None = Field(default=None, ge=RECHECK_SECS_MIN, strict=True)
 
     @model_validator(mode='after')
     def _factory_script_root_requires_predicate(self) -> BeforeDone:
         conflict = script_root_kind_conflict(self.script_root, self.kind)
         if conflict is not None:
             raise ValueError(f'BeforeDone: {conflict}')
+        return self
+
+    @model_validator(mode='after')
+    def _recheck_secs_requires_predicate(self) -> BeforeDone:
+        if self.recheck_secs is not None and self.kind != 'predicate':
+            raise ValueError(
+                f"BeforeDone: recheck_secs requires kind='predicate' (got kind={self.kind!r}); "
+                'only a predicate returns the exit-75 "not yet" verdict it re-arms on.'
+            )
         return self
 
 
@@ -220,6 +246,37 @@ def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
             'a deploy runs a script from its own project.'
         )
     return None
+
+
+def recheck_secs_milestone_conflict(milestone: object) -> str | None:
+    """Why *milestone* cannot carry a ``before_done.recheck_secs`` re-arm; ``None`` when it can.
+
+    The single statement of the dated-milestone rule for re-arming predicates,
+    called by :class:`TaskMetadata`, the fused-memory submit guard and
+    ``orchestrator.predicate_recheck``. *milestone* is the stored value as
+    found: a :class:`Milestone`, a raw mapping, ``None`` when absent, or junk.
+    """
+    found = _non_dated_milestone_finding(milestone)
+    if found is None:
+        return None
+    return (
+        f"before_done.recheck_secs requires a milestone with mode='dated' ({found}); "
+        'a not-yet verdict re-arms the gate by advancing milestone.at, and a delayed '
+        "milestone must not carry 'at' (its anchor is frozen once)."
+    )
+
+
+def _non_dated_milestone_finding(milestone: object) -> str | None:
+    """What a stored milestone is when it is not dated; ``None`` when it is."""
+    if milestone is None:
+        return 'milestone is absent'
+    if isinstance(milestone, Milestone):
+        mode: object = milestone.mode
+    elif isinstance(milestone, Mapping):
+        mode = milestone.get('mode')
+    else:
+        return f'milestone is a {type(milestone).__name__}, not an object'
+    return None if mode == 'dated' else f'got mode={mode!r}'
 
 
 @dataclass(frozen=True)
@@ -619,6 +676,33 @@ class Milestone(BaseModel):
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
 
+    def fired(self, anchor: str | None, now: datetime) -> bool:
+        """Return whether this milestone has fired at *now* (tz-aware).
+
+        This is the home of milestone semantics. A ``'dated'`` milestone fires
+        once ``now >= at``; *anchor* is ignored. A ``'delayed'`` milestone
+        fires once ``now >= anchor + after_secs``, where *anchor* is the raw
+        ``metadata.milestone_deps_satisfied_at`` string; a falsy anchor never
+        fires. A tz-naive ``at`` or anchor is read as UTC.
+
+        A malformed spec cannot be a ``Milestone``, so "never fires" for
+        malformed metadata belongs to the caller; an unparseable *anchor*
+        raises ``ValueError``. ``Scheduler._milestone_time_gated`` keeps its
+        own copy of these rules until a follow-up repoints it here.
+        """
+        if self.mode == 'dated':
+            assert self.at is not None
+            return now >= _as_utc(datetime.fromisoformat(self.at))
+        if not anchor:
+            return False
+        assert self.after_secs is not None
+        deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(seconds=self.after_secs)
+        return deadline <= now
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
 
 class Recurrence(BaseModel):
     """``metadata.recurrence`` — one link of a recurring deterministic chain.
@@ -875,6 +959,17 @@ class TaskMetadata(BaseModel):
             )
         return self
 
+    @model_validator(mode='after')
+    def _recheck_secs_requires_dated_milestone(self) -> TaskMetadata:
+        # A registered submodel, so 'milestone' sits in model_extra: a
+        # Milestone after parse_metadata, a raw dict on direct construction.
+        if self.before_done is None or self.before_done.recheck_secs is None:
+            return self
+        conflict = recheck_secs_milestone_conflict((self.model_extra or {}).get('milestone'))
+        if conflict is not None:
+            raise ValueError(conflict)
+        return self
+
 
 # W10 extension point: lets a later task register its own typed metadata
 # sub-model (e.g. a future "deploy_state" slice) without this module having
@@ -1005,8 +1100,14 @@ register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 # deferral: plans/deferral-flip-condition-prd.md §5.1.
 register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
+# cancel_dispositions: plans/cancel-with-children-prd.md §4.8.
+register_metadata_submodel('cancel_dispositions', CancelDispositionEntry, cardinality='list')
+
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
+# declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
+register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -1157,9 +1258,10 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
 # disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
 # field or a registered submodel already suppresses unknown_key via
-# known_fields, so blessing it too would be redundant. 'recurrence' is the
-# one deliberate overlap: task 4676 / PRD
-# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# known_fields, so blessing it too would be redundant. 'recurrence' and
+# 'cancel_dispositions' are the two deliberate overlaps: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 and
+# plans/cancel-with-children-prd.md §4.8 each specify both, so the key
 # stays suppressed if its registration is ever moved or made lazy, and so
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
@@ -1396,8 +1498,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
-        # R-D4) is the ONE blessed key that is also a registered submodel — see
-        # the header note above on why the overlap is deliberate.
+        # R-D4) is a blessed key that is also a registered submodel — see the
+        # header note above on why the overlap is deliberate.
         'recurrence',
         # Recon-stage execution-class discriminator (task 3780): machine-read
         # by live guards at the fused-memory submit boundary, with real
@@ -1449,7 +1551,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
         # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `_normalize_lane`, consumed at
+        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::
@@ -1525,6 +1627,16 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
         # also reads it back through find_tasks_by_metadata as its dedupe key.
         'main_health_signature',
+        # The cancelled parent's superseders (plans/cancel-with-children-prd.md
+        # §4.8). Writer: the cancel gate, task β; validated there by
+        # shared/src/shared/cancel_dispositions.py::parse_superseded_by. Readers:
+        # the residue backstop, get_cancel_children and /review phase 3.
+        'superseded_by',
+        # Each child's per-parent disposition record; also a registered list
+        # submodel (the second deliberate overlap, header note above). Writer:
+        # the cancel gate, task β. Readers: the residue backstop,
+        # get_cancel_children (existing_disposition) and /review phase 3.
+        'cancel_dispositions',
     }
 )
 
@@ -1551,7 +1663,7 @@ def _cardinality_mismatch_message(
 
 
 def parse_metadata(
-    blob: dict | str | None,
+    blob: object,
     *,
     direction: Literal['read', 'write'],
     enforce: bool = False,
@@ -1575,6 +1687,8 @@ def parse_metadata(
       rather than a validated value — reported under the same failure policy
       as any other malformed slice, and distinct from ``invalid_submodel``
       (which means the shape was right but an element/field failed).
+    * any other value, including a JSON string that decodes to a non-object,
+      is a ``not_an_object`` finding under the failure policy below.
 
     Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
     ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
@@ -1589,15 +1703,10 @@ def parse_metadata(
 
     warnings: list[SchemaWarning] = []
 
-    # A dedicated, non-Optional-and-non-str local: reassigning the `blob`
-    # parameter itself (declared `dict | str | None`) would reset pyright's
-    # narrowed type back to the full declared union on every assignment
-    # (json.loads returns `Any`, and assigning `Any` to a declared-type
-    # variable narrows to the *declared* type, not to `dict`).
-    parsed: dict
+    decoded: object
     if isinstance(blob, str):
         try:
-            parsed = json.loads(blob)
+            decoded = json.loads(blob)
         except ValueError as exc:
             if direction == 'write' and enforce:
                 raise
@@ -1610,21 +1719,21 @@ def parse_metadata(
             )
             return TaskMetadata(), warnings
     else:
-        parsed = blob
+        decoded = blob
 
-    if not isinstance(parsed, dict):
+    if not isinstance(decoded, dict):
         if direction == 'write' and enforce:
-            raise TypeError(f'metadata must be a JSON object, got {type(parsed).__name__}')
+            raise TypeError(f'metadata must be a JSON object, got {type(decoded).__name__}')
         warnings.append(
             SchemaWarning(
                 field=_WHOLE_METADATA_FIELD,
                 code='not_an_object',
-                message=f'metadata is not a JSON object: got {type(parsed).__name__}',
+                message=f'metadata is not a JSON object: got {type(decoded).__name__}',
             )
         )
         return TaskMetadata(), warnings
 
-    parsed = apply_migrations(parsed)
+    parsed: dict = apply_migrations(decoded)
 
     for key, submodel in _SUBMODEL_REGISTRY.items():
         if key not in parsed:
@@ -1686,7 +1795,10 @@ def parse_metadata(
                 # other malformed sub-model, never escaping uncaught in
                 # read or write+enforce=False.
                 parsed = {**parsed, key: submodel(**raw)}
-        except (ValidationError, TypeError) as exc:
+        # ValueError covers ValidationError (its subclass) and the bare
+        # ValueError a RootModel submodel (DeferralRecord, CancelDispositionEntry)
+        # raises when the stored mapping carries a `root` key beside others.
+        except (TypeError, ValueError) as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))
