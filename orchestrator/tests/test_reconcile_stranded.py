@@ -57,7 +57,7 @@ async def _reconcile_stranded(
 
 def _stage_valid_looking_lock(harness: Harness, tid: str) -> Path:
     """Stage an in-progress *tid* whose plan.lock sits where the resolver READS it (task 4028)."""
-    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+    harness.scheduler.get_statuses = AsyncMock(return_value=({tid: 'in-progress'}, None))
     worktree_path = harness.git_ops.worktree_base / tid
     worktree_path.mkdir(parents=True)
     lock_dir = _resolver_lock_dir(worktree_path, tid)
@@ -1794,13 +1794,15 @@ class TestReconcileStrandedInProgress:
     ):
         """With a collector (the startup caller) the same TypeError is an entry failure."""
         lock_path = _stage_valid_looking_lock(harness, '15')
+        set_status = AsyncMock()
+        harness.scheduler.set_task_status = set_status
         failures = EntryFailures('Reconcile')
 
         with patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')):
             await harness._reconcile_stranded_in_progress(failures=failures)
 
         assert [(f.entry, f.exception_type) for f in failures.failures] == [('15', 'TypeError')]
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        set_status.assert_not_called()
         assert lock_path.exists()
 
     async def test_already_merged_branch_marked_done_with_provenance(
@@ -5176,25 +5178,27 @@ class TestReconcileStrandedStartupIsolation:
     """At startup a supplied collector isolates each task; mid-run callers pass none."""
 
     @staticmethod
-    def _fail_revert_of(harness: Harness, failing_tid: str) -> None:
+    def _fail_revert_of(harness: Harness, failing_tid: str) -> AsyncMock:
         async def set_task_status(tid, status, **kwargs):
             if tid == failing_tid:
                 raise RuntimeError('boom')
 
-        harness.scheduler.set_task_status = AsyncMock(side_effect=set_task_status)
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'15': 'in-progress', '16': 'in-progress'}, None,
+        set_status = AsyncMock(side_effect=set_task_status)
+        harness.scheduler.set_task_status = set_status
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'15': 'in-progress', '16': 'in-progress'}, None),
         )
+        return set_status
 
     async def test_one_failing_task_is_recorded_and_the_sweep_continues(
         self, harness: Harness,
     ):
-        self._fail_revert_of(harness, '15')
+        set_status = self._fail_revert_of(harness, '15')
         failures = EntryFailures('Reconcile')
 
         await harness._reconcile_stranded_in_progress(failures=failures)
 
-        harness.scheduler.set_task_status.assert_any_await('16', 'pending')  # type: ignore[attr-defined]
+        set_status.assert_any_await('16', 'pending')
         assert [f.entry for f in failures.failures] == ['15']
 
     async def test_rejection_with_collector_still_escalates_and_is_not_an_entry_failure(
@@ -5203,9 +5207,9 @@ class TestReconcileStrandedStartupIsolation:
         from orchestrator.scheduler import DoneGateRejection
 
         queue = _bind_queue(harness, tmp_path / 'escalations')
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'200': 'in-progress'}, None,
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'200': 'in-progress'}, None),
         )
 
         async def always_reject(tid, *, kind, sha, note=None):
@@ -5214,7 +5218,7 @@ class TestReconcileStrandedStartupIsolation:
                 raw='done_gate_missing_files — metadata.files lists missing paths',
             )
 
-        harness.scheduler.mark_done = AsyncMock(side_effect=always_reject)  # type: ignore[attr-defined]
+        harness.scheduler.mark_done = AsyncMock(side_effect=always_reject)
         failures = EntryFailures('Reconcile')
 
         await harness._reconcile_stranded_in_progress(failures=failures)
@@ -5226,10 +5230,10 @@ class TestReconcileStrandedStartupIsolation:
     async def test_startup_entry_point_returns_the_populated_collector(
         self, harness: Harness,
     ):
-        self._fail_revert_of(harness, '15')
+        set_status = self._fail_revert_of(harness, '15')
 
         failures = await harness._reconcile_stranded_at_startup()
 
         assert isinstance(failures, EntryFailures)
         assert [f.entry for f in failures.failures] == ['15']
-        harness.scheduler.set_task_status.assert_any_await('16', 'pending')  # type: ignore[attr-defined]
+        set_status.assert_any_await('16', 'pending')

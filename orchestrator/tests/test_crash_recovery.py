@@ -753,19 +753,17 @@ class TestRecoverCrashedTasksEntryIsolation:
         wt41 = _setup_worktree(base, '41')
         wt42 = _setup_worktree(base, '42')
 
-        async def cleanup(entry: Path, task_id: str) -> None:
+        async def fail_41(entry: Path, task_id: str) -> None:
             if entry.name == '41':
                 raise OSError('boom')
 
-        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=cleanup)
+        cleanup = AsyncMock(side_effect=fail_41)
+        harness.git_ops.cleanup_worktree = cleanup
 
         with caplog.at_level(logging.ERROR):
             failures = await harness._recover_crashed_tasks()
 
-        cleaned = {
-            c.args[0]
-            for c in harness.git_ops.cleanup_worktree.await_args_list  # type: ignore[attr-defined]
-        }
+        cleaned = {c.args[0] for c in cleanup.await_args_list}
         assert cleaned == {wt41, wt42}
         assert isinstance(failures, EntryFailures)
         assert [(f.entry, f.exception_type) for f in failures.failures] == [('41', 'OSError')]

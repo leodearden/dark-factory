@@ -154,22 +154,27 @@ class TestOrphanReaperEntryIsolation:
         _mk(base, '500')
         wt501 = _mk(base, '501')
 
-        async def cleanup(entry: Path, name: str) -> None:
+        async def fail_500(entry: Path, name: str) -> None:
             if name == '500':
                 raise OSError('boom')
 
-        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=cleanup)
+        cleanup = AsyncMock(side_effect=fail_500)
+        prune = AsyncMock()
+        events = MagicMock()
+        harness.git_ops.cleanup_worktree = cleanup
+        harness.git_ops.prune_worktrees = prune
+        harness.event_store = events
 
         failures = await harness._reap_orphan_worktrees()
 
-        harness.git_ops.cleanup_worktree.assert_any_await(wt501, '501')  # type: ignore[attr-defined]
+        cleanup.assert_any_await(wt501, '501')
         reaped_ids = [
             c.kwargs.get('task_id')
-            for c in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
+            for c in events.emit.call_args_list
             if c.args[0] == EventType.worktree_reaped
         ]
         assert reaped_ids == ['501']
-        harness.git_ops.prune_worktrees.assert_awaited_once()  # type: ignore[attr-defined]
+        prune.assert_awaited_once()
         assert isinstance(failures, EntryFailures)
         assert [f.entry for f in failures.failures] == ['500']
 
