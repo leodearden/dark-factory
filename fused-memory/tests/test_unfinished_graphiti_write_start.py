@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 from _fm_held_writes import HeldWrites
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_service import MemoryService

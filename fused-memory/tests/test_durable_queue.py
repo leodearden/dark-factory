@@ -13,7 +13,8 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 from _fm_held_writes import HeldWrites
-from _fm_helpers import make_retry_budget_queue, poll_until, poll_until_dead
+from _fm_helpers import make_retry_budget_queue
+from _fm_polling import poll_until, poll_until_dead
 from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module

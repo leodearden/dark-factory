@@ -26,9 +26,9 @@ from _fm_helpers import (
     FALKOR_PORT,
     await_index_operational,
     falkor_skipif,
-    poll_until,
     unique_graph_name,
 )
+from _fm_polling import poll_until
 from falkordb.asyncio import FalkorDB
 
 TEST_GRAPH: str = unique_graph_name('530_list_indices_integration')

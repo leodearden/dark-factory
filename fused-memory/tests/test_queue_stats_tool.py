@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import poll_until_dead
+from _fm_polling import poll_until_dead
 from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,

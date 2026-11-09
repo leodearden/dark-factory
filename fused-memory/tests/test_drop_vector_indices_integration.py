@@ -64,10 +64,9 @@ from _fm_helpers import (
     IndexHeaderError,
     await_index_operational,
     falkor_skipif,
-    poll_until,
-    retry_until_observed,
     unique_graph_name,
 )
+from _fm_polling import poll_until, retry_until_observed
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver

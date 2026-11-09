@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _curator_helpers import answer_each_with, serve_existing_task, submit_as_one_batch
-from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
+from _fm_helpers import pydantic_spec
+from _fm_polling import poll_until, poll_until_stable
 from shared.async_sqlite_base import CheckpointResult
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 

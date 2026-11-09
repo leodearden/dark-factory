@@ -19,8 +19,9 @@ from _curator_helpers import (
     submit_as_one_batch,
     zot_agent_result,
 )
-from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
+from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus

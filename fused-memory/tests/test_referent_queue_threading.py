@@ -25,7 +25,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import MockNode, poll_until
+from _fm_helpers import MockNode
+from _fm_polling import poll_until
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.services.durable_queue import DurableWriteQueue

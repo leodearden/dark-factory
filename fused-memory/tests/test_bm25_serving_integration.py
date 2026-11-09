@@ -29,7 +29,8 @@ from _falkor_index_live import (
     missing_production_indices,
     scratch_graphs,
 )
-from _fm_helpers import await_index_operational, falkor_skipif, retry_until_observed
+from _fm_helpers import await_index_operational, falkor_skipif
+from _fm_polling import retry_until_observed
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.graph_queries import (
     NEO4J_TO_FALKORDB_MAPPING,

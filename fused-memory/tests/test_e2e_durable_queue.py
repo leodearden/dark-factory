@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
 from fused_memory.backends.llm_token_usage import measure_llm_tokens
 from fused_memory.middleware.dead_letter_escalator import (

@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 from shared.milestone_rearm import rearmed_milestone
 
 from fused_memory.backends import sqlite_task_backend

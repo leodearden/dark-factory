@@ -14,7 +14,8 @@ import logging
 from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import make_retry_budget_queue, poll_until_dead
+from _fm_helpers import make_retry_budget_queue
+from _fm_polling import poll_until_dead
 
 
 @pytest.mark.asyncio
