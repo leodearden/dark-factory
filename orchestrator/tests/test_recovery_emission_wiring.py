@@ -650,7 +650,7 @@ class TestZeroDispositionChange:
                 for c in harness.scheduler.set_task_status.await_args_list
             ],
             'escalations': sorted(
-                e.id for e in harness._escalation_queue.get_by_task(
+                e.id for e in _queue(harness).get_by_task(
                     'T1', status='pending',
                 )
             ),
@@ -692,7 +692,7 @@ class TestZeroDispositionChange:
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
-        assert harness._escalation_queue.get_by_task('T1', status='pending') == []
+        assert _queue(harness).get_by_task('T1', status='pending') == []
 
     async def test_a_broken_event_store_never_disturbs_the_sweep(self, harness):
         """Telemetry is fire-and-forget: a store fault must not strand a task
@@ -865,7 +865,7 @@ class TestVetoStreakAlarm:
         await _sweeps(harness, clock, 5)
 
         assert len(_alarms(harness)) == 1, 'precondition: the alarm did fire'
-        assert harness._escalation_queue.get_by_task('T1', status='pending') == [], (
+        assert _queue(harness).get_by_task('T1', status='pending') == [], (
             'the subject task\'s own pending set must be untouched by the alarm'
         )
         assert classify_recovery(report) is RecoveryAction.LEAVE, (
@@ -1008,12 +1008,13 @@ class TestVetoStreakAlarmRecovery:
         pending-queue scan on the healthy path."""
         harness, clock = clocked
         _bind_reports(harness, {'T1': _report(claimant=_live_claimant())})
-        harness._escalation_queue = MagicMock(wraps=harness._escalation_queue)
+        wrapped = MagicMock(wraps=_queue(harness))
+        harness._escalation_queue = wrapped
 
         await _sweeps(harness, clock, 3)
 
-        assert harness._escalation_queue.has_open_l1.call_count == 0
-        assert harness._escalation_queue.submit.call_count == 0
+        assert wrapped.has_open_l1.call_count == 0
+        assert wrapped.submit.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -1221,7 +1222,7 @@ class TestPerTickSitesNeverCharge:
     """
 
     async def test_hammering_the_dispatch_gate_never_files_an_l1(self, harness):
-        harness._escalation_queue.submit(Escalation(
+        _queue(harness).submit(Escalation(
             id='esc-T1-1', task_id='T1', agent_role='implementer',
             severity='blocking', category='design_concern',
             summary='an open handoff on task T1', level=1,
@@ -1398,6 +1399,11 @@ class TestBothAdaptersAgreeOnTheVetoSignature:
 
 
 
+def _inherit_pending_alarms(harness) -> None:
+    """Startup step 2c3, as the restarted process runs it."""
+    harness._inherit_pending_streak_alarms()
+
+
 def _restart_with_prior_alarm(harness, *, deterministic_sweep: bool) -> None:
     """Make *harness* the RESTARTED process: a prior one filed T1's alarm."""
     harness.config.deterministic_recon_sweep_enabled = deterministic_sweep
@@ -1408,7 +1414,7 @@ def _restart_with_prior_alarm(harness, *, deterministic_sweep: bool) -> None:
         reason=LeaveReason.escalation_pinned, shape='x', escalation_ids=['esc-1'],
         human_parked=False, suppress_human_parked=True,
     ) is True
-    harness._inherit_pending_streak_alarms()
+    _inherit_pending_alarms(harness)
 
 
 def _tracked_tasks(harness) -> set[str]:
@@ -1475,7 +1481,7 @@ class TestVetoStreakAlarmSurvivesRestart:
             severity='blocking', level=1, category='risk_identified',
             summary='echoed streak alarm',
         ))
-        harness._inherit_pending_streak_alarms()
+        _inherit_pending_alarms(harness)
         _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
 
         await _sweeps(harness, clock, 1)
@@ -1487,8 +1493,8 @@ class TestVetoStreakAlarmSurvivesRestart:
         harness.config.deterministic_recon_sweep_enabled = True
         harness._escalation_queue = None
 
-        harness._inherit_pending_streak_alarms()
+        _inherit_pending_alarms(harness)
 
-        assert tuple(harness._recovery_veto_tracker.tracked()) == ()
+        assert _tracked_tasks(harness) == set()
         assert harness._recovery_streak_filed_at == {}
         assert harness._zero_progress_filed_at == {}
