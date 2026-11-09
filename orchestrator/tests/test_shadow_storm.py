@@ -166,7 +166,7 @@ _STREAK = {
         _ended('c7', _S.FAILED),
     ),
 }
-_RATIO = {'ratios': {'minimax-m3-endpoint': cost_ratio_verdict([_pair(9.0, _M, 2.0)], ceiling=3.0)}}
+_RATIO = {'ratios': {'minimax-m3.1-flash-endpoint': cost_ratio_verdict([_pair(9.0, _M, 2.0)], ceiling=3.0)}}
 
 
 class TestEvaluateStorm:
@@ -193,7 +193,7 @@ class TestEvaluateStorm:
 
         assert trip is not None
         assert trip.cause is ShadowStormCause.COST_RATIO
-        assert 'minimax-m3-endpoint' in trip.detail
+        assert 'minimax-m3.1-flash-endpoint' in trip.detail
         assert '4.50' in trip.detail
         assert '3.00' in trip.detail
 
@@ -366,6 +366,7 @@ def _seed(
         base_sha='a' * 40,
         state=state,
         cost_basis=CostBasis.METERED,
+        configured_model='sonnet',
         plan_source=PlanSource.PRODUCTION,
         reason=_SEEDED_REASONS.get(state),
         reference_kind=ReferenceKind.NONE if state is _S.SETTLED else None,
