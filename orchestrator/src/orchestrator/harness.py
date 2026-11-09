@@ -261,6 +261,7 @@ from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
     emit_zero_progress_requeue_alert,
+    inherit_zero_progress_alarms,
     resolve_zero_progress_requeue_alert,
 )
 
@@ -11751,21 +11752,15 @@ class Harness:
             )
 
             if streak == 0:
-                # Progress. Resolve any alarm we filed, so an operator is not
-                # left holding a blocking L1 for a cleared condition and — more
-                # importantly — so the emitter's has_open_l1 dedup cannot let a
-                # stale pending alert suppress a genuine LATER recurrence.
-                # Ungated by `enabled`: disabling the detector must not strand
-                # an already-filed alarm.
-                if streak_before:
-                    resolve_zero_progress_requeue_alert(
-                        escalation_queue=self._escalation_queue,
-                        event_store=self.event_store,
-                        task_id=task_id,
-                        recovered_streak=streak_before,
-                        threshold=cfg.threshold,
-                        filed_at=self._zero_progress_filed_at,
-                    )
+                # Progress; the resolver's own cheap gate decides whether a disk check is due.
+                resolve_zero_progress_requeue_alert(
+                    escalation_queue=self._escalation_queue,
+                    event_store=self.event_store,
+                    task_id=task_id,
+                    recovered_streak=streak_before,
+                    threshold=cfg.threshold,
+                    filed_at=self._zero_progress_filed_at,
+                )
                 return
 
             if not cfg.enabled:
@@ -11788,6 +11783,26 @@ class Harness:
                 'Task %s: zero-progress requeue check failed (non-fatal): %s',
                 task_id, exc,
             )
+
+    def _inherit_pending_streak_alarms(self) -> None:
+        """Seed the streak detectors from the alarms a prior process left pending.
+
+        Startup step ``2c3-streak-alarms``.  Their trackers and filed-at memos
+        live in memory, so without this their resolvers cannot reach an alarm
+        filed before the restart.  Sync, so it runs atomically on the event
+        loop with respect to any background sweep ``start_all()`` launched.
+        """
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        pending_alarms = queue.get_pending()
+        zero_progress = inherit_zero_progress_alarms(
+            pending_alarms, filed_at=self._zero_progress_filed_at,
+        )
+        logger.info(
+            'Inherited %d pending zero-progress requeue alarm(s) from a prior process',
+            len(zero_progress),
+        )
 
     def _emit_recovery_disposition(
         self,
