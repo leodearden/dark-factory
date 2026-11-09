@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -25,7 +26,7 @@ from unittest.mock import call as mock_call
 import pytest
 from _merge_tool_calls import call_merge_request, call_merge_status
 from shared.merge_state import MergeReason
-from shared.task_read import TaskFound
+from shared.task_read import TaskFound, TaskReadFailed
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -113,8 +114,18 @@ def _make_config(
     )
 
 
+def _read_task_raising() -> AsyncMock:
+    return AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
+
+
+def _read_task_reporting_failure() -> AsyncMock:
+    return AsyncMock(
+        return_value=TaskReadFailed("get_task error='boom', error_type='BackendUnavailable'"),
+    )
+
+
 def _stub_harness(
-    git_ops, *, metadata: dict[str, Any] | None = None, read_task_raises: bool = False,
+    git_ops, *, metadata: dict[str, Any] | None = None, faulty_read_task: AsyncMock | None = None,
 ) -> types.SimpleNamespace:
     """Return the standard merge_status harness stub wired to *git_ops*.
 
@@ -126,18 +137,18 @@ def _stub_harness(
     already uses.
 
     Pass ``metadata=`` to attach a ``.scheduler`` whose ``read_task`` resolves
-    to ``TaskFound({'metadata': metadata})``, or ``read_task_raises=True`` to
-    attach one whose ``read_task`` raises — the scheduler-fault path.
+    to ``TaskFound({'metadata': metadata})``, or ``faulty_read_task=`` to attach
+    a scheduler fault: :func:`_read_task_reporting_failure` is the production
+    shape, since the real ``Scheduler.read_task`` never raises, and
+    :func:`_read_task_raising` is a duck-typed scheduler's.
     """
     harness = types.SimpleNamespace(
         _merge_worker=None,
         _terminal_retention=None,
         git_ops=git_ops,
     )
-    if read_task_raises:
-        harness.scheduler = types.SimpleNamespace(
-            read_task=AsyncMock(side_effect=RuntimeError('scheduler unreachable')),
-        )
+    if faulty_read_task is not None:
+        harness.scheduler = types.SimpleNamespace(read_task=faulty_read_task)
     elif metadata is not None:
         harness.scheduler = types.SimpleNamespace(
             read_task=AsyncMock(return_value=TaskFound({'metadata': metadata})),
@@ -620,7 +631,7 @@ class TestMergeStatusGitAuthority:
         citation: str | None = None,
         effect_present: bool = True,
         metadata: dict[str, Any] | None = None,
-        read_task_raises: bool = False,
+        faulty_read_task: AsyncMock | None = None,
         commit_citation_pattern: str | None = None,
     ) -> tuple[Any, types.SimpleNamespace]:
         """Build a server whose branch is a NON-degenerate ancestor of main.
@@ -637,7 +648,7 @@ class TestMergeStatusGitAuthority:
             commit_effect_present_in_main=AsyncMock(return_value=effect_present),
         )
         stub_harness = _stub_harness(
-            stub_git, metadata=metadata, read_task_raises=read_task_raises,
+            stub_git, metadata=metadata, faulty_read_task=faulty_read_task,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(
@@ -799,33 +810,39 @@ class TestMergeStatusGitAuthority:
         )
 
     @pytest.mark.parametrize(
+        'faulty_read_task',
+        [_read_task_reporting_failure, _read_task_raising],
+        ids=['reports_failure', 'raises'],
+    )
+    @pytest.mark.parametrize(
         ('citation', 'expected_state', 'expected_reason'),
         [('c' * 40, 'done', None), (None, 'no_record', MergeReason.landing_unattributable)],
         ids=['cited', 'uncited'],
     )
-    async def test_read_task_raises_still_applies_citation_gate(
+    async def test_scheduler_fault_still_applies_citation_gate(
         self,
         tmp_path: Path,
         citation: str | None,
         expected_state: str,
         expected_reason: MergeReason | None,
+        faulty_read_task: Callable[[], AsyncMock],
     ) -> None:
         """A scheduler fault degrades ONE guard, never the whole probe.
 
         The metadata lookup's own try/except is nested inside the Tier-3.5
-        fire-safe wrapper precisely so a raising read_task cannot swallow the
+        fire-safe wrapper precisely so a failing read_task cannot swallow the
         citation gate along with the degeneracy check.
         """
         server, _ = self._ancestor_arm_server(
             tmp_path, '906', tip='a' * 40, citation=citation, effect_present=True,
-            read_task_raises=True,
+            faulty_read_task=faulty_read_task(),
         )
 
         result = await call_merge_status(server, task_id='906')
 
         assert isinstance(result, dict), 'merge_status must not raise'
         assert result.get('state') == expected_state, (
-            f'Expected {expected_state} with a raising scheduler, got: {result}'
+            f'Expected {expected_state} with a failing scheduler, got: {result}'
         )
         assert result.get('reason') == expected_reason, f'got: {result}'
 
