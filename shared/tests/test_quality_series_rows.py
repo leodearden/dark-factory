@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from quality_series_fixtures import LandingScenario, at_hour, build_landing_scenario
+from quality_series_fixtures import (
+    LandingScenario,
+    LateClaimScenario,
+    at_hour,
+    build_landing_scenario,
+    build_late_claim_scenario,
+)
 
-from shared.quality_series import LandingRow, landings, rows_for, unit_heads
+from shared.quality_series import Landing, LandingRow, landings, rows_for, unit_heads
 from shared.quality_series.git_lines import landed_lines
 from shared.quality_series.rows import (
     CharterClass,
     CharterClassSource,
+    QualityRowInvariantError,
     ReviewRoundsSource,
     SourceEpochs,
     UnknownCharterClass,
@@ -437,3 +446,103 @@ class TestModuleAllocation:
 
     def test_no_src_lines_allocates_nothing(self, outcomes_scenario, outcome_rows):
         assert module_allocation(outcome_rows[('106', outcomes_scenario.side)]) == ()
+
+
+@pytest.fixture(scope='module')
+def late_claim_scenario(tmp_path_factory: pytest.TempPathFactory) -> LateClaimScenario:
+    """The late-claim history plus outcome events; read-only for every test that uses it."""
+    s = build_late_claim_scenario(tmp_path_factory.mktemp('late-claim-rows') / 'proj')
+    s.db.merge_blocked(at_hour(9.5), '201', POST_MERGE, 'Post-merge verification failed: a')
+    s.db.merge_blocked(at_hour(10.8), '203', POST_MERGE, 'Post-merge verification failed: b')
+    s.db.merge_verify(at_hour(9.8), '201', s.x, passed=True)
+    s.db.merge_verify(at_hour(10.9), '203', s.r203, passed=True)
+    return s
+
+
+def _late_claim_batch(s: LateClaimScenario) -> tuple[Landing, ...]:
+    return landings(s.db.conn, s.repo.root, since_cursor=None).landings
+
+
+def _keys(rows: Sequence[LandingRow]) -> list[tuple[str, str]]:
+    return [(row.landing.task_id, row.landing.merge_sha) for row in rows]
+
+
+class TestLateClaimRows:
+    def test_rows_come_back_in_input_order(self, late_claim_scenario):
+        s = late_claim_scenario
+        batch = _late_claim_batch(s)
+        rows = rows_for(batch, s.db.conn, s.repo.root, git_budget_s=60)
+        assert [row.landing for row in rows] == list(batch)
+
+    def test_the_first_claim_and_the_late_claim_are_separate_units(self, late_claim_scenario):
+        s = late_claim_scenario
+        rows = _by_key(rows_for(_late_claim_batch(s), s.db.conn, s.repo.root, git_budget_s=60))
+        assert rows[('201', s.x)].outcomes.rejection_events == 1
+        late = rows[('203', s.x)]
+        assert late.outcomes.rejection_events == 1
+        assert late.outcomes.reverify_count == 0
+
+    def test_the_late_claim_has_no_lines_and_the_first_claim_keeps_its_own(
+        self, late_claim_scenario
+    ):
+        s = late_claim_scenario
+        rows = _by_key(rows_for(_late_claim_batch(s), s.db.conn, s.repo.root, git_budget_s=60))
+        late = rows[('203', s.x)]
+        assert (late.cost.code_lines, late.cost.src_lines, late.cost.test_lines) == (
+            None, None, None,
+        )
+        assert late.modules == ()
+        first = rows[('201', s.x)]
+        lines = landed_lines(s.repo.root, s.r203, s.x, timeout_s=60)
+        assert (first.cost.code_lines, first.cost.src_lines, first.cost.test_lines) == (
+            lines.code_lines, lines.src_lines, lines.test_lines,
+        )
+        assert first.modules == lines.modules
+
+    def test_every_landing_heads_its_own_unit(self, late_claim_scenario):
+        s = late_claim_scenario
+        rows = rows_for(_late_claim_batch(s), s.db.conn, s.repo.root, git_budget_s=60)
+        assert len(unit_heads(rows)) == 4
+
+    def test_a_budget_limited_resume_covers_each_landing_once_in_order(
+        self, late_claim_scenario
+    ):
+        s = late_claim_scenario
+        batch = _late_claim_batch(s)
+        remaining = batch
+        measured: list[LandingRow] = []
+        while remaining:
+            rows = rows_for(remaining, s.db.conn, s.repo.root, git_budget_s=0)
+            assert rows, 'every call makes progress'
+            assert rows[0].landing == remaining[0]
+            measured.extend(rows)
+            remaining = remaining[len(rows):]
+        assert _keys(measured) == [(landing.task_id, landing.merge_sha) for landing in batch]
+
+
+class TestUnitShape:
+    def _batch(self, s: LandingScenario) -> dict[str, Landing]:
+        rows = landings(s.db.conn, s.repo.root, since_cursor=None).landings
+        return {landing.task_id: landing for landing in rows if landing.merge_sha == s.m3
+                or landing.task_id == '106'}
+
+    def test_a_unit_missing_a_member_is_refused(self, outcomes_scenario):
+        s = outcomes_scenario
+        by_task = self._batch(s)
+        with pytest.raises(QualityRowInvariantError, match='unit_size'):
+            rows_for([by_task['103'], by_task['104']], s.db.conn, s.repo.root, git_budget_s=60)
+
+    def test_an_interleaved_unit_is_refused(self, outcomes_scenario):
+        s = outcomes_scenario
+        by_task = self._batch(s)
+        split = [by_task['103'], by_task['106'], by_task['104'], by_task['105']]
+        with pytest.raises(QualityRowInvariantError):
+            rows_for(split, s.db.conn, s.repo.root, git_budget_s=60)
+
+    def test_a_unit_id_starting_a_second_run_is_refused(self, late_claim_scenario):
+        s = late_claim_scenario
+        batch = list(_late_claim_batch(s))
+        index = next(i for i, landing in enumerate(batch) if landing.task_id == '203')
+        batch[index] = dataclasses.replace(batch[index], late_claim=False, unit_id=s.x)
+        with pytest.raises(QualityRowInvariantError, match=s.x):
+            rows_for(batch, s.db.conn, s.repo.root, git_budget_s=60)
