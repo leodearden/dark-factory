@@ -1080,6 +1080,13 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.
     strand_converted = 'strand_converted'
 
+    # A validate_landing_evidence reject at one of the two call sites that
+    # file no escalation (the already-landed gate's ancestry arm, the reconcile
+    # sweep's MARK_DONE arm).  data = the verdict probe verbatim plus
+    # site/task_status; transition-gated per (site, task_id).  Canonical WHY:
+    # orchestrator/src/orchestrator/landing_reject_emission.py (module docstring).
+    landing_evidence_rejected = 'landing_evidence_rejected'
+
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
     # §5/E11; task theta 3542).  The canonical WHY lives in
