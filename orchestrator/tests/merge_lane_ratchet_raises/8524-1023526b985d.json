@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "Review finding 2 fix: the adoption-void and RUNNER_UNAVAILABLE re-merge sites count the commits the head-failure cascade is about to kill as dead (worker.py::_cascade_doomed_commits, threaded as doomed= through the claim and dead-base chains), so a replacement and the merger's held base are never re-anchored on an inflight entry that dies moments later. Net-additive bug fix, not a refactor.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1950,
+      "current": 1952
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5123,
+      "current": 5125
+    }
+  ]
+}

@@ -157,6 +157,7 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
+    entry_commit,
     frontier_tip,
 )
 from orchestrator.merge_lane.request_ledger import (
@@ -10633,7 +10634,9 @@ class SpeculativeMergeWorker:
             if (d := e.verify_base_divergence) is not None
         )
 
-    def _record_dead_base(self, *shas: str, killer: DeadBaseKiller) -> None:
+    def _record_dead_base(
+        self, *shas: str, killer: DeadBaseKiller, doomed: Collection[str] = (),
+    ) -> None:
         """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
 
         A commit passed here was failed/ejected/superseded/re-merged, so any
@@ -10645,29 +10648,38 @@ class SpeculativeMergeWorker:
         *killer* names that site; the ledger keeps a commit's first killer.
         Each commit is then handed to the merger's re-anchor hook,
         :meth:`SpeculationController.on_base_invalidated`
-        (plans/merge-lane-policy-prd.md D2).
+        (plans/merge-lane-policy-prd.md D2), which counts *doomed* as dead too.
         """
         for sha in shas:
             self._dead_base_commits.record(sha, killer)
-        live_tip = self._merger_live_tip()
+        live_tip = self._merger_live_tip(doomed)
         for sha in shas:
             self._speculation_controller.on_base_invalidated(sha, live_tip)
 
-    def _merger_live_tip(self) -> str | None:
-        """The frontier tip the merger may stack on, or None.  Reads no main,
-        so :meth:`_record_dead_base` stays synchronous."""
+    def _merger_live_tip(self, doomed: Collection[str] = ()) -> str | None:
+        """The frontier tip the merger may stack on, or None; *doomed* commits
+        count as dead.  Reads no main, so :meth:`_record_dead_base` stays
+        synchronous."""
         frontier = self._verify_frontier_entries()
         return choose_remerge_base(
-            '', frontier_tip(frontier) or '', self._dead_base_commits, frontier,
+            '', frontier_tip(frontier) or '', {*self._dead_base_commits, *doomed}, frontier,
             permit_available=True,
         ).tip
 
-    def _record_item_commit_dead(self, item: SpeculativeItem, site: DeadBaseSite) -> None:
+    def _cascade_doomed_commits(self) -> frozenset[str]:
+        """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
+        and records dead whenever :meth:`_finalize_inflight` returns False."""
+        return frozenset(c for e in self._inflight if (c := entry_commit(e)) is not None)
+
+    def _record_item_commit_dead(
+        self, item: SpeculativeItem, site: DeadBaseSite, *, doomed: Collection[str] = (),
+    ) -> None:
         """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
         if isinstance(item, RealMergeItem):
             self._record_dead_base(
                 item.merge_result.merge_commit or '',
                 killer=DeadBaseKiller(site, item.request.task_id),
+                doomed=doomed,
             )
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
@@ -16375,26 +16387,36 @@ class SpeculativeMergeWorker:
         )
 
     def _claim_remerge_base(
-        self, item: SpeculativeItem, main_sha: str, held_permit: SpecPermit | None,
+        self,
+        item: SpeculativeItem,
+        main_sha: str,
+        held_permit: SpecPermit | None,
+        *,
+        doomed: Collection[str] = (),
     ) -> RemergeClaim:
         """Where *item*'s recovery re-merge goes, decided before its site emits
         the triggering row (plans/merge-lane-policy-prd.md D1).
 
-        *item*'s own commit already counts as dead and its own entry is not
-        part of the frontier.  Synchronous, so the frontier and the dead-base
-        ledger are read with no await between them.
+        *item*'s own commit and the *doomed* commits already count as dead,
+        and its own entry is not part of the frontier.  Synchronous, so the
+        frontier and the dead-base ledger are read with no await between them.
         """
         own = item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
-        return self._claim_for_request(item.request, own, main_sha, held_permit)
+        return self._claim_for_request(item.request, own, main_sha, held_permit, doomed=doomed)
 
     def _claim_with_entry_permit(
-        self, entry: InflightEntry, item: SpeculativeItem, main_sha: str,
+        self,
+        entry: InflightEntry,
+        item: SpeculativeItem,
+        main_sha: str,
+        *,
+        doomed: Collection[str] = (),
     ) -> RemergeClaim:
         """Claim *item*'s re-merge base with *entry*'s permit, which then
         leaves the entry: the replacement owns it or the claim freed it, so
         neither finalize's ``finally`` nor the cascade's error chokepoint
         releases it again."""
-        claim = self._claim_remerge_base(item, main_sha, entry.permit)
+        claim = self._claim_remerge_base(item, main_sha, entry.permit, doomed=doomed)
         entry.permit = None
         return claim
 
@@ -16416,6 +16438,8 @@ class SpeculativeMergeWorker:
         own_commit: str | None,
         main_sha: str,
         held_permit: SpecPermit | None,
+        *,
+        doomed: Collection[str] = (),
     ) -> RemergeClaim:
         frontier = [
             e for e in self._verify_frontier_entries()
@@ -16424,7 +16448,7 @@ class SpeculativeMergeWorker:
         return claim_remerge_base(
             main_sha=main_sha,
             frozen_tip=frontier_tip(frontier) or main_sha,
-            dead_bases={*self._dead_base_commits, (own_commit or '').strip()} - {''},
+            dead_bases={*self._dead_base_commits, (own_commit or '').strip(), *doomed} - {''},
             frontier=frontier,
             held_permit=held_permit,
             ledger=self._speculation_ledger,
@@ -18799,8 +18823,9 @@ class SpeculativeMergeWorker:
         Mirrors the RUNNER_UNAVAILABLE remerge→REDISPATCH_PARKED template (the
         registry FINALIZING→MERGING→REDISPATCH_PARKED hops keep the lifecycle
         registry reconciled).  Always returns ``False`` (main not advanced); the
-        caller sets ``_n_failed_val = False`` (a voided item is NOT a failure and
-        must not trigger the downstream head-failure cascade).
+        caller sets ``_n_failed_val = False`` (a voided item is NOT a failure).
+        The head-failure cascade still fires on that False, so the downstream
+        ``_inflight`` entries die in it and are never a re-anchor tip.
         """
         req = item.request
         # Clean the verified worktree — vr.merge_wt for a real verify; the
@@ -18809,7 +18834,8 @@ class SpeculativeMergeWorker:
         _spec_warm = vr.spec_warm if vr is not None else False
         if _wt is not None:
             await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
-        claim = self._claim_with_entry_permit(entry, item, main_sha)
+        doomed = self._cascade_doomed_commits()
+        claim = self._claim_with_entry_permit(entry, item, main_sha, doomed=doomed)
         self._emit_verdict_voided(
             req, item, dead_link, point=VoidPoint.ADOPTION, anchor=claim.anchor,
         )
@@ -18817,7 +18843,7 @@ class SpeculativeMergeWorker:
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
-        self._record_item_commit_dead(item, DeadBaseSite.ADOPTION_VOID)
+        self._record_item_commit_dead(item, DeadBaseSite.ADOPTION_VOID, doomed=doomed)
         # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
         _remerged = await self._remerge(item.request, item.started_monotonic, claim=claim)
         self._note_transition(
@@ -19798,14 +19824,18 @@ class SpeculativeMergeWorker:
                 # record it dead so a straggler stacked on it is caught at
                 # dispatch (parity with the head-failure cascade + Mechanism-2
                 # discard remerge sites).
-                self._record_item_commit_dead(entry.item, DeadBaseSite.RUNNER_UNAVAILABLE)
+                # The entries still in _inflight die in the cascade: no tip.
+                _ru_doomed = self._cascade_doomed_commits()
+                self._record_item_commit_dead(
+                    entry.item, DeadBaseSite.RUNNER_UNAVAILABLE, doomed=_ru_doomed,
+                )
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
                 )
                 # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
                 _ru_claim = self._claim_with_entry_permit(
-                    entry, entry.item, await self._main_sha_or_empty(),
+                    entry, entry.item, await self._main_sha_or_empty(), doomed=_ru_doomed,
                 )
                 _remerged_ru = await self._remerge(
                     entry.item.request, entry.item.started_monotonic, claim=_ru_claim,

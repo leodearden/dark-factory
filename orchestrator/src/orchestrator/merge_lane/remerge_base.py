@@ -21,7 +21,8 @@ from orchestrator.merge_lane.types import (
 )
 
 
-def _commit(entry: InflightEntry) -> str | None:
+def entry_commit(entry: InflightEntry) -> str | None:
+    """*entry*'s merge commit, or None when its item built none."""
     item = entry.item
     if isinstance(item, RealMergeItem) and item.merge_result.merge_commit:
         return item.merge_result.merge_commit.strip() or None
@@ -31,7 +32,7 @@ def _commit(entry: InflightEntry) -> str | None:
 def frontier_tip(entries: Sequence[InflightEntry]) -> str | None:
     """The newest real merge commit among *entries*, or None when there is none."""
     for entry in reversed(entries):
-        commit = _commit(entry)
+        commit = entry_commit(entry)
         if commit is not None:
             return commit
     return None
@@ -62,12 +63,12 @@ def _breaks_chain(entry: InflightEntry, main_sha: str, dead_bases: Container[str
     base = item.base_sha.strip()
     if base and base != main_sha and base in dead_bases:
         return True
-    commit = _commit(entry)
+    commit = entry_commit(entry)
     return commit is not None and commit in dead_bases
 
 
 def _owner_index(tip: str, frontier: Sequence[InflightEntry]) -> int | None:
-    return next((i for i, entry in enumerate(frontier) if _commit(entry) == tip), None)
+    return next((i for i, entry in enumerate(frontier) if entry_commit(entry) == tip), None)
 
 
 def _fall_to_main_reason(
