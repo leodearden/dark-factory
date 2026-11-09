@@ -37,6 +37,7 @@ from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.warm_lane_pool import WarmLanePool
 
 
@@ -52,6 +53,18 @@ async def _reconcile_stranded(
     return await harness._reconcile_one_stranded(
         tid, status, mid_run=mid_run, tally=tally,
     )
+
+
+def _stage_valid_looking_lock(harness: Harness, tid: str) -> Path:
+    """Stage an in-progress *tid* whose plan.lock sits where the resolver READS it (task 4028)."""
+    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+    worktree_path = harness.git_ops.worktree_base / tid
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path, tid)
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / 'plan.lock'
+    lock_path.write_text(f'{{"session_id": "{tid}-xyz", "owner_pid": 1}}')
+    return lock_path
 
 
 def _bind_queue(harness: Harness, path: Path) -> EscalationQueue:
@@ -1766,25 +1779,29 @@ class TestReconcileStrandedInProgress:
         ``orchestrator.harness``, which still bit only because both names
         resolve to the one shared ``json`` module object).
         """
-        from unittest.mock import patch as _patch
+        lock_path = _stage_valid_looking_lock(harness, '15')
 
-        harness.scheduler.get_statuses.return_value = ({'15': 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Staged where the resolver READS it (task 4028) — the whole point is
-        # that json.loads runs on THIS file.
-        worktree_path = harness.git_ops.worktree_base / '15'
-        worktree_path.mkdir(parents=True)
-        lock_dir = _resolver_lock_dir(worktree_path, '15')
-        lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
-
-        with _patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
+        with patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
             await harness._reconcile_stranded_in_progress()
 
         # No revert must have happened
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         # Lock file must not have been deleted
         assert lock_path.exists(), 'Lock file must survive when an unexpected exception propagates'
+
+    async def test_unexpected_exception_is_recorded_into_a_supplied_collector(
+        self, harness: Harness
+    ):
+        """With a collector (the startup caller) the same TypeError is an entry failure."""
+        lock_path = _stage_valid_looking_lock(harness, '15')
+        failures = EntryFailures('Reconcile')
+
+        with patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')):
+            await harness._reconcile_stranded_in_progress(failures=failures)
+
+        assert [(f.entry, f.exception_type) for f in failures.failures] == [('15', 'TypeError')]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert lock_path.exists()
 
     async def test_already_merged_branch_marked_done_with_provenance(
         self, harness: Harness
@@ -5149,3 +5166,67 @@ class TestStaleClaimantBlockedStrandIsReFiled:
 
         set_task_status.assert_not_called()
         assert _pending(queue, '4623') == []
+
+
+@pytest.mark.asyncio
+class TestReconcileStrandedStartupIsolation:
+    """At startup a supplied collector isolates each task; mid-run callers pass none."""
+
+    @staticmethod
+    def _fail_revert_of(harness: Harness, failing_tid: str) -> None:
+        async def set_task_status(tid, status, **kwargs):
+            if tid == failing_tid:
+                raise RuntimeError('boom')
+
+        harness.scheduler.set_task_status = AsyncMock(side_effect=set_task_status)
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'15': 'in-progress', '16': 'in-progress'}, None,
+        )
+
+    async def test_one_failing_task_is_recorded_and_the_sweep_continues(
+        self, harness: Harness,
+    ):
+        self._fail_revert_of(harness, '15')
+        failures = EntryFailures('Reconcile')
+
+        await harness._reconcile_stranded_in_progress(failures=failures)
+
+        harness.scheduler.set_task_status.assert_any_await('16', 'pending')  # type: ignore[attr-defined]
+        assert [f.entry for f in failures.failures] == ['15']
+
+    async def test_rejection_with_collector_still_escalates_and_is_not_an_entry_failure(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        from orchestrator.scheduler import DoneGateRejection
+
+        queue = _bind_queue(harness, tmp_path / 'escalations')
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+            {'200': 'in-progress'}, None,
+        )
+
+        async def always_reject(tid, *, kind, sha, note=None):
+            raise DoneGateRejection(
+                task_id=tid, missing_files=['x.py'],
+                raw='done_gate_missing_files — metadata.files lists missing paths',
+            )
+
+        harness.scheduler.mark_done = AsyncMock(side_effect=always_reject)  # type: ignore[attr-defined]
+        failures = EntryFailures('Reconcile')
+
+        await harness._reconcile_stranded_in_progress(failures=failures)
+
+        [esc] = queue.get_by_task('200', status='pending')
+        assert esc.category == 'reconcile_persistent_rejection'
+        assert failures.failures == ()
+
+    async def test_startup_entry_point_returns_the_populated_collector(
+        self, harness: Harness,
+    ):
+        self._fail_revert_of(harness, '15')
+
+        failures = await harness._reconcile_stranded_at_startup()
+
+        assert isinstance(failures, EntryFailures)
+        assert [f.entry for f in failures.failures] == ['15']
+        harness.scheduler.set_task_status.assert_any_await('16', 'pending')  # type: ignore[attr-defined]
