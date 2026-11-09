@@ -105,8 +105,7 @@ def module_units(
 @dataclass(frozen=True)
 class ScreenCheck:
     id: str
-    module: str
-    node_ids: tuple[str, ...]
+    command: VerifyCmd
 
 
 def member_package_dirs() -> frozenset[str]:
@@ -164,7 +163,7 @@ def _entry_fields(entry: object) -> tuple[str, Mapping[object, object]]:
     return label, entry
 
 
-def _entry_node_ids(label: str, entry: Mapping[object, object], base: VerifyCmd) -> tuple[str, ...]:
+def _entry_node_ids(label: str, entry: Mapping[object, object], base: VerifyCmd) -> list[str]:
     node_ids = entry['node_ids']
     if not isinstance(node_ids, list) or not node_ids or not all(isinstance(n, str) and n for n in node_ids):
         raise HookChecksError(f'{label}: node_ids must be a non-empty list of strings, found {node_ids!r}')
@@ -172,7 +171,7 @@ def _entry_node_ids(label: str, entry: Mapping[object, object], base: VerifyCmd)
     missing = [node for node in node_ids if not (cwd / node.split('::', 1)[0]).exists()]
     if missing:
         raise HookChecksError(f'{label}: node id file missing under {cwd}: {missing}')
-    return tuple(node_ids)
+    return node_ids
 
 
 def _screen_check(entry: object, by_prefix: Mapping[str, ModuleConfig]) -> ScreenCheck:
@@ -181,8 +180,9 @@ def _screen_check(entry: object, by_prefix: Mapping[str, ModuleConfig]) -> Scree
     mc = by_prefix.get(module) if isinstance(module, str) else None
     if mc is None:
         raise HookChecksError(f'{label}: module {module!r} is not a registered module')
-    node_ids = _entry_node_ids(label, fields, _screen_base(label, mc))
-    return ScreenCheck(str(fields['id']), mc.prefix, node_ids)
+    base = _screen_base(label, mc)
+    scoped = apply_pytest_numprocesses(scope_to(base, _entry_node_ids(label, fields, base)), '0')
+    return ScreenCheck(str(fields['id']), scoped)
 
 
 def load_screen_checks(path: Path, registry: list[ModuleConfig]) -> tuple[ScreenCheck, ...]:
@@ -195,14 +195,8 @@ def load_screen_checks(path: Path, registry: list[ModuleConfig]) -> tuple[Screen
     return tuple(checks)
 
 
-def screen_units(checks: Sequence[ScreenCheck], registry: list[ModuleConfig]) -> list[Unit]:
-    by_prefix = {mc.prefix: mc for mc in registry}
-    units: list[Unit] = []
-    for check in checks:
-        base = _screen_base(f'screen check {check.id!r}', by_prefix[check.module])
-        scoped = apply_pytest_numprocesses(scope_to(base, list(check.node_ids)), '0')
-        units.append((f'screen:{check.id}', render(scoped)))
-    return units
+def screen_units(checks: Sequence[ScreenCheck]) -> list[Unit]:
+    return [(f'screen:{check.id}', render(check.command)) for check in checks]
 
 
 def listed_units(staged: list[str]) -> list[Unit]:
@@ -211,7 +205,7 @@ def listed_units(staged: list[str]) -> list[Unit]:
     if not screen_triggered(staged, member_package_dirs()):
         return units
     checks = load_screen_checks(_checkout.ROOT / SCREEN_MANIFEST, registry)
-    return [*units, *screen_units(checks, registry)]
+    return [*units, *screen_units(checks)]
 
 
 def _render(units: Sequence[Unit]) -> Iterator[str]:
