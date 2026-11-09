@@ -48,7 +48,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _host_health_helpers import transport_down
-from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
 from _task_verify_integration_rig import (
     LAPTOP,
     MODULE,
@@ -507,7 +507,7 @@ class TestHarnessDispatcher:
         ) as scene:
             assert not admission_active(scene.config)
             holder = scene.hold()
-            await asyncio.wait_for(holder.granted.wait(), 30)
+            await wait_responsive(holder.granted.wait(), label='the test to hold the laptop turn')
             scene.legs.block(_TEST_LEG, 'local')
             call = scene.start([scene.module(MODULE)])
             await scene.until(
@@ -755,7 +755,7 @@ class TestHostHealthWithTheMergeWorker:
             await scene.start_worker()
             scene.laptop.healthy = False
             local_holder = scene.hold_local()
-            await asyncio.wait_for(local_holder.granted.wait(), 30)
+            await wait_responsive(local_holder.granted.wait(), label='the test to hold the local turn')
             scene.pool.mark_unavailable(LAPTOP, transport_down())
             assert scene.pool.policy(LAPTOP, scene.config).slots == 0
             call = scene.start([scene.module(MODULE)])
@@ -824,8 +824,8 @@ _ENSURE_FAILS = Ensure(rc=1)
 async def _hold_both(scene: Scene) -> tuple[Turn, Turn]:
     """The laptop's turn and the local turn, both held by the test."""
     laptop, local = scene.hold(), scene.hold_local()
-    await asyncio.wait_for(laptop.granted.wait(), 30)
-    await asyncio.wait_for(local.granted.wait(), 30)
+    await wait_responsive(laptop.granted.wait(), label='the test to hold the laptop turn')
+    await wait_responsive(local.granted.wait(), label='the test to hold the local turn')
     return laptop, local
 
 
@@ -1030,7 +1030,7 @@ class TestThroughTheTaskWorkflow:
             assert not younger.granted.is_set()
             scene.legs.release(_TEST)
             await flow.until_parked_at_merge()
-            await asyncio.wait_for(younger.granted.wait(), 30)
+            await wait_responsive(younger.granted.wait(), label='the younger plan to be granted the local turn')
 
             assert len(scene.laptop.requests('verify_task')) == 1
             sidecar = scene.sidecar(1)
@@ -1082,7 +1082,7 @@ async def _stage_the_race(flow: WorkflowScene, stage: str) -> tuple[dict[str, Tu
     if stage == 'withdrawing_local':
         scene.legs.block(PROVISION_LEG)
         laptop_holder = scene.hold()
-        await asyncio.wait_for(laptop_holder.granted.wait(), 30)
+        await wait_responsive(laptop_holder.granted.wait(), label='the test to hold the laptop turn')
         flow.start()
         await flow.until(
             lambda: scene.legs.spawned(PROVISION_LEG)
