@@ -204,6 +204,21 @@ class PermitLedger(Generic[_PermitT]):
         self._live.add(permit)
         return permit
 
+    def try_acquire(self) -> _PermitT | None:
+        """Take a free slot now, or return None; never waits.
+
+        None whenever the semaphore is locked, which includes a slot already
+        handed to a parked ``acquire``.  Mirrors ``asyncio.Semaphore.acquire``'s
+        no-wait path, so nothing awaits between the take and the ``live``
+        registration (task 8524).
+        """
+        if self._slot.locked():
+            return None
+        self._slot._value -= 1
+        permit = self._token_factory()
+        self._live.add(permit)
+        return permit
+
     def release(self, permit: _PermitT) -> None:
         """Release *permit*, restoring one slot. Idempotent + live-checked.
 

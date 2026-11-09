@@ -7,14 +7,17 @@ reason recorded (plans/merge-lane-policy-prd.md D1; contract §6).
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Container, Sequence
 
+from orchestrator.merge_lane.speculation_controller import PermitLedger
 from orchestrator.merge_lane.types import (
     InflightEntry,
     InflightVerifyResult,
     RealMergeItem,
     RemergeBase,
     RemergeReason,
+    SpecPermit,
 )
 
 
@@ -110,3 +113,43 @@ def choose_remerge_base(
     if reason is not None:
         return RemergeBase(None, reason)
     return RemergeBase(tip, RemergeReason.LIVE_TIP)
+
+
+@dataclasses.dataclass(frozen=True)
+class RemergeClaim:
+    """A re-anchor decision and the permit the replacement leaves with: a
+    speculative anchor holds exactly one permit, a fall to main holds none."""
+
+    anchor: RemergeBase
+    permit: SpecPermit | None
+
+    def __post_init__(self) -> None:
+        if self.anchor.speculative != (self.permit is not None):
+            raise ValueError(
+                'RemergeClaim holds a permit iff its anchor is speculative; got '
+                f'reason={self.anchor.reason.value!r} permit={self.permit!r}',
+            )
+
+
+def claim_remerge_base(
+    *,
+    main_sha: str,
+    frozen_tip: str,
+    dead_bases: Container[str],
+    frontier: Sequence[InflightEntry],
+    held_permit: SpecPermit | None,
+    ledger: PermitLedger[SpecPermit],
+) -> RemergeClaim:
+    """Decide the anchor once, with the permit already in hand.
+
+    The replacement keeps *held_permit*, or takes a free slot without
+    waiting; a permit it cannot use (a fall to main) is released here.
+    """
+    taken = held_permit if held_permit is not None else ledger.try_acquire()
+    anchor = choose_remerge_base(
+        main_sha, frozen_tip, dead_bases, frontier, permit_available=taken is not None,
+    )
+    if taken is not None and not anchor.speculative:
+        ledger.release(taken)
+        taken = None
+    return RemergeClaim(anchor, taken)
