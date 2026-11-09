@@ -196,7 +196,14 @@ from orchestrator.slot_lease import (
     suspended_slot_tasks,
     wedged_slot_escalation,
 )
-from orchestrator.startup_steps import EntryFailures
+from orchestrator.startup_steps import (
+    EntryFailures,
+    StartupJournal,
+    StartupStep,
+    StepOutcome,
+    StepStatus,
+    run_startup_step,
+)
 from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
@@ -2709,6 +2716,48 @@ class Harness:
         agents_idle = self._idle_poll_sleeping and not self._live_tasks
         await self._maybe_restart_stale_service(agents_idle=agents_idle)
 
+    async def _start_lifecycle_services(self) -> None:
+        self._build_lifecycle_registry()
+        assert self._lifecycle is not None
+        await self._lifecycle.start_all()
+
+    async def _prewarm_warm_lane_pool(self) -> None:
+        if not (
+            self.config.git.warm_lane_pool
+            and self.config.git.warm_lane_prewarm
+            and self.git_ops.warm_lane_pool is not None
+        ):
+            return
+        # Resolve current-main SHA as the neutral detached start_ref for every
+        # materialized lane; fall back to the symbolic branch name if
+        # rev-parse returns None so prewarm still runs.
+        start_ref = await self.git_ops.resolve_branch_sha(self.config.git.main_branch)
+        if start_ref is None:
+            start_ref = self.config.git.main_branch
+            logger.warning(
+                'warm-lane prewarm: resolve_branch_sha returned None for %r — '
+                'falling back to the symbolic branch ref', self.config.git.main_branch,
+            )
+        logger.info(
+            'warm-lane prewarm enabled — eagerly materializing the warm-lane pool from %s',
+            start_ref,
+        )
+        await self.git_ops.prewarm_pool(start_ref)
+
+    async def _run_startup_steps(
+        self, steps: Sequence[StartupStep], journal: StartupJournal,
+    ) -> tuple[StepOutcome, ...]:
+        outcomes: list[StepOutcome] = []
+        for step in steps:
+            outcomes.append(await run_startup_step(
+                step,
+                journal=journal,
+                event_store=self.event_store,
+                escalation_queue=self._escalation_queue,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            ))
+        return tuple(outcomes)
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -2828,122 +2877,48 @@ class Harness:
         # Hoisted out of the try block so the finally clause can tally the
         # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
+        journal = StartupJournal()
 
         try:
-            # 1. Start fused-memory HTTP server
             logger.info('Starting fused-memory HTTP server...')
             await self.mcp.start()
 
-            # 1b. Start every background-loop/service lifecycle in one
-            # ordered ladder (task 2241, W10-η — PRD §5.3 LR-1/2/3):
-            # escalation-server, merge-worker, offline-lane, then the
-            # sleep-first sweeps. escalation-server + merge-worker start
-            # first (canonical order), so the recovery block immediately
-            # below — which depends on both being live — is unaffected by
-            # collapsing the eleven scattered _start_* calls into this one
-            # seam. _build_lifecycle_registry() is idempotent: a test may
-            # have already pre-built (and monkeypatched) self._lifecycle.
-            self._build_lifecycle_registry()
-            assert self._lifecycle is not None
-            await self._lifecycle.start_all()
+            recovered_merges: list = []
 
-            # 1c. Dismiss stale escalations from prior runs (non-fatal)
-            try:
-                await self._dismiss_stale_escalations()
-            except Exception as e:
-                logger.warning(f'Failed to dismiss stale escalations: {e}')
+            async def recover_pending_merges() -> None:
+                report = await self._recover_pending_merges()
+                recovered_merges.extend(report.get('requests', []))
 
-            # 1c0-dirty. Dirty project_root no longer refuses to start (task
-            # 2380); file (or refresh) a deferred born-at-L2 escalation
-            # instead. Runs after _dismiss_stale_escalations, which only
-            # touches L0, so a prior run's L2 survives for dedup here.
-            # Own try/except (non-fatal), like every neighboring startup
-            # step, so a fault in the escalation path itself (e.g. a
-            # transient git subprocess/lock failure in
-            # has_dirty_working_tree(), or an fsync/rename OSError in
-            # _escalation_queue.submit()) never aborts startup and
-            # recreates the RCA 2026-07-08 crash-loop this task exists to
-            # eliminate.
-            try:
-                await self._file_dirty_tree_escalation(force_dirty_start)
-            except Exception as e:
-                logger.warning(f'Failed to file dirty-tree escalation: {e}')
-
-            # 1c0-config-keys. Surface the unknown-config-key census (task 2989)
-            # as a born-at-L2 escalation so a phantom key that pydantic's
-            # extra='ignore' silently dropped (the 2026-07-22 spare_warm_lanes
-            # incident) can never again vanish unnoticed.  Own try/except
-            # (non-fatal), like every neighboring startup step and matching the
-            # dirty-tree guard above, so a fault here never aborts startup.  The
-            # method is itself fail-open; this is defense in depth.
-            try:
-                await self._file_config_unknown_keys_escalation()
-            except Exception as e:
-                logger.warning(f'Failed to file config-unknown-keys escalation: {e}')
-
-            # 1c0. Rehydrate merge-halt state from preserved L1s (non-fatal).
-            # Must run after _dismiss_stale_escalations so we scan the
-            # settled post-dismissal queue (only real L1s remain).
-            try:
-                self._rehydrate_merge_halt()
-            except Exception as e:
-                logger.warning(f'Failed to rehydrate merge halt: {e}')
-
-            # 1c0a. Recover in-flight merge requests from the durable journal
-            # (task 1772). Runs after _rehydrate_merge_halt so a halted queue
-            # holds re-enqueued items rather than racing to merge them.
-            _recover_report: dict = {}
-            try:
-                _recover_report = await self._recover_pending_merges()
-            except Exception as e:
-                logger.warning(f'Failed to recover pending merges: {e}')
-
-            # 1c0a2. Reap orphaned _merge-* worktrees left by a mid-run SIGTERM
-            # or a restart that wiped the in-memory ledger (task 2060, I6 leak).
-            # Runs after recovery so a worktree still backing a recovered
-            # in-flight merge is re-adopted rather than reaped.  Own try/except
-            # so a reaper fault never blocks startup.
-            try:
-                await self._reap_orphaned_merge_worktrees(
-                    _recover_report.get('requests', []),
-                )
-            except Exception as e:
-                logger.warning(f'Failed to reap orphaned merge worktrees: {e}')
-
-            # 1c0a3. Reconcile the durable LandedOutbox (task 2155, W1 γ):
-            # closes the crash window between a merge advancing main and the
-            # task being marked done. Runs after the reap block so a worker
-            # (and its bound LandedOutbox) is fully settled first. Own
-            # try/except so a reconciler fault never blocks startup.
-            try:
-                await self._reconcile_landed_outbox()
-            except Exception as e:
-                logger.warning(f'Failed to reconcile landed outbox: {e}')
-
-            # 1c0b. File the L1 escalation for a pause restored from a prior
-            # run (deferred from _load_persisted_scheduler_pause, which ran
-            # before the escalation queue existed).  Placed after the stale-L0
-            # dismissal + merge-halt rehydration so the queue is settled;
-            # has_open_l1 dedups against a prior run's surviving L1, so the
-            # operator sees one persistent L1 across the restart loop.
-            self._file_restored_pause_escalation()
-
-            # 1c1g. Unconditional interactive-worktree (_iact-*) crash-safety
-            # sweep (task δ/2012). Runs once at every boot regardless of
-            # warm_lane_gc_enabled — crash recovery must not wait for (or
-            # depend on) the periodic cadence kill-switch. The pass is itself
-            # fail-soft, so a reaper fault can never break startup.
-            await self._run_interactive_worktree_reaper_pass()
-
-            # 1c1h. Unconditional leftover verify-scope (df-verify-{tag}-*.scope)
-            # crash-safety sweep (task 2829; companion to reify enabling
-            # verify_use_cgroup_scope). A crash/SIGKILL can strand a transient
-            # verify scope whose cgroup subtree keeps running; this reaps ONLY
-            # this project's tag-scoped leftovers. Placed beside the interactive
-            # reaper so it inherits the same ordering guarantee — it runs before
-            # scheduler.finish_startup() and the first acquire_next, i.e. before
-            # first dispatch, on every boot. The pass is itself fail-soft.
-            await self._run_leftover_verify_scope_reaper_pass()
+            # The gates between the two segments (the delay, the usage cap,
+            # task-tree reachability) are not steps: their raise is the
+            # intended outcome (plans/startup-hardening-prd.md §3.1).
+            service_steps = (
+                StartupStep('1b', self._start_lifecycle_services, fatal=True),
+                StartupStep('1c', self._dismiss_stale_escalations),
+                StartupStep(
+                    '1c0-dirty',
+                    functools.partial(self._file_dirty_tree_escalation, force_dirty_start),
+                ),
+                StartupStep('1c0-config-keys', self._file_config_unknown_keys_escalation),
+                StartupStep('1c0', self._rehydrate_merge_halt),
+                StartupStep('1c0a', recover_pending_merges),
+                StartupStep(
+                    '1c0a2', lambda: self._reap_orphaned_merge_worktrees(recovered_merges),
+                ),
+                StartupStep('1c0a3', self._reconcile_landed_outbox),
+                StartupStep('1c0b', self._file_restored_pause_escalation),
+                StartupStep('1c1g', self._run_interactive_worktree_reaper_pass),
+                StartupStep('1c1h', self._run_leftover_verify_scope_reaper_pass),
+            )
+            task_tree_steps = (
+                StartupStep('2c', self._recover_crashed_tasks),
+                StartupStep('2c2', self._reconcile_lane_checkouts),
+                StartupStep('2d', self._reconcile_stranded_at_startup),
+                StartupStep('2e', self._reap_orphan_worktrees),
+                StartupStep('diff7', self._reconcile_terminal_lanes),
+                StartupStep('2f', self._prewarm_warm_lane_pool),
+            )
+            outcomes = await self._run_startup_steps(service_steps, journal)
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -3024,86 +2999,18 @@ class Harness:
                 logger.info('Tagging tasks with code modules...')
                 await self._tag_task_modules(force=retag_modules)
 
-            # 2c. Recover crashed tasks from surviving worktrees
-            await self._recover_crashed_tasks()
-
-            # 2c2. Reconcile stale branch checkouts left behind by recovery's
-            # skip branches (identity-guard defer, no-plan/corrupt-plan
-            # release) — runs while no task is yet dispatched, so it only
-            # repairs what _recover_crashed_tasks skipped and never races a
-            # live dispatch.  Own try/except (non-fatal): a startup repair
-            # sweep must never prevent startup.  A conflicted lane is already
-            # handled per lane inside
-            # git_ops.py::GitOps::detach_lane_checkout; this backstops the rest.
-            try:
-                await self._reconcile_lane_checkouts()
-            except Exception as e:
+            outcomes += await self._run_startup_steps(task_tree_steps, journal)
+            not_ok = [o for o in outcomes if o.status is not StepStatus.OK]
+            if not_ok:
                 logger.warning(
-                    'Failed to reconcile lane checkouts (non-fatal, startup '
-                    'continues): %s', e, exc_info=True,
+                    'startup steps not ok: %s',
+                    ', '.join(f'{o.step}={o.status}' for o in not_ok),
                 )
-
-            # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
-            await self._reconcile_stranded_in_progress()
-
-            # 2e. Reap/quarantine orphan worktrees (Fix B).  Runs here — after
-            # recovery + stranded-reconcile and before the first acquire_next —
-            # so no task is yet dispatched and no live workflow can race the
-            # sweep.  Self-gates on worktree_orphan_reaper_enabled.
-            await self._reap_orphan_worktrees()
-            # Diff 7: startup terminal-lane sweep (layer A backstop).
-            # Runs after the orphan reaper so no task is yet dispatched — no
-            # live workflow can race the release.
-            await self._reconcile_terminal_lanes()
-
-            # 2f. Eager warm-lane pool prewarm (task 2879).  Gated on BOTH
-            # git.warm_lane_pool AND the new default-off git.warm_lane_prewarm
-            # knob, and only when the pool actually exists.  Runs HERE — after
-            # every startup reconcile sweep (which have already restored the
-            # existing on-disk lanes, so prewarm's resident-skip will not
-            # double-create them) and BEFORE finish_startup()/the first
-            # acquire_next — so it can never race a live acquire/release.
-            # prewarm_pool is itself fail-open / never-raises / idempotent; the
-            # only thing that can fail on THIS side is resolving start_ref, so
-            # the whole block is best-effort: a start_ref lookup failure logs
-            # and continues, never wedging startup.
-            if (
-                self.config.git.warm_lane_pool
-                and self.config.git.warm_lane_prewarm
-                and self.git_ops.warm_lane_pool is not None
-            ):
-                try:
-                    # Resolve current-main SHA as the neutral detached start_ref
-                    # for every materialized lane (same idiom as the substrate
-                    # gate / dispatch paths; use the configured main_branch, not
-                    # a literal 'main').  Fall back to the symbolic branch name
-                    # if rev-parse returns None so prewarm still runs.
-                    start_ref = await self.git_ops.resolve_branch_sha(
-                        self.config.git.main_branch
-                    )
-                    if start_ref is None:
-                        start_ref = self.config.git.main_branch
-                        logger.warning(
-                            'warm-lane prewarm: resolve_branch_sha returned '
-                            'None for %r — falling back to the symbolic branch '
-                            'ref', self.config.git.main_branch,
-                        )
-                    logger.info(
-                        'warm-lane prewarm enabled — eagerly materializing the '
-                        'warm-lane pool from %s', start_ref,
-                    )
-                    await self.git_ops.prewarm_pool(start_ref)
-                except Exception:
-                    logger.warning(
-                        'warm-lane prewarm: unexpected error during startup '
-                        'prewarm — continuing startup (prewarm is best-effort)',
-                        exc_info=True,
-                    )
 
             # Startup reconcile sweeps above have all run; mark the Scheduler
             # started so acquire_next() may now proceed (task 2235's runtime
-            # enforcement of the "sweeps run before the first tick" invariant
-            # the comments above describe).  Set even under dry_run, which
+            # enforcement of the "sweeps run before the first tick"
+            # invariant).  Set even under dry_run, which
             # never reaches acquire_next but should still leave the Scheduler
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
