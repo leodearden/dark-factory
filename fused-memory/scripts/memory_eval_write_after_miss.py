@@ -40,14 +40,34 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
+
+from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory
+from fused_memory.models.memory import MemoryResult
+from fused_memory.server.grouped_read import child_parent_id
+from fused_memory.server.near_duplicate_guard import (
+    cosine_of,
+    find_near_duplicate_memory,
+    resolve_near_dup_threshold,
+)
 
 EVAL_ID = 'e7-write-after-miss'
 METRIC_ID = 'write-after-miss'
+
+GUARD_SEARCH_DEPTH = 5
+"""The candidate depth of the production guard's pre-write search.
+
+Mirrors the ``limit=5`` literal in ``fused_memory/server/tools.py::add_memory``.
+A replay asks for this many plus the write's own ids, because those are
+filtered out; the guard's max-cosine selection is otherwise unchanged.
+"""
 
 JOURNAL_BUSY_TIMEOUT_SECS = 30.0
 """How long a read waits on the live journal's writer lock (sqlite3's ``timeout``).
@@ -269,4 +289,171 @@ def read_journal(db_path: str | Path, *, project_id: str, period: Period) -> Jou
         searches=tuple(searches),
         unattributed_searches=unattributed,
         unparsed_rows=unparsed,
+    )
+
+
+class SkipReason(StrEnum):
+    """Why a write in the period was not adjudicated. Each one is counted, never dropped."""
+
+    NO_PRIOR_SEARCH = 'no_prior_search'
+    CATEGORY_NOT_COMPARABLE = 'category_not_comparable'
+    NO_MEMORY_ID = 'no_memory_id'
+    CONTENT_UNAVAILABLE = 'content_unavailable'
+    CANDIDATE_SEARCH_DEGRADED = 'candidate_search_degraded'
+
+
+@dataclass(frozen=True)
+class Incident:
+    """One write whose guard-selected near-duplicate no prior search in its window showed."""
+
+    write_row_id: str
+    search_row_ids: tuple[str, ...]
+    project_id: str
+    caller_agent_id: str
+    matched_memory_id: str
+    similarity: float
+    threshold: float
+    category: str
+    write_created_at: datetime
+
+
+@dataclass(frozen=True)
+class Adjudication:
+    incidents: tuple[Incident, ...]
+    adjudicated: int
+    skipped: Mapping[SkipReason, int]
+    """Every reason, present at zero too."""
+
+
+def prior_searches(write: WriteRow, searches: Sequence[SearchRow]) -> tuple[SearchRow, ...]:
+    """The write's window: same project and caller, strictly before the write."""
+    return tuple(
+        search for search in searches
+        if search.project_id == write.project_id
+        and search.caller_agent_id == write.caller_agent_id
+        and search.created_at < write.created_at
+    )
+
+
+def ineligibility(write: WriteRow, prior: Sequence[SearchRow]) -> SkipReason | None:
+    """Why *write* cannot be adjudicated before any store read, or ``None`` when it can."""
+    if write.category not in MEM0_PRIMARY:
+        return SkipReason.CATEGORY_NOT_COMPARABLE
+    if not write.memory_ids:
+        return SkipReason.NO_MEMORY_ID
+    if not prior:
+        return SkipReason.NO_PRIOR_SEARCH
+    return None
+
+
+async def _stored_content(memory: Any, write: WriteRow, project_id: str) -> str | None:
+    for memory_id in write.memory_ids:
+        record = await memory.get_memory_by_id(project_id, memory_id)
+        if record is not None and record.get('content'):
+            return record['content']
+    return None
+
+
+async def fetch_candidates(
+    memory: Any, write: WriteRow, *, project_id: str,
+) -> list[MemoryResult] | SkipReason:
+    """Re-run the guard's search with the write's stored content, journalling nothing.
+
+    No ``causation_id`` is passed, so ``MemoryService.search`` writes no journal
+    row. ``anchor_topics=False`` matches the guard: a pinned canonical carries
+    no cosine and would only spend a candidate slot.
+    """
+    content = await _stored_content(memory, write, project_id)
+    if content is None:
+        return SkipReason.CONTENT_UNAVAILABLE
+    results = await memory.search(
+        query=content,
+        project_id=project_id,
+        categories=[write.category],
+        stores=['mem0'],
+        limit=GUARD_SEARCH_DEPTH + len(write.memory_ids),
+        anchor_topics=False,
+    )
+    if getattr(results, 'degraded', False):
+        return SkipReason.CANDIDATE_SEARCH_DEGRADED
+    return list(results)
+
+
+def _created_before(result: MemoryResult, moment: datetime) -> bool:
+    try:
+        created = datetime.fromisoformat(result.created_at) if result.created_at else None
+    except ValueError:
+        created = None
+    return created is not None and created.tzinfo is not None and created < moment
+
+
+def admissible(results: Sequence[MemoryResult], write: WriteRow) -> list[MemoryResult]:
+    """Candidates that already existed when *write* landed: not its own ids, dated before it."""
+    own = set(write.memory_ids)
+    return [
+        result for result in results
+        if result.id not in own and _created_before(result, write.created_at)
+    ]
+
+
+def was_shown(match: MemoryResult, searches: Sequence[SearchRow]) -> bool:
+    """Whether *match*, or the grouped parent it folds under, was in some search's shown set."""
+    shown = frozenset().union(*(search.shown_ids for search in searches))
+    return match.id in shown or child_parent_id(match.metadata) in shown
+
+
+async def _adjudicate_write(
+    write: WriteRow,
+    searches: Sequence[SearchRow],
+    memory: Any,
+    *,
+    project_id: str,
+    threshold: float,
+) -> Incident | SkipReason | None:
+    """The write's incident, the reason it was skipped, or ``None`` for a clean adjudication."""
+    prior = prior_searches(write, searches)
+    reason = ineligibility(write, prior)
+    if reason is not None:
+        return reason
+    candidates = await fetch_candidates(memory, write, project_id=project_id)
+    if isinstance(candidates, SkipReason):
+        return candidates
+    match = find_near_duplicate_memory(
+        admissible(candidates, write), threshold, category=MemoryCategory(write.category),
+    )
+    if match is None or was_shown(match, prior):
+        return None
+    return Incident(
+        write_row_id=write.row_id,
+        search_row_ids=tuple(search.row_id for search in prior),
+        project_id=write.project_id,
+        caller_agent_id=prior[0].caller_agent_id,
+        matched_memory_id=match.id,
+        similarity=cosine_of(match) or 0.0,
+        threshold=threshold,
+        category=write.category,
+        write_created_at=write.created_at,
+    )
+
+
+async def adjudicate(window: JournalWindow, memory: Any, *, project_id: str) -> Adjudication:
+    """Adjudicate every write in *window* against the production guard at its resolved threshold."""
+    threshold = resolve_near_dup_threshold(memory)
+    incidents: list[Incident] = []
+    skipped: Counter[SkipReason] = Counter()
+    adjudicated = 0
+    for write in window.writes:
+        verdict = await _adjudicate_write(
+            write, window.searches, memory, project_id=project_id, threshold=threshold,
+        )
+        if isinstance(verdict, SkipReason):
+            skipped[verdict] += 1
+            continue
+        adjudicated += 1
+        if verdict is not None:
+            incidents.append(verdict)
+    return Adjudication(
+        incidents=tuple(incidents),
+        adjudicated=adjudicated,
+        skipped=MappingProxyType({reason: skipped[reason] for reason in SkipReason}),
     )

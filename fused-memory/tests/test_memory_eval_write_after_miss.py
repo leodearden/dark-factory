@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
-from fused_memory.models.enums import SourceStore
+from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.services.memory_service import SearchResults
 from fused_memory.services.read_telemetry import (
@@ -54,7 +54,7 @@ def _hit(memory_id: str, *, score: float = 0.5, category: str = 'procedural_know
     return MemoryResult(
         id=memory_id,
         content=f'content of {memory_id}',
-        category=category,
+        category=MemoryCategory(category),
         source_store=SourceStore.mem0,
         metadata={'store_score': score, **(metadata or {})},
         created_at=created_at,
