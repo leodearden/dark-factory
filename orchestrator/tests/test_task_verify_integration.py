@@ -43,7 +43,8 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _host_health_helpers import transport_down
@@ -51,15 +52,26 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _task_verify_integration_rig import (
     LAPTOP,
     MODULE,
+    PROVISION_LEG,
     SECOND_MODULE,
     SSH_CONNECT_FAILURE,
+    WORKFLOW_TASK_ID,
     Cli,
     Ensure,
     Exit,
     Hold,
     Raises,
+    Scene,
     Subprocess,
+    Turn,
+    Verdict,
+    WorkflowScene,
     open_scene,
+    open_workflow_scene,
+)
+from _workflow_helpers import (
+    PLAN,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
 )
 from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
 
@@ -72,14 +84,17 @@ from orchestrator.task_verify_spec import (
     task_spec_from_json,
     task_spec_to_json,
 )
-from orchestrator.verify import admission_active, run_scoped_verification
+from orchestrator.verify import VerifyResult, admission_active, run_scoped_verification
 from orchestrator.verify_cancel import pgid_file, read_worktree_path, worktree_path_file
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+from orchestrator.verify_checkpoint import green_checkpoint_at_tip
 from orchestrator.verify_runner import (
     ConcurrentDispatchError,
     RunnerUnavailable,
     build_merge_verify_spec,
     result_from_json,
 )
+from orchestrator.workflow_types import TerminalReport, WorkflowOutcome, WorkflowState
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures('code_default_config')]
 
@@ -789,3 +804,304 @@ class TestHostHealthWithTheMergeWorker:
             await scene.until(
                 lambda: not scene.laptop_row()['quarantined'], what='the sweep to readmit the laptop',
             )
+
+
+_REMOTE_ALL: dict[str, Any] = {'verify_task_host_policy': 'remote_all'}
+_LINT, _TEST = 'lint', 'test'
+"""The workstation-wide legs a workflow verify runs (the workflow config defines no modules)."""
+_INFRA = VerifyResult(
+    passed=False, test_output='', lint_output='', type_output='', summary='host out of space',
+    category=sorted(INFRA_TRANSIENT_CATEGORIES)[0],
+)
+_GREEN = VerifyResult(
+    passed=True, test_output='', lint_output='', type_output='', summary='All checks passed',
+)
+_RACE_WORKFLOW: dict[str, Any] = {'concurrent_verify': True, 'verify_admission_enabled': True, **_REMOTE_ALL}
+_ENSURE_FAILS = Ensure(rc=1)
+"""Keeps a skew-benched laptop benched: the reprobe sweep readmits one only once ensure succeeds."""
+
+
+async def _hold_both(scene: Scene) -> tuple[Turn, Turn]:
+    """The laptop's turn and the local turn, both held by the test."""
+    laptop, local = scene.hold(), scene.hold_local()
+    await asyncio.wait_for(laptop.granted.wait(), 30)
+    await asyncio.wait_for(local.granted.wait(), 30)
+    return laptop, local
+
+
+def _local_waiter(scene: Scene, task_id: str = WORKFLOW_TASK_ID) -> tuple[str, float]:
+    """The plan id and arrival *task_id* waits under on the local gate."""
+    [request] = [
+        view.request for view in scene.local_gate.snapshot().waiters
+        if view.request.task_id == task_id
+    ]
+    return request.plan_id, request.plan_arrival
+
+
+async def _end(flow: WorkflowScene) -> TerminalReport:
+    """Soft-cancel a run parked at MERGE; its report."""
+    flow.soft_cancel()
+    return await flow.report()
+
+
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestThroughTheTaskWorkflow:
+    """A real TaskWorkflow driven by AgentStub into its real VERIFY, built with the harness's dispatcher."""
+
+    async def test_row10_an_infra_transient_remote_verdict_reruns_locally_inside_the_same_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_REMOTE_ALL) as flow:
+            scene = flow.scene
+            await scene.start_worker()
+            scene.laptop.answers['verify-task'] = Hold(Verdict(_INFRA))
+            flow.start()
+            request_id = await scene.laptop.until_verifying('verify-task')
+            scene.laptop.ensure = _ENSURE_FAILS
+            scene.laptop.release(request_id)
+
+            await flow.until_parked_at_merge()
+
+            [sidecar] = scene.sidecars(1)
+            assert (sidecar['reason'], sidecar['runner']) == ('infra_transient', 'local')
+            assert scene.laptop.requests('verify_task') == [request_id]
+            assert scene.legs.spawned(_TEST, 'local')
+            [row] = flow.verify_rows()
+            assert (row['passed'], row['runner']) == (True, 'local')
+            laptop = scene.laptop_row()
+            assert (
+                laptop['quarantined'], laptop['quarantine_class'], laptop['kind'], laptop['streak'],
+            ) == (True, 'skew', 'no_verdict', 1)
+            await _end(flow)
+
+    async def test_row13_a_soft_cancel_mid_remote_verify_cancels_it_on_the_laptop_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_REMOTE_ALL) as flow:
+            scene = flow.scene
+            scene.laptop.answers['verify-task'] = Hold()
+            flow.start()
+            request_id = await scene.laptop.until_verifying('verify-task')
+
+            flow.soft_cancel()
+            report = await flow.report()
+
+            assert (report.outcome, report.phase) == (
+                WorkflowOutcome.SOFT_CANCELLED, WorkflowState.CANCELLED,
+            )
+            calls = [(call.label, call.request_id) for call in scene.laptop.calls]
+            assert calls.index(('cancel_verify', request_id)) < calls.index(
+                ('verify_unwound', request_id),
+            )
+            assert scene.unwound(), scene.turns()
+
+    async def test_row16_a_workflow_without_the_dispatcher_calls_the_module_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_REMOTE_ALL) as flow:
+            scene = flow.scene
+            module_verify = AsyncMock(return_value=_GREEN)
+            monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', module_verify)
+            flow.start(with_dispatcher=False)
+
+            await flow.until_parked_at_merge()
+
+            assert flow.workflow is not None
+            [call] = module_verify.await_args_list
+            assert (call.args, call.kwargs) == ((flow.workflow.worktree, scene.config, []), {
+                'task_files': PLAN['files'],
+                'attempt_id': 1,
+                'task_id': WORKFLOW_TASK_ID,
+                'archive_root': scene.archive_root,
+                'force_workspace': False,
+                'role': 'task',
+                'event_store': scene.harness.event_store,
+            })
+            assert scene.dispatcher.decision_for(WORKFLOW_TASK_ID, 1) is None
+            assert scene.sidecars(1) == []
+            assert scene.laptop.calls == []
+            assert scene.runners.built == []
+            assert scene.unwound(), scene.turns()
+            await _end(flow)
+
+    async def test_row17_a_remote_green_names_the_laptop_beside_the_worktree_head(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_REMOTE_ALL) as flow:
+            scene = flow.scene
+            flow.start()
+
+            await flow.until_parked_at_merge()
+
+            head = scene.tip
+            [row] = flow.verify_rows()
+            assert (row['passed'], row['runner'], row['tip_sha'], row['site']) == (
+                True, LAPTOP, head, 'implement',
+            )
+            assert green_checkpoint_at_tip(
+                scene.harness.event_store, EventType.workflow_verify, WORKFLOW_TASK_ID, head,
+            ) is True
+            assert scene.sidecar(1)['reason'] == 'remote'
+            assert scene.legs.spawned_at('local') == []
+            assert scene.legs.spawned_at('laptop') == [_LINT, _TEST, 'type']
+            assert (await _end(flow)).outcome == WorkflowOutcome.SOFT_CANCELLED
+
+    async def test_row22_a_laptop_red_confirmed_green_locally_never_reaches_the_debugger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(
+            tmp_path, monkeypatch, verify_task_remote_red_confirms_locally=True, **_REMOTE_ALL,
+        ) as flow:
+            scene = flow.scene
+            scene.legs.fail(_TEST, 'laptop')
+            flow.start()
+
+            await flow.until_parked_at_merge()
+
+            assert 'debugger' not in flow.agents.calls
+            assert scene.legs.spawned(_TEST, 'laptop') and scene.legs.spawned(_TEST, 'local')
+            sidecar = scene.sidecar(1)
+            assert (sidecar['runner'], sidecar['reason']) == ('local', 'red_confirm')
+            assert sidecar['red_confirmed_locally'] == {'remote_passed': False, 'local_passed': True}
+            [row] = flow.verify_rows()
+            assert (row['passed'], row['runner']) == (True, 'local')
+            await _end(flow)
+
+    @_REAL
+    async def test_row26_a_laptop_turn_freed_while_queued_withdraws_the_local_verify(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_RACE_WORKFLOW) as flow:
+            scene = flow.scene
+            scene.legs.block(_LINT)
+            laptop_holder, local_holder = await _hold_both(scene)
+            flow.start()
+            await flow.until_queued_on_both()
+            await flow.until(lambda: scene.legs.spawned(_LINT), what='the local lint leg to spawn')
+            [lint_pid] = scene.legs.pids(_LINT)
+
+            await laptop_holder.leave()
+            await flow.until_parked_at_merge()
+
+            assert not scene.legs.spawned(_TEST)
+            assert not _alive(lint_pid)
+            assert WORKFLOW_TASK_ID not in scene.turns()['local_waiters']
+            assert scene.events(EventType.verify_admission_plan) == []
+            sidecar = scene.sidecar(1)
+            assert (sidecar['decision'], sidecar['runner']) == ('remote', LAPTOP)
+            assert sidecar['remote_wait_secs'] > 0
+            assert scene.unwound(local_holders=['local-holder']), scene.turns()
+            await _end(flow)
+            await local_holder.leave()
+
+    @_REAL
+    async def test_row30_an_unreachable_laptop_after_withdrawal_reenters_at_the_original_arrival(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_workflow_scene(tmp_path, monkeypatch, **_RACE_WORKFLOW) as flow:
+            scene = flow.scene
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            scene.laptop.answers['verify-task'] = _SSH_DOWN
+            scene.legs.block(_TEST)
+            laptop_holder, local_holder = await _hold_both(scene)
+            flow.start()
+            await flow.until_queued_on_both()
+            arrival = _local_waiter(scene)
+            younger = scene.hold_local(task_id='younger')
+            await flow.until(
+                lambda: 'younger' in scene.turns()['local_waiters'], what='a younger local waiter',
+            )
+
+            await laptop_holder.leave()
+            await flow.until(
+                lambda: scene.laptop_row()['quarantined']
+                and WORKFLOW_TASK_ID in scene.turns()['local_waiters'],
+                what='the call to re-enter the local queue',
+            )
+
+            assert _local_waiter(scene) == arrival
+            await local_holder.leave()
+            await flow.until(
+                lambda: scene.legs.spawned(_TEST) or younger.granted.is_set(),
+                what='the local turn to go to the older plan',
+            )
+            assert scene.legs.spawned(_TEST)
+            assert not younger.granted.is_set()
+            scene.legs.release(_TEST)
+            await flow.until_parked_at_merge()
+            await asyncio.wait_for(younger.granted.wait(), 30)
+
+            assert len(scene.laptop.requests('verify_task')) == 1
+            sidecar = scene.sidecar(1)
+            assert (sidecar['reason'], sidecar['runner']) == ('runner_unavailable', 'local')
+            laptop = scene.laptop_row()
+            assert (laptop['quarantined'], laptop['quarantine_class']) == (True, 'ru')
+            await _end(flow)
+            await younger.leave()
+
+    @_REAL
+    @pytest.mark.parametrize('kind', ['soft', 'hard'])
+    @pytest.mark.parametrize('stage', ['queued_on_both', 'withdrawing_local', 'rederiving_scope'])
+    async def test_row31_a_cancel_at_any_stage_of_the_race_unwinds_everything(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, stage: str,
+    ) -> None:
+        async with open_workflow_scene(
+            tmp_path, monkeypatch, term_ignoring_provision=stage == 'withdrawing_local',
+            **_RACE_WORKFLOW,
+        ) as flow:
+            scene = flow.scene
+            laptop_held, local_held = await _stage_the_race(flow, stage)
+
+            if kind == 'soft':
+                flow.soft_cancel()
+            else:
+                flow.hard_cancel()
+            if stage == 'withdrawing_local':
+                await asyncio.sleep(0.1)
+                scene.legs.release(PROVISION_LEG)
+            report = await flow.report()
+
+            expected = WorkflowOutcome.SOFT_CANCELLED if kind == 'soft' else WorkflowOutcome.CANCELLED
+            assert (report.outcome, report.phase) == (expected, WorkflowState.CANCELLED)
+            assert scene.unwound(
+                laptop_holders=list(laptop_held), local_holders=list(local_held),
+            ), scene.turns()
+            await flow.until_no_task_outlives_the_run()
+            pids = {label: scene.legs.pids(label) for label in scene.legs.spawned_at('local')}
+            assert pids and all(len(spawns) == 1 for spawns in pids.values()), pids
+            assert not any(_alive(pid) for [pid] in pids.values())
+            assert scene.laptop.requests('verify_task') == []
+            for turn in (*laptop_held.values(), *local_held.values()):
+                await turn.leave()
+
+
+async def _stage_the_race(flow: WorkflowScene, stage: str) -> tuple[dict[str, Turn], dict[str, Turn]]:
+    """Start the run and bring its verify to *stage*; the laptop and local turns the test still holds."""
+    scene = flow.scene
+    if stage == 'withdrawing_local':
+        scene.legs.block(PROVISION_LEG)
+        laptop_holder = scene.hold()
+        await asyncio.wait_for(laptop_holder.granted.wait(), 30)
+        flow.start()
+        await flow.until(
+            lambda: scene.legs.spawned(PROVISION_LEG)
+            and WORKFLOW_TASK_ID in scene.turns()['laptop_waiters'],
+            what='the local provision to spawn while the call waits for the laptop',
+        )
+        await laptop_holder.leave()
+        await flow.until(
+            lambda: scene.pool.holders() == {LAPTOP: f'task:{WORKFLOW_TASK_ID}'},
+            what='the call to claim the laptop turn',
+        )
+        return {}, {}
+    laptop_holder, local_holder = await _hold_both(scene)
+    flow.start()
+    await flow.until_queued_on_both()
+    if stage == 'queued_on_both':
+        return {'holder': laptop_holder}, {'local-holder': local_holder}
+    flow.merge_base.arm()
+    await laptop_holder.leave()
+    await flow.until(lambda: flow.merge_base.paused.is_set(), what='the scope re-derive to pause')
+    assert scene.pool.holders() == {LAPTOP: f'task:{WORKFLOW_TASK_ID}'}
+    return {}, {'local-holder': local_holder}
