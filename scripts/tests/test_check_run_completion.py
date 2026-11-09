@@ -5,11 +5,16 @@ selection over the real find_tasks_by_metadata tool, the predicate CLI and the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
+import os
+import socket
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Coroutine, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 from unittest.mock import AsyncMock
@@ -447,3 +452,177 @@ def test_the_default_binding_posts_to_the_configured_url(store, monkeypatch):
 def test_the_fused_memory_url_comes_from_the_environment_or_the_dashboard_default():
     assert crc.fused_memory_url({}) == DEFAULT_FUSED_MEMORY_URLS[0]
     assert crc.fused_memory_url({'FUSED_MEMORY_MCP_URL': 'http://x:1'}) == 'http://x:1'
+
+
+# ── The CLI check mode, run as the predicate runner runs it ──
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'check_run_completion.py'
+VERDICT_KEYS = ['run', 'verdict', 'share', 'threshold', 'landed', 'pending', 'total', 'vacuous', 'by_priority', 'error']
+NEVER_MEASURED = ('share', 'landed', 'pending', 'total', 'vacuous', 'by_priority')
+COULD_NOT_CHECK = 2
+_SCRIPT_TIMEOUT_SECS = 120
+
+
+@dataclass(frozen=True)
+class ScriptRun:
+    rc: int
+    lines: list[str]
+    stderr: str
+
+    @property
+    def verdict(self) -> dict[str, Any]:
+        return json.loads(self.lines[-1])
+
+    @property
+    def human(self) -> list[str]:
+        return self.lines[:-1]
+
+
+def run_script(*args: str, url: str) -> ScriptRun:
+    done = subprocess.run(
+        [sys.executable, '-s', str(SCRIPT), *args],
+        env={**os.environ, 'FUSED_MEMORY_MCP_URL': url},
+        capture_output=True,
+        text=True,
+        timeout=_SCRIPT_TIMEOUT_SECS,
+    )
+    return ScriptRun(done.returncode, done.stdout.splitlines(), done.stderr)
+
+
+@contextlib.contextmanager
+def served(store: FixtureStore) -> Iterator[str]:
+    with StubMcpServer(stateful=False, tools=store.call_tool) as stub:
+        yield stub.url
+
+
+def check(store: FixtureStore, run_id: str = RUN, *, root: str | None = None) -> ScriptRun:
+    with served(store) as url:
+        return run_script('--run', run_id, '--threshold', '0.7', '--project-root', root or store.root, url=url)
+
+
+def _closed_port_url() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    return f'http://127.0.0.1:{port}'
+
+
+def _assert_could_not_check(run: ScriptRun, code: str) -> None:
+    assert run.rc == COULD_NOT_CHECK
+    assert list(run.verdict) == VERDICT_KEYS
+    assert run.verdict['verdict'] == 'error'
+    assert run.verdict['error'] == code
+    assert run.verdict['run'] == RUN
+    assert run.verdict['threshold'] == 0.7
+
+
+def test_boundary_row_1_exits_tempfail_with_the_verdict_as_the_last_line(store):
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+
+    run = check(store)
+
+    assert run.rc == os.EX_TEMPFAIL
+    assert run.lines[-1] == BOUNDARY_ROW_1_JSON
+    assert run.human
+    assert run.stderr == ''
+
+
+def test_boundary_row_11_exits_zero(store):
+    store.seed_run(RUN, ('critical', 'done'), ('high', 'done'), ('high', 'pending'))
+
+    run = check(store)
+
+    assert run.rc == 0
+    assert run.verdict['verdict'] == 'pass'
+    assert run.verdict['share'] == 0.7
+
+
+def test_an_unknown_run_on_a_live_key_is_an_empty_run(store):
+    store.seed_run(OTHER_RUN, ('high', 'pending'), ('low', 'done'))
+
+    run = check(store)
+
+    assert run.rc == COULD_NOT_CHECK
+    assert run.verdict['verdict'] == 'error'
+    assert run.verdict['error'] == 'empty_run'
+    assert run.verdict['total'] == 0
+    assert list(run.verdict) == VERDICT_KEYS
+    assert any(
+        f'x_finding_run is live in {store.root}' in line and f'no task carries x_finding_run={RUN}' in line
+        for line in run.human
+    )
+
+
+def test_a_project_where_no_task_carries_the_key_says_so(store):
+    store.seed(priority='high')
+
+    run = check(store)
+
+    assert run.rc == COULD_NOT_CHECK
+    assert run.verdict['error'] == 'empty_run'
+    assert any(f'no task in {store.root} carries x_finding_run at all' in line for line in run.human)
+    assert not any('is live in' in line for line in run.human)
+
+
+def test_an_unknown_priority_could_not_be_checked(store):
+    store.seed_run(RUN, ('high', 'done'))
+    urgent = store.seed(priority='urgent', metadata={'x_finding_run': RUN})
+
+    run = check(store)
+
+    _assert_could_not_check(run, 'unknown_priority')
+    assert any(str(urgent) in line and 'urgent' in line for line in run.human)
+    for key in NEVER_MEASURED:
+        assert run.verdict[key] is None
+
+
+def test_a_tool_error_payload_could_not_be_checked(store, tmp_path):
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    answered = store.call_tool(LOOKUP, {'project_root': str(plain), 'key': 'x_finding_run', 'value': RUN})
+
+    run = check(store, root=str(plain))
+
+    _assert_could_not_check(run, 'tool_error')
+    assert any(answered['error'] in line for line in run.human)
+    for key in NEVER_MEASURED:
+        assert run.verdict[key] is None
+
+
+def test_an_unreachable_store_could_not_be_checked(tmp_path):
+    run = run_script('--run', RUN, '--threshold', '0.7', '--project-root', str(tmp_path), url=_closed_port_url())
+
+    _assert_could_not_check(run, 'store_unreachable')
+    for key in NEVER_MEASURED:
+        assert run.verdict[key] is None
+
+
+def test_an_all_cancelled_run_passes_vacuously_on_the_cli(store):
+    store.seed_run(RUN, ('high', 'cancelled'), ('low', 'cancelled'))
+
+    run = check(store)
+
+    assert run.rc == 0
+    assert run.verdict['verdict'] == 'pass'
+    assert run.verdict['vacuous'] is True
+
+
+@pytest.mark.parametrize('args', [
+    ['--run', RUN, '--project-root', '/tmp'],
+    ['--run', RUN, '--threshold', '0', '--project-root', '/tmp'],
+    ['--run', RUN, '--threshold', '1.5', '--project-root', '/tmp'],
+    ['--run', RUN, '--threshold', 'abc', '--project-root', '/tmp'],
+    ['--run', RUN, '--threshold', '0.7', '--project-root', '/tmp', '--project-root', '/var'],
+    ['--run', RUN, '--pending'],
+], ids=['no_threshold', 'threshold_zero', 'threshold_above_one', 'threshold_not_a_number', 'two_roots', 'run_with_pending'])
+def test_a_usage_error_exits_two_with_no_verdict(args):
+    run = run_script(*args, url=_closed_port_url())
+
+    assert run.rc == COULD_NOT_CHECK
+    assert run.lines == []
+    assert 'usage:' in run.stderr
+
+
+def test_the_script_is_an_executable_python3_predicate():
+    assert os.access(SCRIPT, os.X_OK)
+    assert SCRIPT.read_text().splitlines()[0] == '#!/usr/bin/env python3'
