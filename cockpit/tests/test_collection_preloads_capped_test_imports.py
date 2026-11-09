@@ -47,6 +47,7 @@ def _exec_test_module_in_fresh_interpreter(test_file: str, module: str, cwd: Pat
     ('test_file', 'module'),
     [
         pytest.param('test_app.py', 'cockpit.app', id='test_app'),
+        pytest.param('test_spawn_tree.py', 'cockpit.panes.spawn_tree', id='test_spawn_tree'),
     ],
 )
 def test_collecting_the_module_loads_what_its_capped_tests_import(test_file: str, module: str, tmp_path: Path) -> None:
