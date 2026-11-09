@@ -154,7 +154,7 @@ assert "A11: --base with no value exits 2" test "$RC" -eq 2
 # test_warm_lane_gc.sh A9: the script is copied ALONE into a temp dir and invoked
 # with --help, which normally exits 0 (A4 above), so a 2 here also pins that the
 # guard fires BEFORE argv is parsed. Exit 2, not 1: an incomplete deployment is
-# a WIRING error, and _run_thin_warm_lane logs rc=2 at WARNING, so a broken
+# a WIRING error, and thin_warm_lane logs rc=2 at WARNING, so a broken
 # deployment is loud rather than silently fail-open.
 A12_DIR="$(mktemp -d /tmp/test-thin-warm-lane-a12-XXXXXX)"
 _TMPDIRS+=("$A12_DIR")
@@ -558,7 +558,7 @@ _wait_for_reader_lock "$F_READY" 30
 
 run_helper "$F_LANE" --seed-script "$F_SEED_STUB"
 
-# 75 SPECIFICALLY, not merely non-zero: _run_thin_warm_lane logs rc=75 at DEBUG
+# 75 SPECIFICALLY, not merely non-zero: thin_warm_lane logs rc=75 at DEBUG
 # as a benign skip and every other non-zero rc at WARNING, so any other refusal
 # code would turn each lingering-reference release into a false fault.
 assert "F1: a live-cwd-referenced lane exits 75 (EX_TEMPFAIL), with the flock FREE" \

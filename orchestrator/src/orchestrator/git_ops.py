@@ -5613,7 +5613,7 @@ class GitOps:
         for the script's whole lifetime and auto-released on exit, including
         on holder crash). ``flock`` consumes its own leading args, so the
         script itself still only ever sees ``base_target lane_dir mode`` as
-        its argv. This gives :meth:`_run_thin_warm_lane`'s non-blocking T3
+        its argv. This gives :meth:`thin_warm_lane`'s non-blocking T3
         ``flock -n`` a real counterparty: a concurrent release-thin and a
         re-acquire's seed can no longer both proceed against the same
         ``target/`` at once — see that method's "Lane-lock coupling gap"
@@ -5684,7 +5684,7 @@ class GitOps:
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
                 return 127  # command-not-found sentinel
             # task 2599: outer exclusive lane lock spans the ENTIRE seed
-            # subprocess below (both branches), giving _run_thin_warm_lane's
+            # subprocess below (both branches), giving thin_warm_lane's
             # T3 flock -n a real counterparty — see the "Takes <lane_dir>.lock
             # exclusively" docstring note above. Bounded via -w/-E (task 2599
             # amendment) — see the "Bounded wait, not unbounded" docstring
@@ -6167,7 +6167,7 @@ class GitOps:
         soft-floor defer journal line
         (:meth:`_warm_lane_soft_pressure_defer`) with pool headroom context.
         Mirrors the :meth:`warm_lane_ref_is_degenerate`/
-        :meth:`_run_thin_warm_lane` fail-soft wrapper pattern: no
+        :meth:`thin_warm_lane` fail-soft wrapper pattern: no
         implementation at either location, non-zero exit, or any exception
         all degrade to ``None``; never raises.
 
@@ -6458,8 +6458,13 @@ class GitOps:
             )
             return False
 
-    async def _run_thin_warm_lane(self, lane_dir: Path) -> int:
+    async def thin_warm_lane(self, lane_dir: Path) -> int:
         """Invoke ``thin-warm-lane.sh <lane_dir>``.
+
+        The production caller is :meth:`release_warm_lane`, which invokes it
+        only after the ASSIGNED→FREE flip; the script's T3 flock and T4
+        live-reference gates, not the caller, are what keep an in-use lane's
+        ``target/`` safe.
 
         Located via :meth:`_resolve_warm_lane_script` — project override
         first, then dark-factory's own copy (PRD D3); see
@@ -6559,7 +6564,7 @@ class GitOps:
         """
         if self.pool_in_use() and not self.pool_storage_present():
             logger.warning(
-                '_run_thin_warm_lane: pool storage absent/unmounted at %s — '
+                'thin_warm_lane: pool storage absent/unmounted at %s — '
                 'refusing to spawn thin-warm-lane.sh for %s',
                 self.worktree_base, lane_dir,
             )
@@ -6567,7 +6572,7 @@ class GitOps:
             return 127
         try:
             resolved = self._resolve_warm_lane_script_logged(
-                'thin-warm-lane.sh', '_run_thin_warm_lane',
+                'thin-warm-lane.sh', 'thin_warm_lane',
             )
             if resolved is None:
                 return 127
@@ -6576,23 +6581,23 @@ class GitOps:
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc == 0:
                 logger.info(
-                    '_run_thin_warm_lane: thinned %s (stderr=%r)', lane_dir, err,
+                    'thin_warm_lane: thinned %s (stderr=%r)', lane_dir, err,
                 )
             elif rc == 75:
                 logger.debug(
-                    '_run_thin_warm_lane: lane %s busy (rc=75, EX_TEMPFAIL) '
+                    'thin_warm_lane: lane %s busy (rc=75, EX_TEMPFAIL) '
                     '— benign skip (stderr=%r)',
                     lane_dir, err,
                 )
             else:
                 logger.warning(
-                    '_run_thin_warm_lane: script exited %d for %s (stderr=%r)',
+                    'thin_warm_lane: script exited %d for %s (stderr=%r)',
                     rc, lane_dir, err,
                 )
             return rc
         except Exception:
             logger.warning(
-                '_run_thin_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
+                'thin_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
             )
             return 127
 
@@ -8910,7 +8915,7 @@ class GitOps:
            log line is emitted; the pool release still proceeds.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
         4. **§9.5 η (task 2442)**: when ``self.config.warm_lane_release_thin``
-           is True, invoke :meth:`_run_thin_warm_lane` — an eager free-first
+           is True, invoke :meth:`thin_warm_lane` — an eager free-first
            reclaim of the lane's ``target/`` via reify δ's
            ``scripts/thin-warm-lane.sh``, run strictly AFTER the ASSIGNED→FREE
            flip.  The script holds the lane's own flock (T3), and (task 2599)
@@ -8924,7 +8929,7 @@ class GitOps:
            next :meth:`acquire_warm_lane` always re-seeds from the current
            base regardless (D10), so net warmth is unchanged and only the
            idle-hold of a divergent ``target/`` is eliminated.  Best-effort /
-           never-raise (:meth:`_run_thin_warm_lane` never raises), so a thin
+           never-raise (:meth:`thin_warm_lane` never raises), so a thin
            hiccup can never strand the pool release or the scheduler
            (inv.11: release-thin is not an escalation/fault).  On a live
            process reference the thin is SKIPPED, not deferred: no retry is
@@ -8973,7 +8978,7 @@ class GitOps:
         # §9.5 η (task 2442): eager free-first release-thin — LAST step, so a
         # thin hiccup can never strand the pool release above (inv.11).
         if self.config.warm_lane_release_thin:
-            await self._run_thin_warm_lane(lane_dir)
+            await self.thin_warm_lane(lane_dir)
 
     async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
         """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
