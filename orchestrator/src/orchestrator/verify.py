@@ -10899,7 +10899,10 @@ async def _run_node_id_group(
     qualified_by_id: Mapping[str, str],
     report: Path | None,
 ) -> dict[str, NodeIdStatus]:
-    """Every id of one module's group, run together into *report*, which is removed afterwards."""
+    """Every id of one module's group, run together into *report*, which is removed afterwards.
+
+    An id the group's written report does not record is re-run alone.
+    """
     if report is None:
         logger.warning(
             'run_node_ids: no junit report path in %s for module %r — %s each read error',
@@ -10909,6 +10912,13 @@ async def _run_node_id_group(
     else:
         try:
             statuses = await _node_id_run(tree, config, module_config, qualified_by_id, report)
+            if statuses is not None and len(qualified_by_id) > 1:
+                unreported = [node_id for node_id, status in statuses.items() if status == 'error']
+                for node_id in unreported:
+                    alone = await _node_id_run(
+                        tree, config, module_config, {node_id: qualified_by_id[node_id]}, report,
+                    )
+                    statuses[node_id] = 'error' if alone is None else alone[node_id]
         finally:
             _clear_junit_report(report)
     if statuses is None:
@@ -10938,6 +10948,11 @@ async def run_node_ids(
     ``run_verification``'s junit chokepoint; each group writes its own report,
     removed after it is read. The isolated-rerun discriminator shares the
     mapping (``_group_node_ids_by_subproject``) and ``_node_id_test_config``.
+
+    pytest refuses a whole argv for one not-found id, and a collection error
+    interrupts the session, so an id missing from a group's written report is
+    re-run alone, serially, and reads ``'error'`` only if it is missing again;
+    a group that wrote no report at all is not re-run.
 
     *concurrent_groups* is accepted but not yet acted on.
     """
