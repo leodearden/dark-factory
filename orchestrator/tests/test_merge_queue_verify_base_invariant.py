@@ -44,7 +44,8 @@ from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import lane_scene_config
+from _merge_lane_fakes import VerifyTasks, lane_scene_config
+from _merge_lane_fakes import verifies as verifies
 from test_merge_queue_two_layer_integration import _make_merged_item
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -819,21 +820,21 @@ _VB_DEAD = 'd' * 40
 
 
 async def _straggler_dispatch(
-    git_ops: GitOps, config: OrchestratorConfig, *, tip_status: InflightStatus | None,
+    git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
+    verifies: VerifyTasks, *, tip_status: InflightStatus | None,
 ) -> tuple[SpeculativeMergeWorker, InflightEntry, str]:
     """Dispatch a dead-based straggler that holds a permit, past one frontier
     entry whose verify is running and whose status is *tip_status*.  Returns
     the worker, the dispatched entry and that frontier entry's commit."""
     worker = _make_worker(git_ops)
     worker._host_allocator = _fake_local_allocator()
-    worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
-    worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+    monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', AsyncMock())
+    monkeypatch.setattr(worker, '_run_inflight_verify', AsyncMock(
         return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
-    )
+    ))
     _, tip_item = await _make_merged_item(git_ops, config, 'task/vb-tip', 'vb_tip.py', 't=1\n')
     worker._inflight.append(InflightEntry(
-        item=tip_item, lease=None,
-        verify_task=asyncio.get_running_loop().create_future(),  # type: ignore[arg-type]
+        item=tip_item, lease=None, verify_task=verifies.pending(),
         merge_wt=None, was_speculative=False, status=tip_status,
     ))
     worker._record_dead_base(_VB_DEAD, killer=DeadBaseKiller(DeadBaseSite.HEAD_FAILED, 'vb'))
@@ -855,10 +856,11 @@ class TestReanchorDivergenceAtTheWorker:
 
     async def test_a_vacated_tip_owner_sends_the_reanchor_to_main_with_no_divergence(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
         """Boundary row 3: the 3082 shape, a tip whose verify requeued."""
         worker, entry, _ = await _straggler_dispatch(
-            git_ops, config, tip_status=InflightStatus.REQUEUED,
+            git_ops, config, monkeypatch, verifies, tip_status=InflightStatus.REQUEUED,
         )
 
         assert entry.item.remerge_base == RemergeBase(None, RemergeReason.TIP_VACATED)
@@ -867,8 +869,11 @@ class TestReanchorDivergenceAtTheWorker:
 
     async def test_a_live_tip_reanchor_on_the_frozen_tip_records_no_divergence(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
-        _, entry, tip = await _straggler_dispatch(git_ops, config, tip_status=None)
+        _, entry, tip = await _straggler_dispatch(
+            git_ops, config, monkeypatch, verifies, tip_status=None,
+        )
 
         assert entry.item.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
         assert entry.verify_base_divergence is None

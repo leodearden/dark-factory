@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import AsyncIterator, Coroutine
 from pathlib import Path
 from typing import Any
 
 import pytest
-import pytest_asyncio
-from _merge_lane_fakes import lane_scene_config
+from _merge_lane_fakes import VerifyTasks, lane_scene_config
+from _merge_lane_fakes import verifies as verifies
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import MergeResult
@@ -54,57 +53,6 @@ _MAIN = 'sha-main'
 @pytest.fixture
 def config(tmp_path: Path) -> OrchestratorConfig:
     return lane_scene_config(tmp_path, GitConfig())
-
-
-class Verifies:
-    """Builds verify tasks in each state a frontier owner's verify can be in,
-    and cancels whichever are still pending when the test ends."""
-
-    def __init__(self) -> None:
-        self._made: list[asyncio.Task[Any]] = []
-
-    def pending(self) -> asyncio.Task[Any]:
-        task = asyncio.create_task(asyncio.Event().wait())
-        self._made.append(task)
-        return task
-
-    async def settled(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
-        task = asyncio.create_task(coro)
-        await asyncio.wait([task])
-        return task
-
-    async def finished(self, result: InflightVerifyResult) -> asyncio.Task[Any]:
-        return await self.settled(_returns(result))
-
-    async def raised(self) -> asyncio.Task[Any]:
-        return await self.settled(_raises())
-
-    async def cancelled(self) -> asyncio.Task[Any]:
-        task = self.pending()
-        task.cancel()
-        await asyncio.wait([task])
-        return task
-
-    async def close(self) -> None:
-        for task in self._made:
-            task.cancel()
-        if self._made:
-            await asyncio.wait(self._made)
-
-
-async def _returns(result: InflightVerifyResult) -> InflightVerifyResult:
-    return result
-
-
-async def _raises() -> InflightVerifyResult:
-    raise RuntimeError('verify blew up')
-
-
-@pytest_asyncio.fixture
-async def verifies() -> AsyncIterator[Verifies]:
-    made = Verifies()
-    yield made
-    await made.close()
 
 
 def _request(config: OrchestratorConfig, task_id: str) -> MergeRequest:
@@ -216,7 +164,7 @@ class TestFrontierTip:
     """The tip is the newest real merge commit in the frontier."""
 
     async def test_newest_real_commit(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [
             _entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending()),
@@ -225,7 +173,7 @@ class TestFrontierTip:
         assert frontier_tip(frontier) == 'sha-b'
 
     async def test_passthroughs_and_commitless_merges_are_skipped(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [
             _entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending()),
@@ -248,13 +196,13 @@ class TestChooseRemergeBase:
     async def test_blank_tip_is_no_tip(self) -> None:
         assert _choose('', []) == RemergeBase(None, RemergeReason.NO_TIP)
 
-    async def test_dead_tip(self, config: OrchestratorConfig, verifies: Verifies) -> None:
+    async def test_dead_tip(self, config: OrchestratorConfig, verifies: VerifyTasks) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
         chosen = _choose('sha-a', frontier, dead=frozenset({'sha-a'}))
         assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
 
     async def test_dead_earlier_commit_breaks_the_tip_chain(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         """The circularity case: the tip is stacked on the item being re-merged."""
         frontier = [
@@ -265,7 +213,7 @@ class TestChooseRemergeBase:
         assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
 
     async def test_dead_earlier_base_breaks_the_tip_chain(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [
             _entry(config, 'x', base='sha-gone', commit='sha-x', verify=verifies.pending()),
@@ -275,7 +223,7 @@ class TestChooseRemergeBase:
         assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
 
     async def test_a_base_on_main_is_never_dead(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
         chosen = _choose('sha-a', frontier, dead=frozenset({_MAIN}))
@@ -283,7 +231,7 @@ class TestChooseRemergeBase:
 
     @pytest.mark.parametrize('status', [InflightStatus.REQUEUED, InflightStatus.DROPPED])
     async def test_vacated_owner(
-        self, config: OrchestratorConfig, verifies: Verifies, status: InflightStatus,
+        self, config: OrchestratorConfig, verifies: VerifyTasks, status: InflightStatus,
     ) -> None:
         frontier = [
             _entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending(), status=status),
@@ -291,7 +239,7 @@ class TestChooseRemergeBase:
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VACATED)
 
     async def test_a_vacated_link_below_the_tip_vacates_it(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [
             _entry(
@@ -307,13 +255,13 @@ class TestChooseRemergeBase:
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_owner_verify_cancelled(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=await verifies.cancelled())]
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_owner_verify_raised(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=await verifies.raised())]
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
@@ -324,13 +272,13 @@ class TestChooseRemergeBase:
         InflightVerifyResult(outcome=None, merge_wt=None, status=InflightStatus.DROPPED),
     ], ids=['failed', 'runner-unavailable', 'dropped'])
     async def test_owner_verify_finished_badly(
-        self, config: OrchestratorConfig, verifies: Verifies, result: InflightVerifyResult,
+        self, config: OrchestratorConfig, verifies: VerifyTasks, result: InflightVerifyResult,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=await verifies.finished(result))]
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_owner_parked_on_a_gate(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         owner = _entry(
             config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending(),
@@ -339,20 +287,20 @@ class TestChooseRemergeBase:
         assert _choose('sha-a', [owner]) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_tip_with_no_owner(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
         assert _choose('sha-elsewhere', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_live_tip_without_a_permit(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
         chosen = _choose('sha-a', frontier, permit_available=False)
         assert chosen == RemergeBase(None, RemergeReason.NO_PERMIT)
 
     async def test_live_tip_with_a_pending_verify(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         frontier = [
             _entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending()),
@@ -361,14 +309,14 @@ class TestChooseRemergeBase:
         assert _choose('sha-b', frontier) == RemergeBase('sha-b', RemergeReason.LIVE_TIP)
 
     async def test_live_tip_with_a_passed_verify(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         passed = await verifies.finished(InflightVerifyResult(outcome=None, merge_wt=None))
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=passed)]
         assert _choose('sha-a', frontier) == RemergeBase('sha-a', RemergeReason.LIVE_TIP)
 
     async def test_dead_bases_may_be_the_ledger(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         ledger = DeadBaseLedger(cap=8)
         frontier = [
@@ -414,7 +362,7 @@ class TestClaimRemergeBase:
     """The permit a replacement leaves with, and what the ledger sees."""
 
     async def test_a_held_permit_rides_a_live_tip(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         ledger = _ledger(2)
         held = await ledger.acquire()
@@ -438,7 +386,7 @@ class TestClaimRemergeBase:
         assert ledger.slot_available == 2
 
     async def test_a_live_tip_takes_a_free_slot(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         ledger = _ledger(2)
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
@@ -451,7 +399,7 @@ class TestClaimRemergeBase:
         assert ledger.slot_available == 1
 
     async def test_a_live_tip_with_no_free_slot_falls_to_main(
-        self, config: OrchestratorConfig, verifies: Verifies,
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
         ledger = _ledger(1)
         merger_permit = await ledger.acquire()
@@ -468,7 +416,7 @@ _OWNER_KINDS = ('live', 'vacated', 'verify_dead', 'gate_parked', 'dead_chained')
 
 
 def _random_frontier(
-    rng: random.Random, config: OrchestratorConfig, verifies: Verifies, cascade: int,
+    rng: random.Random, config: OrchestratorConfig, verifies: VerifyTasks, cascade: int,
 ) -> tuple[list[InflightEntry], frozenset[str]]:
     frontier: list[InflightEntry] = []
     dead: set[str] = set()
@@ -499,7 +447,7 @@ def _assert_accounted(ledger: PermitLedger[SpecPermit], outstanding: list[Remerg
 
 @pytest.mark.asyncio
 async def test_permits_are_conserved_across_random_cascades(
-    config: OrchestratorConfig, verifies: Verifies,
+    config: OrchestratorConfig, verifies: VerifyTasks,
 ) -> None:
     """Boundary row 4 (plans/merge-lane-policy-prd.md §7): 100 seeded cascades.
 

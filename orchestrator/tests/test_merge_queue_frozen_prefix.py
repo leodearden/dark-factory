@@ -1774,16 +1774,21 @@ class TestRemergeReturnPathParity:
             f'{len(returns)}. Move the new return into _remerge_inner.'
         )
 
-    def test_anchor_defaults_to_none_on_both_item_variants(self) -> None:
-        """Only `_remerge` produces recovery items, and the old boolean marker
-        is gone: the anchor is the one fact (task 8524)."""
-        from orchestrator.merge_lane.types import DecidedItem as _DI
-        from orchestrator.merge_lane.types import RealMergeItem as _RMI
+    @pytest.mark.asyncio
+    async def test_anchor_defaults_to_none_on_both_item_variants(
+        self, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """An item built without an anchor carries none: only `_remerge`
+        stamps one (task 8524)."""
+        _, real = _make_fake_item('t-unanchored-real', config=config, git_repo=git_repo)
+        _, decided = _make_fake_item(
+            't-unanchored-decided', merge_commit=None, config=config, git_repo=git_repo,
+        )
 
-        for cls in (_RMI, _DI):
-            fields = {f.name: f for f in dataclasses.fields(cls)}
-            assert fields['remerge_base'].default is None, cls.__name__
-            assert 'remerge_recovery' not in fields, cls.__name__
+        assert isinstance(real, RealMergeItem)
+        assert isinstance(decided, DecidedItem)
+        assert real.remerge_base is None
+        assert decided.remerge_base is None
 
     @pytest.mark.asyncio
     async def test_the_recovery_marker_is_a_fall_to_main(

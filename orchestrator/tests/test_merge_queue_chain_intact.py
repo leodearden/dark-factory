@@ -30,7 +30,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import lane_scene_config
+from _merge_lane_fakes import VerifyTasks, lane_scene_config
+from _merge_lane_fakes import verifies as verifies
 
 # Bare sibling-import of the pure builders (no tests/__init__.py — tests dir is
 # on sys.path; mirrors test_concurrent_verify_boundary importing from
@@ -190,13 +191,18 @@ def _make_pass_entry(
     )
 
 
-def _frontier_entry(item: RealMergeItem, *, status: InflightStatus | None = None) -> InflightEntry:
-    """A verify-frontier entry whose verify is still running (a pending future,
-    so the re-anchor decision can read its liveness)."""
+def _frontier_entry(
+    item: RealMergeItem,
+    verify_task: asyncio.Task[InflightVerifyResult],
+    *,
+    status: InflightStatus | None = None,
+) -> InflightEntry:
+    """A verify-frontier entry whose verify is *verify_task* (the re-anchor
+    decision reads its liveness)."""
     return InflightEntry(
         item=item,
         lease=None,
-        verify_task=asyncio.get_running_loop().create_future(),  # type: ignore[arg-type]
+        verify_task=verify_task,
         merge_wt=None,
         was_speculative=False,
         status=status,
@@ -461,6 +467,7 @@ class TestDispatchDeadBaseRecheck:
 
     async def test_dead_base_rechecked_at_dispatch_despite_inflight_verify(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
         main_sha = await git_ops.get_main_sha()   # the REAL tip the re-check reads
         store = _LateArrivalFakeEventStore()
@@ -478,7 +485,7 @@ class TestDispatchDeadBaseRecheck:
             config=config, git_repo=git_repo,
         )
         remerge = AsyncMock(return_value=remerged)
-        worker._remerge = remerge  # type: ignore[method-assign]
+        monkeypatch.setattr(worker, '_remerge', remerge)
 
         # A head entry WITH a running verify → _has_inflight_verify is True (the
         # exact 5260 condition the old global-flag gate mis-handles).
@@ -486,7 +493,7 @@ class TestDispatchDeadBaseRecheck:
             'head', base_sha=main_sha, merge_commit='headc', config=config, git_repo=git_repo,
         )
         assert isinstance(head, RealMergeItem)
-        worker._inflight.append(_frontier_entry(head))
+        worker._inflight.append(_frontier_entry(head, verifies.pending()))
 
         # The built-awaiting-host straggler: base_sha points at a DEAD commit.
         _, item = _make_fake_item(
@@ -635,6 +642,7 @@ class TestCascadeStragglerCaughtComposition:
 
     async def test_straggler_on_dead_downstream_base_caught_at_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         main_sha = await git_ops.get_main_sha()   # the REAL tip the chain check reads
         store = _LateArrivalFakeEventStore()
@@ -688,7 +696,7 @@ class TestCascadeStragglerCaughtComposition:
         voided_before = len(store.speculative_events(EventType.verdict_voided))
         worker._host_allocator = _fake_local_allocator()
         remerge = _make_remerge_to_decided_stub()  # a fresh await_count
-        worker._remerge = remerge  # type: ignore[method-assign]
+        monkeypatch.setattr(worker, '_remerge', remerge)
         _, straggler = _make_fake_item(
             'comp-straggler', base_sha=_DOWN_C, merge_commit=_STRAG_C,
             config=config, git_repo=git_repo,
@@ -811,26 +819,26 @@ class TestRemergeOntoTheClaimedBase:
 
 
 def _dispatching_worker(
-    git_ops: GitOps, store: _LateArrivalFakeEventStore,
+    git_ops: GitOps, store: _LateArrivalFakeEventStore, monkeypatch: pytest.MonkeyPatch,
 ) -> SpeculativeMergeWorker:
     """A bare worker with one free local host, whose verify never runs."""
     worker = _make_worker(git_ops, event_store=store)
     worker._host_allocator = _fake_local_allocator()
-    worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
-    worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+    monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', AsyncMock())
+    monkeypatch.setattr(worker, '_run_inflight_verify', AsyncMock(
         return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
-    )
+    ))
     return worker
 
 
 async def _live_tip(
     worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
-    *, status: InflightStatus | None = None,
+    verifies: VerifyTasks, *, status: InflightStatus | None = None,
 ) -> str:
     """Seed the verify frontier with one real merge whose verify is running;
     return its merge commit."""
     _, tip_item = await _make_merged_item(git_ops, config, 'task/disp-tip', 'disp_tip.py', 't=1\n')
-    worker._inflight.append(_frontier_entry(tip_item, status=status))
+    worker._inflight.append(_frontier_entry(tip_item, verifies.pending(), status=status))
     tip = tip_item.merge_result.merge_commit
     assert tip is not None
     return tip
@@ -871,10 +879,11 @@ class TestDispatchSitesReanchor:
 
     async def test_a_dead_based_straggler_restacks_on_the_live_tip(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
         store = _LateArrivalFakeEventStore()
-        worker = _dispatching_worker(git_ops, store)
-        tip = await _live_tip(worker, git_ops, config)
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
         straggler, permit = await _dead_based_straggler(worker, git_ops, config)
 
         entry = await _dispatch(worker, straggler)
@@ -890,9 +899,10 @@ class TestDispatchSitesReanchor:
 
     async def test_with_no_live_tip_the_straggler_falls_to_main_and_frees_its_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = _LateArrivalFakeEventStore()
-        worker = _dispatching_worker(git_ops, store)
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
         straggler, permit = await _dead_based_straggler(worker, git_ops, config)
 
         entry = await _dispatch(worker, straggler)
@@ -909,12 +919,13 @@ class TestDispatchSitesReanchor:
 
     async def test_a_vacated_tip_owner_sends_the_straggler_to_main(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
         """Boundary row 3 at the worker: the 3082 shape, a frozen tip whose
         verify requeued its request."""
         store = _LateArrivalFakeEventStore()
-        worker = _dispatching_worker(git_ops, store)
-        await _live_tip(worker, git_ops, config, status=InflightStatus.REQUEUED)
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        await _live_tip(worker, git_ops, config, verifies, status=InflightStatus.REQUEUED)
         straggler, permit = await _dead_based_straggler(worker, git_ops, config)
 
         entry = await _dispatch(worker, straggler)
@@ -929,9 +940,10 @@ class TestDispatchSitesReanchor:
 
     async def test_a_mechanism_2_discard_row_names_the_anchor(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = _LateArrivalFakeEventStore()
-        worker = _dispatching_worker(git_ops, store)
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
         _, built = await _make_merged_item(git_ops, config, 'task/disp-stale', 'disp_m.py', 'm=1\n')
         stale = dataclasses.replace(built, base_sha=_LIVE_DEEP)  # main moved since the build
 
@@ -980,10 +992,11 @@ class TestAdoptionVoidReanchor:
 
     async def test_the_replacement_restacks_on_an_unrelated_live_tip_with_the_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
+        verifies: VerifyTasks,
     ) -> None:
         store = _LateArrivalFakeEventStore()
         worker = _make_worker(git_ops, event_store=store)
-        tip = await _live_tip(worker, git_ops, config)
+        tip = await _live_tip(worker, git_ops, config, verifies)
         entry, permit = await _voided_entry(worker, git_ops, config)
 
         assert await _finalize(worker, entry) is False
@@ -1002,6 +1015,7 @@ class TestAdoptionVoidReanchor:
 
     async def test_a_successor_built_on_the_voided_commit_sends_it_to_main(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        verifies: VerifyTasks,
     ) -> None:
         """The circularity ground: the only tip on offer is stacked on the
         commit being voided, so it dies with it."""
@@ -1014,7 +1028,7 @@ class TestAdoptionVoidReanchor:
             merge_commit='7' * 40, config=config, git_repo=git_repo,
         )
         assert isinstance(successor, RealMergeItem)
-        worker._inflight.append(_frontier_entry(successor))
+        worker._inflight.append(_frontier_entry(successor, verifies.pending()))
 
         assert await _finalize(worker, entry) is False
 
@@ -1047,12 +1061,13 @@ async def _merger_holding(
 
 def _seed_live_tip(
     worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+    verifies: VerifyTasks,
 ) -> None:
     _, item = _make_fake_item(
         'merger-tip', base_sha=_MAIN, merge_commit=_TIP_T, config=config, git_repo=git_repo,
     )
     assert isinstance(item, RealMergeItem)
-    worker._inflight.append(_frontier_entry(item))
+    worker._inflight.append(_frontier_entry(item, verifies.pending()))
 
 
 def _speculation(worker: SpeculativeMergeWorker) -> dict[str, object]:
@@ -1066,9 +1081,10 @@ class TestDeadBaseReanchorsTheMerger:
 
     async def test_a_dead_held_base_moves_to_the_live_tip(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        verifies: VerifyTasks,
     ) -> None:
         worker = _make_worker(git_ops)
-        _seed_live_tip(worker, config, git_repo)
+        _seed_live_tip(worker, config, git_repo, verifies)
         await _merger_holding(worker, config, git_repo)
 
         worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
@@ -1093,9 +1109,10 @@ class TestDeadBaseReanchorsTheMerger:
 
     async def test_recording_an_item_commit_dead_reaches_the_same_hook(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        verifies: VerifyTasks,
     ) -> None:
         worker = _make_worker(git_ops)
-        _seed_live_tip(worker, config, git_repo)
+        _seed_live_tip(worker, config, git_repo, verifies)
         await _merger_holding(worker, config, git_repo)
         _, held = _make_fake_item(
             'merger-held', base_sha=_MAIN, merge_commit=_HELD_DEAD,
@@ -1108,9 +1125,10 @@ class TestDeadBaseReanchorsTheMerger:
 
     async def test_an_idle_merger_is_untouched(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        verifies: VerifyTasks,
     ) -> None:
         worker = _make_worker(git_ops)
-        _seed_live_tip(worker, config, git_repo)
+        _seed_live_tip(worker, config, git_repo, verifies)
         before = _speculation(worker)
 
         worker._record_dead_base(_HELD_DEAD, killer=_KILLER)

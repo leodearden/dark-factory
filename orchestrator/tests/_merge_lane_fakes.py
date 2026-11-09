@@ -9,6 +9,10 @@ and records each scoped verify as a ``ScopedVerifyCall``;
 hand-advanced clock whose ``sleep`` advances it and waits at most
 ``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
 in-flight verify keeps writing;
+``VerifyTasks`` builds a verify-frontier entry's ``verify_task`` in each
+state it can be in (pending, finished, raised, cancelled), and its
+``verifies`` fixture cancels the pending ones at teardown -- re-export it
+into a test module as ``from _merge_lane_fakes import verifies as verifies``;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census, and ``slot_states`` each verify
@@ -41,6 +45,7 @@ from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapp
 from pathlib import Path
 from typing import Any, ClassVar
 
+import pytest_asyncio
 from _merge_worker_drive import make_merge_request
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -50,6 +55,7 @@ from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ClockPort, VerifyPort
 from orchestrator.merge_lane.types import (
     DiskGuardOutcome,
+    InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
 )
@@ -534,6 +540,57 @@ def healthy_verify_clock() -> FakeClock:
     worktree, as a healthy one does, so the lane's no-progress abort never
     calls it dead however far the lane's loops have run ``monotonic()``."""
     return FakeClock(content_mtime=1.0, content_tick=1.0)
+
+
+class VerifyTasks:
+    """Builds verify tasks in each state a frontier owner's verify can be in,
+    and cancels whichever are still pending when the test ends."""
+
+    def __init__(self) -> None:
+        self._made: list[asyncio.Task[Any]] = []
+
+    def pending(self) -> asyncio.Task[Any]:
+        task = asyncio.create_task(asyncio.Event().wait())
+        self._made.append(task)
+        return task
+
+    async def settled(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        await asyncio.wait([task])
+        return task
+
+    async def finished(self, result: InflightVerifyResult) -> asyncio.Task[Any]:
+        return await self.settled(_returns(result))
+
+    async def raised(self) -> asyncio.Task[Any]:
+        return await self.settled(_raises())
+
+    async def cancelled(self) -> asyncio.Task[Any]:
+        task = self.pending()
+        task.cancel()
+        await asyncio.wait([task])
+        return task
+
+    async def close(self) -> None:
+        for task in self._made:
+            task.cancel()
+        if self._made:
+            await asyncio.wait(self._made)
+
+
+async def _returns(result: InflightVerifyResult) -> InflightVerifyResult:
+    return result
+
+
+async def _raises() -> InflightVerifyResult:
+    raise RuntimeError('verify blew up')
+
+
+@pytest_asyncio.fixture
+async def verifies() -> AsyncIterator[VerifyTasks]:
+    made = VerifyTasks()
+    yield made
+    await made.close()
 
 
 class RecordingEscalations:

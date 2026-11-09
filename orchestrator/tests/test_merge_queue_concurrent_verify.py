@@ -146,7 +146,9 @@ async def _make_branch_with_file(
 RemergeCall = tuple[str, RemergeClaim | None, SpeculativeItem]
 
 
-def _record_remerges(worker: SpeculativeMergeWorker) -> list[RemergeCall]:
+def _record_remerges(
+    worker: SpeculativeMergeWorker, monkeypatch: pytest.MonkeyPatch,
+) -> list[RemergeCall]:
     """Wrap the worker's re-merge to record each call's task id, claim and
     replacement (task 8524); the re-merge itself runs unchanged."""
     calls: list[RemergeCall] = []
@@ -159,7 +161,7 @@ def _record_remerges(worker: SpeculativeMergeWorker) -> list[RemergeCall]:
         calls.append((req.task_id, claim, out))
         return out
 
-    worker._remerge = _recording  # type: ignore[method-assign]
+    monkeypatch.setattr(worker, '_remerge', _recording)
     return calls
 
 
@@ -2257,6 +2259,7 @@ class TestChainInvalidationUnderOverlap:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """N's local verify fails; N+1's remote verify is aborted and re-verified.
 
@@ -2295,7 +2298,7 @@ class TestChainInvalidationUnderOverlap:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
-        remerges = _record_remerges(worker)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2720,6 +2723,7 @@ class TestHaltAndUnavailable:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """RUNNER_UNAVAILABLE mid-overlap: host quarantined, item re-dispatched on LOCAL.
 
@@ -2766,7 +2770,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, dead_remote)
-        remerges = _record_remerges(worker)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
