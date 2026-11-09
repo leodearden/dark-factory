@@ -88,12 +88,13 @@ from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6
 )
 from shared.cli_invoke import (  # noqa: E402  # debt: task 6760
     AgentResult,
+    AllAccountsCappedException,
     claude_binary_spec,
     invoke_with_cap_retry,
 )
 from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
 from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
-from shared.usage_gate import UsageGate  # noqa: E402  # debt: task 6760
+from shared.usage_gate import PoolFrozen, UsageGate  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -219,6 +220,18 @@ class TimedOut:
     after_secs: float
 
 
+@dataclass(frozen=True)
+class PoolExhausted:
+    """No seat could take the run: every one capped or rejecting its credentials."""
+
+    reason: str
+    earliest_reset: datetime | None
+
+
+Ending = AgentResult | TimedOut | PoolExhausted
+"""How a run ended: the CLI's own result, or the bound or the pool ending it first."""
+
+
 def run(settings: Settings, *, gate: Any = None) -> int:
     """Run the CLI on the fleet pool under the OS sandbox with the prompt on stdin, and judge how it ended."""
     claude = shutil.which(settings.claude_bin)
@@ -291,12 +304,12 @@ def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any]
     return _judge(ending, settings, _measure(inbox, store_path, held_before))
 
 
-async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwargs: Any) -> AgentResult | TimedOut:
+async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwargs: Any) -> Ending:
     """One run through the shared runner, failing over across *gate*'s seats, under ONE wall clock.
 
     The clock covers every attempt and every cap cooldown between them; its expiry kills the CLI's
     process group. ``max_cap_retries`` is one pass over the pool, and a frozen pool raises rather
-    than parks. The gate is shut down on this loop, before it closes.
+    than parks. Every gate read happens here, and the gate is shut down on this loop, before it closes.
     """
     try:
         async with asyncio.timeout(timeout_secs):
@@ -306,6 +319,8 @@ async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwar
             )
     except TimeoutError:
         return TimedOut(timeout_secs)
+    except (AllAccountsCappedException, PoolFrozen) as exc:
+        return PoolExhausted(str(exc), gate.soonest_resets_at)
     finally:
         await gate.shutdown()
 
@@ -396,11 +411,15 @@ def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int
     return offered, undecodable
 
 
-def _judge(ending: AgentResult | TimedOut, settings: Settings, outcome: Outcome) -> int:
+def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
     account = f', account={ending.account_name!r}' if isinstance(ending, AgentResult) else ''
     run_label = f'model={settings.model!r}{account}, recorded={outcome.recorded}'
     if isinstance(ending, TimedOut):
         _log(f'claude timed out after {ending.after_secs:g}s, failovers included ({run_label})')
+        return EXIT_FAILED
+    if isinstance(ending, PoolExhausted):
+        reset = ending.earliest_reset.isoformat() if ending.earliest_reset else 'unknown'
+        _log(f'no pool account could take the run: {ending.reason}; earliest reset {reset} ({run_label})')
         return EXIT_FAILED
     if not ending.success:
         _log(f'claude failed (subtype={ending.subtype!r}, api_error_status={ending.api_error_status!r}, '
