@@ -109,18 +109,23 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.services import mem0_write_retry, overreach_guard
+from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
-from fused_memory.services.mem0_add_outcome import RAISED_MEM0_ADD, read_mem0_add_result
+from fused_memory.services.mem0_add_outcome import (
+    RAISED_MEM0_ADD,
+    Mem0AddOutcome,
+    read_mem0_add_result,
+)
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
+    OnMem0Landed,
     classify_transient_provider_failure,
     mem0_write_op_landed,
     retry_reason,
@@ -147,7 +152,10 @@ from fused_memory.services.topic_anchor import (
     resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
-from fused_memory.services.write_journal import Mem0IntentStatus
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    decode_mem0_intent_metadata,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
@@ -6812,6 +6820,7 @@ class MemoryService:
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
+        defer_transient_mem0_failure: bool = True,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
 
@@ -6877,6 +6886,12 @@ class MemoryService:
         write. A CONFLICTING declaration is likewise legal here: this layer is
         mechanism, and ``server/entities_gate.py`` is the policy that refuses
         it at the tool boundary.
+
+        ``defer_transient_mem0_failure=False`` is for callers that need the Mem0
+        id synchronously because they act on it in the same call: a transient
+        failure is then reported failed, not queued, and is safe to re-run
+        (an openai error proves nothing persisted, per
+        ``mem0_write_retry.classify_transient_provider_failure``).
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
@@ -7101,8 +7116,12 @@ class MemoryService:
                         },
                     )
             except Exception as e:
-                _mem0_pending = await self._defer_mem0_write_for_retry(
-                    e, intent_id=intent_id, write_op_id=write_op_id
+                _mem0_pending = (
+                    await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
+                    )
+                    if defer_transient_mem0_failure
+                    else None
                 )
                 if _mem0_pending is not None:
                     stores_pending_retry.append(SourceStore.mem0)
@@ -7205,7 +7224,7 @@ class MemoryService:
         )
         return reason
 
-    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Any:
+    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
         """Re-issue a journaled Mem0 write intent under its original write_op_id."""
         content = intent.get('content') or ''
         scope = Scope(
@@ -7213,8 +7232,8 @@ class MemoryService:
             agent_id=intent.get('agent_id'),
             session_id=intent.get('session_id'),
         )
-        metadata = json.loads(intent.get('metadata') or '{}')
-        return await self._journaled_backend_call(
+        metadata = decode_mem0_intent_metadata(intent)
+        raw = await self._journaled_backend_call(
             write_op_id=intent['write_op_id'],
             causation_id=intent.get('causation_id'),
             backend='mem0',
@@ -7222,11 +7241,21 @@ class MemoryService:
             payload={'content': content[:200]},
             coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
         )
+        return read_mem0_add_result(
+            raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
+        )
+
+    @property
+    def mem0_retry_policy(self) -> Mem0RetryPolicy:
+        return self._mem0_retry_policy
 
     async def retry_due_mem0_intents(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        on_landed: OnMem0Landed | None = None,
     ) -> Mem0RetryPassSummary:
-        """Run one server-side retry pass over the Mem0 writes deferred for retry."""
+        """Run one server-side retry pass."""
         if self._write_journal is None:
             return Mem0RetryPassSummary()
         return await mem0_write_retry.retry_due_mem0_intents(
@@ -7234,13 +7263,27 @@ class MemoryService:
             self.reissue_mem0_intent,
             policy=self._mem0_retry_policy,
             now=now or datetime.now(UTC),
+            on_landed=on_landed,
+        )
+
+    async def check_mem0_retry_backlog(self, *, now: datetime | None = None) -> list[str]:
+        """Escalate each project whose Mem0 retry backlog is older than the policy allows; return the escalation ids."""
+        if self._write_journal is None:
+            return []
+        return await mem0_retry_backlog_alarm.alarm_on_stale_mem0_retries(
+            self._write_journal,
+            now=now or datetime.now(UTC),
+            max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
+            project_roots=self._known_projects,
         )
 
     # ------------------------------------------------------------------
     # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
     # ------------------------------------------------------------------
 
-    async def recover_mem0_intents(self) -> dict[str, int]:
+    async def recover_mem0_intents(
+        self, *, on_landed: OnMem0Landed | None = None
+    ) -> dict[str, int]:
         """Reconcile every crash-mid-write mem0 intent still ``pending``.
 
         A ``pending`` intent means the process died between the write-ahead
@@ -7255,7 +7298,8 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): ``reissue_mem0_intent``; ``completed`` on
-          success, ``retrying`` on a transient provider error (the periodic
+          success, then ``on_landed`` is told what landed, as the retry pass
+          tells it; ``retrying`` on a transient provider error (the periodic
           retry pass takes it over), ``dead`` on any other error. Crash
           after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
@@ -7318,7 +7362,7 @@ class MemoryService:
                 # note in this method's docstring for the narrow
                 # post-commit-failure case where this can mint a duplicate twin.
                 try:
-                    await self.reissue_mem0_intent(intent)
+                    landed = await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
                         Mem0IntentStatus.COMPLETED,
@@ -7351,6 +7395,9 @@ class MemoryService:
                             intent_id,
                             e,
                         )
+                else:
+                    if on_landed is not None:
+                        await mem0_write_retry.report_mem0_landing(on_landed, intent, landed)
             else:
                 # No backend_op → UNKNOWN outcome → dead-letter (never silent).
                 reason = (
