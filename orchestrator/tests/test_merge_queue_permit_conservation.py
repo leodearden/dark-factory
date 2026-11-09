@@ -453,7 +453,7 @@ class TestCascadeRemergeConservation:
     """
 
     async def test_cascade_remerge_conserves_permits(
-        self, git_ops: GitOps, git_config: GitConfig,
+        self, git_ops: GitOps, git_config: GitConfig, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
 
         K = 2
@@ -500,7 +500,7 @@ class TestCascadeRemergeConservation:
             verifier=_InjectedVerifier(_gated_failing_local), event_store=store,
         )
         _inject_two_host_allocator(worker, fake_remote)
-        remerges = _record_remerges(worker)
+        remerges = _record_remerges(worker, monkeypatch)
 
         req_a = make_merge_request('pc-cascade-a', 'task/pc-cascade-a', wt_a, config)
         req_b = make_merge_request('pc-cascade-b', 'task/pc-cascade-b', wt_b, config)
