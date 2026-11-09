@@ -16482,19 +16482,36 @@ class SpeculativeMergeWorker:
         result = await classify_and_merge(
             self, req, tip, speculative=True, started_monotonic=started_monotonic,
         )
+        return self._remerged_item(req, result, tip, speculative=True, started_monotonic=started_monotonic)
+
+    def _remerged_item(
+        self,
+        req: MergeRequest,
+        result: MergedOk | Decided,
+        base_sha: str,
+        *,
+        speculative: bool,
+        started_monotonic: float | None,
+    ) -> SpeculativeItem:
+        """Wrap one ``classify_and_merge`` *result* on *base_sha* as a re-merge's item.
+
+        A successful merge always has a worktree; RealMergeItem.merge_wt is
+        required non-None (task ο), so narrow explicitly.  A Decided result
+        is wrapped as-is: classify_and_merge already emitted its event(s).
+        """
         if isinstance(result, MergedOk):
             assert result.merge_wt is not None
             self._register_owned_merge_worktree(result.merge_wt)
             return RealMergeItem(
                 request=req, merge_result=result.merge_result,
                 merge_wt=result.merge_wt,
-                base_sha=tip, speculative=True,
-                merged_branch_tip=result.branch_tip,
+                base_sha=base_sha, speculative=speculative,
+                merged_branch_tip=result.branch_tip,  # γ2: parity with merger loop
                 started_monotonic=started_monotonic,
             )
         return DecidedItem(
             request=req,
-            base_sha=tip, speculative=True,
+            base_sha=base_sha, speculative=speculative,
             immediate_outcome=result.outcome,
             failure_diagnostic=result.outcome.failure_diagnostic,
             started_monotonic=started_monotonic,
@@ -16530,16 +16547,8 @@ class SpeculativeMergeWorker:
         )
 
         if isinstance(result, MergedOk):
-            # A successful merge always has a worktree; RealMergeItem.merge_wt is
-            # required non-None (task ο), so narrow explicitly.
-            assert result.merge_wt is not None
-            self._register_owned_merge_worktree(result.merge_wt)
-            return RealMergeItem(
-                request=req, merge_result=result.merge_result,
-                merge_wt=result.merge_wt,
-                base_sha=actual_main, speculative=False,
-                merged_branch_tip=result.branch_tip,  # γ2: parity with merger loop
-                started_monotonic=started_monotonic,
+            return self._remerged_item(
+                req, result, actual_main, speculative=False, started_monotonic=started_monotonic,
             )
 
         # ── Speculation-race retry ─────────────────────────────────────────────
@@ -16653,14 +16662,9 @@ class SpeculativeMergeWorker:
         # ── END speculation-race retry ─────────────────────────────────────────
 
         # Non-retry Decided: branch-presence / already-merged / conflict /
-        # non-conflict-failure / drop-guard — classify_and_merge already
-        # emitted the matching event(s); just wrap its outcome.
-        return DecidedItem(
-            request=req,
-            base_sha=actual_main, speculative=False,
-            immediate_outcome=result.outcome,
-            failure_diagnostic=result.outcome.failure_diagnostic,
-            started_monotonic=started_monotonic,
+        # non-conflict-failure / drop-guard.
+        return self._remerged_item(
+            req, result, actual_main, speculative=False, started_monotonic=started_monotonic,
         )
 
     def _resolve_or_drop_abandoned(

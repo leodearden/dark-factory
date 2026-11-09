@@ -4058,6 +4058,7 @@ class TestSpeculativeMergeWorker:
 
         remerge.assert_awaited_once()
         # Nothing is verifying, so the claim falls to main (task 8524).
+        assert remerge.await_args is not None
         claim = remerge.await_args.kwargs.get('claim')
         assert isinstance(claim, RemergeClaim), remerge.await_args
         assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
