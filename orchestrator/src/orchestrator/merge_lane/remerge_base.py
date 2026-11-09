@@ -80,12 +80,12 @@ def _fall_to_main_reason(
     owner_at = _owner_index(tip, frontier)
     if owner_at is None:
         return RemergeReason.TIP_VERIFY_DEAD
-    if any(_breaks_chain(entry, main_sha, dead_bases) for entry in frontier[:owner_at + 1]):
+    chain = frontier[:owner_at + 1]
+    if any(_breaks_chain(entry, main_sha, dead_bases) for entry in chain):
         return RemergeReason.TIP_DEAD
-    owner = frontier[owner_at]
-    if owner.vacated:
+    if any(entry.vacated for entry in chain):
         return RemergeReason.TIP_VACATED
-    if not _verify_alive(owner):
+    if not _verify_alive(frontier[owner_at]):
         return RemergeReason.TIP_VERIFY_DEAD
     return None
 
@@ -100,9 +100,8 @@ def choose_remerge_base(
 ) -> RemergeBase:
     """Anchor on *frozen_tip* when it is live, else fall to main with the reason.
 
-    Live means: not main, not dead, owned by a *frontier* entry that is not
-    vacated and whose verify is alive, with every entry up to that owner
-    chain-intact.  *frontier* is ordered oldest first.  A live tip still falls
+    Live means: not main, not dead, owned by a *frontier* entry whose verify
+    is alive, with every entry up to that owner chain-intact and not vacated.  *frontier* is ordered oldest first.  A live tip still falls
     to main when no permit is available, since a stacked replacement must
     hold one.
     """

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeGuard, assert_never
 
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
@@ -1309,6 +1309,13 @@ class RemergeBase:
         return {'anchor_reason': self.reason.value, 'anchor_base': self.tip}
 
 
+def fell_to_main(anchor: RemergeBase | None) -> TypeGuard[RemergeBase]:
+    """True for the anchor of a recovery re-merge that fell to main, the one
+    recovery item the §5.3 carve-out still exempts
+    (plans/merge-lane-policy-prd.md D1)."""
+    return anchor is not None and not anchor.speculative
+
+
 @dataclass
 class RealMergeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine:
@@ -1330,19 +1337,11 @@ class RealMergeItem:
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     cap_permit: CapPermit | None = None  # θ: merge-ahead-cap token owned by PermitLedger; non-None for non-speculative, non-train successful merges (Mechanism 1)
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
-    # task 3206 / PRD §5.3 re-merge carve-out: True → produced by _remerge (a
-    # RECOVERY re-merge onto real main), so the §5.3 verify-base⊄frozen-tip
-    # guard is exempt.  Set ONLY at _remerge's single-exit chokepoint (which
-    # covers all five consumer paths); default False keeps every other
-    # construction site unchanged.
-    #
-    # SCOPED TO THE RECOVERY BASE, NOT THE ITEM'S LIFETIME.  dataclasses.replace
-    # copies the marker like any other field, so a re-anchoring rebuild would
-    # otherwise carry the exemption onto a base the carve-out never justified.
-    # The two finalize-path rebuilds that re-anchor base_sha (gate rebase, CAS
-    # retry) therefore pass remerge_recovery=False explicitly; a future re-anchor
-    # site must do the same or it opens a silent §5.3 false-negative window.
-    remerge_recovery: bool = False
+    # Where a recovery re-merge was anchored, stamped only at _remerge's single
+    # exit (plans/merge-lane-policy-prd.md D1); None for every other item.  A
+    # rebuild that re-anchors base_sha (gate rebase, CAS retry) passes None, so
+    # the anchor never outlives the base it describes.
+    remerge_base: RemergeBase | None = None
 
 
 @dataclass
@@ -1367,17 +1366,9 @@ class DecidedItem:
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
-    # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
-    # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
-    # (merge_lane/verify_base_detector.py::detect_verify_base_divergence and
-    # worker.py::SpeculativeMergeWorker::_frozen_base_chain) type-narrow to
-    # RealMergeItem before reading it, because only a real merge has a verify
-    # base to check.  It is not decorative, though: _remerge's single-exit
-    # chokepoint stamps the marker with dataclasses.replace on whichever
-    # variant its body returned, and replace() raises TypeError for an unknown
-    # field — so dropping this would break every DecidedItem exit of the
-    # recovery path.  See the RealMergeItem field for the lifetime scoping.
-    remerge_recovery: bool = False
+    # Mirrors RealMergeItem.remerge_base: _remerge's single exit stamps it on
+    # whichever arm its body returned.
+    remerge_base: RemergeBase | None = None
 
 
 SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem

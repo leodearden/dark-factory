@@ -1555,9 +1555,9 @@ class TestVerifierDispatchFillRegistersDispatching:
         captured: list[Any] = []
         original_remerge = worker._remerge
 
-        async def _spying_remerge(req_: Any, started: Any) -> Any:
+        async def _spying_remerge(req_: Any, started: Any, claim: Any = None) -> Any:
             captured.append(worker._lifecycle.current(req.request_id))
-            return await original_remerge(req_, started)
+            return await original_remerge(req_, started, claim=claim)
 
         worker._remerge = _spying_remerge  # type: ignore[method-assign]
 
@@ -1859,7 +1859,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         remerged = MagicMock(spec=SpeculativeItem)
         captured_mid_remerge: list[Any] = []
 
-        async def _spying_remerge(req_: Any, started: Any) -> Any:
+        async def _spying_remerge(req_: Any, started: Any, claim: Any = None) -> Any:
             captured_mid_remerge.append(worker._lifecycle.current(req.request_id))
             return remerged
 

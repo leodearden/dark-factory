@@ -27,6 +27,8 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     QueuedBranch,
     RealMergeItem,
+    RemergeBase,
+    RemergeReason,
     VerifyBaseDivergence,
 )
 from orchestrator.merge_lane.verify_base_detector import (
@@ -58,7 +60,7 @@ def _request(config: OrchestratorConfig, task_id: str = 't-1') -> MergeRequest:
 
 
 def _real_item(
-    config: OrchestratorConfig, *, base_sha: str, remerge_recovery: bool = False,
+    config: OrchestratorConfig, *, base_sha: str, remerge_base: RemergeBase | None = None,
 ) -> RealMergeItem:
     return RealMergeItem(
         request=_request(config),
@@ -66,7 +68,7 @@ def _real_item(
         merge_wt=Path('/fake/merge-wt'),
         base_sha=base_sha,
         speculative=False,
-        remerge_recovery=remerge_recovery,
+        remerge_base=remerge_base,
     )
 
 
@@ -108,8 +110,10 @@ class TestDetectVerifyBaseDivergence:
     ) -> None:
         assert _detect(_real_item(config, base_sha=''), 'sha-tip') is None
 
-    async def test_recovery_remerge_is_carved_out(self, config: OrchestratorConfig) -> None:
-        item = _real_item(config, base_sha='real-main', remerge_recovery=True)
+    async def test_recovery_remerge_on_main_is_carved_out(self, config: OrchestratorConfig) -> None:
+        item = _real_item(
+            config, base_sha='real-main', remerge_base=RemergeBase(None, RemergeReason.NO_TIP),
+        )
         assert _detect(item, 'sha-tip') is None
 
     async def test_base_on_the_tip_is_no_divergence(self, config: OrchestratorConfig) -> None:

@@ -17,7 +17,12 @@ from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
-from orchestrator.merge_lane.types import RealMergeItem, SpeculativeItem, VerifyBaseDivergence
+from orchestrator.merge_lane.types import (
+    RealMergeItem,
+    SpeculativeItem,
+    VerifyBaseDivergence,
+    fell_to_main,
+)
 
 VERIFY_BASE_DIVERGENCE_SENTINEL = '__merge_verify_base_divergence__'
 
@@ -31,10 +36,11 @@ def detect_verify_base_divergence(
 ) -> VerifyBaseDivergence | None:
     """The divergence *item* commits by verifying off *expected_tip*, or None.
 
-    Only a real merge has a verify base.  A ``remerge_recovery`` item targets
-    real main by construction, so it is carved out (PRD §5.3, task 3206).
+    Only a real merge has a verify base.  A recovery re-merge that fell to
+    main targets main by construction, so it is carved out (PRD §5.3; task
+    8524 narrowed the carve-out to that case, plans/merge-lane-policy-prd.md D1).
     """
-    if not isinstance(item, RealMergeItem) or not item.base_sha or item.remerge_recovery:
+    if not isinstance(item, RealMergeItem) or not item.base_sha or fell_to_main(item.remerge_base):
         return None
     if item.base_sha.strip() == expected_tip.strip():
         return None

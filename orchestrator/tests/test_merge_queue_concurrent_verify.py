@@ -2450,10 +2450,10 @@ class TestChainInvalidationUnderOverlap:
         mid_remerge_state: list[Any] = []
         original_remerge = worker._remerge
 
-        async def _spying_remerge(req_: Any, started: Any) -> Any:
+        async def _spying_remerge(req_: Any, started: Any, claim: Any = None) -> Any:
             if req_.request_id == req_b.request_id:
                 mid_remerge_state.append(worker._lifecycle.current(req_b.request_id))
-            return await original_remerge(req_, started)
+            return await original_remerge(req_, started, claim=claim)
 
         worker._remerge = _spying_remerge  # type: ignore[method-assign]
 
@@ -2623,9 +2623,9 @@ class TestHaltAndUnavailable:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
@@ -4080,13 +4080,13 @@ class TestCascadeErrorContainment:
         # Simulates merge_to_main → _create_merge_worktree failing under ENOSPC.
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'cas-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/cas-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 

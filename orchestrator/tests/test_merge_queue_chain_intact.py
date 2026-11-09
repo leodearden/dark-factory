@@ -532,7 +532,9 @@ def _make_remerge_to_decided_stub() -> AsyncMock:
     ``_remerge`` so lifecycle/registry bookkeeping stays coherent.
     """
 
-    def _side(request: object, started_monotonic: object = None) -> DecidedItem:
+    def _side(
+        request: object, started_monotonic: object = None, claim: object = None,
+    ) -> DecidedItem:
         return DecidedItem(
             request=request,  # type: ignore[arg-type]
             immediate_outcome=MergeOutcome('conflict', reason='remerged-stub'),

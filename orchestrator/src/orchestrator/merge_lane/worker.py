@@ -153,6 +153,11 @@ from orchestrator.merge_lane.ports import (
     VerifyPort,
     escalation_port,
 )
+from orchestrator.merge_lane.remerge_base import (
+    RemergeClaim,
+    claim_remerge_base,
+    frontier_tip,
+)
 from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     report_stuck_requests,
@@ -212,7 +217,9 @@ from orchestrator.merge_lane.types import (
     RealMergeItem,
     RecoveryEvidence,
     RelaneOutcome,
+    RemergeBase,
     SoloVerifyResult,
+    SpecPermit,
     SpeculativeItem,
     TerminalOutcomeRetention,
     TrainCallbackFactory,
@@ -222,6 +229,7 @@ from orchestrator.merge_lane.types import (
     VerifyInFlightKind,
     VerifyWorktreeHandle,
     _HostUnavailability,
+    fell_to_main,
     item_merge_wt,
     lease_activity,
     quarantine_class,
@@ -9256,7 +9264,8 @@ class SpeculativeMergeWorker:
         at the :meth:`frozen_prefix_tip`, since
         :meth:`_frozen_inflight_entries` then counted this head as frozen on
         its phase alone.  Task 5302 added the liveness half of that test
-        (:meth:`_finalize_head_is_frozen`), so a vacated head is not frozen.
+        (the vacated filter in :meth:`_frozen_inflight_entries`), so a vacated
+        head is not frozen.
 
         *inflight_ids*, if given, is used verbatim instead of re-deriving
         ``{e.item.request.request_id for e in self._inflight}``. Callers
@@ -10445,11 +10454,9 @@ class SpeculativeMergeWorker:
         while verification is in flight.
 
         Definition (§5.3):
-          frozen = [the finalize head, if _finalize_head_is_frozen(head)]
-                   + [e for e in self._occupying_inflight_entries()
-                      if e.in_verify_frontier]
+          frozen = [e for e in self._verify_frontier_entries() if not e.vacated]
 
-        Both halves apply one liveness rule: a :attr:`~InflightEntry.vacated`
+        One liveness rule covers the finalize head and the deque alike: a :attr:`~InflightEntry.vacated`
         entry is not frozen.  Its verify requeued or dropped the request and
         released the lease (task 4582), so its merge commit is dead; counting
         it made that commit the :meth:`frozen_prefix_tip` (PRD §5.3 class (a)).
@@ -10467,20 +10474,21 @@ class SpeculativeMergeWorker:
         :meth:`_finalizing_head_entry` (the deleted ``_finalizing_head``
         field's replacement) rather than read from a field.
         """
-        entries: list[InflightEntry] = []
-        head = self._finalizing_head_entry()
-        if head is not None and self._finalize_head_is_frozen(head):
-            entries.append(head)
-        entries.extend(e for e in self._occupying_inflight_entries() if e.in_verify_frontier)
-        return entries
+        return [e for e in self._verify_frontier_entries() if not e.vacated]
 
-    def _finalize_head_is_frozen(self, head: InflightEntry) -> bool:
-        """Whether the finalize *head* counts toward the frozen prefix (§5.3).
+    def _verify_frontier_entries(self) -> list[InflightEntry]:
+        """The finalize head and the ``_inflight`` entries in a verify phase,
+        vacated ones INCLUDED, oldest first.
 
-        It must be in a verify or finalize phase and not vacated, the same
-        liveness rule :meth:`_occupying_inflight_entries` applies to the deque.
+        :meth:`_frozen_inflight_entries` drops the vacated ones; a re-anchor
+        decision keeps them, so a vacated link below the tip is named
+        ``tip_vacated`` rather than skipped (plans/merge-lane-policy-prd.md §7
+        row 3).
         """
-        return not head.vacated and self._entry_phase(head) in _VERIFY_PHASES
+        head = self._finalizing_head_entry()
+        entries = [head] if head is not None and self._entry_phase(head) in _VERIFY_PHASES else []
+        entries.extend(e for e in self._inflight if e.in_verify_frontier)
+        return entries
 
     def _verify_frontier_depth(self) -> int:
         """Return the verify-frontier stack height (task 2340, reuses ε=1890).
@@ -10592,16 +10600,10 @@ class SpeculativeMergeWorker:
     def _newest_frozen_commit(self) -> str | None:
         """Return the newest frozen entry's merge_commit, or None (ε=1890).
 
-        Iterates _frozen_inflight_entries() in reverse (newest first) and
-        returns the first non-None merge_commit found.  Entries with no
-        merge_result (passthroughs) are skipped.
-
+        The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`.
         Pure/synchronous.
         """
-        for entry in reversed(self._frozen_inflight_entries()):
-            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
-                return entry.item.merge_result.merge_commit.strip()
-        return None
+        return frontier_tip(self._frozen_inflight_entries())
 
     def frozen_prefix_tip(self, main_sha: str) -> str:
         """Return the base SHA that η should stack bounce/verify onto (ε=1890).
@@ -10699,8 +10701,8 @@ class SpeculativeMergeWorker:
         legitimately move under an in-flight verify (PRD §5.3, task 5302).
 
         Entries with no merge commit (passthrough / conflict) are skipped and
-        do NOT advance the chain.  A ``remerge_recovery`` entry still advances
-        it: each entry's merge commit sets its successor's expected base, so
+        do NOT advance the chain.  A recovery re-merge that fell to main still
+        advances it: each entry's merge commit sets its successor's expected base, so
         dropping one from the WALK would turn a single carved-out break into a
         cascade of false ones behind it.  The carve-out is applied to violation
         emission only, by the consumer.
@@ -10729,11 +10731,11 @@ class SpeculativeMergeWorker:
             )
         base = item.base_sha.strip() if item.base_sha else ''
         if predecessor is not None and base != predecessor:
+            anchor = item.remerge_base
             annotation = (
-                ' [recovery re-merge (expected): this item came from _remerge '
-                'and targets real main by design — PRD §5.3 carve-out, task '
-                '3206; not structural damage]'
-            ) if item.remerge_recovery else ''
+                f' [recovery re-merge fell to main ({anchor.reason.value}): '
+                'expected, plans/merge-lane-policy-prd.md D1; not structural damage]'
+            ) if fell_to_main(anchor) else ''
             breaks.append(
                 f'frozen-prefix base-chain broken at {rid}: '
                 f'expected base {predecessor!r} but item has {base!r}{annotation}'
@@ -10757,10 +10759,10 @@ class SpeculativeMergeWorker:
              on an older LANDED main is intact, since the CAS rebase and the
              gate re-verify own it.
           2. Successor chain links: each frozen real merge after the head must
-             be based on its predecessor's merge commit.  A
-             ``remerge_recovery`` entry really does break its link, so it is
-             reported, but ANNOTATED 'recovery re-merge (expected)' (PRD §5.3
-             carve-out, task 3206) so it reads apart from structural damage.
+             be based on its predecessor's merge commit.  A recovery re-merge
+             that fell to main really does break its link, so it is reported,
+             but ANNOTATED with its anchor reason (plans/merge-lane-policy-prd.md
+             D1) so it reads apart from structural damage.
           3. Frozen/suffix disjointness: any rid that appears in BOTH
              frozen_prefix() and unfrozen_suffix() is a structural bug; record
              one violation per duplicate.
@@ -11919,8 +11921,8 @@ class SpeculativeMergeWorker:
         task, with that call's freshly fetched main (fail-open: skipped on a
         get_main_sha error).  _dispatch_item stamps the returned record on the
         entry, so the WARNING, the L1 and :meth:`verify_base_divergences` are
-        one computation.  The policy, ``remerge_recovery`` carve-out included,
-        is :func:`detect_verify_base_divergence`.
+        one computation.  The policy, fell-to-main carve-out included, is
+        :func:`detect_verify_base_divergence`.
         """
         divergence = detect_verify_base_divergence(
             item,
@@ -16352,42 +16354,114 @@ class SpeculativeMergeWorker:
             f"branch_ref_in_worktree={diag['branch_ref_in_worktree']}"
         )
 
+    def _claim_remerge_base(
+        self, item: SpeculativeItem, main_sha: str, held_permit: SpecPermit | None,
+    ) -> RemergeClaim:
+        """Where *item*'s recovery re-merge goes, decided before its site emits
+        the triggering row (plans/merge-lane-policy-prd.md D1).
+
+        *item*'s own commit already counts as dead and its own entry is not
+        part of the frontier.  Synchronous, so the frontier and the dead-base
+        ledger are read with no await between them.
+        """
+        own = item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
+        return self._claim_for_request(item.request, own, main_sha, held_permit)
+
+    def _claim_for_request(
+        self,
+        req: MergeRequest,
+        own_commit: str | None,
+        main_sha: str,
+        held_permit: SpecPermit | None,
+    ) -> RemergeClaim:
+        frontier = [
+            e for e in self._verify_frontier_entries()
+            if e.item.request.request_id != req.request_id
+        ]
+        return claim_remerge_base(
+            main_sha=main_sha,
+            frozen_tip=frontier_tip(frontier) or main_sha,
+            dead_bases={*self._dead_base_commits, (own_commit or '').strip()} - {''},
+            frontier=frontier,
+            held_permit=held_permit,
+            ledger=self._speculation_ledger,
+        )
+
     async def _remerge(
         self,
         req: MergeRequest,
         started_monotonic: float | None,
+        claim: RemergeClaim | None = None,
     ) -> SpeculativeItem:
-        """Re-merge a request against actual main after speculation invalidation.
+        """Re-merge *req* onto its claim's anchor after speculation invalidation.
 
-        SINGLE EXIT — the §5.3 carve-out chokepoint (task 3206).  The merge
-        itself runs in :meth:`_remerge_inner`, which owns every early return;
-        this wrapper is the ONE place ``remerge_recovery=True`` is stamped, so
-        the marker holds BY CONSTRUCTION for every present and future exit of
-        the recovery path (a new return added to the body cannot escape it) —
-        rather than by N keyword arguments an N+1'th path could forget.
-
-        §5.3 RE-MERGE CARVE-OUT: items returned here are exempt from the
-        dispatch-time verify-base detector
-        (:meth:`_verify_base_divergence_at_dispatch`), and their chain-link
-        break is annotated in :meth:`check_frozen_prefix_invariant`.  ``base_sha=actual_main``
-        and ``speculative=False`` in the body are ADJUDICATED and must NOT be
-        changed to stack on ``frozen_prefix_tip()``.  PRD §5.3 is the canonical
-        write-up — grounds, five consumer sites, and measured evidence.
+        A speculative claim stacks the replacement on the live frontier tip
+        with the claim's permit; any other claim merges onto main with none
+        (plans/merge-lane-policy-prd.md D1).  With no claim, main is read and
+        the claim is taken here, holding no permit.  SINGLE EXIT: whatever
+        :meth:`_remerge_inner` returns leaves stamped with the claim, and a
+        raising re-merge releases the claim's permit.
         """
-        item = await self._remerge_inner(req, started_monotonic)
-        return dataclasses.replace(item, remerge_recovery=True)
+        if claim is None:
+            claim = self._claim_for_request(req, None, await self._git_ops.get_main_sha(), None)
+        try:
+            item = await self._remerge_inner(req, started_monotonic, claim.anchor)
+        except BaseException:
+            if claim.permit is not None:
+                self._speculation_ledger.release(claim.permit)
+            raise
+        return dataclasses.replace(item, remerge_base=claim.anchor, permit=claim.permit)
 
     async def _remerge_inner(
         self,
         req: MergeRequest,
         started_monotonic: float | None,
+        anchor: RemergeBase,
     ) -> SpeculativeItem:
-        """Body of :meth:`_remerge` — call that, never this (task 3206).
+        """Body of :meth:`_remerge` — call that, never this: items returned
+        here carry neither the anchor nor the permit."""
+        if anchor.tip is not None:
+            return await self._remerge_on_tip(req, started_monotonic, anchor.tip)
+        return await self._remerge_on_main(req, started_monotonic)
 
-        Split out purely so ``_remerge`` has a single exit at which the §5.3
-        ``remerge_recovery`` marker is stamped.  Items returned HERE are
-        deliberately unmarked, so calling this directly yields a recovery item
-        the §5.3 carve-out does not cover.
+    async def _remerge_on_tip(
+        self,
+        req: MergeRequest,
+        started_monotonic: float | None,
+        tip: str,
+    ) -> SpeculativeItem:
+        """One guarded merge of *req* stacked on the live frontier *tip*.
+
+        No speculation-race retry: its gate, main moving between two reads,
+        means nothing for a stacked base.
+        """
+        result = await classify_and_merge(
+            self, req, tip, speculative=True, started_monotonic=started_monotonic,
+        )
+        if isinstance(result, MergedOk):
+            assert result.merge_wt is not None
+            self._register_owned_merge_worktree(result.merge_wt)
+            return RealMergeItem(
+                request=req, merge_result=result.merge_result,
+                merge_wt=result.merge_wt,
+                base_sha=tip, speculative=True,
+                merged_branch_tip=result.branch_tip,
+                started_monotonic=started_monotonic,
+            )
+        return DecidedItem(
+            request=req,
+            base_sha=tip, speculative=True,
+            immediate_outcome=result.outcome,
+            failure_diagnostic=result.outcome.failure_diagnostic,
+            started_monotonic=started_monotonic,
+        )
+
+    async def _remerge_on_main(
+        self,
+        req: MergeRequest,
+        started_monotonic: float | None,
+    ) -> SpeculativeItem:
+        """Re-merge *req* onto actual main, with the speculation-race retry.
 
         task-1724: skip_verify is unconditionally False on every success path —
         the merge gate always runs before advance_main regardless of pre_rebased
@@ -20015,12 +20089,11 @@ class SpeculativeMergeWorker:
             # Update base_sha to current main for retry.
             # I3 (task 1990): replace-only rebuild — see
             # _candidate_after_gate's rebuild for rationale,
-            # including why remerge_recovery is cleared on re-anchor
-            # (task 3206 §5.3).
+            # including why remerge_base is cleared on re-anchor.
             item = dataclasses.replace(
                 item,
                 base_sha=await self._git_ops.get_main_sha(),
-                remerge_recovery=False,
+                remerge_base=None,
             )
             candidate = candidate.reanchored(item, candidate.sha)
             logger.info(
@@ -20272,16 +20345,13 @@ class SpeculativeMergeWorker:
         # back by hand).  Re-invokes __post_init__, re-validating
         # the rebuilt REAL item.
         #
-        # remerge_recovery is the ONE field deliberately not
-        # copied (task 3206): this rebuild RE-ANCHORS the item onto
-        # a fresh base, so the §5.3 carve-out — which exempts an
-        # item because _remerge deliberately based it on real main
-        # — no longer applies to the base it now carries.  Leaving
-        # it set would suppress §5.3 reporting for the rest of the
-        # request's life, a silent false negative for the one class
-        # the guard still exists to catch.
+        # remerge_base is the ONE field deliberately not copied: this
+        # rebuild RE-ANCHORS the item onto a fresh base, so the anchor
+        # _remerge recorded no longer describes it, and a fell-to-main
+        # anchor left set would keep the §5.3 carve-out on a base it
+        # never justified.
         item = dataclasses.replace(
-            item, base_sha=gate.rebased_onto, remerge_recovery=False,
+            item, base_sha=gate.rebased_onto, remerge_base=None,
         )
         logger.info(
             'Task %s: gate cleared (%s); '

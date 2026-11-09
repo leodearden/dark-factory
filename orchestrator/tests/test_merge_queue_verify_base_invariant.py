@@ -48,6 +48,7 @@ from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.types import RemergeBase, RemergeReason
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -182,9 +183,10 @@ def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
     Mirrors what `_remerge` does in production — it is the single producer of
     recovery items for all five consumer paths, so the marker is set once at
     the producer rather than threaded through each consumer.  Mirrors the
-    helper of the same name in test_merge_queue_frozen_prefix.py.
+    helper of the same name in test_merge_queue_frozen_prefix.py: since task
+    8524 that is a recovery re-merge that fell to main.
     """
-    return dataclasses.replace(item, remerge_recovery=True)
+    return dataclasses.replace(item, remerge_base=RemergeBase(None, RemergeReason.NO_TIP))
 
 
 def _make_inflight_entry(
@@ -364,7 +366,8 @@ class TestRemergeCarveOutAfterTheSplit:
         )
         assert violations[0].startswith(
             f'frozen-prefix base-chain broken at {middle.request.request_id}: '
-            f"expected base 'C0' but item has 'real-main' [recovery re-merge (expected):"
+            f"expected base 'C0' but item has 'real-main' "
+            f'[recovery re-merge fell to main (no_tip):'
         ), violations
         assert worker.check_frozen_prefix_invariant('M0') == violations
 
