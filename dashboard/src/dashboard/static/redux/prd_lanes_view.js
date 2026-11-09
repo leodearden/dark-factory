@@ -105,11 +105,17 @@ function doneOfTotal(row) {
   };
 }
 
+function signalLeafText(leaf) {
+  const kind = leaf.status === 'done' && leaf.done_kind ? ` (${leaf.done_kind})` : '';
+  return `${leaf.label} #${leaf.task_id} ${leaf.status}${kind}`;
+}
+
 function signalCell(signal) {
   const text = Object.prototype.hasOwnProperty.call(SIGNAL_MARK_TEXT, signal.mark)
     ? SIGNAL_MARK_TEXT[signal.mark]
     : signal.mark;
-  return { text, detail: signal.reason || null };
+  const lines = [signal.reason, ...(signal.leaves || []).map(signalLeafText)].filter(Boolean);
+  return { text, detail: lines.length === 0 ? null : lines.join('\n') };
 }
 
 // ── The contention line ──
