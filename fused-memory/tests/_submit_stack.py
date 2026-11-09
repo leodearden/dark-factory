@@ -5,15 +5,20 @@ Import the fixtures in the explicit re-export form so pytest registers them in t
 
     from _submit_stack import Stack
     from _submit_stack import curator_creates as curator_creates
+    from _submit_stack import curator_script as curator_script
     from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
     from _submit_stack import stack as stack
+
+``curator_creates`` creates every curated candidate as filed; ``curator_script`` answers each one
+with the next scripted ``CuratorDecision`` (create when the script is empty) and never re-embeds.
+A test uses one of the two, never both.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -43,6 +48,7 @@ class Stack:
     backend: SqliteTaskBackend
     interceptor: TaskInterceptor
     server: Any
+    ticket_store: TicketStore
 
     async def call(self, tool: str, **args: Any) -> Any:
         return await self.server._tool_manager.call_tool(tool, {'project_root': self.root, **args})
@@ -55,19 +61,34 @@ class Stack:
         assert 'error' not in result, result
         return result['metadata']
 
-    async def seed(self, title: str, metadata: dict[str, Any]) -> str:
-        """A row written straight to the store, past every submit-boundary guard."""
+    async def seed(self, title: str, metadata: dict[str, Any], **fields: str) -> str:
+        """A row written straight to the store, past every submit-boundary guard.
+
+        ``fields`` carries any of status, description, details and priority.
+        """
         created = await self.backend.add_task(
-            project_root=self.root, title=title, metadata=json.dumps(metadata),
+            project_root=self.root, title=title, metadata=json.dumps(metadata), **fields,
         )
         return str(created['id'])
 
-    async def file_normal(self, **args: Any) -> str:
+    async def submit(self, **args: Any) -> tuple[str, dict[str, Any]]:
+        """File through submit_task and return the ticket with its resolve_ticket answer."""
         submitted = await self.call('submit_task', **args)
         assert 'ticket' in submitted, submitted
         resolved = await self.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
+        return submitted['ticket'], resolved
+
+    async def file_normal(self, **args: Any) -> str:
+        _ticket, resolved = await self.submit(**args)
         assert resolved.get('status') == 'created', resolved
         return str(resolved['task_id'])
+
+    async def ticket_outcome(self, ticket: str) -> dict[str, Any] | None:
+        """The persisted ticket outcome (result_json), read through the store's public row."""
+        row = await self.ticket_store.get(ticket)
+        assert row is not None, ticket
+        result_json = row['result_json']
+        return None if result_json is None else json.loads(result_json)
 
     async def file_planned(self, **args: Any) -> str:
         result = await self.call('submit_task', planning_mode=True, **args)
@@ -89,7 +110,10 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     try:
-        yield Stack(root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server)
+        yield Stack(
+            root=str(tmp_path / 'proj'), backend=backend, interceptor=interceptor, server=server,
+            ticket_store=ticket_store,
+        )
     finally:
         await interceptor.close()
         await event_buffer.close()
@@ -107,3 +131,33 @@ def curator_creates(monkeypatch: pytest.MonkeyPatch) -> list[PreparedCandidate]:
 
     monkeypatch.setattr(TaskCurator, 'curate_prepared', _create_each)
     return handed
+
+
+@dataclass
+class CuratorScript:
+    """Scripted curator answers: ``decisions`` are consumed first in, first out, one per candidate."""
+
+    decisions: list[CuratorDecision] = field(default_factory=list)
+    handed: list[PreparedCandidate] = field(default_factory=list)
+    reembedded: list[str] = field(default_factory=list)
+
+
+@pytest.fixture
+def curator_script(monkeypatch: pytest.MonkeyPatch) -> CuratorScript:
+    """Each curated candidate gets the next scripted decision; a combine records, never embeds."""
+    script = CuratorScript()
+
+    async def _scripted(self, prepared, project_id, project_root):
+        script.handed.extend(prepared)
+        return [
+            script.decisions.pop(0) if script.decisions
+            else CuratorDecision(action='create', justification='submit-stack script default')
+            for _ in prepared
+        ]
+
+    async def _record_reembed(self, task_id, candidate, project_id):
+        script.reembedded.append(task_id)
+
+    monkeypatch.setattr(TaskCurator, 'curate_prepared', _scripted)
+    monkeypatch.setattr(TaskCurator, 'reembed_task', _record_reembed)
+    return script

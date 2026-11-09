@@ -158,11 +158,13 @@ async def test_a_resubmitted_pair_resolves_combined_without_reading_the_task_tre
 
 
 @pytest.mark.asyncio
-async def test_a_done_task_with_the_pair_still_hits(tmp_path):
+async def test_a_done_task_with_the_pair_does_not_hit(tmp_path):
     async with _open_stack(tmp_path) as stack:
-        existing = await stack.seed('existing', status='done')
+        await stack.seed('existing', status='done')
 
-        assert await stack.submit(_pair()) == _combined_onto(existing)
+        answer = await stack.submit(_pair())
+
+        assert answer['status'] == TicketStatus.CREATED
 
 
 @pytest.mark.asyncio

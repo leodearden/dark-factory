@@ -26,7 +26,8 @@ from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FollowupBundleInvalid,
     FollowupItem,
-    read_items,
+    merge_items,
+    task_items,
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
@@ -54,13 +55,11 @@ from fused_memory.backends.task_backend_errors import (
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
-    TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import (
     AmendmentAdvisory,
     MetadataLookupResult,
-    MetadataLookupRow,
 )
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
@@ -79,12 +78,13 @@ from fused_memory.middleware.curation_deferral import (
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_types import (
-    NON_CANCELLED_STATUSES,
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
+    declared_scope_of,
     exception_summary,
-    is_combine_eligible_status,
+    followup_items_of,
+    is_combine_eligible,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -97,6 +97,7 @@ from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_PROVENANCE_KINDS,
     resolve_deterministic_provenance_authorization,
 )
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -123,6 +124,13 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.r4_idempotency import (
+    DroppedItem,
+    R4Lookup,
+    R4Verdict,
+    check_r4,
+    metadata_keeping,
+)
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcome,
@@ -320,9 +328,6 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # and never compares them to the backend's sentinel.
 _UNSET = object()
 
-# One R4 lookup page; a suggestion_hash shared past it is paged, not missed.
-_R4_LOOKUP_PAGE = 100
-
 
 def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     """Return only the *pairs* entries whose value is not *sentinel*.
@@ -431,6 +436,25 @@ class _PreparedTicket:
     candidate: CandidateTask | None
     prepared: PreparedCandidate | None
     attribution: CreationAttribution
+    r4_dropped: tuple[DroppedItem, ...] = ()
+
+    def keeping(self, verdict: R4Verdict) -> '_PreparedTicket':
+        """This ticket filing only the verdict's kept items, carrying what R4 dropped."""
+        candidate = (
+            None if self.candidate is None
+            else dataclasses.replace(self.candidate, items=verdict.kept)
+        )
+        prepared = (
+            None if self.prepared is None or candidate is None
+            else dataclasses.replace(self.prepared, candidate=candidate)
+        )
+        return dataclasses.replace(
+            self,
+            metadata=metadata_keeping(coerce_task_metadata(self.metadata) or {}, verdict),
+            candidate=candidate,
+            prepared=prepared,
+            r4_dropped=verdict.dropped,
+        )
 
     @property
     def prompt_tokens(self) -> int:
@@ -628,19 +652,6 @@ def _with_derived_bundle_keys(metadata: Any) -> Any:
     if readable is None or FOLLOWUP_ITEMS_METADATA_KEY not in readable:
         return metadata
     return with_derived_bundle_keys(readable)
-
-
-def _candidate_items(meta: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
-    """The candidate's follow-up items; () with a census line when a stored list is malformed."""
-    try:
-        return read_items(meta)
-    except FollowupBundleInvalid as exc:
-        logger.warning(
-            'task_metadata.schema_warning source=%s error=%s; candidate items discarded',
-            '_candidate_items',
-            exc,
-        )
-        return ()
 
 
 class TaskInterceptor:
@@ -2702,7 +2713,8 @@ class TaskInterceptor:
             spawned_from=meta.get('spawned_from'),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
-            items=_candidate_items(meta),
+            items=followup_items_of(meta),
+            declared_scope=declared_scope_of(meta),
         )
 
     def _files_scope_check(
@@ -3493,6 +3505,8 @@ class TaskInterceptor:
         project_root: str,
         decision: CuratorDecision,
         *,
+        candidate: CandidateTask,
+        ticket_id: str,
         candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
@@ -3500,17 +3514,26 @@ class TaskInterceptor:
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
         ``update_task``, writing the curator's rewrite as structured fields
-        and MERGING a three-key combine marker into the target's existing
-        metadata blob (``metadata_mode='merge'``) — it does not replace that
-        blob. See the comment at the write for why (task 3446).
+        and MERGING the combine's keys into the target's existing metadata
+        blob (``metadata_mode='merge'``) — it does not replace that blob. See
+        the comment at the write for why (task 3446). Those keys are the three
+        ``curator_*`` markers, the ``declared_scope`` re-stamped from the
+        rewrite (``basis='combine'``, the one sanctioned re-stamp, written
+        backend-direct), and ``followup_items``: the order-preserving union of
+        the target's and the candidate's items, written when non-empty. It
+        never writes ``metadata.files``. A malformed stored bundle on either
+        side aborts, unaudited, a combine every other guard would let
+        through; an eligibility refusal of that target is still audited, with
+        no items recorded.
 
         Before writing, verifies the decision found its target and that the
         target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
         fingerprint (curator targeted the wrong task) aborts first, so a
         misdirected decision can never be recorded as an eligibility refusal
         against a row it never meant. Eligibility is then the shared
-        ``is_combine_eligible_status`` (task_curator) — the same predicate the
-        curator's selection snapshot uses, so the two cannot drift apart —
+        ``curator_types.is_combine_eligible`` — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart, and
+        a follow-up holder refuses under its own token (``target_is_holder``) —
         conjoined with an execution-only check the snapshot cannot make: a
         target carrying a ``claimant_run_id`` stamp is refused even when its
         status is pending (task 4035). That conjunct tests only for a present,
@@ -3525,8 +3548,9 @@ class TaskInterceptor:
         token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
-        declaring an escalation gate while the live target does not. The
-        candidate's own metadata is never written anywhere by this path, so
+        declaring an escalation gate while the live target does not. Apart
+        from its follow-up items, the candidate's own metadata is never
+        written anywhere by this path, so
         such a combine would silently strip a human decision gate — the
         target-side ``'merge'`` above cannot help. Refusing degrades to
         ``create``, which files the gate as its own task (task 3446).
@@ -3587,9 +3611,21 @@ class TaskInterceptor:
             )
             return None
 
+        target_metadata = target.get('metadata')
+        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+        candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+        audit_context, items_after = _combine_fold(
+            decision,
+            ticket_id=ticket_id,
+            target_title=target_title,
+            target_meta=target_meta or {},
+            candidate=candidate,
+            candidate_meta=candidate_meta,
+        )
+
         # ── Guard: the target must still be combine-ELIGIBLE right now ──
-        # Shared with the curator's selection snapshot (task_curator's
-        # is_combine_eligible_status) so the two cannot drift apart again —
+        # Shared with the curator's selection snapshot (curator_types'
+        # is_combine_eligible) so the two cannot drift apart again —
         # the hand-copied `status == 'pending'` that used to live here as
         # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
         # that had moved on since selection (task 4035).
@@ -3610,16 +3646,16 @@ class TaskInterceptor:
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
 
-        # Single read shared by the eligibility chain and the gate guard.
-        target_metadata = target.get('metadata')
-
-        if not is_combine_eligible_status(target_status):
-            refused_reason = COMBINE_REFUSED_NOT_PENDING
+        if not is_combine_eligible(target):
+            refused_reason = (
+                COMBINE_REFUSED_HOLDER if is_holder(target) else COMBINE_REFUSED_NOT_PENDING
+            )
             logger.warning(
-                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'combine-guard: target %s is not combine-eligible (status=%r, %s) — '
                 'aborting combine to avoid silently losing candidate work',
                 decision.target_id,
                 target_status,
+                refused_reason,
             )
         elif target_is_claimed:
             # Status alone has the same TOCTOU shape one level down: a target
@@ -3661,6 +3697,7 @@ class TaskInterceptor:
                 new_title=rt.title,
                 new_description=rt.description,
                 justification=decision.justification,
+                context=audit_context,
                 refused_reason=refused_reason,
             )
             return None
@@ -3692,17 +3729,14 @@ class TaskInterceptor:
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target_metadata
         ):
-            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
             # _is_gate_metadata answers False both when the target genuinely
             # has no gate AND when its metadata blob is unparseable/corrupt
             # (permissive-on-parse-failure by design). Distinguish the two in
-            # the log text — a shape-level re-check via _parse_metadata_value
-            # (not _extract_metadata_dict, to avoid a second schema_warning
-            # emission for the same blob) is enough. The refuse-and-degrade
-            # decision itself is unchanged either way. Re-checks the SAME
-            # `target_metadata` the condition above consulted, deliberately.
-            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            # the log text: `target_meta`, parsed above from the SAME
+            # `target_metadata` this condition consulted, is None exactly for
+            # the unreadable blob. The refuse-and-degrade decision itself is
+            # unchanged either way.
             if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
@@ -3717,6 +3751,18 @@ class TaskInterceptor:
             )
             return None
 
+        # Unaudited, like the gate guard: a combine that cannot keep every
+        # item must not write, but only a combine every guard above passed
+        # reaches here, so an eligibility refusal stays counted.
+        if items_after is None:
+            logger.warning(
+                'combine-guard: target %s or its candidate carries a malformed follow-up '
+                'bundle — aborting combine, which could not keep every item. Degrading '
+                'to create.',
+                decision.target_id,
+            )
+            return None
+
         # The curator already produced the coherent rewrite — push it to the
         # backend as structured fields. No prompt, no LLM rewrite at the
         # write boundary; sqlite writes the columns directly. The
@@ -3725,13 +3771,19 @@ class TaskInterceptor:
         # kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         details_with_files = f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
-        combine_metadata = json.dumps(
-            {
-                'curator_action': 'combine',
-                'curator_justification': decision.justification[:500],
-                'combined_at': datetime.now(UTC).isoformat(),
-            }
-        )
+        combine_keys: dict[str, Any] = {
+            'curator_action': 'combine',
+            'curator_justification': decision.justification[:500],
+            'combined_at': datetime.now(UTC).isoformat(),
+            DECLARED_SCOPE_METADATA_KEY: derive_declared_scope(
+                rt.files_to_modify, rt.description, rt.details, basis='combine',
+            ).model_dump(),
+        }
+        if items_after:
+            combine_keys[FOLLOWUP_ITEMS_METADATA_KEY] = [
+                item.model_dump(mode='json') for item in items_after
+            ]
+        combine_metadata = json.dumps(combine_keys)
 
         # ── Audit: persist old-vs-new BEFORE the mutation so we can
         # recover if the write crashes mid-flight.
@@ -3744,6 +3796,7 @@ class TaskInterceptor:
             new_title=rt.title,
             new_description=rt.description,
             justification=decision.justification,
+            context=audit_context,
         )
 
         rewrite = _CombineRewrite(
@@ -3758,7 +3811,7 @@ class TaskInterceptor:
                     # Combine MERGES its marker keys into the target's blob; it
                     # does NOT overwrite the blob. Shallow last-write-wins
                     # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
-                    # the three keys above authoritative while everything else
+                    # the keys above authoritative while everything else
                     # already on the target survives: the escalation-gate stamp
                     # (execution_class / operational_mode / task_kind /
                     # always_escalates / gate_escalated_at) plus source,
@@ -3991,8 +4044,9 @@ class TaskInterceptor:
         ticket blob — so this in-place mutation is sufficient to carry the
         marker onto the task the curator creates from that ticket, when one
         is created, with no new plumbing.  It does not reach a ``combine``
-        target: :meth:`_execute_combine` merges only the ``curator_*`` keys
-        onto the existing task (task 4159).
+        target: :meth:`_execute_combine` never copies a candidate's
+        ``possible_scope_mismatch``; it writes only the ``curator_*`` markers,
+        ``declared_scope`` and ``followup_items`` (task 4159).
 
         *source* names the PROVENANCE of the finding and is the marker's only
         discriminator between them: ``'prose'`` (the default, so every
@@ -4044,99 +4098,36 @@ class TaskInterceptor:
     async def _check_escalation_idempotency(
         self,
         *,
+        lookup: R4Lookup | None,
         project_root: str,
         metadata,
-    ) -> tuple[dict | None, bool]:
-        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
-        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
-        matches a non-cancelled task, and ``check_failed`` is ``True`` when the
-        metadata lookup or its confirming read raised (so callers can fall
-        through to CREATE rather than treating a failure as a clean no-hit).
+    ) -> R4Verdict:
+        """R4 for one ticket's metadata (``r4_idempotency.py::check_r4``); no hit when it cannot run.
 
-        The store is asked for the tasks carrying the ``suggestion_hash``, and
-        each match's ``escalation_id`` is confirmed with one read, so the check
-        is bounded by the matching rows, not by the task tree.
-
-        R4: authoritative and cheap — no LLM, no embedding lookup.
-        Works even when the curator is disabled or broken, which is
-        exactly the regime that triggered the duplicate Type::Error
-        tasks (esc-1912-179 → esc-1912-190).
+        *lookup* is the batch's, None without a backend. A lookup that raised falls through to
+        CREATE with every item, logged here.
         """
         meta = self._extract_metadata_dict(metadata)
-        if not meta:
-            return (None, False)
-        esc_id = meta.get('escalation_id')
-        sug_hash = meta.get('suggestion_hash')
-        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return (None, False)
-        if not esc_id or not sug_hash:
-            return (None, False)
-
-        if self.taskmaster is None:
-            return (None, False)
+        if not meta or lookup is None:
+            return R4Verdict()
         try:
-            row = await self._escalation_match(self.taskmaster, project_root, esc_id, sug_hash)
+            verdict = await check_r4(lookup, project_root, meta)
         except Exception:
             logger.warning(
                 'r4: metadata lookup failed during idempotency check',
                 exc_info=True,
             )
-            return (None, True)
-        if row is None:
-            return (None, False)
-        tid = str(row['task_id'])
-        logger.warning(
-            'r4: idempotency hit — returning existing task %s for '
-            'escalation_id=%s suggestion_hash=%s',
-            tid,
-            esc_id,
-            sug_hash,
-        )
-        return (
-            {
-                'id': tid,
-                'title': str(row['title']),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            },
-            False,
-        )
-
-    async def _escalation_match(
-        self,
-        taskmaster: TaskBackendProtocol,
-        project_root: str,
-        esc_id: str,
-        sug_hash: str,
-    ) -> MetadataLookupRow | None:
-        """The first non-cancelled task carrying *sug_hash* whose ``escalation_id`` is *esc_id*."""
-        offset = 0
-        while True:
-            page = await taskmaster.find_tasks_by_metadata(
-                project_root, key='suggestion_hash', value=sug_hash,
-                statuses=list(NON_CANCELLED_STATUSES), limit=_R4_LOOKUP_PAGE, offset=offset,
+            return R4Verdict()
+        if verdict.hit is not None:
+            logger.warning(
+                'r4: idempotency hit — returning existing task %s (%s) for '
+                'escalation_id=%s suggestion_hash=%s',
+                verdict.hit.task_id,
+                verdict.match,
+                meta.get('escalation_id'),
+                meta.get('suggestion_hash'),
             )
-            rows = list(page['results'])
-            if not rows:
-                return None
-            for row in rows:
-                if await self._carries_escalation(taskmaster, project_root, row['task_id'], esc_id):
-                    return row
-            offset += len(rows)
-            if offset >= page['total']:
-                return None
-
-    async def _carries_escalation(
-        self, taskmaster: TaskBackendProtocol, project_root: str, task_id: int, esc_id: str,
-    ) -> bool:
-        """Whether task *task_id* still exists and its metadata names *esc_id*."""
-        try:
-            task = await taskmaster.get_task(str(task_id), project_root)
-        except TaskNotFoundError:
-            return False
-        task_meta = self._extract_metadata_dict(task.get('metadata'))
-        return bool(task_meta) and task_meta.get('escalation_id') == esc_id
+        return verdict
 
     async def submit_task(
         self, project_root: str, *, agent_id: str | None = None, **kwargs: Any
@@ -4949,7 +4940,10 @@ class TaskInterceptor:
                 result_dict,
             )
 
-        if decision is not None and decision.action == 'combine' and decision.target_id:
+        if (
+            decision is not None and decision.action == 'combine' and decision.target_id
+            and candidate is not None
+        ):
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
@@ -4958,7 +4952,8 @@ class TaskInterceptor:
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
-                    project_root, decision, candidate_metadata=metadata,
+                    project_root, decision,
+                    candidate=candidate, ticket_id=ticket_id, candidate_metadata=metadata,
                 )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
@@ -5377,36 +5372,33 @@ class TaskInterceptor:
             curator = await self._get_curator()
 
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
-            # Tickets that match an existing non-cancelled task are resolved
-            # 'combined' immediately and excluded from the curate call.
+            # A ticket whose work a live task already carries resolves
+            # 'combined' onto it and is excluded from the curate call; one
+            # carrying some live items is filed with the rest. No task is
+            # written between these checks, so they share one R4Lookup and
+            # its single scan of the live follow-up items.
+            r4_lookup = None if self.taskmaster is None else R4Lookup(self.taskmaster)
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                # _idem_check_failed is intentionally unused today: both
-                # check_failed=True and check_failed=False with hit=None fall
-                # through to CREATE — retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=t.project_root,
-                        metadata=t.metadata,
-                    )
+                verdict = await self._check_escalation_idempotency(
+                    lookup=r4_lookup,
+                    project_root=t.project_root,
+                    metadata=t.metadata,
                 )
-                if idempotency_hit is not None:
-                    existing_id = str(idempotency_hit.get('id', ''))
+                if verdict.hit is not None:
                     await self._persist_worker_terminal(
                         t.ticket_id,
                         status=TicketStatus.COMBINED,
-                        task_id=existing_id or None,
+                        task_id=str(verdict.hit.task_id),
                         reason='idempotency_hit',
-                        result_dict=idempotency_hit,
+                        result_dict=verdict.hit_result(),
                         caller='add_tickets_batch_idempotency',
                         project_root=t.project_root,
                         attribution=t.attribution,
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
-                    # check_failed=True (get_tasks raised) → fall through to
-                    # CREATE; WARNING already emitted at source.
-                    active_ticket_data.append(t)
+                    active_ticket_data.append(t.keeping(verdict) if verdict.partial else t)
             ticket_data = active_ticket_data
 
             if not ticket_data:
@@ -5603,6 +5595,17 @@ class TaskInterceptor:
                         reason = str(exc)
                         task_id = None
                         result_dict = None
+
+                    if t.r4_dropped:
+                        result_dict = {
+                            **(result_dict or {}),
+                            'idempotency_dropped_items': [d.to_record() for d in t.r4_dropped],
+                        }
+                        logger.info(
+                            'r4: ticket %s filed without %d item(s) already live: %s',
+                            t.ticket_id, len(t.r4_dropped),
+                            ', '.join(f'{d.key}->{d.owner.task_id}' for d in t.r4_dropped),
+                        )
 
                     await self._persist_worker_outcome(
                         t.ticket_id,
@@ -7517,15 +7520,83 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
-# Refusal-reason vocabulary for the combine audit (task 4035). Three stable
+# Refusal-reason vocabulary for the combine audit (task 4035). Four stable
 # coarse tokens, deliberately NOT one per status: an operator greps these to
 # compute the refusal rate, while the record's own old.status field supplies
 # the per-status breakdown for free. A token per status would make this
 # vocabulary track the status enum and force a consumer update every time a
-# status is added. The third marks a target already dispatched into a branch.
+# status is added. The third marks a target already dispatched into a branch;
+# the fourth a follow-up holder, which is pending forever and never a target.
 COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
 COMBINE_REFUSED_CLAIMED = 'target_claimed'
 COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
+COMBINE_REFUSED_HOLDER = 'target_is_holder'
+
+
+@dataclasses.dataclass(frozen=True)
+class _CombineAuditContext:
+    """What one combine folded and on whose behalf: the audit's candidate and item fields."""
+
+    candidate_ticket_id: str
+    candidate_source: str | None
+    candidate_spawned_from: str | None
+    batch_internal: bool
+    items_before: tuple[str, ...]
+    items_after: tuple[str, ...]
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            'candidate_ticket_id': self.candidate_ticket_id,
+            'candidate_source': self.candidate_source,
+            'candidate_spawned_from': self.candidate_spawned_from,
+            'batch_internal': self.batch_internal,
+            'items_before': list(self.items_before),
+            'items_after': list(self.items_after),
+        }
+
+
+def _combine_fold(
+    decision: CuratorDecision,
+    *,
+    ticket_id: str,
+    target_title: str,
+    target_meta: Mapping[str, Any],
+    candidate: CandidateTask,
+    candidate_meta: Mapping[str, Any],
+) -> tuple[_CombineAuditContext, tuple[FollowupItem, ...] | None]:
+    """What a combine folds: its audit context, and the union of items it leaves on the target.
+
+    The union is None when a stored bundle on either side is malformed, logged here: no combine
+    can keep every item, and the context then records no items, so a refusal is still auditable.
+    """
+    items_after: tuple[FollowupItem, ...] | None
+    try:
+        items_before = task_items(
+            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
+        )
+        extra = task_items(
+            title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta,
+        )
+        items_after = merge_items(items_before, extra)
+    except FollowupBundleInvalid as exc:
+        logger.warning(
+            'combine-guard: a follow-up bundle on target=%s or its candidate is malformed (%s)',
+            decision.target_id,
+            exc,
+        )
+        items_before, items_after = (), None
+    candidate_source = candidate_meta.get('source')
+    context = _CombineAuditContext(
+        candidate_ticket_id=ticket_id,
+        candidate_source=candidate_source if isinstance(candidate_source, str) else None,
+        candidate_spawned_from=(
+            None if candidate.spawned_from is None else str(candidate.spawned_from)
+        ),
+        batch_internal=decision.batch_target_index is not None,
+        items_before=tuple(item.key for item in items_before),
+        items_after=tuple(item.key for item in items_after or ()),
+    )
+    return context, items_after
 
 
 def _append_combine_audit(
@@ -7538,14 +7609,15 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    context: _CombineAuditContext,
     refused_reason: str | None = None,
 ) -> None:
     """Append a one-line JSON record documenting a combine.
 
     Records both about-to-happen combines (``refused_reason=None``) and
     REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
-    success records alone. When *refused_reason* is None the emitted record is
-    byte-for-byte the historical shape, so existing records stay parseable and
+    success records alone. The historical keys keep their shape, so existing
+    records stay parseable; *context* adds the candidate and item fields, and
     ``rec.get('refused_reason')`` cleanly partitions refusal from success.
 
     The ``new`` block is populated on a refusal too: it records the title and
@@ -7571,6 +7643,7 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    record.update(context.to_record())
     if refused_reason is not None:
         record['refused_reason'] = refused_reason
     path = _combine_audit_path()
