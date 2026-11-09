@@ -23,6 +23,7 @@
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
 # Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
+# End of work on the t3 lane: $CLAUDE_SPAWN_T3_END; see its entry in skills/spawn/SKILL.md.
 #
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
@@ -87,7 +88,8 @@
 #   145    — the selected lane cannot honour an input (t3 lane only, today: claude CLI
 #            arguments, a disabled provider instance, a cwd in no live T3 project, or
 #            a worktree T3 does not list for its project)
-#   2      — bad usage
+#   2      — bad usage (including an unknown CLAUDE_SPAWN_T3_END, or one that contradicts
+#            CLAUDE_SPAWN_SELF_EXIT=1 on the t3 lane)
 
 set -u
 
@@ -278,20 +280,46 @@ require_python3_for_the_t3_lane() {
   fi
 }
 
+# Sets self_exit (1 or empty) and t3_end (settle, archive or empty) from
+# $CLAUDE_SPAWN_SELF_EXIT and $CLAUDE_SPAWN_T3_END for the resolved lane. A
+# T3 thread ends by the act t3_end names; elsewhere the process exit ends the
+# session, so t3_end stays empty there.
+self_exit=""
+t3_end=""
+resolve_end_of_work() {
+  local asked="${CLAUDE_SPAWN_T3_END:-none}"
+  case "$asked" in
+    none|settle|archive) ;;
+    *)
+      echo "spawn-claude.sh: unknown CLAUDE_SPAWN_T3_END='$asked' (expected none|settle|archive)" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$spawn_backend" != "t3" ]; then
+    [ "${CLAUDE_SPAWN_SELF_EXIT:-}" != "0" ] && self_exit=1
+    if [ "$asked" != none ]; then
+      echo "spawn-claude.sh: CLAUDE_SPAWN_T3_END=$asked does not apply on the $spawn_backend lane (the process exit ends the session); ignoring it" >&2
+    fi
+    return 0
+  fi
+  if [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ]; then
+    if [ "$asked" = settle ]; then
+      echo "spawn-claude.sh: CLAUDE_SPAWN_SELF_EXIT=1 (archive the T3 thread) contradicts CLAUDE_SPAWN_T3_END=settle; set only one" >&2
+      exit 2
+    fi
+    asked=archive
+  fi
+  [ "$asked" = none ] || t3_end="$asked"
+  [ "$t3_end" = archive ] && self_exit=1
+  return 0
+}
+
 resolve_spawn_backend
+resolve_end_of_work
 if [ "$spawn_backend" = "t3" ]; then
   refuse_inputs_the_t3_lane_cannot_honour
   require_python3_for_the_t3_lane
   resolve_t3_provider
-fi
-
-# Decided once spawn_backend is known (the default differs per lane) and before
-# the `launching` write below, which stamps record.self_exit from it.
-self_exit=""
-if [ "$spawn_backend" = "t3" ]; then
-  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
-else
-  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" != "0" ] && self_exit=1
 fi
 
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
@@ -347,6 +375,9 @@ trap _cleanup EXIT
 # captured into SESSION_RECORD_DIR below is unaffected. The CLI `reap` verb
 # is the same pipeline run in the foreground. See
 # session_registry._run_launching's docstring.
+#
+# `launching` stamps record.self_exit and record.t3_end from the
+# CLAUDE_SPAWN_SELF_EXIT and CLAUDE_SPAWN_T3_END that resolve_end_of_work set.
 SESSION_RECORD_DIR=""
 if command -v python3 >/dev/null 2>&1; then
   SESSION_RECORD_DIR=$(
@@ -355,6 +386,7 @@ if command -v python3 >/dev/null 2>&1; then
     CLAUDE_SPAWN_CWD="$cwd" \
     CLAUDE_SPAWN_LAUNCHER_PID="$$" \
     CLAUDE_SPAWN_SELF_EXIT="$self_exit" \
+    CLAUDE_SPAWN_T3_END="$t3_end" \
     python3 "$SESSION_REGISTRY_PY" launching
   ) || true
 fi
@@ -573,21 +605,35 @@ This is best-effort: writing this file must never block your normal exit.
 If you write it before your work is done, set outcome: in-progress and
 rewrite it with a final outcome before you end. Run /reflect before you
 end this session."
-  if [ "$self_exit" = 1 ]; then
-    if [ "$spawn_backend" = "t3" ]; then
-      self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
-/reflect are complete and no background task of yours is still running,
-call the t3_thread_organize MCP tool with action "archive" on your own
-thread as your final action (best-effort; skip it if it fails).'
-    else
-      self_exit_trailer='This session was spawned with self-exit on. When all work, result.md and
+  end_of_work_trailer=""
+  if [ "$spawn_backend" = "t3" ]; then
+    end_of_work_lead="When all work, result.md and /reflect are complete and no
+background task of yours is still running, follow
+\"Ending a T3 session\" in $REPO_ROOT/skills/spawn/SKILL.md (its T3 lane section):"
+    case "$t3_end" in
+      archive)
+        end_of_work_trailer="This session was spawned to end by archiving its own T3 thread.
+${end_of_work_lead} mark your own record exited, then call the
+t3_thread_organize MCP tool with action \"archive\" and no threadId as your
+final tool call."
+        ;;
+      settle)
+        end_of_work_trailer="This session was spawned to end by settling its own T3 thread.
+${end_of_work_lead} call the t3_thread_organize MCP tool with action
+\"settle\" and no threadId, then end the turn with no further tool call
+and no question pending."
+        ;;
+    esac
+  elif [ "$self_exit" = 1 ]; then
+    end_of_work_trailer='This session was spawned with self-exit on. When all work, result.md and
 /reflect are complete and no background task of yours is still running,
 run this as your final action (best-effort; skip it if it fails):
 printf '\''%s'\'' "$CLAUDE_CODE_SESSION_ID" > "$(dirname "$CLAUDE_SPAWN_RESULT_FILE")/exit-requested"'
-    fi
+  fi
+  if [ -n "$end_of_work_trailer" ]; then
     prompt="${prompt}
 
-${self_exit_trailer}"
+${end_of_work_trailer}"
   fi
 fi
 
