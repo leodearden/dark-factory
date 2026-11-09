@@ -96,7 +96,7 @@ class TestTreeObjects:
 
     @pytest.mark.asyncio
     async def test_blob_text_reads_a_file_and_is_none_for_an_absent_path(self, repo, tree):
-        assert await tree_objects.blob_text(repo, tree, 'tools/check.py') == 'print("check")\n'
+        assert await tree_objects.blob_text(repo, tree, 'tools/check.py') == 'print("check")'
         assert await tree_objects.blob_text(repo, tree, 'tools/absent.py') is None
 
     @pytest.mark.asyncio
