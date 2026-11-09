@@ -471,3 +471,102 @@ class TestAdjudication:
         assert adjudication.adjudicated == 0
         assert adjudication.incidents == ()
         assert memory.search_calls == []
+
+
+def _assert_only_skipped_as(adjudication: Any, reason_name: str) -> None:
+    reason = getattr(_mod().SkipReason, reason_name)
+    assert adjudication.adjudicated == 0
+    assert adjudication.incidents == ()
+    assert adjudication.skipped[reason] == 1
+    assert sum(adjudication.skipped.values()) == 1
+
+
+class TestUnadjudicableWritesAreDisclosed:
+    """No write vanishes: every one is adjudicated or counted under exactly one SkipReason."""
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_content_is_content_unavailable(self, tmp_path):
+        window = await _single_write_fixture(tmp_path)
+
+        adjudication = await _adjudicate(window, FakeMemory(contents={}))
+
+        _assert_only_skipped_as(adjudication, 'CONTENT_UNAVAILABLE')
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_candidate_search_is_disclosed(self, tmp_path):
+        window = await _single_write_fixture(tmp_path)
+
+        adjudication = await _adjudicate(
+            window, FakeMemory(contents={'w': 'W content'}, degraded=True),
+        )
+
+        _assert_only_skipped_as(adjudication, 'CANDIDATE_SEARCH_DEGRADED')
+
+    @pytest.mark.asyncio
+    async def test_an_unseen_match_behind_an_incomplete_search_is_never_an_incident(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.search(CALLER_A, result_summary=fallback_search_summary(4))
+            await fixture.write(CALLER_A, content='W content', memory_ids=['w'])
+        window = _read(fixture.db_path)
+        memory = FakeMemory(
+            contents={'w': 'W content'},
+            candidates={'W content': [_hit('y', score=0.97, created_at=_before(window.writes[0]))]},
+        )
+
+        adjudication = await _adjudicate(window, memory)
+
+        _assert_only_skipped_as(adjudication, 'SHOWN_SET_INCOMPLETE')
+
+    @pytest.mark.asyncio
+    async def test_a_match_a_complete_sibling_showed_is_adjudicated_clean(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.search(CALLER_A, result_summary=fallback_search_summary(4))
+            await fixture.search(CALLER_A, [_hit('y')])
+            await fixture.write(CALLER_A, content='W content', memory_ids=['w'])
+        window = _read(fixture.db_path)
+        memory = FakeMemory(
+            contents={'w': 'W content'},
+            candidates={'W content': [_hit('y', score=0.97, created_at=_before(window.writes[0]))]},
+        )
+
+        adjudication = await _adjudicate(window, memory)
+
+        assert adjudication.adjudicated == 1
+        assert adjudication.incidents == ()
+        assert sum(adjudication.skipped.values()) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_graphiti_primary_write_is_category_not_comparable(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.search(CALLER_A, [_hit('x')])
+            await fixture.write(
+                CALLER_A, content='W content', category='decisions_and_rationale',
+                memory_ids=['w'],
+            )
+        window = _read(fixture.db_path)
+
+        adjudication = await _adjudicate(window, FakeMemory(contents={'w': 'W content'}))
+
+        _assert_only_skipped_as(adjudication, 'CATEGORY_NOT_COMPARABLE')
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_landed_no_memory_id_is_disclosed(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.search(CALLER_A, [_hit('x')])
+            await fixture.write(CALLER_A, content='W content', memory_ids=[])
+        window = _read(fixture.db_path)
+
+        adjudication = await _adjudicate(window, FakeMemory(contents={}))
+
+        _assert_only_skipped_as(adjudication, 'NO_MEMORY_ID')
+
+    @pytest.mark.asyncio
+    async def test_a_write_with_no_prior_search_is_disclosed(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.write(CALLER_A, content='W content', memory_ids=['w'])
+            await fixture.search(CALLER_A, [_hit('x')])
+        window = _read(fixture.db_path)
+
+        adjudication = await _adjudicate(window, FakeMemory(contents={'w': 'W content'}))
+
+        _assert_only_skipped_as(adjudication, 'NO_PRIOR_SEARCH')
