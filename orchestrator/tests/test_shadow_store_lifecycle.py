@@ -44,6 +44,7 @@ def _cell(**overrides) -> ShadowCell:
         'base_sha': 'a' * 40,
         'state': _S.OPENED,
         'cost_basis': CostBasis.METERED,
+        'configured_model': 'glm-5.3',
         'opened_at': _OPENED_AT,
         'settle_deadline': _OPENED_AT + timedelta(hours=168),
     }
@@ -468,6 +469,69 @@ class TestRunEndedAt:
         )
         assert ended is not None
         assert ended.run_ended_at == _AT
+
+
+def _column_names(db_path: Path) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute('PRAGMA table_info(shadow_cells)')}
+    finally:
+        conn.close()
+
+
+class TestModelColumns:
+    """``configured_model`` and ``served_model``: the model a cell asked for and the one it got."""
+
+    def test_a_table_without_the_columns_gains_them(self, store, db_path):
+        store.insert_shadow_cell(_cell())
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute('ALTER TABLE shadow_cells DROP COLUMN served_model')
+            conn.execute('ALTER TABLE shadow_cells DROP COLUMN configured_model')
+            conn.commit()
+        finally:
+            conn.close()
+        assert not {'configured_model', 'served_model'} & _column_names(db_path)
+
+        RunStore(db_path)
+
+        assert {'configured_model', 'served_model'} <= _column_names(db_path)
+
+    @pytest.mark.parametrize(
+        'change',
+        [
+            CellChange(state=_S.AWAITING_REFERENCE, at=_AT, served_model='glm-5.3'),
+            CellChange(
+                state=_S.CAP_EXCLUDED, at=_AT, reason='credits_exhausted', served_model='glm-5.3',
+            ),
+        ],
+        ids=lambda change: change.state.value,
+    )
+    def test_a_run_ending_change_records_the_served_model(self, store, change):
+        store.insert_shadow_cell(_cell(state=_S.RUNNING))
+
+        updated = store.advance_shadow_cell(_CELL_ID, expected=_S.RUNNING, change=change)
+
+        assert updated is not None
+        assert (updated.configured_model, updated.served_model) == ('glm-5.3', 'glm-5.3')
+        assert store.get_shadow_cell(_CELL_ID) == updated
+
+    @pytest.mark.parametrize(
+        'fields',
+        [
+            {'state': _S.OPENED},
+            {'state': _S.SETTLED, 'reference_kind': ReferenceKind.NONE},
+        ],
+        ids=lambda fields: fields['state'].value,
+    )
+    def test_a_served_model_is_learned_only_when_a_run_ends(self, fields):
+        with pytest.raises(ValueError, match='served_model'):
+            CellChange(at=_AT, served_model='x', **fields)
+
+    @pytest.mark.parametrize('served_model', ['', '  '])
+    def test_a_blank_served_model_is_refused(self, served_model):
+        with pytest.raises(ValueError, match='served_model'):
+            CellChange(state=_S.AWAITING_REFERENCE, at=_AT, served_model=served_model)
 
 
 class TestTripleUniqueness:
