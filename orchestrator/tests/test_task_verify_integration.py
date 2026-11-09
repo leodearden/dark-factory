@@ -71,7 +71,7 @@ from _task_verify_integration_rig import (
 )
 from _workflow_helpers import (
     PLAN,
-    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _derive_meta_root_like_production,
 )
 from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
 
@@ -96,7 +96,11 @@ from orchestrator.verify_runner import (
 )
 from orchestrator.workflow_types import TerminalReport, WorkflowOutcome, WorkflowState
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures('code_default_config')]
+# Autouse; named here so the agent-side doubles resolve the meta_root production does.
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.usefixtures('code_default_config', _derive_meta_root_like_production.__name__),
+]
 
 _CLI_TIMEOUT = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 _DISPATCH_LOGGER = 'orchestrator.task_verify_dispatch'
