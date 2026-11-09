@@ -22,7 +22,11 @@ from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore
-from orchestrator.lane_record_divergence import LANE_RECORD_DIVERGENCE, LaneDivergence
+from orchestrator.lane_record_divergence import (
+    LANE_RECORD_DIVERGENCE,
+    DivergenceStreak,
+    LaneDivergence,
+)
 from orchestrator.run_store import RunStore
 from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 
@@ -950,14 +954,19 @@ class TestRenderDigestMarkdown:
         assert _make_digest_inputs().lane_record_divergence == ()
 
     def test_lane_record_divergence_section_lists_each_divergence(self) -> None:
+        first_seen = _datetime(2026, 11, 9, 10, 0, tzinfo=UTC)
         divergences = (
             LaneDivergence(
-                lane='_lane-3', map_task_id='5260', record_state=None,
-                record_task_id=None, consecutive_digests=2,
+                lane='_lane-3', map_task_ids=('5260',), record_state=None,
+                record_task_id=None,
+                streak=DivergenceStreak(
+                    consecutive_digests=2, first_seen=first_seen,
+                    last_seen=first_seen + timedelta(hours=2),
+                ),
             ),
             LaneDivergence(
-                lane='_lane-9', map_task_id='4211', record_state=None,
-                record_task_id=None,
+                lane='_lane-9', map_task_ids=('4211',), record_state=None,
+                record_task_id=None, streak=DivergenceStreak.starting(first_seen),
             ),
         )
         inputs = _make_digest_inputs()

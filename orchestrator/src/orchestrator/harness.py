@@ -5704,19 +5704,21 @@ class Harness:
                 )
         return census
 
-    def _lane_record_divergence_for_digest(
-        self, digest_dir: Path,
+    def _advance_lane_record_divergence_and_alarm(
+        self, digest_dir: Path, *, now: datetime,
     ) -> tuple[LaneDivergence, ...] | None:
-        """This digest's warm-lane map↔record divergences (task 2987 δ).
+        """Cross-check the warm-lane map against the durable records (task 2987 δ).
 
-        See :mod:`orchestrator.lane_record_divergence`. ``None`` means the
-        durable records could not be read.
+        Each call counts as one digest: it persists the per-lane divergence
+        streaks under *digest_dir* and files the deduped L2 once a lane
+        diverges persistently. ``None`` means the durable records could not
+        be read. See :mod:`orchestrator.lane_record_divergence`.
         """
         pool = self.git_ops.warm_lane_pool
         if pool is None:
             return ()
         try:
-            # Back-to-back with no await: no acquire/release can interleave.
+            # No await between the two reads, so both see the same instant.
             assignments = pool.assignments_snapshot()
             records = self.git_ops._lane_lifecycle.all_records()
         except OSError:
@@ -5726,7 +5728,7 @@ class Harness:
             )
             return None
         divergences = advance_lane_record_divergence(
-            assignments, records, streaks_path=digest_dir / STREAKS_FILENAME,
+            assignments, records, streaks_path=digest_dir / STREAKS_FILENAME, now=now,
         )
         file_persistent_divergence_alarm(
             self._escalation_queue, divergences,
@@ -19217,7 +19219,7 @@ class Harness:
         11. Compute trip flag and anomaly flags.
         11c. Gather the paused-waiting section inputs (fail-open; task 5311).
         11d. Cross-check the warm-lane map against the durable lane records
-             (read-only, fail-open; task 2987).
+             (acts on no lane, fail-open; task 2987).
         12. Write digest file (fail-open via write_digest_entry).
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
@@ -19374,8 +19376,10 @@ class Harness:
             stale_lane_census = await self._stale_lane_assignment_census()
             # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.
             pause_visibility = await self._pause_visibility_for_digest(events_db_path)
-            # (11d) Lane map↔record divergence cross-check (task 2987 δ) — read-only, fail-open.
-            lane_record_divergence = self._lane_record_divergence_for_digest(digest_dir)
+            # (11d) Lane map↔record divergence cross-check (task 2987 δ) — acts on no lane, fail-open.
+            lane_record_divergence = self._advance_lane_record_divergence_and_alarm(
+                digest_dir, now=datetime.now(UTC),
+            )
 
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,

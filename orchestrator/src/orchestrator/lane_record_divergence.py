@@ -7,20 +7,21 @@ this module reports it and never repairs it.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from escalation.models import Escalation
+from pydantic import AwareDatetime, PositiveInt, TypeAdapter
 from shared import safe_io
 
-from orchestrator.event_store import EventType
+from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
 
 if TYPE_CHECKING:
+    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
     from orchestrator.event_store import EventStore
@@ -29,12 +30,19 @@ logger = logging.getLogger(__name__)
 
 LANE_RECORD_DIVERGENCE: Final = 'lane_record_divergence'
 PERSISTENT_DIVERGENCE_DIGESTS: Final = 2
+PERSISTENT_DIVERGENCE_MIN_AGE: Final = timedelta(hours=1)
 STREAKS_FILENAME: Final = '.lane-record-divergence-streaks.json'
 
 _HOLDING_STATES: Final = frozenset({LaneState.ASSIGNED, LaneState.IN_USE})
 
-_ALARM_SENTINEL_TASK: Final = '__lane_record_divergence__'
-_ALARM_ROLE: Final = 'orchestrator-lane-record-divergence'
+_ALARM: Final = BornAtL2Alarm(
+    root_cause=LANE_RECORD_DIVERGENCE,
+    sentinel_task='__lane_record_divergence__',
+    role='orchestrator-lane-record-divergence',
+    category='infra_issue',
+    suggested_action='investigate_lane_record_divergence',
+    created_reason='lane-record-divergence-persistent',
+)
 _ALARM_GUIDANCE: Final = (
     'This is a read-only alarm: the orchestrator repairs nothing. The durable '
     '.lane-state record is canonical (PRD W2b) and the in-memory assignment map '
@@ -45,64 +53,114 @@ _ALARM_GUIDANCE: Final = (
 
 
 @dataclass(frozen=True)
-class LaneDivergence:
-    """One lane whose map entry and durable record disagree."""
+class DivergenceStreak:
+    """How long one lane has diverged: digests in a row, first and latest."""
 
-    lane: str
-    map_task_id: str | None
-    record_state: LaneState | None
-    record_task_id: str | None
-    consecutive_digests: int = 1
+    consecutive_digests: PositiveInt
+    first_seen: AwareDatetime
+    last_seen: AwareDatetime
+
+    @classmethod
+    def starting(cls, now: datetime) -> DivergenceStreak:
+        return cls(consecutive_digests=1, first_seen=now, last_seen=now)
+
+    def continued(self, now: datetime) -> DivergenceStreak:
+        return replace(
+            self, consecutive_digests=self.consecutive_digests + 1, last_seen=now,
+        )
 
     @property
     def is_persistent(self) -> bool:
-        return self.consecutive_digests >= PERSISTENT_DIVERGENCE_DIGESTS
+        # The age floor rides out GitOps's lane re-seed and steal-retry, which
+        # hold map and record apart across awaits while an escalation burst
+        # can fire two digests.
+        return (
+            self.consecutive_digests >= PERSISTENT_DIVERGENCE_DIGESTS
+            and self.last_seen - self.first_seen >= PERSISTENT_DIVERGENCE_MIN_AGE
+        )
+
+
+@dataclass(frozen=True)
+class LaneDivergence:
+    """One lane whose map entries and durable record disagree."""
+
+    lane: str
+    map_task_ids: tuple[str, ...]
+    record_state: LaneState | None
+    record_task_id: str | None
+    streak: DivergenceStreak
 
     def render(self) -> str:
-        map_view = 'unassigned' if self.map_task_id is None else f'task {self.map_task_id}'
-        if self.record_state is None:
-            record_view = 'no record'
-        elif self.record_task_id is None:
-            record_view = self.record_state.value
-        else:
-            record_view = f'{self.record_state.value} task {self.record_task_id}'
-        plural = '' if self.consecutive_digests == 1 else 's'
         return (
-            f'{self.lane}: map {map_view}, record {record_view} '
-            f'({self.consecutive_digests} consecutive digest{plural})'
+            f'{self.lane}: map {self._map_view()}, record {self._record_view()} '
+            f'({self._streak_view()})'
         )
+
+    def _map_view(self) -> str:
+        if not self.map_task_ids:
+            return 'unassigned'
+        noun = 'task' if len(self.map_task_ids) == 1 else 'tasks'
+        return f'{noun} {", ".join(self.map_task_ids)}'
+
+    def _record_view(self) -> str:
+        if self.record_state is None:
+            return 'no readable record'
+        if self.record_task_id is None:
+            return self.record_state.value
+        return f'{self.record_state.value} task {self.record_task_id}'
+
+    def _streak_view(self) -> str:
+        count = self.streak.consecutive_digests
+        plural = '' if count == 1 else 's'
+        since = self.streak.first_seen.isoformat(timespec='minutes')
+        return f'{count} consecutive digest{plural} since {since}'
 
 
 def cross_check_lane_records(
     assignments: Mapping[str, Path],
     records: Mapping[str, LaneRecord],
-    previous_streaks: Mapping[str, int] | None = None,
+    previous_streaks: Mapping[str, DivergenceStreak] | None = None,
+    *,
+    now: datetime,
 ) -> tuple[LaneDivergence, ...]:
-    """Every lane where the map's task differs from the record's holding task.
+    """Every lane where the map's tasks differ from the record's holding task.
 
     *assignments* maps task id to lane path; *records* maps lane name to its
-    durable record. A record holds a lane only in an ASSIGNED or IN_USE state.
+    readable durable record. A record holds a lane only in an ASSIGNED or
+    IN_USE state, and a lane that several map tasks point at always diverges.
     """
     streaks = previous_streaks or {}
-    map_view = {lane.name: task_id for task_id, lane in assignments.items()}
+    map_view = _task_ids_by_lane(assignments)
     held = {
-        lane: record.task_id
+        lane: (record.task_id,)
         for lane, record in records.items()
         if record.state in _HOLDING_STATES and record.task_id is not None
     }
     divergences = []
     for lane in sorted(map_view.keys() | held.keys()):
-        if map_view.get(lane) == held.get(lane):
+        map_task_ids = map_view.get(lane, ())
+        if map_task_ids == held.get(lane, ()):
             continue
         record = records.get(lane)
+        previous = streaks.get(lane)
         divergences.append(LaneDivergence(
             lane=lane,
-            map_task_id=map_view.get(lane),
+            map_task_ids=map_task_ids,
             record_state=None if record is None else record.state,
             record_task_id=None if record is None else record.task_id,
-            consecutive_digests=streaks.get(lane, 0) + 1,
+            streak=DivergenceStreak.starting(now) if previous is None else previous.continued(now),
         ))
     return tuple(divergences)
+
+
+def _task_ids_by_lane(assignments: Mapping[str, Path]) -> dict[str, tuple[str, ...]]:
+    by_lane: dict[str, list[str]] = {}
+    for task_id, lane in assignments.items():
+        by_lane.setdefault(lane.name, []).append(task_id)
+    return {lane: tuple(sorted(task_ids)) for lane, task_ids in by_lane.items()}
+
+
+_STREAKS: Final = TypeAdapter(dict[str, DivergenceStreak])
 
 
 def advance_lane_record_divergence(
@@ -110,18 +168,19 @@ def advance_lane_record_divergence(
     records: Mapping[str, LaneRecord],
     *,
     streaks_path: Path,
+    now: datetime,
 ) -> tuple[LaneDivergence, ...]:
     """Cross-check one digest, continuing and then saving the per-lane streaks."""
     divergences = cross_check_lane_records(
-        assignments, records, _load_streaks(streaks_path),
+        assignments, records, _load_streaks(streaks_path), now=now,
     )
     _save_streaks(streaks_path, divergences)
     return divergences
 
 
-def _load_streaks(path: Path) -> dict[str, int]:
+def _load_streaks(path: Path) -> dict[str, DivergenceStreak]:
     try:
-        return _parse_streaks(path.read_text(encoding='utf-8'))
+        return _STREAKS.validate_json(path.read_bytes(), strict=True)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -132,23 +191,10 @@ def _load_streaks(path: Path) -> dict[str, int]:
         return {}
 
 
-def _parse_streaks(text: str) -> dict[str, int]:
-    data = json.loads(text)
-    if not isinstance(data, dict) or not all(
-        _is_streak(lane, count) for lane, count in data.items()
-    ):
-        raise ValueError(f'not a lane -> streak map: {text[:80]!r}')
-    return data
-
-
-def _is_streak(lane: object, count: object) -> bool:
-    return isinstance(lane, str) and type(count) is int and count >= 1
-
-
 def _save_streaks(path: Path, divergences: Sequence[LaneDivergence]) -> None:
-    streaks = {d.lane: d.consecutive_digests for d in divergences}
+    streaks = {d.lane: d.streak for d in divergences}
     try:
-        safe_io.atomic_write_text(path, json.dumps(streaks, sort_keys=True), mkdir=True)
+        safe_io.atomic_write_text(path, _STREAKS.dump_json(streaks).decode(), mkdir=True)
     except OSError:
         logger.warning(
             'lane_record_divergence: could not save streaks to %s', path,
@@ -168,72 +214,26 @@ def file_persistent_divergence_alarm(
     Fail-open: any filing error is logged and ``None`` returned, so the
     digest never breaks on it.
     """
-    persistent = [d for d in divergences if d.is_persistent]
-    if escalation_queue is None or not persistent:
+    persistent = [d for d in divergences if d.streak.is_persistent]
+    if not persistent:
         return None
-    try:
-        if escalation_queue.find_pending_l2_by_root_cause(LANE_RECORD_DIVERGENCE) is not None:
-            return None
-        escalation = _alarm(escalation_queue, persistent, filing_claimant_run_id)
-        escalation_queue.submit(escalation)
-    except Exception:
-        logger.warning('lane_record_divergence: failed to file the L2 alarm', exc_info=True)
-        return None
-    _emit_alarm_created(event_store, escalation)
-    logger.warning(
-        'lane_record_divergence: %d lane(s) diverged persistently; L2 filed %s',
-        len(persistent), escalation.id,
-    )
-    return escalation
-
-
-def _alarm(
-    escalation_queue: EscalationQueue,
-    persistent: Sequence[LaneDivergence],
-    filing_claimant_run_id: str | None,
-) -> Escalation:
     lanes = ', '.join(d.lane for d in persistent)
-    summary = (
-        f'warm-lane map/record divergence persisted on {len(persistent)} '
-        f'lane(s): {lanes}'
-    )
+    min_age_minutes = int(PERSISTENT_DIVERGENCE_MIN_AGE.total_seconds() // 60)
     detail = '\n'.join(
-        [f'Lanes diverged for at least {PERSISTENT_DIVERGENCE_DIGESTS} consecutive digests:']
+        [
+            f'Lanes diverged for at least {PERSISTENT_DIVERGENCE_DIGESTS} consecutive '
+            f'digests over at least {min_age_minutes} minutes:',
+        ]
         + [f'- {d.render()}' for d in persistent]
         + ['', _ALARM_GUIDANCE]
     )
-    return Escalation(
-        id=escalation_queue.make_id(_ALARM_SENTINEL_TASK),
-        task_id=_ALARM_SENTINEL_TASK,
-        agent_role=_ALARM_ROLE,
-        severity='urgent',
-        category='infra_issue',
-        level=2,
-        root_cause=LANE_RECORD_DIVERGENCE,
-        summary=summary[:200],
+    return file_deduped_born_at_l2(
+        escalation_queue, _ALARM,
+        summary=(
+            f'warm-lane map/record divergence persisted on {len(persistent)} '
+            f'lane(s): {lanes}'
+        ),
         detail=detail,
-        suggested_action='investigate_lane_record_divergence',
+        event_store=event_store,
         filing_claimant_run_id=filing_claimant_run_id,
     )
-
-
-def _emit_alarm_created(event_store: EventStore | None, escalation: Escalation) -> None:
-    if event_store is None:
-        return
-    try:
-        event_store.emit(
-            EventType.escalation_created,
-            task_id=_ALARM_SENTINEL_TASK,
-            data={
-                'escalation_id': escalation.id,
-                'category': escalation.category,
-                'severity': escalation.severity,
-                'level': escalation.level,
-                'reason': 'lane-record-divergence-persistent',
-            },
-        )
-    except Exception:
-        logger.warning(
-            'lane_record_divergence: L2 %s filed but escalation_created emit failed',
-            escalation.id, exc_info=True,
-        )
