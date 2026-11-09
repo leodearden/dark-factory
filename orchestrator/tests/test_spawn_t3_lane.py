@@ -601,7 +601,7 @@ class TestLaunch:
         assert t3.tool_calls('t3_thread_launch') == [] and t3.tool_calls('t3_thread_list') == []
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
-    def test_launch_first_sweeps_the_projects_records_whose_thread_is_gone(
+    def test_launch_first_sweeps_the_environments_records_whose_thread_is_gone(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         stale_dir = stale_t3_record(env)

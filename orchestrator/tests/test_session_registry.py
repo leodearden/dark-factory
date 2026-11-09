@@ -11933,6 +11933,16 @@ class TestT3RecordsAreExemptFromPidSweeps:
 
         assert [r.session_slug for r in marked] == ['t3-quiet']
 
+    def test_a_failed_index_write_leaves_the_t3_record_exempt(self, tmp_path: Path) -> None:
+        path = self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        sr.t3_thread_pointers_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+        sr.t3_thread_pointers_dir(tmp_path).write_text('not a dir')
+
+        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
+        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
+        assert path.is_file()
+        assert sr.read_record('t3-quiet', root=tmp_path).status == sr.Status.RUNNING
+
     def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
         self._stale_t3_record(tmp_path, sr.Status.EXITED)
 

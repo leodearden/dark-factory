@@ -2941,8 +2941,11 @@ def reap_stale_records(
       ``shared/src/shared/session_liveness.py::judge`` -> reaped,
       reason='stale_pid'. A T3-hosted
       record (``display.kind == 't3'``) is exempt while
-      ``_is_swept_by_its_thread`` holds -- which indexes it when its thread
-      is unheld -- since its liveness is its thread.
+      ``_t3_thread_sweep_owns`` holds, since its liveness is its thread.
+
+    Every non-terminal record is first passed to
+    ``_index_t3_record_if_unheld``, so this sweep also writes the thread
+    pointer of a live t3 record whose thread no pointer holds.
     - otherwise -> kept.
 
     Directories are visited in ``sorted(iterdir())`` order (directory-name
@@ -2977,19 +2980,19 @@ def reap_stale_records(
         else:
             if record.status in TERMINAL_STATUSES:
                 reason = 'terminal_ttl' if age > TERMINAL_TTL else None
-            elif (
-                not _is_swept_by_its_thread(record, slug, root)
-                and age > NON_TERMINAL_HEARTBEAT_TTL
-                and _swept_as_dead(
-                    record.launcher_identity,
-                    record.launcher_pid,
-                    sweep='reap_stale_records',
-                    subject=slug,
-                )
-            ):
-                reason = 'stale_pid'
             else:
-                reason = None
+                _index_t3_record_if_unheld(record, slug, root)
+                stale = (
+                    not _t3_thread_sweep_owns(record, slug, root)
+                    and age > NON_TERMINAL_HEARTBEAT_TTL
+                    and _swept_as_dead(
+                        record.launcher_identity,
+                        record.launcher_pid,
+                        sweep='reap_stale_records',
+                        subject=slug,
+                    )
+                )
+                reason = 'stale_pid' if stale else None
 
         if reason is not None:
             try:
@@ -3277,10 +3280,12 @@ def mark_orphaned_sessions_exited(
     like ``reap_stale_records``'s own fault handling.
 
     A T3-hosted record (``display.kind == 't3'``) is not swept here while
-    ``_is_swept_by_its_thread`` holds -- which indexes it when its thread is
-    unheld: its ``launcher_pid`` is the spawn script, which exits in sibling
-    mode, and its hooks fall silent whenever the thread waits on a human.
-    ``mark_t3_sessions_exited`` sweeps it by thread instead.
+    ``_t3_thread_sweep_owns`` holds: its ``launcher_pid`` is the spawn
+    script, which exits in sibling mode, and its hooks fall silent whenever
+    the thread waits on a human. ``mark_t3_sessions_exited`` sweeps it by
+    thread instead. Every non-terminal record is first passed to
+    ``_index_t3_record_if_unheld``, so this sweep also writes the thread
+    pointer of a live t3 record whose thread no pointer holds.
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock. Returns the list of records this call marked (their post-mark,
@@ -3304,7 +3309,8 @@ def mark_orphaned_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
-        if _is_swept_by_its_thread(record, slug, root):
+        _index_t3_record_if_unheld(record, slug, root)
+        if _t3_thread_sweep_owns(record, slug, root):
             continue
         if not _swept_as_dead(
             record.launcher_identity,
@@ -3347,22 +3353,37 @@ def is_t3_record(record: SessionRecord) -> bool:
     return record.display is not None and record.display.kind == DisplayKind.T3
 
 
-def _is_swept_by_its_thread(record: SessionRecord, slug: str, root: Path | str | None) -> bool:
-    """Whether non-terminal *record* is covered by ``mark_t3_sessions_exited``, indexing it if its thread is unheld.
+def _indexable_t3_thread(record: SessionRecord) -> str | None:
+    """The thread id *record* is a t3 record of, when it can name a thread pointer."""
+    if not is_t3_record(record) or record.display is None:
+        return None
+    thread_id = record.display.t3_thread_id
+    return thread_id if thread_id and is_t3_thread_pointer_name(thread_id) else None
 
-    True when its thread pointer names *slug*, or names nothing and is
-    written now. A t3 record displaced from its thread's pointer by another
-    live record, or with no indexable thread id, is not: the pid sweeps own it.
+
+def _index_t3_record_if_unheld(record: SessionRecord, slug: str, root: Path | str | None) -> None:
+    """Write the thread pointer of non-terminal t3 *record* when no live record holds its thread.
+
+    A failed write is logged by the writer; the next sweep retries it.
     """
-    if not is_t3_record(record):
-        return False
-    thread_id = record.display.t3_thread_id if record.display is not None else None
-    if not thread_id or not is_t3_thread_pointer_name(thread_id):
+    thread_id = _indexable_t3_thread(record)
+    if thread_id is not None and resolve_session_slug_for_t3_thread(thread_id, root=root) is None:
+        write_t3_thread_pointer(thread_id, slug, root=root)
+
+
+def _t3_thread_sweep_owns(record: SessionRecord, slug: str, root: Path | str | None) -> bool:
+    """Whether ``mark_t3_sessions_exited``, not a pid sweep, owns non-terminal *record*. Read-only.
+
+    True for a t3 record whose thread pointer names *slug* or no live record.
+    An unheld thread stays owned, so a failed index write never hands a live
+    record to the pid sweeps. Only displacement by another live record, or a
+    thread id that cannot name a pointer, does.
+    """
+    thread_id = _indexable_t3_thread(record)
+    if thread_id is None:
         return False
     held_by = resolve_session_slug_for_t3_thread(thread_id, root=root)
-    if held_by is None:
-        return write_t3_thread_pointer(thread_id, slug, root=root)
-    return held_by == slug
+    return held_by is None or held_by == slug
 
 
 def mark_t3_sessions_exited(
