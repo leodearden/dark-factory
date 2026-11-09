@@ -2737,15 +2737,18 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h.scheduler.set_task_status = AsyncMock()
 
     # Track ordering: _recover_crashed_tasks
-    async def _fake_recover():
+    async def _fake_recover() -> EntryFailures:
         call_order.append('recover')
+        return EntryFailures('Recovery')
     h._recover_crashed_tasks = _fake_recover
 
     # Runs between recover and reconcile-stranded; not under test here.
     h._reconcile_lane_checkouts = AsyncMock()
 
     # Track ordering: _reconcile_stranded_in_progress
-    async def _fake_reconcile(*, mid_run: bool = False) -> int:
+    async def _fake_reconcile(
+        *, mid_run: bool = False, failures: EntryFailures | None = None,
+    ) -> int:
         call_order.append('reconcile')
         return 0
     h._reconcile_stranded_in_progress = _fake_reconcile
