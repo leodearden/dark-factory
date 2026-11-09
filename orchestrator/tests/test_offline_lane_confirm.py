@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _host_pytest_temp_root import listing, seed_dead_session_dirs
 from _lane_confirm_project import (
     Sabotage,
     arm,
@@ -868,6 +869,28 @@ class TestRealPytestGenericLeg:
 
         assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_grouped_flaky'),), ())
         assert _confirm_record(store, LANE.name).outcomes == {node_id('test_grouped_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_a_pooled_detection_leaves_the_hosts_default_pytest_temp_root_untouched(
+        self, tmp_path: Path, store: RunRecordStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host = tmp_path / 'host-temp'
+        seed_dead_session_dirs(host)
+        before = listing(host)
+        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok', addopts=POOLED_ADDOPTS)
+
+        detect = await _detect(store, LANE, project)
+
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+        after = listing(host)
+        assert after == before, (
+            "a nested lane session must not create, lock or clean dirs in the "
+            "host's default pytest temp root: its exit-time cleanup of other "
+            "sessions' dead dirs is unbounded and runs before the lane's "
+            "proc.wait() returns\n"
+            f'before: {before}\nafter:  {after}'
+        )
 
     @pytest.mark.asyncio
     async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(
