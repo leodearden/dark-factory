@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-15: worker-level reanchor_onto_dead_tip tests dispatch a dead-based straggler past a live or vacated frontier entry on a bare worker and read the dispatch-time detector",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_verify_base_invariant.py",
+      "baseline": 34,
+      "current": 44
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6442,
+      "current": 6452
+    }
+  ]
+}

@@ -45,10 +45,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _merge_lane_fakes import lane_scene_config
+from test_merge_queue_two_layer_integration import _make_merged_item
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_lane.types import RemergeBase, RemergeReason
+from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    RemergeBase,
+    RemergeReason,
+    VerifyBaseDivergenceKind,
+)
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -804,3 +811,85 @@ class TestAdvisoryContractRegressionPins:
             f'healthy base == frozen tip must emit no §5.3 WARNING, got: '
             f'{[r.getMessage() for r in guard_warnings]}'
         )
+
+
+# ── task 8524: a re-anchor's own detector class (plans/merge-lane-policy-prd.md D12) ──
+
+_VB_DEAD = 'd' * 40
+
+
+async def _straggler_dispatch(
+    git_ops: GitOps, config: OrchestratorConfig, *, tip_status: InflightStatus | None,
+) -> tuple[SpeculativeMergeWorker, InflightEntry, str]:
+    """Dispatch a dead-based straggler that holds a permit, past one frontier
+    entry whose verify is running and whose status is *tip_status*.  Returns
+    the worker, the dispatched entry and that frontier entry's commit."""
+    worker = _make_worker(git_ops)
+    worker._host_allocator = _fake_local_allocator()
+    worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+    worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
+    )
+    _, tip_item = await _make_merged_item(git_ops, config, 'task/vb-tip', 'vb_tip.py', 't=1\n')
+    worker._inflight.append(InflightEntry(
+        item=tip_item, lease=None,
+        verify_task=asyncio.get_running_loop().create_future(),  # type: ignore[arg-type]
+        merge_wt=None, was_speculative=False, status=tip_status,
+    ))
+    worker._record_dead_base(_VB_DEAD, killer=DeadBaseKiller(DeadBaseSite.HEAD_FAILED, 'vb'))
+    _, built = await _make_merged_item(git_ops, config, 'task/vb-strag', 'vb_s.py', 's=1\n')
+    permit = await worker._speculation_ledger.acquire()
+    straggler = dataclasses.replace(built, base_sha=_VB_DEAD, speculative=True, permit=permit)
+    entry = await worker._dispatch_item(straggler)
+    assert entry is not None
+    tip = tip_item.merge_result.merge_commit
+    assert tip is not None
+    return worker, entry, tip
+
+
+@pytest.mark.asyncio
+class TestReanchorDivergenceAtTheWorker:
+    """A recovery re-merge stacked on a live tip is judged like any stacked
+    dispatch; a hit on one is ``reanchor_onto_dead_tip``, and one that fell to
+    main stays exempt (plans/merge-lane-policy-prd.md D1, D12; §7 row 3)."""
+
+    async def test_a_vacated_tip_owner_sends_the_reanchor_to_main_with_no_divergence(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Boundary row 3: the 3082 shape, a tip whose verify requeued."""
+        worker, entry, _ = await _straggler_dispatch(
+            git_ops, config, tip_status=InflightStatus.REQUEUED,
+        )
+
+        assert entry.item.remerge_base == RemergeBase(None, RemergeReason.TIP_VACATED)
+        worker._inflight.append(entry)
+        assert worker.verify_base_divergences() == ()
+
+    async def test_a_live_tip_reanchor_on_the_frozen_tip_records_no_divergence(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        _, entry, tip = await _straggler_dispatch(git_ops, config, tip_status=None)
+
+        assert entry.item.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
+        assert entry.verify_base_divergence is None
+
+    async def test_a_reanchor_whose_tip_owner_vacated_before_dispatch_is_its_own_class(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        _, owner = _make_fake_item(
+            't-owner', base_sha='M0', merge_commit='C-tip', config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(
+            dataclasses.replace(_make_inflight_entry(owner), status=InflightStatus.REQUEUED),
+        )
+        _, item = _make_fake_item(
+            't-reanchored', base_sha='C-tip', merge_commit='C-r', config=config, git_repo=git_repo,
+        )
+        item = dataclasses.replace(item, remerge_base=RemergeBase('C-tip', RemergeReason.LIVE_TIP))
+
+        record = worker._verify_base_divergence_at_dispatch(item, 'M0')
+
+        assert record is not None
+        assert record.kind is VerifyBaseDivergenceKind.REANCHOR_ONTO_DEAD_TIP
+        assert (record.base_sha, record.expected_tip) == ('C-tip', 'M0')
