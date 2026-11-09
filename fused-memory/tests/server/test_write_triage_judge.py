@@ -1539,6 +1539,17 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     return client
 
 
+def _hanging_sdk(**_constructor_kwargs: Any) -> MagicMock:
+    """An `openai.AsyncOpenAI` stand-in whose call outlasts a test-sized judge budget."""
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(5)
+
+    client = sdk_client_double()
+    client.responses.create = AsyncMock(side_effect=_hang)
+    return client
+
+
 def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespace:
     """A service double configured for the judge, with an llm section."""
     write_triage.setdefault('judge_provider', provider)
@@ -2661,12 +2672,7 @@ class TestJudgeWriteFailuresRaise:
         arm, which is exactly C1's "judge error/timeout => stored + storm
         counter".
         """
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
-        with patch('openai.AsyncOpenAI', return_value=client), \
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk), \
                 pytest.raises(TimeoutError):
             await judge_write(
                 memory_service=_judge_svc(judge_timeout_seconds=0.01),
@@ -2802,15 +2808,10 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
     @pytest.mark.asyncio
     async def test_a_timeout_stores_and_counts_exactly_once(self) -> None:
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
         counter = TriageFailOpenCounter()
         service = _mid_band_service(judge_timeout_seconds=0.01)
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
 
-        with patch('openai.AsyncOpenAI', return_value=client):
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk):
             decision = await triage_write(
                 service, content='c', project_id='p',
                 counter=counter, judge=judge_write,
@@ -2959,17 +2960,6 @@ def _failing_on_skip(instead: str) -> Iterator[None]:
         pytest.fail(f'skipped instead of {instead}: {skipped}')
 
 
-def _hanging_sdk(**_constructor_kwargs: Any) -> MagicMock:
-    """An `openai.AsyncOpenAI` stand-in whose call outlasts a test-sized judge budget."""
-
-    async def _hang(*_args, **_kwargs):
-        await asyncio.sleep(5)
-
-    client = sdk_client_double()
-    client.responses.create = AsyncMock(side_effect=_hang)
-    return client
-
-
 class TestTheFrontierArmSkipGuard:
     """`_frontier_arm_judge` skips only an unreached provider; any other judge failure fails open and stays red."""
 
@@ -3088,12 +3078,7 @@ class TestTheLiveWordingBudgetGuard:
 
     @pytest.mark.asyncio
     async def test_a_call_past_the_judge_budget_skips_naming_the_budget(self) -> None:
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
-        with patch('openai.AsyncOpenAI', return_value=client), \
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs(judge_timeout_seconds=0.01))
 
