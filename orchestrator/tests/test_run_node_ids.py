@@ -103,6 +103,35 @@ def test_each_id_gets_its_own_status(tmp_path):
 
 @pytest.mark.xdist_group('run_node_ids_real_pytest')
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_an_uncollectable_id_errors_alone(tmp_path):
+    tree = _make_tree(tmp_path)
+    missing = 'pkg/tests/test_probe.py::test_missing'
+
+    statuses = asyncio.run(run_node_ids(
+        tree, _make_config(tree), [_module_config('pkg')], [OK, BAD, SKIP, missing],
+    ))
+
+    assert dict(statuses) == {OK: 'pass', BAD: 'fail', SKIP: 'skipped', missing: 'error'}
+
+
+@pytest.mark.xdist_group('run_node_ids_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+def test_a_collection_error_errors_only_its_own_id(tmp_path):
+    tree = _make_tree(tmp_path)
+    (tree / 'pkg' / 'tests' / 'test_broken.py').write_text(
+        'import no_such_module_t7918\ndef test_never():\n    pass\n', encoding='utf-8',
+    )
+    never = 'pkg/tests/test_broken.py::test_never'
+
+    statuses = asyncio.run(run_node_ids(
+        tree, _make_config(tree), [_module_config('pkg')], [OK, never],
+    ))
+
+    assert dict(statuses) == {OK: 'pass', never: 'error'}
+
+
+@pytest.mark.xdist_group('run_node_ids_real_pytest')
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_no_ids_returns_an_empty_mapping(tmp_path):
     tree = _make_tree(tmp_path)
 
