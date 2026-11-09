@@ -635,6 +635,11 @@ class BacklogPolicy:
         Writes one escalation per project with a non-zero buffered count (or
         per registered project, if the buffered count is unavailable). Returns
         the verdicts produced, primarily for test introspection.
+
+        A project whose routing raises (its orchestrator probe can, e.g. ENOLCK
+        from flock) is logged with its traceback and left out of the result;
+        it never suppresses the alert for the projects after it, the same
+        LOUD-and-INCLUSIVE rule ``_projects_with_backlog`` follows.
         """
         verdicts: list[BacklogVerdict] = []
         # One stats() snapshot for the whole fan-out, and the per-project
@@ -646,19 +651,23 @@ class BacklogPolicy:
         queue_pressure = self._queue_pressure()
         for project_id, buffered in await self._projects_with_backlog():
             backlog = queue_pressure + (buffered or 0)
-            verdict = await self._route_over_limit(
-                project_id=project_id,
-                backlog=backlog,
-                kind='wedge',
-                error_type='SqliteDrainerWedged',
-                summary=f'SQLite drainer wedged for {project_id}',
-                detail=(
-                    'The reconciliation event-queue drainer has not committed '
-                    f'within the stall threshold. Diagnostic payload: '
-                    f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
-                ),
-                suggested_action='inspect_sqlite_drainer',
-            )
+            try:
+                verdict = await self._route_over_limit(
+                    project_id=project_id,
+                    backlog=backlog,
+                    kind='wedge',
+                    error_type='SqliteDrainerWedged',
+                    summary=f'SQLite drainer wedged for {project_id}',
+                    detail=(
+                        'The reconciliation event-queue drainer has not committed '
+                        f'within the stall threshold. Diagnostic payload: '
+                        f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
+                    ),
+                    suggested_action='inspect_sqlite_drainer',
+                )
+            except Exception:
+                logger.exception('backlog_policy: wedge routing failed for %s', project_id)
+                continue
             verdicts.append(verdict)
         return verdicts
 

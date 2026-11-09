@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import json
 import logging
@@ -599,6 +600,45 @@ async def test_watchdog_wedge_survives_count_buffered_failure(tmp_path, caplog):
     # The count is taken ONCE per project (the wedge path reuses the filter's
     # value instead of re-querying via current_backlog).
     assert broken_buffer.count_buffered.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_watchdog_wedge_survives_one_projects_orchestrator_probe_failure(
+    event_buffer, tmp_path, caplog,
+):
+    """A probe that raises for one project must not suppress the rest of the fan-out.
+
+    The lock probe lets flock errors other than BlockingIOError propagate (e.g.
+    ENOLCK on an NFS root without lockd). Projects are routed in sorted order,
+    so the broken one goes first and would starve the healthy one.
+    """
+    logger_name = 'fused_memory.reconciliation.backlog_policy'
+    broken_root = tmp_path / 'a_broken_root'
+    healthy_root = tmp_path / 'b_healthy_root'
+    broken_root.mkdir()
+    healthy_root.mkdir()
+
+    def detector(project_root: str) -> bool:
+        if project_root == str(broken_root):
+            raise OSError(errno.ENOLCK, 'No locks available')
+        return True
+
+    policy = BacklogPolicy(event_buffer, _StubQueue(queue_depth=5), detector)
+    policy.register_project_root('a_broken', str(broken_root))
+    policy.register_project_root('b_healthy', str(healthy_root))
+
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        verdicts = await policy.on_watchdog_wedge({'stale_for_seconds': 180.0})
+
+    assert [(v.project_id, v.outcome, v.error_type) for v in verdicts] == [
+        ('b_healthy', 'escalated', 'SqliteDrainerWedged'),
+    ]
+    assert len(list(escalation_queue_dir(healthy_root).glob('esc-*.json'))) == 1
+    failures = [
+        r for r in caplog.records
+        if r.name == logger_name and 'a_broken' in r.getMessage()
+    ]
+    assert failures and failures[0].exc_info is not None
 
 
 @pytest.mark.asyncio
