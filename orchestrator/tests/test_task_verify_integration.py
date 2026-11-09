@@ -122,8 +122,10 @@ def _alive(pid: int) -> bool:
 
 def _matches(names: list[str], *patterns: str) -> bool:
     """Each name matches exactly one pattern, and each pattern exactly one name."""
-    return len(names) == len(patterns) and all(
-        len(fnmatch.filter(names, pattern)) == 1 for pattern in patterns
+    return (
+        len(names) == len(patterns)
+        and all(len(fnmatch.filter(names, pattern)) == 1 for pattern in patterns)
+        and all(sum(fnmatch.fnmatch(name, p) for p in patterns) == 1 for name in names)
     )
 
 
@@ -644,6 +646,7 @@ class TestHostHealthWithTheMergeWorker:
             assert (row['quarantined'], row['quarantine_class']) == (True, 'skew' if skew else 'ru')
             assert scene.events(EventType.runner_stale) == []
 
+            since_recovery = len(scene.laptop.calls)
             scene.laptop.publish_connect_fails = False
             scene.laptop.ensure = Ensure()
             if not skew:
@@ -651,7 +654,8 @@ class TestHostHealthWithTheMergeWorker:
             await scene.until(
                 lambda: not scene.laptop_row()['quarantined'], what='the sweep to readmit the laptop',
             )
-            assert scene.laptop.healthy is not skew
+            readmitting_probe = 'ensure' if skew else 'health'
+            assert readmitting_probe in scene.laptop.labels()[since_recovery:], scene.laptop.labels()
             assert scene.events(EventType.runner_stale) == []
             scene.laptop.ensure = Ensure(built=True)
             await scene.call([scene.module(MODULE)], attempt_id=2)
@@ -702,7 +706,7 @@ class TestHostHealthWithTheMergeWorker:
             await scene.stop_worker()
 
             with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 1.0), \
-                 pytest.raises(Exception, match='startup refused'):
+                 pytest.raises(Exception, match='enforce_merge_liveness_margin: startup refused'):
                 await scene.start_worker()
 
             assert scene.pool.hosts == (LAPTOP,)
@@ -738,17 +742,17 @@ class TestHostHealthWithTheMergeWorker:
                     await call
                 await scene.until(scene.unwound, what='the task turn to be left')
                 assert merge_runner.dispatch_in_flight
-                assert merge_request not in scene.laptop.requests('verify_unwound')
+                assert merge_request not in scene.laptop.requests('hold_ended')
                 scene.laptop.release(merge_request)
                 await scene.end_merge(merge)
             else:
                 assert scene.worker.cancel_request(merge.request_id).refusal is None
                 await scene.until(
-                    lambda: merge_request in scene.laptop.requests('verify_unwound'),
+                    lambda: merge_request in scene.laptop.requests('hold_ended'),
                     what='the merge verify to unwind',
                 )
                 assert task_runner.dispatch_in_flight
-                assert task_request not in scene.laptop.requests('verify_unwound')
+                assert task_request not in scene.laptop.requests('hold_ended')
                 scene.laptop.release(task_request)
                 assert (await asyncio.wait_for(call, 60)).passed
 
@@ -759,6 +763,7 @@ class TestHostHealthWithTheMergeWorker:
         async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
             await scene.start_worker()
             scene.laptop.healthy = False
+            scene.laptop.answers['verify-task'] = Hold(Cli())
             local_holder = scene.hold_local()
             await wait_responsive(local_holder.granted.wait(), label='the test to hold the local turn')
             scene.pool.mark_unavailable(LAPTOP, transport_down())
@@ -769,9 +774,21 @@ class TestHostHealthWithTheMergeWorker:
                 and scene.task_id in scene.turns()['local_waiters'],
                 what='the call to queue on both gates',
             )
+            younger = scene.hold(task_id='younger')
+            await scene.until(
+                lambda: 'younger' in scene.turns()['laptop_waiters'],
+                what='a younger laptop waiter behind the call',
+            )
 
             scene.laptop.healthy = True
+            request_id = await scene.laptop.until_verifying('verify-task')
+
+            assert scene.turns()['laptop_waiters'] == ['younger']
+            assert not younger.granted.is_set()
+            scene.laptop.release(request_id)
             result = await asyncio.wait_for(call, 60)
+            await wait_responsive(younger.granted.wait(), label='the younger waiter to get the freed turn')
+            await younger.leave()
 
             assert result.passed, result.summary
             assert scene.sidecar()['reason'] == 'remote'
@@ -896,7 +913,7 @@ class TestThroughTheTaskWorkflow:
             )
             calls = [(call.label, call.request_id) for call in scene.laptop.calls]
             assert calls.index(('cancel_verify', request_id)) < calls.index(
-                ('verify_unwound', request_id),
+                ('hold_ended', request_id),
             )
             assert scene.unwound(), scene.turns()
 

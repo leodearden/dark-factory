@@ -147,7 +147,10 @@ Settled = Cli | Exit | Verdict | Raises
 
 @dataclass(frozen=True)
 class Hold:
-    """Wait until released (then answer *then*) or until the verify is unwound."""
+    """Wait until released (then answer *then*) or until the verify is unwound.
+
+    However the hold ends, the transport logs ``hold_ended`` for its request.
+    """
 
     then: Settled = Verdict(GREEN)
 
@@ -194,13 +197,18 @@ def patch_cli_seams(monkeypatch: pytest.MonkeyPatch) -> None:
 class InProcessCli:
     """The real ``orchestrator`` CLI, invoked in this process on a worker thread.
 
-    One invocation at a time: CliRunner swaps ``sys.std*`` process-wide.  The
-    invocation's environment names the laptop yaml and drops the variables
-    that would override it, and is restored afterwards.
+    One invocation at a time: for its whole run CliRunner swaps ``sys.std*``
+    and ``os.environ`` process-wide.  The swapped environment names the laptop
+    yaml (``ORCH_CONFIG_PATH``, which any OrchestratorConfig built meanwhile
+    also reads) and drops the variables that would override it; both are
+    restored afterwards.
 
-    Never run the real cancel-verify against an in-process run: its pgid file
-    holds :data:`PGID_SENTINEL` (with :func:`patch_cli_seams`), and a real
-    cancel would SIGKILL whatever process group bore that number.
+    An in-process run cannot be cancelled.  The real cancel-verify must never
+    meet one: its pgid file holds :data:`PGID_SENTINEL` (with
+    :func:`patch_cli_seams`), and a real cancel would SIGKILL whatever process
+    group bore that number.  Nor can the transport answer for it, since the
+    worker thread would run on holding the swap; :class:`LaptopHost` refuses
+    such a cancel instead.
     """
 
     def __init__(self, laptop_yaml: Path) -> None:
@@ -314,6 +322,7 @@ class LaptopHost:
         self._outcomes: dict[str, tuple[int, str]] = {}
         self._held: dict[str, asyncio.Future[Settled]] = {}
         self._in_child: set[str] = set()
+        self._in_process: set[str] = set()
 
     # -- the runner's seams -------------------------------------------------
 
@@ -413,6 +422,11 @@ class LaptopHost:
     async def _cancel(self, argv: list[str], args: list[str]) -> tuple[int, str, str]:
         request_id = _option(args, '--request-id')
         self._log('cancel_verify', request_id, argv)
+        if request_id in self._in_process:
+            raise AssertionError(
+                f'in-process verify-task {request_id} cannot be cancelled; '
+                'answer it with Hold() or Subprocess()',
+            )
         if request_id in self._in_child:
             return await self._cli.invoke(args)
         if self.cancel_rc == 0 and request_id is not None:
@@ -422,7 +436,11 @@ class LaptopHost:
     async def _answer(self, answer: Answer, args: list[str], request_id: str) -> tuple[int, str, str]:
         match answer:
             case Cli():
-                return await self._cli.invoke(args)
+                # Not cleared when the await is cancelled: the worker thread runs on.
+                self._in_process.add(request_id)
+                settled = await self._cli.invoke(args)
+                self._in_process.discard(request_id)
+                return settled
             case Subprocess():
                 self._in_child.add(request_id)
                 return await self._children.invoke(args)
@@ -441,7 +459,7 @@ class LaptopHost:
         try:
             released = await held
         finally:
-            self._log('verify_unwound', request_id, ())
+            self._log('hold_ended', request_id, ())
         return then if released is _RELEASED else released
 
 
@@ -884,11 +902,10 @@ async def _open_harness(
         runners=runners, children=children, legs=legs, archive_root=archive_root,
         laptop_worktree_base=laptop_base, task_id=task_id,
     )
-    try:
+    async with contextlib.AsyncExitStack() as teardown:
+        teardown.push_async_callback(children.close)
+        teardown.push_async_callback(scene.stop_worker)
         yield scene
-    finally:
-        await scene.stop_worker()
-        await children.close()
 
 
 @contextlib.asynccontextmanager
