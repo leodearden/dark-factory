@@ -19,11 +19,20 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar, assert_never
 
 if TYPE_CHECKING:
@@ -1246,6 +1255,18 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     name = testcase.get('name', '')
     owner = testcase.get('classname') or testcase.get('file')
     return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
+
+
+def _junit_spelling(node_id: str) -> str:
+    """*node_id* as :func:`_junit_testcase_id` spells its testcase, when the rootdir is the id's root.
+
+    Mirrors ``_pytest/junitxml.py::mangle_test_address``.
+    """
+    path, bracket, params = node_id.partition('[')
+    names = path.split('::')
+    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[-1] += bracket + params
+    return f"{'.'.join(names[:-1])}::{names[-1]}"
 
 
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
@@ -2874,13 +2895,15 @@ def _make_infix(module_prefix: 'str | None') -> str:
 
 
 def _prepare_junit_report_path(
-    worktree: Path, module_prefix: 'str | None',
+    worktree: Path, module_prefix: 'str | None', *, group: 'str | None' = None,
 ) -> 'Path | None':
     """Build the merge-verify junit report path under *worktree*, or None.
 
     Returns the absolute ``<worktree>/.df-verify-junit/report{infix}.xml`` path
     (creating ONLY the ``.df-verify-junit`` child dir) for a live worktree, or
     None WITHOUT creating anything when the worktree is gone or unwritable.
+    A *group* adds a second infix, so a caller's own report never shares the
+    merge verify's prefix-keyed one.
 
     Shape-2 husk guard (task 2922): a late merge-role verify writer can fire
     AFTER its worktree was torn down. The previous inline
@@ -2909,7 +2932,7 @@ def _prepare_junit_report_path(
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
-        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}.xml'
+        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}{_make_infix(group)}.xml'
     except OSError:
         return None
     return report
@@ -10803,6 +10826,140 @@ def _node_id_test_config(
         lint_command=None,
         type_check_command=None,
     )
+
+
+NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
+
+#: Per-test timeout (seconds) injected into every ``run_node_ids`` run, so a
+#: hung test is bounded by it rather than by the verify command timeout.
+_NODE_ID_RUN_TIMEOUT_SECS: int = 300
+
+
+def _node_id_statuses(
+    report: Path, prefix: str, qualified_by_id: Mapping[str, str],
+) -> dict[str, NodeIdStatus] | None:
+    """Each id's status as the junit *report* records it; ``None`` when no report parsed.
+
+    An id matches a testcase spelled from its qualified id with the rootdir at
+    the tree root or at the module dir; an id no testcase matches is ``'error'``.
+    """
+    ids = _extract_test_ids_from_junit(report)
+    if ids is None:
+        return None
+    outcomes = extract_test_outcomes_from_junit(report) or {}
+    failing, never_ran = set(ids.failing), set(ids.skipped)
+    passed = {test_id for test_id, outcome in outcomes.items() if outcome == 'passed'}
+    statuses: dict[str, NodeIdStatus] = {}
+    for node_id, qualified in qualified_by_id.items():
+        spellings = {
+            _junit_spelling(qualified),
+            _junit_spelling(qualified.removeprefix(f'{prefix}/')),
+        }
+        if spellings & failing:
+            statuses[node_id] = 'fail'
+        elif spellings & never_ran:
+            statuses[node_id] = 'skipped'
+        elif spellings & passed:
+            statuses[node_id] = 'pass'
+        else:
+            statuses[node_id] = 'error'
+    return statuses
+
+
+async def _node_id_run(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path,
+) -> dict[str, NodeIdStatus] | None:
+    """One run of *qualified_by_id* into *report*, read back per id; ``None`` when it gave no verdict."""
+    try:
+        await run_verification(
+            tree, config,
+            _node_id_test_config(
+                module_config, list(qualified_by_id.values()),
+                tree=tree, timeout_secs=_NODE_ID_RUN_TIMEOUT_SECS,
+            ),
+            max_retries=0, role='merge', junit_report=report,
+        )
+    except Exception:
+        logger.warning(
+            'run_node_ids: running %s in module %r raised — each reads error',
+            list(qualified_by_id), module_config.prefix, exc_info=True,
+        )
+        return None
+    return _node_id_statuses(report, module_config.prefix, qualified_by_id)
+
+
+async def _run_node_id_group(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path | None,
+) -> dict[str, NodeIdStatus]:
+    """Every id of one module's group, run together into *report*, which is removed afterwards."""
+    if report is None:
+        logger.warning(
+            'run_node_ids: no junit report path in %s for module %r — %s each read error',
+            tree, module_config.prefix, list(qualified_by_id),
+        )
+        statuses = None
+    else:
+        try:
+            statuses = await _node_id_run(tree, config, module_config, qualified_by_id, report)
+        finally:
+            _clear_junit_report(report)
+    if statuses is None:
+        return {node_id: 'error' for node_id in qualified_by_id}
+    return statuses
+
+
+async def run_node_ids(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_configs: Sequence[ModuleConfig],
+    ids: Collection[str],
+    *,
+    concurrent_groups: bool = False,
+) -> Mapping[str, NodeIdStatus]:
+    """Run exactly the pytest node *ids* in *tree*; return each one's status, keyed as given.
+
+    ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
+    never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
+    verdict was obtained: the id maps to no module in *module_configs*, names
+    no single test (a module or class id matches no testcase), was never
+    reported, or its run raised or wrote no junit report.
+
+    Each id is mapped to its module on its own, so one unmappable id errors
+    alone. The ids of one module run together, serially, scoped and with a
+    per-test timeout, through ``_node_id_test_config`` and
+    ``run_verification``'s junit chokepoint; each group writes its own report,
+    removed after it is read. The isolated-rerun discriminator shares the
+    mapping (``_group_node_ids_by_subproject``) and ``_node_id_test_config``.
+
+    *concurrent_groups* is accepted but not yet acted on.
+    """
+    mc_by_prefix = {mc.prefix: mc for mc in module_configs}
+    statuses: dict[str, NodeIdStatus] = {}
+    qualified_by_prefix: dict[str, dict[str, str]] = {}
+    for node_id in ids:
+        groups = _group_node_ids_by_subproject(
+            tree, mc_by_prefix, [node_id], log_label='run_node_ids',
+        )
+        if not groups:
+            statuses[node_id] = 'error'
+            continue
+        prefix, [qualified] = next(iter(groups.items()))
+        qualified_by_prefix.setdefault(prefix, {})[node_id] = qualified
+    token = uuid.uuid4().hex
+    for prefix, qualified_by_id in qualified_by_prefix.items():
+        report = _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}')
+        statuses.update(await _run_node_id_group(
+            tree, config, mc_by_prefix[prefix], qualified_by_id, report,
+        ))
+    return MappingProxyType({node_id: statuses[node_id] for node_id in ids})
 
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
