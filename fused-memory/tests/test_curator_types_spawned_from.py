@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.middleware.curator_types import spawned_from_id
+from fused_memory.middleware.curator_types import CandidateTask, spawned_from_id
 
 
 @pytest.mark.parametrize(('stored', 'canonical'), [
@@ -20,3 +20,17 @@ from fused_memory.middleware.curator_types import spawned_from_id
 ])
 def test_spawned_from_id_maps_each_stored_shape_to_its_canonical_text(stored, canonical):
     assert spawned_from_id(stored) == canonical
+
+
+@pytest.mark.parametrize('value', [6592, ' 42 ', '', {'id': 42}])
+def test_a_candidate_refuses_a_spawned_from_that_is_not_canonical(value):
+    with pytest.raises(ValueError) as excinfo:
+        CandidateTask(title='T', spawned_from=value)
+
+    assert 'spawned_from' in str(excinfo.value)
+    assert repr(value) in str(excinfo.value)
+
+
+@pytest.mark.parametrize('value', ['42', 'task-x', None])
+def test_a_candidate_accepts_a_canonical_spawned_from(value):
+    assert CandidateTask(title='T', spawned_from=value).spawned_from == value
