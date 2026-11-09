@@ -787,7 +787,7 @@ class TestContestingChildRender:
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         full_body = _top_level(results, contesting['id'])['content']
-        assert contesting['digest'].endswith('…')
+        assert 'digest' not in contesting
 
         rendered = render_memory_results(results)
 
@@ -797,9 +797,8 @@ class TestContestingChildRender:
         ]
         assert len(contests) == 1, rendered
         assert contests[0].endswith(f'] {full_body}')
-        assert contesting['digest'] not in rendered
 
-    def test_it_renders_ahead_of_the_parents_other_digests(self):
+    def test_it_renders_ahead_of_the_parents_other_amendments(self):
         results = _recorded_results('child-also-matched')
         parent = _grouped_parent_of(results)
         amendments = parent['grouped']['amendments']
@@ -810,7 +809,7 @@ class TestContestingChildRender:
 
         parent_at = _line_index(lines, lambda line: line.endswith(f'] {parent["content"]}'))
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
-        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["content"]}'))
         assert parent_at < contests_at < plain_at, lines
 
     def test_the_contesting_child_is_rendered_once(self):
@@ -831,10 +830,10 @@ class TestContestingChildRender:
 
         lines = rendered.splitlines()
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
-        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["content"]}'))
         assert contests_at < plain_at, lines
         assert lines[contests_at].endswith(f'] {full_body}'), lines
-        assert contesting['digest'] not in rendered
+        assert 'digest' not in contesting
 
     def test_the_childs_own_hit_outranks_the_capped_grouped_text(self):
         results = _recorded_results('child-also-matched')
@@ -861,7 +860,7 @@ class TestContestingChildRender:
         assert 'chars elided]' not in rendered
 
     @pytest.mark.parametrize('name', ['child-also-matched', 'only-parent-matched'])
-    def test_an_uncontested_digest_renders_unchanged(self, name):
+    def test_an_uncontested_amendment_renders_its_text(self, name):
         lines = render_memory_results(_recorded_results(name)).splitlines()
 
         assert (

@@ -1734,7 +1734,7 @@ def create_mcp_server(
     #
     # `contested` maps to AMENDMENT_KIND and NOT to SIGHTING_KIND, and the
     # difference is content visibility rather than bookkeeping: grouped_read
-    # DIGESTS amendment text into the grouped document, while sightings are
+    # CARRIES amendment text into the grouped document, while sightings are
     # only COUNTED. A contested child filed as a sighting has its correction
     # suppressed to a tally underneath the very entry it contests — the
     # esc-5712 five-week-wrong-appendix shape that grouped_read.
@@ -3657,8 +3657,8 @@ def create_mcp_server(
         or different, explicitly or implicitly (ruling:
         plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
         adjudicate which of the two is right. Your full text is stored and
-        readable in the canonical's grouped document (a contesting
-        amendment's text is carried there in full up to
+        readable in the canonical's grouped document (every amendment's
+        text is carried there in full up to
         ``write_triage.judge_field_chars``; sighting text is still only
         counted) and marked as
         contesting it, and the memory you contradict is left untouched. No
@@ -4199,7 +4199,7 @@ def create_mcp_server(
             if triage_decision is not None and triage_decision.outcome == OUTCOME_CONTESTED:
                 # The one key that distinguishes a contested child from an
                 # ordinary amendment — both are AMENDMENT_KIND, because both
-                # need their text DIGESTED into the grouped document rather
+                # need their text CARRIED in the grouped document rather
                 # than counted. Composed from grouped_read's constant, never
                 # the 'x_contested' literal: that module owns the read-side
                 # predicate (is_contested_child) which has to recognise what
@@ -4213,7 +4213,7 @@ def create_mcp_server(
                 # measured rather than assumed: the only consumer of
                 # CONTESTED_METADATA_KEY /
                 # is_contested_child is grouped_read's READ-SIDE suppression,
-                # which keeps the submitted text visible and digested in the
+                # which keeps the submitted text visible, carried in the
                 # canonical's grouped document while marking it as contesting.
                 # There is no gate, no escalation and no operator surface --
                 # reconciliation/consolidation_gate.py keys on a DIFFERENT
@@ -4635,22 +4635,21 @@ def create_mcp_server(
             entry, not beside it.
 
             A result carrying children gains a 'grouped' block:
-            {'amendments': [{'id','digest','created_at','kind'}],
+            {'amendments': [{'id','content','created_at','kind'}],
              'amendment_count': int, 'sighting_count': int} — the counts are
-            EXACT while the digest list is bounded and TRUNCATED to a cap
-            (marked 'truncated': True, and each digest body is itself
-            truncated), so never read the list as the whole set.  Any child that
-            was folded away is pinned into 'grouped'['matched_children'] as
-            {'id','content','created_at','kind','matched': True} carrying its
-            FULL body — that is where a matched child's text lives.  A digest
-            already listing the matched child is marked 'matched': True in
-            place instead and gains a 'content' key carrying that same FULL
-            body alongside its truncated 'digest', so a matched child's text is
-            never shortened by grouping wherever it ends up.  A digest marked
-            'contested': True also carries 'content', whether or not the child
-            itself matched: the child's text capped at
+            EXACT while the amendment list is bounded and TRUNCATED to a cap
+            (marked 'truncated': True), so never read the list as the whole
+            set.  Each amendment's 'content' is its text capped at
             write_triage.judge_field_chars, with the counted elision marker
-            when cut.
+            when cut; one that contests its parent is also marked
+            'contested': True.  Any child that was folded away is pinned into
+            'grouped'['matched_children'] as
+            {'id','content','created_at','kind','matched': True} carrying its
+            FULL body — that is where a matched child's text lives.  An
+            amendment entry already listing the matched child is marked
+            'matched': True in place instead and its 'content' becomes that
+            same FULL body, so a matched child's text is never shortened by
+            grouping wherever it ends up.
 
             Loud-fault keys, present only when something is genuinely unknown:
             'grouped'['children_unavailable'] (+ 'error_type') means the child
@@ -4738,7 +4737,7 @@ def create_mcp_server(
                     memory_service,
                     project_id,
                     results,
-                    contested_text_chars=resolve_judge_field_chars(memory_service),
+                    amendment_text_chars=resolve_judge_field_chars(memory_service),
                 )
             except Exception:
                 # A grouping fault must never turn a working search into an
@@ -5222,10 +5221,12 @@ def create_mcp_server(
 
             A hit additionally carries an optional ``grouped`` key (task 3129)
             when the record participates in a parent/child group: a CANONICAL
-            gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
-            (a digest marked ``'contested': True`` also carries ``'content'``,
-            its text capped at ``write_triage.judge_field_chars``; plus
-            ``'truncated': True`` when the digest listing is bounded, or
+            gains ``{'amendments': [entries], 'amendment_count', 'sighting_count'}``
+            (each entry ``{'id', 'content', 'created_at', 'kind'}``, its
+            ``content`` capped at ``write_triage.judge_field_chars`` with the
+            counted elision marker, one that contests its parent also marked
+            ``'contested': True``; plus ``'truncated': True`` when the
+            amendment listing is bounded, or
             ``{'children_unavailable': True, 'error_type'}`` when the child
             reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
             while keeping its OWN ``content``/``metadata``/``memory_id``.  On
@@ -5315,7 +5316,7 @@ def create_mcp_server(
                 project_id,
                 memory_id,
                 record,
-                contested_text_chars=resolve_judge_field_chars(memory_service),
+                amendment_text_chars=resolve_judge_field_chars(memory_service),
             )
         except Exception:
             logger.warning(

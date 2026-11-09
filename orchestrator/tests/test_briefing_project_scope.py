@@ -388,7 +388,7 @@ class TestDistilledRendering:
         self, briefing: BriefingAssembler, scenario: str,
     ):
         """A correction reaches the agent whole and marked as contesting its
-        parent, not as a cut digest under it — whether the correction itself
+        parent, not as a plain amendment under it — whether the correction itself
         matched the query or only the claim it contests did."""
         # The oracle is the scenario where the correction is its own top-level
         # hit, so its full body comes from a field the render under test never
@@ -406,8 +406,7 @@ class TestDistilledRendering:
             line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
             for line in context.splitlines()
         ), context
-        assert contesting['digest'].endswith('…')
-        assert contesting['digest'] not in context
+        assert 'digest' not in contesting
 
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,

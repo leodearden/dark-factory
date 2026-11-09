@@ -1898,7 +1898,7 @@ class TestPinnedChildCarriesOriginProjectTag:
     async def test_in_place_marking_does_not_clobber_the_digests_origin_tag(self):
         """(b) The in-place branch: a full foreign body lands on a marked digest.
 
-        Regression guard, not new behaviour — ``_digest_entry`` already tagged
+        Regression guard, not new behaviour — ``_amendment_entry`` already tagged
         this entry from the raw Qdrant payload.  Marking it ``matched`` and
         attaching the FULL body must not drop that tag, or the leakiest shape
         of all (a complete foreign body hanging off a native canonical) would
@@ -1925,7 +1925,7 @@ class TestPinnedChildCarriesOriginProjectTag:
             f'PRECONDITION: the marked digest gains the FULL body, got {entry!r}'
         )
         assert entry.get('metadata') == {'src_project': 'reify'}, (
-            'In-place marking must not clobber the origin tag _digest_entry set '
+            'In-place marking must not clobber the origin tag _amendment_entry set '
             f'— got {entry!r}'
         )
 
