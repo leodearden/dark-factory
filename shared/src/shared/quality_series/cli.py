@@ -71,6 +71,8 @@ def _render(value: object) -> str:
         return str(value.value)
     if isinstance(value, float):
         return f'{value:.4f}'
+    if isinstance(value, datetime):
+        return value.isoformat()
     return str(value)
 
 
@@ -165,7 +167,7 @@ def _unit_events_over_landings(
 
 def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
     start, end = _week_bounds(iso_week)
-    week = [row for row in rows if start <= row.landing.landed_time < end]
+    week = [row for row in rows if start <= row.landing.landed_at < end]
     heads = unit_heads(week)
     rounds = [row.cost for row in week if row.cost.review_rounds is not None]
     return WeekSummary(

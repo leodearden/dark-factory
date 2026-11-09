@@ -63,7 +63,7 @@ class TestFullHistory:
             assert member.unit_id == member.merge_sha == s.m3
             assert member.unit_size == 3
             assert member.source is LandingSource.TRAIN_MERGED
-            assert member.landed_at == at_hour(LandingScenario.LANDED_HOURS['m3']).isoformat()
+            assert member.landed_at == at_hour(LandingScenario.LANDED_HOURS['m3'])
 
     def test_plain_landings_are_units_of_one(self, scenario: LandingScenario) -> None:
         s = scenario
@@ -139,6 +139,13 @@ def test_a_unit_has_at_least_one_member(scenario: LandingScenario) -> None:
     row = landings(scenario.db.conn, scenario.repo.root, since_cursor=None).landings[0]
     with pytest.raises(ValueError, match='unit_size'):
         dataclasses.replace(row, unit_size=0)
+
+
+def test_landing_times_are_timezone_aware(scenario: LandingScenario) -> None:
+    row = landings(scenario.db.conn, scenario.repo.root, since_cursor=None).landings[0]
+    assert row.landed_at.utcoffset() is not None
+    with pytest.raises(ValueError, match='landed_at'):
+        dataclasses.replace(row, landed_at=row.landed_at.replace(tzinfo=None))
 
 
 @pytest.fixture(scope='module')

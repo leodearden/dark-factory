@@ -62,14 +62,14 @@ def _invariant(condition: bool, invariant: str, **values: object) -> None:
 
 @dataclass(frozen=True)
 class SourceEpochs:
-    """The first row's timestamp of each source in this runs.db; None when it has none."""
+    """The first row's time of each source in this runs.db; None when it has none."""
 
-    rejections: str | None
-    merge_verify: str | None
-    review_completed: str | None
-    flake_occurrence: str | None
-    invocation_turns: str | None
-    invocations: str | None
+    rejections: datetime | None
+    merge_verify: datetime | None
+    review_completed: datetime | None
+    flake_occurrence: datetime | None
+    invocation_turns: datetime | None
+    invocations: datetime | None
 
 
 _EPOCH_SQL = {
@@ -84,14 +84,17 @@ _EPOCH_SQL = {
 }
 
 
+def _first_time(conn: sqlite3.Connection, sql: str) -> datetime | None:
+    first = conn.execute(sql).fetchone()[0]
+    return None if first is None else parse_utc(first)
+
+
 def _read_epochs(conn: sqlite3.Connection) -> SourceEpochs:
-    return SourceEpochs(**{
-        source: conn.execute(sql).fetchone()[0] for source, sql in _EPOCH_SQL.items()
-    })
+    return SourceEpochs(**{source: _first_time(conn, sql) for source, sql in _EPOCH_SQL.items()})
 
 
-def _covers(epoch: str | None, landing: Landing) -> bool:
-    return epoch is not None and landing.landed_time >= parse_utc(epoch)
+def _covers(epoch: datetime | None, landing: Landing) -> bool:
+    return epoch is not None and landing.landed_at >= epoch
 
 
 @dataclass(frozen=True)
@@ -227,9 +230,9 @@ class _Timeline(Generic[T]):
 
     def window(self, landing: Landing) -> list[T]:
         """Values in (prev_landed_at, landed_at] of the landing's task."""
-        prev = landing.prev_landed_time
+        prev = landing.prev_landed_at
         start = 0 if prev is None else bisect.bisect_right(self._times, prev)
-        return self._values[start:bisect.bisect_right(self._times, landing.landed_time)]
+        return self._values[start:bisect.bisect_right(self._times, landing.landed_at)]
 
 
 _CHUNK = 500

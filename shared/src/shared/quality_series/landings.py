@@ -70,16 +70,19 @@ class UnrecognisedTrainEvent(Exception):
 
 
 def parse_utc(text: str) -> datetime:
-    """A timezone-aware ISO timestamp; a naive one is refused rather than guessed."""
+    """A runs.db timestamp as a timezone-aware datetime; a naive one is refused rather than guessed."""
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
-        raise ValueError(f'a landing timestamp must carry its offset (timestamp={text!r})')
+        raise ValueError(f'a runs.db timestamp must carry its offset (timestamp={text!r})')
     return parsed
 
 
 @dataclass(frozen=True)
 class Landing:
     """One task landed on main; train members share merge_sha == unit_id and unit_size.
+
+    landed_at and prev_landed_at are timezone-aware; ISO text is rendered only where a row is
+    written or printed.
 
     A late claim names a sha an earlier event already claimed for another task: it is a unit of
     one under an opaque unit_id (compared for equality, never parsed) with unmeasurable lines.
@@ -88,14 +91,14 @@ class Landing:
     project_id: str
     merge_sha: str
     task_id: str
-    landed_at: str
+    landed_at: datetime
     ordinal: int
     source: LandingSource
     unit_id: str
     unit_size: int
     late_claim: bool
     git_first_parent: bool
-    prev_landed_at: str | None
+    prev_landed_at: datetime | None
     lines_base: LinesBase
     base_sha: str | None
 
@@ -122,17 +125,9 @@ class Landing:
             raise ValueError(
                 f'a first claim\'s unit_id is its merge_sha (unit_id={self.unit_id!r}, {where})'
             )
-        parse_utc(self.landed_at)
-        if self.prev_landed_at is not None:
-            parse_utc(self.prev_landed_at)
-
-    @property
-    def landed_time(self) -> datetime:
-        return parse_utc(self.landed_at)
-
-    @property
-    def prev_landed_time(self) -> datetime | None:
-        return None if self.prev_landed_at is None else parse_utc(self.prev_landed_at)
+        for name, at in (('landed_at', self.landed_at), ('prev_landed_at', self.prev_landed_at)):
+            if at is not None and at.tzinfo is None:
+                raise ValueError(f'{name} carries its offset ({name}={at!r}, {where})')
 
 
 @dataclass(frozen=True)
@@ -353,9 +348,8 @@ def landings(
         return horizon is None or recorded.landed > horizon
 
     rows: list[Landing] = []
-    previous: dict[str, str] = {}
+    previous: dict[str, datetime] = {}
     for ordinal, recorded in enumerate(history):
-        landed_at = recorded.landed.isoformat()
         unit_id, unit_size = _unit(recorded)
         lines_base, base_sha = (
             (LinesBase.UNMEASURABLE, None) if recorded.late_claim
@@ -365,7 +359,7 @@ def landings(
             project_id=project,
             merge_sha=recorded.merge_sha,
             task_id=recorded.task_id,
-            landed_at=landed_at,
+            landed_at=recorded.landed,
             ordinal=ordinal,
             source=recorded.source,
             unit_id=unit_id,
@@ -376,7 +370,7 @@ def landings(
             lines_base=lines_base,
             base_sha=base_sha,
         )
-        previous[recorded.task_id] = landed_at
+        previous[recorded.task_id] = recorded.landed
         if emitted(recorded):
             rows.append(landing)
 

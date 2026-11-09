@@ -154,10 +154,10 @@ class TestReviews:
 
 def test_rule_vintage_is_the_first_row_of_each_source(outcomes_scenario, outcome_rows):
     expected = SourceEpochs(
-        rejections=at_hour(10.0).isoformat(),
-        merge_verify=at_hour(9.0).isoformat(),
-        review_completed=at_hour(10.8).isoformat(),
-        flake_occurrence=at_hour(11.6).isoformat(),
+        rejections=at_hour(10.0),
+        merge_verify=at_hour(9.0),
+        review_completed=at_hour(10.8),
+        flake_occurrence=at_hour(11.6),
         invocation_turns=None,
         invocations=None,
     )
