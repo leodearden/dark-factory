@@ -1230,6 +1230,7 @@ script:
 
 ```json
 {
+  "task_kind": "deterministic",
   "milestone": {"mode": "dated", "at": "2026-12-01T00:00:00+00:00"},
   "before_done": {
     "kind": "predicate",
@@ -1242,8 +1243,8 @@ script:
 }
 ```
 
-(File it with `task_kind='deterministic'`. `milestone.at` is the first
-check; every `75` moves it forward by `recheck_secs`.)
+(`milestone.at` is the first check; every `75` moves it forward by
+`recheck_secs`.)
 
 ### 6.1 Recurring chains (`metadata.recurrence`)
 
