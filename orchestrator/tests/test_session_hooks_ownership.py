@@ -1230,13 +1230,20 @@ def test_a_thread_pointer_adopts_and_binds_an_unbound_spawn_record(tmp_path: Pat
     assert (record.display.kind, record.display.t3_thread_id) == (sr.DisplayKind.T3, _THREAD)
 
 
-def test_an_unheld_thread_is_claimed_by_the_hand_launched_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    'thread_id',
+    [_THREAD, f'mcp:{_THREAD}', 'mcp:launch:' + 'a1b2c3d4' * 8],
+    ids=['ui-uuid', 'mcp-uuid', 'mcp-launch'],
+)
+def test_an_unheld_thread_is_claimed_by_the_hand_launched_record(
+    tmp_path: Path, thread_id: str
+) -> None:
     hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
     leaked_terminal = {'TMUX': '/tmp/tmux-1000/default,1,0', 'TMUX_PANE': '%3'}
 
     sh.run_session_start(
         hook_input,
-        {**_T3_ENV, **leaked_terminal},
+        {'T3CODE_THREAD_ID': thread_id, **leaked_terminal},
         root=tmp_path,
         process_tree=claude_process_tree(_T3_CLAUDE_PID),
     )
@@ -1244,8 +1251,23 @@ def test_an_unheld_thread_is_claimed_by_the_hand_launched_record(tmp_path: Path)
     slug = _hand_slug(hook_input, tmp_path)
     record = sr.read_record(slug, root=tmp_path)
     assert sr.is_t3_record(record)
-    assert record.display is not None and record.display.t3_thread_id == _THREAD
-    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == slug
+    assert record.display is not None and record.display.t3_thread_id == thread_id
+    assert sr.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) == slug
+
+
+def test_a_thread_id_that_cannot_name_a_pointer_is_never_claimed(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(
+        hook_input,
+        {'T3CODE_THREAD_ID': '../escape'},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_CLAUDE_PID),
+    )
+
+    record = sr.read_record(_hand_slug(hook_input, tmp_path), root=tmp_path)
+    assert not sr.is_t3_record(record)
+    assert not sr.t3_thread_pointers_dir(tmp_path).exists()
 
 
 def test_a_nested_claude_in_a_bound_thread_forks_without_claiming_it(tmp_path: Path) -> None:

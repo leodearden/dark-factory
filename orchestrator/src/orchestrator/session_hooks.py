@@ -447,7 +447,11 @@ def _pointer_resolution(
         probes=probes,
         session_id_keyed=False,
     )
-    if by_pid is not None or t3_thread_id is None:
+    if (
+        by_pid is not None
+        or t3_thread_id is None
+        or not session_registry.is_t3_thread_pointer_name(t3_thread_id)
+    ):
         return _PointerLookup(by_pid)
     thread_slug = session_registry.resolve_session_slug_for_t3_thread(t3_thread_id, root=root)
     if thread_slug is None:

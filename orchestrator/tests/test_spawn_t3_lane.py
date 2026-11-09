@@ -49,7 +49,7 @@ from orchestrator.session_ownership_probes import ProcessTree
 
 _PKG_SRC = Path(lane.__file__).resolve().parents[1]
 
-THREAD_ID = '6f0c2a3e-7489-4c11-9a51-0d6c1f3b2a10'
+THREAD_ID = 'mcp:launch:' + '6f0c2a3e74894c119a510d6c1f3b2a10' * 2
 PROJECT_ID = '5a05e1d3-5bd0-40e5-8ce7-24b2cd160300'
 RUN_ID = 'b2c4e6f8-0a1c-4e3a-8b5d-7f9e1a2b3c4d'
 SESSION_ID = '15fbcf7c-12af-481c-a641-9b00c03a741e'

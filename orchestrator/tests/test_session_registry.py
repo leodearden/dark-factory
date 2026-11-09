@@ -11614,7 +11614,7 @@ def _t3_record(
 
 
 _THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
-_OTHER_THREAD = '0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b'
+_OTHER_THREAD = 'mcp:launch:' + '0f9e8d7c6b5a49388271605f4e3d2c1b' * 2
 
 
 class TestT3ThreadPointers:
@@ -11713,6 +11713,17 @@ class TestT3ThreadPointers:
 
         assert sr.read_record('bystander', root=tmp_path).status == sr.Status.EXITED
         assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == 'holder'
+
+    def test_a_failed_to_start_refresh_drops_the_pointer_naming_the_record(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
+        record_dir = str(sr.sessions_dir(tmp_path) / 'held')
+
+        assert sr.main(['refresh', '--record', record_dir, '--status', 'failed-to-start']) == 0
+
+        assert sr.read_record('held', root=tmp_path).status == sr.Status.FAILED_TO_START
+        assert not sr.t3_thread_pointer_path(_OTHER_THREAD, tmp_path).exists()
 
     def test_folding_a_record_drops_the_pointer_naming_it(self, tmp_path: Path) -> None:
         _t3_record(tmp_path, 'hand', _THREAD, cwd=str(tmp_path))
@@ -11863,7 +11874,9 @@ class TestMarkT3SessionsExited:
         [line] = [
             record.getMessage().replace(str(tmp_path), '<root>')
             for record in caplog.records
-            if record.funcName == 'mark_t3_sessions_exited' and record.levelno == logging.INFO
+            if record.name == 'orchestrator.session_registry'
+            and record.levelno == logging.INFO
+            and 'mark_t3_sessions_exited' in record.getMessage()
         ]
         assert re.search(r'\b3\b', line), line
 
@@ -11891,6 +11904,34 @@ class TestT3RecordsAreExemptFromPidSweeps:
 
         assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
         assert path.is_file()
+
+    def test_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(self, tmp_path: Path) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+
+        sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 't3-quiet'
+
+    def test_a_t3_record_displaced_from_its_thread_pointer_is_pid_swept(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+
+        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'stale_pid')]
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
+
+    def test_mark_orphaned_marks_a_displaced_t3_record_with_a_dead_launcher(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.AWAITING_INPUT)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+
+        marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+        assert [r.session_slug for r in marked] == ['t3-quiet']
 
     def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
         self._stale_t3_record(tmp_path, sr.Status.EXITED)

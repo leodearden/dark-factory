@@ -61,6 +61,10 @@ spawn record, re-points every pointer, and folds the hand record. The lane's
 transcript discovery, which binds the record to the session whose transcript
 names the record dir (task 7489), is now the fallback. The thread pointers
 are also the index the T3 sweep iterates, so every terminal write drops one.
+A thread id that cannot name a pointer file is never claimed. The record
+reap and the orphan sweep index a live t3 record whose thread no pointer
+holds. They pid-sweep a t3 record that another live record displaced from its
+thread's pointer, so every live t3 record stays in exactly one sweep.
 An indexed thread missing from the environment's `t3_thread_list` listing is
 marked exited only after `t3_thread_read` answers that it is gone or
 archived, because the listing omits live side-chat threads (T3 v0.1.6
