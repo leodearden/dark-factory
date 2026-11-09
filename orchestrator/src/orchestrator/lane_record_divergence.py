@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from escalation.categories import EscalationCategory
 from pydantic import AwareDatetime, PositiveInt, TypeAdapter
 from shared import safe_io
 
@@ -40,7 +41,7 @@ _ALARM: Final = BornAtL2Alarm(
     root_cause=LANE_RECORD_DIVERGENCE,
     sentinel_task='__lane_record_divergence__',
     role='orchestrator-lane-record-divergence',
-    category='infra_issue',
+    category=EscalationCategory.INFRA_ISSUE,
     suggested_action='investigate_lane_record_divergence',
     created_reason='lane-record-divergence-persistent',
 )

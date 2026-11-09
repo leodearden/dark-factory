@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from escalation.categories import EscalationCategory, require_registered_category
 from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
@@ -33,9 +34,12 @@ class BornAtL2Alarm:
     root_cause: str
     sentinel_task: str
     role: str
-    category: str
+    category: EscalationCategory
     suggested_action: str
     created_reason: str
+
+    def __post_init__(self) -> None:
+        require_registered_category(self.category)
 
 
 def file_deduped_born_at_l2(
