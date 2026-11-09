@@ -922,7 +922,10 @@ containment, existence and executable-bit checks, so a predicate that ships
 with the factory can gate a task in any project. `'factory'` is allowed
 **only** with `kind='predicate'`; a deploy that asks for it is rejected.
 `cwd` is unchanged (`project_root`). An unresolvable factory root is a
-structured rejection at `submit_task`. The rule is PRD C6
+structured rejection at `submit_task`. A root that resolves at submit but not
+when the runner runs the check is a no-verdict leg (§6): an escalation with
+the summary "Predicate script root unresolvable", task `blocked`, no
+`gate_escalated_at`. The rule is PRD C6
 (`plans/completion-driven-triggers-prd.md`, "C6 — factory-rooted predicate
 scripts").
 
@@ -1097,8 +1100,9 @@ and never persisted.
 `milestone_deps_satisfied_at` (`delayed` mode only — the frozen-once
 wall-clock UTC anchor, stamped the first tick all of the task's
 dependencies go `done`) and, only on a predicate check failure,
-`gate_escalated_at` (shared with §5).  A task author never sets either
-field.
+`gate_escalated_at` (shared with §5). A predicate re-arm (below) adds
+`milestone.scheduled_fire_at`. A task author never sets any of these
+fields.
 
 **Predicate exit-code contract (`before_done.kind`):** `before_done` gains
 a discriminator, `'deploy' | 'predicate'` (default `'deploy'` — every
@@ -1112,8 +1116,8 @@ script and decides by **exit code only** — it parses no output:
 |---|---|
 | `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
 | non-`0` (other than the `75` rows below) | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
-| `75`, `before_done.recheck_secs` declared, milestone `dated`, stall streak below `deterministic.predicate_recheck_stall_cap` | **re-arm**: the task returns to `pending` with `milestone.at` advanced to now + `recheck_secs`, stamps nothing terminal and files **no** escalation. The runner records `predicate_recheck` and `predicate_verdict` and emits a `predicate_rearmed` event |
-| `75`, the streak reaches the cap (default 30) | born-at-L2 `milestone_check_stalled` (`critical`, `agent_role='orchestrator-deterministic'`), stamps `gate_escalated_at`, resets the streak to 0, task `blocked`. `resume` keeps waiting with a fresh streak; `abandon` ends the wait |
+| `75`, `before_done.recheck_secs` declared, milestone `dated`, stall streak below `deterministic.predicate_recheck_stall_cap` | **re-arm**: the task returns to `pending` with `milestone.at` advanced to now + `recheck_secs`, stamps nothing terminal and files **no** escalation. The runner records `predicate_recheck` and `predicate_verdict` and emits a `predicate_rearmed` event. A re-arm that cannot be written is a no-verdict leg instead (see below) |
+| `75`, the streak reaches the cap (default 30) | born-at-L2 `milestone_check_stalled` (`critical`, `agent_role='orchestrator-deterministic'`), stamps `gate_escalated_at`, resets the streak to 0, task `blocked`. `resume` keeps waiting with a fresh streak. `abandon` cancels the gate, which releases its dependents because a cancelled dependency satisfies. To end a trigger chain, abandon its human gate first, then this gate |
 | `75` **without** the declaration (no `recheck_secs`, or the milestone is not `dated`, e.g. a post-submit edit — task 3093) | today's `milestone_check_failed` escalation, plus one detail line naming the missing declaration. Never a silent re-arm |
 | timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
 
@@ -1125,21 +1129,29 @@ Otherwise it is an ordinary failing verdict, the third `75` row:
 re-arm rewrites the `milestone` dict whole (`metadata_mode='merge'` is shallow) and writes three
 keys in one update: `milestone`, `predicate_recheck`
 (`{consecutive, first_rearmed_at, last_checked_at, next_check_at}`) and
-`predicate_verdict`. The streak cap is the config leaf
+`predicate_verdict`. The rewritten milestone keeps the link's first `at` as
+`milestone.scheduled_fire_at`, which later re-arms never move; the scheduler
+still reads only `at` (`shared/src/shared/milestone_rearm.py::rearmed_milestone`).
+A re-arm whose metadata write is refused, or whose milestone has no readable
+ISO fire time, re-pends nothing: it files the no-verdict category and blocks,
+since an unadvanced `at` would re-dispatch at once into the same `75`. The
+streak cap is the config leaf
 `deterministic.predicate_recheck_stall_cap` (default `30`, hot-reloadable).
 `predicate_verdict` is the parsed trailing-JSON tier of the payload described
-below, stamped on every verdict-bearing exit (`0`, `75`, other non-`0`), so
-a predicate that wants its "not yet" share preserved emits it as a trailing
-JSON object. The authority is PRD C1 (`plans/completion-driven-triggers-prd.md`,
+below, refreshed on every verdict-bearing exit (`0`, `75`, other non-`0`) so a
+stamp never outlives the check that produced it. A predicate that wants its
+"not yet" share preserved emits it as a trailing JSON object. The authority is PRD C1 (`plans/completion-driven-triggers-prd.md`,
 "C1 — the predicate exit-code contract gains a re-arm verdict"); the chain
 that consumes it is PRD C2 and `docs/quality-findings-contract.md` §11. The
 filing calls themselves live in `skills/_shared/filing-the-trigger-chain.md`.
 
-The no-verdict row covers **three** ways a run produces no exit code — the outer
+The no-verdict row covers every way a run produces no exit code — the outer
 wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
-and an unexpected error in the runner seam. Only a **non-zero exit** — a real
-verdict — stamps `gate_escalated_at` and thereby latches the task into the
-resume/resolve-to-done path.
+a `script_root='factory'` whose factory root does not resolve at run time
+(summary "Predicate script root unresolvable"), and an unexpected error in the
+runner seam. Only a **non-zero exit** other than a declared re-arm `75` — a
+real verdict — stamps `gate_escalated_at` and thereby latches the task into
+the resume/resolve-to-done path.
 
 **What the `rc == 0` `note` carries (task 3286):** `predicate check passed
 (rc=0)`, plus — when the script emitted one — a single extracted payload:
@@ -1173,8 +1185,9 @@ read-only recurrence guard.
 
 A predicate is **read-only**, so resolving the escalation (`resume`)
 safely **re-runs** the check rather than trusting the resolution blindly —
-it drives to `done` or re-files `milestone_check_failed` from whatever the
-check reports this time. `kind='predicate'` **forbids**
+it drives to `done`, re-files `milestone_check_failed`, or, for a gate
+declaring `recheck_secs`, re-arms (§6's `75` rows) from whatever the check
+reports this time. `kind='predicate'` **forbids**
 `before_done.target_unit` (no unit to verify — no systemd inspect /
 PID-verify on a read-only check) and forbids top-level
 `always_escalates=True` (predicate escalation is already conditional on a
@@ -1239,7 +1252,7 @@ script:
     "kind": "predicate",
     "script": "scripts/check_run_completion.py",
     "script_root": "factory",
-    "args": ["--run", "review-dark_factory-20261004", "--threshold", "0.7", "--project-root", "/home/leo/src/dark-factory"],
+    "args": ["--run", "review-dark_factory-20261004", "--threshold", "0.7", "--project-root", "<project_root>"],
     "timeout_secs": 120,
     "recheck_secs": 86400
   }
@@ -1247,7 +1260,8 @@ script:
 ```
 
 (`milestone.at` is the first check; every `75` moves it forward by
-`recheck_secs`.)
+`recheck_secs`. The script's arguments are owned by PRD C3,
+`plans/completion-driven-triggers-prd.md`.)
 
 ### 6.1 Recurring chains (`metadata.recurrence`)
 
@@ -1326,7 +1340,10 @@ submit-time validation still holds.
 re-arm row) is not terminal: it returns to `pending`
 with its own `milestone.at` advanced, so no successor is minted and the chain
 holds one live link throughout. Minting happens only when the link completes
-`done`.
+`done`. The chain gauge and the successor's run label read the link's
+scheduled fire time (`shared/src/shared/milestone_rearm.py::scheduled_fire_at`),
+not the re-armed `at`, so a carrier still re-arming past its fire time plus
+grace reads overdue.
 
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
@@ -1554,7 +1571,9 @@ Three of the entries belong to the completion-driven trigger chain
   re-arm streak `{consecutive, first_rearmed_at, last_checked_at, next_check_at}`
   (§6).
 - **`predicate_verdict`** — runner-stamped, never author-supplied: the
-  predicate's trailing JSON-object payload, parsed (§6).
+  predicate's trailing JSON-object payload, parsed; or
+  `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
+  declared `75` carried no JSON object (§6).
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not
