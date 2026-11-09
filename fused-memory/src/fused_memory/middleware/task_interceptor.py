@@ -126,6 +126,7 @@ from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.r4_idempotency import (
     DroppedItem,
+    R4Lookup,
     R4Verdict,
     check_r4,
     metadata_keeping,
@@ -4116,18 +4117,20 @@ class TaskInterceptor:
     async def _check_escalation_idempotency(
         self,
         *,
+        lookup: R4Lookup | None,
         project_root: str,
         metadata,
     ) -> R4Verdict:
         """R4 for one ticket's metadata (``r4_idempotency.py::check_r4``); no hit when it cannot run.
 
-        A lookup that raised falls through to CREATE with every item, logged here.
+        *lookup* is the batch's, None without a backend. A lookup that raised falls through to
+        CREATE with every item, logged here.
         """
         meta = self._extract_metadata_dict(metadata)
-        if not meta or self.taskmaster is None:
+        if not meta or lookup is None:
             return R4Verdict()
         try:
-            verdict = await check_r4(self.taskmaster, project_root, meta)
+            verdict = await check_r4(lookup, project_root, meta)
         except Exception:
             logger.warning(
                 'r4: metadata lookup failed during idempotency check',
@@ -5390,10 +5393,14 @@ class TaskInterceptor:
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
             # A ticket whose work a live task already carries resolves
             # 'combined' onto it and is excluded from the curate call; one
-            # carrying some live items is filed with the rest.
+            # carrying some live items is filed with the rest. No task is
+            # written between these checks, so they share one R4Lookup and
+            # its single scan of the live follow-up items.
+            r4_lookup = None if self.taskmaster is None else R4Lookup(self.taskmaster)
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
                 verdict = await self._check_escalation_idempotency(
+                    lookup=r4_lookup,
                     project_root=t.project_root,
                     metadata=t.metadata,
                 )

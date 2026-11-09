@@ -2,7 +2,8 @@
 
 Contract: plans/follow-up-filing-shape-prd.md §4.1. No LLM and no embedding, so it holds while the
 curator is down. Only a live task (``shared.task_statuses.ACTIVE``) owns work. A lookup error
-propagates: the caller chooses how to degrade.
+propagates: the caller chooses how to degrade. Every check reads through an :class:`R4Lookup`, which
+one pass of checks shares.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ __all__ = [
     'LIVE_STATUSES',
     'DroppedItem',
     'LiveOwner',
+    'R4Lookup',
     'R4Match',
     'R4Verdict',
     'check_r4',
@@ -94,9 +96,28 @@ class R4Verdict:
         return result
 
 
-async def check_r4(
-    backend: TaskBackendProtocol, project_root: str, metadata: Mapping[str, Any],
-) -> R4Verdict:
+class R4Lookup:
+    """R4's reads of the live store, shared by one pass of checks that writes no task between them.
+
+    The live item owners come from a scan of every live bundle, so it runs once per project root,
+    on the first check that needs it, and the pass's later checks reuse it. A scan that raised is
+    not kept: the next check scans again.
+    """
+
+    def __init__(self, backend: TaskBackendProtocol) -> None:
+        self.backend: Final = backend
+        self._item_owners: dict[str, Mapping[str, LiveOwner]] = {}
+
+    async def item_owner(self, project_root: str, key: str) -> LiveOwner | None:
+        """The lowest-id live task in *project_root* carrying a follow-up item keyed *key*."""
+        owners = self._item_owners.get(project_root)
+        if owners is None:
+            owners = await _live_item_owners(self.backend, project_root)
+            self._item_owners[project_root] = owners
+        return owners.get(key)
+
+
+async def check_r4(lookup: R4Lookup, project_root: str, metadata: Mapping[str, Any]) -> R4Verdict:
     """The verdict on one submission's metadata.
 
     1. Its ``(escalation_id, suggestion_hash)`` pair on a live task: a hit.
@@ -104,15 +125,15 @@ async def check_r4(
        ``suggestion_hash`` equal to the item key; with every item dropped, a hit on the first owner.
     3. A pre-bundle single whose ``suggestion_hash`` is a live item key: a hit.
     """
-    pair_owner = await _escalation_pair_owner(backend, project_root, metadata)
+    pair_owner = await _escalation_pair_owner(lookup.backend, project_root, metadata)
     if pair_owner is not None:
         return R4Verdict(hit=pair_owner, match=R4Match.ESCALATION_PAIR)
     if FOLLOWUP_ITEMS_METADATA_KEY in metadata:
-        return await _bundle_verdict(backend, project_root, read_items(metadata))
+        return await _bundle_verdict(lookup, project_root, read_items(metadata))
     suggestion_hash = metadata.get('suggestion_hash')
     if not isinstance(suggestion_hash, str) or not suggestion_hash.strip():
         return R4Verdict()
-    owner = (await _live_item_owners(backend, project_root)).get(suggestion_hash)
+    owner = await lookup.item_owner(project_root, suggestion_hash)
     if owner is None:
         return R4Verdict()
     return R4Verdict(
@@ -129,13 +150,15 @@ def metadata_keeping(metadata: Mapping[str, Any], verdict: R4Verdict) -> dict[st
 
 
 async def _bundle_verdict(
-    backend: TaskBackendProtocol, project_root: str, items: Sequence[FollowupItem],
+    lookup: R4Lookup, project_root: str, items: Sequence[FollowupItem],
 ) -> R4Verdict:
-    item_owners = await _live_item_owners(backend, project_root)
     kept: list[FollowupItem] = []
     dropped: list[DroppedItem] = []
     for item in items:
-        owner = item_owners.get(item.key) or await _live_hash_owner(backend, project_root, item.key)
+        owner = (
+            await lookup.item_owner(project_root, item.key)
+            or await _live_hash_owner(lookup.backend, project_root, item.key)
+        )
         if owner is None:
             kept.append(item)
         else:

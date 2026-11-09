@@ -24,6 +24,7 @@ from shared.followup_items import (
 )
 
 from fused_memory.middleware.curator_types import PreparedCandidate
+from fused_memory.middleware.r4_idempotency import LiveOwner, R4Lookup, check_r4
 
 _INTERCEPTOR_LOGGER = 'fused_memory.middleware.task_interceptor'
 _R4_LOOKUP_PAGE = 100
@@ -223,3 +224,53 @@ async def test_a_failed_item_scan_files_every_item(
         and record.getMessage().startswith('r4:')
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_one_lookup_scans_the_live_items_once_for_every_check_it_serves(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = await stack.seed('Follow-ups in src/app', with_derived_bundle_keys(_bundle(_I1, _I2)))
+    lookup_by_metadata = stack.backend.find_tasks_by_metadata
+    item_scans: list[str] = []
+
+    async def _counting_item_scans(project_root: str, key: str, *args: Any, **kwargs: Any) -> Any:
+        if key == FOLLOWUP_ITEMS_METADATA_KEY:
+            item_scans.append(project_root)
+        return await lookup_by_metadata(project_root, key, *args, **kwargs)
+
+    monkeypatch.setattr(stack.backend, 'find_tasks_by_metadata', _counting_item_scans)
+    lookup = R4Lookup(stack.backend)
+
+    exhausted = await check_r4(lookup, stack.root, with_derived_bundle_keys(_bundle(_I1)))
+    partial = await check_r4(lookup, stack.root, with_derived_bundle_keys(_bundle(_I2, _I4)))
+
+    owned = LiveOwner(task_id=int(owner), title='Follow-ups in src/app')
+    assert exhausted.hit == owned
+    assert [(dropped.key, dropped.owner) for dropped in partial.dropped] == [(_key(_I2), owned)]
+    assert [item.key for item in partial.kept] == [_key(_I4)]
+    assert item_scans == [stack.root]
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_whose_scan_raised_scans_again_on_its_next_check(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = await stack.seed('Follow-ups in src/app', with_derived_bundle_keys(_bundle(_I1, _I2)))
+    lookup_by_metadata = stack.backend.find_tasks_by_metadata
+    failures = ['followup_items scan unavailable']
+
+    async def _first_item_scan_fails(project_root: str, key: str, *args: Any, **kwargs: Any) -> Any:
+        if key == FOLLOWUP_ITEMS_METADATA_KEY and failures:
+            raise RuntimeError(failures.pop())
+        return await lookup_by_metadata(project_root, key, *args, **kwargs)
+
+    monkeypatch.setattr(stack.backend, 'find_tasks_by_metadata', _first_item_scan_fails)
+    lookup = R4Lookup(stack.backend)
+    refiled = with_derived_bundle_keys(_bundle(_I1))
+
+    with pytest.raises(RuntimeError, match='followup_items scan unavailable'):
+        await check_r4(lookup, stack.root, refiled)
+    verdict = await check_r4(lookup, stack.root, refiled)
+
+    assert verdict.hit == LiveOwner(task_id=int(owner), title='Follow-ups in src/app')
