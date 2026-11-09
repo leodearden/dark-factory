@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _review_issue_fixtures import contract_issue, contract_issue_without
 from fastmcp import Client, FastMCP
+from shared.mcp_markup_middleware import OUTCOMES as MARKUP_OUTCOMES
 
 from orchestrator.agents.roles import ALL_REVIEWERS
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, verdict_tools
 from orchestrator.mcp.verdict_tools import (
     _SINGLETON_ROLE_TOOLS,
+    IssueIntakeOutcome,
     _artifacts_from_args,
     _submit_completion_verdict,
     _submit_merge_disposition,
@@ -22,6 +25,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_triage,
     create_server,
 )
+from orchestrator.review_issue_contract import IssueField
 
 
 @pytest.fixture()
@@ -99,128 +103,25 @@ class TestSubmitReviewVerdict:
         assert artifacts.read_verdict('test_analyst') is None
         assert artifacts.read_verdict('security') is None
 
-
-def _contract_issue(**overrides: Any) -> dict[str, Any]:
-    issue: dict[str, Any] = {
-        'severity': 'blocking',
-        'location': 'pkg/mod.py:3',
-        'category': 'correctness',
-        'description': 'the thing is broken',
-        'suggested_fix': 'fix the thing',
-    }
-    issue.update(overrides)
-    return issue
-
-
-def _contract_issue_without(field: str, **overrides: Any) -> dict[str, Any]:
-    issue = _contract_issue(**overrides)
-    del issue[field]
-    return issue
-
-
-def _submit_issues(artifacts: TaskArtifacts, issues: list, **overrides: Any) -> dict[str, Any]:
-    kwargs: dict[str, Any] = dict(
-        role='test_analyst',
-        session_id='s',
-        reviewer='test_analyst',
-        verdict='ISSUES_FOUND',
-        issues=issues,
-        summary='x',
-    )
-    kwargs.update(overrides)
-    return _submit_review_verdict(artifacts, **kwargs)
-
-
-class TestSubmitReviewVerdictIssueIntake:
-    """The intake checks each issue against the reviewer issue contract
-    (orchestrator/review_issue_contract.py): off-contract fields are
-    normalised and reported back; only an unusable issue refuses the call.
-    """
-
-    def test_off_contract_fields_are_normalised_and_reported(self, artifacts):
-        high = _contract_issue(severity='high', title='kept')
-        file_and_line = _contract_issue_without(
-            'location', file='pkg/mod.py', line=12,
+    def test_the_sync_seam_applies_the_issue_intake(self, artifacts):
+        """Test doubles (_workflow_helpers.AgentStub) write verdicts through
+        this seam rather than the MCP tool, so it must run the intake itself.
+        """
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='ISSUES_FOUND',
+            issues=[contract_issue(severity='high')],
+            summary='x',
         )
-
-        result = _submit_issues(artifacts, [high, file_and_line])
 
         assert result['status'] == 'ok'
-        assert result['role'] == 'test_analyst'
-        report = result['issue_contract']
-        assert report['outcome'] == 'normalised'
-        assert [d.split(':')[0] for d in report['deviations']] == [
-            'issues[0].severity', 'issues[1].location',
-        ]
-        assert 'submit_review_verdict' in result['message']
-        assert 'again' in result['message']
-
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.NORMALISED
         envelope = artifacts.read_verdict('test_analyst')
         assert envelope is not None
-        stored = envelope['verdict']['issues']
-        assert stored == [
-            {**high, 'severity': 'suggestion'},
-            {**file_and_line, 'location': 'pkg/mod.py:12'},
-        ]
-        assert stored[0]['title'] == 'kept'
-        assert (stored[1]['file'], stored[1]['line']) == ('pkg/mod.py', 12)
-
-    def test_issue_without_description_is_refused_and_nothing_written(self, artifacts):
-        result = _submit_issues(
-            artifacts, [_contract_issue(), _contract_issue_without('description')],
-        )
-
-        assert result['status'] == 'error'
-        assert 'issues[1].description' in result['message']
-        assert 'nothing was written' in result['message'].lower()
-        assert result['issue_contract']['outcome'] == 'rejected'
-        assert artifacts.read_verdict('test_analyst') is None
-
-    def test_issue_without_severity_is_refused_naming_it(self, artifacts):
-        result = _submit_issues(artifacts, [_contract_issue_without('severity')])
-
-        assert result['status'] == 'error'
-        assert 'issues[0].severity' in result['message']
-        assert result['issue_contract']['outcome'] == 'rejected'
-        assert artifacts.read_verdict('test_analyst') is None
-
-    def test_off_vocabulary_severity_alone_still_lands_the_verdict(self, artifacts):
-        """INV-6: a repairable issue must not strand the review gate."""
-        result = _submit_issues(artifacts, [_contract_issue(severity='major')])
-
-        assert result['status'] == 'ok'
-        assert artifacts.read_verdict('test_analyst') is not None
-
-    def test_on_contract_issues_add_no_keys_to_the_ack(self, artifacts):
-        issues = [_contract_issue(), _contract_issue(severity='suggestion')]
-
-        result = _submit_issues(artifacts, issues)
-
-        assert result == {'status': 'ok', 'role': 'test_analyst'}
-        envelope = artifacts.read_verdict('test_analyst')
-        assert envelope is not None
-        assert envelope['verdict']['issues'] == issues
-
-    @pytest.mark.parametrize(
-        ('overrides', 'named'),
-        [
-            ({'reviewer': 'security'}, ('security', 'test_analyst')),
-            ({'verdict': 'GARBAGE'}, ('PASS', 'ISSUES_FOUND')),
-        ],
-    )
-    def test_identity_and_verdict_checks_run_before_the_issue_check(
-        self, artifacts, overrides, named,
-    ):
-        result = _submit_issues(
-            artifacts, [_contract_issue_without('description')], **overrides,
-        )
-
-        assert result['status'] == 'error'
-        for name in named:
-            assert name in result['message']
-        assert 'issues[' not in result['message']
-        assert 'issue_contract' not in result
-        assert artifacts.read_verdict('test_analyst') is None
+        assert envelope['verdict']['issues'] == [contract_issue(severity='suggestion')]
 
 
 class TestSubmitCompletionVerdict:
@@ -364,6 +265,137 @@ def _journal_lines(root: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
 
 
+async def _call_review_tool(
+    artifacts: TaskArtifacts,
+    issues: list[Any],
+    *,
+    journal_root: Path | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Call the registered reviewer tool through an MCP client, as an agent does."""
+    artifacts.write_plan({
+        'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
+        'prerequisites': [], 'steps': [],
+    })
+    server = create_server(
+        artifacts, 'test_analyst', resolve_project_root=lambda _wt: journal_root,
+    )
+    arguments = {
+        'reviewer': 'test_analyst',
+        'verdict': 'ISSUES_FOUND',
+        'issues': issues,
+        'summary': 'x',
+        **overrides,
+    }
+    async with Client(server) as client:
+        result = await client.call_tool('submit_review_verdict', arguments)
+    return result.data
+
+
+@pytest.mark.asyncio
+class TestSubmitReviewVerdictIssueIntake:
+    """The reviewer tool checks each issue against the reviewer issue contract
+    (orchestrator/review_issue_contract.py): off-contract fields are
+    normalised and reported back; only an unusable issue refuses the call.
+    """
+
+    async def test_off_contract_fields_are_normalised_and_reported(self, artifacts):
+        high = contract_issue(severity='high', title='kept')
+        file_and_line = contract_issue_without(
+            IssueField.LOCATION, file='pkg/mod.py', line=12,
+        )
+
+        result = await _call_review_tool(artifacts, [high, file_and_line])
+
+        assert result['status'] == 'ok'
+        assert result['role'] == 'test_analyst'
+        report = result['issue_contract']
+        assert report['outcome'] == IssueIntakeOutcome.NORMALISED
+        assert [d.split(':')[0] for d in report['deviations']] == [
+            'issues[0].severity', 'issues[1].location',
+        ]
+        assert 'submit_review_verdict' in result['message']
+        assert 'again' in result['message']
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [
+            {**high, 'severity': 'suggestion'},
+            {**file_and_line, 'location': 'pkg/mod.py:12'},
+        ]
+
+    async def test_a_description_taken_from_the_finding_text_lands(self, artifacts):
+        issue = contract_issue_without(
+            IssueField.DESCRIPTION, title='a heading', detail='the body',
+        )
+
+        result = await _call_review_tool(artifacts, [issue])
+
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [{**issue, 'description': 'the body'}]
+
+    async def test_issue_without_description_is_refused_and_nothing_written(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue(), contract_issue_without(IssueField.DESCRIPTION)],
+        )
+
+        assert result['status'] == 'error'
+        assert 'issues[1].description' in result['message']
+        assert 'nothing was written' in result['message'].lower()
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
+        assert artifacts.read_verdict('test_analyst') is None
+
+    async def test_issue_without_severity_is_refused_naming_it(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.SEVERITY)],
+        )
+
+        assert result['status'] == 'error'
+        assert 'issues[0].severity' in result['message']
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
+        assert artifacts.read_verdict('test_analyst') is None
+
+    async def test_off_vocabulary_severity_alone_still_lands_the_verdict(self, artifacts):
+        """INV-6: a repairable issue must not strand the review gate."""
+        result = await _call_review_tool(artifacts, [contract_issue(severity='major')])
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_verdict('test_analyst') is not None
+
+    async def test_on_contract_issues_add_no_keys_to_the_ack(self, artifacts):
+        issues = [contract_issue(), contract_issue(severity='suggestion')]
+
+        result = await _call_review_tool(artifacts, issues)
+
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == issues
+
+    @pytest.mark.parametrize(
+        ('overrides', 'named'),
+        [
+            ({'reviewer': 'security'}, ('security', 'test_analyst')),
+            ({'verdict': 'GARBAGE'}, ('PASS', 'ISSUES_FOUND')),
+        ],
+    )
+    async def test_identity_and_verdict_checks_run_before_the_issue_check(
+        self, artifacts, overrides, named,
+    ):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.DESCRIPTION)], **overrides,
+        )
+
+        assert result['status'] == 'error'
+        for name in named:
+            assert name in result['message']
+        assert 'issues[' not in result['message']
+        assert 'issue_contract' not in result
+        assert artifacts.read_verdict('test_analyst') is None
+
+
 @pytest.mark.asyncio
 class TestIssueContractJournal:
     """The registered tool journals every off-contract intake as one
@@ -371,59 +403,49 @@ class TestIssueContractJournal:
     the durable record the markup guard's facts already land in.
     """
 
-    async def _call(
-        self, artifacts: TaskArtifacts, root: Path | None, issues: list[dict[str, Any]],
-    ) -> Any:
-        artifacts.write_plan({
-            'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
-            'prerequisites': [], 'steps': [],
-        })
-        server = create_server(
-            artifacts, 'test_analyst', resolve_project_root=lambda _wt: root,
-        )
-        async with Client(server) as client:
-            return await client.call_tool('submit_review_verdict', {
-                'reviewer': 'test_analyst',
-                'verdict': 'ISSUES_FOUND',
-                'issues': issues,
-                'summary': 'x',
-            })
-
     async def test_a_normalised_intake_is_journalled_once(self, artifacts, tmp_path):
-        result = await self._call(artifacts, tmp_path, [_contract_issue(severity='high')])
+        result = await _call_review_tool(
+            artifacts, [contract_issue(severity='high')], journal_root=tmp_path,
+        )
 
-        assert result.data['status'] == 'ok'
+        assert result['status'] == 'ok'
         [line] = _journal_lines(tmp_path)
         assert line['fact'] == verdict_tools.REVIEW_ISSUE_OFF_CONTRACT_FACT
         assert (line['tool'], line['param'], line['outcome'], line['role']) == (
-            'submit_review_verdict', 'issues', 'normalised', 'test_analyst',
+            'submit_review_verdict', 'issues', IssueIntakeOutcome.NORMALISED, 'test_analyst',
         )
         assert line['subject_task_id'] == 'test-1'
         assert any(d.startswith('issues[0].severity') for d in line['deviations'])
 
-    async def test_a_rejected_intake_is_journalled_once(self, artifacts, tmp_path):
-        result = await self._call(
-            artifacts, tmp_path, [_contract_issue_without('description')],
+    async def test_a_refused_intake_is_journalled_once(self, artifacts, tmp_path):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.DESCRIPTION)], journal_root=tmp_path,
         )
 
-        assert result.data['status'] == 'error'
+        assert result['status'] == 'error'
         [line] = _journal_lines(tmp_path)
-        assert line['outcome'] == 'rejected'
+        assert line['outcome'] == IssueIntakeOutcome.REFUSED
         assert any(d.startswith('issues[0].description') for d in line['deviations'])
 
     async def test_a_clean_intake_writes_no_journal_line(self, artifacts, tmp_path):
-        result = await self._call(artifacts, tmp_path, [_contract_issue()])
+        result = await _call_review_tool(artifacts, [contract_issue()], journal_root=tmp_path)
 
-        assert result.data == {'status': 'ok', 'role': 'test_analyst'}
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
         assert not markup_journal.journal_path(
             tmp_path, verdict_tools.MARKUP_SINK_SPEC.server_label,
         ).exists()
 
     async def test_an_unresolvable_journal_root_does_not_break_the_call(self, artifacts):
-        result = await self._call(artifacts, None, [_contract_issue(severity='high')])
+        result = await _call_review_tool(artifacts, [contract_issue(severity='high')])
 
-        assert result.data['status'] == 'ok'
+        assert result['status'] == 'ok'
         assert artifacts.read_verdict('test_analyst') is not None
+
+
+def test_intake_outcomes_tell_a_floored_journal_line_from_a_markup_fact():
+    """``fact`` is not a journal floor key, but ``outcome`` is."""
+    assert 'outcome' in markup_journal.MARKUP_JOURNAL_FLOOR_KEYS
+    assert not {str(outcome) for outcome in IssueIntakeOutcome} & set(MARKUP_OUTCOMES)
 
 
 class TestSingletonRoleToolsDisjointFromReviewerNames:

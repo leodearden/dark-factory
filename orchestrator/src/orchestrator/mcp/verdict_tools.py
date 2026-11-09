@@ -23,6 +23,7 @@ import logging
 import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,9 @@ from fastmcp import FastMCP
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import (
+    OUTCOMES as MARKUP_OUTCOMES,
+)
 from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -130,6 +134,17 @@ def _submit_review_verdict(
     return ack
 
 
+class IssueIntakeOutcome(StrEnum):
+    """The ``issue_contract.outcome`` of a reviewer call and of its journal line.
+
+    Disjoint from the markup guard's ``OUTCOMES``, so a journal line cut down
+    to its floor keys still says which kind of record it is.
+    """
+
+    NORMALISED = 'normalised'
+    REFUSED = 'refused'
+
+
 def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
     deviations = [d.describe() for d in intake.unusable]
     return {
@@ -141,7 +156,7 @@ def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
             'severity and description on every issue (or drop the issue) and '
             'the verdict will land.'
         ),
-        'issue_contract': {'outcome': 'rejected', 'deviations': deviations},
+        'issue_contract': {'outcome': IssueIntakeOutcome.REFUSED, 'deviations': deviations},
     }
 
 
@@ -155,7 +170,7 @@ def _issue_contract_normalised(intake: IssueIntake) -> dict[str, Any]:
             'call replaces this verdict.'
         ),
         'issue_contract': {
-            'outcome': 'normalised',
+            'outcome': IssueIntakeOutcome.NORMALISED,
             'deviations': [d.describe() for d in intake.normalised],
         },
     }
@@ -220,6 +235,8 @@ def _submit_merge_disposition(
 _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 
 
+_MARKUP_OUTCOMES_AS_JQ = ', '.join(f'"{outcome}"' for outcome in MARKUP_OUTCOMES)
+
 #: verdict-tools' declaration of its own escalation channel (task 3690).
 #: Every field is stated here rather than defaulted inside ``markup_sink``:
 #: adding a server to the shared channel must be a decision at every axis, not
@@ -254,7 +271,11 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
         f'to {markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl under '
         'the main checkout — each line carries subject_task_id, tool, param, '
         'outcome and a UTC timestamp, so the leaking task is nameable from the '
-        "burst window's own lines (jq or grep '\"subject_task_id\"'); note "
+        "burst window's own lines. The same file also journals reviewer "
+        f'issue-contract facts (fact "{REVIEW_ISSUE_OFF_CONTRACT_FACT}"), so '
+        'select the markup lines by their outcome, which the two kinds never '
+        "share and which survives a line cut to its floor keys: jq 'select("
+        f'.outcome | IN({_MARKUP_OUTCOMES_AS_JQ}))\'; note '
         'that under FORWARD_REPAIR a REPAIRED call is never bounced and never '
         'reaches this escalation channel at all, so the journal is the only '
         'place a repair is visible'
@@ -311,7 +332,8 @@ def _markup_fact_journal(
     thread: a verdict can be refused before its plan is readable.
 
     The same journal also receives the review-issue contract facts, told apart
-    by their ``fact`` key (``REVIEW_ISSUE_OFF_CONTRACT_FACT``).
+    by their ``fact`` key (``REVIEW_ISSUE_OFF_CONTRACT_FACT``) and, on a line
+    cut to its floor keys, by their ``outcome`` (``IssueIntakeOutcome``).
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
