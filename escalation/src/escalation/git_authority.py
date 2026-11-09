@@ -45,7 +45,7 @@ from typing import Any
 
 from shared.branch_names import canonical_queued_branch_name
 from shared.merge_state import MergeState
-from shared.task_read import TaskAbsent, TaskFound, TaskReadFailed
+from shared.task_read import TaskAbsent, TaskFound
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +237,10 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
             ``'merge_request'``), interpolated into the degradation
             warning.  Without it a scheduler fault on the SUBMIT path was
             logged as a merge_status failure, so an operator grepping for a
-            submit-path degradation would not find it (review #3).
+            submit-path degradation would not find it (review #3).  Why a
+            read failed is logged once, by its owner
+            ``orchestrator/src/orchestrator/scheduler.py::Scheduler.read_task``;
+            this warning adds only the site and what it skipped.
     """
     if harness is None:
         return TaskMetadataResult(metadata={}, unavailable=True)
@@ -258,9 +261,9 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     if isinstance(read, TaskFound):
         return TaskMetadataResult(metadata=read.task.get('metadata') or {})
     logger.warning(
-        '%s: scheduler.read_task(%s) could not read the task (%s) — proceeding '
-        'without task metadata (degeneracy check skipped)',
-        site, tid, read.reason if isinstance(read, TaskReadFailed) else repr(read),
+        '%s: task %s metadata unavailable — proceeding without it '
+        '(degeneracy check skipped)',
+        site, tid,
     )
     return TaskMetadataResult(metadata={}, unavailable=True)
 

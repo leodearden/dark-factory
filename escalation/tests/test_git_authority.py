@@ -146,15 +146,18 @@ class TestGitAuthorityArm:
 _BACKEND_FAULT_REASON = "get_task error='boom', error_type='BackendUnavailable'"
 
 
+_NO_SUCH_TASK = TaskAbsent()
+
+
 def _harness(
-    *, read: Any = None, raises: bool = False, with_scheduler: bool = True,
+    *, read: Any = _NO_SUCH_TASK, raises: bool = False, with_scheduler: bool = True,
 ) -> types.SimpleNamespace:
     """Build the minimal duck-typed harness ``task_metadata`` reads.
 
     The function touches nothing but ``harness.scheduler.read_task``, which is
     why it can be exercised with a two-attribute SimpleNamespace and no MCP
     server anywhere in sight.  *read* is what ``read_task`` answers: a
-    ``shared.task_read`` outcome.
+    ``shared.task_read`` outcome, by default the healthy "no such task".
     """
     harness = types.SimpleNamespace()
     if with_scheduler:
@@ -290,9 +293,12 @@ class TestTaskMetadata:
         )
         assert 'merge_status' not in caplog.text
 
-    async def test_failed_read_is_logged_with_the_site_label_and_the_reason(
+    async def test_failed_read_is_logged_with_the_site_label_not_the_reason(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """``Scheduler.read_task`` owns the reason's WARNING; repeating it here
+        logged one fault twice.
+        """
         with caplog.at_level(logging.WARNING):
             await task_metadata(
                 _harness(read=TaskReadFailed(_BACKEND_FAULT_REASON)),
@@ -300,7 +306,8 @@ class TestTaskMetadata:
             )
 
         assert 'merge_request' in caplog.text
-        assert 'BackendUnavailable' in caplog.text
+        assert '4887' in caplog.text
+        assert 'BackendUnavailable' not in caplog.text
 
 
 class TestTaskMetadataResult:

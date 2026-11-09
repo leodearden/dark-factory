@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import types
 from pathlib import Path
 from typing import Any
@@ -556,6 +557,20 @@ class TestRealSchedulerReadFeedsLaneSource:
         assert result.get('status') == 'queued', result
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'unavailable', result
+
+    async def test_a_fused_memory_error_reply_logs_its_reason_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level(logging.WARNING)
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'fused-memory backend unreachable', 'error_type': 'TaskmasterError'},
+        )
+        await _submit_nonblocking(tmp_path, harness)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len([m for m in warnings if 'TaskmasterError' in m]) == 1, warnings
+        assert any('merge_request' in m and '4888' in m for m in warnings), warnings
 
     async def test_no_such_task_reports_the_default(self, tmp_path: Path):
         harness = _real_scheduler_harness(
