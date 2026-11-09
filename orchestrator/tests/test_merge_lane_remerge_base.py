@@ -290,6 +290,18 @@ class TestChooseRemergeBase:
         ]
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VACATED)
 
+    async def test_a_vacated_link_below_the_tip_vacates_it(
+        self, config: OrchestratorConfig, verifies: Verifies,
+    ) -> None:
+        frontier = [
+            _entry(
+                config, 'v', base=_MAIN, commit='sha-v', verify=verifies.pending(),
+                status=InflightStatus.DROPPED,
+            ),
+            _entry(config, 'w', base='sha-v', commit='sha-w', verify=verifies.pending()),
+        ]
+        assert _choose('sha-w', frontier) == RemergeBase(None, RemergeReason.TIP_VACATED)
+
     async def test_owner_without_a_verify(self, config: OrchestratorConfig) -> None:
         frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=None)]
         assert _choose('sha-a', frontier) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)

@@ -63,7 +63,15 @@ from _merge_lane_fakes import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_lane.types import InflightStatus, QueuedBranch, VerifyBaseDivergence
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    QueuedBranch,
+    RemergeBase,
+    RemergeReason,
+    SpecPermit,
+    VerifyBaseDivergence,
+)
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -948,8 +956,12 @@ def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
     consumer.  (Named, not line-numbered: line numbers in this ~17k-line
     module rot within a release; PRD §5.3 carries the numbered list and is
     reconciled at close-out.)
+
+    Task 8524 narrowed the marker to a recovery re-merge that FELL TO MAIN
+    (plans/merge-lane-policy-prd.md D1): that is the only recovery item the
+    carve-out still exempts.
     """
-    return dataclasses.replace(item, remerge_recovery=True)
+    return dataclasses.replace(item, remerge_base=RemergeBase(None, RemergeReason.NO_TIP))
 
 
 @pytest.mark.asyncio
@@ -1685,80 +1697,67 @@ class TestVerifyBaseDetectorKey:
 
 
 class TestRemergeReturnPathParity:
-    """Every item `_remerge` can produce carries `remerge_recovery=True`.
-
-    CHARACTERIZATION / chokepoint pin (task regression item 3), modelled on
-    task 3082's on_requeued/_note_requeue pairing test and task 3204's
-    `_requeue_request` chokepoint parity test.
+    """Every item `_remerge` produces carries the claim it was given.
 
     `_remerge` is the SINGLE PRODUCER of recovery items for all five consumer
     paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
     void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
-    dead-base-straggler and Mechanism-2 sites).  That is only true while EVERY
-    exit stamps the marker — an exit that escaped it would silently escape the
-    PRD §5.3 carve-out and start crying wolf again at both §5.3 surfaces.
-
-    MADE TRUE BY CONSTRUCTION, not pinned by shape (review remediation).  The
-    body's many early returns live in `_remerge_inner`; `_remerge` itself is a
-    wrapper with ONE exit that stamps the marker on whatever came back.  So
-    the test below is BEHAVIOURAL — it feeds `_remerge` an arbitrary unmarked
-    item (both union arms) and asserts the stamp — and holds for return paths
-    that do not exist yet.  It replaces an AST walk that asserted `_remerge`
-    contained exactly five `return <Ctor>(...)` nodes each with a literal
-    `remerge_recovery=True` keyword: that pinned implementation shape (a
-    harmless extract-a-local refactor turned it red) while still being unable
-    to catch a path returning a pre-built item.  Do not reinstate it.
+    dead-base-straggler and Mechanism-2 sites).  Its single exit stamps the
+    claim's anchor as `remerge_base` and the claim's permit on whatever
+    `_remerge_inner` returned, so the speculative <=> permit invariant
+    (plans/merge-lane-policy-prd.md §6) holds for every present and future
+    return path of the body, and the §5.3 detector reads the anchor rather
+    than a separately maintained flag (task 8524).
     """
 
     @pytest.mark.asyncio
-    async def test_remerge_stamps_the_marker_on_every_exit(
+    async def test_remerge_stamps_the_claim_on_every_exit(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """Whatever `_remerge_inner` returns, `_remerge` returns it MARKED.
-
-        Covers both arms of the item union — `_remerge` can return either —
-        and, because the stamp is unconditional at the single exit, covers
-        every present and future return path inside the body.
-        """
+        """Whatever `_remerge_inner` returns, `_remerge` returns it stamped
+        with the claim, for both union arms and both kinds of anchor."""
         import unittest.mock as mock
 
         worker = _make_worker(git_ops)
+        claims = (
+            RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None),
+            RemergeClaim(RemergeBase('sha-tip', RemergeReason.LIVE_TIP), SpecPermit()),
+        )
+        for claim in claims:
+            for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
+                _, unmarked = _make_fake_item(
+                    f't-recovery-{label}', base_sha='real-main',
+                    merge_commit=merge_commit, config=config, git_repo=git_repo,
+                )
+                assert unmarked.remerge_base is None, 'fixture must start unmarked'
+                anchors: list[RemergeBase] = []
 
-        for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
-            _, unmarked = _make_fake_item(
-                f't-recovery-{label}', base_sha='real-main',
-                merge_commit=merge_commit, config=config, git_repo=git_repo,
-            )
-            assert unmarked.remerge_recovery is False, 'fixture must start unmarked'
+                # Patch on the INSTANCE, not the class: an instance attribute
+                # is not re-bound, so the defaults survive the call.
+                async def _body(
+                    _req: object, _mono: object, anchor: RemergeBase,
+                    _item: SpeculativeItem = unmarked, _seen: list[RemergeBase] = anchors,
+                ) -> SpeculativeItem:
+                    _seen.append(anchor)
+                    return _item
 
-            # Patch on the INSTANCE, not the class: an instance attribute is
-            # not re-bound, so `_item`'s default survives the call.
-            async def _body(_req: object, _mono: object, _item=unmarked) -> SpeculativeItem:
-                return _item
+                with mock.patch.object(worker, '_remerge_inner', _body):
+                    out = await worker._remerge(unmarked.request, None, claim=claim)
 
-            with mock.patch.object(worker, '_remerge_inner', _body):
-                out = await worker._remerge(unmarked.request, None)
-
-            assert out.remerge_recovery is True, (
-                f'§5.3 CARVE-OUT ESCAPE (task 3206): _remerge returned an '
-                f'UNMARKED {label} item. The single-exit chokepoint must stamp '
-                f'remerge_recovery on whatever the body returns — an unmarked '
-                f'recovery item re-introduces the class-(b) false positives at '
-                f'BOTH §5.3 surfaces. See PRD §5.3.'
-            )
-            # The stamp must be the ONLY difference: dataclasses.replace copies
-            # every other field, so a recovery item is otherwise byte-identical.
-            assert dataclasses.replace(out, remerge_recovery=False) == unmarked, (
-                f'_remerge altered the {label} item beyond the §5.3 marker'
-            )
+                assert anchors == [claim.anchor], f'{label}: the body merges onto the claim'
+                assert out.remerge_base == claim.anchor, f'{label}: anchor not stamped'
+                assert out.permit is claim.permit, f'{label}: permit not handed over'
+                assert dataclasses.replace(out, remerge_base=None, permit=None) == unmarked, (
+                    f'_remerge altered the {label} item beyond the claim'
+                )
 
     def test_remerge_has_a_single_exit(self) -> None:
-        """The chokepoint above is only load-bearing while `_remerge` has ONE exit.
+        """The stamp above is only load-bearing while `_remerge` has ONE exit.
 
-        Deliberately the whole of the structural check (see the class
-        docstring): not what the exits construct, only that there is exactly
-        one, so no path can bypass the stamp.  If you need another return in
-        `_remerge`, put it in `_remerge_inner` instead.
+        Deliberately the whole of the structural check: not what the exits
+        construct, only that there is exactly one, so no path can bypass the
+        stamp.  If you need another return in `_remerge`, put it in
+        `_remerge_inner` instead.
         """
         import ast
         import inspect
@@ -1770,27 +1769,26 @@ class TestRemergeReturnPathParity:
         returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
 
         assert len(returns) == 1, (
-            f'_remerge must have exactly ONE exit — it is the single chokepoint '
-            f'that stamps the §5.3 remerge_recovery marker (task 3206); found '
-            f'{len(returns)}. Move the new return into _remerge_inner, or the '
-            f'marker stops holding by construction.'
+            f'_remerge must have exactly ONE exit -- it is the single chokepoint '
+            f'that stamps the claim (remerge_base + permit, task 8524); found '
+            f'{len(returns)}. Move the new return into _remerge_inner.'
         )
 
-    def test_marker_defaults_false_on_both_item_variants(self) -> None:
-        """Only `_remerge` may produce recovery items.
-
-        The default must stay False so every OTHER construction site — and
-        every `dataclasses.replace` relabel/put-back, which copies all fields
-        — is unaffected by the carve-out. A default of True would exempt the
-        entire pipeline from §5.3 in one character.
-        """
+    def test_anchor_defaults_to_none_on_both_item_variants(self) -> None:
+        """Only `_remerge` produces recovery items, and the old boolean marker
+        is gone: the anchor is the one fact (task 8524)."""
         from orchestrator.merge_lane.types import DecidedItem as _DI
         from orchestrator.merge_lane.types import RealMergeItem as _RMI
 
         for cls in (_RMI, _DI):
-            field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']
-            assert field.default is False, (
-                f'{cls.__name__}.remerge_recovery must default to False, got '
-                f'{field.default!r} — a True default would exempt every item '
-                f'from the §5.3 guard (task 3206).'
-            )
+            fields = {f.name: f for f in dataclasses.fields(cls)}
+            assert fields['remerge_base'].default is None, cls.__name__
+            assert 'remerge_recovery' not in fields, cls.__name__
+
+    @pytest.mark.asyncio
+    async def test_the_recovery_marker_is_a_fall_to_main(
+        self, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        _, item = _make_fake_item('t-mark', config=config, git_repo=git_repo)
+        marked = _mark_recovery(item)
+        assert marked.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)

@@ -47,12 +47,16 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.speculation_controller import PermitLedger
+from orchestrator.merge_lane.types import MergeRequest, RemergeBase, RemergeReason, SpecPermit
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
     MergeOutcome,
     RealMergeItem,
+    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify_runner import HostLease
@@ -670,3 +674,99 @@ class TestCascadeStragglerCaughtComposition:
 
         # INV-3, the invariant two_layer_invariants reports, reads clean.
         assert worker.two_layer_invariants(main_sha) == []
+
+
+# ── task 8524: a recovery re-merge lands on the base its claim names ─────────
+
+
+def _ledger(worker: SpeculativeMergeWorker) -> PermitLedger[SpecPermit]:
+    return worker._speculation_ledger
+
+
+async def _remerge(
+    worker: SpeculativeMergeWorker, req: MergeRequest, claim: RemergeClaim | None = None,
+) -> SpeculativeItem:
+    remerge = worker._remerge
+    if claim is None:
+        return await remerge(req, None)
+    return await remerge(req, None, claim=claim)
+
+
+@pytest.mark.asyncio
+class TestRemergeOntoTheClaimedBase:
+    """``_remerge`` merges onto the claim's anchor and hands the replacement
+    the claim's permit (plans/merge-lane-policy-prd.md D1)."""
+
+    async def test_a_live_tip_claim_stacks_the_replacement_on_the_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        _, item_a = await _make_merged_item(git_ops, config, 'task/tip-a', 'ta.py', 'a=1\n')
+        req_b, _ = await _make_merged_item(git_ops, config, 'task/tip-b', 'tb.py', 'b=1\n')
+        tip = item_a.merge_result.merge_commit
+        assert tip is not None
+        permit = await _ledger(worker).acquire()
+        claim = RemergeClaim(RemergeBase(tip, RemergeReason.LIVE_TIP), permit)
+
+        out = await _remerge(worker, req_b, claim)
+
+        assert isinstance(out, RealMergeItem)
+        assert out.base_sha == tip
+        assert out.speculative is True
+        assert out.permit is permit
+        assert out.remerge_base == claim.anchor
+        commit = out.merge_result.merge_commit
+        assert commit is not None
+        rc, _, _ = await _run(['git', 'merge-base', '--is-ancestor', tip, commit], cwd=git_repo)
+        assert rc == 0, "the replacement's tree must contain the tip's"
+
+    async def test_a_main_claim_merges_onto_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        req, _ = await _make_merged_item(git_ops, config, 'task/main-claim', 'mc.py', 'm=1\n')
+        claim = RemergeClaim(RemergeBase(None, RemergeReason.TIP_DEAD), None)
+
+        out = await _remerge(worker, req, claim)
+
+        assert isinstance(out, RealMergeItem)
+        assert out.base_sha == await git_ops.get_main_sha()
+        assert out.speculative is False
+        assert out.permit is None
+        assert out.remerge_base == claim.anchor
+
+    async def test_no_claim_on_an_empty_frontier_falls_to_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        req, _ = await _make_merged_item(git_ops, config, 'task/no-claim', 'nc.py', 'n=1\n')
+
+        out = await _remerge(worker, req)
+
+        assert isinstance(out, RealMergeItem)
+        assert out.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
+        assert out.base_sha == await git_ops.get_main_sha()
+        assert out.speculative is False
+        assert out.permit is None
+        assert _ledger(worker).live == frozenset()
+
+    async def test_a_failed_remerge_releases_the_claimed_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        import unittest.mock as mock
+
+        worker = _make_worker(git_ops)
+        req, _ = await _make_merged_item(git_ops, config, 'task/raise', 'rs.py', 'r=1\n')
+        permit = await _ledger(worker).acquire()
+        claim = RemergeClaim(RemergeBase('sha-tip', RemergeReason.LIVE_TIP), permit)
+
+        with (
+            mock.patch.object(
+                worker, '_remerge_inner', AsyncMock(side_effect=RuntimeError('merge blew up')),
+            ),
+            pytest.raises(RuntimeError, match='merge blew up'),
+        ):
+            await _remerge(worker, req, claim)
+
+        assert permit.released is True
+        assert _ledger(worker).live == frozenset()
