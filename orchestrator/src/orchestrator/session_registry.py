@@ -2942,11 +2942,11 @@ def reap_stale_records(
       reason='stale_pid'. A T3-hosted
       record (``display.kind == 't3'``) is exempt while
       ``_t3_thread_sweep_owns`` holds, since its liveness is its thread.
+    - otherwise -> kept.
 
     Every non-terminal record is first passed to
     ``_index_t3_record_if_unheld``, so this sweep also writes the thread
     pointer of a live t3 record whose thread no pointer holds.
-    - otherwise -> kept.
 
     Directories are visited in ``sorted(iterdir())`` order (directory-name
     order, not age order).
