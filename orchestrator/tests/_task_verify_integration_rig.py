@@ -68,10 +68,12 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.remote_gate import GateIdentity
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.task_verify_dispatch import TaskVerifyDispatcher
 from orchestrator.task_verify_spec import TaskVerifySpec, build_task_verify_spec
 from orchestrator.verify import VerifyResult, admission_policy
 from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPlan, gate_for
 from orchestrator.verify_cancel import kill_process_tree, read_worktree_path
+from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import RemoteRunner, result_to_json
 from orchestrator.workflow import TaskWorkflow, build_workflow
 from orchestrator.workflow_types import TerminalReport
@@ -643,11 +645,11 @@ class Scene:
         return _git(self.worktree, 'rev-parse', 'HEAD')
 
     @property
-    def pool(self) -> Any:
+    def pool(self) -> HostPool:
         return self.harness._host_pool
 
     @property
-    def dispatcher(self) -> Any:
+    def dispatcher(self) -> TaskVerifyDispatcher:
         return self.harness._task_verify_dispatcher
 
     @property

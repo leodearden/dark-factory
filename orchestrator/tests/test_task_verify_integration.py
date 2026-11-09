@@ -725,6 +725,7 @@ class TestHostHealthWithTheMergeWorker:
             call = scene.start([scene.module(MODULE)])
             task_request = await scene.laptop.until_verifying('verify-task')
             merge_runner = scene.worker.ensure_host_allocator(scene.config).remote_runner(LAPTOP)
+            assert merge_runner is not None
             task_runner = scene.runners.built[-1]
 
             assert task_runner is not merge_runner
