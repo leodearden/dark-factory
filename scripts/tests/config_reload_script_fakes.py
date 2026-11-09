@@ -298,8 +298,14 @@ class ClosedPort:
         return self._holder.getsockname()[1]
 
     def __enter__(self):
+        if self._holder is not None:
+            raise RuntimeError("ClosedPort is already held; enter a fresh one")
         holder = socket.socket()
-        holder.bind(("127.0.0.1", 0))
+        try:
+            holder.bind(("127.0.0.1", 0))
+        except BaseException:
+            holder.close()
+            raise
         self._holder = holder
         return self
 
