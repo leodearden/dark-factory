@@ -31,7 +31,7 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Awaitable, Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -42,6 +42,7 @@ import openai
 import pytest
 from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import sdk_client_double
+from _unreached_provider import skip_if_provider_unreached
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -2916,6 +2917,19 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert counter.live_count() == 0
 
 
+def _frontier_arm_judge(
+    verdicts: list[TriageJudgeVerdict],
+) -> Callable[..., Awaitable[TriageJudgeVerdict]]:
+    """`judge_write`, recording each verdict into *verdicts*; it skips only when the provider was never reached."""
+
+    async def _judge(**kwargs: Any) -> TriageJudgeVerdict:
+        verdict = await skip_if_provider_unreached(judge_write(**kwargs))
+        verdicts.append(verdict)
+        return verdict
+
+    return _judge
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     not os.environ.get('OPENAI_API_KEY'),
@@ -2950,16 +2964,10 @@ class TestTheFrontierArmLive:
             config=config, search=AsyncMock(return_value=SearchResults(slate)),
         )
         verdicts: list[TriageJudgeVerdict] = []
-
-        async def recording_judge(**kwargs) -> TriageJudgeVerdict:
-            verdict = await judge_write(**kwargs)
-            verdicts.append(verdict)
-            return verdict
-
         counter = TriageFailOpenCounter()
         decision = await triage_write(
             service, content=duplicate['content'], project_id='p',
-            counter=counter, judge=recording_judge,
+            counter=counter, judge=_frontier_arm_judge(verdicts),
         )
 
         assert counter.live_count() == 0
@@ -3048,15 +3056,17 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
 async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
     """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
-    A budget expiry, a provider 5xx and a provider 429 each yield no verdict, so they say nothing
-    about the wording. Connection errors, SDK timeouts, other 4xx and unusable answers stay red,
-    and so does a 429 whose code is `insufficient_quota`: an account out of credit is a lasting
-    fault, and skipping it would silently retire every wording check on every run.
-    TestTheFrontierArmLive keeps a timeout red: it is the live edge for the fail-open/latency
-    dimension.
+    A budget expiry, a provider 5xx, a transient 429 and a connect timeout (the provider was
+    never reached) each yield no verdict, so they say nothing about the wording. Connection
+    errors other than a connect timeout, read or SDK timeouts with no connect-timeout cause,
+    other 4xx and unusable answers stay red, and so does a 429 whose code is
+    `insufficient_quota`: an account out of credit is a lasting fault, and skipping it would
+    silently retire every wording check on every run.
+    TestTheFrontierArmLive skips only an unreached provider and keeps a judge-budget expiry
+    red: it is the live edge for the fail-open/latency dimension.
     """
     try:
-        return await judge_write(**judge_kwargs)
+        return await skip_if_provider_unreached(judge_write(**judge_kwargs))
     except TimeoutError:
         service = judge_kwargs['memory_service']
         pytest.skip(
@@ -3090,7 +3100,7 @@ def _raises_without_skipping(
 
 
 class TestTheLiveWordingBudgetGuard:
-    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx or a transient 429; the rest stays red."""
+    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx, a transient 429 or an unreached provider; the rest stays red."""
 
     @staticmethod
     def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
@@ -3246,8 +3256,8 @@ class TestTheShippedWordingLive:
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
     the old wording too, so only Sol tells the two wordings apart. A call past
-    the judge budget, or one the provider answers with a 5xx or a transient
-    429, skips through `_live_judge_verdict`.
+    the judge budget, one the provider answers with a 5xx or a transient 429,
+    or one that never reaches the provider, skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
