@@ -100,11 +100,11 @@ def _cut_at(cap: int) -> str:
     return CONTESTING_BODY[:cap] + elision_marker(len(CONTESTING_BODY) - cap)
 
 
-async def _contested_entry(contested_text_chars: int) -> dict[str, Any]:
+async def _contested_entry(amendment_text_chars: int) -> dict[str, Any]:
     service = _service([_PLAIN_ROW, _contesting_row()])
 
     block = await build_grouped_document(
-        service, PROJECT_ID, P, contested_text_chars=contested_text_chars,
+        service, PROJECT_ID, P, amendment_text_chars=amendment_text_chars,
     )
 
     assert block is not None
@@ -113,13 +113,11 @@ async def _contested_entry(contested_text_chars: int) -> dict[str, Any]:
 
 class TestTheGroupedDocumentCarriesTheContestedText:
     @pytest.mark.asyncio
-    async def test_a_contested_amendment_carries_its_whole_text_beside_its_digest(self) -> None:
+    async def test_a_contested_amendment_carries_its_whole_text_and_its_flag(self) -> None:
         entry = await _contested_entry(len(CONTESTING_BODY) + 100)
 
         assert entry['content'] == CONTESTING_BODY
         assert entry['contested'] is True
-        assert entry['digest'] != CONTESTING_BODY
-        assert entry['digest'].endswith('…')
 
     @pytest.mark.asyncio
     async def test_text_exactly_at_the_cap_is_carried_unmarked(self) -> None:
@@ -132,17 +130,6 @@ class TestTheGroupedDocumentCarriesTheContestedText:
         entry = await _contested_entry(50)
 
         assert entry['content'] == _cut_at(50)
-
-    @pytest.mark.asyncio
-    async def test_an_uncontested_amendment_carries_no_content(self) -> None:
-        service = _service([_PLAIN_ROW, _contesting_row()])
-
-        block = await build_grouped_document(service, PROJECT_ID, P, contested_text_chars=50)
-
-        assert block is not None
-        plain = _entry_for(block['amendments'], PLAIN_ID)
-        assert 'content' not in plain
-        assert plain['digest'] == PLAIN_BODY
 
     @pytest.mark.asyncio
     async def test_with_no_cap_named_the_judges_shipped_default_applies(self) -> None:
@@ -162,7 +149,7 @@ class TestTheGroupedEntryPointsForwardTheCap:
         service = _service([_PLAIN_ROW, _contesting_row()])
 
         results = await group_search_results(
-            service, PROJECT_ID, [_parent_hit()], contested_text_chars=50,
+            service, PROJECT_ID, [_parent_hit()], amendment_text_chars=50,
         )
 
         entry = _entry_for(results[0]['grouped']['amendments'], CONTESTING_ID)
@@ -186,51 +173,12 @@ class TestTheGroupedEntryPointsForwardTheCap:
         )
 
         grouped = await group_memory_document(
-            service, PROJECT_ID, memory_id, record, contested_text_chars=50,
+            service, PROJECT_ID, memory_id, record, amendment_text_chars=50,
         )
 
         assert grouped is not None
         entry = _entry_for(block_of(grouped)['amendments'], CONTESTING_ID)
         assert entry['content'] == _cut_at(50)
-
-
-_ENTRY_POINTS = [
-    pytest.param(
-        lambda service, cap: build_grouped_document(
-            service, PROJECT_ID, P, contested_text_chars=cap,
-        ),
-        id='build_grouped_document',
-    ),
-    pytest.param(
-        lambda service, cap: group_search_results(
-            service, PROJECT_ID, [_parent_hit()], contested_text_chars=cap,
-        ),
-        id='group_search_results',
-    ),
-    pytest.param(
-        lambda service, cap: group_memory_document(
-            service, PROJECT_ID, PLAIN_ID, _PLAIN_RECORD, contested_text_chars=cap,
-        ),
-        id='group_memory_document',
-    ),
-]
-
-
-class TestABadCapIsTheCallersErrorNotABackendFault:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('read', _ENTRY_POINTS)
-    @pytest.mark.parametrize('cap', [0, -1, True, 50.0])
-    async def test_it_is_rejected_by_name_before_any_child_read(
-        self, read: Any, cap: Any,
-    ) -> None:
-        service = _service([_PLAIN_ROW, _contesting_row()], {P: _PARENT_RECORD})
-
-        with pytest.raises(ValueError, match=rf'contested_text_chars.*{cap!r}'):
-            await read(service, cap)
-
-        service.count_memories_by_metadata.assert_not_awaited()
-        service.get_memories_by_metadata.assert_not_awaited()
-        service.get_memory_by_id.assert_not_awaited()
 
 
 def _tool_service(judge_field_chars: int) -> AsyncMock:

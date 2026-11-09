@@ -2,7 +2,7 @@
 
 step-1 (RED) / step-2 (GREEN):
   ``build_grouped_document`` turns a canonical id into ONE grouped block —
-  bounded amendment digests plus an EXACT sighting count — over the three
+  bounded amendment entries plus an EXACT sighting count — over the three
   landed Mem0 read primitives (``count_memories_by_metadata`` /
   ``get_memories_by_metadata`` / ``get_memory_by_id``).
 
@@ -29,9 +29,7 @@ from fused_memory.memory_metadata import (
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
-    _AMENDMENT_DIGEST_CAP,
-    _DIGEST_CHARS,
-    _DIGEST_ELLIPSIS,
+    _AMENDMENT_LIST_CAP,
     _MAX_CONCURRENT_GROUP_READS,
     AMENDMENT_KIND,
     CHILD_KINDS,
@@ -42,6 +40,7 @@ from fused_memory.server.grouped_read import (
     PARENT_UNRESOLVED_KEY,
     SIGHTING_KIND,
     _suppress_child,
+    amendment_text,
     build_grouped_document,
     child_parent_id,
     group_memory_document,
@@ -172,50 +171,26 @@ class TestBuildGroupedDocument:
         )
 
     @pytest.mark.asyncio
-    async def test_digest_entry_shape(self):
-        """Each digest entry carries id / digest / created_at / kind."""
+    async def test_amendment_entry_shape(self):
+        """Each amendment entry carries id / content / created_at / kind, and no digest."""
         service = _stub_service(_two_amendments_three_sightings())
 
         block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
 
         assert block is not None
         for entry in block['amendments']:
-            assert set(entry) >= {'id', 'digest', 'created_at', 'kind'}, (
-                f'Digest entry must carry id/digest/created_at/kind, got {entry!r}'
+            assert set(entry) == {'id', 'content', 'created_at', 'kind'}, (
+                f'Amendment entry must carry id/content/created_at/kind, got {entry!r}'
             )
             assert entry['kind'] == AMENDMENT_KIND, (
-                f"Digest entry kind must be {AMENDMENT_KIND!r}, got {entry!r}"
+                f"Amendment entry kind must be {AMENDMENT_KIND!r}, got {entry!r}"
             )
         first = block['amendments'][0]
         assert first['id'] == _AMEND_1
-        assert first['digest'] == 'first correction', (
-            f"A short body must pass through VERBATIM, got {first['digest']!r}"
+        assert first['content'] == 'first correction', (
+            f"A short body must pass through VERBATIM, got {first['content']!r}"
         )
         assert first['created_at'] == '2026-08-01T00:00:00+00:00'
-
-    @pytest.mark.asyncio
-    async def test_long_body_truncated_to_named_cap_with_ellipsis(self):
-        """A long amendment body is truncated to _DIGEST_CHARS + an ellipsis marker."""
-        long_body = 'x' * (_DIGEST_CHARS + 500)
-        short_body = 'y' * (_DIGEST_CHARS - 1)
-        service = _stub_service([
-            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, long_body, '2026-08-01T00:00:00+00:00'),
-            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, short_body, '2026-08-02T00:00:00+00:00'),
-        ])
-
-        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
-
-        assert block is not None
-        long_digest, short_digest = block['amendments'][0], block['amendments'][1]
-        assert long_digest['digest'] == long_body[:_DIGEST_CHARS] + _DIGEST_ELLIPSIS, (
-            'A body longer than _DIGEST_CHARS must be cut at the named cap and '
-            f'marked with {_DIGEST_ELLIPSIS!r}, got len={len(long_digest["digest"])}'
-        )
-        assert short_digest['digest'] == short_body, (
-            'A body at or under _DIGEST_CHARS must pass through verbatim with NO '
-            f'ellipsis, got {short_digest["digest"][-5:]!r}'
-        )
-        assert not short_digest['digest'].endswith(_DIGEST_ELLIPSIS)
 
     @pytest.mark.asyncio
     async def test_digest_ordering_is_deterministic(self):
@@ -590,10 +565,10 @@ class TestNeverSuppressCarveOuts:
         block.update(overrides)
         return block
 
-    def test_child_listed_as_a_digest_is_represented(self):
+    def test_child_listed_as_an_amendment_is_represented(self):
         """The in-cap amendment case: present in `amendments` → suppressible."""
         block = self._block(
-            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+            amendments=[{'id': _AMEND_1, 'content': 'a correction'}], amendment_count=1
         )
 
         assert _suppress_child(_AMEND_1, {}, self._resolvable_parent(), block) is True
@@ -601,7 +576,7 @@ class TestNeverSuppressCarveOuts:
     def test_child_absent_from_the_block_is_never_suppressed(self):
         """The truncated-list case: a cap-sized sample listing only OTHER ids."""
         block = self._block(
-            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}],
+            amendments=[{'id': _AMEND_1, 'content': 'a correction'}],
             amendment_count=50,
             truncated=True,
         )
@@ -634,7 +609,7 @@ class TestNeverSuppressCarveOuts:
     def test_unusable_child_id_is_never_suppressed(self):
         """Neither pinnable nor verifiable → keep it, visibly."""
         block = self._block(
-            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+            amendments=[{'id': _AMEND_1, 'content': 'a correction'}], amendment_count=1
         )
 
         for bad_id in ('', None, 123, {'id': _AMEND_1}):
@@ -646,7 +621,7 @@ class TestNeverSuppressCarveOuts:
     def test_the_three_existing_carve_outs_still_short_circuit_first(self):
         """Cheapest and most specific first — their behaviour is unchanged."""
         represented = self._block(
-            amendments=[{'id': _AMEND_1, 'digest': 'a correction'}], amendment_count=1
+            amendments=[{'id': _AMEND_1, 'content': 'a correction'}], amendment_count=1
         )
 
         assert _suppress_child(_AMEND_1, {}, None, represented) is False, (
@@ -701,13 +676,17 @@ class TestNeverSuppressCarveOuts:
         )
 
 
-#: A matched child body deliberately LONGER than ``_DIGEST_CHARS``, so "the
+#: A matched child body deliberately LONGER than ``_LISTED_TEXT_CHARS``, so "the
 #: pinned entry carries the FULL text" cannot pass by accident on a short body.
 _MATCHED_TEXT = 'THE MATCHED TEXT — ' + ('the correction body says otherwise. ' * 20)
 
-#: The same, for a match that lands INSIDE the digest cap — distinct text so a
+#: The same, for a match that lands INSIDE the list cap — distinct text so a
 #: byte-for-byte comparison cannot be satisfied by the other child's body.
 _IN_CAP_TEXT = 'THE IN-CAP MATCHED TEXT — ' + ('the in-cap correction runs long. ' * 20)
+
+#: An ``amendment_text_chars`` shorter than both bodies above, so a listed entry
+#: is cut while a matched one must still carry its FULL body.
+_LISTED_TEXT_CHARS = 100
 
 
 class TestSuppressionRequiresRepresentation:
@@ -722,20 +701,20 @@ class TestSuppressionRequiresRepresentation:
         matched amendment beyond the cap simply is not in ``amendments``;
     (b) SIGHTING-ONLY MATCH — ``build_grouped_document`` scrolls
         ``kind='amendment'`` only, so a matched sighting can never be listed;
-    (c) IN-CAP MATCH WITH A LONG BODY — the child IS listed, but a digest is
-        truncated to ``_DIGEST_CHARS``, so "it is in the list" still hands
-        back less text than the ungrouped response carried.
+    (c) IN-CAP MATCH WITH A LONG BODY — the child IS listed, but a listed
+        entry's text is cut at ``amendment_text_chars``, so "it is in the
+        list" still hands back less text than the ungrouped response carried.
 
     The fix keeps BOTH goals: the canonical still absorbs its children
     (esc-5541 stays closed) AND the matched text stays reachable (D6), by
     carrying the swallowed child's full body — from the hit already in hand, at
-    zero extra backend reads — in a ``matched_children`` pin (a, b) or on the
-    existing digest entry alongside its truncated ``digest`` (c).
+    zero extra backend reads — in a ``matched_children`` pin (a, b) or as the
+    existing amendment entry's ``content`` in place of its cut text (c).
     """
 
     _FANOUT = 50
-    _MATCHED_INDEX = 30  # beyond _AMENDMENT_DIGEST_CAP: excluded from the scroll
-    _IN_CAP_INDEX = 2  # inside the cap: listed, but only as a TRUNCATED digest
+    _MATCHED_INDEX = 30  # beyond _AMENDMENT_LIST_CAP: excluded from the scroll
+    _IN_CAP_INDEX = 2  # inside the cap: listed, but with its text CUT
 
     @classmethod
     def _body(cls, index: int) -> str:
@@ -823,9 +802,6 @@ class TestSuppressionRequiresRepresentation:
             'the response BEFORE grouping, so truncating it would itself be the '
             f'retrieval regression, got {entry!r}'
         )
-        assert 'digest' not in entry, (
-            f'A pinned match is a full body, not a _DIGEST_CHARS digest, got {entry!r}'
-        )
         assert entry['kind'] == AMENDMENT_KIND
         assert entry['matched'] is True
         assert entry['created_at'] == '2026-08-01T00:00:30+00:00'
@@ -850,7 +826,7 @@ class TestSuppressionRequiresRepresentation:
             'amendment_count must stay the EXACT count API value, not len(digests) '
             f'and not len(digests) + pins, got {block!r}'
         )
-        assert len(block['amendments']) == _AMENDMENT_DIGEST_CAP, (
+        assert len(block['amendments']) == _AMENDMENT_LIST_CAP, (
             f'Pinning must not widen the bounded digest list, got {block["amendments"]!r}'
         )
         assert block.get('truncated') is True, (
@@ -932,13 +908,13 @@ class TestSuppressionRequiresRepresentation:
         )
 
     @pytest.mark.asyncio
-    async def test_in_cap_matched_amendment_carries_its_full_body_not_just_a_digest(self):
-        """(c) The COMMON case: in-cap, matched, and longer than ``_DIGEST_CHARS``.
+    async def test_in_cap_matched_amendment_carries_its_full_body_not_its_cut_text(self):
+        """(c) The COMMON case: in-cap, matched, and longer than the text cap.
 
-        Marking the digest ``matched`` and stopping there leaves only
-        ``_DIGEST_CHARS`` of a body the UNGROUPED response returned in full —
-        the grouped result would carry strictly less text than the one it
-        replaces, which is the retrieval regression itself.
+        Marking the entry ``matched`` and stopping there leaves only
+        ``amendment_text_chars`` of a body the UNGROUPED response returned in
+        full — the grouped result would carry strictly less text than the one
+        it replaces, which is the retrieval regression itself.
         """
         service = _stub_service([
             _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, _MATCHED_TEXT, '2026-08-01T00:00:00+00:00'),
@@ -949,25 +925,25 @@ class TestSuppressionRequiresRepresentation:
             self._matched_hit(_AMEND_1, AMENDMENT_KIND, 0.8, '2026-08-01T00:00:00+00:00'),
         ]
 
-        grouped = await group_search_results(service, _PROJECT_ID, hits)
+        assert amendment_text(_MATCHED_TEXT, _LISTED_TEXT_CHARS) != _MATCHED_TEXT, (
+            'PRECONDITION: this test is only meaningful while the matched body '
+            'exceeds the text cap and would therefore be CUT in the list'
+        )
+
+        grouped = await group_search_results(
+            service, _PROJECT_ID, hits, amendment_text_chars=_LISTED_TEXT_CHARS,
+        )
 
         assert [r['id'] for r in grouped] == [_CANONICAL_ID], (
             f'The collapse must still happen, got {[r["id"] for r in grouped]!r}'
         )
         block = grouped[0]['grouped']
         entry = {d['id']: d for d in block['amendments']}[_AMEND_1]
-        assert len(_MATCHED_TEXT) > _DIGEST_CHARS and entry['digest'].endswith(_DIGEST_ELLIPSIS), (
-            'PRECONDITION: this test is only meaningful while the matched body '
-            f'exceeds the digest cap and is therefore CUT in the list, got {entry!r}'
-        )
         assert entry['matched'] is True
         assert entry['content'] == _MATCHED_TEXT, (
-            'A matched digest must carry the child FULL body alongside its '
-            'truncated digest: that text was in the response BEFORE grouping, '
-            f'so grouping must not shorten it, got {entry!r}'
-        )
-        assert entry['digest'] != entry['content'], (
-            f'PRECONDITION: the two keys must genuinely differ here, got {entry!r}'
+            'A matched entry must carry the child FULL body, not its cut text: '
+            'that text was in the response BEFORE grouping, so grouping must '
+            f'not shorten it, got {entry!r}'
         )
 
     @pytest.mark.asyncio
@@ -1003,7 +979,7 @@ class TestSuppressionRequiresRepresentation:
         It has teeth in both directions.  Remove the pinning pass and the
         out-of-cap amendment and the sighting stop being represented, so they
         survive as top-level hits and the esc-5541 collapse assertion goes red.
-        Keep pinning but leave the in-cap match as a truncated digest and the
+        Keep pinning but leave the in-cap match with its cut text and the
         byte-for-byte comparison goes red.
 
         All three children are uncontested, with a resolvable parent and a
@@ -1034,12 +1010,14 @@ class TestSuppressionRequiresRepresentation:
         assert set(ungrouped) == {matched_id, _SIGHT_2, in_cap_id}, (
             f'PRECONDITION: three distinct child hits, got {sorted(ungrouped)!r}'
         )
-        assert all(len(body) > _DIGEST_CHARS for body in ungrouped.values()), (
-            'PRECONDITION: every child body must exceed the digest cap, or a '
+        assert all(len(body) > _LISTED_TEXT_CHARS for body in ungrouped.values()), (
+            'PRECONDITION: every child body must exceed the text cap, or a '
             f'truncating regression could pass unnoticed, got {ungrouped!r}'
         )
 
-        grouped = await group_search_results(service, _PROJECT_ID, hits)
+        grouped = await group_search_results(
+            service, _PROJECT_ID, hits, amendment_text_chars=_LISTED_TEXT_CHARS,
+        )
 
         by_id = {r['id']: r for r in grouped}
         assert set(by_id) == {_CANONICAL_ID}, (
@@ -1198,7 +1176,7 @@ class TestBoundedListingHonesty:
 
     @staticmethod
     def _wide_amendment_fanout(extra: int = 5) -> list[dict]:
-        total = _AMENDMENT_DIGEST_CAP + extra
+        total = _AMENDMENT_LIST_CAP + extra
         return [
             _child(
                 f'44444444-4444-4444-8444-{index:012d}',
@@ -1222,15 +1200,15 @@ class TestBoundedListingHonesty:
         block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
 
         assert block is not None
-        assert len(block['amendments']) == _AMENDMENT_DIGEST_CAP, (
-            f'The digest list must be bounded by _AMENDMENT_DIGEST_CAP '
-            f"({_AMENDMENT_DIGEST_CAP}), got {len(block['amendments'])}"
+        assert len(block['amendments']) == _AMENDMENT_LIST_CAP, (
+            f'The digest list must be bounded by _AMENDMENT_LIST_CAP '
+            f"({_AMENDMENT_LIST_CAP}), got {len(block['amendments'])}"
         )
         assert block.get('truncated') is True, (
             'A capped listing must carry truncated: True so it is never read as '
             f'exhaustive, got {block!r}. RED: no truncation marker yet.'
         )
-        assert block['amendment_count'] == _AMENDMENT_DIGEST_CAP + 5, (
+        assert block['amendment_count'] == _AMENDMENT_LIST_CAP + 5, (
             'amendment_count must be the EXACT count from the count API, not '
             f"len(digests) ({len(block['amendments'])}), got "
             f"{block['amendment_count']}"
@@ -1398,12 +1376,11 @@ class TestChildRecordSchema:
                 f'strictly add-only on the read path, got {called} call(s)'
             )
 
-    # (Deliberately no test that _AMENDMENT_DIGEST_CAP / _DIGEST_CHARS are
-    # positive ints: asserting a module's own private constants against
-    # themselves exercises no behaviour and no regression can break it.  Their
-    # real behaviour is pinned by TestBoundedListingHonesty's
-    # test_wide_fanout_is_capped_and_marked_truncated and by
-    # test_long_body_truncated_to_named_cap_with_ellipsis above.)
+    # (Deliberately no test that _AMENDMENT_LIST_CAP is a positive int:
+    # asserting a module's own private constant against itself exercises no
+    # behaviour and no regression can break it.  Its real behaviour is pinned
+    # by TestBoundedListingHonesty's test_wide_fanout_is_capped_and_marked_truncated;
+    # the text cap's is pinned in test_grouped_read_amendment_text.py.)
 
 
 class TestIdLessHitsNeverCollapse:
@@ -1608,13 +1585,13 @@ class TestDetailReadsAreConcurrent:
             'amendments': [
                 {
                     'id': _AMEND_1,
-                    'digest': 'first correction',
+                    'content': 'first correction',
                     'created_at': '2026-08-01T00:00:00+00:00',
                     'kind': AMENDMENT_KIND,
                 },
                 {
                     'id': _AMEND_2,
-                    'digest': 'second correction',
+                    'content': 'second correction',
                     'created_at': '2026-08-02T00:00:00+00:00',
                     'kind': AMENDMENT_KIND,
                 },
@@ -1866,7 +1843,7 @@ class TestDigestCarriesOriginProjectTag:
         assert block is not None
         entry = block['amendments'][0]
         assert entry['id'] == _AMEND_1
-        assert entry['digest'] == 'a rehomed correction'
+        assert entry['content'] == 'a rehomed correction'
         assert entry['created_at'] == '2026-08-01T00:00:00+00:00'
         assert entry['kind'] == AMENDMENT_KIND
 

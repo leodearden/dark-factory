@@ -20,6 +20,8 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS
+
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
 
@@ -275,7 +277,7 @@ def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
 
 EARLY = 'Early detail sits here.'
 LATE = 'Late detail sits here.'
-LONG_CHILD = f'{EARLY} {"x" * 300} {LATE}'
+LONG_CHILD = f'{EARLY} {"x" * (DEFAULT_AMENDMENT_TEXT_CHARS + 300)} {LATE}'
 
 
 def _with_spans(row: dict[str, Any], *spans: str) -> dict[str, Any]:
