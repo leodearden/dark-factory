@@ -88,6 +88,7 @@ PURE_STDLIB_LEAVES = (
     'quality_series.landings',
     'quality_series.rows',
     'quality_series.stats',
+    'quality_series.summary',
     'ratchet',
     'reify_checkout',
     'safe_io',

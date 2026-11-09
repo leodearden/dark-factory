@@ -6,8 +6,7 @@ import argparse
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -19,10 +18,22 @@ from shared.quality_series.landings import (
     UnrecognisedTrainEvent,
     landings,
 )
-from shared.quality_series.rows import LandingRow, ReviewRoundsSource, rows_for, unit_heads
+from shared.quality_series.rows import (
+    LandingRow,
+    QualityRowInvariantError,
+    UnknownCharterClass,
+    rows_for,
+)
+from shared.quality_series.summary import week_bounds, week_summary
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
-__all__ = ['EventsPerLanding', 'KOfN', 'WeekSummary', 'main', 'week_summary']
+__all__ = ['main']
+
+_REFUSALS = (
+    GitUnavailable, GitObjectMissing, GitTimeout, CursorNotOnMain, UnrecognisedTrainEvent,
+    UnknownCharterClass, QualityRowInvariantError, sqlite3.Error,
+)
+"""Every typed refusal of the producer, and sqlite's own errors: a reason on stderr and exit 2."""
 
 _COLUMNS: tuple[tuple[str, Callable[[LandingRow], object]], ...] = (
     ('ordinal', lambda r: r.landing.ordinal),
@@ -76,129 +87,23 @@ def _render(value: object) -> str:
     return str(value)
 
 
-@dataclass(frozen=True)
-class KOfN:
-    """A proportion: k of n landings have the property, so 0 <= k <= n."""
-
-    k: int
-    n: int
-
-    def __post_init__(self) -> None:
-        if not 0 <= self.k <= self.n:
-            raise ValueError(f'a proportion needs 0 <= k <= n (k={self.k!r}, n={self.n!r})')
-
-    def __str__(self) -> str:
-        return f'{self.k}/{self.n}'
-
-
-@dataclass(frozen=True)
-class EventsPerLanding:
-    """An event rate: events over landings; one landing can carry several events."""
-
-    events: int
-    landings: int
-
-    def __post_init__(self) -> None:
-        if self.events < 0 or self.landings < 0:
-            raise ValueError(
-                f'an event rate needs non-negative counts (events={self.events!r}, '
-                f'landings={self.landings!r})'
-            )
-
-    def per(self, scale: int, digits: int) -> str:
-        if self.landings == 0:
-            return 'none'
-        return f'{scale * self.events / self.landings:.{digits}f}'
-
-
-@dataclass(frozen=True)
-class WeekSummary:
-    """One ISO week's figures; a landing whose value is unknown (None) drops out of that figure.
-
-    Event counts (rejection events, re-verifies) are summed once per unit over unit heads, since a
-    unit's value is copied to every member; every rate's denominator is the week's landings whose
-    value is known.
-    """
-
-    week: str
-    units: int
-    landings: int
-    rejection_events: EventsPerLanding
-    rejected_landings: KOfN
-    flake_confirmed: KOfN
-    flake_real_red: KOfN
-    review_rounds_ge2: KOfN
-    review_rounds_sources: tuple[tuple[ReviewRoundsSource, int], ...]
-    reverifies: EventsPerLanding
-
-    def lines(self) -> list[str]:
-        sources = ', '.join(f'{source.value}={count}' for source, count in self.review_rounds_sources)
-        return [
-            f'# week {self.week}: {self.units} units, {self.landings} landings',
-            '#   rejections per 100 landings: '
-            f'{self.rejection_events.per(100, 1)} '
-            f'({self.rejection_events.events} events over {self.rejection_events.landings} landings)',
-            f'#   landings with >= 1 rejection: {self.rejected_landings}',
-            f'#   confirmed-flake landings: {self.flake_confirmed}',
-            f'#   real-red landings: {self.flake_real_red}',
-            f'#   review rounds >= 2: {self.review_rounds_ge2} ({sources})',
-            f'#   re-verifies per landing: {self.reverifies.per(1, 2)} '
-            f'({self.reverifies.events} over {self.reverifies.landings} landings)',
-        ]
-
-
-def _week_bounds(iso_week: str) -> tuple[datetime, datetime]:
-    monday = datetime.strptime(f'{iso_week}-1', '%G-W%V-%u').replace(tzinfo=UTC)
-    return monday, monday + timedelta(days=7)
-
-
-def _count(values: Sequence[bool | None]) -> KOfN:
-    known = [value for value in values if value is not None]
-    return KOfN(sum(1 for value in known if value), len(known))
-
-
-def _unit_events_over_landings(
-    week: Sequence[LandingRow], value: Callable[[LandingRow], int | None]
-) -> EventsPerLanding:
-    events = [value(head) for head in unit_heads(week)]
-    known_landings = sum(1 for row in week if value(row) is not None)
-    return EventsPerLanding(sum(event for event in events if event is not None), known_landings)
-
-
-def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
-    start, end = _week_bounds(iso_week)
-    week = [row for row in rows if start <= row.landing.landed_at < end]
-    heads = unit_heads(week)
-    rounds = [row.cost for row in week if row.cost.review_rounds is not None]
-    return WeekSummary(
-        week=iso_week,
-        units=len(heads),
-        landings=len(week),
-        rejection_events=_unit_events_over_landings(week, lambda r: r.outcomes.rejection_events),
-        rejected_landings=_count([row.outcomes.rejected for row in week]),
-        flake_confirmed=_count([row.outcomes.flake_confirmed for row in week]),
-        flake_real_red=_count([row.outcomes.flake_real_red for row in week]),
-        review_rounds_ge2=KOfN(sum(1 for cost in rounds if (cost.review_rounds or 0) >= 2),
-                               len(rounds)),
-        review_rounds_sources=tuple(
-            (source, sum(1 for cost in rounds if cost.review_rounds_source is source))
-            for source in ReviewRoundsSource
-        ),
-        reverifies=_unit_events_over_landings(week, lambda r: r.outcomes.reverify_count),
-    )
-
-
 def _iso_week(text: str) -> str:
     try:
-        _week_bounds(text)
+        week_bounds(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f'{text!r} is not an ISO week like 2026-W44') from exc
     return text
 
 
+def _project_root(text: str) -> Path:
+    """The root resolved, since the project id derives from its basename (``.`` has none)."""
+    return Path(text).resolve()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='python -m shared.quality_series', description=__doc__)
-    parser.add_argument('--root', required=True, type=Path, help='project root (the git repo)')
+    parser.add_argument('--root', required=True, type=_project_root,
+                        help='project root (the git repo); a relative path is resolved')
     parser.add_argument('--since', default=None, help='cursor sha on main; omit for full history')
     parser.add_argument('--week', type=_iso_week, default=None, help='ISO week, e.g. 2026-W44')
     parser.add_argument('--git-budget-s', type=float, default=600.0)
@@ -223,15 +128,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         conn = connect_ro(runs_db(args.root))
-    except TaskDbUnreadable as exc:
+    except (TaskDbUnreadable, sqlite3.Error) as exc:
         print(f'quality_series: runs.db is unreadable: {exc}', file=sys.stderr)
         return 2
     try:
         batch = landings(conn, args.root, since_cursor=args.since or None, main_ref=args.main_ref)
         rows, deferred = _measure_all(batch.landings, conn, args.root, args.git_budget_s)
-    except (
-        GitUnavailable, GitObjectMissing, GitTimeout, CursorNotOnMain, UnrecognisedTrainEvent,
-    ) as exc:
+    except _REFUSALS as exc:
         print(f'quality_series: {exc}', file=sys.stderr)
         return 2
     finally:

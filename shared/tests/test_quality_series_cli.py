@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ from quality_series_fixtures import (
     build_landing_scenario,
 )
 
-from shared.quality_series import cli, landings, rows_for
+from shared.quality_series import cli, landings, rows_for, summary
 
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 POST_MERGE = 'post_merge_verify'
@@ -107,21 +108,17 @@ def test_week_summary_is_the_hand_computed_one(project, capsys) -> None:
 def test_week_summary_denominators_are_known_landings(project) -> None:
     batch = landings(project.db.conn, project.repo.root, since_cursor=None)
     rows = rows_for(batch.landings, project.db.conn, project.repo.root, git_budget_s=60)
-    summary = cli.week_summary(rows, '2026-W44')
-    assert summary.rejection_events == cli.EventsPerLanding(3, 8)
-    assert summary.reverifies == cli.EventsPerLanding(1, 8)
+    week = summary.week_summary(rows, '2026-W44')
+    assert week.rejection_events == summary.EventsPerLanding(3, 8)
+    assert week.reverifies == summary.EventsPerLanding(1, 8)
 
 
-def test_an_event_rate_may_exceed_one_per_landing() -> None:
-    rate = cli.EventsPerLanding(events=3, landings=1)
-    assert rate.per(100, 1) == '300.0'
-    assert cli.EventsPerLanding(0, 0).per(100, 1) == 'none'
-
-
-@pytest.mark.parametrize(('k', 'n'), [(3, 1), (-1, 2)])
-def test_a_proportion_refuses_k_outside_0_to_n(k: int, n: int) -> None:
-    with pytest.raises(ValueError, match=f'k={k}, n={n}'):
-        cli.KOfN(k, n)
+def test_a_relative_root_is_resolved(project, capsys, monkeypatch) -> None:
+    _, absolute, _ = _run(capsys, '--root', str(project.repo.root), '--since', project.m1)
+    monkeypatch.chdir(project.repo.root)
+    code, relative, err = _run(capsys, '--root', '.', '--since', project.m1)
+    assert (code, err) == (0, '')
+    assert relative == absolute
 
 
 class TestRefusals:
@@ -138,6 +135,23 @@ class TestRefusals:
         code, _, err = _run(capsys, '--root', str(repo.root))
         assert code == 2
         assert 'runs.db' in err
+
+    def test_an_unknown_charter_class_exits_2(self, tmp_path: Path, capsys) -> None:
+        s = build_landing_scenario(tmp_path / 'proj', with_charter_class=True)
+        s.db.task_result('102', 'run-a', 'blocked', at_hour(10.5), charter_class='bogus')
+        code, _, err = _run(capsys, '--root', str(s.repo.root))
+        assert code == 2
+        assert 'bogus' in err
+
+    def test_a_runs_db_without_the_events_table_exits_2(self, tmp_path: Path, capsys) -> None:
+        repo = GitRepoBuilder(tmp_path / 'empty')
+        repo.commit({'README.md': 'x\n'}, 'root')
+        path = repo.root / 'data' / 'orchestrator' / 'runs.db'
+        path.parent.mkdir(parents=True)
+        sqlite3.connect(path).execute('CREATE TABLE other (x)').connection.close()
+        code, _, err = _run(capsys, '--root', str(repo.root))
+        assert code == 2
+        assert 'events' in err
 
     def test_an_unrecognised_train_payload_exits_2(self, tmp_path: Path, capsys) -> None:
         repo = GitRepoBuilder(tmp_path / 'odd')
