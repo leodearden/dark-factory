@@ -173,10 +173,15 @@ def _numstat(
 def landed_lines(
     repo: str | os.PathLike[str], base_sha: str, sha: str, timeout_s: float
 ) -> LandedLines:
-    """Churn of ``base_sha..sha`` by path class, under one git call (see git_output for errors)."""
+    """Churn of ``base_sha..sha`` by path class, under one git call (see git_output for errors).
+
+    A path with no line churn (binary, or a mode-only change) touches no class and no module.
+    """
     by_class: Counter[PathClass] = Counter()
     by_module: Counter[str] = Counter()
     for path, lines in _numstat(repo, base_sha, sha, timeout_s):
+        if lines == 0:
+            continue
         cls = path_class(path)
         by_class[cls] += lines
         if cls is PathClass.SRC:

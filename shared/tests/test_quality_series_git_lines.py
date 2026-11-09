@@ -108,6 +108,24 @@ class TestLandedLines:
             ModuleLines('p/big.py', 9), ModuleLines('p/alpha', 4), ModuleLines('p/zeta', 4),
         )
 
+    def test_a_module_touched_only_by_zero_churn_paths_is_not_a_module(
+        self, tmp_path: Path
+    ) -> None:
+        repo = GitRepoBuilder(tmp_path / 'repo')
+        base = repo.commit({'p/src/p/tool/run.sh': 'echo 1\n'}, 'root')
+        merge = repo.branch_merge('8', {
+            'p/src/p/assets/blob.js': bytes(range(256)) * 4,
+            'p/src/p/core/a.py': _lines(3, 'a'),
+        })
+        (repo.root / 'p/src/p/tool/run.sh').chmod(0o755)
+        mode_only = repo.commit({}, 'mode only')
+        assert landed_lines(repo.root, base, merge, timeout_s=60).modules == (
+            ModuleLines('p/core', 3),
+        )
+        assert landed_lines(repo.root, merge, mode_only, timeout_s=60) == LandedLines(
+            code_lines=0, src_lines=0, test_lines=0, modules=(),
+        )
+
     def test_an_unknown_sha_is_a_missing_object(self, merged) -> None:
         repo, base, _ = merged
         with pytest.raises(GitObjectMissing):
