@@ -51,7 +51,13 @@ from click.testing import CliRunner
 from escalation.queue import EscalationQueue
 
 import orchestrator.cli as cli_module
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.config import (
+    GitConfig,
+    ModuleConfig,
+    OrchestratorConfig,
+    VerifyRunnerConfig,
+    apply_reload,
+)
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.remote_gate import GateIdentity
@@ -517,11 +523,16 @@ def laptop_yaml(tmp_path: Path, repo: Path, provision: str) -> Path:
 
 
 def _workstation_config(
-    tmp_path: Path, repo: Path, laptop: Path, provision: str, overrides: dict[str, Any],
+    tmp_path: Path, repo: Path, laptop: Path, legs: Legs, provision: str,
+    overrides: dict[str, Any],
 ) -> OrchestratorConfig:
+    """The workstation's config; its workspace-wide commands are the legs ``test``, ``lint``, ``type``."""
     fields: dict[str, Any] = {
         'project_root': repo,
         'git': _GIT,
+        'test_command': legs.command('test'),
+        'lint_command': legs.command('lint'),
+        'type_check_command': legs.command('type'),
         'verify_runners': [VerifyRunnerConfig(
             name=LAPTOP, ssh_host='laptop.invalid', git_remote='laptop-remote',
             df_checkout_path='/home/laptop/dark-factory', config_path=str(laptop),
@@ -735,6 +746,12 @@ class Scene:
             await asyncio.sleep(0.05)
         raise AssertionError(f'verify-task never recorded a cold worktree beside {pgf}')
 
+    def reload(self, **keys: Any) -> dict[str, Any]:
+        """Hot-reload *keys* into the live harness config, as ``reload_config`` does; its result."""
+        outcome = apply_reload(self.config, self.config.model_copy(update=keys))
+        assert outcome['reloaded'], outcome
+        return outcome
+
     async def start_worker(self) -> None:
         """Start the harness's own merge worker, with the escalation queue run() would give it."""
         self.harness._escalation_queue = EscalationQueue(self.tmp_path / 'escalations')
@@ -781,11 +798,14 @@ async def open_scene(
     patch_cli_seams(monkeypatch)
     repo, task_checkout, laptop_base = _seed(tmp_path)
     laptop = laptop_yaml(tmp_path, repo, laptop_provision)
+    legs = Legs(tmp_path / 'legs', task_checkout=task_checkout, laptop_base=laptop_base)
     children = ChildCli()
     host = LaptopHost(InProcessCli(laptop), children)
     runners = RecordingRunners(host)
     monkeypatch.setattr('orchestrator.verify_hosts.RemoteRunner', runners)
-    harness = _harness(_workstation_config(tmp_path, repo, laptop, provision, config_overrides))
+    harness = _harness(
+        _workstation_config(tmp_path, repo, laptop, legs, provision, config_overrides),
+    )
     harness.event_store = EventStore(tmp_path / 'runs.db', run_id='iota')
     worktree = (await harness.git_ops.create_worktree(TASK_ID)).path
     assert worktree == task_checkout, worktree
@@ -794,9 +814,7 @@ async def open_scene(
     scene = Scene(
         tmp_path=tmp_path, harness=harness, repo=repo, worktree=worktree,
         tip=_git(worktree, 'rev-parse', 'HEAD'), laptop=host, runners=runners,
-        children=children,
-        legs=Legs(tmp_path / 'legs', task_checkout=worktree, laptop_base=laptop_base),
-        archive_root=tmp_path / 'verify-logs', laptop_worktree_base=laptop_base,
+        children=children, legs=legs, archive_root=tmp_path / 'verify-logs', laptop_worktree_base=laptop_base,
     )
     try:
         yield scene
