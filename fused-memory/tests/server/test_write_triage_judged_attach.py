@@ -54,18 +54,20 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 _T_HIGH = 0.90
 _T_LOW = 0.70
 _BAND_WINNER = 'm1'
+_WRITE = 'the new entry'
 
 
 def _result(
     id_: str,
     cosine: float,
     *,
+    content: str | None = None,
     extra_metadata: dict | None = None,
 ) -> MemoryResult:
     """A post-RRF record: the cosine lives in ``metadata['store_score']``."""
     return MemoryResult(
         id=id_,
-        content=f'content of {id_}',
+        content=content if content is not None else f'content of {id_}',
         category=MemoryCategory.procedural_knowledge,
         source_store=SourceStore.mem0,
         relevance_score=1.0 / (RRF_K + 1),
@@ -103,7 +105,7 @@ def _judge_answering(answer: object) -> AsyncMock:
 
 async def _triage(results: list[MemoryResult], judge, counter: TriageFailOpenCounter):
     return await triage_write(
-        _svc(results), content='the new entry', project_id='p',
+        _svc(results), content=_WRITE, project_id='p',
         counter=counter, judge=judge,
     )
 
@@ -200,7 +202,7 @@ class TestTheJudgedCandidateIsTheAttachTarget:
     @pytest.mark.asyncio
     async def test_the_deterministic_band_never_asks_the_judge(self) -> None:
         judge = _judge_answering(TriageJudgeVerdict(OUTCOME_AMENDED, 'm3'))
-        slate = [_result('m1', 0.95), *_middle_band_slate()[1:]]
+        slate = [_result('m1', 0.95, content=_WRITE), *_middle_band_slate()[1:]]
 
         decision = await _triage(slate, judge, _counter())
 

@@ -91,6 +91,7 @@ from fused_memory.server.grouped_read import (
 # than deleted, and one home for the reader beats a third file to keep in
 # sync.)
 from fused_memory.server.near_duplicate_guard import cosine_of
+from fused_memory.server.near_verbatim import is_near_verbatim
 from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
@@ -188,8 +189,9 @@ OUTCOME_AMENDED = 'amended'
 #: child. Produced by leaf gamma's judge, never by this leaf's stub.
 OUTCOME_CONTESTED = 'contested'
 
-#: INTERNAL routing sentinel: the write landed in the middle band and must be
-#: adjudicated. Deliberately NOT a member of :data:`TRIAGE_OUTCOMES` — the ack
+#: INTERNAL routing sentinel: the write landed in the middle band, or in the
+#: restate band without repeating its winner near-verbatim (:func:`route_band`),
+#: and must be adjudicated. Deliberately NOT a member of :data:`TRIAGE_OUTCOMES` — the ack
 #: says what triage DID with a write, and "sent it to a judge" is not an answer
 #: to that. The judge's own verdict is what a caller eventually sees.
 OUTCOME_JUDGE = 'judge'
@@ -458,7 +460,7 @@ class AttachGuard:
     """Which attach-guard rules are in force for one write, and what they refuse.
 
     The FLOOR refuses any attach whose target's cosine to the write is below
-    ``min_parent_cosine``. The HOIST GAP refuses, in the judge band only, a
+    ``min_parent_cosine``. The HOIST GAP refuses, on a judged write only, a
     hoist whose parent's cosine is more than ``hoist_max_cosine_gap`` below
     the matched child's. ``None`` switches a rule off. The evidence for each
     value is its field description on ``config/schema.py::WriteTriageConfig``.
@@ -629,12 +631,13 @@ def decide_band(
     t_high: float | None,
     t_low: float | None,
 ) -> BandDecision:
-    """Route a write by the MAXIMUM per-store cosine among *results*.
+    """Label a write's cosine BAND by the MAXIMUM per-store cosine among *results*.
 
-    ``s >= t_high`` is a deterministic :data:`OUTCOME_RESTATED` with no judge
-    call; ``t_low <= s < t_high`` routes to :data:`OUTCOME_JUDGE`; anything
-    below ``t_low``, and an empty or wholly uncomparable candidate set, is
-    :data:`OUTCOME_STORED`. Both edges are INCLUSIVE, matching how the
+    ``s >= t_high`` is the restate band, labelled :data:`OUTCOME_RESTATED`;
+    only a write that repeats the band winner near-verbatim keeps that outcome
+    without a judge call (see :func:`route_band`). ``t_low <= s < t_high`` is
+    :data:`OUTCOME_JUDGE`; anything below ``t_low``, and an empty or wholly
+    uncomparable candidate set, is :data:`OUTCOME_STORED`. Both edges are INCLUSIVE, matching how the
     calibrator derives them: each is an order statistic of measured pairs, so
     the boundary value is itself an observed duplicate.
 
@@ -710,6 +713,41 @@ def decide_band(
     return BandDecision(
         OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
         winner_id=best.id,
+    )
+
+
+def route_band(
+    results: list[MemoryResult],
+    *,
+    content: str,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """The routing :func:`triage_write` acts on: :func:`decide_band`, with the restate band narrowed.
+
+    A cosine at or above ``t_high`` says the write is about the same thing as
+    the band winner, not that it adds nothing to it. So a restate-band write
+    keeps :data:`OUTCOME_RESTATED` only when it repeats the band winner, or the
+    winner's canonical, near-verbatim; otherwise it is the same decision routed
+    to :data:`OUTCOME_JUDGE`, band winner kept, so the judge is shown it.
+
+    :func:`decide_band` stays the cosine BAND label, which the eval scripts
+    read as such; this is the one home of the routing rule.
+    """
+    band = decide_band(results, t_high=t_high, t_low=t_low)
+    if band.outcome != OUTCOME_RESTATED or _restates_verbatim(content, results, band):
+        return band
+    return replace(band, outcome=OUTCOME_JUDGE)
+
+
+def _restates_verbatim(
+    content: str, results: Iterable[MemoryResult], decision: BandDecision,
+) -> bool:
+    """Does *content* repeat, near-verbatim, the slate record *decision* attaches from or to?"""
+    compared = {decision.attach_source_id, decision.canonical_id}
+    return any(
+        is_near_verbatim(content, result.content)
+        for result in results if result.id in compared
     )
 
 
@@ -1076,7 +1114,7 @@ async def triage_write(
                 FailOpenStage.RETRIEVE, t_high=t_high, t_low=t_low,
             )
         decision = replace(
-            decide_band(results, t_high=t_high, t_low=t_low),
+            route_band(results, content=content, t_high=t_high, t_low=t_low),
             truncation_facts=_retrieval_cap_facts(results, k, t_low),
         )
     except Exception as exc:  # C1: nothing escapes this path.

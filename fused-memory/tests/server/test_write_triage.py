@@ -68,6 +68,10 @@ from fused_memory.utils.clip_disclosure import TruncationFact
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
 _RRF_RANK1 = 1.0 / (RRF_K + 1)
 
+#: Every record's text unless a test says otherwise; a write of this text
+#: repeats it verbatim, which is what keeps a restate-band write `restated`.
+_RECORD_TEXT = 'some procedural content'
+
 
 def _result(
     id_: str,
@@ -75,7 +79,7 @@ def _result(
     *,
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
-    content: str = 'some procedural content',
+    content: str = _RECORD_TEXT,
     relevance_score: float = _RRF_RANK1,
     store_rank: int = 1,
     omit_store_score: bool = False,
@@ -1335,7 +1339,7 @@ class TestTriageWriteFailsOpen:
         service = self._service(search=AsyncMock(return_value=[_result('m1', 0.97)]))
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter,
         )
 
         assert decision.outcome == OUTCOME_RESTATED
@@ -1633,7 +1637,7 @@ class TestTheRetrievedCandidatesReachTheJudge:
 
         await triage_write(
             self._service(SearchResults([_result('m1', score)])),
-            content='c', project_id='p', counter=counter, judge=_judge,
+            content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert called == [], label
