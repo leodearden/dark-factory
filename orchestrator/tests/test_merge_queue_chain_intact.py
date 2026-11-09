@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,6 +37,7 @@ from _merge_lane_fakes import verifies as verifies
 # Bare sibling-import of the pure builders (no tests/__init__.py — tests dir is
 # on sys.path; mirrors test_concurrent_verify_boundary importing from
 # test_merge_queue_concurrent_verify).
+from test_merge_queue_concurrent_verify import _one_remerge, _record_remerges
 from test_merge_queue_two_layer_integration import (
     _make_fake_item,
     _make_inflight_entry,
@@ -584,23 +586,24 @@ def _make_remerge_to_decided_stub() -> AsyncMock:
 
 
 async def _drive_cascade_recording(
-    worker: object, *, timeout_s: float = 5.0,
+    worker: object, until: Callable[[], bool], *, timeout_s: float = 5.0,
 ) -> None:
-    """Drive ``_verifier_loop`` until the head-failure cascade calls ``_remerge``.
+    """Drive ``_verifier_loop`` until *until* holds -- the head-failure cascade
+    has re-merged what the caller is waiting on.
 
     The cascade is INLINE in ``_verifier_loop`` (not a callable method), so it is
     driven by pre-populating ``worker._inflight`` with a FAILED head + a
     downstream entry (both with ALREADY-RESOLVED verify_tasks so DISPATCH-FILL
     breaks straight to FINALIZE-HEAD) and running the loop as a task.  The loop
-    is cancelled as soon as the cascade has awaited ``_remerge`` once — at which
-    point step-10's ``_record_dead_base`` calls (which run BEFORE that remerge)
-    have populated the ledger.  A persistent verifier-getter, if one was armed,
-    is cancelled too so no pending task leaks.
+    is cancelled as soon as *until* holds — once the cascade has awaited
+    ``_remerge``, step-10's ``_record_dead_base`` calls (which run BEFORE that
+    remerge) have populated the ledger.  A persistent verifier-getter, if one
+    was armed, is cancelled too so no pending task leaks.
     """
     loop_task = asyncio.ensure_future(worker._verifier_loop())  # type: ignore[attr-defined]
     try:
         for _ in range(int(timeout_s / 0.01)):
-            if worker._remerge.await_count >= 1:  # type: ignore[attr-defined]
+            if until():
                 break
             await asyncio.sleep(0.01)
     finally:
@@ -651,7 +654,8 @@ class TestCascadeStragglerCaughtComposition:
         worker._release_or_cleanup = AsyncMock()  # type: ignore[method-assign]
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
-        worker._remerge = _make_remerge_to_decided_stub()  # type: ignore[method-assign]
+        cascade_remerge = _make_remerge_to_decided_stub()
+        monkeypatch.setattr(worker, '_remerge', cascade_remerge)
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
             return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
         )
@@ -678,7 +682,7 @@ class TestCascadeStragglerCaughtComposition:
         worker._inflight.append(head_entry)
         worker._inflight.append(down_entry)
         await asyncio.sleep(0.05)
-        await _drive_cascade_recording(worker)
+        await _drive_cascade_recording(worker, lambda: cascade_remerge.await_count >= 1)
 
         # Precondition for phase 2, and both ends of enforcement point (c): the
         # cascade records the FAILED head's own merge commit dead as well as the
@@ -984,34 +988,58 @@ async def _finalize(worker: SpeculativeMergeWorker, entry: InflightEntry) -> boo
     return await worker._finalize_inflight(entry)
 
 
+def _stub_cascade_teardown(worker: SpeculativeMergeWorker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the head-failure cascade run with no worktree, remote host or free
+    verify host: its re-merged items park instead of dispatching."""
+    allocator = _make_mock_allocator()
+    allocator.free_host_count.return_value = 0
+    monkeypatch.setattr(worker, '_host_allocator', allocator)
+    for name in ('_release_or_cleanup', '_cleanup_owned_merge_worktree', '_abort_remote_verify'):
+        monkeypatch.setattr(worker, name, AsyncMock())
+
+
 @pytest.mark.asyncio
 class TestAdoptionVoidReanchor:
-    """A voided verdict's replacement takes the entry's permit onto a live
-    frontier tip, or falls to main and frees it (plans/merge-lane-policy-prd.md
-    D1)."""
+    """A voided verdict's replacement re-anchors only on a tip that outlives
+    the head-failure cascade its void sets off; with none it falls to main and
+    frees the entry's permit (plans/merge-lane-policy-prd.md D1)."""
 
-    async def test_the_replacement_restacks_on_an_unrelated_live_tip_with_the_permit(
+    async def test_an_unrelated_inflight_entry_dies_in_the_cascade_so_the_replacement_falls_to_main(
         self, git_ops: GitOps, config: OrchestratorConfig,
-        verifies: VerifyTasks,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
+        """A voided head returns False, so the head-failure cascade tears down
+        every entry behind it: an unrelated W behind the voided X is no tip
+        for X's replacement to stack on."""
         store = _LateArrivalFakeEventStore()
         worker = _make_worker(git_ops, event_store=store)
-        tip = await _live_tip(worker, git_ops, config, verifies)
         entry, permit = await _voided_entry(worker, git_ops, config)
+        worker._inflight.append(entry)
+        w_commit = await _live_tip(worker, git_ops, config, verifies)
+        _stub_cascade_teardown(worker, monkeypatch)
+        remerges = _record_remerges(worker, monkeypatch)
 
-        assert await _finalize(worker, entry) is False
+        await _drive_cascade_recording(
+            worker, lambda: {'task/adopt-x', 'task/disp-tip'} <= {c[0] for c in remerges},
+        )
 
-        replacement = _parked(worker, 'task/adopt-x')
+        claim, replacement = _one_remerge(remerges, 'task/adopt-x')
+        assert claim.anchor == RemergeBase(None, RemergeReason.TIP_DEAD)
+        assert claim.anchor.tip != w_commit
         assert isinstance(replacement, RealMergeItem)
-        assert replacement.base_sha == tip
-        assert replacement.speculative is True
-        assert replacement.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
-        assert replacement.permit is permit
-        assert permit.released is False, "finalize's finally must not free a transferred permit"
-        assert permit in _ledger(worker).live
-        row = _the_row(store, EventType.verdict_voided)
-        assert row['point'] == 'adoption'
-        assert (row['anchor_reason'], row['anchor_base']) == ('live_tip', tip)
+        assert replacement.base_sha == await git_ops.get_main_sha()
+        assert replacement.speculative is False
+        assert replacement.permit is None
+        assert permit.released is True
+        adoption_rows = [
+            row['data'] for row in store.speculative_events(EventType.verdict_voided)
+            if row['data']['point'] == 'adoption'
+        ]
+        assert [(r['anchor_reason'], r['anchor_base']) for r in adoption_rows] == [
+            ('tip_dead', None),
+        ]
+        assert w_commit in worker._dead_base_commits
+        assert worker.speculation_accounting_violations() == []
 
     async def test_a_successor_built_on_the_voided_commit_sends_it_to_main(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
@@ -1042,6 +1070,50 @@ class TestAdoptionVoidReanchor:
         assert (row['anchor_reason'], row['anchor_base']) == ('tip_dead', None)
 
 
+async def _runner_unavailable_entry(
+    worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
+    verifies: VerifyTasks,
+) -> tuple[InflightEntry, SpecPermit]:
+    """An entry whose remote verify host died mid-verify, holding a permit."""
+    _, built = await _make_merged_item(git_ops, config, 'task/ru-x', 'ru_x.py', 'x=1\n')
+    permit = await _ledger(worker).acquire()
+    item = dataclasses.replace(built, permit=permit)
+    unavailable = InflightVerifyResult(
+        outcome=None, merge_wt=item.merge_wt,
+        status=InflightStatus.RUNNER_UNAVAILABLE, reason='ssh timeout',
+    )
+    entry = InflightEntry(
+        item=item, lease=None, verify_task=await verifies.finished(unavailable),
+        merge_wt=item.merge_wt, was_speculative=False, permit=permit,
+    )
+    return entry, permit
+
+
+@pytest.mark.asyncio
+class TestRunnerUnavailableReanchor:
+    """A RUNNER_UNAVAILABLE re-merge decides against the frontier that
+    survives the head-failure cascade its False return sets off
+    (plans/merge-lane-policy-prd.md D1)."""
+
+    async def test_an_unrelated_inflight_entry_is_no_tip_for_the_replacement(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        monkeypatch.setattr(worker, '_release_or_cleanup', AsyncMock())
+        await _live_tip(worker, git_ops, config, verifies)
+        entry, permit = await _runner_unavailable_entry(worker, git_ops, config, verifies)
+
+        assert await _finalize(worker, entry) is False
+
+        replacement = _parked(worker, 'task/ru-x')
+        assert replacement.base_sha == await git_ops.get_main_sha()
+        assert replacement.remerge_base == RemergeBase(None, RemergeReason.TIP_DEAD)
+        assert replacement.permit is None
+        assert permit.released is True
+        assert _ledger(worker).live == frozenset()
+
+
 # ── task 8524: a dead base re-anchors the merger's held base (D2) ────────────
 
 _TIP_T = '3' * 40       # a live frontier entry's merge commit
@@ -1049,14 +1121,14 @@ _HELD_DEAD = '4' * 40   # the base the merger holds, about to be recorded dead
 
 
 async def _merger_holding(
-    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path, base: str,
 ) -> None:
     """Put the merger in state A: a look-ahead found, its permit retained,
-    stacked on _HELD_DEAD."""
+    stacked on *base*."""
     controller = worker._speculation_controller
     await controller.acquire_for_lookahead()
     req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
-    controller.on_lookahead_found(req, _HELD_DEAD)
+    controller.on_lookahead_found(req, base)
 
 
 def _seed_live_tip(
@@ -1085,7 +1157,7 @@ class TestDeadBaseReanchorsTheMerger:
     ) -> None:
         worker = _make_worker(git_ops)
         _seed_live_tip(worker, config, git_repo, verifies)
-        await _merger_holding(worker, config, git_repo)
+        await _merger_holding(worker, config, git_repo, _HELD_DEAD)
 
         worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
 
@@ -1097,7 +1169,7 @@ class TestDeadBaseReanchorsTheMerger:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         worker = _make_worker(git_ops)
-        await _merger_holding(worker, config, git_repo)
+        await _merger_holding(worker, config, git_repo, _HELD_DEAD)
         assert _speculation(worker)['slot_available'] == 0
 
         worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
@@ -1113,7 +1185,7 @@ class TestDeadBaseReanchorsTheMerger:
     ) -> None:
         worker = _make_worker(git_ops)
         _seed_live_tip(worker, config, git_repo, verifies)
-        await _merger_holding(worker, config, git_repo)
+        await _merger_holding(worker, config, git_repo, _HELD_DEAD)
         _, held = _make_fake_item(
             'merger-held', base_sha=_MAIN, merge_commit=_HELD_DEAD,
             config=config, git_repo=git_repo,
@@ -1134,3 +1206,26 @@ class TestDeadBaseReanchorsTheMerger:
         worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
 
         assert _speculation(worker) == before
+
+    async def test_a_void_does_not_repoint_the_merger_at_a_doomed_inflight_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        """The merger holds a look-ahead stacked on X, and X's verdict is voided.
+        The unrelated W behind X dies in the cascade X's void sets off, so the
+        merger's held base goes nowhere and its permit is let go."""
+        # Depth 2: room for X's permit and the merger's.
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        monkeypatch.setattr(worker, '_release_or_cleanup', AsyncMock())
+        await _live_tip(worker, git_ops, config, verifies)
+        entry, _ = await _voided_entry(worker, git_ops, config)
+        assert isinstance(entry.item, RealMergeItem)
+        x_commit = entry.item.merge_result.merge_commit
+        assert x_commit is not None
+        await _merger_holding(worker, config, git_repo, x_commit)
+
+        assert await _finalize(worker, entry) is False
+
+        spec = _speculation(worker)
+        assert spec['spec_base'] is None
+        assert spec['held_by_merger'] == 0
