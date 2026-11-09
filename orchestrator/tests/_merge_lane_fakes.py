@@ -20,7 +20,8 @@ the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
-off.
+off. ``branch_merge_request`` commits one root-level file on a fresh task
+branch and returns the ``MergeRequest`` that merges it.
 
 Since task 5037 every merge-lane module, and ``suffix_graph``, logs under
 exactly ``'orchestrator.merge_lane'``; filter caplog by that name. A
@@ -41,10 +42,16 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ClockPort, VerifyPort
-from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
+from orchestrator.merge_lane.types import (
+    DiskGuardOutcome,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+)
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import RunnerUnavailable
@@ -123,6 +130,30 @@ def lane_scene_config(
     return OrchestratorConfig(
         project_root=project_root, git=git,
         escalate_preexisting_main_break=False, **overrides,
+    )
+
+
+async def branch_merge_request(
+    git_ops: GitOps, config: OrchestratorConfig, task_id: str, *, filename: str,
+) -> MergeRequest:
+    """The request merging task *task_id*'s new branch, one commit adding root-level *filename*.
+
+    A root-level file lies outside every service-restart watched prefix, so
+    landing it restarts nothing.
+    """
+    worktree = (await git_ops.create_worktree(task_id)).path
+    (worktree / filename).write_text(f'# {task_id}\n')
+    await git_ops.commit(worktree, f'Add {filename}')
+    prefix = config.git.branch_prefix
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(f'{prefix}{task_id}', prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
     )
 
 

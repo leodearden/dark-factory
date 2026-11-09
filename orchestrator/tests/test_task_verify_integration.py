@@ -564,7 +564,7 @@ class TestHostHealthWithTheMergeWorker:
             outcome = await scene.end_merge(merge)
             result = await asyncio.wait_for(call, 60)
 
-            assert outcome in {'done', 'cancelled'}
+            assert outcome == 'done'
             assert result.passed, result.summary
             assert scene.sidecar()['reason'] == 'remote'
 
@@ -755,7 +755,8 @@ class TestHostHealthWithTheMergeWorker:
 
             assert result.passed, result.summary
             assert scene.sidecar()['reason'] == 'remote'
-            assert scene.legs.spawned_at('local') == []
+            assert not scene.legs.spawned(_TEST_LEG, 'local')
+            assert scene.legs.spawned(_TEST_LEG, 'laptop')
             assert not scene.laptop_row()['quarantined']
             assert scene.unwound(local_holders=['local-holder']), scene.turns()
             await local_holder.leave()

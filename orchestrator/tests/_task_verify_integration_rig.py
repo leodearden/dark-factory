@@ -46,6 +46,7 @@ import pytest
 import yaml
 from _gate_fixtures import TEST_DEPLOYED_SHA, ensure_reply, is_ensure, is_gate_publish
 from _git_fixtures import RepoSeed, seed_repo
+from _merge_lane_fakes import branch_merge_request
 from _orch_helpers import wait_responsive
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
@@ -58,7 +59,7 @@ from orchestrator.config import (
     VerifyRunnerConfig,
     apply_reload,
 )
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.remote_gate import GateIdentity
 from orchestrator.task_verify_spec import TaskVerifySpec, build_task_verify_spec
@@ -82,7 +83,7 @@ _GIT = GitConfig(
     main_branch='main', branch_prefix='task/', remote='origin',
     worktree_dir='.worktrees', push_after_advance=False,
 )
-_SSH_CONNECT_FAILURE = (
+SSH_CONNECT_FAILURE = (
     'ssh: connect to host laptop.invalid port 22: Connection timed out\n'
     'fatal: Could not read from remote repository.\n'
 )
@@ -291,6 +292,8 @@ class LaptopHost:
         self.healthy = True
         self.cancel_rc = 0
         self.pgrep_rc = 1
+        self.on_pgrep: Callable[[], object] | None = None
+        self.pgrep_seen: list[object] = []
         self.calls: list[Call] = []
         self._next_id = 1
         self._outcomes: dict[str, tuple[int, str]] = {}
@@ -307,7 +310,7 @@ class LaptopHost:
     async def run(self, argv: list[str], *, cwd: Any = None) -> tuple[int, str, str]:
         if is_gate_publish(argv):
             self._log('publish', None, argv)
-            return (128, '', _SSH_CONNECT_FAILURE) if self.publish_connect_fails else (0, '', '')
+            return (128, '', SSH_CONNECT_FAILURE) if self.publish_connect_fails else (0, '', '')
         if is_ensure(argv):
             self._log('ensure', None, argv)
             return self.ensure.reply()
@@ -378,9 +381,11 @@ class LaptopHost:
         remote_cmd = argv[-1]
         if remote_cmd == 'true':
             self._log('health', None, argv)
-            return (0, '', '') if self.healthy else (255, '', _SSH_CONNECT_FAILURE)
+            return (0, '', '') if self.healthy else (255, '', SSH_CONNECT_FAILURE)
         if remote_cmd.startswith('pgrep'):
             self._log('pgrep', None, argv)
+            if self.on_pgrep is not None:
+                self.pgrep_seen.append(self.on_pgrep())
             return self.pgrep_rc, '', ''
         if 'reap-gates' in remote_cmd:
             self._log('reap', None, argv)
@@ -547,6 +552,7 @@ def _workstation_config(
         'verify_host_unreachable_escalate_after_n': 1,
         'verify_host_reprobe_interval_s': 1.0,
         'verify_host_policy': 'prefer_remote',
+        'escalate_preexisting_main_break': False,
     }
     return OrchestratorConfig(**{**fields, **overrides})
 
@@ -762,6 +768,39 @@ class Scene:
         if self._worker_started:
             self._worker_started = False
             await self.harness._stop_merge_worker()
+
+    def laptop_row(self) -> dict[str, Any]:
+        """The laptop's row of the merge worker's snapshot ``hosts`` block."""
+        return {row['name']: row for row in self.worker.snapshot()['hosts']}[LAPTOP]
+
+    async def merge(self, task_id: str) -> Any:
+        """Enqueue, on the harness's merge queue, a merge of task *task_id*'s new branch."""
+        request = await branch_merge_request(
+            self.harness.git_ops, self.config, task_id, filename=f'{task_id}.txt',
+        )
+        await self.harness._merge_queue.put(request)
+        return request
+
+    async def end_merge(self, request: Any, *, settle_secs: float = 30.0) -> str:
+        """The merge's outcome status once it lands or fails, else ``'cancelled'`` by the worker."""
+        try:
+            outcome = await asyncio.wait_for(asyncio.shield(request.result), settle_secs)
+        except (TimeoutError, asyncio.CancelledError):
+            if not request.result.done():
+                self.worker.cancel_request(request.request_id)
+            await asyncio.wait({request.result}, timeout=settle_secs)
+            return 'cancelled'
+        return outcome.status
+
+    def escalations(self, category: str) -> list[Any]:
+        """The pending escalations of *category* on the harness's queue."""
+        queue = self.harness._escalation_queue
+        return [] if queue is None else [e for e in queue.get_pending() if e.category == category]
+
+    def events(self, event_type: EventType) -> list[dict[str, Any]]:
+        store = self.harness.event_store
+        assert store is not None
+        return store.fetch_events_by_type(event_type)
 
 
 def _seed(tmp_path: Path) -> tuple[Path, Path, Path]:
