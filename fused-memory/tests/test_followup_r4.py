@@ -26,6 +26,7 @@ from shared.followup_items import (
 from fused_memory.middleware.curator_types import PreparedCandidate
 
 _INTERCEPTOR_LOGGER = 'fused_memory.middleware.task_interceptor'
+_R4_LOOKUP_PAGE = 100
 _PARENT = '8414'
 _AREA_FILES = ['src/app/a.py', 'src/app/b.py', 'src/app/c.py', 'src/app/d.py']
 _I1 = {'summary': 'The retry loop swallows the timeout', 'files': ['src/app/a.py']}
@@ -77,6 +78,20 @@ async def test_an_exhausted_bundle_resolves_onto_the_owner_and_records_the_dropp
     outcome = await stack.ticket_outcome(ticket)
     assert outcome is not None
     assert outcome['idempotency_dropped_items'] == [{'key': _key(_I1), 'task_id': owner}]
+
+
+@pytest.mark.asyncio
+async def test_an_item_owned_past_the_first_lookup_page_still_resolves_onto_its_owner(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    for n in range(_R4_LOOKUP_PAGE):
+        filler = {'summary': f'An unrelated observation {n}', 'files': ['src/app/a.py']}
+        await stack.seed(f'Filler bundle {n}', with_derived_bundle_keys(_bundle(filler)))
+    owner = await stack.seed('Follow-ups in src/app', with_derived_bundle_keys(_bundle(_I1, _I2)))
+
+    _ticket, resolved = await stack.submit(**_filing(_bundle(_I1), title='The retry loop'))
+
+    assert {key: resolved.get(key) for key in ('status', 'task_id', 'reason')} == _idempotency_hit(owner)
 
 
 @pytest.mark.asyncio
