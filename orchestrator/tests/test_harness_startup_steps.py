@@ -9,16 +9,16 @@ a failing non-fatal step leaves startup running, emits one
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 from orchestrator.startup_steps import (
@@ -58,21 +58,36 @@ _INJECTABLE = [
 ]
 
 
-def _stub_table_steps(h: Harness) -> None:
-    for _step, attr in _STUBBED_STEPS:
-        setattr(h, attr, MagicMock() if attr in _SYNC_STEPS else AsyncMock())
-    h._recover_pending_merges = AsyncMock(return_value={'requests': []})
+@dataclass(frozen=True)
+class StartupHarness:
+    """A Harness whose run() reaches finish_startup, with the mocks installed on it."""
+
+    harness: Harness
+    scheduler: MagicMock
+    stubs: Mapping[str, AsyncMock]
+    sync_stubs: Mapping[str, MagicMock]
+
+
+def _stub_table_steps(h: Harness) -> tuple[dict[str, AsyncMock], dict[str, MagicMock]]:
+    stubs = {attr: AsyncMock() for _step, attr in _STUBBED_STEPS if attr not in _SYNC_STEPS}
+    stubs['_recover_pending_merges'] = AsyncMock(return_value={'requests': []})
+    sync_stubs = {attr: MagicMock() for attr in _SYNC_STEPS}
+    for attr, stub in {**stubs, **sync_stubs}.items():
+        setattr(h, attr, stub)
     h._tag_task_modules = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
+    return stubs, sync_stubs
 
 
 @pytest.fixture
-def make_startup_harness(tmp_path: Path, mock_orch_config: MagicMock) -> Callable[[], Harness]:
+def make_startup_harness(
+    tmp_path: Path, mock_orch_config: MagicMock,
+) -> Callable[[], StartupHarness]:
     """Build Harnesses whose run() reaches finish_startup over one shared tmp_path."""
     mock_orch_config.max_concurrent_tasks = 2
     mock_orch_config.fused_memory.project_id = 'test'
 
-    def make() -> Harness:
+    def make() -> StartupHarness:
         with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
@@ -92,11 +107,12 @@ def make_startup_harness(tmp_path: Path, mock_orch_config: MagicMock) -> Callabl
         h._stop_escalation_server = AsyncMock()
         h._start_merge_worker = AsyncMock()
         h._stop_merge_worker = AsyncMock()
-        _stub_table_steps(h)
+        stubs, sync_stubs = _stub_table_steps(h)
 
-        h.scheduler = MagicMock()
-        h.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
-        return h
+        scheduler = MagicMock()
+        scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+        h.scheduler = scheduler
+        return StartupHarness(h, scheduler, stubs, sync_stubs)
 
     return make
 
@@ -118,11 +134,15 @@ def _startup_l1s(queue: EscalationQueue) -> list[Escalation]:
 
 
 def _failed_events(h: Harness) -> list[dict]:
-    return cast(EventStore, h.event_store).fetch_events_by_type(EventType.startup_step_failed)
+    store = h.event_store
+    assert store is not None
+    return store.fetch_events_by_type(EventType.startup_step_failed)
 
 
-def _inject(h: Harness, attr: str, exc: Exception) -> None:
-    setattr(h, attr, AsyncMock(side_effect=exc))
+def _inject(handle: StartupHarness, attr: str, exc: Exception) -> AsyncMock:
+    injected = AsyncMock(side_effect=exc)
+    setattr(handle.harness, attr, injected)
+    return injected
 
 
 def _steps_after(step: str) -> list[str]:
@@ -144,19 +164,20 @@ class TestNonFatalStepFailure:
     async def test_failure_is_reported_and_startup_continues(
         self, make_startup_harness, step: str, attr: str,
     ) -> None:
-        h = make_startup_harness()
-        _inject(h, attr, RuntimeError(f'injected {step}'))
+        handle = make_startup_harness()
+        _inject(handle, attr, RuntimeError(f'injected {step}'))
 
-        await _run(h)
+        await _run(handle.harness)
 
-        cast(MagicMock, h.scheduler.finish_startup).assert_called_once()
-        [event] = _failed_events(h)
+        handle.scheduler.finish_startup.assert_called_once()
+        [event] = _failed_events(handle.harness)
         assert event['data']['step'] == step
         assert event['data']['status'] == 'failed'
-        [esc] = _startup_l1s(_queue(h))
+        [esc] = _startup_l1s(_queue(handle.harness))
         assert esc.task_id == sentinel_task_id(step)
+        installed = {**handle.stubs, **handle.sync_stubs}
         for later in _steps_after(step):
-            assert getattr(h, later).called, f'{later} must still run after {step} failed'
+            assert installed[later].called, f'{later} must still run after {step} failed'
 
     @pytest.mark.parametrize(('step', 'attr'), _INJECTABLE)
     async def test_repeat_failure_on_the_next_start_refreshes_the_l1(
@@ -164,14 +185,14 @@ class TestNonFatalStepFailure:
     ) -> None:
         first = make_startup_harness()
         _inject(first, attr, RuntimeError(f'injected {step}'))
-        await _run(first)
-        [filed] = _startup_l1s(_queue(first))
+        await _run(first.harness)
+        [filed] = _startup_l1s(_queue(first.harness))
 
         second = make_startup_harness()
         _inject(second, attr, RuntimeError(f'injected {step}'))
-        await _run(second)
+        await _run(second.harness)
 
-        [refreshed] = _startup_l1s(_queue(second))
+        [refreshed] = _startup_l1s(_queue(second.harness))
         assert refreshed.id == filed.id
         assert refreshed.dedupe_count == 1
 
@@ -181,27 +202,28 @@ class TestRecoveredMergesReachTheReaper:
     async def test_failed_recovery_still_runs_the_reaper_with_no_requests(
         self, make_startup_harness,
     ) -> None:
-        h = make_startup_harness()
-        _inject(h, '_recover_pending_merges', RuntimeError('injected 1c0a'))
+        handle = make_startup_harness()
+        _inject(handle, '_recover_pending_merges', RuntimeError('injected 1c0a'))
 
-        await _run(h)
+        await _run(handle.harness)
 
-        cast(AsyncMock, h._reap_orphaned_merge_worktrees).assert_awaited_once_with([])
+        handle.stubs['_reap_orphaned_merge_worktrees'].assert_awaited_once_with([])
 
     async def test_recovered_requests_reach_the_reaper(self, make_startup_harness) -> None:
-        h = make_startup_harness()
+        handle = make_startup_harness()
         request = object()
-        h._recover_pending_merges = AsyncMock(return_value={'requests': [request]})
+        handle.harness._recover_pending_merges = AsyncMock(return_value={'requests': [request]})
 
-        await _run(h)
+        await _run(handle.harness)
 
-        cast(AsyncMock, h._reap_orphaned_merge_worktrees).assert_awaited_once_with([request])
+        handle.stubs['_reap_orphaned_merge_worktrees'].assert_awaited_once_with([request])
 
 
 @pytest.mark.asyncio
 class TestPartialStep:
     async def test_entry_failures_are_reported_as_partial(self, make_startup_harness) -> None:
-        h = make_startup_harness()
+        handle = make_startup_harness()
+        h = handle.harness
         failures = EntryFailures('Recovery')
         failures.record('41', OSError('boom'))
         h._recover_crashed_tasks = AsyncMock(return_value=failures)
@@ -214,7 +236,7 @@ class TestPartialStep:
         [esc] = _startup_l1s(_queue(h))
         assert esc.task_id == sentinel_task_id('2c')
         assert '41' in esc.summary or '41' in esc.detail
-        cast(MagicMock, h.scheduler.finish_startup).assert_called_once()
+        handle.scheduler.finish_startup.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -222,7 +244,8 @@ class TestFatalStep:
     async def test_merge_liveness_refusal_still_refuses_startup(
         self, make_startup_harness,
     ) -> None:
-        h = make_startup_harness()
+        handle = make_startup_harness()
+        h = handle.harness
         h._build_lifecycle_registry()
         assert h._lifecycle is not None
         refusal = MergeLivenessConfigError('over budget')
@@ -233,7 +256,7 @@ class TestFatalStep:
             await _run(h)
 
         assert raised.value is refusal
-        cast(MagicMock, h.scheduler.finish_startup).assert_not_called()
+        handle.scheduler.finish_startup.assert_not_called()
         [event] = _failed_events(h)
         assert event['data']['step'] == '1b'
 
@@ -241,7 +264,7 @@ class TestFatalStep:
 @pytest.mark.asyncio
 class TestSummaryWarning:
     async def test_healthy_start_reports_nothing(self, make_startup_harness, caplog) -> None:
-        h = make_startup_harness()
+        h = make_startup_harness().harness
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await _run(h)
@@ -253,11 +276,11 @@ class TestSummaryWarning:
     async def test_failing_start_logs_one_summary_naming_the_step(
         self, make_startup_harness, caplog,
     ) -> None:
-        h = make_startup_harness()
-        _inject(h, '_recover_crashed_tasks', RuntimeError('injected 2c'))
+        handle = make_startup_harness()
+        _inject(handle, '_recover_crashed_tasks', RuntimeError('injected 2c'))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await _run(h)
+            await _run(handle.harness)
 
         [summary] = _not_ok_warnings(caplog)
         assert '2c=failed' in summary
@@ -266,11 +289,10 @@ class TestSummaryWarning:
 @pytest.mark.asyncio
 class TestStrandedSweepAtStartup:
     async def test_startup_runs_2d_with_a_collector(self, make_startup_harness) -> None:
-        h = make_startup_harness()
+        handle = make_startup_harness()
 
-        await _run(h)
+        await _run(handle.harness)
 
-        reconcile = cast(AsyncMock, h._reconcile_stranded_in_progress)
-        [call] = reconcile.await_args_list
+        [call] = handle.stubs['_reconcile_stranded_in_progress'].await_args_list
         assert isinstance(call.kwargs.get('failures'), EntryFailures)
         assert call.kwargs.get('mid_run', False) is False
