@@ -28,6 +28,8 @@ from textual.coordinate import Coordinate
 from cockpit.app import CockpitApp
 
 if TYPE_CHECKING:
+    from textual.pilot import Pilot
+
     from cockpit.registry_reader import SessionScannerProtocol
 
 
@@ -518,6 +520,23 @@ class _ScanStartCountingScanner:
         return self._inner.scan()
 
 
+async def _wait_until_a_poll_scan_has_applied(
+    pilot: Pilot, app: CockpitApp, scanner: _ScanStartCountingScanner, *, since: int
+) -> None:
+    """Return once the first poll scan to begin after *since* has been applied.
+
+    Poll scans never overlap, and each one's apply lands before the next can
+    begin, so by the time a second scan has begun after *since* the first has
+    been read and applied. The second half rests on
+    cockpit/src/cockpit/app.py::CockpitApp._scan_registry_worker marshalling
+    _apply_scan BEFORE its finally clears _scan_in_flight. There is no time
+    bound here: the calling test's pytest timeout guards liveness only (a poll
+    timer that never fires).
+    """
+    while scanner.starts < since + 2:
+        await pilot.pause(app.poll_interval)
+
+
 class TestTimerIntegration:
     """The one test driven by the real set_interval poll timer (see TestPollRefresh).
 
@@ -634,6 +653,7 @@ class TestWriteDiscipline:
         never create, modify, or delete a sessions/ or decisions/ file --
         those belong to spawn-claude.sh/T4-T7/C8/C5b, never the C5a view."""
         from cockpit.panes.session_table import SessionTable
+        from cockpit.registry_reader import SessionScanner
 
         record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
         sr.write_record(record, root=tmp_path)
@@ -652,12 +672,14 @@ class TestWriteDiscipline:
         assert any(path.startswith('sessions/') for path in before)
         assert any(path.startswith('decisions/') for path in before)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        scanner = _ScanStartCountingScanner(SessionScanner(tmp_path))
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
+            starts_at_mount = scanner.starts
 
-            await pilot.pause(0.2)  # let at least one poll tick land
+            await _wait_until_a_poll_scan_has_applied(pilot, app, scanner, since=starts_at_mount)
 
             table.move_cursor(row=table.get_row_index('write-disc-1'))
             await pilot.pause()
