@@ -1351,11 +1351,14 @@ restriction; until one exists, the rejection *is* the contract.
 ```
 
 **What a carrier gets today.** Every escalation a carrier's deterministic
-run files carries `category='milestone_check_failed'` — the deny-listed
-category (`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
+run files carries `category='milestone_check_failed'`, with one exception:
+the stall-cap escalation of a carrier declaring `recheck_secs` is
+`milestone_check_stalled` (§6's stall row). Both are deny-listed
+(`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
 so a recurring job's failures are discriminable instead of disappearing into
-the crowded `infra_issue` bucket. That covers the no-verdict legs in §6's
-table as well as the non-zero-exit verdict; the **stamp** rule in that table
+the crowded `infra_issue` bucket; an alarm or route keyed on a carrier's
+failures must match both. `milestone_check_failed` covers the no-verdict legs
+in §6's table as well as the non-zero-exit verdict; the **stamp** rule in that table
 is unchanged either way. A non-carrier predicate's no-verdict legs stay
 `infra_issue`, and so do `kind='deploy'` deterministic tasks — the
 deterministic-recon sweep's Source B auto-closer keys on that category to
