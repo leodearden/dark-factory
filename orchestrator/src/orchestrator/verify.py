@@ -10875,7 +10875,7 @@ _NODE_ID_RUN_TIMEOUT_SECS: int = 300
 
 
 #: The status of a function id over its parametrizations: the first of these any of them has.
-_PARAMETRIZED_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'pass', 'skipped')
+_PARAMETRIZED_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
 
 
 def _node_id_statuses(
@@ -11019,8 +11019,9 @@ async def run_node_ids(
     junit report.
 
     A function id without its parameters names every parametrization:
-    ``'fail'`` if any failed, else ``'error'`` if any errored, else ``'pass'``
-    if any passed, else ``'skipped'``.
+    ``'fail'`` if any failed, else ``'error'`` if any errored, else
+    ``'skipped'`` if any was skipped, else ``'pass'`` (every parametrization
+    passed).
 
     Each id is mapped to its module on its own, so one unmappable id errors
     alone. The ids of one module run together, serially, scoped and with a
