@@ -813,6 +813,25 @@ def test_the_json_report_carries_the_check_mode_verdict(store):
     assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
 
 
+def test_a_passed_gate_under_a_blocked_human_gate_still_reports_its_share(store):
+    store.seed_run(RUN, ('high', 'done'), ('medium', 'done'), ('low', 'pending'))
+    chain = seed_chain(store, gate_status='done', human_status='blocked')
+
+    checked = check(store)
+    run = pending(store, store.root)
+    reported = _only_chain(pending_json(store, store.root))
+
+    assert checked.rc == 0
+    assert run.rc == 0
+    assert not any('interim form' in line for line in run.lines)
+    assert 'done' in _line_with(run, f'completion gate {chain.gate}')
+    assert 'blocked' in _line_with(run, f'human gate {chain.human}')
+    _line_with(run, f'share {checked.verdict["share"]}')
+    assert reported['completion_gate']['id'] == chain.gate
+    assert reported['completion_gate']['status'] == 'done'
+    assert reported['verdict'] == checked.verdict
+
+
 def test_the_threshold_is_read_back_from_the_gates_own_args(store):
     store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
     seed_chain(store, threshold='0.55')

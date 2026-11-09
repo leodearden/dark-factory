@@ -477,7 +477,6 @@ def exit_code(result: CompletionVerdict | CheckFailure) -> int:
 
 
 GET_TASK_TOOL: Final = 'get_task'
-CHAIN_STATUSES: Final = tuple(status.value for status in sorted(ACTIVE))
 
 
 class ProjectState(enum.StrEnum):
@@ -587,17 +586,26 @@ def _chain_links(
         try:
             links.append(_ChainLink(row, TriggerChain.model_validate(value)))
         except (ValidationError, TypeError):
-            unreadable.append(row['task_id'])
+            if row['status'] in ACTIVE:
+                unreadable.append(row['task_id'])
     return tuple(links), tuple(unreadable)
 
 
 def _open_chains(links: Iterable[_ChainLink]) -> dict[tuple[str, str], dict[str, Mapping[str, Any]]]:
-    """Each open chain's first row per role, keyed by (skill, run_id); open is the C2 guard's rule."""
+    """Each open chain's first row per role, keyed by (skill, run_id).
+
+    A chain is open while one of its unsuperseded rows is ACTIVE (the C2 guard's rule); its
+    terminal rows stay attached, so a passed completion gate still reports under its
+    blocked human gate rather than reading as the interim form.
+    """
     chains: dict[tuple[str, str], dict[str, Mapping[str, Any]]] = {}
     for item in links:
         if item.link.superseded_by is None:
             chains.setdefault((item.link.skill, item.link.run_id), {}).setdefault(item.link.role, item.row)
-    return chains
+    return {
+        chain: roles for chain, roles in chains.items()
+        if any(row['status'] in ACTIVE for row in roles.values())
+    }
 
 
 def _milestone_at(metadata: Mapping[str, Any]) -> str | None:
@@ -651,25 +659,16 @@ def _chain_report(
     return ChainReport(skill, run_id, gate, human, verdict)
 
 
-def _without_active_chains(call_tool: CallTool, project_root: str) -> ProjectReport:
-    """Never filed, or all closed: the ACTIVE lookup's own count cannot tell them apart."""
-    arguments = {'project_root': project_root, 'key': TRIGGER_CHAIN_KEY, 'limit': 1}
-    page = _lookup_page(_call(call_tool, LOOKUP_TOOL, arguments), f'{LOOKUP_TOOL} for {project_root}')
-    state = ProjectState.NEVER_FILED if page.tasks_with_key == 0 else ProjectState.NO_OPEN_CHAINS
-    return ProjectReport(project_root, state, chain_tasks=page.tasks_with_key)
-
-
 def _read_project(call_tool: CallTool, project_root: str) -> ProjectReport:
     arguments = {
         'project_root': project_root,
         'key': TRIGGER_CHAIN_KEY,
-        'statuses': list(CHAIN_STATUSES),
         'include_value': True,
         'limit': LOOKUP_PAGE_SIZE,
     }
     rows, _ = _lookup_pages(call_tool, arguments)
     if not rows:
-        return _without_active_chains(call_tool, project_root)
+        return ProjectReport(project_root, ProjectState.NEVER_FILED)
     links, unreadable = _chain_links(call_tool, project_root, rows)
     chains = tuple(
         _chain_report(call_tool, project_root, chain, roles) for chain, roles in _open_chains(links).items()
