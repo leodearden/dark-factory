@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 
 from orchestrator.agents.roles import ALL_REVIEWERS
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import verdict_tools
+from orchestrator.mcp import markup_journal, verdict_tools
 from orchestrator.mcp.verdict_tools import (
     _SINGLETON_ROLE_TOOLS,
     _artifacts_from_args,
@@ -352,6 +354,76 @@ class TestCreateServer:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
+
+
+def _journal_lines(root: Path) -> list[dict[str, Any]]:
+    """Every verdict-tools fact journalled under *root*; an absent file is no lines."""
+    path = markup_journal.journal_path(root, verdict_tools.MARKUP_SINK_SPEC.server_label)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+
+@pytest.mark.asyncio
+class TestIssueContractJournal:
+    """The registered tool journals every off-contract intake as one
+    ``review_issue_off_contract`` fact in the verdict-tools fact journal,
+    the durable record the markup guard's facts already land in.
+    """
+
+    async def _call(
+        self, artifacts: TaskArtifacts, root: Path | None, issues: list[dict[str, Any]],
+    ) -> Any:
+        artifacts.write_plan({
+            'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
+            'prerequisites': [], 'steps': [],
+        })
+        server = create_server(
+            artifacts, 'test_analyst', resolve_project_root=lambda _wt: root,
+        )
+        async with Client(server) as client:
+            return await client.call_tool('submit_review_verdict', {
+                'reviewer': 'test_analyst',
+                'verdict': 'ISSUES_FOUND',
+                'issues': issues,
+                'summary': 'x',
+            })
+
+    async def test_a_normalised_intake_is_journalled_once(self, artifacts, tmp_path):
+        result = await self._call(artifacts, tmp_path, [_contract_issue(severity='high')])
+
+        assert result.data['status'] == 'ok'
+        [line] = _journal_lines(tmp_path)
+        assert line['fact'] == verdict_tools.REVIEW_ISSUE_OFF_CONTRACT_FACT
+        assert (line['tool'], line['param'], line['outcome'], line['role']) == (
+            'submit_review_verdict', 'issues', 'normalised', 'test_analyst',
+        )
+        assert line['subject_task_id'] == 'test-1'
+        assert any(d.startswith('issues[0].severity') for d in line['deviations'])
+
+    async def test_a_rejected_intake_is_journalled_once(self, artifacts, tmp_path):
+        result = await self._call(
+            artifacts, tmp_path, [_contract_issue_without('description')],
+        )
+
+        assert result.data['status'] == 'error'
+        [line] = _journal_lines(tmp_path)
+        assert line['outcome'] == 'rejected'
+        assert any(d.startswith('issues[0].description') for d in line['deviations'])
+
+    async def test_a_clean_intake_writes_no_journal_line(self, artifacts, tmp_path):
+        result = await self._call(artifacts, tmp_path, [_contract_issue()])
+
+        assert result.data == {'status': 'ok', 'role': 'test_analyst'}
+        assert not markup_journal.journal_path(
+            tmp_path, verdict_tools.MARKUP_SINK_SPEC.server_label,
+        ).exists()
+
+    async def test_an_unresolvable_journal_root_does_not_break_the_call(self, artifacts):
+        result = await self._call(artifacts, None, [_contract_issue(severity='high')])
+
+        assert result.data['status'] == 'ok'
+        assert artifacts.read_verdict('test_analyst') is not None
 
 
 class TestSingletonRoleToolsDisjointFromReviewerNames:
