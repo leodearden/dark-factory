@@ -80,7 +80,12 @@ class KOfN:
 
 @dataclass(frozen=True)
 class WeekSummary:
-    """One ISO week; unit figures count unit heads, landing figures count rows; None rows drop out."""
+    """One ISO week's figures; a landing whose value is unknown (None) drops out of that figure.
+
+    Event counts (rejection events, re-verifies) are summed once per unit over unit heads, since a
+    unit's value is copied to every member; every rate's denominator is the week's landings whose
+    value is known.
+    """
 
     week: str
     units: int
@@ -99,13 +104,13 @@ class WeekSummary:
             f'# week {self.week}: {self.units} units, {self.landings} landings',
             '#   rejections per 100 landings: '
             f'{_per(self.rejection_events, 100, 1)} '
-            f'({self.rejection_events.k} events over {self.rejection_events.n} units)',
+            f'({self.rejection_events.k} events over {self.rejection_events.n} landings)',
             f'#   landings with >= 1 rejection: {self.rejected_landings}',
             f'#   confirmed-flake landings: {self.flake_confirmed}',
             f'#   real-red landings: {self.flake_real_red}',
             f'#   review rounds >= 2: {self.review_rounds_ge2} ({sources})',
             f'#   re-verifies per landing: {_per(self.reverifies, 1, 2)} '
-            f'({self.reverifies.k} over {self.reverifies.n} units)',
+            f'({self.reverifies.k} over {self.reverifies.n} landings)',
         ]
 
 
@@ -123,9 +128,12 @@ def _count(values: Sequence[bool | None]) -> KOfN:
     return KOfN(sum(1 for value in known if value), len(known))
 
 
-def _total(values: Sequence[int | None]) -> KOfN:
-    known = [value for value in values if value is not None]
-    return KOfN(sum(known), len(known))
+def _unit_events_over_landings(
+    week: Sequence[LandingRow], value: Callable[[LandingRow], int | None]
+) -> KOfN:
+    events = [value(head) for head in unit_heads(week)]
+    known_landings = sum(1 for row in week if value(row) is not None)
+    return KOfN(sum(event for event in events if event is not None), known_landings)
 
 
 def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
@@ -137,7 +145,7 @@ def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
         week=iso_week,
         units=len(heads),
         landings=len(week),
-        rejection_events=_total([row.outcomes.rejection_events for row in heads]),
+        rejection_events=_unit_events_over_landings(week, lambda r: r.outcomes.rejection_events),
         rejected_landings=_count([row.outcomes.rejected for row in week]),
         flake_confirmed=_count([row.outcomes.flake_confirmed for row in week]),
         flake_real_red=_count([row.outcomes.flake_real_red for row in week]),
@@ -147,7 +155,7 @@ def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
             (source, sum(1 for cost in rounds if cost.review_rounds_source is source))
             for source in ReviewRoundsSource
         ),
-        reverifies=_total([row.outcomes.reverify_count for row in heads]),
+        reverifies=_unit_events_over_landings(week, lambda r: r.outcomes.reverify_count),
     )
 
 
@@ -204,7 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     check = batch.git_check
     print(f'# git first-parent disagreement: {check.disagreement} '
           f'(off_first_parent={check.off_first_parent}, '
-          f'merges_without_landing={check.merges_without_landing})')
+          f'merges_without_landing={check.merges_without_landing}, '
+          f'late_claims={check.late_claims})')
     print(ANCHORING)
     if deferred:
         print(f'# deferred: {deferred}')
