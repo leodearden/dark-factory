@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from shared.memory_eval_metrics import (
     parse_metric_series,
     report_artifact_path,
     run_stamp,
+    stamp_datetime,
     validate_metric_series,
     validate_stamp,
     write_metric_series,
@@ -675,6 +677,25 @@ class TestStampShapeIsEnforcedNotAssumed:
             )
             != []
         )
+
+
+class TestStampDatetime:
+    """``stamp_datetime`` is ``run_stamp``'s inverse, beside the one stamp format.
+
+    A caller that orders runs in time (the write-after-miss producer tiles its
+    evaluation periods on consecutive run stamps) parses a stamp here rather
+    than restating ``%Y%m%dT%H%M%SZ`` in a second module.
+    """
+
+    def test_inverts_a_pinned_run_stamp_to_an_aware_utc_datetime(self, monkeypatch):
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
+        parsed = stamp_datetime(run_stamp())
+        assert parsed == datetime(2026, 7, 4, 3, 15, tzinfo=UTC)
+        assert parsed.tzinfo is not None
+
+    def test_a_misshapen_stamp_gets_the_validate_stamp_refusal(self):
+        with pytest.raises(MetricSchemaError, match='%Y%m%dT%H%M%SZ'):
+            stamp_datetime('2026-07-04T03:15:00Z')
 
 
 class TestDelegatesToSharedAtomicWriter:
