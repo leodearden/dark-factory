@@ -6863,6 +6863,7 @@ def _make_esc_with_category(
     *,
     status: str = 'pending',
     level: int = 1,
+    dedupe_fingerprint: str | None = None,
 ) -> Escalation:
     """An Escalation with a caller-chosen category (the top-level _make_escalation
     hardcodes category='task_failure', so has_open_l1 signature tests need this)."""
@@ -6874,6 +6875,7 @@ def _make_esc_with_category(
         category=category,
         summary='merge blocked',
         level=level,
+        dedupe_fingerprint=dedupe_fingerprint,
     )
     esc.status = status
     return esc
@@ -6918,6 +6920,86 @@ class TestHasOpenL1CategoryFilter:
             _make_esc_with_category('esc-T-1', 'T', 'merge_error', status='resolved')
         )
         assert queue.has_open_l1('T', category='merge_error') is False
+
+
+class TestHasOpenL1FingerprintFilter:
+    """has_open_l1 gains an optional keyword-only `dedupe_fingerprint` filter.
+
+    The scheduled memory-eval runner files every metric of one eval under the
+    same synthetic task id, so without this filter one open alarm would
+    suppress every OTHER metric's alarm.  Default None keeps prior behaviour.
+    """
+
+    def _queue_with(self, tmp_path: Path, esc: Escalation) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(esc)
+        return queue
+
+    def test_matching_fingerprint_is_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is True
+
+    def test_new_fingerprint_not_suppressed_by_unrelated_open_one(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-b',
+        ) is False
+
+    def test_resolved_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            status='resolved', dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_level0_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            level=0, dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_matching_fingerprint_other_category_is_not_open(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'merge_error',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_default_none_keeps_prior_behaviour(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', category='eval_regression') is True
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint=None,
+        ) is True
+
+    def test_fingerprint_applies_without_category(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-a') is True
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-b') is False
 
 
 class TestDismissIfCovered:

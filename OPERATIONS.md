@@ -2963,6 +2963,7 @@ missing `LoadState` detector).
 |---|---|---|
 | 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
+| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
@@ -2975,7 +2976,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 02:30, 03:00, 04:00 and 05:00 ones, and
+for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones, and
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
@@ -3184,6 +3185,96 @@ One failure is not an exhaustion. `<label>: claude CLI could not be started
 (model='haiku', cwd=...): [Errno 2] ...` means `claude` is missing from the
 unit's PATH. Every digest fails with it, so the night is a storm that exits
 1. Check the unit's `Environment=PATH=` pin.
+
+### Scheduled memory evals (03:15)
+
+**What it does.** Measures the memory subsystem once a day and files
+regressions where the recon-escalation-watcher sees them. The runner
+(`fused-memory/scripts/memory_eval_runner.py`, contract in
+`docs/prds/memory-eval-program.md` M2/M3) runs each registered producer
+read-only, judges each new series against its trailing window, writes the
+verdicts and a run report, then files `eval_regression` escalations on the
+reconciliation queue (port 8103, `data/reconciliation/escalations`). It never
+resolves one: the watcher is the sole closer.
+
+| File | Role |
+|---|---|
+| `scripts/fused-memory-memory-eval.sh` | Wrapper: service env, then `uv run --no-sync` of the runner |
+| `scripts/fused-memory-memory-eval.service` | `Type=oneshot` around the wrapper |
+| `scripts/fused-memory-memory-eval.timer` | `OnCalendar=*-*-* 03:15:00` |
+| `scripts/install-memory-eval-timer.sh` | Installer |
+| `fused-memory/scripts/memory_eval_runner.py` | The runner and its producer registry |
+| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it) |
+
+**Artifacts** live under `fused-memory/data/memory-evals/`: one directory per
+eval (its M1 series, reports and `limits-current.json`), plus
+`verdicts-<STAMP>.json`, `verdicts-current.json` (what the dashboard reads)
+and `run-report-<STAMP>.txt` at the root.
+
+**The first run is the grandfather snapshot.** An eval with no
+`limits-current.json` records today's failures as known-bad and alarms on
+nothing; its run report lists them under "Initial-state baseline". Deleting an
+eval's `limits-current.json` re-snapshots it on the next run. The installer
+therefore starts nothing: the first run happens on schedule.
+
+**Exit status and what a failed run means.** 0 means the run completed, even
+if it alarmed. 1 means something failed to run: a producer, an evaluation or
+the runner itself. Every such failure in one run collapses into one
+`eval_regression` (task id `memory-eval-program`) on the 8103 queue, and the
+unit is left `failed`. 2 means preflight refused: a bad config, a recon queue
+directory that is missing or empty, a malformed `MEMORY_EVAL_RUN_STAMP`, or
+another run holding the artifact root's `.runner.lock`. The refusal names
+that run's pid and stamp. Two runs at once could file the same fingerprint
+twice or interleave a `limits-current.json` update, so the second run writes
+nothing.
+Nothing is filed then, so the unit state and the journal are the only signal.
+A relative `--artifact-root` is resolved against the caller's directory.
+Unlike the 05:00 and 05:30 wrappers, this one does not mask a failure with
+exit 0: the escalation is the alarm. A failed
+unit does not stop its timer. `fused-memory-flag-marker-sweep.service`
+failed with status 127 on 2026-08-18, and its timer ran it again on
+2026-08-19 (journal excerpt in that unit file).
+
+```bash
+journalctl --user -u fused-memory-memory-eval.service -n 100
+systemctl --user list-timers fused-memory-memory-eval.timer
+```
+
+The run's last stdout line is a JSON summary:
+`{"alarms": …, "failures": …, "filed": …, "run_stamp": …, "suppressed": …}`.
+
+**Re-filing.** While a record is pending, the runner files nothing for its
+`dedupe_fingerprint`. A regression's fingerprint and the runner-failure
+fingerprint carry no stamp, so each stays one record across runs. The storm
+aggregate's fingerprint is scoped to its run
+(`shared/src/shared/memory_eval_verdicts.py::storm_fingerprint`). So a storm
+that persists, such as a corpus migration that trips more than K metrics for
+several days, files one new aggregate per run. The watcher folds those into
+the oldest one.
+
+**Install.**
+
+```bash
+scripts/install-memory-eval-timer.sh
+```
+
+**Deploy is a separate task.** An agent cannot run that installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set (see "The nightly
+ladder" above). The host install is a `task_kind='deterministic'`
+`before_done` task of kind `deploy` that runs
+`scripts/install-memory-eval-timer.sh`. It can be filed only once the
+installer is on main, because
+`fused-memory/src/fused_memory/middleware/deterministic_task_guard.py` rejects
+a `before_done` script that main does not have yet. The job is done when
+`systemctl --user list-timers --all` lists `fused-memory-memory-eval.timer`.
+
+That deploy task must depend on task 3217. The runner writes one verdict
+entry per tripwire item. The dashboard reader
+(`dashboard/src/dashboard/data/memory_evals.py::_read_verdicts`) still keys
+verdicts by `(eval_id, metric_id)` and keeps the first, so it would show an
+alarming tripwire as clear whenever its first item passes. Task 3217 re-keys
+that reader. Until it lands, the first scheduled run would publish a verdicts
+file the Memory tab misreads.
 
 ### Legibility trickle health probe (04:30)
 

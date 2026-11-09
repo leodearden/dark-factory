@@ -1197,7 +1197,13 @@ class EscalationQueue:
             results.append(esc)
         return results
 
-    def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
+    def has_open_l1(
+        self,
+        task_id: str,
+        *,
+        category: str | None = None,
+        dedupe_fingerprint: str | None = None,
+    ) -> bool:
         """Return True when the task has at least one pending level-1 escalation.
 
         Level-1 is the handed-to-human tier: the presence of one signals that
@@ -1207,8 +1213,12 @@ class EscalationQueue:
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
         root cause (a different failure category) escape being silently
         suppressed by an UNRELATED open L1.  Default None preserves the exact
-        prior behavior (any pending L1 counts).  A non-None ``category`` outside
-        ``escalation.categories.EscalationCategory`` raises
+        prior behavior (any pending L1 counts).  ``dedupe_fingerprint``, when
+        given, further restricts the check to open L1s carrying that exact
+        ``.dedupe_fingerprint``; its first caller is
+        ``fused-memory/scripts/memory_eval_runner.py``, which files many
+        fingerprints under one synthetic task id.  A non-None ``category``
+        outside ``escalation.categories.EscalationCategory`` raises
         ``UnregisteredEscalationCategory``.
         """
         if category is not None:
@@ -1216,6 +1226,10 @@ class EscalationQueue:
         open_l1s = self.get_by_task(task_id, status='pending', level=1)
         if category is not None:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
+        if dedupe_fingerprint is not None:
+            open_l1s = [
+                esc for esc in open_l1s if esc.dedupe_fingerprint == dedupe_fingerprint
+            ]
         return bool(open_l1s)
 
     def dismiss_if_covered(self, esc: Escalation, *, resolver: str) -> list[str]:
