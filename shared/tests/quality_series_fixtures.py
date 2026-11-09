@@ -431,3 +431,39 @@ def build_landing_scenario(root: Path, *, with_charter_class: bool = False) -> L
     db.merge_done(at_hour(hours['m7']), '107', m7)
     db.merge_done(at_hour(hours['m8']), '108', m8)
     return LandingScenario(repo, db, c0, m1, d, f1, f2, m3, m4, m6, side, m7, m8)
+
+
+@dataclass(frozen=True)
+class LateClaimScenario:
+    """A done row naming a sha an earlier event already claimed for another task.
+
+    main's first-parent line: c0, r203 (203's own merge, which no runs.db row names), x (201,
+    so x^1 == r203), y (202), z (204). runs.db: 201@x, 202@y, then 203@x, then 204@z.
+    """
+
+    repo: GitRepoBuilder
+    db: RunsDbBuilder
+    c0: str
+    r203: str
+    x: str
+    y: str
+    z: str
+
+
+def build_late_claim_scenario(root: Path) -> LateClaimScenario:
+    """Repo at ``root`` and runs.db at ``root/data/orchestrator/runs.db`` (the project layout)."""
+    repo = GitRepoBuilder(root)
+    c0 = repo.commit({'README.md': 'late claim\n'}, 'root')
+    r203 = repo.branch_merge('203', {'pkg/src/pkg/late/a.py': _src(4, 'a')})
+    x = repo.branch_merge('201', {
+        'pkg/src/pkg/first/b.py': _src(6, 'b'), 'pkg/tests/test_b.py': _src(3, 'tb'),
+    })
+    y = repo.branch_merge('202', {'pkg/src/pkg/second/c.py': _src(2, 'c')})
+    z = repo.branch_merge('204', {'pkg/src/pkg/fourth/d.py': _src(5, 'd')})
+
+    db = RunsDbBuilder(root / 'data' / 'orchestrator' / 'runs.db')
+    db.merge_done(at_hour(10.0), '201', x)
+    db.merge_done(at_hour(10.5), '202', y)
+    db.merge_done(at_hour(11.0), '203', x)
+    db.merge_done(at_hour(11.5), '204', z)
+    return LateClaimScenario(repo, db, c0, r203, x, y, z)

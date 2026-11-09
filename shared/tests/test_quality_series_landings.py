@@ -6,7 +6,13 @@ import dataclasses
 from pathlib import Path
 
 import pytest
-from quality_series_fixtures import LandingScenario, at_hour, build_landing_scenario
+from quality_series_fixtures import (
+    LandingScenario,
+    LateClaimScenario,
+    at_hour,
+    build_landing_scenario,
+    build_late_claim_scenario,
+)
 
 from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, landings
@@ -90,6 +96,7 @@ class TestFullHistory:
         check = landings(scenario.db.conn, scenario.repo.root, since_cursor=None).git_check
         assert check.off_first_parent == 1
         assert check.merges_without_landing == 1
+        assert check.late_claims == 0
         assert check.disagreement == 2
 
 
@@ -130,3 +137,98 @@ def test_a_unit_has_at_least_one_member(scenario: LandingScenario) -> None:
     row = landings(scenario.db.conn, scenario.repo.root, since_cursor=None).landings[0]
     with pytest.raises(ValueError, match='unit_size'):
         dataclasses.replace(row, unit_size=0)
+
+
+@pytest.fixture(scope='module')
+def late_claim(tmp_path_factory: pytest.TempPathFactory) -> LateClaimScenario:
+    """Read-only for every test that uses it."""
+    return build_late_claim_scenario(tmp_path_factory.mktemp('late-claim') / 'proj')
+
+
+def _keys(rows: tuple[Landing, ...]) -> list[tuple[str, str]]:
+    return [_key(row) for row in rows]
+
+
+class TestLateClaim:
+    """A done row naming a sha that an earlier event already claimed for another task."""
+
+    def test_full_history_keeps_the_late_claim_in_landed_order(
+        self, late_claim: LateClaimScenario
+    ) -> None:
+        s = late_claim
+        rows = landings(s.db.conn, s.repo.root, since_cursor=None).landings
+        assert _keys(rows) == [('201', s.x), ('202', s.y), ('203', s.x), ('204', s.z)]
+        assert [row.ordinal for row in rows] == [0, 1, 2, 3]
+
+    def test_the_first_claim_keeps_the_sha_as_its_unit(self, late_claim: LateClaimScenario) -> None:
+        s = late_claim
+        first = _by_key(landings(s.db.conn, s.repo.root, since_cursor=None).landings)[('201', s.x)]
+        assert first.late_claim is False
+        assert first.unit_id == s.x
+        assert first.unit_size == 1
+        assert (first.lines_base, first.base_sha) == (LinesBase.FIRST_PARENT, s.r203)
+
+    def test_the_late_claim_is_its_own_unit_with_unmeasurable_lines(
+        self, late_claim: LateClaimScenario
+    ) -> None:
+        s = late_claim
+        rows = landings(s.db.conn, s.repo.root, since_cursor=None).landings
+        late = _by_key(rows)[('203', s.x)]
+        assert late.late_claim is True
+        assert late.unit_size == 1
+        assert late.source is LandingSource.MERGE_FINALIZED
+        assert late.git_first_parent is True
+        assert (late.lines_base, late.base_sha) == (LinesBase.UNMEASURABLE, None)
+        assert late.unit_id != s.x
+        unit_ids = [row.unit_id for row in rows]
+        assert len(set(unit_ids)) == len(unit_ids)
+
+    def test_git_check_counts_the_late_claim(self, late_claim: LateClaimScenario) -> None:
+        s = late_claim
+        check = landings(s.db.conn, s.repo.root, since_cursor=None).git_check
+        assert check.late_claims == 1
+        assert check.off_first_parent == 0
+        assert check.merges_without_landing == 0
+        assert check.disagreement == 1
+
+    def test_a_range_reaching_the_late_claimers_own_merge_counts_it(
+        self, late_claim: LateClaimScenario
+    ) -> None:
+        s = late_claim
+        check = landings(s.db.conn, s.repo.root, since_cursor=s.c0).git_check
+        assert check.late_claims == 1
+        assert check.merges_without_landing == 1
+        assert check.off_first_parent == 0
+        assert check.disagreement == 2
+
+    @pytest.mark.parametrize(
+        ('cursor', 'expected'),
+        [
+            ('x', [('202', 'y'), ('203', 'x'), ('204', 'z')]),
+            ('y', [('203', 'x'), ('204', 'z')]),
+            ('z', []),
+        ],
+    )
+    def test_a_cursor_emits_the_late_claim_until_a_landing_after_it(
+        self, late_claim: LateClaimScenario, cursor: str, expected: list[tuple[str, str]]
+    ) -> None:
+        s = late_claim
+        full = _by_key(landings(s.db.conn, s.repo.root, since_cursor=None).landings)
+        resumed = landings(s.db.conn, s.repo.root, since_cursor=getattr(s, cursor)).landings
+        assert _keys(resumed) == [(task, getattr(s, name)) for task, name in expected]
+        for row in resumed:
+            assert row.ordinal == full[_key(row)].ordinal
+
+    def test_a_late_claim_refuses_measurable_lines(self, late_claim: LateClaimScenario) -> None:
+        s = late_claim
+        late = _by_key(landings(s.db.conn, s.repo.root, since_cursor=None).landings)[('203', s.x)]
+        with pytest.raises(ValueError, match='late_claim'):
+            dataclasses.replace(late, lines_base=LinesBase.FIRST_PARENT, base_sha=s.r203)
+
+    def test_a_first_claim_refuses_a_unit_id_other_than_its_sha(
+        self, late_claim: LateClaimScenario
+    ) -> None:
+        s = late_claim
+        first = _by_key(landings(s.db.conn, s.repo.root, since_cursor=None).landings)[('201', s.x)]
+        with pytest.raises(ValueError, match='unit_id'):
+            dataclasses.replace(first, unit_id='other')
