@@ -8,7 +8,9 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -30,16 +32,22 @@ class SpawnTempName:
     prefix: str
     suffix: str
     _shape: re.Pattern[str] = field(init=False, repr=False, compare=False)
+    _occurrence: re.Pattern[str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        shape = re.compile(re.escape(self.prefix) + '[a-z0-9_]{8}' + re.escape(self.suffix))
-        object.__setattr__(self, '_shape', shape)
+        shape = re.escape(self.prefix) + '[a-z0-9_]{8}' + re.escape(self.suffix)
+        object.__setattr__(self, '_shape', re.compile(shape))
+        object.__setattr__(self, '_occurrence', re.compile(f'(?=({shape}))'))
 
     def mkstemp(self) -> tuple[int, str]:
         return tempfile.mkstemp(prefix=self.prefix, suffix=self.suffix)
 
     def matches(self, name: str) -> bool:
         return self._shape.fullmatch(name) is not None
+
+    def names_in(self, text: str) -> frozenset[str]:
+        """Every name of this kind occurring anywhere in *text*, overlapping ones included."""
+        return frozenset(occurrence.group(1) for occurrence in self._occurrence.finditer(text))
 
 
 SYSPROMPT_TEMP_NAME = SpawnTempName('sysprompt_', '.txt')
@@ -53,6 +61,7 @@ def sweep_orphaned_spawn_temp_files(
     proc_root: Path = Path('/proc'),
     min_age_secs: float = ORPHAN_MIN_AGE_SECS,
     deadline_secs: float = 5.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Delete the spawn temp files in *base_dir* that no live process names on its cmdline.
 
@@ -64,45 +73,47 @@ def sweep_orphaned_spawn_temp_files(
     A file is deleted only when ALL of these hold: its name has a ``SPAWN_TEMP_NAMES``
     kind's exact mkstemp shape; it is a regular file (not a symlink, not a dir); it is
     owned by this euid; it is at least *min_age_secs* old; and its basename appears in no
-    live process's ``/proc/<pid>/cmdline`` (substring of the NUL-joined blob, so a path
+    live process's ``/proc/<pid>/cmdline`` (anywhere in the NUL-joined blob, so a path
     embedded in an ``sh -c`` token or a ``--flag=value`` is caught). Why cmdline and not
     fds: shared/tests/test_spawn_temp_files.py::test_keeps_a_stale_file_a_live_process_names_on_its_cmdline.
 
     Fails safe: when liveness cannot be established (*proc_root* unlistable, this
-    process absent from it, or a cmdline unreadable for any reason but the pid exiting),
-    nothing is deleted and one WARNING says so.
+    process absent from it, a cmdline unreadable for any reason but the pid exiting, or
+    the read unfinished at the deadline), nothing is deleted and one WARNING says so.
 
     No TOCTOU: every invocation, resume included since task 3983, mkstemps FRESH files,
     so no new process can come to reference a file already past *min_age_secs*.
 
-    *deadline_secs* bounds the directory walk and the unlinks, and a stop is logged as
-    INCOMPLETE. The /proc read is deliberately NOT bounded: a truncated process table is
-    unknown liveness and must never license a delete.
+    Returns within about *deadline_secs* on *clock*, however big *base_dir* or slow
+    *proc_root*. The walk may spend half of it, which leaves the rest to check and
+    reclaim whatever a walk too big to finish did find. The cmdline read runs on a
+    daemon thread that is abandoned if it is still blocked at the deadline (a read can
+    block behind a process in uninterruptible sleep). Any stop on the deadline is
+    logged as INCOMPLETE.
     """
     base = base_dir or Path(tempfile.gettempdir())
-    deadline = time.monotonic() + deadline_secs
+    start = clock()
+    deadline = start + deadline_secs
     try:
-        scan = _scan_stale_candidates(base, min_age_secs, deadline)
+        scan = _scan_stale_candidates(base, min_age_secs, start + deadline_secs / 2, clock)
     except OSError:
         logger.warning('Could not scan %s for orphaned agent-spawn temp files — skipping the sweep',
                        base, exc_info=True)
         return 0
-    if not scan.complete:
-        _warn_incomplete(deadline_secs, scan.examined, removed=0)
-        return 0
-    if not scan.candidates:
-        return 0
-    referenced = _referenced_by_live_processes(proc_root, [path.name for path in scan.candidates])
-    if referenced is None:
-        logger.warning(
-            'Deleted nothing from %s: could not establish process liveness from %s (it must be '
-            'listable, list this process, pid %d, and have every cmdline readable)',
-            base, proc_root, os.getpid(),
-        )
-        return 0
-    orphans = [path for path in scan.candidates if path.name not in referenced]
-    removed, complete = _unlink_orphans(orphans, deadline)
-    if not complete:
+    removed, unlinked_every_orphan = 0, True
+    if scan.candidates:
+        referenced = _names_on_live_cmdlines(proc_root, deadline, clock)
+        if referenced is None:
+            logger.warning(
+                'Deleted nothing from %s: could not establish process liveness from %s by the '
+                'deadline (it must be listable, list this process, pid %d, and have every '
+                'cmdline readable)',
+                base, proc_root, os.getpid(),
+            )
+            return 0
+        orphans = [path for path in scan.candidates if path.name not in referenced]
+        removed, unlinked_every_orphan = _unlink_orphans(orphans, deadline, clock)
+    if not (scan.complete and unlinked_every_orphan):
         _warn_incomplete(deadline_secs, scan.examined, removed)
     if removed:
         logger.info('Reclaimed %d orphaned agent-spawn temp file(s) from %s', removed, base)
@@ -115,14 +126,16 @@ class _Scan(NamedTuple):
     complete: bool
 
 
-def _scan_stale_candidates(base: Path, min_age_secs: float, deadline: float) -> _Scan:
+def _scan_stale_candidates(
+    base: Path, min_age_secs: float, deadline: float, clock: Callable[[], float],
+) -> _Scan:
     euid = os.geteuid()
     now = time.time()
     candidates: list[Path] = []
     examined = 0
     with os.scandir(base) as entries:
         for entry in entries:
-            if time.monotonic() >= deadline:
+            if clock() >= deadline:
                 return _Scan(candidates, examined, complete=False)
             examined += 1
             if not any(kind.matches(entry.name) for kind in SPAWN_TEMP_NAMES):
@@ -136,8 +149,28 @@ def _scan_stale_candidates(base: Path, min_age_secs: float, deadline: float) -> 
     return _Scan(candidates, examined, complete=True)
 
 
-def _referenced_by_live_processes(proc_root: Path, names: list[str]) -> frozenset[str] | None:
-    """The *names* some live process's cmdline mentions, or None when liveness is unknown."""
+def _names_on_live_cmdlines(
+    proc_root: Path, deadline: float, clock: Callable[[], float],
+) -> frozenset[str] | None:
+    """Every spawn temp-file name a live process's cmdline mentions, or None when that is
+    not known by *deadline*."""
+    read: list[list[bytes] | None] = []
+    reader = threading.Thread(
+        target=lambda: read.append(_read_live_cmdlines(proc_root, deadline, clock)),
+        name='spawn-temp-liveness', daemon=True,
+    )
+    reader.start()
+    reader.join(timeout=max(0.0, deadline - clock()))
+    cmdlines = read[0] if read else None
+    if cmdlines is None:
+        return None
+    text = os.fsdecode(b'\0'.join(cmdlines))
+    return frozenset(name for kind in SPAWN_TEMP_NAMES for name in kind.names_in(text))
+
+
+def _read_live_cmdlines(
+    proc_root: Path, deadline: float, clock: Callable[[], float],
+) -> list[bytes] | None:
     try:
         pids = [name for name in os.listdir(proc_root) if name.isdigit()]
     except OSError:
@@ -146,21 +179,24 @@ def _referenced_by_live_processes(proc_root: Path, names: list[str]) -> frozense
         return None
     cmdlines: list[bytes] = []
     for pid in pids:
+        if clock() >= deadline:
+            return None
         try:
             cmdlines.append((proc_root / pid / 'cmdline').read_bytes())
         except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError:
             return None
-    blob = b'\0'.join(cmdlines)
-    return frozenset(name for name in names if os.fsencode(name) in blob)
+    return cmdlines
 
 
-def _unlink_orphans(orphans: list[Path], deadline: float) -> tuple[int, bool]:
+def _unlink_orphans(
+    orphans: list[Path], deadline: float, clock: Callable[[], float],
+) -> tuple[int, bool]:
     """Unlink *orphans* until the deadline; return (removed, whether every one was tried)."""
     removed = 0
     for path in orphans:
-        if time.monotonic() >= deadline:
+        if clock() >= deadline:
             return removed, False
         try:
             path.unlink()
@@ -176,6 +212,6 @@ def _unlink_orphans(orphans: list[Path], deadline: float) -> tuple[int, bool]:
 def _warn_incomplete(deadline_secs: float, examined: int, removed: int) -> None:
     logger.warning(
         'Orphaned agent-spawn temp-file sweep stopped on the %.1fs deadline — this sweep is '
-        'INCOMPLETE (examined %d, removed %d). Later sweeps reclaim the rest.',
+        'INCOMPLETE (examined %d, removed %d); whatever it did not reach is left in place.',
         deadline_secs, examined, removed,
     )

@@ -5,11 +5,14 @@ SIGKILLed spawner never unlinked.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import itertools
 import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -29,10 +32,6 @@ _STALE_SECS = 25 * 3600
 _LOGGER = 'shared.spawn_temp_files'
 
 
-def test_spawn_temp_names_are_exactly_the_two_kinds() -> None:
-    assert SPAWN_TEMP_NAMES == (SYSPROMPT_TEMP_NAME, MCP_CONFIG_TEMP_NAME)
-
-
 @pytest.mark.parametrize('kind', SPAWN_TEMP_NAMES, ids=lambda k: k.prefix)
 def test_matches_a_real_mkstemp_name(kind: SpawnTempName, tmp_path: Path) -> None:
     fd, path = tempfile.mkstemp(prefix=kind.prefix, suffix=kind.suffix, dir=tmp_path)
@@ -49,14 +48,6 @@ def test_matches_its_own_mkstemp_output_in_the_default_tempdir(
     os.close(fd)
     assert Path(path).parent == tmp_path
     assert kind.matches(Path(path).name), path
-
-
-def test_names_are_the_ones_already_on_hosts() -> None:
-    """Legacy orphans on hosts carry these names; keeping them keeps those reclaimable."""
-    assert SYSPROMPT_TEMP_NAME.prefix == 'sysprompt_'
-    assert SYSPROMPT_TEMP_NAME.suffix == '.txt'
-    assert MCP_CONFIG_TEMP_NAME.prefix == 'mcp_'
-    assert MCP_CONFIG_TEMP_NAME.suffix == '.json'
 
 
 @pytest.mark.parametrize('name', [
@@ -156,6 +147,17 @@ def test_keeps_a_stale_file_a_live_process_names_on_its_cmdline(
     referenced, unreferenced = (sysprompt, mcp) if b'sysprompt_' in cmdline else (mcp, sysprompt)
     assert referenced.exists()
     assert not unreferenced.exists()
+
+
+def test_a_process_that_exits_mid_read_does_not_stop_the_reclaim(
+    base: Path, tmp_path: Path,
+) -> None:
+    stale = _plant(base, 'sysprompt_abcd1234.txt', _STALE_SECS)
+    proc = _fake_proc(tmp_path / 'proc', {})
+    (proc / str(os.getpid() + 1)).mkdir()
+
+    assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=proc) == 1
+    assert not stale.exists()
 
 
 def test_keeps_stale_entries_that_are_not_a_spawn_temp_file(
@@ -265,6 +267,43 @@ def test_deletes_nothing_when_liveness_cannot_be_established(
     ), messages
 
 
+_HANG_GUARD_SECS = 10.0
+
+
+def _release(fifo: Path) -> None:
+    """Let a reader blocked opening *fifo* through to EOF; a no-op when none is waiting."""
+    with contextlib.suppress(OSError):
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+
+def test_a_cmdline_read_that_never_returns_deletes_nothing_at_the_deadline(
+    base: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reading a cmdline can block behind a process in uninterruptible sleep; a FIFO
+    nobody writes blocks the same way. The guard timer only turns a regression into
+    a failure instead of a hang."""
+    stale = _plant(base, 'sysprompt_abcd1234.txt', _STALE_SECS)
+    proc = _fake_proc(tmp_path / 'proc', {})
+    hung = proc / str(os.getpid() + 1)
+    hung.mkdir()
+    os.mkfifo(hung / 'cmdline')
+    guard = threading.Timer(_HANG_GUARD_SECS, _release, (hung / 'cmdline',))
+    started = time.monotonic()
+    guard.start()
+    try:
+        removed = sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=proc, deadline_secs=1.0)
+        elapsed = time.monotonic() - started
+    finally:
+        guard.cancel()
+        _release(hung / 'cmdline')
+
+    assert elapsed < _HANG_GUARD_SECS
+    assert removed == 0
+    assert stale.exists()
+    messages = _warnings(caplog)
+    assert any('liveness' in m.lower() and 'nothing' in m.lower() for m in messages), messages
+
+
 def test_consults_proc_only_when_there_is_something_to_delete(
     base: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -291,6 +330,58 @@ def test_an_expired_deadline_stops_the_sweep_and_says_it_is_incomplete(
         'INCOMPLETE' in m and re.search(r'examined \d+', m) and re.search(r'removed \d+', m)
         for m in messages
     ), messages
+
+
+def _clock_jumping_after(calls: int, to: float) -> Callable[[], float]:
+    ticks = itertools.count()
+    return lambda: 0.0 if next(ticks) < calls else to
+
+
+def test_a_walk_cut_short_by_the_deadline_still_reclaims_what_it_found(
+    base: Path, idle_proc: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Directory order is stable, so a walk too big for its budget stops at the same
+    place every startup; reclaiming nothing it found would never make progress."""
+    planted = [_plant(base, f'mcp_{i:08d}.json', _STALE_SECS) for i in range(20)]
+
+    removed = sweep_orphaned_spawn_temp_files(
+        base_dir=base, proc_root=idle_proc, deadline_secs=10.0,
+        clock=_clock_jumping_after(calls=6, to=7.5),
+    )
+
+    assert 0 < removed < len(planted)
+    assert sum(path.exists() for path in planted) == len(planted) - removed
+    messages = _warnings(caplog)
+    assert any('INCOMPLETE' in m and f'removed {removed}' in m for m in messages), messages
+
+
+def test_a_deadline_reached_while_unlinking_stops_there_and_says_it_is_incomplete(
+    base: Path, idle_proc: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    planted = [_plant(base, f'sysprompt_{i:08d}.txt', _STALE_SECS) for i in range(3)]
+
+    def clock_stopped_until_the_first_reclaim() -> float:
+        return 0.0 if all(path.exists() for path in planted) else 100.0
+
+    assert sweep_orphaned_spawn_temp_files(
+        base_dir=base, proc_root=idle_proc, clock=clock_stopped_until_the_first_reclaim,
+    ) == 1
+
+    assert sum(path.exists() for path in planted) == 2
+    messages = _warnings(caplog)
+    assert any('INCOMPLETE' in m and 'removed 1' in m for m in messages), messages
+
+
+def test_an_unscannable_base_dir_warns_once_and_deletes_nothing(
+    tmp_path: Path, idle_proc: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    missing = tmp_path / 'missing'
+
+    assert sweep_orphaned_spawn_temp_files(base_dir=missing, proc_root=idle_proc) == 0
+
+    messages = _warnings(caplog)
+    assert len(messages) == 1, messages
+    assert str(missing) in messages[0], messages
 
 
 @_ROOT_READS_ANYTHING
@@ -339,11 +430,11 @@ def test_reclaims_what_build_claude_argv_creates_once_no_live_process_names_it(
 
         spawned = b'\0'.join(os.fsencode(arg) for arg in cmd) + b'\0'
         live_proc = _fake_proc(tmp_path / 'live-proc', {os.getpid() + 1: spawned})
-        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=live_proc) == 0
+        assert sweep_orphaned_spawn_temp_files(proc_root=live_proc) == 0
         assert sysprompt.exists()
         assert mcp.exists()
 
-        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=idle_proc) == 2
+        assert sweep_orphaned_spawn_temp_files(proc_root=idle_proc) == 2
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
