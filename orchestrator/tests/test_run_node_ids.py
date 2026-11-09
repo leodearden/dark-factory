@@ -59,6 +59,12 @@ def test_p(p):
 @pytest.mark.parametrize('q', [1, 2])
 def test_q(q):
     assert q == 1
+
+
+@pytest.mark.parametrize('baseline', ['present', 'absent'])
+def test_ratchet(baseline):
+    if baseline == 'absent':
+        pytest.skip('baseline absent')
 '''
 
 OK = 'pkg/tests/test_probe.py::test_ok'
@@ -69,6 +75,7 @@ BOX_Z = 'pkg/tests/test_probe.py::TestBox::test_z'
 PARAM = 'pkg/tests/test_probe.py::test_p[a/b]'
 PARAMETRIZED_ALL_PASS = 'pkg/tests/test_probe.py::test_p'
 PARAMETRIZED_ONE_FAILS = 'pkg/tests/test_probe.py::test_q'
+PARAMETRIZED_ONE_SKIPS = 'pkg/tests/test_probe.py::test_ratchet'
 MODULE_RELATIVE_Z = 'tests/test_probe.py::TestBox::test_z'
 ABSENT_FILE = 'pkg/tests/test_absent.py::test_x'
 MISSING = 'pkg/tests/test_probe.py::test_missing'
@@ -127,7 +134,7 @@ def test_each_id_gets_its_own_status(tmp_path):
     tree = _make_tree(tmp_path)
     ids = [
         OK, BAD, SKIP, SETUP_ERROR, PARAM, PARAMETRIZED_ALL_PASS, PARAMETRIZED_ONE_FAILS,
-        MODULE_RELATIVE_Z, ABSENT_FILE,
+        PARAMETRIZED_ONE_SKIPS, MODULE_RELATIVE_Z, ABSENT_FILE,
     ]
 
     statuses = asyncio.run(run_node_ids(tree, _make_config(tree), [_module_config('pkg')], ids))
@@ -140,6 +147,7 @@ def test_each_id_gets_its_own_status(tmp_path):
         PARAM: 'pass',
         PARAMETRIZED_ALL_PASS: 'pass',
         PARAMETRIZED_ONE_FAILS: 'fail',
+        PARAMETRIZED_ONE_SKIPS: 'skipped',
         MODULE_RELATIVE_Z: 'pass',
         ABSENT_FILE: 'error',
     }
