@@ -25,6 +25,8 @@ import pytest
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
 
+from cockpit.app import CockpitApp
+
 if TYPE_CHECKING:
     from cockpit.registry_reader import SessionScannerProtocol
 
@@ -148,7 +150,6 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
     suppressed every write would leave ``[]``, and a write per rebuild would
     leave one entry per round.
     """
-    from cockpit.app import CockpitApp
     from cockpit.panes.detail_pane import DetailPane
     from cockpit.panes.session_table import SessionTable
 
@@ -300,7 +301,6 @@ async def _poll_held_after_its_read(
 class TestInitialRender:
     @pytest.mark.timeout(10)
     async def test_seeded_records_render_as_rows(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
@@ -332,7 +332,6 @@ class TestSessionTableDefaultFilter:
         "tens, not 10k" holds even when the registry carries stale history."""
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -359,7 +358,6 @@ class TestToggleHistory:
         an in-memory-only toggle, re-rendered immediately (no poll tick)."""
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -399,7 +397,6 @@ class TestToggleHistory:
         that hard-coded the filtered view inside _apply_scan, would only be
         caught by a test with an intervening scan -- pressing 'h' and
         asserting immediately (as above) is not enough."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -453,7 +450,6 @@ class TestPollRefresh:
         short real interval, an in-flight poll tick can race this exact
         write+refresh_registry() sequence under a loaded runner.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
@@ -486,7 +482,6 @@ class TestPollRefresh:
         call_from_thread) in between this test's own write and its direct
         refresh_registry() call.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, state_glyph
 
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
@@ -534,7 +529,6 @@ class TestTimerIntegration:
 
     @pytest.mark.timeout(10)
     async def test_timer_tick_triggers_refresh(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.registry_reader import SessionScanner
 
@@ -567,7 +561,6 @@ class TestTimerIntegration:
 class TestRowSelectionDetail:
     @pytest.mark.timeout(10)
     async def test_selecting_row_renders_detail(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.detail_pane import DetailPane
         from cockpit.panes.session_table import SessionTable
 
@@ -607,7 +600,6 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
         the FULL scanned set, not just the (possibly filtered) visible
         `records` -- so a visible parent's non-terminal child is never
         undercounted just because the child itself is hidden from view."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -641,7 +633,6 @@ class TestWriteDiscipline:
         running the app end-to-end (mount, a poll tick, a row selection) must
         never create, modify, or delete a sessions/ or decisions/ file --
         those belong to spawn-claude.sh/T4-T7/C8/C5b, never the C5a view."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
@@ -690,7 +681,6 @@ class TestSelectedSlugRestore:
         ui_config's whole reason to exist. Both halves were unit-tested;
         the seam joining them was not. Also note here that the persisted
         poll_interval is deliberately inert (task 4054 scope)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
 
@@ -736,7 +726,6 @@ class TestSelectedSlugRestore:
         from disk INSIDE the app's lifetime -- after on_unmount the value is
         written either way, which is exactly the gap this pins.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
@@ -793,7 +782,6 @@ class TestSelectedSlugRestore:
         cockpit must still mount and land on row 0. This test is a
         fail-soft regression guard, NOT a second proof of the restore --
         it passes with or without the restore branch, by design."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import CockpitUIConfig, save_ui_config
 
@@ -844,7 +832,6 @@ class TestUIConfigWriteDebounce:
     async def test_highlight_burst_writes_nothing_until_shutdown(self, tmp_path, monkeypatch):
         """A burst of cursor moves does ZERO I/O while the app runs; the one
         write that lands is on_unmount's, carrying the LAST slug."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config, ui_config_path
 
@@ -945,7 +932,6 @@ class TestUIConfigWriteDebounce:
         tick over an unchanged selection writes nothing more -- so this is a
         real debounce, not one-write-per-keypress traded for
         one-write-per-interval forever."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
 
@@ -1018,7 +1004,6 @@ class TestUIConfigWriteDebounce:
         synchronous atomic write back on every single tick -- reintroducing, in
         the worst case, exactly the per-tick I/O this debounce removed.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import ui_config_path
 
@@ -1093,7 +1078,6 @@ class TestUIConfigWriteDebounce:
         the busy-fleet case where the operator is most likely to be moving
         the cursor -- and the selection would sit unpersisted until unmount.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         running = _debounce_running_records()
@@ -1139,7 +1123,6 @@ class TestUIConfigWriteDebounce:
         gate asks "is the on-disk file stale", not "did the selection
         change", so a successful restore leaves the live selection already
         equal to the persisted one and the first tick writes nothing."""
-        from cockpit.app import CockpitApp
         from cockpit.ui_config import CockpitUIConfig, save_ui_config
 
         running = _seed_debounce_fleet(tmp_path)
@@ -1180,7 +1163,6 @@ class TestUIConfigWriteDebounce:
         test_mount_over_a_restored_selection_writes_nothing -- do not
         "simplify" it away as a duplicate.
         """
-        from cockpit.app import CockpitApp
         from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
 
         _seed_debounce_fleet(tmp_path)
@@ -1216,7 +1198,6 @@ class TestDecisionQueueRender:
         """
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1284,7 +1265,6 @@ class TestDecisionQueueRender:
         render '100d', widen the age column past its label and silently move
         this arithmetic by one.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1329,7 +1309,6 @@ class TestDecisionQueueRender:
         half of this that a formatter-only cap cannot do. Widths: 200 - 26
         fixed - 2 padding == 172, and 100 - 26 - 2 == 72.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1401,7 +1380,6 @@ class TestDecisionQueueRender:
         Widths: 200 - 26 fixed - 2 padding == 172 with no scrollbar, 170 once
         two cells go to one.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1453,7 +1431,6 @@ class TestDecisionQueueRender:
         derived bound -- is identical before and after; only the guard keeps
         the reflow from running anyway.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1500,7 +1477,6 @@ class TestSignalDontMove:
         this path; a subsequent awaiting-input->idle transition clears the
         urgency hint.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1556,7 +1532,6 @@ class TestSharedTargetAttentionNotClearedPrematurely:
         incorrectly clear the shared target's urgency hint, even though a
         live ask (the session) still points at it.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
 
         display = sr.Display(kind='wm', wm_title='shared title')
@@ -1607,7 +1582,6 @@ class TestEnterFocus:
         call may originate from (see TestSignalDontMove for the refresh
         path's complementary "never focus" half of the same invariant).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1658,7 +1632,6 @@ class TestEnterFocus:
         -- fail-soft, PRD §2. A gone/unlinked lead is still a no-op, never
         a crash.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1707,7 +1680,6 @@ class TestEnterFocus:
 
     @pytest.mark.timeout(10)
     async def test_enter_on_a_watcher_filed_decision_focuses_the_watcher(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1737,7 +1709,6 @@ class TestEnterFocus:
         itself must see record_slug -- not only resolve_target."""
         from dataclasses import replace
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1778,7 +1749,6 @@ class TestBoostReordersAndPersists:
         comparison hermetic -- independent of wall-clock time and of
         whatever priorities.yaml (if any) happens to live on the host.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
@@ -1855,7 +1825,6 @@ class TestDropRemovesAndPersists:
         """
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1899,7 +1868,6 @@ class TestDropRemovesAndPersists:
         ONLY -- sessions aren't cockpit-writable (PRD §2/§6.6), so this
         must not touch the session's record on disk, and must not raise.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1944,7 +1912,6 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
 
     @pytest.mark.timeout(10)
     async def test_project_stays_canonical_across_the_boost_and_drop_re_reads(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1999,7 +1966,6 @@ class TestInjectedDecisionsReaderIsEveryDecisionRead:
         would let a test fake see one registry while the app showed another."""
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.registry_reader import scan_decisions
@@ -2058,7 +2024,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         itself triggers. Clause (b) below is the standing guard against that
         mistake -- a live drop must survive an unrelated rebuild.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2144,7 +2109,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         still silently suppress Q2 -- the exact failure class this whole
         prune exists to kill.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2206,7 +2170,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         WAKE-UP TRIGGER (the snapshot) is at least as strong as the overlay
         identity (_ask_identity's `(question.text, question.asked_at)`).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2266,7 +2229,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         identity itself (not the liveness gate) that has to do the work
         when the non-awaiting state is never observed.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2326,7 +2288,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         purely-time-passing tick diff). So this pins the IDENTITY's job,
         with the wake-up trigger supplied independently.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2378,7 +2339,6 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         rule -- and self._overlay_asks, the bookkeeping side-table, must be
         garbage-collected along with it rather than becoming the new leak.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
         display = sr.Display(kind='wm', wm_title='boost title')
@@ -2416,7 +2376,6 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         stamp must expire rather than sit in memory forever suppressing the
         effective age of whatever later reuses that id.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
         decision = sr.DecisionRecord(
@@ -2466,7 +2425,6 @@ class TestReorderTargetsAreDeduped:
         Uses a tmux display because tmux is the only backend whose reorder
         is not a documented no-op.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2528,7 +2486,6 @@ class TestReorderTargetsAreDeduped:
         through sess-a's own display -- target A, the same object the
         sess-a row resolves to.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2617,7 +2574,6 @@ class TestCopyAction:
         touching sessions/ or decisions/ (mirrors TestWriteDiscipline's
         before/after _snapshot_tree diff).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2677,7 +2633,6 @@ class TestCopyAction:
         action_copy itself (reviewer_comprehensive test_coverage
         suggestion, test_app.py:911).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2723,7 +2678,6 @@ class TestCopyAction:
         crash and must never reach the clipboard seam at all (no stray
         subprocess, no misleading toast for a row that doesn't exist).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2837,7 +2791,6 @@ class TestCopyFallbackAndFeedback:
         with the helper name dropped) would otherwise leave every test in
         this class green while telling the operator nothing useful.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2871,7 +2824,6 @@ class TestCopyFallbackAndFeedback:
     @pytest.mark.timeout(10)
     async def test_no_local_helper_falls_back_to_osc52_and_warns(self, tmp_path, monkeypatch):
         """The over-SSH case: the same payload goes out as OSC 52, and the toast says so."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2912,7 +2864,6 @@ class TestCopyFallbackAndFeedback:
         with the same payload, and the toast reports the failure rather than
         silently claiming success.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2950,7 +2901,6 @@ class TestCopyFallbackAndFeedback:
     @pytest.mark.timeout(10)
     async def test_empty_queue_neither_falls_back_nor_toasts(self, tmp_path, monkeypatch):
         """No highlighted row: nothing was copied, so there is nothing to say about it."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2989,7 +2939,6 @@ class TestDeferResetsAge:
         comparison hermetic -- independent of wall-clock time and of
         whatever priorities.yaml (if any) happens to live on the host.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
@@ -3077,7 +3026,6 @@ class TestWeightEditorReordersAndPersists:
         -- the "another factor" a project-weight bump on 'beta' alone must
         overcome to flip the order.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.weight_editor import merge_weight_edits
@@ -3149,7 +3097,6 @@ class TestWeightEditorReordersAndPersists:
         code change -- cockpit.app.save_priorities is monkeypatched here to
         a no-op stand-in for the worst case, not to prove a NEW behavior.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.weight_editor import merge_weight_edits
@@ -3223,7 +3170,6 @@ class TestPrioritiesPathResolution:
 
         from orchestrator.session_registry import fleet_root as resolve_fleet_root
 
-        from cockpit.app import CockpitApp
         from cockpit.priority import Priorities, save_priorities
 
         seeded = replace(Priorities.default(), project_weights={'df': 7.0})
@@ -3244,7 +3190,6 @@ class TestWeightEditor:
     async def test_w_key_pushes_weight_editor_screen(self, tmp_path):
         """'w' (PRD §9 C9b weight editor) pushes a WeightEditorScreen (mirrors
         TestSpawnBar.test_new_session_key_pushes_spawn_screen)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -3268,7 +3213,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3310,7 +3254,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3352,7 +3295,6 @@ class TestWeightEditor:
         cancel accidentally submit (or fail to dismiss) would leave
         *received* non-empty, or leave the screen on top, respectively.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3398,7 +3340,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3445,7 +3386,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3490,7 +3430,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3529,7 +3468,6 @@ class TestSpawnBar:
     @pytest.mark.timeout(10)
     async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
         """'n' (PRD §9 C5b spawn bar) pushes a SpawnScreen project/role/prompt picker."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
@@ -3551,7 +3489,6 @@ class TestSpawnBar:
         runner is faked) -- driven directly per this task's plan, rather
         than through SpawnScreen's own Input/Select widgets.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import build_spawn_argv
 
         spawned: list[list[str]] = []
@@ -3581,8 +3518,6 @@ class TestSpawnBar:
         """spawn_session(..., skip_perms=True) (F9 fix, task 2518) threads
         through to build_spawn_argv, so argv[2] is the 'true' literal
         spawn-claude.sh's positional contract expects."""
-        from cockpit.app import CockpitApp
-
         spawned: list[list[str]] = []
         spawn_script = '/repo/skills/spawn/spawn-claude.sh'
 
@@ -3605,8 +3540,6 @@ class TestSpawnBar:
     async def test_spawn_session_forwards_skip_perms_false(self, tmp_path):
         """spawn_session(..., skip_perms=False) (F9 fix, task 2518) threads
         through to build_spawn_argv, so argv[2] is the 'false' literal."""
-        from cockpit.app import CockpitApp
-
         spawned: list[list[str]] = []
         spawn_script = '/repo/skills/spawn/spawn-claude.sh'
 
@@ -3633,7 +3566,6 @@ class TestSpawnBar:
         4th arg."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         calls: list[tuple[str, str, str, bool]] = []
@@ -3669,7 +3601,6 @@ class TestSpawnBar:
         env-configured default (F9 fix, task 2518)."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         calls: list[tuple[str, str, str, bool]] = []
@@ -3711,7 +3642,6 @@ class TestSpawnBar:
         expects at argv[2]."""
         from textual.widgets import Checkbox, Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'true')
@@ -3753,7 +3683,6 @@ class TestSpawnBar:
         skip-perms Checkbox is seeded False -- the safe default."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         monkeypatch.delenv('CLAUDE_SPAWN_SKIP_PERMS', raising=False)
@@ -3775,7 +3704,6 @@ class TestSpawnTree:
     async def test_toggle_key_pushes_tree_screen_with_structure(self, tmp_path):
         """'t' (Fleet Cockpit C9a spawn-tree toggle) pushes a SpawnTreeScreen
         rendering the parent_session_id parent→child session-tree structure."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3804,7 +3732,6 @@ class TestSpawnTree:
         """Outstanding (non-terminal) children are visually marked in the
         rendered tree (Fleet Cockpit C9a, PRD §9) -- pins the "outstanding
         children highlighted" half of the leaf signal at the widget level."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import _OUTSTANDING_MARKER, SpawnTree, SpawnTreeScreen
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3848,7 +3775,6 @@ class TestSpawnTreeEnterFocus:
         the focus backend -- the C9a leaf signal (PRD §9), mirroring
         TestEnterFocus's decision-queue contract at the tree-toggle level.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -3888,7 +3814,6 @@ class TestSpawnTreeEnterFocus:
     async def test_enter_on_child_with_no_display_is_fail_soft(self, tmp_path):
         """A child with no Display resolves to no focus target -- pressing
         Enter on it must not focus anything and must not raise (PRD §2)."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -3926,7 +3851,6 @@ class TestSpawnTreeEnterFocus:
         opened tree's own snapshot, once stale) resolves to no record at all
         -- the `record is None` branch -- and must not raise or focus
         anything (PRD §2), mirroring the no-Display fail-soft case above."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
         some_record = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3955,7 +3879,6 @@ class TestSpawnTreeEnterFocus:
         alternate approach stops disk from still backing the child.
         Enter must still focus the original child's Display, exactly as if
         the poll tick had never landed."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -4013,7 +3936,6 @@ class TestSessionTableEnterFocus:
         mirroring TestSpawnTreeEnterFocus's contract at the top-level
         session-table Enter path.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.session_table import SessionTable
 
@@ -4059,7 +3981,6 @@ class TestSessionTableEnterFocus:
         """A session row with no Display resolves to no focus target --
         pressing Enter on it must not focus anything and must not raise
         (PRD §2), mirroring TestSpawnTreeEnterFocus's no-Display guard."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.session_table import SessionTable
 
@@ -4086,7 +4007,6 @@ class TestSpawnTreeToggle:
         """'t' toggles: pressing it again while the tree is open closes it
         (back to the default screen) rather than leaving it open or
         pushing a second modal on top (Fleet Cockpit C9a, PRD §9)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -4105,7 +4025,6 @@ class TestSpawnTreeToggle:
     async def test_escape_closes_the_open_tree(self, tmp_path):
         """'escape' also dismisses the open spawn-tree modal, mirroring
         SpawnScreen.action_cancel's own escape-to-dismiss binding."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -4141,7 +4060,6 @@ class TestRefreshWriteDiscipline:
         direct refresh_registry() call, so the diff below isolates exactly
         what the automatic refresh/diff path itself writes: nothing.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -4225,7 +4143,6 @@ class TestNonBlockingPoll:
 
     @pytest.mark.timeout(10)
     async def test_poll_scan_runs_off_thread_and_event_loop_stays_responsive(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         scanner = _BlockingScanner()
@@ -4267,7 +4184,6 @@ class TestThreadedScanReachesUI:
 
     @pytest.mark.timeout(10)
     async def test_worker_result_reaches_table_and_writes_nothing(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         first = _make_record(session_slug='thread-1', status=sr.Status.RUNNING)
@@ -4393,8 +4309,6 @@ class TestScanBackpressure:
 
     @pytest.mark.timeout(10)
     async def test_overlapping_tick_is_dropped_while_scan_in_flight(self, tmp_path):
-        from cockpit.app import CockpitApp
-
         scanner = _BlockingCountingScanner()
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing an uncontrolled worker mid-test -- the only ticks driven
@@ -4426,8 +4340,6 @@ class TestScanBackpressure:
     async def test_scan_in_flight_clears_after_a_raising_scan(self, tmp_path):
         from textual.worker import WorkerFailed
 
-        from cockpit.app import CockpitApp
-
         scanner = _RaisingThenOkScanner()
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
@@ -4453,7 +4365,6 @@ class TestALatePollCannotRegressAFresherScan:
     async def test_a_poll_landing_after_a_fresher_scan_is_dropped_and_the_next_poll_applies(
         self, tmp_path
     ):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         sr.write_record(_make_record(session_slug='r-1'), root=tmp_path)
@@ -4494,7 +4405,6 @@ class TestInFlightScanCannotUndoAKeypressWrite:
 
     @pytest.mark.timeout(10)
     async def test_a_boost_survives_a_scan_issued_before_it(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
@@ -4555,7 +4465,6 @@ class TestInFlightScanCannotUndoAKeypressWrite:
     async def test_a_drop_survives_a_scan_issued_before_it(self, tmp_path):
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -4600,7 +4509,6 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         keypresses kept landing mid-scan -- on a large fleet, whose scan
         outlasts the gap between presses, a whole triage burst.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.session_table import SessionTable
@@ -4661,7 +4569,6 @@ class TestDecisionQueueDetail:
         full -- and syncing it there must not disturb the session table's own
         detail sync or the selected-slug restore seam.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4749,7 +4656,6 @@ class TestDecisionQueueDetail:
         consistent alternative. The queue's session row still must not write
         _selected_slug: that restore seam is the session TABLE's alone.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4814,7 +4720,6 @@ class TestDecisionQueueDetail:
         own restore seam stays a function of the session table alone, rebuild
         or not.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4892,7 +4797,6 @@ class TestDecisionQueueDetail:
         a regression of startup behaviour and of the cockpit-ui.json restore (the
         restored slug's own repost fires only when its row index changes).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.detail_pane import DetailPane
         from cockpit.panes.session_table import SessionTable
@@ -4938,7 +4842,6 @@ class TestDecisionQueueDetail:
         filed while they read a session row shifts the queue's highlighted INDEX,
         and the resulting repost yanks the pane out from under them.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5013,7 +4916,6 @@ class TestDecisionQueueDetail:
         that hands the pane to the queue mid-drag, off a session row the
         operator deliberately parked on.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5093,7 +4995,6 @@ class TestDecisionQueueDetail:
         test that leaves both tables pointing at the same session passes for the
         wrong reason.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5175,7 +5076,6 @@ class TestDecisionQueueDetail:
         stale self._decisions, since an unchanged question is exactly what a
         stale render shows.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5253,7 +5153,6 @@ class TestDecisionQueueDetail:
         longer exists with no rebuild able to clear it -- a wedged pane, not a
         transient miss. So an empty queue releases ownership.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5354,7 +5253,6 @@ class TestSessionTableFocusCue:
 
     @pytest.mark.timeout(10)
     async def test_focusable_and_headless_rows_are_distinguishable(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, focus_marker, state_glyph
 
         focusable = _make_record(
@@ -5414,7 +5312,6 @@ class TestSessionTableCapNotice:
 
     @pytest.mark.timeout(10)
     async def test_replace_rows_reports_and_clears_the_cap_notice(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
         records = [
@@ -5456,7 +5353,6 @@ class TestSessionTableCapNotice:
         the cap to bite, and this keeps the test in the same sub-second
         band as its neighbours.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         over_cap = [
@@ -5480,7 +5376,6 @@ class TestSessionTableCapNotice:
     async def test_small_fleet_claims_no_truncation(self, tmp_path):
         """A fleet that fits stays quiet -- a complete table must not
         announce itself as capped."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         records = [
@@ -5510,7 +5405,6 @@ class TestSessionTableCapNotice:
         live band does not) because with a small fleet an empty subtitle
         after 'h' is true no matter what the history branch reports.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         live = [
