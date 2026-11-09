@@ -14,6 +14,7 @@ exit-time cleanup of other sessions' dead dirs is unbounded; the contract is
 
 from __future__ import annotations
 
+import json
 import stat
 from enum import StrEnum
 from pathlib import Path
@@ -104,7 +105,7 @@ def inherited_temp_root(project: Path) -> str:
 def write_pytest_config(project: Path, addopts: str = '') -> None:
     options = f'{_BASE_ADDOPTS} {addopts}'.strip()
     (project / 'pyproject.toml').write_text(
-        f'[tool.pytest.ini_options]\naddopts = "{options}"\n', encoding='utf-8',
+        f'[tool.pytest.ini_options]\naddopts = {json.dumps(options)}\n', encoding='utf-8',
     )
 
 
