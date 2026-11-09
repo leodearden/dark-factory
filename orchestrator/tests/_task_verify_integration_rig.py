@@ -42,7 +42,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -71,7 +71,12 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher
 from orchestrator.task_verify_spec import TaskVerifySpec, build_task_verify_spec
 from orchestrator.verify import VerifyResult, admission_policy
-from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPlan, gate_for
+from orchestrator.verify_admission_gate import (
+    AdmissionGate,
+    AdmissionPlan,
+    AdmissionPolicy,
+    gate_for,
+)
 from orchestrator.verify_cancel import kill_process_tree, read_worktree_path
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import RemoteRunner, result_to_json
@@ -597,8 +602,19 @@ class Turn:
             await self.task
 
 
+
+class PendingMerge(Protocol):
+    """What ``Scene.end_merge`` reads off an enqueued merge request."""
+
+    @property
+    def request_id(self) -> str: ...
+
+    @property
+    def result(self) -> asyncio.Future[Any]: ...
+
+
 def _queue(
-    gate: AdmissionGate, policy: Callable[[], Any], *, task_id: str, arrival: float | None = None,
+    gate: AdmissionGate, policy: Callable[[], AdmissionPolicy], *, task_id: str, arrival: float | None = None,
 ) -> Turn:
     plan = AdmissionPlan.begin(role='task', task_id=task_id)
     if arrival is not None:
@@ -653,7 +669,7 @@ class Scene:
         return self.harness._task_verify_dispatcher
 
     @property
-    def worker(self) -> Any:
+    def worker(self):  # return type inferred: no lane type name imported
         assert self.harness._merge_worker is not None, 'start_worker() first'
         return self.harness._merge_worker
 
@@ -788,7 +804,7 @@ class Scene:
         """The laptop's row of the merge worker's snapshot ``hosts`` block."""
         return {row['name']: row for row in self.worker.snapshot()['hosts']}[LAPTOP]
 
-    async def merge(self, task_id: str) -> Any:
+    async def merge(self, task_id: str):  # return type inferred: no lane type name imported
         """Enqueue, on the harness's merge queue, a merge of task *task_id*'s new branch."""
         request = await branch_merge_request(
             self.harness.git_ops, self.config, task_id, filename=f'{task_id}.txt',
@@ -796,7 +812,7 @@ class Scene:
         await self.harness._merge_queue.put(request)
         return request
 
-    async def end_merge(self, request: Any, *, settle_secs: float = 30.0) -> str:
+    async def end_merge(self, request: PendingMerge, *, settle_secs: float = 30.0) -> str:
         """The merge's outcome status once it lands or fails, else ``'cancelled'`` by the worker."""
         try:
             outcome = await asyncio.wait_for(asyncio.shield(request.result), settle_secs)
