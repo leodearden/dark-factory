@@ -49,7 +49,13 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
 from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.speculation_controller import PermitLedger
-from orchestrator.merge_lane.types import MergeRequest, RemergeBase, RemergeReason, SpecPermit
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    MergeRequest,
+    RemergeBase,
+    RemergeReason,
+    SpecPermit,
+)
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -182,6 +188,27 @@ def _make_pass_entry(
         merge_wt=merge_wt_val,
         was_speculative=False,
     )
+
+
+def _frontier_entry(item: RealMergeItem, *, status: InflightStatus | None = None) -> InflightEntry:
+    """A verify-frontier entry whose verify is still running (a pending future,
+    so the re-anchor decision can read its liveness)."""
+    return InflightEntry(
+        item=item,
+        lease=None,
+        verify_task=asyncio.get_running_loop().create_future(),  # type: ignore[arg-type]
+        merge_wt=None,
+        was_speculative=False,
+        status=status,
+    )
+
+
+def _remerge_claim(remerge: AsyncMock) -> RemergeClaim:
+    """The claim the last awaited ``_remerge`` call was handed (task 8524)."""
+    assert remerge.await_args is not None
+    claim = remerge.await_args.kwargs.get('claim')
+    assert isinstance(claim, RemergeClaim), remerge.await_args
+    return claim
 
 
 # ── _chain_dead_link predicate ───────────────────────────────────────────────
@@ -450,14 +477,16 @@ class TestDispatchDeadBaseRecheck:
             'remerged-dispatch', base_sha=main_sha, merge_commit=None,
             config=config, git_repo=git_repo,
         )
-        worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
+        remerge = AsyncMock(return_value=remerged)
+        worker._remerge = remerge  # type: ignore[method-assign]
 
-        # A head entry WITH a verify_task → _has_inflight_verify is True (the exact
-        # 5260 condition the old global-flag gate mis-handles).
+        # A head entry WITH a running verify → _has_inflight_verify is True (the
+        # exact 5260 condition the old global-flag gate mis-handles).
         _, head = _make_fake_item(
             'head', base_sha=main_sha, merge_commit='headc', config=config, git_repo=git_repo,
         )
-        worker._inflight.append(_make_inflight_entry(head, verifying=True))
+        assert isinstance(head, RealMergeItem)
+        worker._inflight.append(_frontier_entry(head))
 
         # The built-awaiting-host straggler: base_sha points at a DEAD commit.
         _, item = _make_fake_item(
@@ -467,7 +496,9 @@ class TestDispatchDeadBaseRecheck:
 
         await worker._dispatch_item(item)
 
-        worker._remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
+        remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
+        # The live head's commit is the tip the replacement is claimed onto.
+        assert _remerge_claim(remerge).anchor == RemergeBase('headc', RemergeReason.LIVE_TIP)
         worker._run_inflight_verify.assert_not_called()  # NO verify burned on the dead base
         voided = store.speculative_events(EventType.verdict_voided)
         assert len(voided) == 1
@@ -656,7 +687,8 @@ class TestCascadeStragglerCaughtComposition:
         # which isolates them exactly as swapping in a fresh store did.
         voided_before = len(store.speculative_events(EventType.verdict_voided))
         worker._host_allocator = _fake_local_allocator()
-        worker._remerge = _make_remerge_to_decided_stub()  # reset await_count
+        remerge = _make_remerge_to_decided_stub()  # a fresh await_count
+        worker._remerge = remerge  # type: ignore[method-assign]
         _, straggler = _make_fake_item(
             'comp-straggler', base_sha=_DOWN_C, merge_commit=_STRAG_C,
             config=config, git_repo=git_repo,
@@ -665,8 +697,9 @@ class TestCascadeStragglerCaughtComposition:
 
         await worker._dispatch_item(straggler)
 
-        # Caught at dispatch: re-merged against real main, NO verify burned.
-        worker._remerge.assert_awaited_once()
+        # Caught at dispatch: re-merged under a claim, NO verify burned.
+        remerge.assert_awaited_once()
+        _remerge_claim(remerge)
         worker._run_inflight_verify.assert_not_called()
         voided = store.speculative_events(EventType.verdict_voided)[voided_before:]
         assert len(voided) == 1
@@ -772,3 +805,139 @@ class TestRemergeOntoTheClaimedBase:
 
         assert permit.released is True
         assert _ledger(worker).live == frozenset()
+
+
+# ── task 8524: the dispatch sites re-anchor (consumers 4 and 5) ──────────────
+
+
+def _dispatching_worker(
+    git_ops: GitOps, store: _LateArrivalFakeEventStore,
+) -> SpeculativeMergeWorker:
+    """A bare worker with one free local host, whose verify never runs."""
+    worker = _make_worker(git_ops, event_store=store)
+    worker._host_allocator = _fake_local_allocator()
+    worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+    worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+        return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
+    )
+    return worker
+
+
+async def _live_tip(
+    worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
+    *, status: InflightStatus | None = None,
+) -> str:
+    """Seed the verify frontier with one real merge whose verify is running;
+    return its merge commit."""
+    _, tip_item = await _make_merged_item(git_ops, config, 'task/disp-tip', 'disp_tip.py', 't=1\n')
+    worker._inflight.append(_frontier_entry(tip_item, status=status))
+    tip = tip_item.merge_result.merge_commit
+    assert tip is not None
+    return tip
+
+
+async def _dead_based_straggler(
+    worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
+) -> tuple[RealMergeItem, SpecPermit]:
+    """A speculative straggler built on a recorded-dead commit, holding a permit."""
+    worker._record_dead_base(_DEAD, killer=_KILLER)
+    _, built = await _make_merged_item(git_ops, config, 'task/disp-strag', 'disp_s.py', 's=1\n')
+    permit = await _ledger(worker).acquire()
+    straggler = dataclasses.replace(built, base_sha=_DEAD, speculative=True, permit=permit)
+    return straggler, permit
+
+
+async def _dispatch(worker: SpeculativeMergeWorker, item: RealMergeItem) -> InflightEntry | None:
+    return await worker._dispatch_item(item)
+
+
+def _the_row(store: _LateArrivalFakeEventStore, event_type: EventType) -> dict[str, object]:
+    rows = store.speculative_events(event_type)
+    assert len(rows) == 1, rows
+    return rows[0]['data']
+
+
+def _replacement(entry: InflightEntry | None) -> RealMergeItem:
+    assert entry is not None
+    assert isinstance(entry.item, RealMergeItem), entry.item
+    return entry.item
+
+
+@pytest.mark.asyncio
+class TestDispatchSitesReanchor:
+    """A dead-base straggler (consumer 4) and a Mechanism-2 stale discard
+    (consumer 5) re-merge onto the claimed base, and the triggering row names
+    the anchor (plans/merge-lane-policy-prd.md D1, §7 rows 1 and 3)."""
+
+    async def test_a_dead_based_straggler_restacks_on_the_live_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store)
+        tip = await _live_tip(worker, git_ops, config)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+
+        entry = await _dispatch(worker, straggler)
+
+        replacement = _replacement(entry)
+        assert replacement.base_sha == tip
+        assert replacement.speculative is True
+        assert replacement.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
+        assert entry is not None and entry.permit is permit
+        row = _the_row(store, EventType.verdict_voided)
+        assert row['point'] == 'dispatch'
+        assert (row['anchor_reason'], row['anchor_base']) == ('live_tip', tip)
+
+    async def test_with_no_live_tip_the_straggler_falls_to_main_and_frees_its_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+
+        entry = await _dispatch(worker, straggler)
+
+        replacement = _replacement(entry)
+        assert replacement.base_sha == await git_ops.get_main_sha()
+        assert replacement.speculative is False
+        assert replacement.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
+        assert permit.released is True
+        assert permit not in _ledger(worker).live
+        assert entry is not None and entry.permit is None
+        row = _the_row(store, EventType.verdict_voided)
+        assert (row['anchor_reason'], row['anchor_base']) == ('no_tip', None)
+
+    async def test_a_vacated_tip_owner_sends_the_straggler_to_main(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Boundary row 3 at the worker: the 3082 shape, a frozen tip whose
+        verify requeued its request."""
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store)
+        await _live_tip(worker, git_ops, config, status=InflightStatus.REQUEUED)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+
+        entry = await _dispatch(worker, straggler)
+
+        replacement = _replacement(entry)
+        assert replacement.base_sha == await git_ops.get_main_sha()
+        assert replacement.remerge_base == RemergeBase(None, RemergeReason.TIP_VACATED)
+        assert permit.released is True
+        assert entry is not None and entry.permit is None
+        row = _the_row(store, EventType.verdict_voided)
+        assert row['anchor_reason'] == 'tip_vacated'
+
+    async def test_a_mechanism_2_discard_row_names_the_anchor(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store)
+        _, built = await _make_merged_item(git_ops, config, 'task/disp-stale', 'disp_m.py', 'm=1\n')
+        stale = dataclasses.replace(built, base_sha=_LIVE_DEEP)  # main moved since the build
+
+        entry = await _dispatch(worker, stale)
+
+        assert _replacement(entry).remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
+        row = _the_row(store, EventType.speculative_discard)
+        assert row['reason'] == 'main_advanced'
+        assert (row['anchor_reason'], row['anchor_base']) == ('no_tip', None)
