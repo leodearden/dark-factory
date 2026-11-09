@@ -171,6 +171,7 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    inherit_veto_streak_alarms,
     pending_holder_candidates,
     pin_buckets,
     render_shape,
@@ -367,6 +368,15 @@ _HARNESS_FILING_SESSION_ID: str = 'harness'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# The veto-streak charging sites each sweep's end-of-pass release stands down
+# (Harness._release_recovery_veto_streaks).  Startup adoption of inherited
+# alarms (Harness._inherit_pending_streak_alarms) reads the same definitions.
+_RECONCILE_RELEASE_SITES: tuple[RecoverySite, ...] = (RecoverySite.reconcile_sweep,)
+_DETERMINISTIC_RECON_RELEASE_SITES: tuple[RecoverySite, ...] = (
+    RecoverySite.deterministic_recon_sweep,
+    RecoverySite.deterministic_recon_deploy,
+)
 
 # Statuses a resolution-driven `resume` may re-pend (task 3540 / PRD
 # `plans/task-escalation-state-graph-prd.md` D8, spec E9).  Deliberately an
@@ -11799,10 +11809,33 @@ class Harness:
         zero_progress = inherit_zero_progress_alarms(
             pending_alarms, filed_at=self._zero_progress_filed_at,
         )
-        logger.info(
-            'Inherited %d pending zero-progress requeue alarm(s) from a prior process',
-            len(zero_progress),
+        tracker = getattr(self, '_recovery_veto_tracker', None)
+        if tracker is None:
+            tracker = RecoveryVetoStreakTracker()
+            self._recovery_veto_tracker = tracker
+        veto_streak = inherit_veto_streak_alarms(
+            pending_alarms,
+            filed_at=self._recovery_streak_memo(),
+            tracker=tracker,
+            sites=self._veto_streak_release_sites(),
         )
+        logger.info(
+            'Inherited pending streak alarms from a prior process: %d zero-progress '
+            'requeue, %d recovery veto',
+            len(zero_progress), len(veto_streak),
+        )
+
+    def _veto_streak_release_sites(self) -> tuple[RecoverySite, ...]:
+        """Every veto-streak charging site some sweep in this process releases.
+
+        The reconcile sites always: the startup and idle reconciles run
+        whatever ``stranded_reconcile_enabled`` says.  The deterministic sites
+        only while their sweep runs, because an entry adopted at a site nothing
+        releases would hold its alarm open forever.
+        """
+        if self.config.deterministic_recon_sweep_enabled:
+            return _RECONCILE_RELEASE_SITES + _DETERMINISTIC_RECON_RELEASE_SITES
+        return _RECONCILE_RELEASE_SITES
 
     def _emit_recovery_disposition(
         self,
@@ -12081,7 +12114,7 @@ class Harness:
         self,
         tally: RecoverySweepTally,
         *,
-        sites: Sequence[RecoverySite] = (RecoverySite.reconcile_sweep,),
+        sites: Sequence[RecoverySite] = _RECONCILE_RELEASE_SITES,
     ) -> None:
         """End-of-pass: drop every streak this sweep did NOT re-observe.
 
@@ -16673,11 +16706,7 @@ class Harness:
         # keeps Source B's re-globbed get_pending() from re-observing an
         # escalation this pass just closed.
         self._release_recovery_veto_streaks(
-            recovery_tally,
-            sites=(
-                RecoverySite.deterministic_recon_sweep,
-                RecoverySite.deterministic_recon_deploy,
-            ),
+            recovery_tally, sites=_DETERMINISTIC_RECON_RELEASE_SITES,
         )
 
         pending = self._escalation_queue.get_pending()
