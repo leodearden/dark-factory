@@ -62,8 +62,8 @@ negative, so an EWMA chart can never show improvement at these rates.
 1. **One landing datum.** A landing is a `merge_finalized state=done` event or a `train_merged` member;
    its time is main's advance (the event timestamp), its key `(project_id, merge_sha, task_id)` (train
    members share one merge commit; see §Contract → Landing record, Correction). A **verify unit**
-   covers the set of landings one merge verify proved (a train's `member_task_ids`, a chain's
-   `chain_items`): per-landing outcome flags are inherited by every member; verify and rejection counts
+   covers the set of landings one merge verify proved (a train's `member_task_ids`; chain units are
+   not formed, see §Contract → Landing record, Correction): per-landing outcome flags are inherited by every member; verify and rejection counts
    are per unit.
 2. **A shared producer** (`shared/src/shared/quality_series/`) computes, for landings newer than a
    per-project cursor, one per-landing row from runs.db (events, invocations, flake tables),
@@ -324,21 +324,32 @@ main's first-parent line (served as the disagreement count, never dropped).
 
 ```
 LandingRow = Landing + {
-  outcomes: {rejected: bool|None, rejection_events: int, reviewed: bool, review_blocking: bool|None,
-             flake_confirmed: bool, flake_real_red: bool, flake_rows: int, reverify_count: int,
-             verify_failed_rows: int},
-  cost:     {all_role_usd: float|None, by_role: {role: usd}, implementer_invocations: int,
-             execute_iterations: int|None, turns: int|None, turns_capped: bool, code_lines: int,
-             src_lines: int, test_lines: int, review_rounds: int|None, review_rounds_source:
+  outcomes: {rejected: bool|None, rejection_events: int|None, reviewed: bool|None,
+             review_blocking: bool|None, flake_confirmed: bool|None, flake_real_red: bool|None,
+             flake_rows: int|None, reverify_count: int|None, verify_failed_rows: int|None},
+  cost:     {all_role_usd: float|None, by_role: ((role, usd), ...), implementer_invocations: int|None,
+             execute_iterations: int|None, turns: int|None, turns_capped: bool, code_lines: int|None,
+             src_lines: int|None, test_lines: int|None, review_rounds: int|None, review_rounds_source:
              'review_completed'|'disk_counter'|None, charter_class: str|None, charter_class_source: ...},
   modules:  [{module, src_lines}],
-  rule_vintage: {metric_id: measured_since_iso}}
+  rule_vintage: SourceEpochs   # one first-row timestamp per source, not per metric}
 rows_for(landings, runs_db, repo, git_budget_s) -> list[LandingRow]
 ```
 Invariants: `None` means "source not started or not applicable", never 0; `rejected`/`reverify_count`
 are the unit's values copied to every member; `all_role_usd is None` iff the task has no `invocations`
 row; `code_lines` follows decision 6's path classes; every window is `(prev_landing_time(task),
 landed_at]`.
+
+**Correction (α, 2026-11-09).** The block above was widened in place to the shipped shape. Every
+outcome field, `implementer_invocations` and the three line fields are Optional, because one epoch rule
+applies uniformly: a field is None when its source has not started at the landing (lines: when the
+base is unmeasurable). So quality.db columns for them are nullable. `rule_vintage` is keyed by
+source, not by metric: a consumer maps each metric to the source it reads. `by_role` is a tuple of
+(role, usd) pairs. The single homes are `shared/src/shared/quality_series/rows.py::Outcomes`,
+`::Cost` and `::SourceEpochs`, with their `__post_init__` invariants. The `rejections` and
+`flake_occurrence` epochs are the first positive row of their source, so each is outcome-conditioned.
+As measured in α's review, on df and reify the first post_merge_verify rejection is also the first categorised `merge_blocked`
+(2026-07-19 and 07-20).
 
 ### Pure statistics (`shared/src/shared/quality_series/stats.py`)
 

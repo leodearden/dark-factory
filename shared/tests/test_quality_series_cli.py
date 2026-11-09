@@ -107,8 +107,20 @@ def test_week_summary_denominators_are_known_landings(project) -> None:
     batch = landings(project.db.conn, project.repo.root, since_cursor=None)
     rows = rows_for(batch.landings, project.db.conn, project.repo.root, git_budget_s=60)
     summary = cli.week_summary(rows, '2026-W44')
-    assert summary.rejection_events == cli.KOfN(3, 8)
-    assert summary.reverifies == cli.KOfN(1, 8)
+    assert summary.rejection_events == cli.EventsPerLanding(3, 8)
+    assert summary.reverifies == cli.EventsPerLanding(1, 8)
+
+
+def test_an_event_rate_may_exceed_one_per_landing() -> None:
+    rate = cli.EventsPerLanding(events=3, landings=1)
+    assert rate.per(100, 1) == '300.0'
+    assert cli.EventsPerLanding(0, 0).per(100, 1) == 'none'
+
+
+@pytest.mark.parametrize(('k', 'n'), [(3, 1), (-1, 2)])
+def test_a_proportion_refuses_k_outside_0_to_n(k: int, n: int) -> None:
+    with pytest.raises(ValueError, match=f'k={k}, n={n}'):
+        cli.KOfN(k, n)
 
 
 class TestRefusals:

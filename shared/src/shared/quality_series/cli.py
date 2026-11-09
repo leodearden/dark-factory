@@ -22,7 +22,7 @@ from shared.quality_series.landings import (
 from shared.quality_series.rows import LandingRow, ReviewRoundsSource, rows_for, unit_heads
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
-__all__ = ['KOfN', 'WeekSummary', 'main', 'week_summary']
+__all__ = ['EventsPerLanding', 'KOfN', 'WeekSummary', 'main', 'week_summary']
 
 _COLUMNS: tuple[tuple[str, Callable[[LandingRow], object]], ...] = (
     ('ordinal', lambda r: r.landing.ordinal),
@@ -76,11 +76,37 @@ def _render(value: object) -> str:
 
 @dataclass(frozen=True)
 class KOfN:
+    """A proportion: k of n landings have the property, so 0 <= k <= n."""
+
     k: int
     n: int
 
+    def __post_init__(self) -> None:
+        if not 0 <= self.k <= self.n:
+            raise ValueError(f'a proportion needs 0 <= k <= n (k={self.k!r}, n={self.n!r})')
+
     def __str__(self) -> str:
         return f'{self.k}/{self.n}'
+
+
+@dataclass(frozen=True)
+class EventsPerLanding:
+    """An event rate: events over landings; one landing can carry several events."""
+
+    events: int
+    landings: int
+
+    def __post_init__(self) -> None:
+        if self.events < 0 or self.landings < 0:
+            raise ValueError(
+                f'an event rate needs non-negative counts (events={self.events!r}, '
+                f'landings={self.landings!r})'
+            )
+
+    def per(self, scale: int, digits: int) -> str:
+        if self.landings == 0:
+            return 'none'
+        return f'{scale * self.events / self.landings:.{digits}f}'
 
 
 @dataclass(frozen=True)
@@ -95,32 +121,28 @@ class WeekSummary:
     week: str
     units: int
     landings: int
-    rejection_events: KOfN
+    rejection_events: EventsPerLanding
     rejected_landings: KOfN
     flake_confirmed: KOfN
     flake_real_red: KOfN
     review_rounds_ge2: KOfN
     review_rounds_sources: tuple[tuple[ReviewRoundsSource, int], ...]
-    reverifies: KOfN
+    reverifies: EventsPerLanding
 
     def lines(self) -> list[str]:
         sources = ', '.join(f'{source.value}={count}' for source, count in self.review_rounds_sources)
         return [
             f'# week {self.week}: {self.units} units, {self.landings} landings',
             '#   rejections per 100 landings: '
-            f'{_per(self.rejection_events, 100, 1)} '
-            f'({self.rejection_events.k} events over {self.rejection_events.n} landings)',
+            f'{self.rejection_events.per(100, 1)} '
+            f'({self.rejection_events.events} events over {self.rejection_events.landings} landings)',
             f'#   landings with >= 1 rejection: {self.rejected_landings}',
             f'#   confirmed-flake landings: {self.flake_confirmed}',
             f'#   real-red landings: {self.flake_real_red}',
             f'#   review rounds >= 2: {self.review_rounds_ge2} ({sources})',
-            f'#   re-verifies per landing: {_per(self.reverifies, 1, 2)} '
-            f'({self.reverifies.k} over {self.reverifies.n} landings)',
+            f'#   re-verifies per landing: {self.reverifies.per(1, 2)} '
+            f'({self.reverifies.events} over {self.reverifies.landings} landings)',
         ]
-
-
-def _per(ratio: KOfN, scale: int, digits: int) -> str:
-    return 'none' if ratio.n == 0 else f'{scale * ratio.k / ratio.n:.{digits}f}'
 
 
 def _week_bounds(iso_week: str) -> tuple[datetime, datetime]:
@@ -135,10 +157,10 @@ def _count(values: Sequence[bool | None]) -> KOfN:
 
 def _unit_events_over_landings(
     week: Sequence[LandingRow], value: Callable[[LandingRow], int | None]
-) -> KOfN:
+) -> EventsPerLanding:
     events = [value(head) for head in unit_heads(week)]
     known_landings = sum(1 for row in week if value(row) is not None)
-    return KOfN(sum(event for event in events if event is not None), known_landings)
+    return EventsPerLanding(sum(event for event in events if event is not None), known_landings)
 
 
 def week_summary(rows: Sequence[LandingRow], iso_week: str) -> WeekSummary:
