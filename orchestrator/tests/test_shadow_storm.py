@@ -366,6 +366,7 @@ def _seed(
         base_sha='a' * 40,
         state=state,
         cost_basis=CostBasis.METERED,
+        configured_model='sonnet',
         plan_source=PlanSource.PRODUCTION,
         reason=_SEEDED_REASONS.get(state),
         reference_kind=ReferenceKind.NONE if state is _S.SETTLED else None,

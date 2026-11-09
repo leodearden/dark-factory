@@ -905,6 +905,7 @@ class ShadowCoordinator:
             plan_source=_PLAN_SOURCE_BY_SHAPE.get(inputs.shape),
             state=ShadowCellState.SAMPLED,
             cost_basis=cost_basis_of(candidate),
+            configured_model=candidate.model,
             run_id=self.run_id,
             opened_at=now,
             settle_deadline=now + timedelta(hours=self._config.settle_deadline_hours),
