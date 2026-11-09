@@ -89,6 +89,7 @@ class ShadowCell:
 
     def __post_init__(self) -> None:
         self._check_identity()
+        self._check_served_model()
         self._check_timestamps()
         self._check_costs()
         self._check_stratum()
@@ -106,10 +107,20 @@ class ShadowCell:
             value = getattr(self, name)
             if _is_blank(value):
                 self._refuse(f'{name} must be non-blank (got {value!r})')
-        if self.served_model is not None and _is_blank(self.served_model):
-            self._refuse(f'served_model must be None or non-blank (got {self.served_model!r})')
         if self.parent_cell_id == self.cell_id:
             self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
+
+    def _check_served_model(self) -> None:
+        if self.served_model is None:
+            return
+        if _is_blank(self.served_model):
+            self._refuse(f'served_model must be None or non-blank (got {self.served_model!r})')
+        if self.running_at is None or self.run_ended_at is None:
+            self._refuse(
+                f'a served_model is learned only from a run that started and ended '
+                f'(got served_model={self.served_model!r}, running_at={self.running_at!r}, '
+                f'run_ended_at={self.run_ended_at!r})'
+            )
 
     def _check_timestamps(self) -> None:
         for name in _SHADOW_CELL_TIME_COLUMNS:
@@ -148,6 +159,11 @@ _REASON_REQUIRED_STATES = ', '.join(
     f"'{state.value}'" for state in ShadowCellState if state.requires_reason
 )
 _SQL_BLANK_CHARS = f"char({', '.join(str(ord(c)) for c in _BLANK_CHARS)})"
+# Shared by the fresh DDL and the pre-8086 migration, which cannot add NOT NULL.
+_MODEL_COLUMN_DDL = {
+    column: f"TEXT CHECK ({column} IS NULL OR trim({column}, {_SQL_BLANK_CHARS}) <> '')"
+    for column in ('configured_model', 'served_model')
+}
 
 _SHADOW_CELLS_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS shadow_cells (
@@ -170,8 +186,8 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     cost_usd        REAL NOT NULL DEFAULT 0,
     cost_credits    REAL NOT NULL DEFAULT 0,
     cost_basis      TEXT NOT NULL,
-    configured_model TEXT NOT NULL CHECK (trim(configured_model, {_SQL_BLANK_CHARS}) <> ''),
-    served_model    TEXT CHECK (served_model IS NULL OR trim(served_model, {_SQL_BLANK_CHARS}) <> ''),
+    configured_model {_MODEL_COLUMN_DDL['configured_model']} NOT NULL,
+    served_model    {_MODEL_COLUMN_DDL['served_model']},
     run_id          TEXT,
     opened_at       TEXT NOT NULL,
     running_at      TEXT,
@@ -752,13 +768,14 @@ class RunStore:
     def _migrate_shadow_cells_model_columns(self, conn: sqlite3.Connection) -> None:
         """Add ``configured_model`` and ``served_model`` to a pre-8086 ``shadow_cells``.
 
-        A pre-8086 row reads ``configured_model`` NULL and is refused on read by
-        ``ShadowCell`` (no such row exists: the coordinator has never run a cell).
+        Each column keeps its blank-refusing CHECK. A pre-8086 row reads
+        ``configured_model`` NULL and is refused on read by ``ShadowCell`` (no
+        such row exists: the coordinator has never run a cell).
         """
         added = [
             column
-            for column in ('configured_model', 'served_model')
-            if add_column_if_missing_sync(conn, 'shadow_cells', column, 'TEXT')
+            for column, column_ddl in _MODEL_COLUMN_DDL.items()
+            if add_column_if_missing_sync(conn, 'shadow_cells', column, column_ddl)
         ]
         if added:
             conn.commit()

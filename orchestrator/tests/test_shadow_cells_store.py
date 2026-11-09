@@ -19,6 +19,11 @@ from orchestrator.shadow_types import (
 )
 
 _OPENED_AT = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+_RAN = {
+    'state': ShadowCellState.AWAITING_REFERENCE,
+    'running_at': _OPENED_AT + timedelta(minutes=5),
+    'run_ended_at': _OPENED_AT + timedelta(minutes=50),
+}
 
 
 def _cell(**overrides) -> ShadowCell:
@@ -77,8 +82,20 @@ class TestShadowCellInvariants:
 
     @pytest.mark.parametrize('served_model', ['', '  '])
     def test_a_blank_served_model_is_refused(self, served_model):
-        with pytest.raises(ValueError, match='served_model'):
-            _cell(served_model=served_model)
+        with pytest.raises(ValueError, match='served_model must be None or non-blank'):
+            _cell(served_model=served_model, **_RAN)
+
+    def test_a_cell_whose_run_ended_carries_its_served_model(self):
+        assert _cell(served_model='glm-5.3', **_RAN).served_model == 'glm-5.3'
+
+    @pytest.mark.parametrize(
+        'run_times',
+        [{}, {'running_at': _RAN['running_at']}, {'run_ended_at': _RAN['run_ended_at']}],
+        ids=['never_ran', 'still_running', 'ended_without_starting'],
+    )
+    def test_a_served_model_needs_a_run_that_started_and_ended(self, run_times):
+        with pytest.raises(ValueError, match='served_model.*running_at.*run_ended_at'):
+            _cell(served_model='glm-5.3', **run_times)
 
     @pytest.mark.parametrize('field', ['opened_at', 'settle_deadline', 'running_at', 'settled_at'])
     def test_naive_timestamp_is_refused(self, field):
@@ -242,7 +259,7 @@ class TestShadowCellsTable:
         assert store.get_shadow_cell(cell.cell_id) == cell
 
     def test_both_model_columns_round_trip(self, store):
-        served = _cell(configured_model='gpt-6.1-terra', served_model='gpt-6.1-terra')
+        served = _cell(configured_model='gpt-6.1-terra', served_model='gpt-6.1-terra', **_RAN)
         unobserved = _cell(cell_id='01JCELLBBBBBBBBBBBBBBBBBBB', candidate='kimi-endpoint')
         store.insert_shadow_cell(served)
         store.insert_shadow_cell(unobserved)
