@@ -24,6 +24,7 @@ from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 from orchestrator.startup_steps import (
     STARTUP_STEP_SENTINEL_PREFIX,
     EntryFailures,
+    run_startup_step,
     sentinel_task_id,
 )
 
@@ -46,6 +47,8 @@ _STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('diff7', '_reconcile_terminal_lanes'),
 )
 _SYNC_STEPS = frozenset({'_rehydrate_merge_halt', '_file_restored_pause_escalation'})
+#: Table steps the fixture runs for real against its mocked services.
+_UNSTUBBED_STEPS = frozenset({'1b', '2f'})
 
 _INJECTABLE = [
     ('2c', '_recover_crashed_tasks'),
@@ -156,6 +159,23 @@ def _not_ok_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
         if r.name == 'orchestrator.harness' and r.levelno == logging.WARNING
         and 'startup steps not ok' in r.getMessage()
     ]
+
+
+@pytest.mark.asyncio
+class TestStubbedStepsMirrorTheTable:
+    async def test_every_other_table_step_is_stubbed_in_run_order(
+        self, make_startup_harness,
+    ) -> None:
+        handle = make_startup_harness()
+        runner = AsyncMock(wraps=run_startup_step)
+
+        with patch('orchestrator.harness.run_startup_step', runner):
+            await _run(handle.harness)
+
+        ran = [call.args[0].name for call in runner.await_args_list]
+        assert [name for name in ran if name not in _UNSTUBBED_STEPS] == [
+            name for name, _attr in _STUBBED_STEPS
+        ]
 
 
 @pytest.mark.asyncio
