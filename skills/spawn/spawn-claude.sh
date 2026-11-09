@@ -49,7 +49,8 @@
 #     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
 #     names one explicitly; a disabled one is refused, exit 145). Child mode
 #     joins on the thread's result.md or archive, records spawn_t3_lane.py
-#     `wait`'s code as the session's exit and exits with it. The started-grace
+#     `wait`'s code as the session's exit and exits with it; a sibling spawn
+#     prints `record=<dir> t3_thread_id=<id>` on stdout. The started-grace
 #     defaults to 300s.
 #   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -1343,6 +1344,13 @@ join_t3_thread() {
   exit "$code"
 }
 
+# A sibling spawn's only stdout line names the record `launch` stamped (display
+# t3, running) before it answered `started`, so the caller reads that record
+# instead of looking one up by title. `none` is the lane's spelling for absent.
+name_t3_sibling_on_stdout() {
+  printf 'record=%s t3_thread_id=%s\n' "${SESSION_RECORD_DIR:-none}" "$t3_thread_id"
+}
+
 # --- emulator selection ----------------------------------------------------
 
 if [ "$spawn_backend" = "t3" ]; then
@@ -1520,6 +1528,7 @@ case "$first_word" in
     launch_t3_thread
     await_t3_thread_started
     if [ "$spawn_mode" = "sibling" ]; then
+      name_t3_sibling_on_stdout
       resolve_sibling
     else
       join_t3_thread
