@@ -996,7 +996,7 @@ verify_admission_pytest_n: "8"
 # 51.5 -> 54.7 min), and landings/day fell 17.1 -> 14.1. Full before/after on
 # all five measures, with sources and caveats:
 # plans/verify-admission-task-slots-gate.md.
-verify_admission_task_slots: 1
+verify_admission_task_slots: 2
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
