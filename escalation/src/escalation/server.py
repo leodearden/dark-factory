@@ -4338,9 +4338,9 @@ def create_server(
             """The task's metadata, read AT MOST ONCE per merge_request call.
 
             ``git_authority.task_metadata`` is uncached — every call is a fresh
-            ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+            ``scheduler.read_task`` → Taskmaster MCP dispatch with an internal
             ``timeout=15`` (``orchestrator/src/orchestrator/scheduler.py::
-            Scheduler::get_task``).  It has two consumers here, the degeneracy
+            Scheduler.read_task``).  It has two consumers here, the degeneracy
             probe and the lane fallback, and this memo is what keeps the count
             per call at 0 or 1 and makes 2 unreachable
             (test_merge_request_lane.py::TestMetadataReadIsPaidAtMostOnce).
@@ -4397,10 +4397,10 @@ def create_server(
             # off that common path.
             #
             # What the metadata read costs, stated as it now is (task 4888).
-            # At most ONE `scheduler.get_task` per merge_request call — a
+            # At most ONE `scheduler.read_task` per merge_request call — a
             # Taskmaster MCP dispatch with an internal timeout=15
-            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler::
-            # get_task`) — shared via `_task_metadata_once()` between this
+            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler.
+            # read_task`) — shared via `_task_metadata_once()` between this
             # probe and the lane fallback.  It is never paid twice, and never
             # paid at all when the caller supplies an explicit `lane`; it IS
             # paid on every no-explicit-lane submission, including the common
