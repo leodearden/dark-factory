@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import itertools
+import json
 import re
 import sqlite3
 import types
@@ -25,6 +26,7 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.memory_eval_metrics import load_metric_series
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -42,6 +44,7 @@ PROJECT = 'dark_factory'
 CALLER_A = 'claude-task-101-implementer'
 CALLER_B = 'claude-task-202-implementer'
 THRESHOLD = 0.9
+STAMP = '20261109T220000Z'
 
 
 @functools.cache
@@ -174,6 +177,7 @@ class FakeMemory:
         self._candidates = {query: list(results) for query, results in (candidates or {}).items()}
         self._degraded = degraded
         self.search_calls: list[dict[str, Any]] = []
+        self.write_calls: list[str] = []
 
     async def get_memory_by_id(self, project_id: str, memory_id: str) -> dict | None:
         content = self._contents.get(memory_id)
@@ -190,12 +194,15 @@ class FakeMemory:
         )
 
     async def add_memory(self, *args: Any, **kwargs: Any) -> Any:
+        self.write_calls.append('add_memory')
         raise AssertionError('the write-after-miss producer must never write the corpus')
 
     async def update_memory(self, *args: Any, **kwargs: Any) -> Any:
+        self.write_calls.append('update_memory')
         raise AssertionError('the write-after-miss producer must never write the corpus')
 
     async def delete_memory(self, *args: Any, **kwargs: Any) -> Any:
+        self.write_calls.append('delete_memory')
         raise AssertionError('the write-after-miss producer must never write the corpus')
 
 
@@ -319,10 +326,10 @@ class TestJournalReader:
             _read(not_a_journal)
 
 
-async def _headline_fixture(tmp_path: Path) -> tuple[Any, FakeMemory, dict[str, str]]:
+async def _headline_fixture(tmp_path: Path) -> tuple[Any, FakeMemory, dict[str, str], Path]:
     """Caller A misses an existing entry and re-writes it; caller B is shown it and still writes.
 
-    Returns the parsed window, the memory double, and the row ids by role.
+    Returns the parsed window, the memory double, the row ids by role, and the journal path.
     """
     async with _fixture_journal(tmp_path) as fixture:
         search_a = await fixture.search(CALLER_A, [_hit('x')])
@@ -342,7 +349,7 @@ async def _headline_fixture(tmp_path: Path) -> tuple[Any, FakeMemory, dict[str, 
         },
     )
     rows = {'search_a': search_a, 'write_1': write_1, 'search_b': search_b, 'write_2': write_2}
-    return window, memory, rows
+    return window, memory, rows, fixture.db_path
 
 
 async def _single_write_fixture(tmp_path: Path, *, shown: Sequence[Any] = (_hit('x'),)) -> Any:
@@ -362,7 +369,7 @@ class TestAdjudication:
 
     @pytest.mark.asyncio
     async def test_a_missed_near_duplicate_is_one_incident_and_a_shown_one_is_none(self, tmp_path):
-        window, memory, rows = await _headline_fixture(tmp_path)
+        window, memory, rows, _journal = await _headline_fixture(tmp_path)
         w1 = _write_by_row(window, rows['write_1'])
 
         adjudication = await _adjudicate(window, memory)
@@ -441,7 +448,7 @@ class TestAdjudication:
 
     @pytest.mark.asyncio
     async def test_every_candidate_search_has_the_guards_shape_and_journals_nothing(self, tmp_path):
-        window, memory, _rows = await _headline_fixture(tmp_path)
+        window, memory, _rows, _journal = await _headline_fixture(tmp_path)
 
         await _adjudicate(window, memory)
 
@@ -570,3 +577,120 @@ class TestUnadjudicableWritesAreDisclosed:
         adjudication = await _adjudicate(window, FakeMemory(contents={'w': 'W content'}))
 
         _assert_only_skipped_as(adjudication, 'NO_PRIOR_SEARCH')
+
+
+async def _run(memory: FakeMemory, journal_path: Path, out_root: Path) -> Any:
+    return await _mod().run_write_after_miss(
+        memory,
+        journal_path=journal_path,
+        out_root=out_root,
+        project_id=PROJECT,
+        stamp=STAMP,
+        period=_period_around_now(),
+    )
+
+
+class TestSeriesAndArtifacts:
+    """One M1 proportion, its structured incident evidence, and every narrowing disclosed."""
+
+    @pytest.mark.asyncio
+    async def test_the_series_holds_one_proportion_of_incidents_over_adjudicated(self, tmp_path):
+        _window, memory, _rows, journal = await _headline_fixture(tmp_path)
+        out_root = tmp_path / 'evals'
+
+        await _run(memory, journal, out_root)
+
+        metrics_path = out_root / 'e7-write-after-miss' / f'metrics-{STAMP}.json'
+        series = load_metric_series(metrics_path)
+        assert series.eval_id == 'e7-write-after-miss'
+        assert series.run_stamp == STAMP
+        assert len(series.metrics) == 1
+        metric = series.metrics[0]
+        assert metric.metric_id == 'write-after-miss'
+        assert metric.kind == 'proportion'
+        assert metric.direction == 'higher_is_worse'
+        assert metric.denominator == metric.n == 2
+        assert metric.value == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_details_path_resolves_to_the_structured_incident_evidence(self, tmp_path):
+        _window, memory, rows, journal = await _headline_fixture(tmp_path)
+        out_root = tmp_path / 'evals'
+        period = _period_around_now()
+
+        outcome = await _mod().run_write_after_miss(
+            memory, journal_path=journal, out_root=out_root, project_id=PROJECT,
+            stamp=STAMP, period=period,
+        )
+
+        eval_root = out_root / 'e7-write-after-miss'
+        metric = outcome.series.metrics[0]
+        incidents_path = eval_root / f'incidents-{STAMP}.json'
+        assert metric.details_path is not None
+        assert outcome.metrics_path.parent / metric.details_path == incidents_path
+        assert outcome.incidents_path == incidents_path
+        payload = json.loads(incidents_path.read_text(encoding='utf-8'))
+        assert payload['period_start'] == period.start.isoformat()
+        assert payload['period_end'] == period.end.isoformat()
+        assert payload['skipped'] == {reason.value: 0 for reason in _mod().SkipReason}
+        assert len(payload['incidents']) == 1
+        incident = payload['incidents'][0]
+        assert set(incident) == {
+            'write_row_id', 'search_row_ids', 'project_id', 'caller_agent_id',
+            'matched_memory_id', 'similarity', 'threshold', 'category', 'write_created_at',
+        }
+        assert incident['write_row_id'] == rows['write_1']
+        assert incident['search_row_ids'] == [rows['search_a']]
+        assert incident['matched_memory_id'] == 'y'
+
+    @pytest.mark.asyncio
+    async def test_corpus_counts_disclose_every_narrowing_even_at_zero(self, tmp_path):
+        _window, memory, _rows, journal = await _headline_fixture(tmp_path)
+
+        outcome = await _run(memory, journal, tmp_path / 'evals')
+
+        corpus = outcome.series.corpus
+        assert corpus.project_id == PROJECT
+        expected = {
+            'writes_in_period': 2,
+            'adjudicated': 2,
+            'incidents': 1,
+            'unattributed_searches': 0,
+            **{f'skipped_{reason.value}': 0 for reason in _mod().SkipReason},
+        }
+        assert {key: corpus.counts.get(key) for key in expected} == expected
+
+    @pytest.mark.asyncio
+    async def test_nothing_adjudicated_writes_a_series_with_no_metric(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.write(CALLER_A, content='W content', memory_ids=['w'])
+        memory = FakeMemory(contents={'w': 'W content'})
+
+        outcome = await _run(memory, fixture.db_path, tmp_path / 'evals')
+
+        series = load_metric_series(outcome.metrics_path)
+        assert series.metrics == []
+        assert series.corpus.counts['skipped_no_prior_search'] == 1
+        report = outcome.report_path.read_text(encoding='utf-8')
+        assert 'write-after-miss: not measured' in report
+        assert 'no_prior_search' in report
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_each_incidents_write_and_match(self, tmp_path):
+        _window, memory, rows, journal = await _headline_fixture(tmp_path)
+
+        outcome = await _run(memory, journal, tmp_path / 'evals')
+
+        report = outcome.report_path.read_text(encoding='utf-8')
+        assert report == outcome.report
+        incident_line = next(line for line in report.splitlines() if rows['write_1'] in line)
+        assert 'y' in incident_line.replace(',', ' ').split()
+        assert rows['write_2'] not in report
+
+    @pytest.mark.asyncio
+    async def test_a_run_never_writes_the_corpus(self, tmp_path):
+        _window, memory, _rows, journal = await _headline_fixture(tmp_path)
+
+        await _run(memory, journal, tmp_path / 'evals')
+
+        assert memory.write_calls == []
