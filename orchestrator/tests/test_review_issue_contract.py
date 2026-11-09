@@ -7,9 +7,11 @@ intake normalises against it and the review gate's aggregation flags against it.
 from __future__ import annotations
 
 import copy
+import logging
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.review_issue_contract import (
     Deviation,
     IssueDeviation,
@@ -17,6 +19,11 @@ from orchestrator.review_issue_contract import (
     IssueIntake,
     IssueSeverity,
     check_issues,
+)
+from orchestrator.reviewer_failure import (
+    ReviewerFailure,
+    ReviewerFailureKind,
+    error_review,
 )
 
 _JOURNAL_FIELD_CAP = 200
@@ -220,3 +227,76 @@ class TestDescribe:
             text = deviation.describe()
             assert len(text) < _JOURNAL_FIELD_CAP, text
             assert long_value not in text
+
+
+_OFF_CONTRACT_EVENT = 'review_issue_off_contract'
+
+
+class TestAggregateReviewsFlagsOffContractIssues:
+    """The use-side half of the contract's redundant enforcement: the review
+    gate's aggregation flags an issue that bypassed intake, without rewriting it.
+    """
+
+    @pytest.fixture()
+    def artifacts(self, tmp_path) -> TaskArtifacts:
+        artifacts = TaskArtifacts(tmp_path)
+        artifacts.init('test-1', 'Test task', 'A test')
+        return artifacts
+
+    @staticmethod
+    def _off_contract_records(caplog) -> list[logging.LogRecord]:
+        return [
+            record for record in caplog.records
+            if record.name == 'orchestrator.artifacts'
+            and getattr(record, 'event', None) == _OFF_CONTRACT_EVENT
+        ]
+
+    @staticmethod
+    def _review(*issues: object) -> dict[str, object]:
+        return {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'ISSUES_FOUND',
+            'issues': list(issues),
+            'summary': 's',
+        }
+
+    def test_an_off_contract_review_is_flagged_once_and_left_unrewritten(
+        self, artifacts, caplog,
+    ):
+        minor = _issue(severity='minor')
+        file_and_line = _without(IssueField.LOCATION, severity='suggestion', file='a.py', line=4)
+        artifacts.write_review('reviewer_comprehensive', self._review(minor, file_and_line))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
+            aggregation = artifacts.aggregate_reviews()
+
+        [record] = self._off_contract_records(caplog)
+        assert record.levelno == logging.WARNING
+        assert record.__dict__['reviewer'] == 'reviewer_comprehensive'
+        deviations = record.__dict__['deviations']
+        assert any(d.startswith('issues[0].severity') for d in deviations)
+        assert any(d.startswith('issues[1].location') for d in deviations)
+
+        assert aggregation.has_blocking_issues is False
+        assert {**minor, 'reviewer': 'reviewer_comprehensive'} in aggregation.suggestions
+        assert {**file_and_line, 'reviewer': 'reviewer_comprehensive'} in aggregation.suggestions
+
+    def test_an_on_contract_review_is_not_flagged(self, artifacts, caplog):
+        artifacts.write_review('reviewer_comprehensive', self._review(_issue()))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
+            artifacts.aggregate_reviews()
+
+        assert self._off_contract_records(caplog) == []
+
+    def test_an_error_review_is_not_flagged(self, artifacts, caplog):
+        failure = ReviewerFailure(ReviewerFailureKind.TURN_CAP, 'd')
+        artifacts.write_review(
+            'reviewer_comprehensive',
+            error_review('reviewer_comprehensive', failure, summary='s'),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
+            artifacts.aggregate_reviews()
+
+        assert self._off_contract_records(caplog) == []
