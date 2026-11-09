@@ -70,7 +70,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1504, "function_local_imports": 4, "lines": 16656, "prose_lines": 9510, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1505, "function_local_imports": 4, "lines": 16667, "prose_lines": 9517, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 866, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -243,7 +243,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_merge_marker": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_merge_marker_checked": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::find_task_citation_commit": 1,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::find_task_citation_commit_checked": 6,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::find_task_citation_commit_checked": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::forget_stack_bases": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::get_branch_changed_files": 8,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::get_changed_files": 3,
@@ -357,6 +357,7 @@
     "orchestrator/src/orchestrator/git_ops.py::parse_diff_added_line_ranges": 22,
     "orchestrator/src/orchestrator/git_ops.py::parse_diff_line_ranges": 29,
     "orchestrator/src/orchestrator/git_ops.py::render_protect_glob": 5,
+    "orchestrator/src/orchestrator/git_ops.py::task_citation_pattern": 3,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::__init__": 0,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_best_effort_step": 3,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_file_corrupt_record_escalation": 0,
@@ -1317,6 +1318,7 @@
     "orchestrator/tests/test_invoke_role_config_resolution.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_item_lifecycle.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_landed_outbox.py": {"patch_targets": [], "private_reads": 7},
+    "orchestrator/tests/test_landed_sha_searches.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_landing_contract_vocabulary.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_landing_evidence.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_landing_evidence_degenerate.py": {"patch_targets": [], "private_reads": 1},
