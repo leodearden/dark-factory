@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-2: new pure re-anchor decision module merge_lane/remerge_base.py (choose_remerge_base, frontier_tip) and the RemergeBase invariant check in types.py; net-additive policy (plans/merge-lane-policy-prd.md D1), not a refactor",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 89,
+      "current": 90
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5071,
+      "current": 5100
+    }
+  ]
+}

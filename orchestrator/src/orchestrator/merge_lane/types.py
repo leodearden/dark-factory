@@ -1270,6 +1270,45 @@ class CapPermit:
     released: bool = False
 
 
+class RemergeReason(StrEnum):
+    """Why a recovery re-merge was anchored where it was
+    (plans/merge-lane-policy-prd.md §6)."""
+
+    LIVE_TIP = 'live_tip'
+    NO_TIP = 'no_tip'
+    TIP_DEAD = 'tip_dead'
+    TIP_VACATED = 'tip_vacated'
+    TIP_VERIFY_DEAD = 'tip_verify_dead'
+    NO_PERMIT = 'no_permit'
+
+
+@dataclass(frozen=True)
+class RemergeBase:
+    """Where a recovery re-merge is anchored: the live frontier ``tip``, or
+    real main at merge time when ``tip`` is None.
+
+    ``tip`` is set exactly when ``reason`` is LIVE_TIP, so a fall to main
+    never records a main SHA that the re-merge would read again anyway.
+    """
+
+    tip: str | None
+    reason: RemergeReason
+
+    def __post_init__(self) -> None:
+        if (self.tip is not None) != (self.reason is RemergeReason.LIVE_TIP):
+            raise ValueError(
+                'RemergeBase.tip is set iff reason is live_tip; got '
+                f'reason={self.reason.value!r} tip={self.tip!r}',
+            )
+
+    @property
+    def speculative(self) -> bool:
+        return self.tip is not None
+
+    def to_wire(self) -> dict[str, str | None]:
+        return {'anchor_reason': self.reason.value, 'anchor_base': self.tip}
+
+
 @dataclass
 class RealMergeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine:
