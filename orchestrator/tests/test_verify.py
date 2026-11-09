@@ -3067,6 +3067,19 @@ class TestRunVerificationJunitxmlInjection:
         assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
         assert result.failing_test_ids == ['tests.test_sample::test_fail']
 
+    async def test_caller_named_report_is_refused_with_a_segmented_test_leg(
+        self, tmp_path: Path,
+    ):
+        report = tmp_path / 'r.xml'
+
+        with pytest.raises(ValueError, match='segment_chained_test=True') as refused:
+            await run_verification(
+                tmp_path, self._make_config(tmp_path), self._module_config(),
+                max_retries=0, role='task', segment_chained_test=True, junit_report=report,
+            )
+
+        assert repr(report) in str(refused.value)
+
 
 # ---------------------------------------------------------------------------
 # Task 5627: run_verification records WHICH module produced its junit ids —

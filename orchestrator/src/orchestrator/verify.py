@@ -7180,7 +7180,8 @@ async def run_verification(
 
     A caller-named *junit_report* is injected into the test leg at the existing
     chokepoint, cleared before each pytest invocation, and parsed into
-    ``failing_test_ids``/``skipped_test_ids``.
+    ``failing_test_ids``/``skipped_test_ids``. It is refused with
+    *segment_chained_test*, whose segments would each overwrite it.
 
     *admission_request* places the gated test leg in the admission gate's
     order (task 5628). A caller verifying several modules as one plan passes
@@ -7251,6 +7252,11 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if junit_report is not None and segment_chained_test:
+        raise ValueError(
+            f'a caller-named junit report cannot be written by a segmented test leg: '
+            f'junit_report={junit_report!r}, segment_chained_test={segment_chained_test!r}',
+        )
     if admission_request is not None and admission_request.role != role:
         raise ValueError(
             f'an admission request must carry its verify role: request role='
@@ -7530,9 +7536,11 @@ async def run_verification(
             # segments run.
             #
             # Co-occurrence guard (task 3478). An ATTRIBUTING junit report
-            # and segmentation are mutually exclusive by construction today:
-            # the former requires role=='merge' and breadth=='full', the
-            # latter `segment_chained_test=role != 'merge'`. So per-segment
+            # and segmentation do not co-occur today: a caller-named report
+            # with segment_chained_test is refused at entry, and the
+            # role-derived report requires role=='merge' and breadth=='full'
+            # while the one segmenting call site passes
+            # `segment_chained_test=role != 'merge'`. So per-segment
             # attribution junit is deliberately UNWIRED, and node-id
             # attribution on this path comes from _extract_failing_test_ids
             # over the aggregated segment stdout instead. The task-path COST
@@ -7550,11 +7558,13 @@ async def run_verification(
                 logger.warning(
                     'Segmented verify (%d segments) co-occurs with a junit report '
                     'path at %s, which will NOT be written: per-segment attribution '
-                    'junitxml is deliberately unwired (task 3478). These two were mutually '
-                    'exclusive by construction — attribution requires role==\'merge\' '
-                    'with merge_verify_breadth==\'full\', segmentation requires '
-                    'role!=\'merge\' — so reaching here means one of those gates '
-                    'changed. Do NOT resolve this by injecting one shared '
+                    'junitxml is deliberately unwired (task 3478). These two do not '
+                    'co-occur today — run_verification refuses a caller-named report '
+                    'with segment_chained_test, and the role-derived report requires '
+                    'role==\'merge\' with merge_verify_breadth==\'full\' while the one '
+                    'segmenting call site passes segment_chained_test only for '
+                    'role!=\'merge\' — so reaching here means that call site or one of '
+                    'those gates changed. Do NOT resolve this by injecting one shared '
                     '--junitxml: %d pytest runs writing one path is last-writer-wins, '
                     'a report describing only the final segment. Node-id attribution '
                     'for THIS run remains available via _extract_failing_test_ids '
