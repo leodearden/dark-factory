@@ -1418,7 +1418,7 @@
     "orchestrator/tests/test_merge_queue_bounce.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_merge_queue_build_chain.py": {"patch_targets": ["worker._emit_merge_attempt"], "private_reads": 20},
     "orchestrator/tests/test_merge_queue_c3_submit_identity.py": {"patch_targets": [], "private_reads": 0},
-    "orchestrator/tests/test_merge_queue_chain_intact.py": {"patch_targets": [], "private_reads": 80},
+    "orchestrator/tests/test_merge_queue_chain_intact.py": {"patch_targets": [], "private_reads": 86},
     "orchestrator/tests/test_merge_queue_coalesce.py": {"patch_targets": ["member_redrive.validate_landing_evidence", "worker._do_train_merge", "worker.run_scoped_verification"], "private_reads": 85},
     "orchestrator/tests/test_merge_queue_concurrent_verify.py": {"patch_targets": ["worker._alarm_illegal_lifecycle_transition", "worker._maybe_schedule_shadow_compare"], "private_reads": 179},
     "orchestrator/tests/test_merge_queue_conflict_graph.py": {"patch_targets": [], "private_reads": 16},

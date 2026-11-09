@@ -1026,3 +1026,93 @@ class TestAdoptionVoidReanchor:
         assert permit.released is True
         row = _the_row(store, EventType.verdict_voided)
         assert (row['anchor_reason'], row['anchor_base']) == ('tip_dead', None)
+
+
+# ── task 8524: a dead base re-anchors the merger's held base (D2) ────────────
+
+_TIP_T = '3' * 40       # a live frontier entry's merge commit
+_HELD_DEAD = '4' * 40   # the base the merger holds, about to be recorded dead
+
+
+async def _merger_holding(
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+) -> None:
+    """Put the merger in state A: a look-ahead found, its permit retained,
+    stacked on _HELD_DEAD."""
+    controller = worker._speculation_controller
+    await controller.acquire_for_lookahead()
+    req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
+    controller.on_lookahead_found(req, _HELD_DEAD)
+
+
+def _seed_live_tip(
+    worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
+) -> None:
+    _, item = _make_fake_item(
+        'merger-tip', base_sha=_MAIN, merge_commit=_TIP_T, config=config, git_repo=git_repo,
+    )
+    assert isinstance(item, RealMergeItem)
+    worker._inflight.append(_frontier_entry(item))
+
+
+def _speculation(worker: SpeculativeMergeWorker) -> dict[str, object]:
+    return worker.snapshot()['speculation']
+
+
+@pytest.mark.asyncio
+class TestDeadBaseReanchorsTheMerger:
+    """Recording a dead base re-points the merger's held base at the live
+    frontier tip, or lets the permit go (plans/merge-lane-policy-prd.md D2)."""
+
+    async def test_a_dead_held_base_moves_to_the_live_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        _seed_live_tip(worker, config, git_repo)
+        await _merger_holding(worker, config, git_repo)
+
+        worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
+
+        spec = _speculation(worker)
+        assert spec['spec_base'] == _TIP_T
+        assert spec['held_by_merger'] == 1
+
+    async def test_with_no_live_tip_the_held_permit_is_released(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        await _merger_holding(worker, config, git_repo)
+        assert _speculation(worker)['slot_available'] == 0
+
+        worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
+
+        spec = _speculation(worker)
+        assert spec['spec_base'] is None
+        assert spec['held_by_merger'] == 0
+        assert spec['slot_available'] == spec['depth']
+
+    async def test_recording_an_item_commit_dead_reaches_the_same_hook(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        _seed_live_tip(worker, config, git_repo)
+        await _merger_holding(worker, config, git_repo)
+        _, held = _make_fake_item(
+            'merger-held', base_sha=_MAIN, merge_commit=_HELD_DEAD,
+            config=config, git_repo=git_repo,
+        )
+
+        worker._record_item_commit_dead(held, DeadBaseSite.DISPATCH_VOID)
+
+        assert _speculation(worker)['spec_base'] == _TIP_T
+
+    async def test_an_idle_merger_is_untouched(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        _seed_live_tip(worker, config, git_repo)
+        before = _speculation(worker)
+
+        worker._record_dead_base(_HELD_DEAD, killer=_KILLER)
+
+        assert _speculation(worker) == before
