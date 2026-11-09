@@ -896,8 +896,35 @@ dependency gate as every other task (§3).
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
+  script_root: "project",           # "project" | "factory"; default "project" — see below
+  recheck_secs: None,               # int|None; strict int >= 300; predicate only — see below
 }
 ```
+
+**`before_done.recheck_secs`** (`int | None`, default `None`) declares that a
+predicate may answer "not yet" (exit `75`, §6) and how many seconds the
+runner then advances `metadata.milestone.at`. It is a **strict** int
+(`true`, `"86400"` and `86400.0` are rejected, not coerced) with a floor of
+`300`. It is valid only with `kind='predicate'` **and** a `dated`
+`metadata.milestone`; it is forbidden on `kind='deploy'` and with a
+`delayed` or absent milestone. The kind half is checked by `BeforeDone`, the
+milestone half by `TaskMetadata`'s cross-field validator, so the milestone
+half also holds on `update_task`. The rule is PRD C1
+(`plans/completion-driven-triggers-prd.md`, "C1 — the predicate exit-code
+contract gains a re-arm verdict"); the verdicts it unlocks are §6's table.
+
+**`before_done.script_root`** (`'project'` | `'factory'`, default
+`'project'`) selects what a relative `script` resolves against.
+`'project'` is the orchestrator's configured `project_root`, as above.
+`'factory'` resolves `script` against the dark-factory checkout
+(`shared/src/shared/repo_paths.py::resolve_dark_factory_root`), with the same
+containment, existence and executable-bit checks, so a predicate that ships
+with the factory can gate a task in any project. `'factory'` is allowed
+**only** with `kind='predicate'`; a deploy that asks for it is rejected.
+`cwd` is unchanged (`project_root`). An unresolvable factory root is a
+structured rejection at `submit_task`. The rule is PRD C6
+(`plans/completion-driven-triggers-prd.md`, "C6 — factory-rooted predicate
+scripts").
 
 A relative `script` (even when `cwd` is set) and a relative `cwd` resolve
 against the orchestrator's **configured** `project_root` — the `project_root` in its
@@ -1084,10 +1111,28 @@ script and decides by **exit code only** — it parses no output:
 | Exit code | Outcome |
 |---|---|
 | `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
-| non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| non-`0` (other than the `75` rows below) | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| `75`, `before_done.recheck_secs` declared, milestone `dated`, stall streak below `deterministic.predicate_recheck_stall_cap` | **re-arm**: the task returns to `pending` with `milestone.at` advanced to now + `recheck_secs`, stamps nothing terminal and files **no** escalation. The runner records `predicate_recheck` and `predicate_verdict` and emits a `predicate_rearmed` event |
+| `75`, the streak reaches the cap (default 30) | born-at-L2 `milestone_check_stalled` (`critical`, `agent_role='orchestrator-deterministic'`), stamps `gate_escalated_at`, resets the streak to 0, task `blocked`. `resume` keeps waiting with a fresh streak; `abandon` ends the wait |
+| `75` **without** the declaration (no `recheck_secs`, or the milestone is not `dated`, e.g. a post-submit edit — task 3093) | today's `milestone_check_failed` escalation, plus one detail line naming the missing declaration. Never a silent re-arm |
 | timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
 
-The last row covers **three** ways a run produces no exit code — the outer
+Exit `75` is `os.EX_TEMPFAIL` ("not yet"), and the runner treats it as a
+verdict only when `recheck_secs` is declared. The re-arm rewrites the
+`milestone` dict whole (`metadata_mode='merge'` is shallow) and writes three
+keys in one update: `milestone`, `predicate_recheck`
+(`{consecutive, first_rearmed_at, last_checked_at, next_check_at}`) and
+`predicate_verdict`. The streak cap is the config leaf
+`deterministic.predicate_recheck_stall_cap` (default `30`, hot-reloadable).
+`predicate_verdict` is the parsed trailing-JSON tier of the payload described
+below, stamped on every verdict-bearing exit (`0`, `75`, other non-`0`), so
+a predicate that wants its "not yet" share preserved emits it as a trailing
+JSON object. The authority is PRD C1 (`plans/completion-driven-triggers-prd.md`,
+"C1 — the predicate exit-code contract gains a re-arm verdict"); the chain
+that consumes it is PRD C2 and `docs/quality-findings-contract.md` §11. The
+filing calls themselves live in `skills/_shared/filing-the-trigger-chain.md`.
+
+The no-verdict row covers **three** ways a run produces no exit code — the outer
 wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
 and an unexpected error in the runner seam. Only a **non-zero exit** — a real
 verdict — stamps `gate_escalated_at` and thereby latches the task into the
@@ -1178,6 +1223,28 @@ comparison, per its header.) The anchor stamps when X reaches `done`;
 §5) — predicate mode reuses the `DeterministicRunner` (§5), and the
 delayed anchor waits on the same dependency gate described in §3.
 
+**Exemplar — a predicate that may answer "not yet"** (re-checks daily,
+until the check exits `0`). The complete `submit_task` metadata, with a
+`dated` milestone (`recheck_secs` forbids `delayed`) and a factory-rooted
+script:
+
+```json
+{
+  "milestone": {"mode": "dated", "at": "2026-12-01T00:00:00+00:00"},
+  "before_done": {
+    "kind": "predicate",
+    "script": "scripts/check_run_completion.py",
+    "script_root": "factory",
+    "args": ["--run", "review-dark_factory-20261004", "--threshold", "0.7", "--project-root", "/home/leo/src/dark-factory"],
+    "timeout_secs": 120,
+    "recheck_secs": 86400
+  }
+}
+```
+
+(File it with `task_kind='deterministic'`. `milestone.at` is the first
+check; every `75` moves it forward by `recheck_secs`.)
+
 ### 6.1 Recurring chains (`metadata.recurrence`)
 
 A recurring job is not a self-rescheduling task — it is a **chain** of
@@ -1249,6 +1316,12 @@ re-verify the carrier of the link it renews, through
 `deterministic_task_error`, and fails soft when it no longer holds; any other
 consumer acting on a chain link should likewise re-verify rather than assume
 submit-time validation still holds.
+
+**75 re-arms in place; never mints.** A carrier whose predicate declares
+`recheck_secs` and exits `75` (§6) is not terminal: it returns to `pending`
+with its own `milestone.at` advanced, so no successor is minted and the chain
+holds one live link throughout. Minting happens only when the link completes
+`done`.
 
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
@@ -1456,6 +1529,24 @@ registration is ever moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
+
+Three of the entries belong to the completion-driven trigger chain
+(`plans/completion-driven-triggers-prd.md` C1/C2;
+`docs/quality-findings-contract.md` §11):
+
+- **`trigger_chain`** — author-set, typed
+  (`shared/src/shared/task_metadata.py::TriggerChain`):
+  `{role: 'completion_gate' | 'human_gate', skill: 'review' | 'hotspot-survey' | 'review-all', run_id, superseded_by}`.
+  `skill` is the bare name (no leading slash) and `run_id` must start with
+  `<skill>-`. The submit guard enforces the carrier rules (a completion gate
+  is a dated `recheck_secs` predicate; a human gate is a pure gate) and allows
+  one open chain per project and skill. Both are submit-time only (task 3093).
+  The filing calls are in `skills/_shared/filing-the-trigger-chain.md`.
+- **`predicate_recheck`** — runner-stamped, never author-supplied: the
+  re-arm streak `{consecutive, first_rearmed_at, last_checked_at, next_check_at}`
+  (§6).
+- **`predicate_verdict`** — runner-stamped, never author-supplied: the
+  predicate's trailing JSON-object payload, parsed (§6).
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not
