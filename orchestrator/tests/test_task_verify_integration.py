@@ -43,13 +43,18 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from _host_health_helpers import transport_down
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _task_verify_integration_rig import (
     LAPTOP,
     MODULE,
     SECOND_MODULE,
+    SSH_CONNECT_FAILURE,
+    Cli,
+    Ensure,
     Exit,
     Hold,
     Raises,
@@ -59,6 +64,8 @@ from _task_verify_integration_rig import (
 from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
 
 from orchestrator.config import load_config
+from orchestrator.event_store import EventType
+from orchestrator.remote_gate import local_gate_identity
 from orchestrator.task_verify_run import prepare_task_verify_worktree
 from orchestrator.task_verify_spec import (
     build_task_verify_spec,
@@ -507,3 +514,277 @@ class TestHarnessDispatcher:
             assert scene.sidecar()['reason'] == 'local_granted_first'
             assert scene.laptop.calls == []
             assert scene.unwound(), scene.turns()
+
+
+_REAL = pytest.mark.real_verify_admission
+_SSH_DOWN = Exit(255, '', SSH_CONNECT_FAILURE)
+_UNREACHABLE = 'verify_host_unreachable'
+
+
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+class TestHostHealthWithTheMergeWorker:
+    """The harness's own merge worker, started, beside its task-path pool."""
+
+    async def test_row6_a_busy_merge_slot_leaves_the_task_turn_free(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            allocator = scene.worker.ensure_host_allocator(scene.config)
+            lease = allocator.acquire_remote()
+            assert lease is not None and lease.name == LAPTOP
+            try:
+                result = await scene.call([scene.module(MODULE)])
+
+                assert result.passed, result.summary
+                assert scene.sidecar()['reason'] == 'remote'
+                assert allocator.is_busy(LAPTOP)
+                assert scene.laptop.requests('verify_merge') == []
+            finally:
+                await allocator.release(lease)
+
+    async def test_row7_a_merge_verify_runs_on_the_host_a_task_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.answers['verify-task'] = Hold()
+            scene.laptop.answers['verify-merge'] = Hold()
+            call = scene.start([scene.module(MODULE)])
+            task_request = await scene.laptop.until_verifying('verify-task')
+
+            merge = await scene.merge('m7')
+            merge_request = await scene.laptop.until_verifying('verify-merge')
+
+            assert merge_request != task_request
+            row = scene.laptop_row()
+            assert (row['slot_state'], row['task_held_by']) == ('busy', f'task:{scene.task_id}')
+            scene.laptop.release(merge_request)
+            scene.laptop.release(task_request)
+            outcome = await scene.end_merge(merge)
+            result = await asyncio.wait_for(call, 60)
+
+            assert outcome in {'done', 'cancelled'}
+            assert result.passed, result.summary
+            assert scene.sidecar()['reason'] == 'remote'
+
+    @pytest.mark.parametrize('escalate_after_n', [1, 2])
+    async def test_row9_an_unreachable_laptop_benches_ru_and_the_sweep_readmits_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, escalate_after_n: int,
+    ) -> None:
+        async with open_scene(
+            tmp_path, monkeypatch,
+            verify_host_unreachable_escalate_after_n=escalate_after_n, **_REMOTE_MINE,
+        ) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            scene.laptop.answers['verify-task'] = _SSH_DOWN
+
+            result = await scene.call([scene.module(MODULE)], attempt_id=1)
+
+            assert result.passed, result.summary
+            assert scene.legs.spawned_at('local')
+            assert scene.sidecar(1)['reason'] == 'runner_unavailable'
+            row = scene.laptop_row()
+            assert (row['quarantined'], row['quarantine_class'], row['streak']) == (True, 'ru', 1)
+            assert bool(scene.escalations(_UNREACHABLE)) is (escalate_after_n == 1)
+
+            scene.laptop.answers['verify-task'] = Cli()
+            scene.laptop.healthy = True
+            await scene.until(
+                lambda: not scene.laptop_row()['quarantined'], what='the sweep to readmit the laptop',
+            )
+            await scene.call([scene.module(MODULE)], attempt_id=2)
+
+            assert scene.sidecar(2)['reason'] == 'remote'
+            assert scene.laptop.requests('verify_merge') == []
+
+    @pytest.mark.parametrize('failure', ['ensure_rc_1', 'identity', 'ensure_rc_255', 'publish'])
+    async def test_row12_a_gate_that_cannot_be_ensured_benches_by_kind_before_any_verify(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ) -> None:
+        skew = failure in {'ensure_rc_1', 'identity'}
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            if failure == 'publish':
+                scene.laptop.publish_connect_fails = True
+            else:
+                scene.laptop.ensure = {
+                    'ensure_rc_1': Ensure(rc=1),
+                    'identity': Ensure(identity=local_gate_identity('e' * 40)),
+                    'ensure_rc_255': Ensure(rc=255),
+                }[failure]
+
+            result = await scene.call([scene.module(MODULE)], attempt_id=1)
+
+            assert result.passed, result.summary
+            assert scene.sidecar(1)['reason'] == 'runner_unavailable'
+            assert scene.laptop.requests('verify_task') == []
+            row = scene.laptop_row()
+            assert (row['quarantined'], row['quarantine_class']) == (True, 'skew' if skew else 'ru')
+            assert scene.events(EventType.runner_stale) == []
+
+            scene.laptop.publish_connect_fails = False
+            scene.laptop.ensure = Ensure()
+            if not skew:
+                scene.laptop.healthy = True
+            await scene.until(
+                lambda: not scene.laptop_row()['quarantined'], what='the sweep to readmit the laptop',
+            )
+            assert scene.laptop.healthy is not skew
+            assert scene.events(EventType.runner_stale) == []
+            scene.laptop.ensure = Ensure(built=True)
+            await scene.call([scene.module(MODULE)], attempt_id=2)
+
+            assert scene.sidecar(2)['reason'] == 'remote'
+            assert len(scene.events(EventType.runner_stale)) == 1
+
+    async def test_row14_a_failed_cancel_holds_the_turn_through_the_probe_then_benches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            scene.laptop.answers['verify-task'] = Hold()
+            scene.laptop.cancel_rc, scene.laptop.pgrep_rc = 1, 0
+            scene.laptop.on_pgrep = scene.pool.holders
+            call = scene.start([scene.module(MODULE)], attempt_id=1)
+            await scene.laptop.until_verifying('verify-task')
+
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            await scene.until(
+                lambda: scene.laptop_row()['quarantined'], what='the failed cancel to bench the laptop',
+            )
+            await scene.until(scene.unwound, what='the laptop turn to be left')
+
+            assert scene.laptop.pgrep_seen
+            assert all(seen == {LAPTOP: f'task:{scene.task_id}'} for seen in scene.laptop.pgrep_seen)
+            assert scene.laptop_row()['quarantine_class'] == 'ru'
+            await scene.call([scene.module(MODULE)], attempt_id=2)
+            assert scene.sidecar(2)['reason'] == 'local_granted_first'
+
+    async def test_row20_one_quarantine_set_survives_a_worker_rebuild_and_a_refused_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+
+            scene.pool.mark_unavailable(LAPTOP, transport_down())
+
+            assert scene.worker.ensure_host_allocator(scene.config).is_quarantined(LAPTOP)
+            assert scene.pool.policy(LAPTOP, scene.config).slots == 0
+            await scene.stop_worker()
+            await scene.start_worker()
+            assert scene.laptop_row()['quarantined'] is True
+            await scene.stop_worker()
+
+            with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 1.0), \
+                 pytest.raises(Exception, match='startup refused'):
+                await scene.start_worker()
+
+            assert scene.pool.hosts == (LAPTOP,)
+            assert scene.pool.policy(LAPTOP, scene.config).slots == 0
+            result = await scene.call([scene.module(MODULE)])
+            assert result.passed, result.summary
+            assert scene.sidecar()['reason'] == 'local_granted_first'
+
+    @_REAL
+    @pytest.mark.parametrize('cancelled', ['task', 'merge'])
+    async def test_row28_a_merge_and_a_task_verify_run_on_the_laptop_at_once_and_cancel_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancelled: str,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.answers['verify-task'] = Hold()
+            scene.laptop.answers['verify-merge'] = Hold()
+            merge = await scene.merge('m28')
+            merge_request = await scene.laptop.until_verifying('verify-merge')
+            call = scene.start([scene.module(MODULE)])
+            task_request = await scene.laptop.until_verifying('verify-task')
+            merge_runner = scene.worker.ensure_host_allocator(scene.config).remote_runner(LAPTOP)
+            task_runner = scene.runners.built[-1]
+
+            assert task_runner is not merge_runner
+            assert task_request != merge_request
+            assert merge_runner.dispatch_in_flight and task_runner.dispatch_in_flight
+
+            if cancelled == 'task':
+                call.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await call
+                await scene.until(scene.unwound, what='the task turn to be left')
+                assert merge_runner.dispatch_in_flight
+                assert merge_request not in scene.laptop.requests('verify_unwound')
+                scene.laptop.release(merge_request)
+                await scene.end_merge(merge)
+            else:
+                assert scene.worker.cancel_request(merge.request_id).refusal is None
+                await scene.until(
+                    lambda: merge_request in scene.laptop.requests('verify_unwound'),
+                    what='the merge verify to unwind',
+                )
+                assert task_runner.dispatch_in_flight
+                assert task_request not in scene.laptop.requests('verify_unwound')
+                scene.laptop.release(task_request)
+                assert (await asyncio.wait_for(call, 60)).passed
+
+    @_REAL
+    async def test_row32_a_readmitted_host_gives_its_oldest_waiter_the_turn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            local_holder = scene.hold_local()
+            await asyncio.wait_for(local_holder.granted.wait(), 30)
+            scene.pool.mark_unavailable(LAPTOP, transport_down())
+            assert scene.pool.policy(LAPTOP, scene.config).slots == 0
+            call = scene.start([scene.module(MODULE)])
+            await scene.until(
+                lambda: scene.task_id in scene.turns()['laptop_waiters']
+                and scene.task_id in scene.turns()['local_waiters'],
+                what='the call to queue on both gates',
+            )
+
+            scene.laptop.healthy = True
+            result = await asyncio.wait_for(call, 60)
+
+            assert result.passed, result.summary
+            assert scene.sidecar()['reason'] == 'remote'
+            assert scene.legs.spawned_at('local') == []
+            assert not scene.laptop_row()['quarantined']
+            assert scene.unwound(local_holders=['local-holder']), scene.turns()
+            await local_holder.leave()
+
+    @_REAL
+    async def test_row48_a_merge_bench_during_a_task_verify_outlives_the_tasks_green(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            await scene.start_worker()
+            scene.laptop.healthy = False
+            scene.laptop.answers['verify-task'] = Hold()
+            scene.laptop.answers['verify-merge'] = _SSH_DOWN
+            call = scene.start([scene.module(MODULE)])
+            task_request = await scene.laptop.until_verifying('verify-task')
+
+            merge = await scene.merge('m48')
+            await scene.until(
+                lambda: scene.laptop_row()['quarantined'], what='the merge to bench the laptop',
+            )
+            scene.laptop.release(task_request)
+            result = await asyncio.wait_for(call, 60)
+
+            assert result.passed, result.summary
+            assert scene.sidecar()['reason'] == 'remote'
+            row = scene.laptop_row()
+            assert (row['quarantined'], row['quarantine_class'], row['streak']) == (True, 'ru', 1)
+            await scene.end_merge(merge)
+            scene.laptop.healthy = True
+            await scene.until(
+                lambda: not scene.laptop_row()['quarantined'], what='the sweep to readmit the laptop',
+            )
