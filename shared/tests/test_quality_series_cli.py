@@ -126,6 +126,16 @@ class TestRefusals:
         assert code == 2
         assert 'runs.db' in err
 
+    def test_an_unrecognised_train_payload_exits_2(self, tmp_path: Path, capsys) -> None:
+        repo = GitRepoBuilder(tmp_path / 'odd')
+        repo.commit({'README.md': 'x\n'}, 'root')
+        db = RunsDbBuilder(repo.root / 'data' / 'orchestrator' / 'runs.db')
+        db.event(at_hour(10.0), 'train_merged', '401', {'train_id': 't', 'verdict': 'other'})
+        db.close()
+        code, _, err = _run(capsys, '--root', str(repo.root))
+        assert code == 2
+        assert 'train_merged' in err
+
 
 def test_the_module_runs_as_a_program(project) -> None:
     env = {**os.environ, 'PYTHONPATH': os.pathsep.join(

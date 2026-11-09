@@ -8,6 +8,7 @@ from shared.quality_series.landings import (
     GitCrossCheck,
     Landing,
     LandingBatch,
+    UnrecognisedTrainEvent,
     landings,
 )
 from shared.quality_series.rows import LandingRow, rows_for, unit_heads
@@ -18,6 +19,7 @@ __all__ = [
     'Landing',
     'LandingBatch',
     'LandingRow',
+    'UnrecognisedTrainEvent',
     'landings',
     'rows_for',
     'unit_heads',

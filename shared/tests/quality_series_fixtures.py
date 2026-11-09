@@ -180,6 +180,14 @@ class RunsDbBuilder:
             'base_sha': base_sha,
         }, phase='merge')
 
+    def train_attributed(self, ts: Timestamp, member: str, train_id: str, sha: str) -> None:
+        """The solo-passer payload of orchestrator workflow.py::_attribute_train_failure."""
+        self.event(ts, 'train_merged', member, {
+            'train_id': train_id,
+            'verdict': 'attributed',
+            'merge_sha': sha,
+        }, phase='merge')
+
     def merge_verify(
         self, ts: Timestamp, task_id: str, sha: str, passed: bool, chain_items: int | None = 1
     ) -> None:

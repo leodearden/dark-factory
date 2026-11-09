@@ -13,7 +13,12 @@ from pathlib import Path
 
 from shared.project_layout import runs_db
 from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, GitUnavailable
-from shared.quality_series.landings import CursorNotOnMain, Landing, landings
+from shared.quality_series.landings import (
+    CursorNotOnMain,
+    Landing,
+    UnrecognisedTrainEvent,
+    landings,
+)
 from shared.quality_series.rows import LandingRow, ReviewRoundsSource, rows_for, unit_heads
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
@@ -200,7 +205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         batch = landings(conn, args.root, since_cursor=args.since or None, main_ref=args.main_ref)
         rows, deferred = _measure_all(batch.landings, conn, args.root, args.git_budget_s)
-    except (GitUnavailable, GitObjectMissing, GitTimeout, CursorNotOnMain) as exc:
+    except (
+        GitUnavailable, GitObjectMissing, GitTimeout, CursorNotOnMain, UnrecognisedTrainEvent,
+    ) as exc:
         print(f'quality_series: {exc}', file=sys.stderr)
         return 2
     finally:

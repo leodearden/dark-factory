@@ -5,7 +5,6 @@ Contract and its α correction: plans/quality-dashboard-prd.md §Contract "Landi
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from dataclasses import dataclass, replace
@@ -22,14 +21,23 @@ __all__ = [
     'LandingBatch',
     'LandingSource',
     'LinesBase',
+    'UnrecognisedTrainEvent',
     'landings',
     'parse_utc',
 ]
 
 
 class LandingSource(StrEnum):
+    """Which runs.db event recorded the landing.
+
+    TRAIN_MERGED: a coalesced train's member (``$.member_task_ids``), sharing its train's merge
+    commit. TRAIN_ATTRIBUTED: a train member that passed solo after the train's union verify
+    failed (``$.verdict = 'attributed'``); it advanced main alone, so it is a unit of one.
+    """
+
     MERGE_FINALIZED = 'merge_finalized'
     TRAIN_MERGED = 'train_merged'
+    TRAIN_ATTRIBUTED = 'train_attributed'
 
 
 class LinesBase(StrEnum):
@@ -48,6 +56,17 @@ class LinesBase(StrEnum):
 
 class CursorNotOnMain(Exception):
     """The cursor sha is not a commit on main's first-parent line."""
+
+
+class UnrecognisedTrainEvent(Exception):
+    """A train_merged event carries neither the coalesced nor the attributed payload."""
+
+    def __init__(self, event_ids: list[int]) -> None:
+        self.event_ids = tuple(event_ids)
+        super().__init__(
+            'train_merged events with neither member_task_ids + merge_commit_sha nor '
+            f"verdict='attributed' + merge_sha (event ids={list(self.event_ids)})"
+        )
 
 
 def parse_utc(text: str) -> datetime:
@@ -159,33 +178,55 @@ SELECT id, timestamp, task_id, json_extract(data, '$.merge_sha')
    AND json_extract(data, '$.merge_sha') IS NOT NULL
 """
 
-_TRAIN_SQL = """
-SELECT id, timestamp, json_extract(data, '$.merge_commit_sha'), data
-  FROM events
- WHERE event_type = 'train_merged'
+_COALESCED_TRAIN = """
+json_type(data, '$.member_task_ids') = 'array'
+AND json_array_length(data, '$.member_task_ids') > 0
+AND json_extract(data, '$.merge_commit_sha') IS NOT NULL
 """
 
+_ATTRIBUTED_TRAIN = """
+json_extract(data, '$.verdict') = 'attributed'
+AND json_extract(data, '$.merge_sha') IS NOT NULL
+"""
 
-def _train_members(event_id: int, data: str) -> list[str]:
-    members = json.loads(data).get('member_task_ids')
-    if not isinstance(members, list) or not members:
-        raise ValueError(f'a train_merged event names its members (event id={event_id})')
-    return [str(member) for member in members]
+_COALESCED_TRAIN_SQL = f"""
+SELECT events.id, events.timestamp, json_extract(data, '$.merge_commit_sha'),
+       member.key, member.value, json_array_length(data, '$.member_task_ids')
+  FROM events, json_each(events.data, '$.member_task_ids') AS member
+ WHERE event_type = 'train_merged' AND {_COALESCED_TRAIN}
+"""
+
+_ATTRIBUTED_TRAIN_SQL = f"""
+SELECT id, timestamp, task_id, json_extract(data, '$.merge_sha')
+  FROM events
+ WHERE event_type = 'train_merged' AND {_ATTRIBUTED_TRAIN}
+"""
+
+_UNRECOGNISED_TRAIN_SQL = f"""
+SELECT id
+  FROM events
+ WHERE event_type = 'train_merged'
+   AND NOT COALESCE(({_COALESCED_TRAIN}), 0)
+   AND NOT COALESCE(({_ATTRIBUTED_TRAIN}), 0)
+ ORDER BY id
+"""
 
 
 def _recorded_history(conn: sqlite3.Connection) -> list[_Recorded]:
     """Every landing in the store, deduplicated on (merge_sha, task_id) by earliest event."""
+    unrecognised = [event_id for (event_id,) in conn.execute(_UNRECOGNISED_TRAIN_SQL)]
+    if unrecognised:
+        raise UnrecognisedTrainEvent(unrecognised)
     found: list[_Recorded] = []
     for event_id, ts, task_id, sha in conn.execute(_DONE_SQL):
         found.append(_Recorded(parse_utc(ts), sha, 0, str(task_id),
                                LandingSource.MERGE_FINALIZED, 1, event_id))
-    for event_id, ts, sha, data in conn.execute(_TRAIN_SQL):
-        members = _train_members(event_id, data)
-        found.extend(
-            _Recorded(parse_utc(ts), sha, position, member, LandingSource.TRAIN_MERGED,
-                      len(members), event_id)
-            for position, member in enumerate(members)
-        )
+    for event_id, ts, sha, position, member, size in conn.execute(_COALESCED_TRAIN_SQL):
+        found.append(_Recorded(parse_utc(ts), sha, position, str(member),
+                               LandingSource.TRAIN_MERGED, size, event_id))
+    for event_id, ts, task_id, sha in conn.execute(_ATTRIBUTED_TRAIN_SQL):
+        found.append(_Recorded(parse_utc(ts), sha, 0, str(task_id),
+                               LandingSource.TRAIN_ATTRIBUTED, 1, event_id))
     earliest: dict[tuple[str, str], _Recorded] = {}
     for recorded in sorted(found, key=lambda r: (r.landed, r.event_id)):
         earliest.setdefault((recorded.merge_sha, recorded.task_id), recorded)
@@ -282,7 +323,7 @@ def landings(
     ``git_timeout_s``, so a coroutine calls it through ``asyncio.to_thread``. The return is a
     LandingBatch whose ``.landings`` are the rows.
 
-    Raises CursorNotOnMain, and the git_lines errors (GitUnavailable for a non-repository).
+    Raises CursorNotOnMain, UnrecognisedTrainEvent, and the git_lines errors (GitUnavailable for a non-repository).
     """
     project = project_id if project_id is not None else project_id_for_root(repo)
     line = _first_parent_line(repo, main_ref, git_timeout_s)

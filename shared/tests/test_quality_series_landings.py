@@ -7,15 +7,17 @@ from pathlib import Path
 
 import pytest
 from quality_series_fixtures import (
+    GitRepoBuilder,
     LandingScenario,
     LateClaimScenario,
+    RunsDbBuilder,
     at_hour,
     build_landing_scenario,
     build_late_claim_scenario,
 )
 
 from shared.project_id import project_id_for_root
-from shared.quality_series import CursorNotOnMain, Landing, landings
+from shared.quality_series import CursorNotOnMain, Landing, UnrecognisedTrainEvent, landings
 from shared.quality_series.git_lines import GitUnavailable
 from shared.quality_series.landings import LandingSource, LinesBase
 
@@ -232,3 +234,36 @@ class TestLateClaim:
         first = _by_key(landings(s.db.conn, s.repo.root, since_cursor=None).landings)[('201', s.x)]
         with pytest.raises(ValueError, match='unit_id'):
             dataclasses.replace(first, unit_id='other')
+
+
+class TestTrainAttribution:
+    """A train member that passed solo after the train's union verify went red."""
+
+    @pytest.fixture
+    def solo(self, tmp_path: Path) -> tuple[GitRepoBuilder, RunsDbBuilder, str, str]:
+        repo = GitRepoBuilder(tmp_path / 'proj')
+        repo.commit({'README.md': 'solo\n'}, 'root')
+        a = repo.branch_merge('301', {'pkg/src/pkg/a.py': 'a = 1\n'})
+        b = repo.branch_merge('302', {'pkg/src/pkg/b.py': 'b = 1\n'})
+        db = RunsDbBuilder(repo.root / 'data' / 'orchestrator' / 'runs.db')
+        db.train_attributed(at_hour(10.0), '301', 'train-x', a)
+        db.merge_done(at_hour(11.0), '302', b)
+        return repo, db, a, b
+
+    def test_a_solo_passer_is_a_landing_and_a_unit_of_one(self, solo) -> None:
+        repo, db, a, b = solo
+        rows = landings(db.conn, repo.root, since_cursor=None).landings
+        assert _keys(rows) == [('301', a), ('302', b)]
+        passer = rows[0]
+        assert passer.source is LandingSource.TRAIN_ATTRIBUTED
+        assert (passer.unit_id, passer.unit_size) == (a, 1)
+        assert passer.late_claim is False
+        assert passer.git_first_parent is True
+        assert passer.lines_base is LinesBase.FIRST_PARENT
+
+    def test_an_unrecognised_train_payload_is_a_typed_refusal(self, solo) -> None:
+        repo, db, _, _ = solo
+        db.event(at_hour(12.0), 'train_merged', '303', {'train_id': 'train-y', 'verdict': 'other'})
+        with pytest.raises(UnrecognisedTrainEvent) as excinfo:
+            landings(db.conn, repo.root, since_cursor=None)
+        assert len(excinfo.value.event_ids) == 1

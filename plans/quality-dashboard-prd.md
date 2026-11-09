@@ -267,7 +267,7 @@ negative, so an EWMA chart can never show improvement at these rates.
 
 ```
 Landing = {project_id, merge_sha, task_id, landed_at (UTC ISO), ordinal (int, per project, by landed_at
-           then merge_sha), source ('merge_finalized' | 'train_merged'), unit_id (merge_sha of the verify
+           then merge_sha), source ('merge_finalized' | 'train_merged' | 'train_attributed'), unit_id (merge_sha of the verify
            unit's tip; == merge_sha for a plain landing), unit_size (int ≥ 1), git_first_parent (bool)}
 landings(runs_db, repo, since_cursor) -> list[Landing]   # ordered; never re-emits a sha ≤ cursor
 ```
@@ -307,6 +307,13 @@ main's first-parent line (served as the disagreement count, never dropped).
 - (2026-11-09) A unit's members are consecutive in ordinal order, and
   `shared/src/shared/quality_series/rows.py::rows_for` refuses input that splits, shortens or repeats
   a unit, before any git work.
+- (2026-11-09) `train_merged` has two payload shapes. A coalesced train carries `member_task_ids` and
+  `merge_commit_sha`. A member that passes solo after the train's union verify fails
+  (`orchestrator/src/orchestrator/workflow.py::_attribute_train_failure`) carries `verdict =
+  'attributed'` and `merge_sha` under the member's own `task_id`. It advanced main alone, so it is a
+  landing with source `train_attributed` and is its own unit. Any other shape raises
+  `UnrecognisedTrainEvent`, which names the event ids; the store is never read past it. The full df
+  history had 0 attributed events on 2026-11-09.
 
 ### Per-landing row (`shared/src/shared/quality_series/rows.py`)
 
