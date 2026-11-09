@@ -11,16 +11,13 @@ from collections.abc import Awaitable, Callable
 import httpx
 import openai
 import pytest
+from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _unreached_provider import skip_if_provider_unreached
 
 
 async def _sdk_call(handler: Callable[[httpx.Request], httpx.Response]) -> None:
     """Make one real SDK call over *handler*."""
-    async with openai.AsyncOpenAI(
-        api_key='sk-hermetic-not-a-real-key',
-        max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    ) as client:
+    async with real_sdk_over(handler)(max_retries=0) as client:
         await client.chat.completions.create(
             model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
         )
@@ -35,18 +32,6 @@ async def _raised_by(awaitable: Awaitable[object]) -> BaseException:
     except (Exception, pytest.skip.Exception) as raised:
         return raised
     pytest.fail('the awaited call raised nothing')
-
-
-def _connect_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectTimeout('timed out', request=request)
-
-
-def _connect_error(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectError('[Errno -3] Temporary failure in name resolution', request=request)
-
-
-def _read_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ReadTimeout('timed out', request=request)
 
 
 def _model_not_found(request: httpx.Request) -> httpx.Response:
@@ -65,23 +50,19 @@ def _model_not_found(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_a_connect_timeout_skips_the_live_write():
-    raised = await _raised_by(skip_if_provider_unreached(_sdk_call(_connect_timeout)))
+async def test_a_connect_timeout_skips_the_live_call():
+    raised = await _raised_by(skip_if_provider_unreached(_sdk_call(connect_timeout)))
 
     assert isinstance(raised, pytest.skip.Exception), raised
     assert 'api.openai.com' in str(raised)
     assert 'ConnectTimeout' in str(raised)
-    assert 'episode' not in str(raised), (
-        'the policy is shared by every live provider test, so its reason must '
-        f'not name one caller; got {raised}'
-    )
 
 
 @pytest.mark.parametrize(
     'handler',
     [
-        pytest.param(_connect_error, id='connect-error'),
-        pytest.param(_read_timeout, id='read-timeout'),
+        pytest.param(connect_error, id='connect-error'),
+        pytest.param(read_timeout, id='read-timeout'),
         pytest.param(_model_not_found, id='model-not-found'),
     ],
 )

@@ -41,6 +41,7 @@ import httpx
 import openai
 import pytest
 from _mock_openai_server import mock_openai_server
+from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
 from _unreached_provider import skip_if_provider_unreached
 
@@ -2761,39 +2762,6 @@ def _mid_band_service(**write_triage) -> types.SimpleNamespace:
     return service
 
 
-_REAL_ASYNC_OPENAI = openai.AsyncOpenAI
-
-
-def _real_sdk_over(
-    handler: Callable[[httpx.Request], httpx.Response],
-) -> Callable[..., openai.AsyncOpenAI]:
-    """An `openai.AsyncOpenAI` stand-in building the REAL SDK client over *handler*.
-
-    The real client raises the SDK's own exception chain; a hand-built
-    `openai.APITimeoutError` carries no `__cause__`, so it cannot stand in for it.
-    """
-
-    def _construct(**kwargs: Any) -> openai.AsyncOpenAI:
-        return _REAL_ASYNC_OPENAI(
-            **{'api_key': 'sk-hermetic-not-a-real-key', **kwargs},
-            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        )
-
-    return _construct
-
-
-def _connect_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectTimeout('timed out', request=request)
-
-
-def _connect_error(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectError('[Errno -3] Temporary failure in name resolution', request=request)
-
-
-def _read_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ReadTimeout('timed out', request=request)
-
-
 class TestJudgeWriteInheritsBetasFailOpenApparatus:
     """The INTEGRATION property, asserted directly rather than argued.
 
@@ -2855,7 +2823,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     async def test_an_unreached_provider_stores_and_counts_exactly_once(self) -> None:
         counter = TriageFailOpenCounter()
 
-        with patch('openai.AsyncOpenAI', side_effect=_real_sdk_over(_connect_timeout)):
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)):
             decision = await triage_write(
                 _mid_band_service(), content='c', project_id='p',
                 counter=counter, judge=judge_write,
@@ -3007,7 +2975,7 @@ class TestTheFrontierArmSkipGuard:
 
     @pytest.mark.asyncio
     async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=_real_sdk_over(_connect_timeout)), \
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await triage_write(
                 _mid_band_service(), content='c', project_id='p',
@@ -3023,8 +2991,8 @@ class TestTheFrontierArmSkipGuard:
         ('construct', 'write_triage'),
         [
             pytest.param(_hanging_sdk, {'judge_timeout_seconds': 0.01}, id='budget-expiry'),
-            pytest.param(_real_sdk_over(_connect_error), {}, id='connect-error'),
-            pytest.param(_real_sdk_over(_read_timeout), {}, id='read-timeout'),
+            pytest.param(real_sdk_over(connect_error), {}, id='connect-error'),
+            pytest.param(real_sdk_over(read_timeout), {}, id='read-timeout'),
         ],
     )
     async def test_any_other_judge_failure_fails_open_and_keeps_the_live_test_red(
@@ -3127,7 +3095,7 @@ class TestTheLiveWordingBudgetGuard:
 
     @pytest.mark.asyncio
     async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=_real_sdk_over(_connect_timeout)), \
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs())
 
@@ -3183,14 +3151,14 @@ class TestTheLiveWordingBudgetGuard:
     @pytest.mark.parametrize(
         'handler',
         [
-            pytest.param(_connect_error, id='connect-error'),
-            pytest.param(_read_timeout, id='read-timeout'),
+            pytest.param(connect_error, id='connect-error'),
+            pytest.param(read_timeout, id='read-timeout'),
         ],
     )
     async def test_a_connection_failure_other_than_a_connect_timeout_stays_red(
         self, handler: Callable[[httpx.Request], httpx.Response],
     ) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=_real_sdk_over(handler)), \
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 _raises_without_skipping(openai.APIConnectionError):
             await _live_judge_verdict(**self._judge_kwargs())
 
