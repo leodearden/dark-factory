@@ -392,6 +392,27 @@ row is written to quality.db or printed.
 `explain_alarm(onset_idx, onset_at, markers, k=25, days=3)`. All deterministic for equal inputs; no
 module-level state; stdlib only.
 
+**Correction (α, 2026-11-09).** The shipped signatures differ from the list above in three places
+that γ and δ build on; `shared/src/shared/quality_series/stats.py` is the single home.
+- `cusum_design(p0) -> CusumDesign(p1_up, p1_down, h)` with `p1_up = min(2·p0, (1 + p0)/2)`: the
+  doubling up to p0 = 1/3, and halfway from p0 to 1 above it, because 2·p0 reaches 1 at p0 = 1/2,
+  where the Bernoulli log-likelihood ratio is undefined. `p1_down = p0/2`, `h = CUSUM_H = 5`, and a
+  p0 outside (0, 1) is refused (`::cusum_design`).
+- Markers reach the statistics as `::RegimeEvent(event_id, at, until=None, series=None,
+  artefact=False)`. `series=None` applies to every series, and an artefact is a range `[at, until]`.
+  δ's markers are converted to it. `regime_segments(landed_at, events, series) ->
+  RegimeSegments(segments, excluded)` takes the landings' `landed_at` datetimes, not landing records.
+  An event's boundary is the first landing at or after its `at`, and an artefact's landings are
+  `excluded` (`::regime_segments`).
+- `explain_alarm(onset_idx, onset_at, events, landed_at, k=25, days=3) -> event_id | None` takes the
+  same `RegimeEvent`s plus the required `landed_at` sequence, which places each event on the landing
+  axis. Among events within ±k landings or ±days, the nearest in landings wins, then the nearest in
+  time, then the smallest `event_id` (`::explain_alarm`).
+- The other return shapes are typed, never bare tuples of strings: `baseline_rate` returns
+  `(p0, BaselineState | None)`, `block_rate_datum` returns `RateDatum`, and `before_after_rate` /
+  `before_after_cost` return `Effect` / `CostEffect` or `NotYet`. `cost_fit(lines, costs, min_lines=5)`
+  exposes the log–log fit that `reference_cost` evaluates.
+
 ### Wire shape (`dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire`)
 
 ```
