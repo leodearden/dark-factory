@@ -160,6 +160,7 @@ DEFAULT_PRODUCERS: tuple[Producer, ...] = (
     Producer(E1_EVAL_ID, _SCRIPTS_DIR / 'memory_eval_retrieval_probe.py', _probe_argv),
     Producer('e4-staleness-sweep', _SCRIPTS_DIR / 'memory_eval_staleness_sweep.py', _sweep_argv),
     Producer('e6-corpus-health', _SCRIPTS_DIR / 'audit_duplicate_memories.py', _sweep_argv),
+    Producer('e7-write-after-miss', _SCRIPTS_DIR / 'memory_eval_write_after_miss.py', _sweep_argv),
 )
 """Every scheduled producer, run read-only: no argv here may carry --apply or --no-metrics."""
 
