@@ -16,9 +16,11 @@ from quality_series_fixtures import (
     build_late_claim_scenario,
 )
 
+from shared.cost_store import CapReason
 from shared.quality_series import Landing, LandingRow, landings, rows_for, unit_heads
 from shared.quality_series.git_lines import landed_lines
 from shared.quality_series.rows import (
+    TURNS_CAP_REASON,
     CharterClass,
     CharterClassSource,
     QualityRowInvariantError,
@@ -246,6 +248,19 @@ class TestTurns:
         cost = cost_rows[('107', cost_scenario.m7)].cost
         assert (cost.turns, cost.turns_capped) == (None, False)
 
+    def test_before_the_first_turns_bearing_row_turns_are_unknown_not_zero(
+        self, tmp_path: Path
+    ) -> None:
+        s = build_landing_scenario(tmp_path / 'proj')
+        s.db.invocation_end(at_hour(9.0), '101', 'implementer', None)
+        s.db.invocation_end(at_hour(12.5), '101', 'implementer', 7)
+        rows = _by_key(_rows(s))
+        assert rows[('101', s.m1)].cost.turns is None
+        assert rows[('101', s.m6)].cost.turns == 7
+
+    def test_the_cap_reason_is_the_cost_store_vocabulary(self) -> None:
+        assert TURNS_CAP_REASON == CapReason.TURNS
+
 
 class TestExecuteIterations:
     def test_sums_rows_completed_inside_the_window(self, cost_scenario, cost_rows):
@@ -255,10 +270,14 @@ class TestExecuteIterations:
         assert cost_rows[('107', cost_scenario.m7)].cost.execute_iterations is None
 
 
-def _review_state(root: Path, dirname: str, text: str) -> None:
+def _review_state(root: Path, dirname: str, content: str | bytes) -> None:
     meta = root / '.worktrees' / '.task-meta' / dirname
     meta.mkdir(parents=True, exist_ok=True)
-    (meta / 'review_state.json').write_text(text)
+    state = meta / 'review_state.json'
+    if isinstance(content, bytes):
+        state.write_bytes(content)
+    else:
+        state.write_text(content)
 
 
 UNACTIONABLE = 'Architect reported task unactionable: x'
@@ -276,6 +295,7 @@ def review_scenario(tmp_path_factory: pytest.TempPathFactory) -> LandingScenario
     db.review_completed(at_hour(13.8), '107', cycle=2, has_blocking=False)
     _review_state(root, '101', json.dumps({'review_cycles_total': 2}))
     _review_state(root, 'task-102', json.dumps({'review_cycles_total': 0}))
+    _review_state(root, '103', b'{"review_cycles_total": \xff}')
     _review_state(root, '104', '{not json')
     _review_state(root, '105', json.dumps({'amendment_rounds_total': 1}))
     _review_state(root, '106', json.dumps({'review_cycles_total': 'two'}))
@@ -332,6 +352,16 @@ class TestReviewRounds:
         cost = review_rows[('108', review_scenario.m8)].cost
         assert (cost.review_rounds, cost.review_rounds_source) == (None, None)
 
+    def test_the_task_keyed_directory_wins_over_the_legacy_one(self, tmp_path: Path) -> None:
+        s = build_landing_scenario(tmp_path / 'proj')
+        s.db.review_completed(at_hour(13.5), '107', cycle=1, has_blocking=False)
+        _review_state(s.repo.root, '102', json.dumps({'review_cycles_total': 5}))
+        _review_state(s.repo.root, 'task-102', json.dumps({'review_cycles_total': 1}))
+        cost = _by_key(_rows(s))[('102', s.f2)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (
+            2, ReviewRoundsSource.DISK_COUNTER,
+        )
+
 
 class TestCharterClassBackfill:
     @pytest.mark.parametrize(
@@ -368,6 +398,22 @@ class TestCharterClassColumn:
                          block_reason=UNACTIONABLE, charter_class='stale_charter')
         cost = _by_key(_rows(s))[('102', s.f2)].cost
         assert (cost.charter_class, cost.charter_class_source) == (
+            CharterClass.STALE_CHARTER, CharterClassSource.CHARTER_CLASS,
+        )
+
+    def test_a_null_column_falls_back_to_the_prefix_backfill_per_row(
+        self, tmp_path: Path
+    ) -> None:
+        s = build_landing_scenario(tmp_path / 'proj', with_charter_class=True)
+        s.db.task_result('102', 'run-a', 'blocked', at_hour(10.5), block_reason=UNACTIONABLE)
+        s.db.task_result('103', 'run-a', 'blocked', at_hour(11.5),
+                         block_reason=UNACTIONABLE, charter_class='stale_charter')
+        rows = _by_key(_rows(s))
+        f2, m3 = rows[('102', s.f2)].cost, rows[('103', s.m3)].cost
+        assert (f2.charter_class, f2.charter_class_source) == (
+            CharterClass.UNDER_SPECIFIED, CharterClassSource.REGEX_BACKFILL,
+        )
+        assert (m3.charter_class, m3.charter_class_source) == (
             CharterClass.STALE_CHARTER, CharterClassSource.CHARTER_CLASS,
         )
 

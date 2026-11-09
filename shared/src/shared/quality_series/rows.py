@@ -40,6 +40,7 @@ __all__ = [
     'Outcomes',
     'QualityRowInvariantError',
     'ReviewRoundsSource',
+    'TURNS_CAP_REASON',
     'SourceEpochs',
     'UnknownCharterClass',
     'module_allocation',
@@ -156,8 +157,11 @@ class UnknownCharterClass(ValueError):
 
 
 _CHARTER_BACKFILL_PREFIXES: tuple[tuple[str, CharterClass], ...] = (
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_unactionable_task_report
     ('Architect reported task unactionable', CharterClass.UNDER_SPECIFIED),
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_false_premise_report
     ('Architect reported false RED-test premise', CharterClass.UNDER_SPECIFIED),
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_already_done_report
     ('Architect reported task already done', CharterClass.STALE_CHARTER),
     # orchestrator/src/orchestrator/merge_lane/gates.py::PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
     ('Plan files not touched by branch', CharterClass.PLAN_FILES_UNTOUCHED),
@@ -165,7 +169,10 @@ _CHARTER_BACKFILL_PREFIXES: tuple[tuple[str, CharterClass], ...] = (
 """The pre-ζ backfill: block_reason prefixes, the only string matching in this package."""
 
 TURNS_CAP_REASON = 'turns'
-"""shared/src/shared/cost_store.py::CapReason.TURNS, restated: that module is not stdlib-only."""
+"""shared/src/shared/cost_store.py::CapReason.TURNS, restated: that module is not stdlib-only.
+
+shared/tests/test_quality_series_rows.py asserts the two stay equal.
+"""
 
 
 @dataclass(frozen=True)
@@ -321,6 +328,8 @@ def _charter(values: tuple[Any, ...]) -> _Charter | None:
             return _Charter(charter_class, CharterClassSource.REGEX_BACKFILL)
     return None
 
+
+# orchestrator/src/orchestrator/flake_ledger.py::FlakeVerdict, restated: shared may not import it.
 FLAKE_CONFIRMED = 'passes_in_isolation'
 FLAKE_REAL_RED = 'fails_in_isolation'
 
@@ -438,14 +447,19 @@ def _usd_by_role(invocations: list[_Invocation]) -> tuple[tuple[str, float], ...
 
 
 def _disk_review_cycles(repo: str | os.PathLike[str], task_id: str) -> int | None:
+    """The task's lifetime review counter; None when the file is absent, unreadable or malformed.
+
+    The task-keyed directory (orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.task_root_for)
+    is review_state.json's current home, so it wins over the legacy bare-id directory.
+    """
     meta = Path(repo) / '.worktrees' / '.task-meta'
-    for dirname in (task_id, f'task-{task_id}'):
+    for dirname in (f'task-{task_id}', task_id):
         state = meta / dirname / 'review_state.json'
         if not state.exists():
             continue
         try:
-            document = json.loads(state.read_text())
-        except (OSError, json.JSONDecodeError):
+            document = json.loads(state.read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         total = document.get('review_cycles_total') if isinstance(document, dict) else None
         return total if isinstance(total, int) and not isinstance(total, bool) else None
