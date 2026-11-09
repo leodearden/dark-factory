@@ -23,7 +23,7 @@ from typing import Literal, Protocol, assert_never
 
 from escalation.amendments import amendment_room
 from escalation.categories import EscalationCategory
-from escalation.classify import INFO_L0_MECHANICAL_ROLES, info_l0_mechanical_class
+from escalation.classify import INFO_L0_MECHANICAL_ROLES, info_l0_mechanical_class, is_harness_filed
 from escalation.disposition import (
     Addressed,
     ConvertViaCurator,
@@ -559,6 +559,8 @@ def reviewer_note_refusal(record: Escalation | None, *, task_id: str, enabled: b
 
     The one eligibility rule for the reviewer leg (D2): the briefing lists
     exactly the notes it admits, and a disposition of any other is rejected.
+    D2 admits agent-filed notes only, so the harness namespace
+    (escalation/classify.py::is_harness_filed) is refused.
     """
     if record is None:
         return 'no such escalation'
@@ -575,6 +577,8 @@ def reviewer_note_refusal(record: Escalation | None, *, task_id: str, enabled: b
     mechanical_class = info_l0_mechanical_class(record)
     if mechanical_class is not None:
         return f'a mechanical {mechanical_class!r} notice, which the exit router closes'
+    if is_harness_filed(record):
+        return f'filed by the harness under role {record.agent_role!r}, not by an agent'
     hold = read_hold(record)
     if hold is not None:
         return f'held by the router on curator ticket {hold.ticket}'
