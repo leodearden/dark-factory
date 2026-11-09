@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from itertools import groupby
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -495,10 +496,19 @@ def _cost(
 
 
 def _units(landings: Sequence[Landing]) -> list[tuple[Landing, ...]]:
-    members: dict[str, list[Landing]] = {}
-    for landing in landings:
-        members.setdefault(landing.unit_id, []).append(landing)
-    return [tuple(unit) for unit in members.values()]
+    """The input's units in order; each must be one complete run of consecutive landings."""
+    units = [tuple(run) for _, run in groupby(landings, key=lambda landing: landing.unit_id)]
+    started: set[str] = set()
+    for unit in units:
+        head = unit[0]
+        _invariant(len(unit) == head.unit_size,
+                   "a unit's members arrive as one run of unit_size landings",
+                   unit_id=head.unit_id, unit_size=head.unit_size,
+                   task_ids=tuple(member.task_id for member in unit))
+        _invariant(head.unit_id not in started,
+                   'a unit_id starts only one run of consecutive landings', unit_id=head.unit_id)
+        started.add(head.unit_id)
+    return units
 
 
 FIRST_UNIT_GIT_FLOOR_S = 60.0
@@ -538,16 +548,19 @@ def rows_for(
 ) -> list[LandingRow]:
     """LandingRows for the longest unit-atomic prefix of ``landings`` measurable in the budget.
 
-    Units are measured in the order given (ordinal order from landings()); the first always gets
-    at least FIRST_UNIT_GIT_FLOOR_S of git time, each later one the remaining budget. A spent
-    budget or a GitTimeout ends the call before that unit, never inside it, and no row is ever
-    emitted with lines missing for budget reasons: the caller resumes with
-    ``landings[len(rows):]``.
+    ``landings`` must carry each unit's members consecutive and complete, as landings() returns
+    them and as any slice at a unit boundary keeps them; the whole input is checked before any
+    git work, and a split, short or repeated unit raises QualityRowInvariantError. Rows come
+    back in input order. Units are measured in that order; the first always gets at least
+    FIRST_UNIT_GIT_FLOOR_S of git time, each later one the remaining budget. A spent budget or
+    a GitTimeout ends the call before that unit, never inside it, and no row is ever emitted
+    with lines missing for budget reasons: the caller resumes with ``landings[len(rows):]``.
     """
+    units = _units(landings)
     deadline = time.monotonic() + git_budget_s
     sources = _Sources.load(runs_db, sorted({landing.task_id for landing in landings}))
     rows: list[LandingRow] = []
-    for index, unit in enumerate(_units(landings)):
+    for index, unit in enumerate(units):
         head = unit[0]
         try:
             timeout_s = _git_timeout(index == 0, deadline) if head.base_sha is not None else 0.0
