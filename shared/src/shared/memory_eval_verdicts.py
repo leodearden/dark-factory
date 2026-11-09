@@ -177,7 +177,7 @@ def _tripwire_entries(
     alarm_details = {alarm.item_key: alarm.detail for alarm in judged.alarms}
     items = metric.items or []
     failing = {item.item_key for item in items if not item.passed}
-    limit_ref = f'grandfather_set_hash={result.grandfather_hash[:12]}'
+    limit_ref = f'grandfather_set_hash={result.grandfather_hash}'
     for key in dict.fromkeys(item.item_key for item in items):
         if key in alarm_details:
             verdict: Verdict = 'alarm'

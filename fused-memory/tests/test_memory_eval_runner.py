@@ -520,7 +520,8 @@ class TestPerAlarmFiling:
             ):
                 assert cited in detail, cited
             if entry.rule_kind == 'tripwire':
-                assert 'grandfather_set_hash=' in detail
+                assert f'limit: {entry.limit_ref}' in detail
+                assert run.result.grandfather_hash in detail
             else:
                 assert 'alpha=' in detail and 'p_value=' in detail
                 assert all(stamp in detail for stamp in run.result.baseline_run_stamps)

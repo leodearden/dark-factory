@@ -391,9 +391,9 @@ def _matching_alarm(run: EvalRun, entry: VerdictEntry) -> Alarm:
     raise ValueError(f'{run.eval_id}: no evaluator alarm matches entry {_subject(entry)}.')
 
 
-def _limit_line(run: EvalRun, alarm: Alarm) -> str:
+def _limit_line(entry: VerdictEntry, alarm: Alarm) -> str:
     if alarm.rule_kind == 'tripwire':
-        return f'limit: grandfather_set_hash={run.result.grandfather_hash}'
+        return f'limit: {entry.limit_ref}'
     return f'limit: alpha={alarm.alpha!r} p_value={alarm.p_value!r}'
 
 
@@ -408,7 +408,7 @@ def alarm_filing(run: EvalRun, entry: VerdictEntry, context: FilingContext) -> F
         *([f'direction: {alarm.direction}'] if alarm.direction is not None else []),
         f'value: {_num(alarm.value)}',
         f'baseline: {_num(alarm.baseline)}',
-        _limit_line(run, alarm),
+        _limit_line(entry, alarm),
         f'baseline_run_stamps: {", ".join(run.result.baseline_run_stamps) or "none"}',
         f'evaluator: {alarm.detail}',
         f'limits artifact: {run.limits_path}',

@@ -135,6 +135,11 @@ class TestRegressionRunClassification:
             assert entry.value == values[entry.metric_id]
             assert isinstance(entry.limit_ref, str) and entry.limit_ref
 
+    def test_a_tripwire_limit_ref_carries_the_full_grandfather_hash(self):
+        result = evaluate_exemplar()
+        tripwire_refs = {e.limit_ref for e in _regression_entries() if e.metric_id == _TRIPWIRE}
+        assert tripwire_refs == {f'grandfather_set_hash={result.grandfather_hash}'}
+
 
 class TestFingerprints:
     def test_fingerprints_are_stable_across_runs(self):
