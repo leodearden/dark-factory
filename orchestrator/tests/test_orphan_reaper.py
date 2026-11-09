@@ -16,6 +16,7 @@ from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.warm_lane_pool import WarmLanePool
 
 
@@ -144,6 +145,33 @@ class TestOrphanReaper:
         _mk(harness.git_ops.worktree_base, '500')
         await harness._reap_orphan_worktrees()
         harness.git_ops.prune_worktrees.assert_called_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestOrphanReaperEntryIsolation:
+    async def test_one_failing_orphan_does_not_stop_the_sweep(self, harness: Harness):
+        base = harness.git_ops.worktree_base
+        _mk(base, '500')
+        wt501 = _mk(base, '501')
+
+        async def cleanup(entry: Path, name: str) -> None:
+            if name == '500':
+                raise OSError('boom')
+
+        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=cleanup)
+
+        failures = await harness._reap_orphan_worktrees()
+
+        harness.git_ops.cleanup_worktree.assert_any_await(wt501, '501')  # type: ignore[attr-defined]
+        reaped_ids = [
+            c.kwargs.get('task_id')
+            for c in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
+            if c.args[0] == EventType.worktree_reaped
+        ]
+        assert reaped_ids == ['501']
+        harness.git_ops.prune_worktrees.assert_awaited_once()  # type: ignore[attr-defined]
+        assert isinstance(failures, EntryFailures)
+        assert [f.entry for f in failures.failures] == ['500']
 
 
 # ---------------------------------------------------------------------------
