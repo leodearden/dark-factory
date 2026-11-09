@@ -9,6 +9,7 @@ reason recorded.
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import AsyncIterator, Coroutine
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,13 @@ from orchestrator.merge_lane.dead_base_ledger import (
     DeadBaseLedger,
     DeadBaseSite,
 )
-from orchestrator.merge_lane.remerge_base import choose_remerge_base, frontier_tip
+from orchestrator.merge_lane.remerge_base import (
+    RemergeClaim,
+    choose_remerge_base,
+    claim_remerge_base,
+    frontier_tip,
+)
+from orchestrator.merge_lane.speculation_controller import PermitLedger
 from orchestrator.merge_lane.types import (
     DecidedItem,
     InflightEntry,
@@ -38,6 +45,7 @@ from orchestrator.merge_lane.types import (
     RealMergeItem,
     RemergeBase,
     RemergeReason,
+    SpecPermit,
 )
 
 _MAIN = 'sha-main'
@@ -132,12 +140,13 @@ def _entry(
     commit: str | None,
     verify: asyncio.Task[Any] | None,
     status: InflightStatus | None = None,
-    gate: PendingGate | None = None,
+    gate_task: asyncio.Task[Any] | None = None,
 ) -> InflightEntry:
     item = _real_item(config, task_id, base=base, commit=commit)
     return InflightEntry(
         item=item, lease=None, verify_task=verify, merge_wt=item.merge_wt,
-        was_speculative=item.speculative, status=status, gate=gate,
+        was_speculative=item.speculative, status=status,
+        gate=None if gate_task is None else _gate(item, gate_task),
     )
 
 
@@ -311,9 +320,10 @@ class TestChooseRemergeBase:
     async def test_owner_parked_on_a_gate(
         self, config: OrchestratorConfig, verifies: Verifies,
     ) -> None:
-        owner = _entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())
-        assert isinstance(owner.item, RealMergeItem)
-        owner.gate = _gate(owner.item, verifies.pending())
+        owner = _entry(
+            config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending(),
+            gate_task=verifies.pending(),
+        )
         assert _choose('sha-a', [owner]) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
     async def test_tip_with_no_owner(
@@ -356,3 +366,156 @@ class TestChooseRemergeBase:
         assert _choose('sha-y', frontier, dead=ledger) == RemergeBase('sha-y', RemergeReason.LIVE_TIP)
         ledger.record('sha-x', DeadBaseKiller(DeadBaseSite.ADOPTION_VOID, 'x'))
         assert _choose('sha-y', frontier, dead=ledger) == RemergeBase(None, RemergeReason.TIP_DEAD)
+
+
+def _ledger(depth: int) -> PermitLedger[SpecPermit]:
+    return PermitLedger(asyncio.Semaphore(depth), depth)
+
+
+def _claim(
+    ledger: PermitLedger[SpecPermit],
+    frontier: list[InflightEntry],
+    *,
+    held: SpecPermit | None,
+    dead: frozenset[str] = frozenset(),
+) -> RemergeClaim:
+    return claim_remerge_base(
+        main_sha=_MAIN, frozen_tip=frontier_tip(frontier) or _MAIN, dead_bases=dead,
+        frontier=frontier, held_permit=held, ledger=ledger,
+    )
+
+
+class TestRemergeClaimInvariant:
+    """A claim holds a permit exactly when its anchor is speculative."""
+
+    def test_a_speculative_anchor_needs_a_permit(self) -> None:
+        with pytest.raises(ValueError, match=r'live_tip.*None'):
+            RemergeClaim(RemergeBase('t', RemergeReason.LIVE_TIP), None)
+
+    def test_a_fall_to_main_holds_no_permit(self) -> None:
+        with pytest.raises(ValueError, match=r'no_tip.*SpecPermit'):
+            RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), SpecPermit())
+
+
+@pytest.mark.asyncio
+class TestClaimRemergeBase:
+    """The permit a replacement leaves with, and what the ledger sees."""
+
+    async def test_a_held_permit_rides_a_live_tip(
+        self, config: OrchestratorConfig, verifies: Verifies,
+    ) -> None:
+        ledger = _ledger(2)
+        held = await ledger.acquire()
+        frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
+
+        claim = _claim(ledger, frontier, held=held)
+
+        assert claim == RemergeClaim(RemergeBase('sha-a', RemergeReason.LIVE_TIP), held)
+        assert ledger.live == frozenset({held})
+        assert ledger.slot_available == 1
+
+    async def test_a_held_permit_is_released_on_a_fall_to_main(self) -> None:
+        ledger = _ledger(2)
+        held = await ledger.acquire()
+
+        claim = _claim(ledger, [], held=held)
+
+        assert claim == RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None)
+        assert held.released is True
+        assert ledger.live == frozenset()
+        assert ledger.slot_available == 2
+
+    async def test_a_live_tip_takes_a_free_slot(
+        self, config: OrchestratorConfig, verifies: Verifies,
+    ) -> None:
+        ledger = _ledger(2)
+        frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
+
+        claim = _claim(ledger, frontier, held=None)
+
+        assert claim.anchor == RemergeBase('sha-a', RemergeReason.LIVE_TIP)
+        assert claim.permit is not None
+        assert ledger.live == frozenset({claim.permit})
+        assert ledger.slot_available == 1
+
+    async def test_a_live_tip_with_no_free_slot_falls_to_main(
+        self, config: OrchestratorConfig, verifies: Verifies,
+    ) -> None:
+        ledger = _ledger(1)
+        merger_permit = await ledger.acquire()
+        frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
+
+        claim = _claim(ledger, frontier, held=None)
+
+        assert claim == RemergeClaim(RemergeBase(None, RemergeReason.NO_PERMIT), None)
+        assert ledger.live == frozenset({merger_permit})
+        assert ledger.slot_available == 0
+
+
+_OWNER_KINDS = ('live', 'vacated', 'verify_dead', 'gate_parked', 'dead_chained')
+
+
+def _random_frontier(
+    rng: random.Random, config: OrchestratorConfig, verifies: Verifies, cascade: int,
+) -> tuple[list[InflightEntry], frozenset[str]]:
+    frontier: list[InflightEntry] = []
+    dead: set[str] = set()
+    base = _MAIN
+    for i in range(rng.randint(0, 3)):
+        kind = rng.choice(_OWNER_KINDS)
+        commit = f'sha-{cascade}-{i}'
+        frontier.append(_entry(
+            config, f't{cascade}-{i}', base=base, commit=commit,
+            verify=None if kind == 'verify_dead' else verifies.pending(),
+            status=InflightStatus.REQUEUED if kind == 'vacated' else None,
+            gate_task=verifies.pending() if kind == 'gate_parked' else None,
+        ))
+        if kind == 'dead_chained':
+            dead.add(commit)
+        base = commit
+    return frontier, frozenset(dead)
+
+
+def _assert_accounted(ledger: PermitLedger[SpecPermit], outstanding: list[RemergeClaim]) -> None:
+    assert ledger.slot_available + len(ledger.live) == ledger.depth
+    for claim in outstanding:
+        if claim.anchor.speculative:
+            assert claim.permit in ledger.live
+        else:
+            assert claim.permit is None
+
+
+@pytest.mark.asyncio
+async def test_permits_are_conserved_across_random_cascades(
+    config: OrchestratorConfig, verifies: Verifies,
+) -> None:
+    """Boundary row 4 (plans/merge-lane-policy-prd.md §7): 100 seeded cascades.
+
+    Other holders (the merger, other in-flight items) occupy a random share
+    of the slots, so a live tip sometimes finds none free.
+    """
+    rng = random.Random(8524)
+    seen: set[RemergeReason] = set()
+    for cascade in range(100):
+        depth = rng.randint(2, 4)
+        ledger = _ledger(depth)
+        others = [ledger.try_acquire() for _ in range(rng.randint(0, depth))]
+        frontier, dead = _random_frontier(rng, config, verifies, cascade)
+        outstanding: list[RemergeClaim] = []
+        for _ in range(rng.randint(1, depth)):
+            held = ledger.try_acquire() if rng.random() < 0.5 else None
+            claim = _claim(ledger, frontier, held=held, dead=dead)
+            seen.add(claim.anchor.reason)
+            outstanding.append(claim)
+            _assert_accounted(ledger, outstanding)
+        rng.shuffle(outstanding)
+        while outstanding:
+            permit = outstanding.pop().permit
+            if permit is not None:
+                ledger.release(permit)
+            _assert_accounted(ledger, outstanding)
+        for permit in others:
+            assert permit is not None
+            ledger.release(permit)
+        assert ledger.live == frozenset()
+    assert seen == set(RemergeReason)
