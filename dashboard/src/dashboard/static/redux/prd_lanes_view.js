@@ -105,9 +105,14 @@ function doneOfTotal(row) {
   };
 }
 
+function storeStatusText(status) {
+  return status === null ? 'not in the store' : status;
+}
+
 function signalLeafText(leaf) {
+  const id = leaf.task_id === null ? '' : ` #${leaf.task_id}`;
   const kind = leaf.status === 'done' && leaf.done_kind ? ` (${leaf.done_kind})` : '';
-  return `${leaf.label} #${leaf.task_id} ${leaf.status}${kind}`;
+  return `${leaf.label}${id} ${storeStatusText(leaf.status)}${kind}`;
 }
 
 function signalCell(signal) {
@@ -124,7 +129,7 @@ function contentionEntryText(entry) {
   const holder = entry.holder;
   const held = holder === null
     ? 'no holder'
-    : `held by #${holder.task_id} (${holder.status === null ? 'not in the store' : holder.status})`;
+    : `held by #${holder.task_id} (${storeStatusText(holder.status)})`;
   return `${entry.key} · ${entry.wanted_by_ready} ready want it · ${held}`;
 }
 
