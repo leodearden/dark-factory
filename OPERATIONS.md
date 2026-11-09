@@ -2723,10 +2723,12 @@ directly, not just interactive sessions. Treat it accordingly:
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
   no-code change. Reach for `--only` first regardless. A docs-only commit
-  outside `plans/`, `docs/` and `review/` passes the hook cheaply anyway
-  (no merge-gate check maps to it); one inside them pays for the screen.
-  Either way, `--no-verify` is a last resort for genuine index-lock
-  contention, not a way to dodge a slow hook.
+  pays for the screen (about 10 s warm) when it stages anything under
+  `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md` outside a
+  workspace package, root-level docs such as this file included. Other
+  docs-only commits skip the merge-gate checks. Either way, `--no-verify`
+  is a last resort for genuine index-lock contention, not a way to dodge
+  a slow hook.
 
 ---
 
