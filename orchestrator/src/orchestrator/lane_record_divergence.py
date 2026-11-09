@@ -1,8 +1,9 @@
-"""Read-only digest-time cross-check of the warm-lane pool's in-memory
-assignment map against the durable ``.lane-state`` records (PRD
+"""Digest-time cross-check of the warm-lane pool's in-memory assignment map
+against the durable ``.lane-state`` records (PRD
 ``plans/warm-lane-exhaustion-hardening-prd.md`` δ). The durable record is
-canonical and the map is its cache, so every disagreement is a defect signal;
-this module reports it and never repairs it.
+canonical and the map is its cache, so every disagreement is a defect signal.
+This module counts each lane's divergence streak across digests and alarms on
+a persistent one; it acts on no lane and never repairs.
 """
 
 from __future__ import annotations
