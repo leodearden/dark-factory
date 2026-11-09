@@ -16,12 +16,13 @@ Each run:
    limit K, plus one escalation covering everything that failed to run.
 
 Exit status: 0 when the run completed (an alarm is not a failure), 1 when
-something failed to run (after filing), 2 when the config or the recon queue
-failed preflight.
+something failed to run (after filing), 2 when the config, the recon queue or
+the run stamp failed preflight, or another run holds the artifact root's lock.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -31,6 +32,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import yaml
 from escalation.categories import EscalationCategory
@@ -81,6 +83,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'memory-eval.yaml'
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'memory-evals'
 VERDICTS_CURRENT_NAME = 'verdicts-current.json'
+RUN_LOCK_NAME = '.runner.lock'
 _STDERR_TAIL_CHARS = 2000
 
 EXIT_OK = 0
@@ -529,7 +532,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         description='Run the scheduled memory evals and file eval_regression escalations.',
     )
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument('--artifact-root', type=Path, default=DEFAULT_ARTIFACT_ROOT)
+    parser.add_argument(
+        '--artifact-root', type=lambda value: Path(value).resolve(), default=DEFAULT_ARTIFACT_ROOT,
+        help='resolved against the current directory before any producer runs',
+    )
     parser.add_argument(
         '--queue-dir', type=Path, default=None,
         help="recon escalation queue (default: fused-memory's "
@@ -696,6 +702,34 @@ class _PreflightRefused(Exception):
     """Carries the message main() prints before exiting EXIT_PREFLIGHT."""
 
 
+class RunLockHeld(Exception):
+    """Another run holds the artifact root: this one must write and file nothing."""
+
+
+def hold_run_lock(root: Path, *, holder: str) -> TextIO:
+    """Take the artifact root's exclusive run lock, naming *holder* in it; closing the handle releases it.
+
+    Overlapping runs could both pass has_open_l1 before either submits, and could
+    interleave one eval's limits-current.json read-modify-write.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / RUN_LOCK_NAME
+    handle = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), 'r+', encoding='utf-8')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held_by = handle.read().strip() or 'a run that has not named itself yet'
+        handle.close()
+        raise RunLockHeld(f'{path} is held by {held_by}') from None
+    except BaseException:
+        handle.close()
+        raise
+    handle.truncate(0)
+    handle.write(holder + '\n')
+    handle.flush()
+    return handle
+
+
 def _preflight(args: argparse.Namespace) -> tuple[RunnerConfig, EscalationQueue, str]:
     try:
         config = load_runner_config(args.config)
@@ -717,26 +751,50 @@ def _preflight(args: argparse.Namespace) -> tuple[RunnerConfig, EscalationQueue,
     return config, EscalationQueue(queue_dir), stamp
 
 
-def main(argv: Sequence[str] | None = None, *, producers: Sequence[Producer] = DEFAULT_PRODUCERS) -> int:
-    args = _parse_args(argv)
+def _refused(exc: Exception) -> int:
+    print(f'memory_eval_runner: {exc}', file=sys.stderr)
+    return EXIT_PREFLIGHT
+
+
+def _crashed(
+    queue: EscalationQueue, exc: Exception, config: RunnerConfig, root: Path, stamp: str,
+) -> int:
+    traceback.print_exc()
+    filing = _file_runner_crash(queue, exc, config, root, stamp)
+    _print_summary(stamp, filing, failures=1, alarms=0)
+    return EXIT_RUN_FAILED
+
+
+def _run_and_report(
+    config: RunnerConfig, producers: Sequence[Producer], root: Path, queue: EscalationQueue, stamp: str,
+) -> int:
     try:
-        config, queue, stamp = _preflight(args)
-    except _PreflightRefused as exc:
-        print(f'memory_eval_runner: {exc}', file=sys.stderr)
-        return EXIT_PREFLIGHT
-    try:
-        outcome = run_program(config, producers, args.artifact_root, queue, stamp)
+        outcome = run_program(config, producers, root, queue, stamp)
     except Exception as exc:
-        traceback.print_exc()
-        filing = _file_runner_crash(queue, exc, config, args.artifact_root, stamp)
-        _print_summary(stamp, filing, failures=1, alarms=0)
-        return EXIT_RUN_FAILED
+        return _crashed(queue, exc, config, root, stamp)
     artifact = outcome.artifact
     _print_summary(
         stamp, outcome.filing,
         failures=len(artifact.runner_failures), alarms=artifact.storm_escape.alarm_count,
     )
     return EXIT_RUN_FAILED if artifact.runner_failures else EXIT_OK
+
+
+def main(argv: Sequence[str] | None = None, *, producers: Sequence[Producer] = DEFAULT_PRODUCERS) -> int:
+    args = _parse_args(argv)
+    root = args.artifact_root
+    try:
+        config, queue, stamp = _preflight(args)
+    except _PreflightRefused as exc:
+        return _refused(exc)
+    try:
+        lock = hold_run_lock(root, holder=f'pid={os.getpid()} run_stamp={stamp}')
+    except RunLockHeld as exc:
+        return _refused(exc)
+    except OSError as exc:
+        return _crashed(queue, exc, config, root, stamp)
+    with lock:
+        return _run_and_report(config, producers, root, queue, stamp)
 
 
 if __name__ == '__main__':

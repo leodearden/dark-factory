@@ -3222,8 +3222,13 @@ if it alarmed. 1 means something failed to run: a producer, an evaluation or
 the runner itself. Every such failure in one run collapses into one
 `eval_regression` (task id `memory-eval-program`) on the 8103 queue, and the
 unit is left `failed`. 2 means preflight refused: a bad config, a recon queue
-directory that is missing or empty, or a malformed `MEMORY_EVAL_RUN_STAMP`.
+directory that is missing or empty, a malformed `MEMORY_EVAL_RUN_STAMP`, or
+another run holding the artifact root's `.runner.lock`. The refusal names
+that run's pid and stamp. Two runs at once could file the same fingerprint
+twice or interleave a `limits-current.json` update, so the second run writes
+nothing.
 Nothing is filed then, so the unit state and the journal are the only signal.
+A relative `--artifact-root` is resolved against the caller's directory.
 Unlike the 05:00 and 05:30 wrappers, this one does not mask a failure with
 exit 0: the escalation is the alarm. A failed
 unit does not stop its timer. `fused-memory-flag-marker-sweep.service`

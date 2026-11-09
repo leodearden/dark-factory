@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import shutil
+import sys
 import textwrap
 import types
 from pathlib import Path
@@ -136,6 +138,12 @@ class TestPreflightExits:
         ])
         assert code == 2
         assert f'CONFIG_PATH={bad}' in capsys.readouterr().err
+        assert self._no_artifacts(tmp_path)
+
+    def test_a_malformed_run_stamp_exits_2_without_artifacts(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, 'bogus')
+        assert self._run(tmp_path, _seeded_queue_dir(tmp_path)) == 2
+        assert RUN_STAMP_ENV_VAR in capsys.readouterr().err
         assert self._no_artifacts(tmp_path)
 
 
@@ -278,6 +286,16 @@ class TestRunProducer:
         assert (failure.scope, failure.phase, failure.error_type) == (
             _E1, 'produce', 'TimeoutExpired',
         )
+
+    def test_a_producer_that_cannot_start_is_a_produce_failure(
+        self, tmp_path, fake_script, monkeypatch,
+    ):
+        monkeypatch.setattr(sys, 'executable', str(tmp_path / 'no-such-python'))
+        failure = self._run(_fake(fake_script), tmp_path / 'artifacts')
+        assert (failure.scope, failure.phase, failure.error_type) == (
+            _E1, 'produce', 'FileNotFoundError',
+        )
+        assert 'could not start' in failure.message
 
 
 _TRIPWIRE = 'topic-canonical-present'
@@ -745,6 +763,52 @@ class TestMain:
         assert f'verdicts: {stamped}' in only.detail
         assert 'run report: not written' in only.detail
         assert str(root / f'run-report-{_FIRST}.txt') not in only.summary + only.detail
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root writes through a read-only directory')
+    def test_a_crash_whose_own_filing_fails_still_exits_1_and_says_so(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root = tmp_path / 'root'
+        (root / 'verdicts-current.json').mkdir(parents=True)
+        queue_dir = _seeded_queue_dir(tmp_path)
+        queue_dir.chmod(0o500)
+        try:
+            assert _main(root, queue_dir, []) == 1
+        finally:
+            queue_dir.chmod(0o700)
+        assert 'could not file the runner-failure escalation' in capsys.readouterr().err
+        assert _pending(EscalationQueue(queue_dir)) == []
+
+    def test_a_relative_artifact_root_is_the_callers_not_the_producers(
+        self, tmp_path, fake_script, monkeypatch,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        monkeypatch.chdir(tmp_path)
+        queue_dir = _seeded_queue_dir(tmp_path)
+        inner = _producing(fake_script, _FIRST)
+
+        def build_argv(root: Path, eval_id: str, project_id: str) -> list[str]:
+            if not root.is_absolute():
+                pytest.fail(f'a producer runs in the repo root but was handed {root}')
+            return inner.build_argv(root, eval_id, project_id)
+
+        producer = _mod().Producer(eval_id=_E1, script=fake_script, build_argv=build_argv)
+        assert _main(Path('artifacts'), queue_dir, [producer]) == 0
+        assert (tmp_path / 'artifacts' / 'verdicts-current.json').is_file()
+
+    def test_a_run_while_another_holds_the_root_exits_2_naming_the_holder(
+        self, tmp_path, fake_script, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _FIRST)
+        root, queue_dir = tmp_path / 'root', _seeded_queue_dir(tmp_path)
+        producers = [_producing(fake_script, _FIRST)]
+        with _mod().hold_run_lock(root, holder='pid=4242 run_stamp=20260630T031500Z'):
+            assert _main(root, queue_dir, producers) == 2
+        assert 'pid=4242 run_stamp=20260630T031500Z' in capsys.readouterr().err
+        assert not (root / _E1).exists()
+        assert not (root / 'verdicts-current.json').exists()
+        assert _main(root, queue_dir, producers) == 0
 
     def test_a_rerun_at_the_pinned_stamp_files_nothing_and_rewrites_identical_verdicts(
         self, tmp_path, fake_script, monkeypatch,
