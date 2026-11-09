@@ -51,6 +51,10 @@ currently holds (or ``None``) rather than a bare boolean:
   WorktreeMissing/Exception in-body releases).
 * ``on_shutdown`` — releases any held permit and clears all five fields
   (covers the shutdown-after-lookahead branch and the outer ``finally``).
+* ``on_base_invalidated`` — a base the merger holds was recorded dead: it is
+  re-pointed at the live tip, or cleared with the retained permit released;
+  mid-iteration with no live tip the dispatch-time re-anchor handles it.
+  Never acquires (task 8524, plans/merge-lane-policy-prd.md D2).
 
 The verifier-side releases (``_resolve_and_release``'s ``was_speculative``/
 ``speculative`` release, ``_finalize_inflight``'s finally release, and the
@@ -265,6 +269,10 @@ class PermitLedger(Generic[_PermitT]):
         """
         for _ in range(count):
             self._slot.release()
+
+
+def _same_commit(base: str | None, dead: str) -> bool:
+    return base is not None and base.strip() == dead
 
 
 class SpeculationController:
@@ -546,9 +554,7 @@ class SpeculationController:
         request_abandoned/train/WorktreeMissing/Exception in-body releases
         (``merge_queue.py:6540/6645/7013/7045``).
         """
-        if self._permit is not None:
-            self._ledger.release(self._permit)
-            self._permit = None
+        self._release_held()
         self.spec_base = None
 
     def on_shutdown(self) -> None:
@@ -561,13 +567,45 @@ class SpeculationController:
         branch and the outer ``finally`` (``merge_queue.py:6958-6962`` and
         ``:7052-7053``).
         """
-        if self._permit is not None:
-            self._ledger.release(self._permit)
-            self._permit = None
+        self._release_held()
         self.spec_base = None
         self.prefetched = None
         self.pending_spec_base = None
         self.pending_predecessor = None
+
+    def on_base_invalidated(self, dead_sha: str, live_tip: str | None) -> None:
+        """Re-point a held base that died at *live_tip*, or let it go.
+
+        With no live tip a prefetched request falls back to main and its
+        retained permit is released.  Mid-iteration the merger may already
+        have read ``spec_base``, so base and permit stay and the dispatch
+        re-anchor rebuilds that item.  Idempotent; never acquires.
+        """
+        dead = dead_sha.strip()
+        if dead and _same_commit(self.spec_base, dead):
+            self._reanchor_spec_base(live_tip)
+        if dead and _same_commit(self.pending_spec_base, dead):
+            self._reanchor_pending(live_tip)
+
+    def _reanchor_spec_base(self, live_tip: str | None) -> None:
+        if live_tip is not None:
+            self.spec_base = live_tip
+        elif self.prefetched is not None:
+            self.spec_base = None
+            self._release_held()
+
+    def _reanchor_pending(self, live_tip: str | None) -> None:
+        if live_tip is not None:
+            self.pending_spec_base = live_tip
+            return
+        self.pending_spec_base = None
+        self.pending_predecessor = None
+        self._release_held()
+
+    def _release_held(self) -> None:
+        if self._permit is not None:
+            self._ledger.release(self._permit)
+            self._permit = None
 
     def snapshot(self) -> dict[str, Any]:
         """Return a synchronous read-only snapshot of the controller's state.
