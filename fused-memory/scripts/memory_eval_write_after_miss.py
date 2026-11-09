@@ -49,6 +49,19 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from shared import safe_io
+from shared.memory_eval_metrics import (
+    SCHEMA_VERSION,
+    Corpus,
+    Metric,
+    MetricSeries,
+    canonical_json_text,
+    eval_dir,
+    validate_stamp,
+    write_metric_series,
+)
+from shared.memory_eval_metrics import render_report as render_series_report
+
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import child_parent_id
@@ -479,4 +492,172 @@ async def adjudicate(window: JournalWindow, memory: Any, *, project_id: str) -> 
         incidents=tuple(incidents),
         adjudicated=adjudicated,
         skipped=MappingProxyType({reason: skipped[reason] for reason in SkipReason}),
+    )
+
+
+def incidents_filename(stamp: str) -> str:
+    """``incidents-<STAMP>.json``: the evidence file's name beside the metrics, and its ``details_path``.
+
+    A bare filename, resolved against the metrics file's directory, as the
+    sibling producers stamp theirs.
+    """
+    return f'incidents-{validate_stamp(stamp, what="incidents stamp")}.json'
+
+
+def corpus_counts(adjudication: Adjudication, window: JournalWindow) -> dict[str, int]:
+    """Every narrowing between the period's rows and the metric's denominator, at zero too."""
+    return {
+        'writes_in_period': len(window.writes),
+        'searches_in_period': len(window.searches),
+        'unattributed_searches': window.unattributed_searches,
+        'unparsed_rows': window.unparsed_rows,
+        'adjudicated': adjudication.adjudicated,
+        'incidents': len(adjudication.incidents),
+        **{f'skipped_{reason.value}': count for reason, count in adjudication.skipped.items()},
+    }
+
+
+def build_series(
+    adjudication: Adjudication,
+    window: JournalWindow,
+    *,
+    project_id: str,
+    stamp: str,
+    details_path: str,
+    eval_id: str = EVAL_ID,
+) -> MetricSeries:
+    """The run's M1 series. The proportion is ABSENT when nothing was adjudicated, never 0/0."""
+    metrics = []
+    if adjudication.adjudicated > 0:
+        metrics.append(Metric(
+            metric_id=METRIC_ID,
+            kind='proportion',
+            value=len(adjudication.incidents) / adjudication.adjudicated,
+            n=adjudication.adjudicated,
+            denominator=adjudication.adjudicated,
+            direction='higher_is_worse',
+            details_path=details_path,
+        ))
+    return MetricSeries(
+        schema_version=SCHEMA_VERSION,
+        eval_id=eval_id,
+        run_stamp=stamp,
+        corpus=Corpus(project_id=project_id, counts=corpus_counts(adjudication, window)),
+        metrics=metrics,
+    )
+
+
+def _incident_record(incident: Incident) -> dict[str, Any]:
+    return {
+        'write_row_id': incident.write_row_id,
+        'search_row_ids': list(incident.search_row_ids),
+        'project_id': incident.project_id,
+        'caller_agent_id': incident.caller_agent_id,
+        'matched_memory_id': incident.matched_memory_id,
+        'similarity': incident.similarity,
+        'threshold': incident.threshold,
+        'category': incident.category,
+        'write_created_at': incident.write_created_at.isoformat(),
+    }
+
+
+def incidents_payload(
+    adjudication: Adjudication, *, project_id: str, stamp: str, period: Period, eval_id: str = EVAL_ID,
+) -> dict[str, Any]:
+    """The structured INV-2 evidence: each incident's fields, the period, and the skip tally."""
+    return {
+        'eval_id': eval_id,
+        'run_stamp': stamp,
+        'project_id': project_id,
+        'period_start': period.start.isoformat(),
+        'period_end': period.end.isoformat(),
+        'adjudicated': adjudication.adjudicated,
+        'skipped': {reason.value: count for reason, count in adjudication.skipped.items()},
+        'incidents': [_incident_record(incident) for incident in adjudication.incidents],
+    }
+
+
+def _measurement_line(adjudication: Adjudication, writes: int) -> str:
+    if adjudication.adjudicated == 0:
+        return (
+            f'{METRIC_ID}: not measured: 0 of {writes} write(s) in the period were '
+            'adjudicated (see the skipped_* counts above)'
+        )
+    return (
+        f'{METRIC_ID}: {len(adjudication.incidents)} incident(s) in '
+        f'{adjudication.adjudicated} adjudicated write(s)'
+    )
+
+
+def _incident_line(incident: Incident) -> str:
+    return (
+        f'  - write {incident.write_row_id}: caller {incident.caller_agent_id}, '
+        f'matched {incident.matched_memory_id}, similarity {incident.similarity:.3f} '
+        f'vs threshold {incident.threshold:.3f}, '
+        f'searches {", ".join(incident.search_row_ids)}'
+    )
+
+
+def render_report(
+    series: MetricSeries, adjudication: Adjudication, *, period: Period, writes: int,
+) -> str:
+    """The shared series report, then the period, the measurement, and each incident."""
+    lines = [
+        render_series_report(series).rstrip('\n'),
+        '',
+        f'period: [{period.start.isoformat()}, {period.end.isoformat()})',
+        _measurement_line(adjudication, writes),
+    ]
+    if adjudication.incidents:
+        lines.append(f'incidents ({len(adjudication.incidents)}):')
+        lines.extend(_incident_line(incident) for incident in adjudication.incidents)
+    return '\n'.join(lines) + '\n'
+
+
+@dataclass(frozen=True)
+class WriteAfterMissOutcome:
+    series: MetricSeries
+    adjudication: Adjudication
+    report: str
+    metrics_path: Path
+    report_path: Path
+    incidents_path: Path
+
+
+def _write_artifact(path: Path, text: str) -> None:
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
+
+
+async def run_write_after_miss(
+    memory: Any,
+    *,
+    journal_path: str | Path,
+    out_root: str | Path,
+    project_id: str,
+    stamp: str,
+    period: Period,
+    eval_id: str = EVAL_ID,
+) -> WriteAfterMissOutcome:
+    """Read the period, adjudicate it, and write the incidents, metrics and report artifacts."""
+    window = read_journal(journal_path, project_id=project_id, period=period)
+    adjudication = await adjudicate(window, memory, project_id=project_id)
+    incidents_path = eval_dir(out_root, eval_id) / incidents_filename(stamp)
+    series = build_series(
+        adjudication, window,
+        project_id=project_id, stamp=stamp, details_path=incidents_path.name, eval_id=eval_id,
+    )
+    incidents_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_artifact(incidents_path, canonical_json_text(incidents_payload(
+        adjudication, project_id=project_id, stamp=stamp, period=period, eval_id=eval_id,
+    )))
+    metrics_path, report_path = write_metric_series(series, out_root)
+    report = render_report(series, adjudication, period=period, writes=len(window.writes))
+    _write_artifact(report_path, report)
+    return WriteAfterMissOutcome(
+        series=series,
+        adjudication=adjudication,
+        report=report,
+        metrics_path=metrics_path,
+        report_path=report_path,
+        incidents_path=incidents_path,
     )
