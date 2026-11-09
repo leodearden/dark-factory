@@ -246,7 +246,7 @@ def make_hook_repo(
         shutil.copyfile(source, target)
     uv_log = tmp_path / 'uv_stub.log'
     uv_log.write_text('', encoding='utf-8')
-    repo = HookRepo(root, _commit_env(tmp_path, uv_log), uv_log)
+    repo = HookRepo(root, stub_uv_env(tmp_path, uv_log), uv_log)
     subprocess.run(['git', 'init', '--quiet', '-b', 'main'], cwd=root, env=dict(repo.env), check=True)
     for key, value in (
         ('user.name', 'hook parity test'),
@@ -260,7 +260,8 @@ def make_hook_repo(
     return repo
 
 
-def _commit_env(tmp_path: Path, uv_log: Path) -> dict[str, str]:
+def stub_uv_env(tmp_path: Path, uv_log: Path) -> dict[str, str]:
+    """This environment with a PATH-stub ``uv`` in *tmp_path*/stub_bin logging each call to *uv_log*."""
     stub_bin = tmp_path / 'stub_bin'
     stub_bin.mkdir()
     stub = stub_bin / 'uv'

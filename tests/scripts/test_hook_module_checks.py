@@ -6,8 +6,9 @@ Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
 """
 from __future__ import annotations
 
+import subprocess
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
 import pytest
 import yaml
@@ -22,6 +23,7 @@ from hook_checks_fixture import (
     ModuleSpec,
     make_layout,
     run_helper,
+    stub_uv_env,
     write_file,
 )
 from orchestrator.verify_cmd import (
@@ -110,21 +112,15 @@ def test_an_unregistered_dependency_module_cannot_list(tmp_path: Path) -> None:
     assert 'dependency module' in run.stderr
 
 
-ORCH_CHECK: dict[str, Any] = {
-    'id': 'orch_check',
-    'module': 'orchestrator',
-    'node_ids': ['tests/test_a.py::test_x', 'tests/test_b.py'],
-}
-SCRIPTS_CHECK: dict[str, Any] = {
-    'id': 'scripts_check',
-    'module': 'scripts',
-    'node_ids': ['scripts/tests/test_c.py'],
-}
+ORCH_NODE_IDS = ['tests/test_a.py::test_x', 'tests/test_b.py']
+SCRIPTS_NODE_IDS = ['scripts/tests/test_c.py']
+ORCH_CHECK: dict[str, object] = {'id': 'orch_check', 'module': 'orchestrator', 'node_ids': ORCH_NODE_IDS}
+SCRIPTS_CHECK: dict[str, object] = {'id': 'scripts_check', 'module': 'scripts', 'node_ids': SCRIPTS_NODE_IDS}
 NODE_FILES = ('orchestrator/tests/test_a.py', 'orchestrator/tests/test_b.py', 'scripts/tests/test_c.py')
 CHAINED = ModuleSpec('chained', None, None, 'uv run --project shared pytest chained/tests/ -q && echo done', False)
 
 
-def _manifest(*checks: dict[str, Any], **top: Any) -> str:
+def _manifest(*checks: Mapping[str, object], **top: object) -> str:
     return yaml.safe_dump({'checks': list(checks), **top}, sort_keys=False)
 
 
@@ -170,12 +166,12 @@ def test_a_screen_command_is_its_modules_test_command_scoped_to_the_node_ids(tmp
     commands = dict(run.units)
     orch_command = commands['screen:orch_check']
     assert run.rc == 0, run.stderr
-    assert orch_command == _expected_screen_command(ORCHESTRATOR, ORCH_CHECK['node_ids'])
+    assert orch_command == _expected_screen_command(ORCHESTRATOR, ORCH_NODE_IDS)
     assert orch_command.startswith('cd orchestrator && uv run pytest')
-    assert all(node_id in orch_command for node_id in ORCH_CHECK['node_ids'])
+    assert all(node_id in orch_command for node_id in ORCH_NODE_IDS)
     assert '-n 0' in orch_command
     assert 'tests/' not in orch_command.split()
-    assert commands['screen:scripts_check'] == _expected_screen_command(SCRIPTS, SCRIPTS_CHECK['node_ids'])
+    assert commands['screen:scripts_check'] == _expected_screen_command(SCRIPTS, SCRIPTS_NODE_IDS)
 
 
 @pytest.mark.parametrize(
@@ -236,3 +232,37 @@ def test_the_real_tree_screens_exactly_the_committed_manifest() -> None:
 
     assert run.rc == 0, run.stderr
     assert [unit for unit, _ in run.units] == [f'screen:{check["id"]}' for check in committed['checks']]
+
+
+COLLECT_TIMEOUT_SECS = 300
+
+
+def test_every_real_screen_unit_collects_its_node_ids(tmp_path: Path) -> None:
+    """A renamed screen test fails here, where the rename is made, not on main's next docs commit."""
+    run = run_helper(REPO_ROOT, ['plans/_probe.md'])
+    assert run.rc == 0, run.stderr
+    env = {**stub_uv_env(tmp_path, tmp_path / 'uv.log'), 'PYTEST_ADDOPTS': '--collect-only'}
+
+    procs = {
+        unit: subprocess.Popen(
+            ['bash', '-c', command],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for unit, command in run.units
+    }
+    collected: dict[str, tuple[int, str]] = {}
+    try:
+        for unit, proc in procs.items():
+            out, _ = proc.communicate(timeout=COLLECT_TIMEOUT_SECS)
+            collected[unit] = (proc.returncode, out)
+    finally:
+        for proc in procs.values():
+            proc.kill()
+            proc.wait()
+
+    failed = {unit: out[-2000:] for unit, (rc, out) in collected.items() if rc != 0}
+    assert failed == {}
