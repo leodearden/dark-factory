@@ -51,6 +51,10 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+#: The ``fact`` key of the journal line recording an off-contract issue intake,
+#: which shares the verdict-tools fact journal with the markup guard's facts.
+REVIEW_ISSUE_OFF_CONTRACT_FACT = 'review_issue_off_contract'
+
 
 def _envelope(role: str, session_id: str, payload: dict) -> dict:
     """Wrap *payload* in the schema-versioned verdict envelope."""
@@ -304,6 +308,9 @@ def _markup_fact_journal(
 
     ``subject_task_id`` stays a THUNK, evaluated per record on the worker
     thread: a verdict can be refused before its plan is readable.
+
+    The same journal also receives the review-issue contract facts, told apart
+    by their ``fact`` key (``REVIEW_ISSUE_OFF_CONTRACT_FACT``).
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
@@ -431,11 +438,13 @@ def create_server(
     #
     # One injected resolver feeds both channels, so a residue record and the
     # journal line about it land in the same checkout: two independently
-    # resolved roots could silently disagree.
+    # resolved roots could silently disagree. The one journal instance also
+    # serves the reviewer tool's issue-contract facts below.
+    fact_journal = _markup_fact_journal(artifacts, resolve_project_root)
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
-        fact_sink=_markup_fact_journal(artifacts, resolve_project_root),
+        fact_sink=fact_journal,
         escalation_sink=markup_sink.make_escalation_sink(
             worktree=artifacts.worktree,
             spec=MARKUP_SINK_SPEC,
@@ -508,7 +517,7 @@ def create_server(
 
         @mcp.tool()
         @accepts_markup_override
-        def submit_review_verdict(
+        async def submit_review_verdict(
             reviewer: str,
             verdict: str,
             issues: list[dict],
@@ -521,12 +530,26 @@ def create_server(
                     a mismatch is rejected (status: error) rather than
                     written.
                 verdict: One of "PASS" or "ISSUES_FOUND".
-                issues: Structured list of issues found (empty if PASS).
+                issues: Structured list of issues found (empty if PASS),
+                    each shaped as the reviewer contract in your
+                    instructions states. An issue lacking severity or
+                    description is refused (status: error); other
+                    off-contract fields are normalised and reported back
+                    under issue_contract.
                 summary: One-paragraph summary of the review.
             """
-            return _submit_review_verdict(
+            response = _submit_review_verdict(
                 artifacts, role, session_id, reviewer, verdict, issues, summary,
             )
+            if 'issue_contract' in response:
+                await fact_journal({
+                    'fact': REVIEW_ISSUE_OFF_CONTRACT_FACT,
+                    'tool': 'submit_review_verdict',
+                    'param': 'issues',
+                    'role': role,
+                    **response['issue_contract'],
+                })
+            return response
 
     return mcp
 
