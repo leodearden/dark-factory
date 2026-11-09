@@ -60,7 +60,8 @@ negative, so an EWMA chart can never show improvement at these rates.
 ## Sketch of approach
 
 1. **One landing datum.** A landing is a `merge_finalized state=done` event or a `train_merged` member;
-   its time is main's advance (the event timestamp), its key `(project_id, merge_sha)`. A **verify unit**
+   its time is main's advance (the event timestamp), its key `(project_id, merge_sha, task_id)` (train
+   members share one merge commit; see §Contract → Landing record, Correction). A **verify unit**
    covers the set of landings one merge verify proved (a train's `member_task_ids`, a chain's
    `chain_items`): per-landing outcome flags are inherited by every member; verify and rejection counts
    are per unit.
@@ -175,7 +176,8 @@ negative, so an EWMA chart can never show improvement at these rates.
     baseline median); artefact ranges hatched and excluded from baseline, CUSUM and comparisons.
 14. **Store and loop.** `quality.db` at `<project_root>/data/burndown/quality.db` (`config.quality_db`),
     owned by `_QualityStore` in `dashboard/loops.py` on the `_BurndownStore` pattern; tables `landings`
-    (one row per `(project_id, merge_sha)`, immutable), `late_events` (reverts, keyed to the target
+    (one row per `(project_id, merge_sha, task_id)`, upserted on that key: late claims and
+    off-first-parent landings may be re-emitted; see §Contract → Landing record, Correction), `late_events` (reverts, keyed to the target
     landing), `markers_derived` (per project, role, kind, at, ordinal), `sample_state` (per project: value
     or gap with ts, reason, cursor sha, landings sampled). **Not** registered in
     `metrics.py::_DOWNSAMPLE_TABLES`; a test pins its absence from `retention.py::apply_retention`. A
@@ -269,9 +271,12 @@ negative, so an EWMA chart can never show improvement at these rates.
 Landing = {project_id, merge_sha, task_id, landed_at (UTC ISO), ordinal (int, per project, by landed_at
            then merge_sha), source ('merge_finalized' | 'train_merged' | 'train_attributed'), unit_id (merge_sha of the verify
            unit's tip; == merge_sha for a plain landing), unit_size (int ≥ 1), git_first_parent (bool)}
-landings(runs_db, repo, since_cursor) -> list[Landing]   # ordered; never re-emits a sha ≤ cursor
+           + late_claim, prev_landed_at, lines_base, base_sha (see the Correction below)
+landings(runs_db, repo, since_cursor) -> LandingBatch(landings, git_check)
+    # ordered; since_cursor=None is the full history; may re-emit late claims and off-first-parent
+    # landings, so consumers upsert on (project_id, merge_sha, task_id)
 ```
-Invariants: one row per `(project_id, merge_sha)`; `unit_size == len(members)` for a train or chain;
+Invariants: one row per `(project_id, merge_sha, task_id)`; `unit_size == len(members)` for a train;
 every member of a unit shares `unit_id`; `git_first_parent` is False for a landing whose sha is not on
 main's first-parent line (served as the disagreement count, never dropped).
 
@@ -303,7 +308,7 @@ main's first-parent line (served as the disagreement count, never dropped).
   `shared/src/shared/quality_series/landings.py::landings`.
 - (2026-11-09) Late claims and off-first-parent landings are emitted by `landed_at`, after the newest
   first-claim landing at or below the cursor, so a later cursor may re-emit one. Consumers upsert on
-  `(project_id, merge_sha, task_id)`. This supersedes the sketch's "never re-emits a sha ≤ cursor".
+  `(project_id, merge_sha, task_id)`. This replaced the original sketch's "never re-emits a sha ≤ cursor".
 - (2026-11-09) A unit's members are consecutive in ordinal order, and
   `shared/src/shared/quality_series/rows.py::rows_for` refuses input that splits, shortens or repeats
   a unit, before any git work.
