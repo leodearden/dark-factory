@@ -42,11 +42,15 @@ _STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('1c1h', '_run_leftover_verify_scope_reaper_pass'),
     ('2c', '_recover_crashed_tasks'),
     ('2c2', '_reconcile_lane_checkouts'),
+    ('2c3-streak-alarms', '_inherit_pending_streak_alarms'),
     ('2d', '_reconcile_stranded_in_progress'),
     ('2e', '_reap_orphan_worktrees'),
     ('diff7', '_reconcile_terminal_lanes'),
 )
-_SYNC_STEPS = frozenset({'_rehydrate_merge_halt', '_file_restored_pause_escalation'})
+_SYNC_STEPS = frozenset({
+    '_rehydrate_merge_halt', '_file_restored_pause_escalation',
+    '_inherit_pending_streak_alarms',
+})
 #: Table steps the fixture runs for real against its mocked services.
 _UNSTUBBED_STEPS = frozenset({'1b', '2f'})
 
