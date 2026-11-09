@@ -672,3 +672,38 @@ async def test_the_ticket_of_an_all_streams_failed_candidate_parks_awaiting_cura
     assert row is not None
     assert row['defer_reason'] == DeferReason.CORPUS_FAILED.value
     assert stored == {}
+
+
+@pytest.mark.asyncio
+async def test_an_integer_spawned_from_submitted_through_submit_task_resolves_created(tmp_path):
+    prompts: list[str] = []
+    invoke = invoke_by_role(
+        single=_creating_and_recording(prompts),
+        batch=tripwire('one candidate must take the single spec'),
+    )
+    async with (
+        _open_stack(tmp_path / 'project', SqliteTaskBackend, invoke=invoke) as stack,
+        _interceptor_over(stack, tmp_path) as (interceptor, store),
+    ):
+        parent_id = await stack.seed('parent')
+        submitted = await interceptor.submit_task(
+            stack.root, title='Fix the slate runner', metadata={
+                'files': [_CANDIDATE_FILE],
+                'spawned_from': int(parent_id),
+                'spawn_context': _FOLLOWUP,
+            },
+        )
+
+        answer = await asyncio.wait_for(
+            interceptor.resolve_ticket(
+                submitted['ticket'], stack.root, timeout_seconds=_RESOLVE_DEADLINE_SECONDS,
+            ),
+            timeout=_RESOLVE_DEADLINE_SECONDS + 5,
+        )
+
+    assert answer['status'] == TicketStatus.CREATED
+    [prompt] = prompts
+    assert any(
+        line.startswith(f'[Task {parent_id}]') and 'source=anchor' in line
+        for line in prompt.splitlines()
+    )
