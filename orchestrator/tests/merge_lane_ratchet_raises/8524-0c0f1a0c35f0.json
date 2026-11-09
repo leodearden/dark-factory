@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-16: detect_verify_base_divergence classifies a hit as off_frozen_tip or reanchor_onto_dead_tip (_kind_of), the new detector class of plans/merge-lane-policy-prd.md D12",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/verify_base_detector.py",
+      "baseline": 6,
+      "current": 8
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5117,
+      "current": 5119
+    }
+  ]
+}

@@ -19,8 +19,10 @@ from escalation.models import Escalation
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.types import (
     RealMergeItem,
+    RemergeBase,
     SpeculativeItem,
     VerifyBaseDivergence,
+    VerifyBaseDivergenceKind,
     fell_to_main,
 )
 
@@ -39,6 +41,8 @@ def detect_verify_base_divergence(
     Only a real merge has a verify base.  A recovery re-merge that fell to
     main targets main by construction, so it is carved out (PRD §5.3; task
     8524 narrowed the carve-out to that case, plans/merge-lane-policy-prd.md D1).
+    One re-anchored on a live tip is judged like any stacked dispatch, and a
+    hit on it is its own kind.
     """
     if not isinstance(item, RealMergeItem) or not item.base_sha or fell_to_main(item.remerge_base):
         return None
@@ -51,7 +55,14 @@ def detect_verify_base_divergence(
         expected_tip=expected_tip,
         verify_depth=verify_depth,
         observed_at=observed_at,
+        kind=_kind_of(item.remerge_base),
     )
+
+
+def _kind_of(anchor: RemergeBase | None) -> VerifyBaseDivergenceKind:
+    if anchor is not None and anchor.speculative:
+        return VerifyBaseDivergenceKind.REANCHOR_ONTO_DEAD_TIP
+    return VerifyBaseDivergenceKind.OFF_FROZEN_TIP
 
 
 def alarm_verify_base_divergence(
@@ -78,9 +89,9 @@ def alarm_verify_base_divergence(
         level=1,
         category=EscalationCategory.MERGE_VERIFY_BASE_DIVERGENCE,
         summary=(
-            f'Merge verify dispatched off the frozen-prefix tip: {divergence.request_id} '
-            f'(task {divergence.task_id}) verifies on {divergence.base_sha!r}, '
-            f'expected {divergence.expected_tip!r}'
+            f'Merge verify dispatched off the frozen-prefix tip ({divergence.kind.value}): '
+            f'{divergence.request_id} (task {divergence.task_id}) verifies on '
+            f'{divergence.base_sha!r}, expected {divergence.expected_tip!r}'
         ),
         detail=(
             'A real verify started on a base that was not the frozen-prefix '
@@ -103,9 +114,11 @@ def alarm_verify_base_divergence(
             'tkt_0RWKN8Q02REA5YEFNQX4WDJRJT): a phantom tip the liveness rule '
             'cannot see, and the item itself is fine.  (3) Otherwise the item '
             'was stacked on a speculative-only base, a genuine class-(d) '
-            'violation: find the path that built it.  Recovery re-merges are '
-            'carved out, and the cached main is never read, so neither '
-            'explains a hit.'
+            'violation: find the path that built it.  A recovery re-merge '
+            'that fell to main is exempt and the cached main is never read, '
+            'so neither explains a hit; a reanchor_onto_dead_tip hit means a '
+            're-anchored tip died or was vacated between re-merge and '
+            'dispatch (expected 0; plans/merge-lane-policy-prd.md D12).'
         ),
     )
     escalation_queue.submit(esc)

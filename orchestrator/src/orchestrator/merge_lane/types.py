@@ -1762,6 +1762,16 @@ class VerifyBaseFacts:
     merge_base_sha: str | None
 
 
+class VerifyBaseDivergenceKind(StrEnum):
+    """Which item a :class:`VerifyBaseDivergence` caught off the tip: an
+    ordinary stacked dispatch, or a recovery re-merge re-anchored on a live
+    tip that died or was vacated before dispatch
+    (plans/merge-lane-policy-prd.md D12)."""
+
+    OFF_FROZEN_TIP = 'off_frozen_tip'
+    REANCHOR_ONTO_DEAD_TIP = 'reanchor_onto_dead_tip'
+
+
 @dataclass(frozen=True)
 class VerifyBaseDivergence:
     """A real-verify dispatched on a base that was not the frozen-prefix tip
@@ -1770,7 +1780,7 @@ class VerifyBaseDivergence:
     Recorded once, at dispatch, against that moment's freshly read main, so a
     later move of main can never create or change one.  ``verify_depth`` is
     the frozen-prefix height the verify joined; ``observed_at`` is the lane
-    clock's reading at dispatch.
+    clock's reading at dispatch; ``kind`` says which item it caught.
     """
 
     request_id: str
@@ -1779,6 +1789,7 @@ class VerifyBaseDivergence:
     expected_tip: str
     verify_depth: int
     observed_at: float
+    kind: VerifyBaseDivergenceKind = VerifyBaseDivergenceKind.OFF_FROZEN_TIP
 
     def to_wire(self) -> dict[str, str | int | float]:
         return {
@@ -1788,6 +1799,7 @@ class VerifyBaseDivergence:
             'expected_tip': self.expected_tip,
             'verify_depth': self.verify_depth,
             'observed_at': self.observed_at,
+            'kind': self.kind.value,
         }
 
 
