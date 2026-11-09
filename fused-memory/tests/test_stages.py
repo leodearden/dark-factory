@@ -13179,7 +13179,6 @@ class TestPropagateEscalationQueueHelper:
         """When harness has no URL or queue, pre-existing stage values are not overwritten."""
         sentinel_queue = MagicMock()
         harness = _minimal_harness()
-        harness._escalation_url = None
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=sentinel_queue)
@@ -13240,7 +13239,6 @@ class TestPropagateEscalationQueueHelper:
         """
         fake_queue = MagicMock()
         harness = _minimal_harness(escalation_queue=fake_queue)
-        harness._escalation_url = None
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=None)

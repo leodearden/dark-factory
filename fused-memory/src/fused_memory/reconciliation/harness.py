@@ -1285,9 +1285,10 @@ class ReconciliationHarness:
         ``_start_escalation_server`` anymore; escalation startup only stores
         ``self._escalation_url`` for the next ``_make_stages`` call to pick up,
         and ``self._escalation_queue`` is either injected at construction or
-        built by escalation startup). Defensive: only assigns when the
-        harness has a value, so calls before escalation startup leave stages
-        untouched.
+        built by escalation startup). Defensive: assigns each value only when
+        the harness has one, so a call before escalation startup leaves the
+        URL untouched, and the queue too unless one was injected at
+        construction.
 
         Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
