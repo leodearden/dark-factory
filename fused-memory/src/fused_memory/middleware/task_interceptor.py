@@ -3535,7 +3535,9 @@ class TaskInterceptor:
         backend-direct), and ``followup_items``: the order-preserving union of
         the target's and the candidate's items, written when non-empty. It
         never writes ``metadata.files``. A malformed stored bundle on either
-        side aborts the combine, unaudited.
+        side aborts, unaudited, a combine every other guard would let
+        through; an eligibility refusal of that target is still audited, with
+        no items recorded.
 
         Before writing, verifies the decision found its target and that the
         target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
@@ -3622,30 +3624,16 @@ class TaskInterceptor:
             )
             return None
 
-        target_meta, _target_warnings = _parse_metadata_value(target.get('metadata'))
+        target_metadata = target.get('metadata')
+        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
         candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
-        try:
-            items_before, items_after = _combined_items(
-                target_title, target_meta or {}, candidate, candidate_meta,
-            )
-        except FollowupBundleInvalid as exc:
-            logger.warning(
-                'combine-guard: a follow-up bundle on target=%s or its candidate is '
-                'malformed (%s) — aborting combine',
-                decision.target_id,
-                exc,
-            )
-            return None
-        candidate_source = candidate_meta.get('source')
-        audit_context = _CombineAuditContext(
-            candidate_ticket_id=ticket_id,
-            candidate_source=candidate_source if isinstance(candidate_source, str) else None,
-            candidate_spawned_from=(
-                None if candidate.spawned_from is None else str(candidate.spawned_from)
-            ),
-            batch_internal=decision.batch_target_index is not None,
-            items_before=tuple(item.key for item in items_before),
-            items_after=tuple(item.key for item in items_after),
+        audit_context, items_after = _combine_fold(
+            decision,
+            ticket_id=ticket_id,
+            target_title=target_title,
+            target_meta=target_meta or {},
+            candidate=candidate,
+            candidate_meta=candidate_meta,
         )
 
         # ── Guard: the target must still be combine-ELIGIBLE right now ──
@@ -3670,9 +3658,6 @@ class TaskInterceptor:
         # a "live" claimant — it is not that check.
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
-
-        # Single read shared by the eligibility chain and the gate guard.
-        target_metadata = target.get('metadata')
 
         if not is_combine_eligible(target):
             refused_reason = (
@@ -3757,17 +3742,14 @@ class TaskInterceptor:
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target_metadata
         ):
-            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
             # _is_gate_metadata answers False both when the target genuinely
             # has no gate AND when its metadata blob is unparseable/corrupt
             # (permissive-on-parse-failure by design). Distinguish the two in
-            # the log text — a shape-level re-check via _parse_metadata_value
-            # (not _extract_metadata_dict, to avoid a second schema_warning
-            # emission for the same blob) is enough. The refuse-and-degrade
-            # decision itself is unchanged either way. Re-checks the SAME
-            # `target_metadata` the condition above consulted, deliberately.
-            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            # the log text: `target_meta`, parsed above from the SAME
+            # `target_metadata` this condition consulted, is None exactly for
+            # the unreadable blob. The refuse-and-degrade decision itself is
+            # unchanged either way.
             if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
@@ -3778,6 +3760,18 @@ class TaskInterceptor:
                 'absorbed into an ungated task. Degrading to create.',
                 declared,
                 target_reason,
+                decision.target_id,
+            )
+            return None
+
+        # Unaudited, like the gate guard: a combine that cannot keep every
+        # item must not write, but only a combine every guard above passed
+        # reaches here, so an eligibility refusal stays counted.
+        if items_after is None:
+            logger.warning(
+                'combine-guard: target %s or its candidate carries a malformed follow-up '
+                'bundle — aborting combine, which could not keep every item. Degrading '
+                'to create.',
                 decision.target_id,
             )
             return None
@@ -7574,20 +7568,48 @@ class _CombineAuditContext:
         }
 
 
-def _combined_items(
+def _combine_fold(
+    decision: CuratorDecision,
+    *,
+    ticket_id: str,
     target_title: str,
     target_meta: Mapping[str, Any],
     candidate: CandidateTask,
     candidate_meta: Mapping[str, Any],
-) -> tuple[tuple[FollowupItem, ...], tuple[FollowupItem, ...]]:
-    """The target's items, and the union a combine leaves on it.
+) -> tuple[_CombineAuditContext, tuple[FollowupItem, ...] | None]:
+    """What a combine folds: its audit context, and the union of items it leaves on the target.
 
-    Raises:
-        FollowupBundleInvalid: when either side's stored bundle is malformed.
+    The union is None when a stored bundle on either side is malformed, logged here: no combine
+    can keep every item, and the context then records no items, so a refusal is still auditable.
     """
-    before = task_items(title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta)
-    extra = task_items(title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta)
-    return before, merge_items(before, extra)
+    items_after: tuple[FollowupItem, ...] | None
+    try:
+        items_before = task_items(
+            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
+        )
+        extra = task_items(
+            title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta,
+        )
+        items_after = merge_items(items_before, extra)
+    except FollowupBundleInvalid as exc:
+        logger.warning(
+            'combine-guard: a follow-up bundle on target=%s or its candidate is malformed (%s)',
+            decision.target_id,
+            exc,
+        )
+        items_before, items_after = (), None
+    candidate_source = candidate_meta.get('source')
+    context = _CombineAuditContext(
+        candidate_ticket_id=ticket_id,
+        candidate_source=candidate_source if isinstance(candidate_source, str) else None,
+        candidate_spawned_from=(
+            None if candidate.spawned_from is None else str(candidate.spawned_from)
+        ),
+        batch_internal=decision.batch_target_index is not None,
+        items_before=tuple(item.key for item in items_before),
+        items_after=tuple(item.key for item in items_after or ()),
+    )
+    return context, items_after
 
 
 def _append_combine_audit(

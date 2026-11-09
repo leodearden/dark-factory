@@ -238,6 +238,36 @@ async def test_a_target_whose_bundle_repeats_a_key_is_not_combined(
 
 
 @pytest.mark.asyncio
+async def test_an_ineligible_target_whose_bundle_repeats_a_key_is_still_audited_as_refused(
+    stack: Stack, curator_script: CuratorScript,
+) -> None:
+    repeated = observed_item(summary=_A['summary'], files=_A['files'], origin_task='101').model_dump(mode='json')
+    target_title = 'A finished bundle the registry could not refuse'
+    target = await stack.seed(target_title, {
+        'files': list(_FILES), FOLLOWUP_ITEMS_METADATA_KEY: [repeated, repeated],
+    }, status='done')
+    target_before = await _row(stack, target)
+    _combine_into(curator_script, target, target_title)
+
+    ticket, resolved = await stack.submit(
+        title='Follow-ups from 202', description='Two more.', metadata=_bundle('202', _B, _C),
+    )
+
+    assert resolved.get('status') == 'created', resolved
+    assert await _row(stack, target) == target_before
+    [audit] = _audit_rows()
+    assert audit['refused_reason'] == 'target_not_pending'
+    assert {field: audit[field] for field in _AUDIT_FIELDS} == {
+        'candidate_ticket_id': ticket,
+        'candidate_source': 'agent-followup',
+        'candidate_spawned_from': '202',
+        'batch_internal': False,
+        'items_before': [],
+        'items_after': [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_an_unstamped_target_gains_the_combine_stamp(
     stack: Stack, curator_script: CuratorScript,
 ) -> None:
