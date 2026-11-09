@@ -58,13 +58,10 @@ though the wrapper renders the page whatever this returns.
 from __future__ import annotations
 
 import argparse
-import contextlib
+import asyncio
 import json
 import logging
-import os
 import shutil
-import signal
-import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -89,11 +86,14 @@ from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6
     set_backend,
     wrap_command,
 )
-from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
-from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
+from shared.cli_invoke import (  # noqa: E402  # debt: task 6760
+    AgentResult,
+    claude_binary_spec,
+    invoke_with_cap_retry,
+)
 from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
 from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
-from shared.secret_env import agent_subprocess_env  # noqa: E402  # debt: task 6760
+from shared.usage_gate import UsageGate  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -213,16 +213,14 @@ class Outcome:
 
 
 @dataclass(frozen=True)
-class Completed:
-    """What the CLI left behind; ``returncode`` is None when the timeout killed it."""
+class TimedOut:
+    """The run's own wall clock ran out; it covers every seat the run failed over to."""
 
-    returncode: int | None
-    stdout: str
-    stderr: str
+    after_secs: float
 
 
 def run(settings: Settings, *, gate: Any = None) -> int:
-    """Lease an account, run the CLI once under the OS sandbox with the prompt on stdin, and judge how it ended."""
+    """Run the CLI on the fleet pool under the OS sandbox with the prompt on stdin, and judge how it ended."""
     claude = shutil.which(settings.claude_bin)
     if claude is None:
         _log(f'claude binary not found or not executable: {settings.claude_bin!r}')
@@ -238,18 +236,19 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except SandboxUnavailable as exc:
         _log(f'refusing to run unconfined: {exc}')
         return EXIT_CONFIG
+    if gate is None:
+        gate = account_pool.build_pool()
+    if not gate.account_count:
+        _log('no pool account resolved; skipping: the nightly never uses the host login')
+        return EXIT_FAILED
     root = settings.root.resolve()
     inbox = _new_inbox(root)
     sitting_data = root / SITTING_DATA_PATH
     config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=sitting_data / 'config')
     try:
-        env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox, config_dir)
-        if env is None:
-            config_dir.cleanup()
-            return EXIT_FAILED
         return _run_confined(
-            claude=claude, settings=settings, mcp_config=mcp_config, env=env, root=root, inbox=inbox,
-            grants=(sitting_data, _ensure_uv_cache()),
+            claude=claude, settings=settings, mcp_config=mcp_config, gate=gate, config_dir=config_dir,
+            root=root, inbox=inbox, grants=(sitting_data, _ensure_uv_cache()),
         )
     finally:
         config_dir.remove_credentials()
@@ -262,37 +261,59 @@ def _ensure_uv_cache() -> Path:
     return uv_cache
 
 
-def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any], env: dict[str, str],
-                  root: Path, inbox: Path, grants: Sequence[Path]) -> int:
-    argv, temp_files = build_claude_argv(
-        model=settings.model,
-        max_budget_usd=settings.budget_usd,
-        system_prompt=NIGHTLY_SYSTEM_PROMPT,
-        max_turns=settings.max_turns,
-        permission_mode=PERMISSION_MODE,
-        allowed_tools=list(nightly_allowed_tools(inbox)),
-        disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
-        mcp_config=mcp_config,
-        output_schema=None,
-        effort=None,
-        resume_session_id=None,
-        session_id=None,
-        strict_mcp_config=True,
-        setting_sources=[],
-    )
-    argv[0] = claude
-    confined = wrap_command(argv, root, [], writable_extras=[str(grant) for grant in grants])
+def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any], gate: UsageGate,
+                  config_dir: TaskConfigDir, root: Path, inbox: Path, grants: Sequence[Path]) -> int:
     store_path = root / preparation.DEFAULT_PREPARATION_PATH
     held_before = _load_or_empty(store_path)
     try:
-        completed = _run_bounded(confined, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
+        ending = asyncio.run(_invoke_on_pool(
+            gate,
+            timeout_secs=settings.timeout_secs,
+            config_dir=config_dir,
+            prompt=nightly_prompt(inbox, root),
+            system_prompt=NIGHTLY_SYSTEM_PROMPT,
+            cwd=root,
+            model=settings.model,
+            max_turns=settings.max_turns,
+            max_budget_usd=settings.budget_usd,
+            permission_mode=PERMISSION_MODE,
+            allowed_tools=list(nightly_allowed_tools(inbox)),
+            disallowed_tools=list(NIGHTLY_DENIED_TOOLS),
+            mcp_config=mcp_config,
+            strict_mcp_config=True,
+            setting_sources=[],
+            env_overrides={preparation.NIGHTLY_CONFINEMENT_ENV: str(inbox)},
+            sandbox_wrap=_spawn_command(claude, root, grants),
+        ))
     except OSError as exc:
         _log(f'claude could not be started ({claude!r}): {exc}')
         return EXIT_CONFIG
+    return _judge(ending, settings, _measure(inbox, store_path, held_before))
+
+
+async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwargs: Any) -> AgentResult | TimedOut:
+    """One run through the shared runner, failing over across *gate*'s seats, under ONE wall clock.
+
+    The clock covers every attempt and every cap cooldown between them; its expiry kills the CLI's
+    process group. ``max_cap_retries`` is one pass over the pool, and a frozen pool raises rather
+    than parks. The gate is shut down on this loop, before it closes.
+    """
+    try:
+        async with asyncio.timeout(timeout_secs):
+            return await invoke_with_cap_retry(
+                gate, 'nightly_prepare', max_cap_retries=gate.account_count, park_on_frozen_pool=False,
+                **invoke_kwargs,
+            )
+    except TimeoutError:
+        return TimedOut(timeout_secs)
     finally:
-        for path in temp_files:
-            Path(path).unlink(missing_ok=True)
-    return _judge(completed, settings, _measure(inbox, store_path, held_before))
+        await gate.shutdown()
+
+
+def _spawn_command(claude: str, root: Path, grants: Sequence[Path]) -> Callable[[list[str]], list[str]]:
+    """The command actually spawned for a built argv: *claude* as the binary, confined under the pinned backend."""
+    writable = [str(grant) for grant in grants]
+    return lambda argv: wrap_command([claude, *argv[1:]], root, [], writable_extras=writable)
 
 
 def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT,
@@ -325,39 +346,6 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     if missing:
         raise McpConfigUnusable(f'{path}: no mcpServers block for {", ".join(missing)}')
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
-
-
-def _child_env(gate: Any, inbox: Path, config_dir: TaskConfigDir) -> dict[str, str] | None:
-    """The CLI's env with a leased account written into *config_dir*, or None when no pool account is free."""
-    env = agent_subprocess_env(os.environ)
-    env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
-    env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
-    lease = gate.try_lease(reverse=True)
-    if lease is None:
-        _log('no pool account free; skipping: the nightly never uses the host login')
-        return None
-    try:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = lease.token
-        config_dir.write_credentials(lease.token)
-        return env
-    finally:
-        gate.release_probe_slot(lease.token)
-
-
-def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float, *, cwd: Path, prompt: str) -> Completed:
-    """Kill the whole process group on timeout: the CLI's own children would otherwise hold the pipes open."""
-    proc = subprocess.Popen(
-        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=cwd, start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(prompt, timeout=timeout_secs)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        stdout, stderr = proc.communicate()
-        return Completed(None, stdout, stderr)
-    return Completed(proc.returncode, stdout, stderr)
 
 
 def _load_or_empty(store_path: Path) -> preparation.PreparationStore:
@@ -408,25 +396,19 @@ def _offered(inbox: Path) -> tuple[dict[str, list[preparation.Preparation]], int
     return offered, undecodable
 
 
-def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
-    run_label = f'model={settings.model!r}, recorded={outcome.recorded}'
-    if completed.returncode is None:
-        _log(f'claude timed out after {settings.timeout_secs:g}s ({run_label}): {_tails(completed)}')
+def _judge(ending: AgentResult | TimedOut, settings: Settings, outcome: Outcome) -> int:
+    account = f', account={ending.account_name!r}' if isinstance(ending, AgentResult) else ''
+    run_label = f'model={settings.model!r}{account}, recorded={outcome.recorded}'
+    if isinstance(ending, TimedOut):
+        _log(f'claude timed out after {ending.after_secs:g}s, failovers included ({run_label})')
         return EXIT_FAILED
-    if completed.returncode != 0:
-        _log(f'claude exited {completed.returncode} ({run_label}){_banner_clause(completed)}: {_tails(completed)}')
+    if not ending.success:
+        _log(f'claude failed (subtype={ending.subtype!r}, api_error_status={ending.api_error_status!r}, '
+             f'{run_label}): {_tails(ending)}')
         return EXIT_FAILED
-    result = _parse_result(completed.stdout)
-    if result is None:
-        _log(f'claude exited 0 without a JSON result ({run_label}){_banner_clause(completed)}: {_tails(completed)}')
-        return EXIT_FAILED
-    if result.get('is_error'):
-        _log(f'claude reported an error result (subtype={result.get("subtype")!r}, {run_label}): {_tails(completed)}')
-        return EXIT_FAILED
-    summary = (f'model={settings.model!r}, turns={result.get("num_turns")}, cost_usd={result.get("total_cost_usd")}, '
-               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}, '
-               f'permission_denials={len(result.get("permission_denials") or [])}')
-    verdict = f'{result.get("result", "")!s:.200}'
+    summary = (f'model={settings.model!r}{account}, turns={ending.turns}, cost_usd={ending.cost_usd}, '
+               f'recorded={outcome.recorded} of {outcome.offered_keys}, undecodable={outcome.undecodable}')
+    verdict = f'{ending.output:.200}'
     if outcome.recorded == 0:
         _log(f'recorded nothing; {outcome.offered_keys} item key(s) offered ({summary}): {verdict}')
         return EXIT_FAILED
@@ -434,23 +416,9 @@ def _judge(completed: Completed, settings: Settings, outcome: Outcome) -> int:
     return EXIT_OK
 
 
-def _parse_result(stdout: str) -> dict[str, Any] | None:
-    """The CLI's ``--output-format json`` result object; a reply that parses is a verdict, never a banner."""
-    try:
-        result = json.loads(stdout)
-    except ValueError:
-        return None
-    return result if isinstance(result, dict) else None
-
-
-def _banner_clause(completed: Completed) -> str:
-    marker = looks_like_blocking_banner(f'{completed.stdout}\n{completed.stderr}')
-    return f', usage-limit banner {marker!r}' if marker else ''
-
-
-def _tails(completed: Completed) -> str:
-    return (f'stdout={completed.stdout[-STREAM_TAIL_CHARS:]!r} '
-            f'stderr={completed.stderr[-STREAM_TAIL_CHARS:]!r}')
+def _tails(result: AgentResult) -> str:
+    return (f'stdout={result.output[-STREAM_TAIL_CHARS:]!r} '
+            f'stderr={result.stderr[-STREAM_TAIL_CHARS:]!r}')
 
 
 def _log(message: str) -> None:
