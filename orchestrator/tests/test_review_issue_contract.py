@@ -10,6 +10,7 @@ import copy
 import logging
 
 import pytest
+from _review_issue_fixtures import ON_CONTRACT_VALUES, contract_issue, contract_issue_without
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.review_issue_contract import (
@@ -19,7 +20,9 @@ from orchestrator.review_issue_contract import (
     IssueIntake,
     IssueSeverity,
     check_issues,
+    parse_severity,
 )
+from orchestrator.review_payload import ReviewPayload, Verdict
 from orchestrator.reviewer_failure import (
     ReviewerFailure,
     ReviewerFailureKind,
@@ -29,44 +32,28 @@ from orchestrator.reviewer_failure import (
 _JOURNAL_FIELD_CAP = 200
 
 
-def _issue(**overrides: object) -> dict[str, object]:
-    issue: dict[str, object] = {
-        'severity': 'blocking',
-        'location': 'pkg/mod.py:3',
-        'category': 'correctness',
-        'description': 'the thing is broken',
-        'suggested_fix': 'fix the thing',
-    }
-    issue.update(overrides)
-    return issue
-
-
-def _without(field: IssueField, **overrides: object) -> dict[str, object]:
-    issue = _issue(**overrides)
-    del issue[field]
-    return issue
-
-
 def _only_deviation(intake: IssueIntake) -> IssueDeviation:
     assert len(intake.deviations) == 1, intake.deviations
     return intake.deviations[0]
 
 
 USABLE_FIXTURES: tuple[dict[str, object], ...] = (
-    _issue(severity='high'),
-    _issue(severity=' Blocking '),
-    _without(IssueField.LOCATION, file='pkg/mod.py', line=12),
-    _without(IssueField.LOCATION, file='pkg/mod.py'),
-    _without(IssueField.LOCATION, file='pkg/mod.py', line=True),
-    _without(IssueField.LOCATION),
-    _issue(location=42),
-    _issue(location=['a' * 500]),
-    _without(IssueField.CATEGORY),
-    _issue(category=None),
-    _issue(category='   '),
-    _without(IssueField.SUGGESTED_FIX),
-    _issue(suggested_fix=None),
-    _issue(),
+    contract_issue(severity='high'),
+    contract_issue(severity=' Blocking '),
+    contract_issue_without(IssueField.LOCATION, file='pkg/mod.py', line=12),
+    contract_issue_without(IssueField.LOCATION, file='pkg/mod.py'),
+    contract_issue_without(IssueField.LOCATION, file='pkg/mod.py', line=True),
+    contract_issue_without(IssueField.LOCATION),
+    contract_issue(location=42),
+    contract_issue(location=['a' * 500]),
+    contract_issue_without(IssueField.CATEGORY),
+    contract_issue(category=None),
+    contract_issue(category='   '),
+    contract_issue_without(IssueField.SUGGESTED_FIX),
+    contract_issue(suggested_fix=None),
+    contract_issue_without(IssueField.DESCRIPTION, title='t', detail='d'),
+    contract_issue(description=None, summary='s'),
+    contract_issue(),
 )
 
 
@@ -92,7 +79,7 @@ def test_the_normal_form_of_a_whole_list_is_a_fixed_point():
 
 class TestOnContractIssue:
     def test_comes_back_equal_with_no_deviations(self):
-        issue = _issue(title='a title', file='pkg/mod.py', line=3)
+        issue = contract_issue(title='a title', file='pkg/mod.py', line=3)
 
         intake = check_issues([issue])
 
@@ -101,8 +88,8 @@ class TestOnContractIssue:
         assert intake.unusable == ()
         assert intake.normalised == ()
 
-    def test_every_contract_field_is_named_by_the_vocabulary(self):
-        assert {str(field) for field in IssueField} == set(_issue())
+    def test_the_on_contract_fixture_covers_every_contract_field(self):
+        assert set(ON_CONTRACT_VALUES) == set(IssueField)
 
     def test_severity_vocabulary_is_blocking_and_suggestion(self):
         assert [str(severity) for severity in IssueSeverity] == ['blocking', 'suggestion']
@@ -110,7 +97,7 @@ class TestOnContractIssue:
 
 class TestSeverityVocabulary:
     def test_off_vocabulary_severity_is_recorded_as_a_suggestion(self):
-        intake = check_issues([_issue(severity='high')])
+        intake = check_issues([contract_issue(severity='high')])
 
         assert intake.issues[0]['severity'] == IssueSeverity.SUGGESTION
         assert _only_deviation(intake) == IssueDeviation(
@@ -124,13 +111,43 @@ class TestSeverityVocabulary:
         assert intake.normalised == intake.deviations
 
     def test_case_and_whitespace_variant_is_recorded_as_its_member_and_flagged(self):
-        intake = check_issues([_issue(severity=' Blocking ')])
+        intake = check_issues([contract_issue(severity=' Blocking ')])
 
         assert intake.issues[0]['severity'] == 'blocking'
         deviation = _only_deviation(intake)
         assert deviation.deviation is Deviation.OFF_VOCABULARY
         assert deviation.recorded_as == 'blocking'
         assert not deviation.unusable
+
+
+class TestOneReadingOfSeverity:
+    @pytest.mark.parametrize(
+        ('value', 'parsed'),
+        [
+            ('blocking', IssueSeverity.BLOCKING),
+            (' Blocking ', IssueSeverity.BLOCKING),
+            ('SUGGESTION', IssueSeverity.SUGGESTION),
+            ('high', None),
+            ('', None),
+            (None, None),
+            (3, None),
+        ],
+    )
+    def test_parse_severity_ignores_case_and_surrounding_whitespace_only(self, value, parsed):
+        assert parse_severity(value) is parsed
+
+    @pytest.mark.parametrize(
+        'severity', ['blocking', ' Blocking ', 'BLOCKING', 'suggestion', 'Suggestion', 'high', 'nit'],
+    )
+    def test_the_gate_blocks_exactly_what_the_intake_records_as_blocking(self, severity):
+        issue = contract_issue(severity=severity)
+        [recorded] = check_issues([issue]).issues
+
+        payload = ReviewPayload(Verdict.ISSUES_FOUND, issues=(issue,), reviewer='r')
+
+        assert bool(payload.blocking_issues) == (
+            recorded['severity'] == IssueSeverity.BLOCKING
+        )
 
 
 class TestLocationFallback:
@@ -145,7 +162,7 @@ class TestLocationFallback:
         ],
     )
     def test_missing_location_is_derived_from_file_and_line(self, extras, recorded):
-        issue = _without(IssueField.LOCATION, **extras)
+        issue = contract_issue_without(IssueField.LOCATION, **extras)
 
         intake = check_issues([issue])
 
@@ -160,7 +177,7 @@ class TestLocationFallback:
         )
 
     def test_empty_location_with_nothing_to_derive_is_on_contract(self):
-        issue = _issue(location='')
+        issue = contract_issue(location='')
 
         intake = check_issues([issue])
 
@@ -168,7 +185,7 @@ class TestLocationFallback:
         assert intake.deviations == ()
 
     def test_empty_location_is_derived_from_file_and_line(self):
-        issue = _issue(location='', file='pkg/mod.py', line=12)
+        issue = contract_issue(location='', file='pkg/mod.py', line=12)
 
         intake = check_issues([issue])
 
@@ -182,11 +199,54 @@ class TestLocationFallback:
         )
 
 
+class TestDescriptionFallback:
+    @pytest.mark.parametrize(
+        ('extras', 'recorded'),
+        [
+            ({'title': 'a heading', 'detail': 'the body'}, 'the body'),
+            ({'title': 'a heading', 'summary': 'the body'}, 'the body'),
+            ({'summary': 'the body'}, 'the body'),
+            ({'title': 'a heading'}, 'a heading'),
+            ({'detail': '   ', 'title': 'a heading'}, 'a heading'),
+            ({'detail': 3, 'title': 'a heading'}, 'a heading'),
+        ],
+    )
+    def test_missing_description_is_taken_from_the_finding_text(self, extras, recorded):
+        issue = contract_issue_without(IssueField.DESCRIPTION, **extras)
+
+        intake = check_issues([issue])
+
+        assert intake.issues == ({**issue, 'description': recorded},)
+        assert _only_deviation(intake) == IssueDeviation(
+            index=0,
+            field=IssueField.DESCRIPTION,
+            deviation=Deviation.MISSING,
+            received=None,
+            recorded_as=recorded,
+        )
+
+    def test_blank_description_is_taken_from_the_finding_text(self):
+        intake = check_issues([contract_issue(description='  ', detail='the body')])
+
+        assert intake.issues[0]['description'] == 'the body'
+        assert _only_deviation(intake).received == '  '
+
+    def test_no_finding_text_leaves_the_issue_unusable(self):
+        issue = contract_issue_without(IssueField.DESCRIPTION, title='  ', detail=None)
+
+        intake = check_issues([issue])
+
+        assert intake.issues == ()
+        assert [(d.field, d.recorded_as) for d in intake.unusable] == [
+            (IssueField.DESCRIPTION, None),
+        ]
+
+
 class TestOptionalFields:
     @pytest.mark.parametrize('field', [IssueField.CATEGORY, IssueField.SUGGESTED_FIX])
     @pytest.mark.parametrize('absent_form', ['absent', None, '   '])
     def test_missing_optional_field_is_recorded_blank_and_flagged(self, field, absent_form):
-        issue = _without(field) if absent_form == 'absent' else _issue(**{field: absent_form})
+        issue = contract_issue_without(field) if absent_form == 'absent' else contract_issue(**{field: absent_form})
 
         intake = check_issues([issue])
 
@@ -198,7 +258,7 @@ class TestOptionalFields:
 
     @pytest.mark.parametrize('field', [IssueField.CATEGORY, IssueField.SUGGESTED_FIX])
     def test_empty_optional_field_is_on_contract(self, field):
-        issue = _issue(**{field: ''})
+        issue = contract_issue(**{field: ''})
 
         intake = check_issues([issue])
 
@@ -206,7 +266,7 @@ class TestOptionalFields:
         assert intake.deviations == ()
 
     def test_present_non_string_optional_field_is_recorded_as_its_str(self):
-        intake = check_issues([_issue(location=42)])
+        intake = check_issues([contract_issue(location=42)])
 
         assert intake.issues[0]['location'] == '42'
         deviation = _only_deviation(intake)
@@ -219,13 +279,13 @@ class TestUnusableIssues:
     @pytest.mark.parametrize(
         ('issue', 'field', 'deviation'),
         [
-            (_without(IssueField.SEVERITY), IssueField.SEVERITY, Deviation.MISSING),
-            (_issue(severity=None), IssueField.SEVERITY, Deviation.MISSING),
-            (_issue(severity='  '), IssueField.SEVERITY, Deviation.MISSING),
-            (_issue(severity=3), IssueField.SEVERITY, Deviation.NOT_A_STRING),
-            (_without(IssueField.DESCRIPTION), IssueField.DESCRIPTION, Deviation.MISSING),
-            (_issue(description=None), IssueField.DESCRIPTION, Deviation.MISSING),
-            (_issue(description=''), IssueField.DESCRIPTION, Deviation.MISSING),
+            (contract_issue_without(IssueField.SEVERITY), IssueField.SEVERITY, Deviation.MISSING),
+            (contract_issue(severity=None), IssueField.SEVERITY, Deviation.MISSING),
+            (contract_issue(severity='  '), IssueField.SEVERITY, Deviation.MISSING),
+            (contract_issue(severity=3), IssueField.SEVERITY, Deviation.NOT_A_STRING),
+            (contract_issue_without(IssueField.DESCRIPTION), IssueField.DESCRIPTION, Deviation.MISSING),
+            (contract_issue(description=None), IssueField.DESCRIPTION, Deviation.MISSING),
+            (contract_issue(description=''), IssueField.DESCRIPTION, Deviation.MISSING),
             ('a prose finding', None, Deviation.NOT_AN_OBJECT),
         ],
     )
@@ -241,10 +301,10 @@ class TestUnusableIssues:
         assert found.unusable
 
     def test_indices_are_positional_in_the_input(self):
-        good_first = _issue(description='first')
-        good_last = _issue(description='last')
+        good_first = contract_issue(description='first')
+        good_last = contract_issue(description='last')
 
-        intake = check_issues([good_first, _without(IssueField.DESCRIPTION), good_last])
+        intake = check_issues([good_first, contract_issue_without(IssueField.DESCRIPTION), good_last])
 
         assert intake.issues == (good_first, good_last)
         assert [(d.index, d.field) for d in intake.unusable] == [
@@ -254,10 +314,10 @@ class TestUnusableIssues:
 
 def test_the_input_issues_are_not_mutated():
     issues = [
-        _issue(severity='HIGH'),
-        _without(IssueField.LOCATION, file='pkg/mod.py', line=1),
-        _issue(category=None),
-        _without(IssueField.DESCRIPTION),
+        contract_issue(severity='HIGH'),
+        contract_issue_without(IssueField.LOCATION, file='pkg/mod.py', line=1),
+        contract_issue(category=None),
+        contract_issue_without(IssueField.DESCRIPTION),
     ]
     before = copy.deepcopy(issues)
 
@@ -268,7 +328,7 @@ def test_the_input_issues_are_not_mutated():
 
 class TestDescribe:
     def test_names_the_field_path_received_value_and_recording(self):
-        intake = check_issues([_issue(), _issue(severity='high')])
+        intake = check_issues([contract_issue(), contract_issue(severity='high')])
 
         text = intake.deviations[0].describe()
 
@@ -277,7 +337,7 @@ class TestDescribe:
         assert "'suggestion'" in text
 
     def test_names_the_issue_path_for_a_non_object(self):
-        intake = check_issues([_issue(), 'a prose finding'])
+        intake = check_issues([contract_issue(), 'a prose finding'])
 
         text = intake.unusable[0].describe()
 
@@ -288,8 +348,8 @@ class TestDescribe:
     def test_long_values_are_shortened_to_fit_the_journal_field_cap(self):
         long_value = 'x' * 1000
         intake = check_issues([
-            _issue(location=['a' * 500]),
-            _issue(severity=long_value),
+            contract_issue(location=['a' * 500]),
+            contract_issue(severity=long_value),
         ])
 
         for deviation in intake.deviations:
@@ -332,8 +392,8 @@ class TestAggregateReviewsFlagsOffContractIssues:
     def test_an_off_contract_review_is_flagged_once_and_left_unrewritten(
         self, artifacts, caplog,
     ):
-        minor = _issue(severity='minor')
-        file_and_line = _without(IssueField.LOCATION, severity='suggestion', file='a.py', line=4)
+        minor = contract_issue(severity='minor')
+        file_and_line = contract_issue_without(IssueField.LOCATION, severity='suggestion', file='a.py', line=4)
         artifacts.write_review('reviewer_comprehensive', self._review(minor, file_and_line))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
@@ -352,10 +412,10 @@ class TestAggregateReviewsFlagsOffContractIssues:
 
     def test_an_intake_normalised_review_is_not_flagged(self, artifacts, caplog):
         off_contract = [
-            _issue(severity='minor'),
-            _without(IssueField.LOCATION),
-            _without(IssueField.CATEGORY),
-            _issue(suggested_fix=None),
+            contract_issue(severity='minor'),
+            contract_issue_without(IssueField.LOCATION),
+            contract_issue_without(IssueField.CATEGORY),
+            contract_issue(suggested_fix=None),
         ]
         normalised = list(check_issues(off_contract).issues)
         artifacts.write_review('reviewer_comprehensive', self._review(*normalised))
@@ -366,7 +426,7 @@ class TestAggregateReviewsFlagsOffContractIssues:
         assert self._off_contract_records(caplog) == []
 
     def test_an_on_contract_review_is_not_flagged(self, artifacts, caplog):
-        artifacts.write_review('reviewer_comprehensive', self._review(_issue()))
+        artifacts.write_review('reviewer_comprehensive', self._review(contract_issue()))
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
             artifacts.aggregate_reviews()
