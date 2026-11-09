@@ -13981,7 +13981,7 @@ class SpeculativeMergeWorker:
         dead_link: str,
         *,
         point: VoidPoint,
-        anchor: RemergeBase | None = None,
+        anchor: RemergeBase,
     ) -> None:
         """Emit ``verdict_voided`` with the voided item's commit, its base's
         killer, and the *anchor* its replacement is re-merged onto.
@@ -14004,7 +14004,7 @@ class SpeculativeMergeWorker:
                     item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
                 ),
                 'killer': killer.to_wire() if killer is not None else None,
-                **(anchor.to_wire() if anchor is not None else {}),
+                **anchor.to_wire(),
             },
         )
 
@@ -15895,7 +15895,7 @@ class SpeculativeMergeWorker:
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
                 # all downstream in-flight verifies, re-merge each item onto
-                # actual main, and front-queue the re-merged items on the redispatch park
+                # its claimed base, and front-queue the re-merged items on the redispatch park
                 # for strictly-ordered re-dispatch.
                 #
                 # This preserves chain-invalidation under overlap: a speculative
@@ -15949,12 +15949,11 @@ class SpeculativeMergeWorker:
                     # resolves as MergeOutcome('blocked', reason='Verifier
                     # cascade error: ...') and the loop continues to the next
                     # downstream entry.
-                    # Release discipline: lease+permit are released in-body
-                    # at cancel_and_release / speculation_ledger.release()
-                    # BEFORE _remerge is called. The permit release is
-                    # genuinely idempotent (PermitLedger.release checks
-                    # permit.released first), so the except handler below can
-                    # re-run it unconditionally: no guard needed. The LEASE
+                    # Release discipline: the lease is released in-body at
+                    # cancel_and_release BEFORE _remerge is called; the permit
+                    # leaves the entry for the replacement's claim, or is freed
+                    # on a skip path, so the except handler below never sees
+                    # it a second time. The LEASE
                     # release is NOT idempotent for a REMOTE lease —
                     # HostAllocator.cancel_and_release unconditionally
                     # re-issues cancel_verify() before any FREE-check
@@ -16011,22 +16010,13 @@ class SpeculativeMergeWorker:
                                     await self._cleanup_owned_merge_worktree(
                                         _entry.merge_wt
                                     )
-                            # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6):
-                            # A late arrival B attached via pending_spec_base is
-                            # dispatched with speculative=True and held_spec_permit
-                            # retained (step-2), so B's InflightEntry carries a
-                            # permit. The release below fires here (predecessor
-                            # failed → B is a downstream entry), and _remerge
-                            # returns speculative=False → re-dispatched B carries
-                            # permit=None → no duplicate release.
-                            # Slot symmetry is maintained on the late-arrival path
-                            # identically to the standard prefetch path.
-                            # η: release THROUGH the ledger, guarded by the
-                            # threaded token rather than was_speculative.
-                            if _entry.permit is not None:
-                                self._speculation_ledger.release(_entry.permit)
+                            # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6): a
+                            # downstream entry's permit, attached or prefetched,
+                            # is freed on a skip path below or moves to its
+                            # replacement's claim (plans/merge-lane-policy-prd.md D1).
                             # REQUEUED: abort-poll already put req on _queue → skip.
                             if _entry_status == InflightStatus.REQUEUED:
+                                self._free_entry_permit(_entry)
                                 continue
                             # Head was REQUEUED (operator halt) and we cancelled
                             # this downstream task before its abort-poll could
@@ -16037,6 +16027,7 @@ class SpeculativeMergeWorker:
                                 and _entry.verify_task is not None
                                 and _entry.verify_task.cancelled()
                             ):
+                                self._free_entry_permit(_entry)
                                 _entry_req = _entry.item.request
                                 if not _entry_req.result.done():
                                     self._requeue_request(_entry_req)
@@ -16086,12 +16077,17 @@ class SpeculativeMergeWorker:
                                     _rid, _from_state,
                                     ItemLifecycleState.MERGING, live_obj=_entry,
                                 )
-                            # §5.3 re-merge carve-out, consumer 1/5 —
-                            # head-failure cascade.  Targets real main, NOT
-                            # frozen_prefix_tip(); do not "fix" that.  PRD §5.3.
+                            # Re-anchor on the live frontier tip, else main:
+                            # plans/merge-lane-policy-prd.md D1.  Main is read
+                            # only after the teardown above, so no await ever
+                            # delays a downstream verify's remote cancel.
+                            _cascade_claim = self._claim_with_entry_permit(
+                                _entry, _entry.item, await self._main_sha_or_empty(),
+                            )
                             _remerged = await self._remerge(
                                 _entry.item.request,
                                 _entry.item.started_monotonic,
+                                claim=_cascade_claim,
                             )
                             if _from_state is not None:
                                 self._note_transition(
@@ -16374,6 +16370,29 @@ class SpeculativeMergeWorker:
         """
         own = item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
         return self._claim_for_request(item.request, own, main_sha, held_permit)
+
+    def _claim_with_entry_permit(
+        self, entry: InflightEntry, item: SpeculativeItem, main_sha: str,
+    ) -> RemergeClaim:
+        """Claim *item*'s re-merge base with *entry*'s permit, which then
+        leaves the entry: the replacement owns it or the claim freed it, so
+        neither finalize's ``finally`` nor the cascade's error chokepoint
+        releases it again."""
+        claim = self._claim_remerge_base(item, main_sha, entry.permit)
+        entry.permit = None
+        return claim
+
+    def _free_entry_permit(self, entry: InflightEntry) -> None:
+        """Release *entry*'s speculation permit through the ledger, if it holds one."""
+        if entry.permit is not None:
+            self._speculation_ledger.release(entry.permit)
+
+    async def _main_sha_or_empty(self) -> str:
+        """Current main, or '' when it cannot be read: callers fail open."""
+        try:
+            return await self._git_ops.get_main_sha()
+        except Exception:
+            return ''
 
     def _claim_for_request(
         self,
@@ -18735,6 +18754,7 @@ class SpeculativeMergeWorker:
         item: SpeculativeItem,
         dead_link: str,
         vr: InflightVerifyResult | None,
+        main_sha: str,
     ) -> bool:
         """VOID a dead-based verdict at adoption time and re-merge it (INV-3).
 
@@ -18747,11 +18767,12 @@ class SpeculativeMergeWorker:
         *dead_link*, record the voided verdict's own merge commit dead (so a
         follower stacked on it is caught at its next dispatch even when no
         head-failure cascade runs; parity with the dispatch-time void, task
-        2885), re-merge the item against real main, and re-park it on
+        2885), re-merge the item onto its claimed base with the entry's permit
+        (plans/merge-lane-policy-prd.md D1), and re-park it on
         the redispatch park for a fresh verify.  The request is left UNRESOLVED — a
-        dead-base FAIL never blocks the task, and (because the re-merge resets
-        base_sha to live real-main, not in the dead set) a subsequent GENUINE
-        failure on real main IS adopted normally, so voiding is one-shot and
+        dead-base FAIL never blocks the task, and (because the re-merge re-anchors
+        base_sha on main or a live tip, neither in the dead set) a subsequent GENUINE
+        failure IS adopted normally, so voiding is one-shot and
         cannot livelock.
 
         Mirrors the RUNNER_UNAVAILABLE remerge→REDISPATCH_PARKED template (the
@@ -18767,17 +18788,17 @@ class SpeculativeMergeWorker:
         _spec_warm = vr.spec_warm if vr is not None else False
         if _wt is not None:
             await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
-        self._emit_verdict_voided(req, item, dead_link, point=VoidPoint.ADOPTION)
+        claim = self._claim_with_entry_permit(entry, item, main_sha)
+        self._emit_verdict_voided(
+            req, item, dead_link, point=VoidPoint.ADOPTION, anchor=claim.anchor,
+        )
         self._note_transition(
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
         self._record_item_commit_dead(item, DeadBaseSite.ADOPTION_VOID)
-        # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
-        # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
-        # enforcement: it is where a verdict built on a known-dead base is
-        # discarded, PASS or FAIL.  Replacement item targets real main.
-        _remerged = await self._remerge(item.request, item.started_monotonic)
+        # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+        _remerged = await self._remerge(item.request, item.started_monotonic, claim=claim)
         self._note_transition(
             req.request_id, ItemLifecycleState.MERGING,
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged,
@@ -19739,7 +19760,7 @@ class SpeculativeMergeWorker:
                 # documented never-raise, so a residual directory degrades to an
                 # ordinary unregistered orphan the grace-window reaper claims.
                 await self._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
-                # Re-merge against actual main and front-insert into the redispatch park
+                # Re-merge onto its claimed base and front-insert into the redispatch park
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
                 # handle any downstream entries still in _inflight.
@@ -19761,11 +19782,12 @@ class SpeculativeMergeWorker:
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
                 )
-                # §5.3 re-merge carve-out, consumer 3/5 — RUNNER_UNAVAILABLE
-                # re-dispatch: targets real main, not frozen_prefix_tip().
-                # PRD §5.3.
+                # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+                _ru_claim = self._claim_with_entry_permit(
+                    entry, entry.item, await self._main_sha_or_empty(),
+                )
                 _remerged_ru = await self._remerge(
-                    entry.item.request, entry.item.started_monotonic,
+                    entry.item.request, entry.item.started_monotonic, claim=_ru_claim,
                 )
                 self._note_transition(
                     req.request_id, ItemLifecycleState.MERGING,
@@ -19793,7 +19815,7 @@ class SpeculativeMergeWorker:
             # describes a tree that will NEVER be on main.  It is PHANTOM: a dead-
             # based FAIL must NEVER block the task and a dead-based PASS must NEVER
             # be advanced onto main.  VOID it via _void_and_remerge (emit
-            # verdict_voided, re-merge against real main, re-park on the redispatch park,
+            # verdict_voided, re-merge onto its claimed base, re-park on the redispatch park,
             # leave req UNRESOLVED).  _n_failed_val is False — a merely-voided item
             # is NOT a failure, so it must not spuriously trigger the downstream
             # head-failure cascade off a request that never actually failed.
@@ -19809,16 +19831,13 @@ class SpeculativeMergeWorker:
             # finalize on the #1-reliability hot path (PRD design decision 4:
             # degrade never).  A void missed here is caught again at the item's
             # next dispatch-time re-check (enforcement point (a)).
-            try:
-                _void_main = await self._git_ops.get_main_sha()
-            except Exception:
-                _void_main = ''
+            _void_main = await self._main_sha_or_empty()
             _dead_link = (
                 self._chain_dead_link(item, _void_main) if _void_main else None
             )
             if _dead_link is not None:
                 _n_failed_val = False  # voided ≠ failed → no false cascade
-                return await self._void_and_remerge(entry, item, _dead_link, vr)
+                return await self._void_and_remerge(entry, item, _dead_link, vr, _void_main)
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             # `not entry.chain_adopted` is task 3186 (PRD δ), the
