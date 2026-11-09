@@ -98,6 +98,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
     'orchestrator/tests/test_merge_queue.py': 'GitOps over the tmp_path git_repo fixture',
     'orchestrator/tests/test_merge_queue_build_chain.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_chain_intact.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_landing.py': _SEEDS_ITS_OWN_REPO,
