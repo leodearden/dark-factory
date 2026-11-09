@@ -882,9 +882,11 @@ class SchedulerChronicFlakeTaskClient:
         so the ledger's warning carries the real cause.  The id is coerced to ``str``
         for the same reason ``get_statuses`` coerces its ids.
 
-        Not delegated to ``scheduler.py::Scheduler.get_task``: that returns ``None`` for
-        a failed read AND for a missing task, the very conflation this pair exists to
-        remove.
+        ``scheduler.py::Scheduler.read_task`` types the same reply as TaskFound /
+        TaskAbsent / TaskReadFailed, and :func:`_extract_task` still disagrees with it
+        on an ``isError`` envelope, a row without ``status`` and an ``error_type``-only
+        reply.  Projecting this pair from ``read_task`` and deleting
+        :func:`_extract_task` is ticket tkt_0RWS67MFHYSKHF60BWRYE8F1VR.
         """
         try:
             result = await self._scheduler.dispatch_tool(
