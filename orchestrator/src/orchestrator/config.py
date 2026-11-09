@@ -3431,8 +3431,8 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens, and every
-    # codex row prices that split from the published cached rate.
+    # Codex sticker rates; each codex arm's cached rate is required by
+    # orchestrator/tests/test_eval_codex_pi_bundles.py::TestCodexSlatePin.
     'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
     'gpt-6.1-sol': {'input_per_1m': 2.00, 'output_per_1m': 10.00, 'cached_input_per_1m': 0.10},
     'gpt-6.1-terra': {'input_per_1m': 1.00, 'output_per_1m': 5.00, 'cached_input_per_1m': 0.05},

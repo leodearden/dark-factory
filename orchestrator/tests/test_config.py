@@ -3585,9 +3585,6 @@ class TestOrchestratorConfigPrices:
         prices = OrchestratorConfig().prices
         assert prices['gpt-6.1-sol'].cached_input_per_1m == 0.10
         assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
-        table = default_price_table()
-        assert table['gpt-6.1-sol']['cached_input_per_1m'] == 0.10
-        assert table['gpt-6.1-terra']['cached_input_per_1m'] == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):
         """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's

@@ -191,8 +191,13 @@ class TestCodexSlatePin:
         assert get_config_by_name('codex-gpt5.6-sol') is None
         assert get_config_by_name('codex-gpt5.6-terra') is None
 
-    def test_every_codex_arm_has_a_price_seed(self):
-        """Derived from the roster, so a future arm without a seed reddens."""
+    def test_every_codex_arm_has_a_price_seed_with_a_cached_rate(self):
+        """Derived from the roster, so a future arm without a seed or a cached rate reddens.
+
+        codex reports cached_input_tokens inside input_tokens, so a seed
+        without cached_input_per_1m would price that share at the full input
+        rate.
+        """
         from orchestrator.config import default_price_table
         from orchestrator.evals.configs import codex_pi_candidates
 
@@ -200,6 +205,7 @@ class TestCodexSlatePin:
         codex_models = {c.model for c in codex_pi_candidates() if c.backend == 'codex'}
         assert codex_models
         assert codex_models <= table.keys()
+        assert {m for m in codex_models if table[m].get('cached_input_per_1m') is None} == set()
 
     def test_pi_control_is_unchanged(self):
         from orchestrator.evals.configs import (
