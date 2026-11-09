@@ -82,6 +82,7 @@ from orchestrator.config import (
 from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
@@ -925,6 +926,17 @@ def _delivered_checks_descriptor_digest(checks: list | None) -> str:
             'utf-8'
         )
     ).hexdigest()
+
+
+def _terminal_record_is_immutable(record: dict) -> bool:
+    """Whether a fetched TERMINAL dep record can be served from the cross-tick cache.
+
+    A record carrying ``metadata.delivered_checks`` may have its descriptor
+    corrected in place, and a scheduled self-deploy's ``deploy_state.phase``
+    advances after it goes done; both must be re-fetched.
+    """
+    metadata = record.get('metadata') or {}
+    return not metadata.get('delivered_checks') and not awaits_scheduled_restart(metadata)
 
 
 class McpSessionLike(Protocol):
@@ -4602,6 +4614,7 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        terminal_dep_records: dict[str, dict] | None = None,
     ) -> None:
         """Per-tick sweep: stamp the frozen-once ``milestone_deps_satisfied_at``
         wall-clock anchor for pending 'delayed' milestone tasks (task 2335 β).
@@ -4614,8 +4627,9 @@ class Scheduler:
         ``metadata.milestone`` whose ``mode == 'delayed'`` that does NOT
         already carry a truthy ``metadata.milestone_deps_satisfied_at``: if
         :meth:`_deps_satisfied` holds — forwarding *external_status_cache* /
-        *external_resolver_failed* so the anchor reflects the SAME complete
-        local+external dependency evaluation dispatch uses (PRD § 2 gap 2) —
+        *external_resolver_failed* / *terminal_dep_records* so the anchor
+        reflects the SAME local+external+scheduled-deploy dependency
+        evaluation dispatch uses (PRD § 2 gap 2) —
         stamp ``self._wall_now().isoformat()`` via
         ``update_task(..., metadata_mode='merge')`` so sibling metadata keys
         are preserved.
@@ -4660,6 +4674,7 @@ class Scheduler:
                     task, status_map, tasks_by_id,
                     external_status_cache=external_status_cache,
                     external_resolver_failed=external_resolver_failed,
+                    terminal_dep_records=terminal_dep_records,
                 ):
                     continue
                 await self.update_task(
@@ -5745,8 +5760,8 @@ class Scheduler:
         already populated) and before ``delivered_check_gate`` and both
         candidate-dispatch loops — all of which consult
         ``ctx.terminal_dep_records`` as an additive fallback source for the
-        two delivered-check consumers (``_deps_satisfied``,
-        ``_compute_delivered_check_cache``).
+        delivered-check and scheduled-deploy arms of ``_deps_satisfied`` and
+        for ``_compute_delivered_check_cache``.
 
         Correctness crux (mirrors γ2's ``_phase_backfill_dep_status``, but
         for RECORDS rather than statuses): the active-only ``get_tasks``
@@ -5758,24 +5773,25 @@ class Scheduler:
         delivered-check consumers key off ``tasks_by_id.get(dep_id)`` and
         silently skip the gate entirely (task 2692's root cause).
 
-        Gated by (``config.delivered_checks.enabled`` AND a non-empty
-        missing-id set) — zero extra cost when the gate is off or nothing
-        is missing, mirroring ``_phase_delivered_check_gate``'s own kill
-        switch. Only PENDING tasks' deps are considered, and only deps
-        whose ``status_map`` entry is TERMINAL.
+        Gated by a non-empty missing-id set — zero extra cost when nothing
+        is missing. NOT gated by ``config.delivered_checks.enabled``: the
+        scheduled-deploy hold reads these records too, and the
+        delivered-check arm is switched off by its own ``None`` cache. Only
+        PENDING tasks' deps are considered, and only deps whose
+        ``status_map`` entry is TERMINAL.
 
         Cross-tick record cache (task 2692, reviewer_comprehensive
         performance amendment): a dep_id already present in
         ``self._terminal_dep_record_cache`` is served straight into
         ``ctx.terminal_dep_records`` with NO ``get_task`` call at all,
-        PROVIDED the cached record carries no ``metadata.delivered_checks``
-        — such a checkless terminal task's record is treated as immutable
-        once fetched. Without this, every pending task's completed local
-        deps would be re-fetched on EVERY tick forever, even in the common
-        case where none of them carry ``metadata.delivered_checks``. A
-        cached record that DOES carry ``metadata.delivered_checks`` is
-        instead treated as a cache MISS and re-fetched every sweep (task
-        2977, closing the loop with task 2975's descriptor-digest
+        PROVIDED :func:`_terminal_record_is_immutable` holds: it carries no
+        ``metadata.delivered_checks`` and is not a scheduled self-deploy
+        still awaiting its restart (whose ``deploy_state.phase`` the
+        settler advances later). Without this, every pending task's
+        completed local deps would be re-fetched on EVERY tick forever. A
+        mutable cached record is instead treated as a cache MISS and
+        re-fetched every sweep (task 2977, closing the loop with task
+        2975's descriptor-digest
         self-heal): otherwise an operator's in-place correction of a DONE
         dep's check descriptor, at a fixed main SHA, would be served
         stale forever, since this phase is the sole source
@@ -5798,8 +5814,11 @@ class Scheduler:
         never recompetes for a future tick's budget), so this is fail-safe
         deferral, not silent dropping.
 
-        Budget priority (task 2977, reviewer_comprehensive performance
-        amendment): genuinely-NEW dep_ids (absent from
+        Budget priority: a held scheduled-deploy re-validation goes first
+        of all, since deferring it serves no record and a missing record
+        fails open, releasing the hold. Then (task 2977,
+        reviewer_comprehensive performance amendment): genuinely-NEW
+        dep_ids (absent from
         ``_terminal_dep_record_cache`` entirely — typically a dependent's
         first-ever evaluation of that dep) are always ordered ahead of
         already-warmed checks-carrying dep_ids up for re-validation, so a
@@ -5826,9 +5845,9 @@ class Scheduler:
         returns ``None`` on failure/absence. A dep that fails to fetch is
         left out of ``ctx.terminal_dep_records`` (and NOT cached, so it's
         retried next tick) for this tick's fail-safe wait — but a pending
-        dependent's delivered-check gate on THAT dep is bypassed
-        (fail-open) rather than withheld for this tick, since both
-        delivered-check consumers treat "dep record unavailable" as "not
+        dependent's delivered-check gate and scheduled-deploy hold on THAT
+        dep are bypassed (fail-open) rather than withheld for this tick,
+        since every consumer treats "dep record unavailable" as "not
         checked" (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
         This is a conscious trade-off (reviewer_comprehensive robustness
         amendment): the alternative (fail-safe-WAIT whenever a terminal
@@ -5841,8 +5860,6 @@ class Scheduler:
         ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
         ``_phase_delivered_check_gate``. Always continues.
         """
-        if not self.config.delivered_checks.enabled:
-            return _CONTINUE
         try:
             needed: set[str] = set()
             for _t in ctx.tasks:
@@ -5860,63 +5877,53 @@ class Scheduler:
             if not needed:
                 return _CONTINUE
 
+            _held_to_fetch: list[str] = []
             _new_to_fetch: list[str] = []
             _revalidate_to_fetch: list[str] = []
             for _dep_id in needed:
                 _cached_record = self._terminal_dep_record_cache.get(_dep_id)
-                # Task 2977: a warmed record is served from cache ONLY when
-                # it carries no delivered_checks. The record cache is never
-                # evicted, so if a checks-carrying record were always
-                # served from cache, an operator correcting a DONE dep's
-                # check descriptor in place (at a fixed main SHA) would be
-                # served the stale descriptor forever — freezing task
-                # 2975's (dep_id, main_sha, descriptor_digest) self-heal,
-                # whose digest is computed from whatever this phase serves
-                # into ctx.terminal_dep_records. Treating a checks-carrying
-                # cache entry as a MISS forces a re-fetch every sweep (the
-                # loop below overwrites the cache with the fresh record),
-                # so a corrected descriptor is observed on the very next
-                # tick. Checkless records — the common case and the entire
-                # performance rationale for this cache — are still served
-                # for free. Documented boundary: adding delivered_checks to
-                # a previously-checkless, already-warmed record is NOT
-                # observed until an orchestrator restart resets the cache.
-                if _cached_record is not None and not (
-                    (_cached_record.get('metadata') or {}).get('delivered_checks')
-                ):
-                    ctx.terminal_dep_records[_dep_id] = _cached_record
-                elif _cached_record is not None:
-                    # Already warmed but checks-carrying — a re-validation,
-                    # not a first-time fetch (budget priority below).
-                    _revalidate_to_fetch.append(_dep_id)
-                else:
+                # A warmed record is served from cache ONLY while immutable.
+                # The cache is never evicted, so a mutable record served from
+                # it would be stale forever: a corrected check descriptor
+                # (task 2977, freezing task 2975's digest self-heal) or a
+                # scheduled self-deploy's phase (task 7276, holding its
+                # dependents forever). Documented boundary: adding
+                # delivered_checks to a previously-checkless, already-warmed
+                # record is NOT observed until an orchestrator restart.
+                if _cached_record is None:
                     _new_to_fetch.append(_dep_id)
-            if not _new_to_fetch and not _revalidate_to_fetch:
+                elif _terminal_record_is_immutable(_cached_record):
+                    ctx.terminal_dep_records[_dep_id] = _cached_record
+                elif awaits_scheduled_restart(_cached_record.get('metadata')):
+                    _held_to_fetch.append(_dep_id)
+                else:
+                    _revalidate_to_fetch.append(_dep_id)
+            if not (_held_to_fetch or _new_to_fetch or _revalidate_to_fetch):
                 return _CONTINUE
 
-            # Task 2977 (reviewer_comprehensive performance amendment): a
-            # genuinely-new dep_id always gets budget priority over an
-            # already-warmed re-validation dep_id — see this method's
-            # "Budget priority" docstring paragraph. Each group is sorted
-            # independently for determinism.
-            _ordered = sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
+            # See this method's "Budget priority" docstring paragraph. Each
+            # group is sorted independently for determinism.
+            _ordered = (
+                sorted(_held_to_fetch) + sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
+            )
             _budget = self.config.delivered_checks.max_checks_per_tick
             if len(_ordered) > _budget:
                 _total = len(_ordered)
-                _deferred = _ordered[_budget:]
+                _deferred = set(_ordered[_budget:])
                 _ordered = _ordered[:_budget]
-                _new_set = set(_new_to_fetch)
-                _deferred_new = sum(1 for _d in _deferred if _d in _new_set)
-                _deferred_revalidate = len(_deferred) - _deferred_new
                 logger.warning(
                     'acquire_next: terminal dep record backfill has %d '
-                    'dep(s) to fetch this tick (%d new, %d re-validation), '
-                    'exceeding delivered_checks.max_checks_per_tick (%d) — '
-                    'fetching %d, deferring %d (%d new, %d re-validation) '
+                    'dep(s) to fetch this tick (%d held, %d new, %d '
+                    're-validation), exceeding '
+                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    '%d, deferring %d (%d held, %d new, %d re-validation) '
                     'to a later tick.',
-                    _total, len(_new_to_fetch), len(_revalidate_to_fetch),
-                    _budget, len(_ordered), _total - len(_ordered),
-                    _deferred_new, _deferred_revalidate,
+                    _total, len(_held_to_fetch), len(_new_to_fetch),
+                    len(_revalidate_to_fetch), _budget, len(_ordered),
+                    len(_deferred),
+                    len(_deferred.intersection(_held_to_fetch)),
+                    len(_deferred.intersection(_new_to_fetch)),
+                    len(_deferred.intersection(_revalidate_to_fetch)),
                 )
             _fetched = await asyncio.gather(
                 *(self.get_task(_dep_id) for _dep_id in _ordered)
@@ -5929,9 +5936,9 @@ class Scheduler:
                     logger.warning(
                         'acquire_next: terminal dep %s record fetch '
                         'returned None (transient?) — any pending '
-                        "dependent's delivered-check gate on this dep is "
-                        'bypassed (fail-open, not affirmatively passed) '
-                        'this tick; will retry next tick.',
+                        "dependent's delivered-check gate or scheduled-deploy "
+                        'hold on this dep is bypassed (fail-open, not '
+                        'affirmatively passed) this tick; will retry next tick.',
                         _dep_id,
                     )
         except Exception:
@@ -5990,7 +5997,9 @@ class Scheduler:
         - ``'deps_unsatisfied:external'`` — the resolver reports a
           cross-project dependency other than done;
         - ``'deps_unsatisfied:delivered_check'`` — a dependency's delivered
-          check ran and failed.
+          check ran and failed;
+        - ``'deps_unsatisfied:scheduled_deploy'`` — a dependency is a
+          scheduled self-deploy whose restart is not yet verified.
 
         A dependency that is merely UNKNOWN this tick keeps the parks:
         expiry needs affirmative evidence
@@ -6672,8 +6681,9 @@ class Scheduler:
         """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
-        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
-        none on ctx (persists via ``_stamp_milestone_deps_satisfied``). For
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.terminal_dep_records``. Writes: none on ctx (persists via
+        ``_stamp_milestone_deps_satisfied``). For
         pending 'delayed' milestone tasks whose full (local + external)
         deps just became satisfied (task 2335 β). Placed after the
         external-dep cache phase so the anchor reflects the SAME complete
@@ -6686,6 +6696,7 @@ class Scheduler:
             ctx.tasks, ctx.status_map, ctx.tasks_by_id,
             external_status_cache=ctx.external_cache,
             external_resolver_failed=ctx.external_resolver_failed,
+            terminal_dep_records=ctx.terminal_dep_records,
         )
         return _CONTINUE
 
