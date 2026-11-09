@@ -22,7 +22,12 @@ from _fm_helpers import load_script_module
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.memory_eval_limits import LimitsConfig, limits_artifact_path, load_limits_artifact
-from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, load_metric_series
+from shared.memory_eval_metrics import (
+    RUN_STAMP_ENV_VAR,
+    load_metric_series,
+    stamp_datetime,
+    write_metric_series,
+)
 from shared.memory_eval_verdicts import (
     RunnerFailureRecord,
     RunnerPhase,
@@ -199,20 +204,46 @@ _PRODUCER_CLI: dict[str, tuple[str, str]] = {
     'e1-retrieval-health': ('build_parser', 'out_root'),
     'e4-staleness-sweep': ('build_parser', 'metrics_root'),
     'e6-corpus-health': ('_build_parser', 'metrics_root'),
+    'e7-write-after-miss': ('build_parser', 'metrics_root'),
 }
 """eval_id -> (the producer script's parser factory, the dest its artifact root lands in)."""
 
 
+def _write_after_miss_series(stamp: str, *, incidents: int, adjudicated: int):
+    """An e7 series built by the producer's own ``build_series``, so the shape is the real one."""
+    producer = load_script_module(
+        _FM_ROOT / 'scripts' / 'memory_eval_write_after_miss.py',
+        mod_name='memory_eval_write_after_miss',
+    )
+    incident = producer.Incident(
+        write_row_id='write-row', search_row_ids=('search-row',), project_id='dark_factory',
+        caller_agent_id='claude-task-1-implementer', matched_memory_id='existing',
+        similarity=0.95, threshold=0.92, category='procedural_knowledge',
+        write_created_at=stamp_datetime(stamp),
+    )
+    adjudication = producer.Adjudication(
+        incidents=(incident,) * incidents,
+        adjudicated=adjudicated,
+        skipped={reason: 0 for reason in producer.SkipReason},
+    )
+    window = producer.JournalWindow(writes=(), searches=(), unattributed_searches=0, unparsed_rows=0)
+    return producer.build_series(
+        adjudication, window, project_id='dark_factory', stamp=stamp,
+        details_path=producer.incidents_filename(stamp),
+    )
+
+
 class TestDefaultProducers:
-    def test_three_producers_whose_scripts_exist(self):
+    def test_four_producers_whose_scripts_exist(self):
         producers = _mod().DEFAULT_PRODUCERS
         assert [p.eval_id for p in producers] == [
-            'e1-retrieval-health', 'e4-staleness-sweep', 'e6-corpus-health',
+            'e1-retrieval-health', 'e4-staleness-sweep', 'e6-corpus-health', 'e7-write-after-miss',
         ]
         assert [p.script.name for p in producers] == [
             'memory_eval_retrieval_probe.py',
             'memory_eval_staleness_sweep.py',
             'audit_duplicate_memories.py',
+            'memory_eval_write_after_miss.py',
         ]
         for producer in producers:
             assert producer.script.is_file()
@@ -237,6 +268,18 @@ class TestDefaultProducers:
         assert Path(args[root_dest]) == tmp_path
         assert args.get('eval_id', eval_id) == eval_id
         assert not args.get('apply') and not args.get('no_metrics')
+
+    def test_write_after_miss_is_judged_by_the_proportion_rule(self, tmp_path):
+        """The wiring, not a limit (G6): e7's own build_series output reaches alpha's proportion rule."""
+        stamps = ('20260701T031500Z', '20260702T031500Z', '20260703T031500Z', '20260704T031500Z')
+        for stamp in stamps:
+            write_metric_series(_write_after_miss_series(stamp, incidents=2, adjudicated=20), tmp_path)
+        limits = _mod().load_runner_config(COMMITTED_CONFIG).limits_config()
+
+        run = _mod().evaluate_eval(tmp_path, 'e7-write-after-miss', stamps[-1], limits)
+
+        verdict = next(v for v in run.result.verdicts if v.metric_id == 'write-after-miss')
+        assert verdict.rule_kind == 'proportion'
 
     def test_e4_and_e6_are_told_the_registry_eval_id(self, tmp_path):
         for producer in _mod().DEFAULT_PRODUCERS[1:]:
