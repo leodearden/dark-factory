@@ -77,14 +77,15 @@ def _intent(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _run_loop_until(service: _RecordingService, event: asyncio.Event) -> None:
-    from fused_memory.server.main import _start_mem0_retry_loop  # noqa: PLC0415
+    """Fail unless ``event`` fires sooner than the default policy's first pass could, proving the loop read the service's own policy."""
+    from fused_memory.server.main import _start_mem0_retry_loop
 
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     task = _start_mem0_retry_loop(service)
     try:
-        # noqa: wall-clock-deadline — the deadline is the assertion: an event inside half the default policy's interval proves the loop read the service's own policy
-        await asyncio.wait_for(
-            event.wait(), timeout=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds / 2
-        )
+        await event.wait()
+        assert loop.time() - started < DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds / 2
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -152,7 +153,7 @@ class TestTheBacklogCheckWiring:
 class TestTheStartupRecoveryWiring:
     @pytest.mark.asyncio
     async def test_a_recovered_writes_supersedes_are_marked_when_it_lands(self):
-        from fused_memory.server.main import _recover_mem0_intents_at_startup  # noqa: PLC0415
+        from fused_memory.server.main import _recover_mem0_intents_at_startup
 
         service = _RecordingService()
 

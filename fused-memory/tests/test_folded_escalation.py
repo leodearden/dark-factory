@@ -1030,7 +1030,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.journal_growth_alarm import (
         _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
-    from fused_memory.services.mem0_retry_backlog_alarm import (  # noqa: PLC0415
+    from fused_memory.services.mem0_retry_backlog_alarm import (
         ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
     )
     from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415

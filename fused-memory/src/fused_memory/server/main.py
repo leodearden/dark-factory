@@ -43,19 +43,7 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
-from fused_memory.services.consolidation_ops import MemoryUpdater  # noqa: E402
-from fused_memory.services.mem0_retry_backlog_alarm import (  # noqa: E402
-    Mem0RetryBacklogChecker,
-)
-from fused_memory.services.mem0_write_retry import (  # noqa: E402
-    Mem0RetryRunner,
-    OnMem0Landed,
-    run_periodic_mem0_retry,
-)
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
-from fused_memory.services.supersession_mark import (  # noqa: E402
-    mark_superseded_after_retry,
-)
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -71,7 +59,19 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+    from fused_memory.services.mem0_retry_backlog_alarm import Mem0RetryBacklogChecker
+    from fused_memory.services.mem0_write_retry import Mem0RetryRunner, OnMem0Landed
+
+    class _Mem0WriteDurabilityService(
+        Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
+    ):
+        """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
+
+        async def recover_mem0_intents(
+            self, *, on_landed: OnMem0Landed | None = None
+        ) -> object: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -1614,22 +1614,14 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
-class _Mem0WriteDurabilityService(
-    Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
-):
-    """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
-
-    async def recover_mem0_intents(
-        self, *, on_landed: OnMem0Landed | None = None
-    ) -> object: ...
-
-
 def _mark_supersedes_on_landing(memory_service: MemoryUpdater) -> OnMem0Landed:
     """The hook every Mem0 re-issue path runs when it lands: mark the write's journaled supersedes.
 
     Composed here because the service layer cannot import supersession_mark
     without pulling server modules up into it.
     """
+    from fused_memory.services.supersession_mark import mark_superseded_after_retry
+
     return partial(mark_superseded_after_retry, memory_service)
 
 
@@ -1645,6 +1637,8 @@ def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> async
 
     Each runs in its own loop, so a failing pass never skips the check.
     """
+    from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry
+
     policy = memory_service.mem0_retry_policy
 
     async def _run_both() -> None:
