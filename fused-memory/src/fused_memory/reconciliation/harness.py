@@ -817,6 +817,7 @@ class ReconciliationHarness:
         server_ready_event: asyncio.Event | None = None,
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
+        escalation_queue: EscalationQueue | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -947,7 +948,7 @@ class ReconciliationHarness:
         )
 
         # Escalation support
-        self._escalation_queue: EscalationQueue | None = None
+        self._escalation_queue: EscalationQueue | None = escalation_queue
         self._escalation_task: asyncio.Task | None = None
         self._escalation_url: str | None = None
 
@@ -1282,10 +1283,12 @@ class ReconciliationHarness:
         Called from ``_make_stages`` once per cycle (task 2146 β — there is no
         long-lived ``self.stages`` list to push into from
         ``_start_escalation_server`` anymore; escalation startup only stores
-        ``self._escalation_url``/``self._escalation_queue`` for the next
-        ``_make_stages`` call to pick up). Defensive: only assigns when the
-        harness has a value, so calls before escalation startup leave stages
-        untouched.
+        ``self._escalation_url`` for the next ``_make_stages`` call to pick up,
+        and ``self._escalation_queue`` is either injected at construction or
+        built by escalation startup). Defensive: assigns each value only when
+        the harness has one, so a call before escalation startup leaves the
+        URL untouched, and the queue too unless one was injected at
+        construction.
 
         Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
@@ -2545,16 +2548,27 @@ class ReconciliationHarness:
 
     # ── Escalation support ─────────────────────────────────────────────
 
+    def _configured_escalation_queue_dir(self) -> Path:
+        """``config.escalation_queue_dir``, made absolute against ``explore_codebase_root``."""
+        queue_dir = Path(self.config.escalation_queue_dir)
+        if not queue_dir.is_absolute():
+            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
+        return queue_dir
+
     async def _start_escalation_server(self) -> None:
-        """Start the escalation MCP server as a background asyncio task."""
+        """Start the escalation MCP server as a background asyncio task.
+
+        A queue injected at construction takes precedence over
+        ``config.escalation_queue_dir`` and is the one the server serves, so
+        filing and serving share one store.
+        """
         if not HAS_ESCALATION:
             logger.info('Escalation package not installed — skipping escalation server')
             return
 
-        queue_dir = Path(self.config.escalation_queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
+        if self._escalation_queue is None:
+            queue_dir = self._configured_escalation_queue_dir()
+            self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
 
         mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
             self._escalation_queue,
@@ -2591,8 +2605,8 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL and queue; _make_stages propagates them to each
-        # cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
+        # Store the escalation URL; _make_stages propagates it (and the queue) to
+        # each cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
         # there is no long-lived self.stages list to push into here anymore).
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
