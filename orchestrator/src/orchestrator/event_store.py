@@ -1163,6 +1163,13 @@ class EventType(StrEnum):
     shadow_cell_settled = 'shadow_cell_settled'
     shadow_cell_ended = 'shadow_cell_ended'
 
+    # startup_step_failed — one row per startup step whose outcome is not ok
+    #   (plans/startup-hardening-prd.md §3.1). Producer:
+    #   orchestrator/src/orchestrator/startup_steps.py::run_startup_step. Payload:
+    #   {step, status ('failed'|'partial'), exception_type, message,
+    #    failed_entries: [{entry, exception_type, message}]}
+    startup_step_failed = 'startup_step_failed'
+
 
 def cli_resume_failed_data(
     *,
