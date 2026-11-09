@@ -4,7 +4,10 @@ Bounds the backlog of unprocessed reconciliation events per project. When the
 count of buffered events plus the in-flight queue exceeds a hard limit, the
 policy routes to one of two outcomes:
 
-* **Orchestrator live for project** → file an L1 escalation under
+* **Orchestrator holds its project flock** (some process holds
+  ``<project_root>/data/orchestrator/orchestrator.lock``; see
+  ``fused_memory/services/orchestrator_detector.py``'s module docstring for
+  why the flock, not the PID probe, gates filing) → file an L1 escalation under
   ``<project_root>/data/escalations/`` through
   ``escalation.dedupe.submit_or_dedupe``. A tick that finds the condition
   still live FOLDS into the pending record for the same
@@ -33,6 +36,8 @@ from urllib.parse import quote
 
 from shared.project_layout import escalation_queue_dir
 from shared.safe_io import atomic_write_text
+
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -80,7 +85,7 @@ logger = logging.getLogger(__name__)
 
 
 OrchestratorDetector = Callable[[str], bool]
-"""Callable that takes a project_root path and returns True iff orchestrator is live."""
+"""Blocking callable: project_root -> True iff an orchestrator is live. Called through asyncio.to_thread."""
 
 TimeProvider = Callable[[], float]
 
@@ -239,7 +244,7 @@ class BacklogPolicy:
         self,
         event_buffer: EventBuffer,
         event_queue: EventQueueLike | None,
-        orchestrator_detector: OrchestratorDetector,
+        orchestrator_detector: OrchestratorDetector = is_orchestrator_lock_held,
         *,
         hard_limit: int = 500,
         hard_limit_overrides: dict[str, int] | None = None,
@@ -630,6 +635,11 @@ class BacklogPolicy:
         Writes one escalation per project with a non-zero buffered count (or
         per registered project, if the buffered count is unavailable). Returns
         the verdicts produced, primarily for test introspection.
+
+        A project whose routing raises (its orchestrator probe can, e.g. ENOLCK
+        from flock) is logged with its traceback and left out of the result;
+        it never suppresses the alert for the projects after it, the same
+        LOUD-and-INCLUSIVE rule ``_projects_with_backlog`` follows.
         """
         verdicts: list[BacklogVerdict] = []
         # One stats() snapshot for the whole fan-out, and the per-project
@@ -641,19 +651,23 @@ class BacklogPolicy:
         queue_pressure = self._queue_pressure()
         for project_id, buffered in await self._projects_with_backlog():
             backlog = queue_pressure + (buffered or 0)
-            verdict = await self._route_over_limit(
-                project_id=project_id,
-                backlog=backlog,
-                kind='wedge',
-                error_type='SqliteDrainerWedged',
-                summary=f'SQLite drainer wedged for {project_id}',
-                detail=(
-                    'The reconciliation event-queue drainer has not committed '
-                    f'within the stall threshold. Diagnostic payload: '
-                    f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
-                ),
-                suggested_action='inspect_sqlite_drainer',
-            )
+            try:
+                verdict = await self._route_over_limit(
+                    project_id=project_id,
+                    backlog=backlog,
+                    kind='wedge',
+                    error_type='SqliteDrainerWedged',
+                    summary=f'SQLite drainer wedged for {project_id}',
+                    detail=(
+                        'The reconciliation event-queue drainer has not committed '
+                        f'within the stall threshold. Diagnostic payload: '
+                        f'{json.dumps(payload, default=str, sort_keys=True)[:2000]}'
+                    ),
+                    suggested_action='inspect_sqlite_drainer',
+                )
+            except Exception:
+                logger.exception('backlog_policy: wedge routing failed for %s', project_id)
+                continue
             verdicts.append(verdict)
         return verdicts
 
@@ -731,7 +745,7 @@ class BacklogPolicy:
         """
         limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
-        if project_root is not None and self._detector(project_root):
+        if project_root is not None and await asyncio.to_thread(self._detector, project_root):
             path = await self._maybe_write_escalation(_EscalationFiling(
                 project_id=project_id,
                 project_root=project_root,
