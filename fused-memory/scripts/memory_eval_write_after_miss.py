@@ -38,12 +38,17 @@ limit: the scheduled runner judges the series (G6).
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
+import logging
+import os
 import sqlite3
+import sys
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -57,11 +62,15 @@ from shared.memory_eval_metrics import (
     MetricSeries,
     canonical_json_text,
     eval_dir,
+    load_series_window,
+    run_stamp,
+    stamp_datetime,
     validate_stamp,
     write_metric_series,
 )
 from shared.memory_eval_metrics import render_report as render_series_report
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import child_parent_id
@@ -70,9 +79,19 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_threshold,
 )
+from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.write_journal import WriteJournal
 
 EVAL_ID = 'e7-write-after-miss'
 METRIC_ID = 'write-after-miss'
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+"""fused-memory.service's WorkingDirectory: the anchor of a relative ``reconciliation.data_dir``."""
+
+_DEFAULT_METRICS_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'memory-evals'
+
+INITIAL_PERIOD_HOURS = 24.0
+"""The first run's period length. Every later period runs from the previous run's stamp."""
 
 GUARD_SEARCH_DEPTH = 5
 """The candidate depth of the production guard's pre-write search.
@@ -661,3 +680,107 @@ async def run_write_after_miss(
         report_path=report_path,
         incidents_path=incidents_path,
     )
+
+
+def evaluation_period(
+    root: str | Path, eval_id: str, stamp: str, *, initial_period_hours: float,
+) -> Period:
+    """``[previous run's stamp, stamp)``, so consecutive runs are disjoint samples.
+
+    With no earlier artifact, the period is the *initial_period_hours* before *stamp*.
+    """
+    end = stamp_datetime(stamp)
+    previous = load_series_window(root, eval_id, limit=1, before_stamp=stamp)
+    if previous:
+        return Period(stamp_datetime(previous[-1].run_stamp), end)
+    return Period(end - timedelta(hours=initial_period_hours), end)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The runner's ``--metrics-root/--eval-id/--project-id`` plus this producer's inputs.
+
+    There is no ``--apply`` and no ``--no-metrics``: the producer only reads,
+    and a run that cannot write its artifact must fail rather than go quiet.
+    """
+    parser = argparse.ArgumentParser(description=(
+        'Read-only E7 write-after-miss producer: the share of searched-then-written '
+        'Mem0 writes whose near-duplicate the caller was never shown.'
+    ))
+    parser.add_argument('--project-id', dest='project_id', required=True, help='Project id to measure')
+    parser.add_argument(
+        '--metrics-root', dest='metrics_root', default=str(_DEFAULT_METRICS_ROOT),
+        help=f'Root for M1 metric artifacts (default: {_DEFAULT_METRICS_ROOT})',
+    )
+    parser.add_argument(
+        '--eval-id', dest='eval_id', default=EVAL_ID,
+        help=f'Artifact directory name under --metrics-root (default: {EVAL_ID})',
+    )
+    parser.add_argument(
+        '--journal', default=None,
+        help='Write journal to read (default: <reconciliation.data_dir>/write_journal.db '
+             'from the fused-memory config, a relative data_dir anchored at the repo root)',
+    )
+    parser.add_argument(
+        '--initial-period-hours', dest='initial_period_hours', type=float,
+        default=INITIAL_PERIOD_HOURS,
+        help='First-run bootstrap only: the period length when no earlier artifact exists. '
+             'Later periods run from the previous run stamp (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    return parser
+
+
+def _default_journal(config: FusedMemoryConfig) -> Path:
+    data_dir = Path(config.reconciliation.data_dir)
+    return WriteJournal(data_dir if data_dir.is_absolute() else REPO_ROOT / data_dir).db_path
+
+
+async def _open_memory(config: FusedMemoryConfig) -> MemoryService:
+    """The one live-service factory. The caller closes what it returns."""
+    memory = MemoryService(config)
+    await memory.initialize()
+    return memory
+
+
+async def _run(args: argparse.Namespace) -> int:
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+    stamp = run_stamp()
+    period = evaluation_period(
+        args.metrics_root, args.eval_id, stamp, initial_period_hours=args.initial_period_hours,
+    )
+    config = FusedMemoryConfig()
+    journal_path = Path(args.journal) if args.journal else _default_journal(config)
+    memory = await _open_memory(config)
+    try:
+        outcome = await run_write_after_miss(
+            memory,
+            journal_path=journal_path,
+            out_root=args.metrics_root,
+            project_id=args.project_id,
+            stamp=stamp,
+            period=period,
+            eval_id=args.eval_id,
+        )
+    finally:
+        await memory.close()
+    print(outcome.report, end='')
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Exit non-zero on an unreadable journal, so the runner files a produce failure."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    args = build_parser().parse_args(argv)
+    try:
+        return asyncio.run(_run(args))
+    except JournalUnavailableError as exc:
+        print(f'{args.eval_id}: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
