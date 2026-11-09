@@ -1035,3 +1035,41 @@ def test_the_bound_covers_the_whole_run_failovers_included(tmp_path, capsys, poo
 
     assert _tokens_called(fake) == [TOKEN_B]
     assert any('timed out' in line for line in capsys.readouterr().err.splitlines())
+
+
+def _exhaustion_line(err: str) -> str:
+    [line] = [line for line in err.splitlines() if 'no pool account could take the run' in line]
+    assert line.startswith('nightly_prepare: ')
+    return line
+
+
+def _credentials_left(root: Path) -> list[Path]:
+    return list((root / 'data' / 'sitting' / 'config').rglob('.credentials.json'))
+
+
+@pytest.mark.timeout(FAILOVER_TEST_TIMEOUT_SECS)
+def test_every_seat_capped_fails_naming_the_earliest_reset(tmp_path, capsys, pool):
+    fake = _fake_claude(tmp_path, by_token={TOKEN_B: _cap(), TOKEN_H: _cap()})
+
+    assert _run(fake, pool) == mod.EXIT_FAILED
+
+    assert _tokens_called(fake) == [TOKEN_B, TOKEN_H], 'one pass over the pool, then stop'
+    line = _exhaustion_line(capsys.readouterr().err)
+    assert pool.soonest_resets_at is not None
+    assert pool.soonest_resets_at.isoformat() in line
+    assert 'recorded=0' in line
+    assert _credentials_left(tmp_path) == []
+
+
+def test_every_seat_rejecting_its_credentials_fails_and_never_rides_the_host_login(
+    tmp_path, capsys, sentinel_login, pool,
+):
+    fake = _fake_claude(tmp_path, by_token={TOKEN_B: _auth_401(), TOKEN_H: _auth_401()})
+
+    assert _run(fake, pool) == mod.EXIT_FAILED
+
+    assert _tokens_called(fake) == [TOKEN_B, TOKEN_H], 'no third call on a fallback credential'
+    assert not any(Path(call['env']['CLAUDE_CONFIG_DIR']).is_relative_to(sentinel_login) for call in fake.calls())
+    line = _exhaustion_line(capsys.readouterr().err)
+    assert 'auth-failed' in line and SEAT_B in line and SEAT_H in line
+    assert _credentials_left(tmp_path) == []
