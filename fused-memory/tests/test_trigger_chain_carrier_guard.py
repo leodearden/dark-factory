@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+from typing import get_args
 
 import pytest
+from shared.task_metadata import TriggerChainRole, TriggerChainSkill
 
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 
@@ -94,6 +96,12 @@ class TestShapeRefused:
     def test_non_mapping_chain(self, tmp_path) -> None:
         meta = {**human_gate(), 'trigger_chain': 'review'}
         _assert_refused(_guard(meta, tmp_path))
+
+    def test_the_hint_offers_every_role_and_skill_the_model_accepts(self, tmp_path) -> None:
+        meta = {**human_gate(), 'trigger_chain': 'review'}
+        hint = _assert_refused(_guard(meta, tmp_path))['hint']
+        for accepted in (*get_args(TriggerChainRole), *get_args(TriggerChainSkill)):
+            assert repr(accepted) in hint, accepted
 
     def test_run_id_without_the_skill_prefix(self, tmp_path) -> None:
         meta = human_gate()

@@ -10,7 +10,6 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared import task_metadata
 from shared.task_metadata import (
     TASK_METADATA_CAPABILITIES,
     TRIGGER_CHAIN_KEY,
@@ -18,6 +17,7 @@ from shared.task_metadata import (
     TriggerChain,
     is_known_metadata_key,
     parse_metadata,
+    registered_metadata_submodel,
 )
 
 SKILLS = ('review', 'hotspot-survey', 'review-all')
@@ -117,6 +117,12 @@ class TestTriggerChainRegistration:
     def test_key_spelling(self) -> None:
         assert TRIGGER_CHAIN_KEY == 'trigger_chain'
 
+    def test_the_key_is_registered_to_the_model(self) -> None:
+        assert registered_metadata_submodel(TRIGGER_CHAIN_KEY) is TriggerChain
+
+    def test_an_unregistered_key_has_no_model(self) -> None:
+        assert registered_metadata_submodel('x_never_registered') is None
+
     def test_write_boundary_refuses_a_slashed_skill(self) -> None:
         with pytest.raises(ValidationError, match='no leading slash'):
             parse_metadata(
@@ -164,4 +170,4 @@ class TestCapabilities:
                 assert head == 'before_done', capability
                 assert field in BeforeDone.model_fields, capability
             else:
-                assert capability in task_metadata._SUBMODEL_REGISTRY, capability
+                assert registered_metadata_submodel(capability) is not None, capability

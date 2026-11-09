@@ -58,12 +58,14 @@ __all__ = [
     'SubmodelCardinality',
     'TaskMetadata',
     'TriggerChain',
+    'TriggerChainRole',
     'TriggerChainSkill',
     'apply_migrations',
     'is_known_metadata_key',
     'parse_metadata',
     'recheck_secs_milestone_conflict',
     'register_metadata_submodel',
+    'registered_metadata_submodel',
     'script_root_kind_conflict',
     'validate_model_overrides',
 ]
@@ -737,6 +739,8 @@ class Recurrence(BaseModel):
 
 TRIGGER_CHAIN_KEY: str = 'trigger_chain'
 
+TriggerChainRole = Literal['completion_gate', 'human_gate']
+
 TriggerChainSkill = Literal['review', 'hotspot-survey', 'review-all']
 
 
@@ -751,7 +755,7 @@ class TriggerChain(BaseModel):
 
     model_config = ConfigDict(extra='allow')
 
-    role: Literal['completion_gate', 'human_gate']
+    role: TriggerChainRole
     skill: TriggerChainSkill
     run_id: str
     superseded_by: str | None = None
@@ -1096,6 +1100,11 @@ def register_metadata_submodel(
         )
     _SUBMODEL_REGISTRY[key] = model
     _SUBMODEL_CARDINALITY[key] = cardinality
+
+
+def registered_metadata_submodel(key: str) -> type[BaseModel] | None:
+    """The model :func:`register_metadata_submodel` registered for ``metadata[key]``, if any."""
+    return _SUBMODEL_REGISTRY.get(key)
 
 
 # Milestone is the first real W10 registrant: registering at module-import

@@ -77,7 +77,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never, get_args
 
 from pydantic import ValidationError
 from shared.before_done_paths import ScriptRootRefused, resolve_script_base
@@ -90,6 +90,8 @@ from shared.task_metadata import (
     Milestone,
     Recurrence,
     TriggerChain,
+    TriggerChainRole,
+    TriggerChainSkill,
     recheck_secs_milestone_conflict,
 )
 
@@ -347,9 +349,13 @@ def _validate_recurrence(
     return None
 
 
+def _alternatives(vocabulary: Any) -> str:
+    return '|'.join(repr(value) for value in get_args(vocabulary))
+
+
 _TRIGGER_CHAIN_SHAPE_HINT = (
-    "A trigger_chain must be {'role': 'completion_gate'|'human_gate', "
-    "'skill': 'review'|'hotspot-survey'|'review-all' (the bare skill name, no leading "
+    f"A trigger_chain must be {{'role': {_alternatives(TriggerChainRole)}, "
+    f"'skill': {_alternatives(TriggerChainSkill)} (the bare skill name, no leading "
     "slash), 'run_id': '<skill>-…', 'superseded_by': <run_id>|None}."
 )
 
@@ -387,9 +393,13 @@ def _validate_trigger_chain(
             "chain task must never count toward its own run's measure.",
             hint="Remove 'x_finding_run' from the chain task's metadata.",
         )
-    if role == 'completion_gate':
-        return _completion_gate_carrier_error(before_done)
-    return _human_gate_carrier_error(before_done, always_escalates)
+    match role:
+        case 'completion_gate':
+            return _completion_gate_carrier_error(before_done)
+        case 'human_gate':
+            return _human_gate_carrier_error(before_done, always_escalates)
+        case _:
+            assert_never(role)
 
 
 def _completion_gate_carrier_error(before_done: Any) -> dict[str, Any] | None:
