@@ -185,11 +185,12 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
     assert body['category'] == 'infra_issue'
 
 
-def _write_lock_file(project_root: Path, first_line: str) -> Path:
+def _write_orchestrator_lock(project_root: Path, first_line: str) -> Path:
+    """Write ``<project_root>/data/orchestrator/orchestrator.lock`` with *first_line*; return its path."""
     lock_dir = project_root / 'data' / 'orchestrator'
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / 'orchestrator.lock'
-    lock_path.write_text(f'{first_line}\n')
+    lock_path.write_text(first_line + '\n', encoding='utf-8')
     return lock_path
 
 
@@ -199,7 +200,7 @@ async def test_default_detector_rejects_when_the_lock_names_a_live_pid_but_nothi
 ):
     await _seed_buffered(event_buffer, 'proj', n=6)
     project_root = tmp_path / 'proj_root'
-    _write_lock_file(project_root, f'PID {os.getpid()} started 2026-04-18T00:00:00Z')
+    _write_orchestrator_lock(project_root, f'PID {os.getpid()} started 2026-04-18T00:00:00Z')
     policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
 
     verdict = await policy.check('proj', project_root=str(project_root))
@@ -215,7 +216,7 @@ async def test_default_detector_escalates_when_the_lock_is_held_whatever_pid_it_
 ):
     await _seed_buffered(event_buffer, 'proj', n=6)
     project_root = tmp_path / 'proj_root'
-    lock_path = _write_lock_file(project_root, 'PID 2147483646 started 2026-04-13T00:00:00Z')
+    lock_path = _write_orchestrator_lock(project_root, 'PID 2147483646 started 2026-04-13T00:00:00Z')
     policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
 
     handle = lock_path.open('r+b')
@@ -783,17 +784,6 @@ def test_orchestrator_detector_unparseable_lock(tmp_path):
 
 
 # ── orchestrator_started_at (task 2963) ───────────────────────────────────
-
-
-def _write_orchestrator_lock(project_root, first_line: str):
-    """Write ``<project_root>/data/orchestrator/orchestrator.lock`` with *first_line*.
-
-    Mirrors the ``PID <N> started <ISO>`` lock-write fixture pattern used by
-    the ``is_orchestrator_live_for`` tests above.
-    """
-    lock_dir = project_root / 'data' / 'orchestrator'
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_dir.joinpath('orchestrator.lock').write_text(first_line + '\n', encoding='utf-8')
 
 
 def test_orchestrator_started_at_parses_z_suffix_utc_aware(tmp_path):
