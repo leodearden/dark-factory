@@ -93,6 +93,7 @@ __all__ = [
     'report_artifact_path',
     'run_stamp',
     'serialize_metric_series',
+    'stamp_datetime',
     'validate_metric_series',
     'validate_stamp',
     'write_metric_series',
@@ -183,6 +184,11 @@ def validate_stamp(stamp: str, *, what: str) -> str:
         )
     return stamp
 
+
+def stamp_datetime(stamp: str) -> datetime:
+    """Inverse of :func:`run_stamp`, beside :data:`_STAMP_FORMAT` so the format has one home."""
+    validate_stamp(stamp, what='stamp')
+    return datetime.strptime(stamp, _STAMP_FORMAT).replace(tzinfo=UTC)
 
 def _is_whole(value: float) -> bool:
     return abs(value - round(value)) <= _WHOLE_NUMBER_TOL * max(1.0, abs(value))
