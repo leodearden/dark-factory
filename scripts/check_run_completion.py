@@ -23,9 +23,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, NamedTuple, NoReturn, TypeGuard
 
+from _task_db_scan import discover_project_roots
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+from orchestrator.predicate_recheck import PredicateRecheck
+from pydantic import ValidationError
 from shared.mcp_session import SyncMcpSession
-from shared.task_statuses import TaskStatus
+from shared.task_metadata import TRIGGER_CHAIN_KEY, TriggerChain
+from shared.task_statuses import ACTIVE, TaskStatus
 
 PRIORITY_WEIGHTS: Final[Mapping[str, int]] = MappingProxyType(
     {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'polish': 1}
@@ -467,6 +471,271 @@ def exit_code(result: CompletionVerdict | CheckFailure) -> int:
     return os.EX_TEMPFAIL if result.verdict is Verdict.NOT_YET else COULD_NOT_CHECK
 
 
+GET_TASK_TOOL: Final = 'get_task'
+CHAIN_STATUSES: Final = tuple(status.value for status in sorted(ACTIVE))
+
+
+class ProjectState(enum.StrEnum):
+    NEVER_FILED = 'never_filed'
+    NO_OPEN_CHAINS = 'no_open_chains'
+    OPEN_CHAINS = 'open_chains'
+    ERROR = 'error'
+
+
+@dataclass(frozen=True)
+class CompletionGateReport:
+    task_id: int
+    status: str
+    next_check_at: str | None
+    streak: int
+    threshold: float | None
+    threshold_unreadable: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        rendered: dict[str, Any] = {
+            'id': self.task_id,
+            'status': self.status,
+            'next_check_at': self.next_check_at,
+            'streak': self.streak,
+            'threshold': self.threshold,
+        }
+        if self.threshold_unreadable is not None:
+            rendered['threshold_unreadable'] = self.threshold_unreadable
+        return rendered
+
+
+@dataclass(frozen=True)
+class HumanGateReport:
+    task_id: int
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {'id': self.task_id, 'status': self.status}
+
+
+@dataclass(frozen=True)
+class ChainReport:
+    skill: str
+    run_id: str
+    completion_gate: CompletionGateReport | None
+    human_gate: HumanGateReport | None
+    verdict: CompletionVerdict | CheckFailure | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'skill': self.skill,
+            'run_id': self.run_id,
+            'completion_gate': None if self.completion_gate is None else self.completion_gate.to_dict(),
+            'human_gate': None if self.human_gate is None else self.human_gate.to_dict(),
+            'verdict': None if self.verdict is None else self.verdict.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ProjectReport:
+    project_root: str
+    state: ProjectState
+    chains: tuple[ChainReport, ...] = ()
+    unreadable_task_ids: tuple[int, ...] = ()
+    chain_tasks: int = 0
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        rendered: dict[str, Any] = {'project_root': self.project_root, 'state': self.state.value}
+        if self.error is not None:
+            rendered['error'] = self.error
+        rendered['unreadable_task_ids'] = list(self.unreadable_task_ids)
+        rendered['chains'] = [chain.to_dict() for chain in self.chains]
+        return rendered
+
+
+@dataclass(frozen=True)
+class _ChainLink:
+    row: Mapping[str, Any]
+    link: TriggerChain
+
+
+def _get_task(call_tool: CallTool, project_root: str, task_id: int) -> tuple[str, Mapping[str, Any]]:
+    """A task's status and metadata, under the same reply checks as the lookup."""
+    reply = _call(call_tool, GET_TASK_TOOL, {'id': str(task_id), 'project_root': project_root})
+    status, metadata = reply.get('status'), reply.get('metadata')
+    if not isinstance(status, str) or not isinstance(metadata, Mapping):
+        raise MalformedReply(f'{GET_TASK_TOOL} for task {task_id} in {project_root}: no str status and metadata object')
+    return status, metadata
+
+
+def _chain_links(rows: Iterable[Mapping[str, Any]]) -> tuple[tuple[_ChainLink, ...], tuple[int, ...]]:
+    links: list[_ChainLink] = []
+    unreadable: list[int] = []
+    for row in rows:
+        try:
+            links.append(_ChainLink(row, TriggerChain.model_validate(row.get('matched_value'))))
+        except (ValidationError, TypeError):
+            unreadable.append(row['task_id'])
+    return tuple(links), tuple(unreadable)
+
+
+def _open_chains(links: Iterable[_ChainLink]) -> dict[tuple[str, str], dict[str, Mapping[str, Any]]]:
+    """Each open chain's first row per role, keyed by (skill, run_id); open is the C2 guard's rule."""
+    chains: dict[tuple[str, str], dict[str, Mapping[str, Any]]] = {}
+    for item in links:
+        if item.link.superseded_by is None:
+            chains.setdefault((item.link.skill, item.link.run_id), {}).setdefault(item.link.role, item.row)
+    return chains
+
+
+def _milestone_at(metadata: Mapping[str, Any]) -> str | None:
+    milestone = metadata.get('milestone')
+    at = milestone.get('at') if isinstance(milestone, Mapping) else None
+    return at if isinstance(at, str) else None
+
+
+def _gate_request(metadata: Mapping[str, Any]) -> CheckRequest | str:
+    """The check the gate's predicate runs (D9), or why its args cannot be read back."""
+    before_done = metadata.get('before_done')
+    args = before_done.get('args') if isinstance(before_done, Mapping) else None
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return 'the gate carries no before_done.args list of strings'
+    try:
+        request = parse_args(args)
+    except UsageError as exc:
+        return str(exc)
+    return request if isinstance(request, CheckRequest) else 'before_done.args ask for --pending, not a check'
+
+
+def _completion_gate(
+    call_tool: CallTool, project_root: str, task_id: int,
+) -> tuple[CompletionGateReport, CheckRequest | None]:
+    status, metadata = _get_task(call_tool, project_root, task_id)
+    request = _gate_request(metadata)
+    readable = request if isinstance(request, CheckRequest) else None
+    recheck = PredicateRecheck.from_metadata(metadata)
+    report = CompletionGateReport(
+        task_id=task_id,
+        status=status,
+        next_check_at=_milestone_at(metadata),
+        streak=0 if recheck is None else recheck.consecutive,
+        threshold=None if readable is None else readable.threshold,
+        threshold_unreadable=request if isinstance(request, str) else None,
+    )
+    return report, readable
+
+
+def _chain_report(
+    call_tool: CallTool, project_root: str, chain: tuple[str, str], rows: Mapping[str, Mapping[str, Any]],
+) -> ChainReport:
+    skill, run_id = chain
+    human_row = rows.get('human_gate')
+    human = None if human_row is None else HumanGateReport(human_row['task_id'], human_row['status'])
+    gate_row = rows.get('completion_gate')
+    if gate_row is None:
+        return ChainReport(skill, run_id, None, human, None)
+    gate, request = _completion_gate(call_tool, project_root, gate_row['task_id'])
+    verdict = None if request is None else evaluate(request, call_tool=call_tool).result
+    return ChainReport(skill, run_id, gate, human, verdict)
+
+
+def _without_active_chains(call_tool: CallTool, project_root: str) -> ProjectReport:
+    """Never filed, or all closed: the ACTIVE lookup's own count cannot tell them apart."""
+    arguments = {'project_root': project_root, 'key': TRIGGER_CHAIN_KEY, 'limit': 1}
+    page = _lookup_page(_call(call_tool, LOOKUP_TOOL, arguments), f'{LOOKUP_TOOL} for {project_root}')
+    state = ProjectState.NEVER_FILED if page.tasks_with_key == 0 else ProjectState.NO_OPEN_CHAINS
+    return ProjectReport(project_root, state, chain_tasks=page.tasks_with_key)
+
+
+def _read_project(call_tool: CallTool, project_root: str) -> ProjectReport:
+    arguments = {
+        'project_root': project_root,
+        'key': TRIGGER_CHAIN_KEY,
+        'statuses': list(CHAIN_STATUSES),
+        'include_value': True,
+        'limit': LOOKUP_PAGE_SIZE,
+    }
+    rows, _ = _lookup_pages(call_tool, arguments)
+    if not rows:
+        return _without_active_chains(call_tool, project_root)
+    links, unreadable = _chain_links(rows)
+    chains = tuple(
+        _chain_report(call_tool, project_root, chain, roles) for chain, roles in _open_chains(links).items()
+    )
+    state = ProjectState.OPEN_CHAINS if chains else ProjectState.NO_OPEN_CHAINS
+    return ProjectReport(project_root, state, chains, unreadable, chain_tasks=len(rows))
+
+
+def read_pending(
+    project_roots: Iterable[str], *, call_tool: CallTool = call_fused_memory_tool,
+) -> tuple[ProjectReport, ...]:
+    """One report per root; a root whose store read fails is reported as an error, never dropped."""
+    reports: list[ProjectReport] = []
+    for root in map(_absolute_root, project_roots):
+        try:
+            reports.append(_read_project(call_tool, root))
+        except LookupFailed as exc:
+            reports.append(ProjectReport(root, ProjectState.ERROR, error=str(exc)))
+    return tuple(reports)
+
+
+def _gate_line(gate: CompletionGateReport | None) -> str:
+    if gate is None:
+        return 'completion gate: none (interim form), no threshold or share measured'
+    threshold = gate.threshold if gate.threshold_unreadable is None else f'unreadable: {gate.threshold_unreadable}'
+    return (
+        f'completion gate {gate.task_id}: {gate.status}, next check {gate.next_check_at or "unscheduled"}, '
+        f'streak {gate.streak}, threshold {threshold}'
+    )
+
+
+def _share_line(verdict: CompletionVerdict | CheckFailure) -> str:
+    rendered = verdict.to_dict()
+    share = 'none' if rendered['share'] is None else rendered['share']
+    outcome = 'pass, vacuous' if rendered['vacuous'] else rendered.get('error', rendered['verdict'])
+    detail = f': {verdict.detail}' if isinstance(verdict, CheckFailure) else ''
+    return f'share {share} ({outcome}){detail}'
+
+
+def _chain_lines(chain: ChainReport) -> list[str]:
+    human = 'human gate: none' if chain.human_gate is None else (
+        f'human gate {chain.human_gate.task_id}: {chain.human_gate.status}'
+    )
+    lines = [_gate_line(chain.completion_gate), human]
+    if chain.verdict is not None:
+        lines.append(_share_line(chain.verdict))
+    return [f'{chain.skill} {chain.run_id}', *(f'  {line}' for line in lines)]
+
+
+def _project_lines(report: ProjectReport) -> list[str]:
+    root = report.project_root
+    if report.state is ProjectState.ERROR:
+        return [f'project {root}: could not read: {report.error}']
+    if report.state is ProjectState.NEVER_FILED:
+        body = [f'no trigger chain has been filed in {root}']
+    elif report.state is ProjectState.NO_OPEN_CHAINS:
+        body = [f'no open trigger chain in {root} ({report.chain_tasks} chain tasks, none open)']
+    else:
+        body = [line for chain in report.chains for line in _chain_lines(chain)]
+    body += [f'unreadable trigger_chain on task {task_id}' for task_id in report.unreadable_task_ids]
+    return [f'project {root}', *(f'  {line}' for line in body)]
+
+
+def render_text(reports: Sequence[ProjectReport]) -> list[str]:
+    if not reports:
+        return ['no project root to report: none named and none discovered']
+    return [line for report in reports for line in _project_lines(report)]
+
+
+def render_json(reports: Sequence[ProjectReport]) -> str:
+    return json.dumps({'projects': [report.to_dict() for report in reports]})
+
+
+def _report_pending(request: PendingRequest) -> int:
+    reports = read_pending(request.project_roots or discover_project_roots())
+    if request.as_json:
+        print(render_json(reports))
+    else:
+        print('\n'.join(render_text(reports)))
+    return COULD_NOT_CHECK if any(report.state is ProjectState.ERROR for report in reports) else os.EX_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         request = parse_args(sys.argv[1:] if argv is None else argv)
@@ -474,7 +743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f'{exc.usage}{PROG}: error: {exc}', file=sys.stderr)
         return COULD_NOT_CHECK
     if isinstance(request, PendingRequest):
-        raise NotImplementedError('--pending lands with the report layer')
+        return _report_pending(request)
     outcome = evaluate(request)
     for line in human_lines(outcome):
         print(line)
