@@ -70,6 +70,7 @@ from shared.memory_eval_verdicts import (
 
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH as FUSED_MEMORY_DEFAULT_CONFIG_PATH
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.eval.retrieval_probe import EVAL_ID as E1_EVAL_ID
 from fused_memory.utils.target_store_preflight import (
     TargetStoreUnpopulated,
     assert_queue_dir_populated,
@@ -97,6 +98,7 @@ class RunnerConfig(BaseModel):
     model_config = ConfigDict(extra='forbid', frozen=True)
 
     project_id: str = Field(min_length=1)
+    """The project E4 and E6 measure. E1 takes no project: it probes its topic registry's own census set."""
     runs_per_quarter: int
     false_alarm_budget: float
     min_samples: int
@@ -152,7 +154,7 @@ def _sweep_argv(root: Path, eval_id: str, project_id: str) -> list[str]:
 
 
 DEFAULT_PRODUCERS: tuple[Producer, ...] = (
-    Producer('e1-retrieval-health', _SCRIPTS_DIR / 'memory_eval_retrieval_probe.py', _probe_argv),
+    Producer(E1_EVAL_ID, _SCRIPTS_DIR / 'memory_eval_retrieval_probe.py', _probe_argv),
     Producer('e4-staleness-sweep', _SCRIPTS_DIR / 'memory_eval_staleness_sweep.py', _sweep_argv),
     Producer('e6-corpus-health', _SCRIPTS_DIR / 'audit_duplicate_memories.py', _sweep_argv),
 )

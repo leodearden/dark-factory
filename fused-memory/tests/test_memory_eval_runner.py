@@ -30,6 +30,8 @@ from shared.memory_eval_verdicts import (
     load_verdicts_artifact,
 )
 
+from fused_memory.eval.retrieval_probe import EVAL_ID as E1_PROBE_EVAL_ID
+
 _FM_ROOT = Path(__file__).parent.parent
 SCRIPT_PATH = _FM_ROOT / 'scripts' / 'memory_eval_runner.py'
 COMMITTED_CONFIG = _FM_ROOT / 'config' / 'memory-eval.yaml'
@@ -185,6 +187,14 @@ def _flag_value(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
+_PRODUCER_CLI: dict[str, tuple[str, str]] = {
+    'e1-retrieval-health': ('build_parser', 'out_root'),
+    'e4-staleness-sweep': ('build_parser', 'metrics_root'),
+    'e6-corpus-health': ('_build_parser', 'metrics_root'),
+}
+"""eval_id -> (the producer script's parser factory, the dest its artifact root lands in)."""
+
+
 class TestDefaultProducers:
     def test_three_producers_whose_scripts_exist(self):
         producers = _mod().DEFAULT_PRODUCERS
@@ -200,11 +210,25 @@ class TestDefaultProducers:
             assert producer.script.is_file()
             assert producer.script.parent == _FM_ROOT / 'scripts'
 
-    def test_e1_writes_under_the_root(self, tmp_path):
+    def test_e1_is_registered_under_the_probe_s_own_eval_id(self):
+        assert _mod().DEFAULT_PRODUCERS[0].eval_id == E1_PROBE_EVAL_ID
+
+    def test_e1_writes_under_the_root_and_probes_its_own_project_set(self, tmp_path):
         e1 = _mod().DEFAULT_PRODUCERS[0]
         argv = e1.build_argv(tmp_path, e1.eval_id, 'dark_factory')
         assert _flag_value(argv, '--out-root') == str(tmp_path)
         assert '--eval-id' not in argv
+        assert '--project-id' not in argv
+
+    @pytest.mark.parametrize('eval_id', sorted(_PRODUCER_CLI))
+    def test_the_real_producer_parses_the_registry_argv(self, tmp_path, eval_id):
+        producer = next(p for p in _mod().DEFAULT_PRODUCERS if p.eval_id == eval_id)
+        parser_name, root_dest = _PRODUCER_CLI[eval_id]
+        parser = getattr(load_script_module(producer.script), parser_name)()
+        args = vars(parser.parse_args(producer.build_argv(tmp_path, eval_id, 'dark_factory')))
+        assert Path(args[root_dest]) == tmp_path
+        assert args.get('eval_id', eval_id) == eval_id
+        assert not args.get('apply') and not args.get('no_metrics')
 
     def test_e4_and_e6_are_told_the_registry_eval_id(self, tmp_path):
         for producer in _mod().DEFAULT_PRODUCERS[1:]:

@@ -2,7 +2,9 @@
 # Every value is an operator declaration and every key is required: the runner
 # has no code defaults (docs/prds/memory-eval-program.md G6).
 
-# The memory project the producers measure.
+# The memory project E4 and E6 measure. E1 is not told it: it probes the
+# project set its topic registry was derived from (DEFAULT_PROJECT_IDS in
+# fused-memory/scripts/memory_eval_retrieval_probe.py).
 project_id: dark_factory
 
 # Runs per quarter: the timer fires daily (OnCalendar in
