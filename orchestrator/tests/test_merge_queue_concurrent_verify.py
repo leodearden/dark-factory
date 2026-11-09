@@ -71,12 +71,14 @@ from _wait_hygiene_scan import (
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.types import QueuedBranch, RemergeBase, RemergeReason
 from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
+    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify import VerifyResult
@@ -139,6 +141,37 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
+
+
+RemergeCall = tuple[str, RemergeClaim | None, SpeculativeItem]
+
+
+def _record_remerges(worker: SpeculativeMergeWorker) -> list[RemergeCall]:
+    """Wrap the worker's re-merge to record each call's task id, claim and
+    replacement (task 8524); the re-merge itself runs unchanged."""
+    calls: list[RemergeCall] = []
+    original = worker._remerge
+
+    async def _recording(
+        req: MergeRequest, started: float | None, claim: RemergeClaim | None = None,
+    ) -> SpeculativeItem:
+        out = await original(req, started, claim=claim)
+        calls.append((req.task_id, claim, out))
+        return out
+
+    worker._remerge = _recording  # type: ignore[method-assign]
+    return calls
+
+
+def _one_remerge(
+    calls: list[RemergeCall], task_id: str,
+) -> tuple[RemergeClaim, SpeculativeItem]:
+    """The single re-merge of *task_id*, which must have been handed a claim."""
+    mine = [(claim, out) for tid, claim, out in calls if tid == task_id]
+    assert len(mine) == 1, calls
+    claim, out = mine[0]
+    assert claim is not None, f'{task_id} was re-merged without a claim'
+    return claim, out
 
 
 # THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
@@ -2262,6 +2295,7 @@ class TestChainInvalidationUnderOverlap:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
+        remerges = _record_remerges(worker)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2325,6 +2359,13 @@ class TestChainInvalidationUnderOverlap:
             'GREEN (step-20): head-failure cascade clears _inflight, '
             're-dispatches N+1 via the redispatch park → "done".'
         )
+        # The head failed and the cascade cleared _inflight, so no live tip
+        # was left: N+1's replacement fell to main, holding no permit, with
+        # the reason on the item (plans/merge-lane-policy-prd.md D1).
+        claim, replacement = _one_remerge(remerges, 'ci-b')
+        assert claim.anchor.tip is None and claim.permit is None, claim
+        assert replacement.remerge_base == claim.anchor
+        assert replacement.speculative is False
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
         # Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
@@ -2725,6 +2766,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, dead_remote)
+        remerges = _record_remerges(worker)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2768,6 +2810,13 @@ class TestHaltAndUnavailable:
                 req_b.result,
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
+            # N had landed by N+1's finalize, so nothing was left to stack on:
+            # N+1's replacement fell to main and its permit was freed, not
+            # carried (plans/merge-lane-policy-prd.md D1).
+            claim, replacement = _one_remerge(remerges, 'unav-b')
+            assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
+            assert claim.permit is None and replacement.permit is None
+            assert worker.speculation_accounting_violations() == []
         finally:
             await stop_merge_worker(worker, worker_task)
 

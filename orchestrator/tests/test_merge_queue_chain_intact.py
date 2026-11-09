@@ -941,3 +941,88 @@ class TestDispatchSitesReanchor:
         row = _the_row(store, EventType.speculative_discard)
         assert row['reason'] == 'main_advanced'
         assert (row['anchor_reason'], row['anchor_base']) == ('no_tip', None)
+
+
+# ── task 8524: the adoption-time void re-anchors (consumer 2) ────────────────
+
+
+def _parked(worker: SpeculativeMergeWorker, task_id: str) -> SpeculativeItem:
+    """The one item parked for re-dispatch under *task_id*."""
+    parked = [i for i in worker._intake.pending_redispatch() if i.request.task_id == task_id]
+    assert len(parked) == 1, parked
+    return parked[0]
+
+
+async def _voided_entry(
+    worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
+) -> tuple[InflightEntry, SpecPermit]:
+    """A FAILed verdict built on a recorded-dead base, whose entry holds a permit."""
+    _, built = await _make_merged_item(git_ops, config, 'task/adopt-x', 'adopt_x.py', 'x=1\n')
+    permit = await _ledger(worker).acquire()
+    item = dataclasses.replace(built, base_sha=_DEAD, permit=permit)
+    worker._register_owned_merge_worktree(item.merge_wt)
+    worker._host_allocator = _make_mock_allocator()
+    worker._record_dead_base(_DEAD, killer=_KILLER)
+    lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+    entry = _make_fail_entry(item, lease, MergeOutcome('blocked', reason='verify fail'), item.merge_wt)
+    return dataclasses.replace(entry, permit=permit), permit
+
+
+async def _finalize(worker: SpeculativeMergeWorker, entry: InflightEntry) -> bool:
+    return await worker._finalize_inflight(entry)
+
+
+@pytest.mark.asyncio
+class TestAdoptionVoidReanchor:
+    """A voided verdict's replacement takes the entry's permit onto a live
+    frontier tip, or falls to main and frees it (plans/merge-lane-policy-prd.md
+    D1)."""
+
+    async def test_the_replacement_restacks_on_an_unrelated_live_tip_with_the_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
+        tip = await _live_tip(worker, git_ops, config)
+        entry, permit = await _voided_entry(worker, git_ops, config)
+
+        assert await _finalize(worker, entry) is False
+
+        replacement = _parked(worker, 'task/adopt-x')
+        assert isinstance(replacement, RealMergeItem)
+        assert replacement.base_sha == tip
+        assert replacement.speculative is True
+        assert replacement.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
+        assert replacement.permit is permit
+        assert permit.released is False, "finalize's finally must not free a transferred permit"
+        assert permit in _ledger(worker).live
+        row = _the_row(store, EventType.verdict_voided)
+        assert row['point'] == 'adoption'
+        assert (row['anchor_reason'], row['anchor_base']) == ('live_tip', tip)
+
+    async def test_a_successor_built_on_the_voided_commit_sends_it_to_main(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The circularity ground: the only tip on offer is stacked on the
+        commit being voided, so it dies with it."""
+        store = _LateArrivalFakeEventStore()
+        worker = _make_worker(git_ops, event_store=store)
+        entry, permit = await _voided_entry(worker, git_ops, config)
+        assert isinstance(entry.item, RealMergeItem)
+        _, successor = _make_fake_item(
+            'adopt-y', base_sha=entry.item.merge_result.merge_commit or '',
+            merge_commit='7' * 40, config=config, git_repo=git_repo,
+        )
+        assert isinstance(successor, RealMergeItem)
+        worker._inflight.append(_frontier_entry(successor))
+
+        assert await _finalize(worker, entry) is False
+
+        replacement = _parked(worker, 'task/adopt-x')
+        assert replacement.base_sha == await git_ops.get_main_sha()
+        assert replacement.speculative is False
+        assert replacement.remerge_base == RemergeBase(None, RemergeReason.TIP_DEAD)
+        assert replacement.permit is None
+        assert permit.released is True
+        row = _the_row(store, EventType.verdict_voided)
+        assert (row['anchor_reason'], row['anchor_base']) == ('tip_dead', None)
