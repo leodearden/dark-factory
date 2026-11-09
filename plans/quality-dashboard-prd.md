@@ -66,12 +66,12 @@ negative, so an EWMA chart can never show improvement at these rates.
    `chain_items`): per-landing outcome flags are inherited by every member; verify and rejection counts
    are per unit.
 2. **A shared producer** (`shared/src/shared/quality_series/`) computes, for landings newer than a
-   per-project cursor, one immutable per-landing row from runs.db (events, invocations, flake tables),
+   per-project cursor, one per-landing row from runs.db (events, invocations, flake tables),
    git (lines and paths of the landing vs its first parent, budgeted) and, for backfill only, the on-disk
    review counter. It also holds the pure statistics (stdlib only). The dashboard and any offline re-run
    call the same functions.
-3. **A dashboard sampler loop** (600 s, beside `dashboard/loops.py::_burndown_loop`) appends rows to a
-   new `quality.db` outside the retention policy and writes a value-or-gap `sample_state` row per
+3. **A dashboard sampler loop** (600 s, beside `dashboard/loops.py::_burndown_loop`) upserts rows into a
+   new `quality.db` (decision 14) outside the retention policy and writes a value-or-gap `sample_state` row per
    project per tick. The read side marks the datum `stale` with "N landings not yet sampled" when main
    is ahead of the cursor; nothing computes on read.
 4. **A marker stream**, derived (routing steps from `routing_decision`, cause from `config_reload`,
