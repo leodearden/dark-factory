@@ -78,7 +78,7 @@ def glm_subscription_config(token: str = 'zai-test-token') -> EvalConfig:
 
 def minimax_metered_config(token: str = 'minimax-test-token') -> EvalConfig:
     return EvalConfig(
-        'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
+        'minimax-m3.1-flash-endpoint', 'claude', MINIMAX_MODEL, 'high',
         env_overrides={'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL, 'ANTHROPIC_AUTH_TOKEN': token},
     )
 
