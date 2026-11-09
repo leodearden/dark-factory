@@ -72,6 +72,7 @@ from orchestrator.verify_admission_record import (
     legs_from_wire,
     plan_request,
 )
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -4873,7 +4874,7 @@ class VerifyResult:
     # not recorded (an older remote, hand-built results, sentinels); () = nothing ran.
     units: tuple[verify_evidence.VerifyUnit, ...] | None = None
     # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
-    cache_mode: verify_evidence.CacheMode = verify_evidence.CacheMode.OFF
+    cache_mode: CacheMode = CacheMode.OFF
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4888,7 +4889,7 @@ class VerifyResult:
             self.admission_legs = legs_from_wire(self.admission_legs)
         if self.units is not None:
             self.units = verify_evidence.units_from_wire(self.units)
-        self.cache_mode = verify_evidence.CacheMode(self.cache_mode)
+        self.cache_mode = CacheMode(self.cache_mode)
 
     @property
     def plan_hash(self) -> str | None:
@@ -8579,12 +8580,13 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
     return _list
 
 
-# Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
-# it renders into. Used by _executed_module_configs_from_plan to recover
-# which of test_command/lint_command/type_check_command a PlannedRun belongs
-# to. Keyed off `reason` (verify_plan._derive_module_runs's docstring: "Each
-# per-tool run's reason is prefixed with the tool name ... so a caller can
-# recover tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
+# Maps a PlannedRun's leg to the ModuleConfig attribute it renders into. Used
+# by _executed_module_configs_from_plan to recover which of
+# test_command/lint_command/type_check_command a PlannedRun belongs to. The
+# leg comes from verify_plan.py::planned_run_leg, which decodes the run's
+# reason prefix (verify_plan._derive_module_runs's docstring: "Each per-tool
+# run's reason is prefixed with the tool name ... so a caller can recover
+# tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
 # because an OPAQUE-parsed command — an unrecognised head, e.g. a synthetic
 # test-fixture command, or a chain invoking no recognised tool or two of them
 # — always resolves to the SAME `ToolKind.OPAQUE` regardless of which slot
@@ -8594,11 +8596,11 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
 # commands to.) A SKIPPED run's cmd
 # is None and needs no attribution, since the corresponding ModuleConfig
 # field is simply left unset (None) there.
-_MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
-    ('lint:', 'lint_command'),
-    ('pyright:', 'type_check_command'),
-    ('pytest:', 'test_command'),
-)
+_MC_ATTR_BY_LEG: dict[verify_evidence.Leg, str] = {
+    verify_evidence.Leg.LINT: 'lint_command',
+    verify_evidence.Leg.TYPE: 'type_check_command',
+    verify_evidence.Leg.TEST: 'test_command',
+}
 
 
 def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
@@ -8611,10 +8613,8 @@ def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     ``ModuleConfig`` tool slots. :func:`_mc_attr_for_run` is the raising
     variant for callers that have already excluded that shape.
     """
-    for prefix, attr in _MC_ATTR_BY_REASON_PREFIX:
-        if run.reason.startswith(prefix):
-            return attr
-    return None
+    leg = verify_plan.planned_run_leg(run)
+    return None if leg is None else _MC_ATTR_BY_LEG[leg]
 
 
 def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
