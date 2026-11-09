@@ -1,9 +1,10 @@
 """Escalation classification helpers.
 
-Single site (INV-5) for four related but distinct classification concerns.
+Single site (INV-5) for five related but distinct classification concerns.
 The first two are described in plans/escalation-lifecycle-dashboard-prd.md
 Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8; the
-fourth has no design doc, and its docstring is its contract:
+fourth in that PRD's D2; the fifth has no design doc, and its docstring is its
+contract:
 
 - ``classify_resolver_tier`` — maps a ``resolved_by`` attribution string to a
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
@@ -16,6 +17,8 @@ fourth has no design doc, and its docstring is its contract:
 - ``info_l0_mechanical_class`` — which mechanical info-L0 class a record
   belongs to, if any: a registered filer role (``INFO_L0_MECHANICAL_ROLES``)
   or the discriminated done-step-commit orphan (``is_done_step_commit_orphan``).
+- ``is_harness_filed`` — whether a record was filed by the harness (the bare
+  ``HARNESS_ROLE`` or a sentinel-prefixed role) rather than by an agent.
 - ``closed_by_non_sweep_resolver`` — whether a record was closed by something
   that carries a finding (an agent, a human, a cascade) rather than by an
   automated sweep.
@@ -30,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Set as AbstractSet
 
 from escalation.authority import COORDINATOR_IDENTITY
-from escalation.models import Escalation
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 # Resolver→tier classification table (plans/escalation-lifecycle-dashboard-prd.md
 # Contract Seam 1). Exact-membership frozensets for the tiers whose
@@ -158,6 +161,16 @@ INFO_L0_MECHANICAL_ROLES: frozenset[str] = frozenset({
 
 DONE_STEP_COMMIT_ORPHAN_CLASS = 'done-step-commit-orphan'
 
+# The bare role in-process harness code files under (workflow, merge worker,
+# exit contract); sentinel-prefixed roles are the rest of the harness namespace.
+HARNESS_ROLE = 'orchestrator'
+
+
+def is_harness_filed(record: Escalation) -> bool:
+    """Was *record* filed by the harness rather than by an agent?"""
+    role = record.agent_role or ''
+    return role == HARNESS_ROLE or role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES)
+
 
 def is_done_step_commit_orphan(esc: Escalation) -> bool:
     """Return True iff *esc* is the done-step-commit orphan class filed by
@@ -174,7 +187,7 @@ def is_done_step_commit_orphan(esc: Escalation) -> bool:
     changes, unlike a fragile summary-substring match.
     """
     return (
-        esc.agent_role == 'orchestrator'
+        esc.agent_role == HARNESS_ROLE
         and esc.category == 'infra_issue'
         and esc.suggested_action == 'verify_wip_reconciliation'
     )

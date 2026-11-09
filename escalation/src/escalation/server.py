@@ -79,6 +79,7 @@ from escalation.models import (
     ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
+    HARNESS_SENTINEL_ROLE_PREFIXES,
     KNOWN_SEVERITIES,
     NOTE_TO_FILE_CLASS,
     RESOLUTION_CLASSES,
@@ -109,20 +110,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Sentinel role allowlist — resolves PRD Open question 2 (C4/D3)
-# ---------------------------------------------------------------------------
-# All harness-internal sentinels use one of these prefixes:
-#   harness-*      → harness-stranded-blocked-reaper, harness-reconcile,
-#                    harness-orphan-reaper (harness.py)
-#   orchestrator-* → orchestrator-scheduler, orchestrator-watcher-supervisor
-#                    (the watcher-outage L2 named in the user-observable signal)
-# Verified against orchestrator/src/orchestrator/agents/roles.py: NO LLM agent
-# role (architect, implementer, debugger, merger, steward, deep_reviewer,
-# reviewer_comprehensive, judge, simple_task) uses either prefix.
-# A prefix check is forward-compatible: new harness sentinels are auto-exempt.
-_HARNESS_SENTINEL_ROLE_PREFIXES = ('harness-', 'orchestrator-')
-
 # Maximum number of seconds the server will block waiting for a merge outcome.
 # Callers may pass a larger wait_secs value; the server silently clamps it to
 # this limit so MCP framework timeouts (≈120 s) are never breached.
@@ -138,7 +125,7 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     ``None`` or empty strings (possible on legacy/deserialized records) fall
     through to the downgrade path instead of raising ``AttributeError``.
     """
-    return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+    return (agent_role or '').startswith(HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
 def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
@@ -910,7 +897,7 @@ _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
 _MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
 
 # The sentinel role these records are filed under.  A born-at-L2 record must
-# carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
+# carry a role in ``escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
 # ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
 # the reason the agent-role downgrade gate below exists.  The residue sink
 # writes ``level=2`` directly via ``queue.submit`` and so bypasses that gate;

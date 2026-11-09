@@ -11,8 +11,9 @@ These tables constrain ONLY identified callers whose identity is a key of
 connection (no X-Escalation-Identity) — the esc-2087-2 human-channel
 guarantee — is NEVER narrowed by this module and keeps full authority.
 Policy is DATA at module scope (mirrors the existing RESOLVE_ACTIONS /
-_DISMISS_ACTIONS / _HARNESS_SENTINEL_ROLE_PREFIXES convention in
-``escalation.server``), not an ``if resolved_by == watcher`` fork.
+_DISMISS_ACTIONS convention in ``escalation.server`` and
+``escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES``), not an
+``if resolved_by == watcher`` fork.
 
 Layer direction: ``escalation`` is the lower fleet-wide package and must NOT
 module-level import ``orchestrator`` (the existing orchestrator imports in

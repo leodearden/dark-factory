@@ -411,6 +411,18 @@ PERSIST_CHECKS: tuple[str, ...] = (PERSIST_CHECK_ABSENT, PERSIST_CHECK_UNREADABL
 # bypassing the auto-watcher and routing straight to a human.
 BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 
+# The harness sentinel role namespace: only a role in it may file at a
+# BORN_AT_L2_SEVERITIES severity (resolves PRD Open question 2, C4/D3).
+#   harness-*      → harness-stranded-blocked-reaper, harness-reconcile,
+#                    harness-orphan-reaper (harness.py)
+#   orchestrator-* → orchestrator-scheduler, orchestrator-watcher-supervisor
+#                    (the watcher-outage L2 named in the user-observable signal)
+# Verified against orchestrator/src/orchestrator/agents/roles.py: NO LLM agent
+# role (architect, implementer, debugger, merger, steward, deep_reviewer,
+# reviewer_comprehensive, judge, simple_task) uses either prefix.
+# A prefix check is forward-compatible: new harness sentinels are auto-exempt.
+HARNESS_SENTINEL_ROLE_PREFIXES: tuple[str, ...] = ('harness-', 'orchestrator-')
+
 # All valid severity values accepted by the MCP tools (escalate_blocker /
 # escalate_info).  Used to validate caller input and return a clear error
 # rather than silently misrouting escalations.
