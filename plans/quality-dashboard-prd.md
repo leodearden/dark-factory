@@ -291,6 +291,22 @@ main's first-parent line (served as the disagreement count, never dropped).
   the git cross-check counts. `since_cursor` has no default; `None` means the full history (every
   landing in the store, ordered by landed_at then merge_sha), the promise
   `plans/instruments-honesty-prd.md` decision 2 relies on.
+- (2026-11-09) A **late claim** is a `merge_finalized done` row naming a sha that an earlier event
+  already claimed for another task. The full df history has 5: 2980@d397ce031f (first claimed by 2913),
+  5267 and 6042@100e526e15 (5963), 5149@0c8596de4c (4152), 6677@18fd0e0047 (3723). For 5149, 5267
+  and 6677, `git log -1 --format=%P` shows the task's own `Merge task/<id> into main` commit as the
+  claimed sha's first parent, and no runs.db landing names that commit. 2980's own merge
+  (95abbf6df8) is a separate landing. 6042's own merge (51fcedc570) is on main and no runs.db
+  landing names it. A late claim stays a landing, because the task left the merge queue with main
+  advanced. It forms its own unit of one (`late_claim`, with an opaque `unit_id` compared only for
+  equality) with unmeasurable lines, and `git_check.late_claims` counts it in the disagreement. See
+  `shared/src/shared/quality_series/landings.py::landings`.
+- (2026-11-09) Late claims and off-first-parent landings are emitted by `landed_at`, after the newest
+  first-claim landing at or below the cursor, so a later cursor may re-emit one. Consumers upsert on
+  `(project_id, merge_sha, task_id)`. This supersedes the sketch's "never re-emits a sha ≤ cursor".
+- (2026-11-09) A unit's members are consecutive in ordinal order, and
+  `shared/src/shared/quality_series/rows.py::rows_for` refuses input that splits, shortens or repeats
+  a unit, before any git work.
 
 ### Per-landing row (`shared/src/shared/quality_series/rows.py`)
 
