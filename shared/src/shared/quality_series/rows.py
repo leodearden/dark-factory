@@ -386,17 +386,15 @@ class _Sources:
             ), task_ids, _charter),
         )
 
-    def window(self, timelines: dict[str, _Timeline[T]], landing: Landing) -> list[T]:
-        timeline = timelines.get(landing.task_id)
-        return [] if timeline is None else timeline.window(landing)
+
+def _window(timelines: dict[str, _Timeline[T]], landing: Landing) -> list[T]:
+    """The landing's window of its task's timeline; empty when the task has no rows."""
+    timeline = timelines.get(landing.task_id)
+    return [] if timeline is None else timeline.window(landing)
 
 
-def _members_window(
-    timelines: dict[str, _Timeline[T]], unit: Sequence[Landing]
-) -> list[T]:
-    empty: _Timeline[T] = _Timeline([])
-    return [value for member in unit
-            for value in timelines.get(member.task_id, empty).window(member)]
+def _members_window(timelines: dict[str, _Timeline[T]], unit: Sequence[Landing]) -> list[T]:
+    return [value for member in unit for value in _window(timelines, member)]
 
 
 @dataclass(frozen=True)
@@ -420,10 +418,8 @@ def _unit_outcomes(sources: _Sources, unit: Sequence[Landing]) -> _UnitOutcomes:
 
 
 def _outcomes(sources: _Sources, unit: _UnitOutcomes, landing: Landing) -> Outcomes:
-    reviews: list[_Review] | None = None
-    if _covers(sources.epochs.review_completed, landing):
-        timeline = sources.reviews.get(landing.task_id)
-        reviews = timeline.window(landing) if timeline is not None else []
+    reviews = (_window(sources.reviews, landing)
+               if _covers(sources.epochs.review_completed, landing) else None)
     verdicts = unit.flake_verdicts
     passed = unit.verify_passed
     return Outcomes(
@@ -471,14 +467,14 @@ def _review_rounds(
 ) -> tuple[int | None, ReviewRoundsSource | None]:
     """Rounds from review_completed cycles; before that source's epoch, the lifetime disk counter."""
     if _covers(sources.epochs.review_completed, landing):
-        cycles = [review.cycle for review in sources.window(sources.reviews, landing)]
+        cycles = [review.cycle for review in _window(sources.reviews, landing)]
         return (max(cycles), ReviewRoundsSource.REVIEW_COMPLETED) if cycles else (None, None)
     total = _disk_review_cycles(repo, landing.task_id)
     return (total + 1, ReviewRoundsSource.DISK_COUNTER) if total is not None else (None, None)
 
 
 def _charter_class(sources: _Sources, landing: Landing) -> _Charter | None:
-    classified = [c for c in sources.window(sources.charters, landing) if c is not None]
+    classified = [c for c in _window(sources.charters, landing) if c is not None]
     return classified[-1] if classified else None
 
 
@@ -486,11 +482,11 @@ def _cost(
     sources: _Sources, landing: Landing, repo: str | os.PathLike[str], lines: LandedLines | None
 ) -> Cost:
     epochs = sources.epochs
-    invocations = (sources.window(sources.invocations, landing)
+    invocations = (_window(sources.invocations, landing)
                    if _covers(epochs.invocations, landing) else [])
-    turns = (sources.window(sources.turns, landing)
+    turns = (_window(sources.turns, landing)
              if _covers(epochs.invocation_turns, landing) else [])
-    iterations = sources.window(sources.execute_iterations, landing)
+    iterations = _window(sources.execute_iterations, landing)
     by_role = _usd_by_role(invocations)
     implementer = sum(1 for i in invocations if i.role in IMPLEMENTER_CLASS_ROLES)
     review_rounds, review_rounds_source = _review_rounds(sources, landing, repo)
@@ -537,13 +533,11 @@ class _BudgetSpent(Exception):
 
 
 def _unit_lines(
-    repo: str | os.PathLike[str], head: Landing, timeout_s: float
+    repo: str | os.PathLike[str], base_sha: str, sha: str, timeout_s: float
 ) -> LandedLines | None:
-    """The unit's landed lines; None when they are permanently unmeasurable."""
-    if head.base_sha is None:
-        return None
+    """The unit's landed lines; None when a named commit is missing, so they never will be."""
     try:
-        return landed_lines(repo, head.base_sha, head.merge_sha, timeout_s)
+        return landed_lines(repo, base_sha, sha, timeout_s)
     except GitObjectMissing:
         return None
 
@@ -555,6 +549,28 @@ def _git_timeout(first: bool, deadline: float) -> float:
     if remaining <= 0:
         raise _BudgetSpent
     return remaining
+
+
+_MeasuredUnit = tuple[tuple[Landing, ...], LandedLines | None]
+
+
+def _measure(
+    units: Sequence[tuple[Landing, ...]], repo: str | os.PathLike[str], git_budget_s: float
+) -> list[_MeasuredUnit]:
+    """The longest prefix of ``units`` whose lines fit the budget, each with its lines."""
+    deadline = time.monotonic() + git_budget_s
+    measured: list[_MeasuredUnit] = []
+    for index, unit in enumerate(units):
+        head = unit[0]
+        if head.base_sha is None:
+            measured.append((unit, None))
+            continue
+        try:
+            timeout_s = _git_timeout(index == 0, deadline)
+            measured.append((unit, _unit_lines(repo, head.base_sha, head.merge_sha, timeout_s)))
+        except (_BudgetSpent, GitTimeout):
+            break
+    return measured
 
 
 def rows_for(
@@ -572,18 +588,12 @@ def rows_for(
     FIRST_UNIT_GIT_FLOOR_S of git time, each later one the remaining budget. A spent budget or
     a GitTimeout ends the call before that unit, never inside it, and no row is ever emitted
     with lines missing for budget reasons: the caller resumes with ``landings[len(rows):]``.
+    runs.db is read after git, and only for the measured prefix's tasks.
     """
-    units = _units(landings)
-    deadline = time.monotonic() + git_budget_s
-    sources = _Sources.load(runs_db, sorted({landing.task_id for landing in landings}))
+    measured = _measure(_units(landings), repo, git_budget_s)
+    sources = _Sources.load(runs_db, sorted({m.task_id for unit, _ in measured for m in unit}))
     rows: list[LandingRow] = []
-    for index, unit in enumerate(units):
-        head = unit[0]
-        try:
-            timeout_s = _git_timeout(index == 0, deadline) if head.base_sha is not None else 0.0
-            lines = _unit_lines(repo, head, timeout_s) if head.base_sha is not None else None
-        except (_BudgetSpent, GitTimeout):
-            break
+    for unit, lines in measured:
         unit_outcomes = _unit_outcomes(sources, unit)
         rows.extend(
             LandingRow(
