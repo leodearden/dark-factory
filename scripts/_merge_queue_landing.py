@@ -1,18 +1,48 @@
-"""Landing one file's new content on a target project's main through that
-target's own merge queue: the step a config-deploy script takes before it
-hot-reloads (scripts/merge-deep-set-cap.sh, scripts/merge-pytest-n-ab-switch.sh).
+"""Landing new content for a set of files on a target project's main through
+that target's own merge queue, rather than by a direct commit to its main.
 
 A direct commit to a target's main is drift its queue never verified, which
 forces every merge in flight there to re-verify in full
 (orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers).
+A config-deploy script lands its knob edit this way before it hot-reloads
+(scripts/merge-deep-set-cap.sh, scripts/merge-pytest-n-ab-switch.sh), and a
+docs session lands its new or edited documents the same way:
 
-`land_file` commits the content on a short-lived `task/deploy-<label>-<UTC
-stamp>` branch, in a worktree outside the target checkout, submits it through
-merge_request, polls the request's own handle until it settles, and confirms
-the landing by git: the deploy commit is on main, and the target checkout's
-file is main's. Any other outcome raises `LandingNotConfirmed`, whose
-`.failure` is a wire tag a caller may print. `land_or_exit` is the same call,
-exiting through `_config_reload_gate.die`.
+    landing = land_files(repo, {"plans/foo-prd.md": prd, "plans/foo.yaml": manifest},
+                         base_sha, port=port, label="docs-prd-foo", message=message)
+
+lands every path as ONE commit through ONE merge request on the queue of the
+orchestrator whose escalation MCP listens on 127.0.0.1:*port*. `land_file` is
+its single-path form.
+
+Paths are relative to the checkout *repo*; an absolute path inside it is
+accepted. The content is the caller's, authored outside the target checkout,
+and is never read from it. Nothing here writes the checkout, and its state
+outside the landed paths is left alone; at a landed path it must be clean,
+because the lane's advance would refuse to move main over uncommitted state
+there, halting the whole queue, or overwrite it.
+
+Refused before any queue call: an empty set; a path outside the checkout,
+through a symlink in it, with a .git component, or the checkout itself; two
+spellings of one path; a path whose content equals its copy at *base_sha* (a
+path the base lacks is a new file); all INVALID_CHANGE. Uncommitted state at
+a landed path is CHECKOUT_DIRTY. A path the target ignores is refused by git
+itself, as GIT_FAILED, and a write the host refuses in the scratch
+directory is SCRATCH_WRITE_FAILED.
+
+A confirmed landing returns `Landing`, whose `landed_as` is the commit the
+queue landed it as. Any other outcome raises `LandingNotConfirmed`: `.failure`
+is a wire tag a caller may print, `.state` the last merge state seen, and
+`.reason` the queue's own stated reason for a terminal refusal.
+
+Every landing takes the normal lane, unverified, so it pays the target's full
+merge gate; nothing is special-cased for docs.
+
+The change is committed on a short-lived `task/deploy-<label>-<UTC stamp>`
+branch, in a worktree outside the target checkout, submitted through
+merge_request, and polled by the request's own handle until it settles. The
+landing is then confirmed by git: the deploy commit is on main, and the
+target checkout's copy of every landed path is main's.
 
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
@@ -30,19 +60,20 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import os
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+from _config_reload_gate import load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
@@ -82,19 +113,25 @@ class LandingFailure(enum.StrEnum):
     INTERRUPTED = "interrupted"
     QUEUE_DONE_NOT_ON_MAIN = "queue_done_not_on_main"
     CHECKOUT_NOT_SYNCED = "checkout_not_synced"
+    CHECKOUT_DIRTY = "checkout_dirty"
     INVALID_CHANGE = "invalid_change"
+    SCRATCH_WRITE_FAILED = "scratch_write_failed"
     GIT_FAILED = "git_failed"
 
 
 class LandingNotConfirmed(Exception):
     """The content did not provably land: *failure* names why, *detail* tells
-    the operator, *state* is the last merge state seen (None before any)."""
+    the operator, *state* is the last merge state seen (None before any), and
+    *reason* is the queue's own stated reason for a terminal refusal (None
+    when it gave none, or the refusal is not the queue's)."""
 
-    def __init__(self, failure: LandingFailure, detail: str, state: str | None = None):
+    def __init__(self, failure: LandingFailure, detail: str, state: str | None = None, *,
+                 reason: str | None = None):
         super().__init__(detail)
         self.failure = failure
         self.detail = detail
         self.state = state
+        self.reason = reason
 
 
 class _GitFailed(LandingNotConfirmed):
@@ -124,14 +161,16 @@ class Landing:
     landed_as: str
 
 
-def land_file(
-    repo: str, path: str, base_sha: str, content: bytes, *,
+def land_files(
+    repo: str, files: Mapping[str, bytes], base_sha: str, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
 ) -> Landing:
-    """Land *content* as *path* (relative to the checkout *repo*) on
-    *main_branch*, branching from *base_sha*, through the merge queue of the
-    orchestrator whose escalation MCP listens on 127.0.0.1:*port*.
+    """Land each of *files*' content as its path (relative to the checkout
+    *repo*) on *main_branch*, as one commit branching from *base_sha*, through
+    the merge queue of the orchestrator whose escalation MCP listens on
+    127.0.0.1:*port*.
 
     *timeout_secs* bounds the wait for the queue, defaulting to
     DEFAULT_LANDING_TIMEOUT_SECS. A string is read as a number, so a caller
@@ -139,30 +178,36 @@ def land_file(
     between polls: a queue call in flight when it passes runs to its own reply
     timeout (SUBMIT_REPLY_TIMEOUT_SECS for the submit, POLL_REPLY_TIMEOUT_SECS
     for a poll), and a request still unsettled is then cancelled
-    (POLL_REPLY_TIMEOUT_SECS more), so land_file can return up to about 190 s,
-    plus its git teardown, after the deadline.
+    (POLL_REPLY_TIMEOUT_SECS more), so land_files can return up to about 190 s,
+    plus its git teardown, after the deadline. *clock* is the monotonic clock
+    the deadline is measured on, time.monotonic by default.
     """
     queue = _MergeQueue.connect(port)
-    target = _Target(Path(repo), path, main_branch)
-    target.check_change(base_sha, content)
-    deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
+    target = _Target.of(Path(repo), files, main_branch)
+    target.check_change(base_sha)
+    target.check_checkout_clean()
+    deadline = _Deadline.after(float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS), clock)
     with (
         _stop_signals_held() as stop,
-        _deploy_branch(target, base_sha, content, label=label, message=message) as deploy,
+        _deploy_branch(target, base_sha, label=label, message=message) as deploy,
     ):
         return _land(queue, target, deploy, deadline, stop, description=message)
 
 
-def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
-                 **kwargs: Any) -> Landing:
-    """`land_file`, exiting through `die` with the refusal's detail."""
-    try:
-        return land_file(repo, path, base_sha, content, **kwargs)
-    except LandingNotConfirmed as exc:
-        die(prog, exc.detail)
+def land_file(
+    repo: str, path: str, base_sha: str, content: bytes, *,
+    port: str, label: str, message: str,
+    timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
+) -> Landing:
+    """`land_files` of *content* as the one *path*."""
+    return land_files(
+        repo, {path: content}, base_sha, port=port, label=label, message=message,
+        timeout_secs=timeout_secs, main_branch=main_branch, clock=clock,
+    )
 
 
-def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
+def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,
           stop: _StopSignals, *, description: str) -> Landing:
     stop.check()
     try:
@@ -182,6 +227,22 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
 # ---------------------------------------------------------------------------
 # Stopping: the deadline and the stop signals
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Deadline:
+    """The moment *at* which the landing's ceiling passes, on the monotonic
+    *clock* it was taken from."""
+
+    at: float
+    clock: Callable[[], float]
+
+    @classmethod
+    def after(cls, timeout_secs: float, clock: Callable[[], float]) -> _Deadline:
+        return cls(clock() + timeout_secs, clock)
+
+    def remaining(self) -> float:
+        return self.at - self.clock()
+
 
 class _CeilingReached(Exception):
     """The landing's deadline passed with its request still unsettled."""
@@ -257,8 +318,8 @@ def _stop_signals_held() -> Iterator[_StopSignals]:
         signal.raise_signal(stop.received)
 
 
-def _sleep_before_poll(delay: float, deadline: float, stop: _StopSignals) -> None:
-    remaining = deadline - time.monotonic()
+def _sleep_before_poll(delay: float, deadline: _Deadline, stop: _StopSignals) -> None:
+    remaining = deadline.remaining()
     if remaining <= 0:
         raise _CeilingReached("the landing timed out")
     stop.wait(min(delay, remaining))
@@ -286,34 +347,107 @@ def _git(cwd: Path, *args: str) -> str:
 
 @dataclass(frozen=True)
 class _Target:
-    """The target project's checkout, the file being landed, and its main."""
+    """The target project's checkout, its main, and the change being landed:
+    each path's new content, in path order."""
 
     repo: Path
-    path: str
     main_branch: str
+    changes: tuple[tuple[str, bytes], ...]
 
-    def check_change(self, base_sha: str, content: bytes) -> None:
-        """Raise INVALID_CHANGE unless *content* changes the file *base_sha*
-        carries."""
+    @classmethod
+    def of(cls, repo: Path, files: Mapping[str, bytes], main_branch: str) -> _Target:
+        """The change *files* make to *repo*, every path made repo-relative:
+        INVALID_CHANGE for an empty set, a path _repo_relative refuses, and
+        two spellings of one path."""
+        if not files:
+            raise LandingNotConfirmed(
+                LandingFailure.INVALID_CHANGE, f"nothing to land: no paths given for {repo}",
+            )
+        spelled: dict[str, str] = {}
+        changes: dict[str, bytes] = {}
+        for given, content in files.items():
+            relative = _repo_relative(repo, given)
+            if relative in spelled:
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE,
+                    f"{spelled[relative]} and {given} both name {relative} in {repo}",
+                )
+            spelled[relative], changes[relative] = given, content
+        return cls(repo, main_branch, tuple(sorted(changes.items())))
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(path for path, _ in self.changes)
+
+    def check_change(self, base_sha: str) -> None:
+        """Raise INVALID_CHANGE unless *base_sha* is a commit and every path's
+        content differs from the copy *base_sha* carries, if any: a path it
+        lacks is a new file."""
         if _run_git(self.repo, "rev-parse", "--verify", "--quiet",
                     f"{base_sha}^{{commit}}").returncode != 0:
             raise LandingNotConfirmed(
                 LandingFailure.INVALID_CHANGE, f"base {base_sha} is not a commit in {self.repo}",
             )
-        base_content = self.blob(base_sha)
-        if base_content is None:
-            raise LandingNotConfirmed(
-                LandingFailure.INVALID_CHANGE, f"{self.path} is not tracked at base {base_sha}",
-            )
-        if base_content == content:
+        unchanged = [path for path, content in self.changes
+                     if self.blob(base_sha, path) == content]
+        if unchanged:
             raise LandingNotConfirmed(
                 LandingFailure.INVALID_CHANGE,
-                f"nothing to land: {self.path} at base {base_sha} already carries this content",
+                f"nothing to land for {', '.join(unchanged)}: base {base_sha} already carries "
+                f"this content",
             )
 
-    def blob(self, rev: str) -> bytes | None:
-        """The file's content at *rev*, or None when *rev* has no such file."""
-        proc = _run_git(self.repo, "show", f"{rev}:{self.path}")
+    def check_checkout_clean(self) -> None:
+        """Raise CHECKOUT_DIRTY when any landed path carries uncommitted state
+        in the checkout."""
+        dirty = self.dirty_paths()
+        if dirty:
+            raise LandingNotConfirmed(
+                LandingFailure.CHECKOUT_DIRTY,
+                f"the checkout {self.repo} carries uncommitted state at {', '.join(dirty)}: "
+                f"the merge lane would refuse to move {self.main_branch} over it (wip_overlap, "
+                f"which halts the whole queue) or overwrite it; pass content authored outside "
+                f"the checkout, and leave the landed paths clean there",
+            )
+
+    def dirty_paths(self) -> list[str]:
+        """The landed paths carrying staged, unstaged or untracked state in the
+        checkout, read without taking its index.lock: the merge worker treats
+        a held lock as contention."""
+        return [path for path in self.paths
+                if _git(self.repo, "--no-optional-locks", "status", "--porcelain",
+                        "--untracked-files=all", "--", path)]
+
+    def write_into(self, worktree: Path) -> None:
+        """Write every path's new content into *worktree*, the base checked
+        out. A path git's tree cannot hold there as a file (under a file, over
+        a directory, through a symlink the base carries but the target
+        checkout no longer does) is INVALID_CHANGE; any other write the host
+        refuses is SCRATCH_WRITE_FAILED."""
+        for path, content in self.changes:
+            destination = worktree / path
+            if _crosses_symlink(worktree, path):
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE,
+                    f"{path} crosses a symlink at the base, so it would be written somewhere "
+                    f"other than the path it names",
+                )
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            except (IsADirectoryError, NotADirectoryError, FileExistsError) as exc:
+                raise LandingNotConfirmed(
+                    LandingFailure.INVALID_CHANGE, f"{path} cannot be written as a file: {exc}",
+                ) from exc
+            except OSError as exc:
+                raise LandingNotConfirmed(
+                    LandingFailure.SCRATCH_WRITE_FAILED,
+                    f"the host refused writing {path} into the deploy worktree {worktree}: {exc}",
+                ) from exc
+
+    def blob(self, rev: str, path: str) -> bytes | None:
+        """*path*'s content at *rev*, or None when *rev* has no such file."""
+        proc = _run_git(self.repo, "cat-file", "blob", f"{rev}:{path}")
         return proc.stdout if proc.returncode == 0 else None
 
     def carries(self, tip: str) -> bool:
@@ -324,13 +458,46 @@ class _Target:
         cherry = _git(self.repo, "cherry", self.main_branch, tip).splitlines()
         return bool(cherry) and all(line.startswith("-") for line in cherry)
 
-    def checkout_synced(self) -> bool:
-        """Whether the checkout's file on disk is main's: what a reload re-reads."""
-        on_disk = self.repo / self.path
-        return on_disk.is_file() and on_disk.read_bytes() == self.blob(self.main_branch)
+    def unsynced_paths(self) -> list[str]:
+        """The landed paths whose copy on disk in the checkout is not main's:
+        what a reload, or any reader of the checkout, would see instead."""
+        return [path for path in self.paths
+                if not _holds(self.repo / path, self.blob(self.main_branch, path))]
 
     def main_tip(self) -> str:
         return _git(self.repo, "rev-parse", self.main_branch)
+
+
+def _holds(on_disk: Path, content: bytes | None) -> bool:
+    return content is not None and on_disk.is_file() and on_disk.read_bytes() == content
+
+
+def _repo_relative(repo: Path, path: str) -> str:
+    """*path*, relative to the checkout *repo* or absolute inside it, as a
+    repo-relative POSIX path. INVALID_CHANGE when it names the checkout
+    itself or anything outside it, has a .git component, or crosses a symlink
+    in it."""
+    root = repo.absolute()
+    try:
+        relative = Path(os.path.normpath(root / path)).relative_to(root)
+    except ValueError:
+        problem = f"is outside the checkout {repo}"
+    else:
+        if not relative.parts:
+            problem = f"names the checkout {repo} itself, not a file in it"
+        elif any(part.lower() == ".git" for part in relative.parts):
+            problem = "has a .git component (in some letter case), which git refuses to commit"
+        elif _crosses_symlink(repo, relative.as_posix()):
+            problem = (f"crosses a symlink in the checkout {repo}, so it would be written "
+                       f"somewhere other than the path it names")
+        else:
+            return relative.as_posix()
+    raise LandingNotConfirmed(LandingFailure.INVALID_CHANGE, f"{path} {problem}")
+
+
+def _crosses_symlink(root: Path, relative: str) -> bool:
+    resolved_root = root.resolve()
+    return (resolved_root / relative).resolve() != resolved_root / relative
 
 
 @dataclass(frozen=True)
@@ -344,8 +511,7 @@ class _DeployBranch:
     tip: str
 
     @classmethod
-    def create(cls, target: _Target, base_sha: str, content: bytes, *,
-               label: str, message: str) -> _DeployBranch:
+    def create(cls, target: _Target, base_sha: str, *, label: str, message: str) -> _DeployBranch:
         scratch = Path(tempfile.mkdtemp(prefix="deploy-landing-"))
         branch = f"task/deploy-{label}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         worktree = _worktree_in(scratch)
@@ -359,8 +525,10 @@ class _DeployBranch:
             raise
         try:
             _git(target.repo, "worktree", "add", "-q", str(worktree), branch)
-            (worktree / target.path).write_bytes(content)
-            _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", target.path)
+            target.write_into(worktree)
+            # Staged first: `commit -- <path>` refuses a path git does not track yet.
+            _git(worktree, "add", "--", *target.paths)
+            _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", *target.paths)
             tip = _git(worktree, "rev-parse", "HEAD")
         except BaseException:
             _tear_down(target.repo, scratch, branch)
@@ -390,18 +558,20 @@ class _DeployBranch:
         return LandingNotConfirmed(
             refusal.failure,
             f"{refusal.detail}; kept the deploy worktree {self.worktree} and branch "
-            f"{self.branch}, which the request may still land from: if it lands, its value "
-            f"goes live at the next reload or restart",
+            f"{self.branch}, which the request may still land from: if it does, its change "
+            f"reaches main unconfirmed (a config change then goes live at the next reload or "
+            f"restart)",
             refusal.state,
+            reason=refusal.reason,
         )
 
 
 @contextlib.contextmanager
-def _deploy_branch(target: _Target, base_sha: str, content: bytes, *,
+def _deploy_branch(target: _Target, base_sha: str, *,
                    label: str, message: str) -> Iterator[_DeployBranch]:
     """The deploy branch, torn down on the way out unless a refusal says its
     request may still land."""
-    deploy = _DeployBranch.create(target, base_sha, content, label=label, message=message)
+    deploy = _DeployBranch.create(target, base_sha, label=label, message=message)
     retained = False
     try:
         yield deploy
@@ -532,6 +702,7 @@ def _submit_pending(submitted: dict, target: _Target, deploy: _DeployBranch) -> 
         raise LandingNotConfirmed(
             LandingFailure.SUBMIT_REJECTED,
             f"merge_request refused the submission: {submitted.get('error') or submitted}{code}",
+            reason=submitted.get("error") or None,
         )
     if status in SUBMIT_NON_TERMINAL:
         return True
@@ -572,7 +743,7 @@ class _Pending:
 
 
 def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
-                       pending: _Pending, deadline: float, stop: _StopSignals) -> dict:
+                       pending: _Pending, deadline: _Deadline, stop: _StopSignals) -> dict:
     """The merge_status reply that shows the *pending* request landed,
     cancelling the request if the deadline, a stop signal or a git failure
     comes first."""
@@ -654,6 +825,7 @@ def _not_landed(reply: dict, *, state: str | None) -> LandingNotConfirmed:
         LandingFailure.NOT_LANDED,
         f"{subject} settled {state}{reason}{successor}: nothing landed",
         state,
+        reason=reply.get("reason") or None,
     )
 
 
@@ -703,7 +875,7 @@ def _backoff() -> Iterator[float]:
 
 def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
     """The Landing *reply* settled, once git agrees: the deploy commit is on
-    main, and the checkout's file is main's."""
+    main, and the checkout's copy of every landed path is main's."""
     request_id = reply.get("request_id")
     if not target.carries(deploy.tip):
         reported = reply.get("state") or reply.get("status")
@@ -713,11 +885,14 @@ def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
             f"carries {deploy.tip} neither as an ancestor nor as an equal patch",
             MergeState.done,
         )
-    if not target.checkout_synced():
+    unsynced = target.unsynced_paths()
+    if unsynced:
+        on_disk = ", ".join(str(target.repo / path) for path in unsynced)
         raise LandingNotConfirmed(
             LandingFailure.CHECKOUT_NOT_SYNCED,
-            f"{deploy.branch} landed on {target.main_branch}, but {target.repo / target.path} "
-            f"on disk is not {target.main_branch}'s copy, so a reload would re-read the old file",
+            f"{deploy.branch} landed on {target.main_branch}, but on disk the checkout's "
+            f"{on_disk} is not {target.main_branch}'s copy, so a reader of the checkout, a "
+            f"config reload among them, would see the old content",
             MergeState.done,
         )
     return Landing(

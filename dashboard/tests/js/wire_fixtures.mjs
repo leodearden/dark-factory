@@ -199,17 +199,35 @@ export function escalationsPayload(subsections) {
   };
 }
 
+// The unknown triad data/datum.py::unknown_datum emits, for a runs.db that
+// could not be read.
+function unreadWireDatum(reason) {
+  return wireDatum(null, { as_of: null, state: 'unknown', reason });
+}
+
 // One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
 // serves it: a measured, empty queue whose depth series holds `buckets` labels
 // ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
 // A null `bucketMinutes` is a series that names no width; its labels are then
-// hourly.
-export function mergeQueueBlock({ bucketMinutes = null, buckets = 3 } = {}) {
+// hourly. `outcomes` counts the window's untimed attempts by outcome. With
+// `unread`, the project's runs.db could not be read, so its depth and attempts
+// are unknown.
+export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false } = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
+  const outcomeLabels = Object.keys(outcomes);
+  const outcomeValues = outcomeLabels.map(label => outcomes[label]);
+  const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
+  const unreadReason = 'the merge_attempt events could not be read from runs.db';
   return {
-    depth: { labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes },
-    outcomes: { labels: [], values: [], colors: [] },
-    latency: { p50: 0, p95: 0, p99: 0, mean_ms: 0, with_duration: 0, without_duration: 0 },
+    depth: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes }),
+    attempts: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({
+        outcomes: { labels: outcomeLabels, values: outcomeValues, colors: outcomeLabels.map(() => '#888888') },
+        latency: { p50: null, p95: null, p99: null, mean_ms: null, with_duration: 0, without_duration: attempts },
+      }),
     recent: [],
     active: [],
     recent_total: wireDatum(0),
@@ -219,8 +237,36 @@ export function mergeQueueBlock({ bucketMinutes = null, buckets = 3 } = {}) {
     active_spark: { labels: [], values: [] },
     halt: { offline: true },
     train_events: [],
+    train_throughput: wireDatum({}),
     metrics: {},
   };
+}
+
+// The SCHEDULER payload, as /scheduler serves it: the keys data.js seeds it
+// with, every project in `offlineProjects` listed offline, nothing paused.
+export function schedulerSnapshot({ offlineProjects = [], rows = [], modules = [] } = {}) {
+  return {
+    rows,
+    modules,
+    pin_queue: [],
+    events_by_task: {},
+    snapshot_at: WIRE_AS_OF,
+    offline: offlineProjects.length > 0,
+    offline_projects: offlineProjects,
+    paused: false,
+    paused_projects: [],
+  };
+}
+
+// One SCHEDULER row: the modules task `taskId` of `project` declares it locks.
+export function schedulerLockRow({ project, taskId, lockSet }) {
+  return { project, task_id: taskId, lock_set: lockSet };
+}
+
+// One SCHEDULER.modules entry: who holds `path` in `project`, and who has it
+// parked. Every lock field is null unless given, which reads as a free module.
+export function schedulerModule({ project, path, holder = null, holderProject = null, parkedBy = null, parkedOwnerLive = null }) {
+  return { project, path, holder, holder_project: holderProject, parked_by: parkedBy, parked_owner_live: parkedOwnerLive };
 }
 
 // One ORCHESTRATORS row, as /orchestrators serves it.

@@ -539,7 +539,7 @@ def write_escalation_record(
 
     Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
     ``created_at``) since that is what the queue serialises and what
-    ``load_queue_escalations`` passes through unchanged.  The
+    ``escalation.models.Escalation.from_dict`` reads back.  The
     ``category='eval_regression'`` / ``status='pending'`` defaults are exactly
     the pair ``memory_evals._index_escalations`` accepts; every other
     combination is dropped by that reader and can only ever appear on the
@@ -549,8 +549,9 @@ def write_escalation_record(
     VERBATIM, so a caller can hand it a JSON number and get an ``id`` that
     survives to both payloads un-coerced — which is what makes a str/int drift
     testable rather than hypothetical.  ``omit_id=True`` leaves the ``id`` key
-    out of the record entirely, the shape that makes a queue file address
-    NOTHING; ``**extra`` overrides or adds any other field.
+    out of the record entirely, a shape ``Escalation.from_dict`` rejects, so
+    both payloads report the file as unreadable; ``**extra`` overrides or adds
+    any other field.
 
     KNOWN DUPLICATION, deliberately left: ``test_memory_evals_data.py`` carries
     its own ``_write_escalation``/``_dump`` with this same field set.  Folding
@@ -1263,13 +1264,13 @@ def strip_js_comments(source: str) -> str:
 # list they check against can never drift from what the files actually say.
 #
 # `destructure_bindings` returns (canonical, local) PAIRS, and each caller
-# projects the half it needs.  This is not fussiness — the three consumers it
-# replaces answer OPPOSITE questions over the identical line:
+# projects the half it needs.  This is not fussiness — its two DF_CHARTS
+# consumers answer OPPOSITE questions over the identical line:
 #   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
 #       must actually reference, since the alias is what it renders by;
-#   test_charts_axis_labels wants the CANONICAL/source name   — what must
-#       actually exist on the namespace object;
-#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+#   test_tab_burndown wants BOTH, as an alias -> canonical map, plus the
+#       CANONICAL/source names of the export literal — what must actually
+#       exist on the namespace object.
 # On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
 # that picked one side would silently INVERT one of the two suites, which is
 # precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
@@ -1289,10 +1290,11 @@ def strip_js_comments(source: str) -> str:
 #     object are not statically enumerable the way a destructure list is.  The
 #     defect these suites exist to catch can only exist in the destructure
 #     shape anyway.
-#   - A NESTED brace must fail loudly at the call site that names the coupling,
-#     rather than yield a half-read binding list that turns a downstream
-#     assertion red with an unrelated-looking message.  Three call sites turn
-#     the miss into a self-naming assertion for exactly that reason.
+#   - A NESTED brace must yield NO match rather than a half-read binding list:
+#     an empty result turns a downstream assertion red, where a half-read list
+#     would let a sweep go quietly wrong.  No call site names the coupling on
+#     that miss (test_tab_burndown.py's readers return an empty result), so the
+#     property is pinned in the contract below.
 #
 # Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
 # ---------------------------------------------------------------------------

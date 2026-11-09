@@ -52,6 +52,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
     fields: dict[str, Path] = dict(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
+        task_root=Path('/base/.task-meta/task-2909'),
         git_objects=Path('/main/.git/objects'),
         git_task_refs=Path('/main/.git/refs/heads/task'),
         git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
@@ -215,7 +216,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         hermetic = _make_write_set(claude_fleet=claude_fleet)
         assert not claude_fleet.exists()
         monkeypatch.setattr(
-            'orchestrator.workflow.compute_write_set', lambda _cwd: hermetic,
+            'orchestrator.workflow.compute_write_set', lambda _cwd, *, task_id, task_root: hermetic,
         )
 
         # Spy: record whether claude_fleet already exists on disk at the moment

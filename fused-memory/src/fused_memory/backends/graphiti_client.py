@@ -2058,19 +2058,8 @@ class GraphitiBackend:
             # Translate only a not-found provably about the caller's own uuid —
             # graphiti_core raises the same class from entity/edge resolution
             # after the episode loaded fine. The proof CONSTRUCTS the genuine
-            # upstream exception instead of parsing its text (the regex in
-            # durable_queue.py::_parse_not_found_uuid exists only because that
-            # module refuses to import graphiti_core; this one already does), so
-            # an upstream reword fails open rather than mislabelling.
-            #
-            # The replacement message deliberately does not match
-            # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
-            # it would fall open to ordinary retry rather than task 3586's
-            # ('permanent', 1) rule — moot today, since post-3561 an add_episode
-            # payload cannot carry a uuid at all. Enforced, not merely claimed:
-            # tests/test_graphiti_add_episode_uuid_param.py::
-            # test_the_translated_message_stays_retryable_for_the_durable_queue
-            # feeds this message through durable_queue's real parser.
+            # upstream exception instead of parsing its text, so an upstream
+            # reword fails open rather than mislabelling.
             if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
                 raise
             raise NodeNotFoundError(
@@ -3637,6 +3626,11 @@ class GraphitiBackend:
         `old_uuid` lost the race, which is acceptable for an audit-only
         property.
 
+        Deleted-graph note: detection is read over GRAPH.RO_QUERY, so a graph
+        deleted after the startup scan listed it is refused rather than
+        recreated empty. Pinned by
+        fused-memory/tests/test_startup_identity_scan.py::TestRepairDuplicateEdgeUuidsLiveFalkorDB::test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted.
+
         Args:
             group_id: Project graph to repair.
 
@@ -3651,7 +3645,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher)
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:

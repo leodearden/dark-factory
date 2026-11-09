@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import load_script_module
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
@@ -334,10 +335,8 @@ class _Provider:
         return _response()
 
     def client(self) -> MagicMock:
-        """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-        client = MagicMock()
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
+        """A fake ``AsyncOpenAI`` served by this endpoint."""
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=self._create)
         return client
 
@@ -1140,9 +1139,7 @@ def _naming(candidate_id: str) -> MagicMock:
         reply.output_text = json.dumps({'verdict': 'restates', 'candidate_id': candidate_id})
         return reply
 
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=_create)
     return client
 

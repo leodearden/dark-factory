@@ -830,6 +830,12 @@ _JUDGE_MAX_TOKENS = 128
 #: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
+#: Every arm's SDK client makes ONE attempt, so nothing retries inside
+#: ``write_triage.judge_timeout_seconds``; the SDK's per-attempt timeouts still
+#: apply within it. Why: that field's description in
+#: ``config/schema.py::WriteTriageConfig``.
+_JUDGE_SDK_MAX_RETRIES = 0
+
 
 class _ProviderCredentials(NamedTuple):
     """How to reach *provider*'s endpoint, and what that endpoint speaks."""
@@ -942,9 +948,10 @@ async def _call_llm(
     Each arm builds and closes its client PER CALL. A cached client would pin
     a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
     knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
-    closes the connection pool even when a timeout cancels the request, which
-    matters because neither SDK client defines ``__del__``. The lost
-    connection reuse is a deliberate trade.
+    closes the connection pool even when a timeout cancels the request. The
+    SDK's own ``httpx`` wrapper finaliser (``AsyncHttpxClientWrapper.__del__``)
+    is no substitute: it closes the pool only if an event loop is running when
+    the client is collected. The lost connection reuse is a deliberate trade.
 
     NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
     failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,
@@ -1001,7 +1008,9 @@ async def _call_openai_responses(
         if reasoning_effort is None
         else {'reasoning': {'effort': reasoning_effort}}
     )
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.responses.create(
                 model=model,
@@ -1041,7 +1050,9 @@ async def _call_openai_chat(
     """
     import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=model,
@@ -1076,7 +1087,9 @@ async def _call_anthropic(
     """
     import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
+    async with anthropic.AsyncAnthropic(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.messages.create(
                 model=model,

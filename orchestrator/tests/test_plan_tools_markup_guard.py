@@ -188,7 +188,7 @@ class Harness:
 
     @property
     def plan_path(self) -> Path:
-        return self.artifacts.root / 'plan.json'
+        return self.artifacts.artifact_path('plan.json')
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()

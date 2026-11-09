@@ -4,6 +4,12 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    MAX_SUMMARY_CHARS,
+)
 from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
@@ -16,6 +22,7 @@ from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
+from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
 
@@ -132,8 +139,8 @@ class AgentRole:
                 )
 
 
-# --- Read-only tools for analysis roles ---
-_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
+# --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
+_ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
 # --- jCodeMunch tools for structured code retrieval ---
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
@@ -612,6 +619,22 @@ agent — passing your own id there would hide everyone else's memories from you
 # drift after the fact, it does not prevent it structurally.
 MANDATED_STAGING_COMMAND = 'git add -- .'
 
+# The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
+# like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
+# block of correct staging commands.
+_TASK_DIR_NEVER_COMMITTED = """\
+`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
+`.task/iterations.jsonl` links into durable task storage that survives
+worktree resets, plus the Claude config dir. It must NEVER be committed. It is
+gitignored at the repo root, so an ordinary staging command already excludes
+it — no exclusion pathspec is needed. Never force-add `.task/`
+(`git add -f .task/...`). As a backstop, a pre-commit hook silently strips any
+`.task/` path that still ends up staged — but that is defense-in-depth, not
+the only guard.
+
+Stage your changes with:
+"""
+
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
@@ -820,6 +843,10 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 """
 
 
+# Exercised against real git by orchestrator/tests/test_roles_already_done_commit_search.py.
+ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -854,7 +881,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
-   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with `git log --all --oneline -- <path>` or by grepping recent merge commits. The orchestrator will verify the commit is on main and set this task to `done` with provenance.
+   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with a search scoped to main and to the path: `""" + ALREADY_DONE_COMMIT_SEARCH + """` lists, oldest first, the commits on main that changed how often `<symbol>` (a string the asked-for work introduced) occurs in `<path>`. When the task declares files, `<path>` must be one of them: the orchestrator attributes only a commit whose own diff touched a declared file. The first row is normally the commit that introduced the symbol; if a later row removed it, the right row is the latest one that brought it back. Never use `git log --all` (not scoped to main), main's HEAD, or a sha picked by eye from an unscoped listing: the on-main check passes for every commit on main, so only a task-scoped search names the right one. The orchestrator checks the commit is on main and attributes it to this task against its declared files or delivered checks before setting the task to `done` with provenance.
    - **Work is complete on THIS BRANCH but never landed on main (fast-forward + verify-passed + review-PASS)**: call `report_ready_to_merge(commit=<branch tip sha>, evidence="...")` and stop. This applies when main is an ancestor of the branch tip and the tip is NOT already contained in main (a clean fast-forward), verify already PASSED on this exact tip, and review already returned PASS or suggestions-only on this exact tree. Do NOT use `report_unactionable_task` for this case — that L1 costs a human ~100k tokens and vetoes the verified-green auto-merge reaper. Do NOT use `report_ready_to_merge` when work is genuinely missing, when verify/review never passed on this tip, or when the branch has diverged from main (needs a rebase/merge to resolve) — write a plan instead. If the work is already on MAIN, that is `report_task_already_done`, not this.
    - **A referenced file/symbol is missing AND a sibling task is expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. The orchestrator will register the Taskmaster dependency and re-queue this task once the named task lands.
    - **A referenced file/symbol is missing AND you can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
@@ -945,8 +972,8 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
-1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (this one is NOT symlinked into the lane) to see what's been done in prior iterations.
+1. Read `.task/plan.json` to understand the full plan.
+2. Read `.task/iterations.jsonl` to see what's been done in prior iterations (absent until the first iteration is logged, meaning there is no prior history).
 3. Run `git log --oneline -10` to see recent commits in this worktree.
 4. Identify the next pending step(s) in the plan.
 
@@ -960,25 +987,12 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
-`<worktree_base>/.task-meta/<worktree-name>/` directory, OUTSIDE this
-worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
-`.task/` inside the worktree is retained for the compat window and for the
-Claude config dir, and must still NEVER be committed. It is gitignored at
-the repo root, so an ordinary staging command already excludes it — no
-exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT — stage by specific files, or stage everything at once:
+# Stage by specific files, or stage everything at once:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged — but that is defense-in-depth, not the only guard.
 
 The workflow for each step is:
 1. Write code (implementation or tests)
@@ -1011,8 +1025,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 You will be given:
 - The failure output (test errors, lint violations, type errors). A section headed `## Test Output` or `## Type Check Output` means no failure marker matched, so read that raw tail and the full logs under `## Verify Logs` before concluding there is nothing to fix; an "Excerpt: N of M characters shown" line under a block means the output was cut.
 - Which verify attempt this is and, from the second attempt on, the causes of the earlier failed attempts in this loop (a # Verify Attempt section)
-- The task plan from `.task/plan.json` — a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets)
-- The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT symlinked into the lane)
+- The task plan from `.task/plan.json`
+- The iteration history from `.task/iterations.jsonl`
 
 ## Rules
 
@@ -1023,23 +1037,11 @@ You will be given:
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and for the Claude config dir, and must still NEVER be
-committed. It is gitignored at the repo root, so an ordinary staging command
-already excludes it — no exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged.
 """ + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
@@ -1235,7 +1237,7 @@ def build_reviewer_role(
     return AgentRole(
         name=f'reviewer_{name}',
         system_prompt=spec.in_code_constant,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS],
+        allowed_tools=[*_ANALYSIS_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
@@ -1344,7 +1346,7 @@ Submit your verdict by calling submit_completion_verdict(complete,
 reasoning, uncovered_plan_steps, substantive_work). Do not print the
 verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
@@ -1420,13 +1422,7 @@ never keep it.
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
@@ -1466,72 +1462,6 @@ architect.\
 """
 
 
-def submit_resolve_instructions(
-    metadata_template: str,
-    *,
-    outcome_target: str,
-    project_root_expr: str = '...',
-    step_prefix: tuple[str, str] = ('a', 'b'),
-    extra_submit_guidance: str = '',
-    caller_indent: str = '',
-) -> str:
-    """Return the shared submit_task → resolve_ticket two-step instruction block.
-
-    Returns the block indented by ``caller_indent`` (default ``''`` for no
-    extra indentation).  Pass the same prefix you would have given to
-    ``textwrap.indent`` — the helper applies it internally so callers don't
-    need a separate wrap step and the sub-continuation alignment is always
-    correct regardless of indent width.
-
-    Args:
-        metadata_template: The metadata dict literal to show in the submit_task call.
-        outcome_target: Role-specific outcome target string (e.g. 'resolve_issue summary',
-            'review output', 'finding description').
-        project_root_expr: Expression for project_root arg (default '...' placeholder;
-            use e.g. '"/actual/path"' for interpolated contexts).
-        step_prefix: Tuple of (first_label, second_label) for the step bullets,
-            e.g. ('a', 'b') or ('1', '2').
-        extra_submit_guidance: Optional per-site extra guidance paragraph inserted
-            after the error-shape description.
-        caller_indent: Prefix string applied to every line of the returned block via
-            ``textwrap.indent``.  Defaults to ``''`` (unindented).
-
-    Returns:
-        Multi-line string with the shared skeleton, indented by caller_indent.
-    """
-    a, b = step_prefix
-    # Normalize multi-line metadata_template: add 3-space continuation indent so
-    # lines after the first align at the 'metadata=' column in the raw block.
-    metadata_normalized = metadata_template.replace('\n', '\n   ')
-    # extra_submit_guidance sits after the error-shape sentence; indent its lines
-    # 3 spaces so they read as a sub-continuation under step a./1. in the raw block.
-    extra = (
-        '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
-    ) if extra_submit_guidance.strip() else '\n'
-    # Build the raw (unindented) block, then apply caller_indent in one shot.
-    raw = (
-        f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
-        f'   metadata={metadata_normalized},\n'
-        f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
-        '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
-        '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
-        '   error shape, treat the candidate as skipped and record the error in your\n'
-        f'   {outcome_target}.'
-        + extra
-        + f'{b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —\n'
-        '   (60 s is intentionally conservative; server default is 115 s — raise if\n'
-        '   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:\n'
-        '   - `created` — the curator accepted the candidate; record `task_id`.\n'
-        '   - `combined` — the curator deduped into an existing task; `task_id` points\n'
-        '     at that task. Record it the same way as `created` (the candidate was\n'
-        '     absorbed, not lost).\n'
-        f'   - `failed` — report the `reason` in your {outcome_target}.'
-        + '\n\n'
-        + _COMPLEXITY_RUBRIC
-    )
-    return textwrap.indent(raw, caller_indent)
-
-
 def submit_only_instructions(
     metadata_template: str,
     *,
@@ -1543,8 +1473,8 @@ def submit_only_instructions(
 ) -> str:
     """Return a one-step ``submit_task``-only instruction block.
 
-    Sibling of :func:`submit_resolve_instructions` for callers (steward,
-    deep_reviewer) that should not block on the curator. The R4 idempotency
+    For callers (steward, deep_reviewer, and the follow-up filing fragment)
+    that should not block on the curator. The R4 idempotency
     cache (``task_interceptor`` / ``(escalation_id, suggestion_hash)``) and
     the server-side ticket janitor together replace the per-call
     ``resolve_ticket`` wait: failed tickets resurface as a follow-up
@@ -1553,7 +1483,9 @@ def submit_only_instructions(
 
     Args:
         metadata_template: The metadata dict literal to show in the submit_task call.
-            MUST include both ``escalation_id`` and ``suggestion_hash`` keys —
+            MUST include both ``escalation_id`` and ``suggestion_hash`` keys unless
+            the submit boundary derives them, as it does for the follow-up bundle
+            (``shared/src/shared/followup_items.py::with_derived_bundle_keys``) —
             once the agent stops calling ``resolve_ticket``, that R4 metadata
             is the only handle the interceptor has to dedupe re-queued triages.
         outcome_target: Role-specific outcome target string (e.g. 'resolve_issue
@@ -1611,9 +1543,9 @@ candidate so it is captured deterministically instead of left for a downstream
 reaper to maybe recover:
 """ + submit_only_instructions(
     '{"source": "agent-followup", "spawn_context": "agent_followup",\n'
-    '"spawned_from": "<this task id>", "files": ["path/to/file-or-dir", ...],\n'
-    '"escalation_id": "agent-followup-<this task id>",\n'
-    '"suggestion_hash": "<stable hash of the follow-up>"}',
+    '"spawned_from": "<this task id>", "files": ["<every file any item names>", ...],\n'
+    f'"{FOLLOWUP_ITEMS_METADATA_KEY}": [{{"summary": "<one standalone line, at most {MAX_SUMMARY_CHARS} chars>",\n'
+    '"files": ["path/to/file.py", ...]}, ...]}',
     outcome_target='iteration log',
     step_label='1',
     extra_submit_guidance=(
@@ -1621,8 +1553,17 @@ reaper to maybe recover:
         "steps you can just do. Use priority `low` unless the work is clearly more\n"
         "urgent. The `description` must stand alone WITHOUT your session context:\n"
         "name this task's id, the escalation id if one exists, the concrete file\n"
-        "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
-        "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
+        "paths, and the rationale verbatim.\n"
+        "File ONE `submit_task` per area (a module or subsystem): each observation in\n"
+        f"that area is one entry of `{FOLLOWUP_ITEMS_METADATA_KEY}`, at most {MAX_FOLLOWUP_ITEMS} items, and a\n"
+        "further one starts a second call. A lone observation is a bundle of one.\n"
+        "Every item file must also be in the top-level `files`; name files, not\n"
+        "directories. Do not send `escalation_id`, `suggestion_hash` or item keys:\n"
+        "the submit boundary derives them from `spawned_from` and the items and\n"
+        "overwrites any you send, which is what makes a re-filed observation dedupe.\n"
+        f"A `{FOLLOWUP_ITEMS_REFUSED_ERROR}` error is the exception to skipping: it is\n"
+        "correctable, so fix what its `reason` and `detail` name (add the file to the\n"
+        "top-level `files`, or move the extra items into a second call) and resubmit once.\n"
         'An observation that is not a work item is not filed here: see "## Escalation".\n'
         "A one-time operational ask that no agent can carry out (restart a service,\n"
         "run a script after X lands) IS filed here too: add\n"
@@ -1860,16 +1801,10 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-""" + MERGE_HALT_SAFETY_RULE + """
+""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + """
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
@@ -2222,20 +2157,10 @@ dispatch.
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root, so an ordinary staging command already excludes it (a pre-commit
-hook also backstops this by stripping any `.task/` path that still gets
-staged).
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add path/to/file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
 """ + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[

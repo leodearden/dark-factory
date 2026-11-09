@@ -469,6 +469,26 @@ directly, not just interactive agents.
   by an unrelated process, and a `stash pop` on a clean tree can apply another
   task's WIP into yours. Park WIP as commits on a branch instead.
 
+## Killing processes on this host
+
+- **Never** kill by a bare program or script name. `pkill -f PATTERN` and
+  `kill $(pgrep -f PATTERN)` match the full command line of **every** process
+  on this shared host: every project's merge verifies, the offline lane, and
+  production systemd timers. On 2026-11-02 a read-only `/team` investigation
+  subagent stopped its own `/tmp/s2/c.sh` loops by killing whatever
+  `pgrep -f 'c\.sh'` returned. `c\.sh` matches any "gc.sh", so that one
+  command SIGTERMed the offline lane's
+  `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` run and reify's
+  production `reify-warm-lane-gc.service` (task 8231).
+- Stop what you launched by the pid, process group or session id you captured
+  at launch: `setsid` plus a recorded session id, or the task id `Bash`'s
+  `run_in_background` returns. Failing that, anchor the pattern on your own
+  absolute path and preview it with `pgrep -af` before killing. A `pkill -f`
+  whose pattern appears in your own command line also kills the shell running
+  it ("Exit code 144").
+- The full rule's single home is
+  `orchestrator/src/orchestrator/agents/pkill_guidance.py::PKILL_SELF_MATCH_GUIDANCE`.
+
 ## Reference
 
 - **User docs**: `README.md` (entry point) · `SETUP.md` (install/onboard)

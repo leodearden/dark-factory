@@ -253,6 +253,8 @@ def _effective_config_dir() -> Path:
 _INVOKE_DEFAULTS: dict[str, Any] = {
     'system_prompt': 'You are a helpful assistant. Be very brief.',
     'cwd': Path('/tmp'),
+    # /tmp names no project: without this, live runs land in the session registry's 'tmp' bucket.
+    'spawn_env': {'CLAUDE_SPAWN_ROLE': 'cli_invoke_integration', 'CLAUDE_SPAWN_PROJECT': 'dark_factory'},
     'model': 'haiku',
     'max_turns': 1,
     # RAISED from $0.01 (task 3484, steward decision at iteration 1).  MEASURED

@@ -20,6 +20,9 @@ import {
   orchestratorRow,
   projectRow,
   receiptsFor,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
   tasksSnapshotEntry,
   wireDatum,
@@ -79,6 +82,26 @@ function graphNode(container, task) {
   return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
+// By PRD is the Tasks tab's default view, and it draws no graph until a lanes
+// row opens; a test that reads graph nodes lists the project flat first, as a
+// user who chose the list would have stored it.
+function listFlat(window) {
+  window.localStorage.setItem('df.tasksGroupByPrd', JSON.stringify({ [PROJECT]: 'flat' }));
+}
+
+// The Tasks tab's detail pane, opened on `task` by clicking its graph node;
+// undefined unless the pane names that task.
+function taskDetailOf(harness, task) {
+  listFlat(harness.window);
+  const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  const node = graphNode(container, task);
+  assert.ok(node, 'the task never reached the graph, so it cannot be selected');
+  click(harness.window, node);
+  const detail = container.querySelector('.task-detail');
+  const idText = harness.window.DF_SHELL.taskId(task.id);
+  return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
+}
+
 // Each site's options are the ones its call site passes, and `render` returns
 // the element the badge belongs in: the task's row, node or detail pane.
 const STRAND_SITES = [
@@ -94,6 +117,7 @@ const STRAND_SITES = [
     site: 'tab_tasks.jsx::TaskGraph renderNode',
     options: { compact: true },
     render(harness, task) {
+      listFlat(harness.window);
       const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
       return graphNode(container, task);
     },
@@ -101,15 +125,7 @@ const STRAND_SITES = [
   {
     site: 'tab_tasks.jsx::TaskDetail',
     options: undefined,
-    render(harness, task) {
-      const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
-      const node = graphNode(container, task);
-      assert.ok(node, 'the task never reached the graph, so it cannot be selected');
-      click(harness.window, node);
-      const detail = container.querySelector('.task-detail');
-      const idText = harness.window.DF_SHELL.taskId(task.id);
-      return detail?.querySelector('.sub')?.textContent.includes(idText) ? detail : undefined;
-    },
+    render: taskDetailOf,
   },
 ];
 
@@ -386,10 +402,155 @@ for (const bucketMinutes of [60, null]) {
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
       .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth);
+    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── An unread runs.db (merge_queue.js::attemptsOver, worstP95Over, projectAttempts) ──
+// A project whose runs.db could not be read renders every runs.db reading as
+// unknown: no measured-looking 0, and no chart drawn over nothing.
+
+function mountMergeTab(t, block) {
+  const harness = openWindow(t);
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: { [PROJECT]: block },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  return { harness, container };
+}
+
+function panelTitled(container, prefix) {
+  const titles = [...container.querySelectorAll('.panel-head > .title')].filter(title => title.textContent.startsWith(prefix));
+  assert.equal(titles.length, 1, `expected exactly one panel titled "${prefix}…"`);
+  return titles[0].closest('.panel');
+}
+
+test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured zeros', t => {
+  const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, unread: true }));
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, worstP95Over, projectAttempts } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, EM_DASH } = harness.window.DF_DATUM;
+
+  const merges = datumView(attemptsOver(DF, null)).text;
+  assert.equal(merges, EM_DASH);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, merges);
+  const worst = datumView(worstP95Over(DF, null)).text;
+  assert.equal(worst, EM_DASH);
+  assert.equal(statTile(container, 'p95 latency · worst project').querySelector('.val').textContent, worst);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
+  assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
+  }
+});
+
+test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount', t => {
+  const block = mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3, conflict: 2 } });
+  const { harness, container } = mountMergeTab(t, block);
+
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+  assert.equal(count, 5);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
+  }
+});
+
+function withDepthValues(block, values) {
+  return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
+}
+
+function panelMeta(container, prefix) {
+  return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
+}
+
+// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
+for (const values of [[1], [2, 0, 3]]) {
+  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
+    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
+    const { container } = mountMergeTab(t, block);
+
+    const meta = panelMeta(container, 'Merge attempts');
+    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
+  });
+}
+
+test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
+  const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
+  const { harness, container } = mountMergeTab(t, block);
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${count} attempts`), JSON.stringify(pips));
+  const outcomes = panelMeta(container, 'Outcomes');
+  assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  const depth = panelMeta(container, 'Merge attempts');
+  assert.doesNotMatch(depth, /\battempts\b/);
+  assert.doesNotMatch(depth, /\bmerges\b/);
+});
+
+// ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
+// Every slice performance.py::get_completion_paths serves draws in a colour of
+// its own, so no slice reads as another or as nothing.
+
+const COMPLETION_PATHS = ['one-pass', 'multi-pass', 'via-steward', 'via-interactive', 'requeued', 'blocked'];
+
+// performance.py::PerformanceCards.to_wire, one attempt down each path.
+const PERF_CARDS = {
+  paths: COMPLETION_PATHS.map(path => ({ path, count: 1, pct: 16.7 })),
+  escalation: {
+    steward_rate: 0, interactive_rate: 0, interactive_count: 0,
+    human_attention: { zero: 0, minimal: 0, significant: 0 },
+  },
+  hist_outer: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  hist_inner: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  ttc: { p50: 1000, p75: 1000, p90: 1000, p95: 1000, count: 2 },
+};
+
+function seedPerformance(window) {
+  seedDashboardData(window, {
+    PROJECTS: [projectRow(PROJECT)],
+    PERFORMANCE: {
+      [PROJECT]: {
+        cards: wireDatum(PERF_CARDS),
+        time_centiles_history: { labels: [], p50: [], p95: [] },
+        one_pass_history: { labels: [], values: [] },
+        escalation_history: { labels: [], values: [] },
+      },
+    },
+    PERFORMANCE_LISTING: wireDatum(1),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['PERFORMANCE', 'PERFORMANCE_LISTING', 'PROJECTS']),
+  });
+}
+
+// The 8px swatch beside the legend label that reads *path*.
+function legendSwatch(panel, path) {
+  const labels = [...panel.querySelectorAll('span')].filter(
+    span => span.textContent === path && span.previousElementSibling?.style.width === '8px',
+  );
+  assert.equal(labels.length, 1, `expected exactly one Completion-paths legend row for "${path}"`);
+  return labels[0].previousElementSibling;
+}
+
+test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths swatch', t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const panel = panelTitled(container, 'Completion paths');
+
+  const swatches = COMPLETION_PATHS.map(path => {
+    const swatch = legendSwatch(panel, path).style.background;
+    assert.notEqual(swatch, '', `the "${path}" slice has no swatch colour`);
+    assert.equal(swatch, styledColor(harness.window, harness.window.DF_CHARTS.PALETTE.paths[path]), path);
+    return swatch;
+  });
+  assert.equal(new Set(swatches).size, COMPLETION_PATHS.length, `two slices share a colour: ${JSON.stringify(swatches)}`);
+});
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
@@ -485,6 +646,45 @@ test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with n
   assertSiblingRenders(container);
   assert.deepEqual(harness.consoleErrors, []);
 });
+
+// ── The shell's two Datum readers title a reading with its rule ──
+// The non-fresh reason, when datumView gives one, wins over the rule; the rule
+// fills the fresh case; with neither, the reading carries no title at all.
+
+const RULE = 'R: how this figure is counted';
+const DATUM_READERS = [
+  { name: 'DatumReading', outer: container => container.firstElementChild },
+  { name: 'Pip', outer: container => container.querySelector('.pip') },
+];
+const RULED_DATUMS = [
+  { arm: 'a fresh Datum', datum: wireDatum(5) },
+  { arm: 'a stale Datum', datum: wireDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
+  { arm: 'a lower_bound Datum', datum: wireDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
+  { arm: 'an unknown Datum', datum: wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
+];
+
+for (const reader of DATUM_READERS) {
+  for (const { arm, datum } of RULED_DATUMS) {
+    test(`shell.jsx::${reader.name} over ${arm} with a rule titles the reading with datumView's reason, else the rule`, t => {
+      const harness = openWindow(t);
+      const { DF_SHELL, DF_DATUM } = harness.window;
+      const { container } = harness.mount(DF_SHELL[reader.name], { datum, rule: RULE });
+
+      const view = DF_DATUM.datumView(datum, { now: Date.now() });
+      const outer = reader.outer(container);
+      assert.equal(outer.title, view.title || RULE);
+      if (datum.state !== 'fresh') assert.notEqual(outer.title, RULE, 'a non-fresh reason must replace the rule');
+      assert.ok(outer.textContent.startsWith(view.text), `the reading must start with datumView's text ${view.text}`);
+    });
+  }
+
+  test(`shell.jsx::${reader.name} over a fresh Datum with no rule carries no title`, t => {
+    const harness = openWindow(t);
+    const { container } = harness.mount(harness.window.DF_SHELL[reader.name], { datum: wireDatum(5) });
+
+    assert.equal(reader.outer(container).hasAttribute('title'), false);
+  });
+}
 
 // ── The page app.jsx bootstraps: each fault stays in its own region ──
 // Every fault lands as a malformed payload a poll could deliver, then App's
@@ -795,6 +995,7 @@ function viewButton(window, container, key) {
 function mountTasks(harness) {
   const task = inProgressTask(false);
   seedOneTask(harness.window, task);
+  listFlat(harness.window);
   const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
   assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
   return handle;
@@ -828,7 +1029,8 @@ function fillStorageToQuota(storage) {
 
 test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
   const harness = openWindow(t);
-  mountTasks(harness);
+  seedOneTask(harness.window, inProgressTask(false));
+  harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
 
   const stored = storedKeys(harness.window);
   assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
@@ -837,6 +1039,7 @@ test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at it
 test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
   const harness = openWindow(t);
   const { window } = harness;
+  listFlat(window);
   const refusal = fillStorageToQuota(window.localStorage);
   assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
   const warnings = [];
@@ -890,14 +1093,257 @@ function groupingButton(container, label) {
   return buttons[0];
 }
 
-test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+test('tab_tasks.jsx::TasksTab stores a project listed flat, and removes the key when grouped by PRD again', t => {
   const harness = openWindow(t);
   const { window } = harness;
-  const { container } = mountTasks(harness);
-  click(window, groupingButton(container, 'by PRD'));
-  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
-
+  seedOneTask(window, inProgressTask(false));
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'by PRD is not the default grouping');
   click(window, groupingButton(container, 'list'));
-  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'flat', 'the flat listing was not stored');
+
+  click(window, groupingButton(container, 'by PRD'));
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'the project did not return to the lanes');
   assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
+});
+
+// ── Decision 9: a count axis's maximum (spark_path.js::axisMax) ──
+// A chart marked `countAxis` labels its gridlines and draws its data against
+// axisMax's snapped maximum; any other chart keeps its exact data maximum, and
+// formatY only presents the ticks it is handed.
+
+const DATA_MAX = 7;
+
+const COUNT_AXIS_CHARTS = [
+  {
+    name: 'LineChart',
+    props: { series: [{ values: [0, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+  {
+    name: 'StackedAreaChart',
+    props: { stacks: [{ key: 'a', color: 'red', values: [3, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+];
+
+function yTickLabels(container) {
+  return [...container.querySelectorAll('svg text[text-anchor="end"]')].map(text => text.textContent);
+}
+
+function gridlineYs(container) {
+  return [...container.querySelectorAll('svg line')].map(line => Number(line.getAttribute('y1')));
+}
+
+function peakY(container) {
+  const ys = [...container.querySelectorAll('svg path')].flatMap(path =>
+    [...path.getAttribute('d').matchAll(/[ML]\s*[-\d.e]+,([-\d.e]+)/g)].map(match => Number(match[1])),
+  );
+  return Math.min(...ys);
+}
+
+function renderAxis(harness, chart, props) {
+  const { container } = harness.mount(harness.window.DF_CHARTS[chart.name], { ...chart.props, ...props });
+  const labels = yTickLabels(container);
+  const gridYs = gridlineYs(container);
+  return {
+    labels,
+    ticks: labels.length - 1,
+    floor: Math.max(...gridYs),
+    top: Math.min(...gridYs),
+    peak: peakY(container),
+  };
+}
+
+function tickValues(max, ticks) {
+  return Array.from({ length: ticks + 1 }, (_, i) => (max * i) / ticks);
+}
+
+for (const chart of COUNT_AXIS_CHARTS) {
+  test(`charts.jsx::${chart.name} with countAxis labels its gridlines to axisMax's snapped maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.notEqual(max, DATA_MAX, 'the fixture does not make the snap visible');
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+  });
+
+  test(`charts.jsx::${chart.name} with countAxis draws its data on the same snapped scale as its gridlines`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.equal((axis.floor - axis.peak) / (axis.floor - axis.top), DATA_MAX / max);
+  });
+
+  test(`charts.jsx::${chart.name} without countAxis keeps its exact data maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { formatY: v => String(v) });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, false);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+    assert.equal(axis.peak, axis.top, 'the data maximum does not reach the top gridline');
+  });
+
+  test(`charts.jsx::${chart.name} hands a caller's formatY the snapped ticks on a count axis`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true, formatY: v => `${v} ops` });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
+  });
+}
+
+// ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
+// Every notice kind the helper returns renders under its own test id. Each
+// case seeds the one /tasks fact that yields that kind and nothing else, so a
+// kind with no bannerTestIds entry renders with no test id and fails here.
+
+const OTHER_PROJECT = 'q';
+const BANNER_CASES = [
+  { kind: 'global', testId: 'tasks-offline-banner',
+    data: { TASKS_OFFLINE: true, TASKS_OFFLINE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'partial', testId: 'tasks-partial-banner',
+    data: { TASKS_OFFLINE_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'degraded', testId: 'tasks-degraded-banner',
+    data: { TASKS_DEGRADED_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'count-unknown', testId: 'tasks-count-unknown-banner',
+    data: { TASKS_COUNT_UNKNOWN_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'count-stale', testId: 'tasks-count-stale-banner',
+    data: { TASKS_COUNT_STALE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+];
+
+for (const { kind, testId, data } of BANNER_CASES) {
+  test(`tab_tasks.jsx::TasksTab renders the ${kind} notice tasksBannerNoticesFor describes under ${testId}`, t => {
+    const harness = openWindow(t);
+    const { window } = harness;
+    seedOneTask(window, inProgressTask(false));
+    seedDashboardData(window, { ...data, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(data)) });
+    const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+    const notices = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+    assert.deepEqual(Array.from(notices, n => n.kind), [kind]);
+    const rendered = [...container.querySelectorAll(`[data-testid="${testId}"]`)];
+    assert.equal(rendered.length, 1, `the ${kind} notice must render exactly once under ${testId}`);
+    assert.equal(rendered[0].textContent, notices[0].text);
+    for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
+      assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
+  });
+}
+
+// ── Decision 11: the Task-detail Module locks section (task_row_cells.js::locksCellState, scheduler_utils.jsx::lockChipStateFor) ──
+
+function seedTaskWithScheduler(window, task, scheduler) {
+  seedOneTask(window, task);
+  seedDashboardData(window, { SCHEDULER: scheduler, __receipt: receiptsFor(window.DF_DATA_LOADER, ['SCHEDULER']) });
+}
+
+// The "Module locks" label and the element it heads, or null when the pane
+// draws no such section.
+function moduleLocksSection(detail) {
+  const label = [...detail.querySelectorAll('.section-lbl')].find(lbl => lbl.textContent.startsWith('Module locks'));
+  return label ? { label, body: label.nextElementSibling } : null;
+}
+
+// What the section is asked to draw, as the helpers it calls answer it.
+function expectedLocksCell(window, task) {
+  const D = window.DF_DATA;
+  const { locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
+  return locksCellState(schedulerLocksDatum(D.SCHEDULER, PROJECT, D.__receipt), window.DF_SCHED_UTILS.buildSchedLockInfo(task, D.SCHEDULER));
+}
+
+function lockChips(root) {
+  return [...root.querySelectorAll('.chip')].filter(chip => [...chip.classList].some(cls => cls.startsWith('lock-')));
+}
+
+test("tab_tasks.jsx::TaskDetail draws the Module locks em-dash with locksCellState's reason for a project the scheduler lists offline", t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot({ offlineProjects: [PROJECT] }));
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const expected = expectedLocksCell(harness.window, task);
+  assert.ok(expected.placeholder, 'locksCellState draws no placeholder for an offline project, so this fixture tests nothing');
+  assert.ok(expected.title, 'locksCellState gives no reason for an offline project, so this fixture tests nothing');
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a project whose locks are unknown');
+  assert.equal(section.label.textContent, 'Module locks', 'an unknown lock set has no count to show');
+  assert.ok(section.body?.matches('span.chip-empty'), 'the unknown arm must draw a span.chip-empty under the label');
+  assert.equal(section.body.textContent, expected.placeholder);
+  assert.equal(section.body.title, expected.title, "the em-dash must carry locksCellState's reason as its title");
+  assert.deepEqual(lockChips(detail), [], 'a project whose locks are unknown must draw no lock chip');
+});
+
+// `task` locks four paths in a measured project, one in each lock class.
+function seedTaskHoldingEveryLockClass(window, task) {
+  const paths = { mine: 'src/mine', taken: 'src/taken', parked: 'src/parked', free: 'src/free' };
+  seedTaskWithScheduler(window, task, schedulerSnapshot({
+    rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: Object.values(paths) })],
+    modules: [
+      schedulerModule({ project: PROJECT, path: paths.mine, holder: task.id, holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.taken, holder: '7', holderProject: PROJECT }),
+      schedulerModule({ project: PROJECT, path: paths.parked, parkedBy: '9', parkedOwnerLive: true }),
+    ],
+  }));
+}
+
+test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateFor answers, for a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const lockInfo = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  assert.equal(expectedLocksCell(window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  const expected = new Map(lockInfo.lockSet.map(path => [
+    path,
+    window.DF_SCHED_UTILS.lockChipStateFor(lockInfo.moduleByPath.get(path), task.id, PROJECT),
+  ]));
+  assert.equal(new Set([...expected.values()].map(state => state.cls)).size, 4, 'the four paths must cover four lock classes');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  assert.equal(section.label.textContent, `Module locks (${lockInfo.lockSet.length})`);
+  assert.ok(section.body && !section.body.matches('.chip-empty') && !section.body.querySelector('.chip-empty'),
+    'a measured project with locks must draw chips, not the em-dash');
+  for (const [path, { cls, ownerLabel }] of expected) {
+    const chip = section.body.querySelector(`.chip[title="${path}"]`);
+    assert.ok(chip, `no chip titled ${path}`);
+    assert.ok(chip.classList.contains(cls), `the ${path} chip is not ${cls}, the class lockChipStateFor answers`);
+    if (cls === 'lock-taken' || cls === 'lock-parked') {
+      assert.ok(chip.querySelector('.holder')?.textContent.includes(ownerLabel), `the ${path} chip does not name ${ownerLabel}`);
+    }
+  }
+});
+
+// An inline classifier answers as lockChipStateFor does until the two drift, so
+// the public seam is swapped for a sentinel: a chip it did not classify shows.
+test('tab_tasks.jsx::TaskDetail classifies every lock chip through window.DF_SCHED_UTILS.lockChipStateFor, with no classifier of its own', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
+  const { lockSet } = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  window.DF_SCHED_UTILS = { ...window.DF_SCHED_UTILS, lockChipStateFor: () => ({ cls: 'lock-probe', ownerLabel: 'probe' }) };
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  const chips = lockChips(section.body);
+  assert.equal(chips.length, lockSet.length, 'the section must draw one chip per locked path');
+  for (const chip of chips) {
+    assert.deepEqual([...chip.classList].filter(cls => cls.startsWith('lock-')), ['lock-probe'],
+      `the ${chip.title} chip was not classified by window.DF_SCHED_UTILS.lockChipStateFor`);
+  }
+});
+
+test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding no locks in a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const task = inProgressTask(false);
+  seedTaskWithScheduler(harness.window, task, schedulerSnapshot());
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task, so the absent section proves nothing');
+
+  assert.equal(expectedLocksCell(harness.window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
+  assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
 });

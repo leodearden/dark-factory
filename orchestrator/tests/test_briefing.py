@@ -25,9 +25,9 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _roles_helpers import tool_is_granted
 from shared.capability_manifest import DeliveredCheckMeta
 from shared.task_text_fingerprint import TaskTextDrift
-from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
@@ -678,7 +678,7 @@ class TestPlanTighteningPromptToolGrants:
         granted = set(ARCHITECT.allowed_tools)
         missing = sorted(
             qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
-            if not _tool_is_granted(qualified, granted)
+            if not tool_is_granted(qualified, granted)
         )
         assert not missing, (
             f'build_plan_tightening_prompt prescribes plan tools absent from '
@@ -978,6 +978,23 @@ class TestResumePriorProposal:
             'Root cause is a stale cache entry; fix by invalidating on write.'
             in prompt
         )
+
+
+@pytest.mark.asyncio
+class TestResumePromptArgumentPlacement:
+    """``escalation_summary`` and ``resolution`` are both positional ``str``,
+    and the template renders the issue before the resolution, so a swap shows
+    up as the two arguments arriving out of order."""
+
+    async def test_issue_renders_before_resolution(self, briefing: BriefingAssembler):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                {'id': '3754', 'metadata': {}}, {}, 'ISSUE-SENTINEL', 'RESOLUTION-SENTINEL',
+            )
+
+        assert prompt.index('ISSUE-SENTINEL') < prompt.index('RESOLUTION-SENTINEL')
 
 
 class TestPriorProposalStaleness:

@@ -1,4 +1,6 @@
-"""Contract for ``conftest.py``'s suite-wide confinement of the UsageGate probe-dir sweep.
+"""Contract for the suite-wide confinement of the UsageGate probe-dir sweep.
+
+``conftest.py`` arms it via ``df_pytest_isolation.py::arm_usage_gate_sweep_confinement``.
 
 ``UsageGate.__init__`` reclaims dead-PID probe dirs under the system tempdir, so
 every gate a test builds must have that sweep re-based onto a private per-test
@@ -12,11 +14,14 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 from _usage_gate_test_helpers import make_gate
+from df_pytest_isolation import arm_usage_gate_sweep_confinement
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
+from shared import usage_gate
 from shared.config_dir import reset_sweep_once_state
 
 
@@ -65,3 +70,17 @@ def test_real_probe_dir_sweep_restores_the_unconfined_sweep(real_probe_dir_sweep
     make_gate(['work'])
 
     assert not ghost.exists(), f'{ghost.name} should have been reclaimed by the real sweep'
+
+
+def test_re_arming_with_the_same_module_is_a_no_op(pytestconfig):
+    arm_usage_gate_sweep_confinement(pytestconfig, usage_gate)
+
+
+def test_re_arming_with_a_different_module_is_refused(pytestconfig):
+    impostor = ModuleType('shared.usage_gate')
+
+    with pytest.raises(pytest.UsageError) as refusal:
+        arm_usage_gate_sweep_confinement(pytestconfig, impostor)
+
+    assert repr(usage_gate) in str(refusal.value), 'the refusal must name the module already patched'
+    assert repr(impostor) in str(refusal.value), 'the refusal must name the module it refused'

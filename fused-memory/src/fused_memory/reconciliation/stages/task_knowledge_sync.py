@@ -3514,7 +3514,6 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -3550,7 +3549,6 @@ class TaskKnowledgeSync(BaseStage):
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -4646,7 +4644,6 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -4681,7 +4678,6 @@ class IntegrityCheck(BaseStage):
         """
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.

@@ -91,7 +91,7 @@ class TestCanonicalConfigPreferred:
     ):
         """A no-URL earlier legacy spelling does not halt the fallback loop.
 
-        With the canonical config absent, ``_discover_root_escalation_url``
+        With the canonical config absent, ``discover_root_escalation_url``
         iterates ``_LEGACY_CONFIG_NAMES`` in order. A portless, unparseable,
         or non-mapping-``escalation:`` config at an EARLIER spelling
         (``orchestrator.yaml``) must not stop iteration nor be treated as

@@ -6,7 +6,9 @@ that prior incarnation aside and starts on a branch freshly cut from main.
 The marker lives in the TASK record's metadata under ``recut_ruling``, since
 a ruling is a human-issued, task-lifetime fact. It is satisfied only by the
 explicit ``recut_executed`` record naming the same ruling id. Provenance:
-esc-2896-8, task 3154.
+esc-2896-8, task 3154. A ruling is issued by a restart resolution with
+``recut=True`` (``harness.py::Harness._action_teardown_and_set_status``), or
+by hand.
 
 Dependency-light (stdlib + ``shared.task_metadata_wire``), like
 ``cross_repo_gate``: git_ops, harness and workflow import this module, never
@@ -133,6 +135,10 @@ def read_recut_ruling(task: dict[str, Any]) -> RecutReading:
             task.get('id'),
         )
         return RecutReading(RecutState.SKIP)
+    return _reading_of(metadata)
+
+
+def _reading_of(metadata: dict[str, Any]) -> RecutReading:
     if RECUT_RULING_KEY not in metadata:
         return RecutReading(RecutState.ABSENT)
     ruling = _parse_ruling(metadata[RECUT_RULING_KEY])
@@ -170,6 +176,71 @@ def execution_record(
         'quarantined_worktree': parked.quarantined_worktree,
         'relocated_meta_roots': list(parked.relocated_meta_roots),
     }
+
+
+def ruling_on_record(ruling_id: str, resolved_at: object, *, now: datetime) -> RecutRuling:
+    """The ruling a record resolved at *resolved_at* issues; ruled *now* if that is unreadable."""
+    return RecutRuling(ruling_id, _parse_ruled_at(resolved_at) or now)
+
+
+def ruling_patch(ruling: RecutRuling) -> dict[str, Any]:
+    """The metadata patch that issues *ruling*; ``_parse_ruling`` reads it back."""
+    return {
+        RECUT_RULING_KEY: {
+            'ruling_id': ruling.ruling_id,
+            'ruled_at': ruling.ruled_at.isoformat(),
+        },
+    }
+
+
+async def issue_ruling(
+    ruling: RecutRuling,
+    *,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+) -> str | None:
+    """Persist *ruling*; the failure reason, or None once it is durable."""
+    return await _persist_failure(persist, ruling_patch(ruling))
+
+
+def issued_ruling_was_dropped(task: dict[str, Any], ruling: RecutRuling) -> bool:
+    """True when *task* carries neither *ruling*, its execution, nor a newer ruling.
+
+    An older ruling in its place, pending or already executed, reads as
+    dropped: a stale read-modify-write restored it. Unreadable metadata, or
+    a malformed ruling the dispatch gate will refuse loudly, reads False.
+    """
+    metadata = coerce_task_metadata(task.get('metadata'))
+    if metadata is None or _executed_ruling_id(metadata) == ruling.ruling_id:
+        return False
+    reading = _reading_of(metadata)
+    if reading.state is RecutState.ABSENT:
+        return True
+    present = reading.ruling
+    if reading.state is RecutState.MALFORMED or present is None:
+        return False
+    return present.ruling_id != ruling.ruling_id and present.ruled_at < ruling.ruled_at
+
+
+async def reassert_ruling(
+    task: dict[str, Any],
+    ruling: RecutRuling,
+    *,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+) -> str | None:
+    """Re-issue *ruling* if *task* dropped it; the failure reason, or None.
+
+    Re-issuing cannot re-cut twice: once ``recut_executed`` names the
+    ruling, it is neither re-issued nor enforced again.
+    """
+    if not issued_ruling_was_dropped(task, ruling):
+        return None
+    failure = await issue_ruling(ruling, persist=persist)
+    if failure is None:
+        logger.warning(
+            'RECUT RE-ASSERTED: task %s ruling %s had been dropped',
+            task.get('id'), ruling.ruling_id,
+        )
+    return failure
 
 
 async def enforce_recut_ruling(

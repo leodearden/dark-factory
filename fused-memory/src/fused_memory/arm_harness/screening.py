@@ -23,7 +23,7 @@ from fused_memory.arm_harness.screening_evidence import (
     reported_evidence,
 )
 from fused_memory.arm_harness.slate import LocalLlmStack, ReasoningMode, SlateArm
-from fused_memory.arm_harness.usage_tap import CallRecord
+from fused_memory.arm_harness.usage_tap import CallRecord, StatusOrigin
 
 SURVIVOR_CAP = 3
 SCREENING_VERDICT_SCHEMA_VERSION = 1
@@ -142,13 +142,26 @@ def _reported_prompts(calls: Sequence[CallRecord]) -> list[int]:
     return [tokens for tokens in map(_reported_prompt_tokens, calls) if tokens is not None]
 
 
+def _origin_note(origin: StatusOrigin | None) -> str:
+    match origin:
+        case StatusOrigin.TAP:
+            return ' (synthesized by the usage tap)'
+        case StatusOrigin.UPSTREAM:
+            return ' (from the server)'
+        case None:
+            return ''
+
+
 def _unreported_detail(
     model_id: str, unreported: Sequence[CallRecord], own: Sequence[CallRecord]
 ) -> str:
-    kinds = sorted(Counter((call.status, call.error_excerpt or '') for call in unreported).items())
+    kinds = sorted(Counter(
+        (call.status, _origin_note(call.status_origin), call.error_excerpt or '')
+        for call in unreported
+    ).items())
     listed = '; '.join(
-        f'{count}x status {status}: {excerpt}'
-        for (status, excerpt), count in kinds[:_LISTED_REJECTIONS]
+        f'{count}x status {status}{origin_note}: {excerpt}'
+        for (status, origin_note, excerpt), count in kinds[:_LISTED_REJECTIONS]
     )
     reported = _reported_prompts(own)
     longest = f'{max(reported)} tokens' if reported else 'none'

@@ -80,6 +80,7 @@ def reset_probe_cache():
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=tmp_path,
+        escalate_preexisting_main_break=True,
         max_concurrent_tasks=1,
         git=GitConfig(
             main_branch='main',

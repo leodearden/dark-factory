@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
+
+New restart-only leaf `Mem0BackendConfig.persist_history`. It defaults to True, and
+under that default the config mem0 receives is byte-identical to before. At False,
+each mem0 instance keeps its history in a private in-memory SQLite DB instead of the
+process-shared `$MEM0_DIR/history.db`. The conftest `mock_config` and
+`fused-memory/scripts/bake_off_storage_shape.py::run_bake_off` now turn it off, and no
+longer patch mem0's private `instance.db.add_history`.
+
 #### `consolidate_memories` teaches the write-time topic guard its topic (task 3135)
 
 Removes the manual human hop that was supposed to teach `add_memory`'s topic guard a
@@ -1695,6 +1704,39 @@ contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
 
 ### Fixed
+
+#### Fairness parks can no longer deadlock pending owners (task 7799)
+
+Two pending owners could each hold a partial park and need a key the other had parked.
+Each one's acquire was refused by the other's park, and only the score-top ever retried
+its install, so neither moved until someone deferred one of them or the orchestrator
+restarted. solar_challenge hit this four times between 10-27 and 11-01, once for about
+31 h. Park entries now have one order, `scheduler.py::_ParkKey`: rank, then older
+numeric id, then id. A foreign park blocks a requester that owns parks only when its key
+precedes the requester's best key, and install shadows or blocks by the same key. A
+requester that owns no park is still blocked by every park. Every park wait therefore
+points at a strictly smaller key, and no cycle can form. What an operator will see:
+`reservation_shadowed` events now also occur between same-tier owners (the older id
+shadows), and a park owner can pass a lower-key park on a key it has not parked.
+`request_park_eviction` behaves as before. Rationale:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
+
+#### resolve_escalation_shas reports git faults as failed_shas (task 7485)
+
+- **A git fault is never read as "no twin".** `GitOps.resolve_rebased_citation` used to
+  return None, the "already on main, not a commit, or no twin" answer, when git could not
+  answer: a `project_root` that is not a git repository, an unknown main branch, or a
+  failed `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new
+  `GitQueryFailed` for each of these (`WorktreeMissing` when `project_root` no longer
+  exists). Only empty output stays a fact.
+- **Only tokens that name a commit count against the cap.** One `git cat-file
+  --batch-check` (`GitOps.commits_named`) checks every cited token's object type before
+  `MAX_CITED_SHAS_RESOLVED` is applied. UUID segments, digit runs and hashes are dropped,
+  so they no longer push a real SHA into `skipped_shas`.
+- **New response key `failed_shas: [{cited, error}]`**, in cited order, for each token git
+  could not answer for. Nothing may be concluded about those tokens. Each fault is also
+  logged at WARNING with its traceback. When git cannot check the tokens at all, every
+  token counts against the cap, so the response stays bounded.
 
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 

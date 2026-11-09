@@ -27,7 +27,7 @@ from escalation.grant_delivery import (
     GrantDelivery,
     shortfall_reason,
 )
-from escalation.models import DeliveredCheckOwner, Escalation
+from escalation.models import DeliveredCheckOwner, Escalation, cascade_parent_id
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -71,6 +71,7 @@ from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.already_landed_tick_view import (
     AlreadyLandedTickView,
+    PendingEscalationsByTask,
     branch_absent_and_unmarked,
     read_already_landed_tick_view,
 )
@@ -108,6 +109,7 @@ from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
+from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landing_reject_emission import LandingRejectRecorder, LandingRejectSite
 from orchestrator.lane_lifecycle import LaneRecord
@@ -115,6 +117,7 @@ from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane import enqueue_merge_request
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
@@ -126,11 +129,10 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
 from orchestrator.merge_lane.worker import (
-    enqueue_merge_request,
     reconcile_landed_outbox,
     reconcile_landed_task,
-    select_recovery_winner,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
@@ -162,6 +164,7 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    pending_holder_candidates,
     pin_buckets,
     render_shape,
     resolve_recovery_veto_streak_escalation,
@@ -227,9 +230,12 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     is_infra_held,
 )
+from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.usage_gate import UsageGate
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
+from orchestrator.verify_runner import RunnerUnavailable
 from orchestrator.workflow import (
     ResumeFailure,
     TerminalReport,
@@ -244,6 +250,8 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
+    from shared.uuid_prefix_guard import PrefixResolver
+
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -252,6 +260,7 @@ if TYPE_CHECKING:
     from orchestrator.warm_lane_pool import WarmLanePoolCensus
 
 try:
+    from escalation.prefix_resolver_client import PrefixResolverClient
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
     from escalation.store_identity import StoreIdentity
@@ -738,7 +747,7 @@ def _deterministic_gate_stranded(metadata: dict | None) -> bool:
     was supposed to be filed) but whose escalation record never landed or was
     lost across a restart.  ``gate_escalated_at`` is written ONLY by the
     gate-filing paths (``DeterministicRunner._file_milestone_gate_and_block`` /
-    ``_file_milestone_check_failed_and_block`` / the predicate leg), so it is
+    ``_file_predicate_escalation_and_block`` / the predicate leg), so it is
     the sole reliable "a gate was supposed to be filed" signal.
 
     Metadata-only predicate — the archive-inclusive empty-escalation-queue
@@ -1796,6 +1805,9 @@ class Harness:
         #   - read_already_landed_tick_view (task 4900): one local-branch
         #     snapshot per already-landed consult, read through the bound
         #     method so a test-replaced self.git_ops is honoured.
+        #   - read_pending_escalations_by_task (task 8073): one pending
+        #     escalation-store read per consult, through the bound method so
+        #     the late-wired self._escalation_queue is honoured.
         self.scheduler = Scheduler(
             config,
             callbacks=SchedulerCallbacks(
@@ -1810,6 +1822,7 @@ class Harness:
                 on_warm_base_resolve=self._resolve_warm_base_hard_down,
                 suppress_blocked_write=self._is_action_teardown_task,
                 read_already_landed_tick_view=self._read_already_landed_tick_view,
+                read_pending_escalations_by_task=self._read_pending_escalations_by_task,
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
@@ -2228,6 +2241,22 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        # Remote verify host health for the PROCESS lifetime (task 6670, PRD
+        # plans/remote-task-leg-verify-prd.md §5.6): one quarantine set, shared
+        # by reference with every merge worker built below, and the task path's
+        # pool and dispatcher over it, whether or not a merge worker starts.
+        self._runner_quarantine: set[str] = set()
+        self._host_pool = HostPool(
+            task_verify_hosts(config, deployed_sha=deployed_sha),
+            runner_for=remote_runner_factory(
+                config, config.project_root, deployed_sha=deployed_sha,
+            ),
+            quarantine=self._runner_quarantine,
+            on_unavailable=self._bench_verify_host,
+        )
+        self._task_verify_dispatcher = TaskVerifyDispatcher(
+            self._host_pool, self.git_ops, policy_of=policy_from_config,
+        )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
         # worker's admission from the heartbeat pass, reports at stop.
@@ -3575,22 +3604,42 @@ class Harness:
             logger.info(f'Module cache sample: {sample}')
 
     def _resolve_recovery_artifact(self, entry: Path, name: str) -> Path:
-        """Resolve a `.task` artifact path new-then-old (W11 delta relocation).
+        """Resolve a LANE-keyed artifact (``agent_session.json``) new-then-old.
 
         Prefers ``TaskArtifacts.meta_root_for(worktree_base, entry.name) /
-        name`` (the new ``.task-meta`` sibling location, W11 beta), falling
-        back to the legacy ``entry / '.task' / name`` when the new path is
-        absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract, for the ``_recover_crashed_tasks`` reads that don't go
-        through a ``TaskArtifacts`` instance.
+        name`` (the ``.task-meta`` lane root, W11 beta), falling back to the
+        legacy ``entry / '.task' / name`` when that path is absent.
+        Task-scoped artifacts go through :meth:`_task_recovery_artifact`.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
             return new_path
         return entry / '.task' / name
 
+    def _task_recovery_artifact(self, entry: Path, task_id: str | None, name: str) -> Path | None:
+        """Where task-scoped *name* (plan.json, plan.lock) of *task_id* survives
+        for *entry*: the task root (``TaskArtifacts.for_task``), else the legacy
+        ``entry / '.task' / name`` (W11 compat).
+
+        ``None`` when *task_id* is None or ``task_root_for`` rejects it: there
+        is no task to read for, so the caller takes its no-plan branch.
+        """
+        if task_id is None:
+            return None
+        try:
+            task_path = TaskArtifacts.for_task(entry, task_id).artifact_path(name)
+        except ValueError as exc:
+            logger.warning(
+                'Recovery: %s names an unaddressable task id (%s) — no %s to read',
+                entry.name, exc, name,
+            )
+            return None
+        if task_path.exists():
+            return task_path
+        return entry / '.task' / name
+
     def _clear_recovery_artifact(self, entry: Path, name: str) -> None:
-        """Remove a `.task` artifact from BOTH the new and legacy roots.
+        """Remove a LANE-keyed artifact from BOTH the lane and legacy roots.
 
         The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
         ``TaskArtifacts._clear_path``: clearing only the resolved path risks
@@ -3617,11 +3666,11 @@ class Harness:
         ``AgentSession`` through.
 
         Keying: when *task_id* is given (the plan-present sites, keyed by
-        the plan-derived recovery id) it is used directly — this covers both
+        the entry's recovery id) it is used directly — this covers both
         a v2 sidecar (whose own ``task_id`` should equal it) and a v1
         sidecar (which has no ``task_id`` of its own, B11 fallback). When
         *task_id* is ``None`` (the no-plan lane site, which has no
-        plan-derived id) falls back to the sidecar's own v2 ``task_id``. If
+        recovered plan) falls back to the sidecar's own v2 ``task_id``. If
         neither yields a usable key (a v1 sidecar on a no-plan lane) — or the
         sidecar is missing, unreadable, or parsed to something that is not a
         JSON OBJECT — nothing is adopted and ``None`` is returned. Never
@@ -3684,8 +3733,8 @@ class Harness:
         # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
         # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
         # And ``key`` above IS the real task id at every call arity (the
-        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
-        # cold worktree's dir name — all the same identity).
+        # lane metadata's recovery id, the v2 sidecar's own ``task_id``, or
+        # the cold worktree's dir name — all the same identity).
         #
         # Nothing else is EVER stashed: the one other creator,
         # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
@@ -4301,6 +4350,12 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        # Leaf δ: under the unit's KillMode=control-group no dark-factory
+        # child survives the restart that led here, so every IN_USE record is
+        # a crash fossil; left alone it would make its lane unreclaimable
+        # once ε lands. An orphan of an unmanaged kill (its agents run in
+        # their own sessions) is still guarded by γ's /proc gate.
+        self.git_ops.reset_stale_lane_in_use_records()
         self.git_ops.warn_on_warm_lane_pool_shrink()
 
         for entry in worktree_base.iterdir():
@@ -4517,10 +4572,10 @@ class Harness:
                                 continue
 
                         pool.restore_assignment(rec.task_id, entry)
-                        rec_plan_path = self._resolve_recovery_artifact(
-                            entry, 'plan.json',
+                        rec_plan_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.json',
                         )
-                        if rec_plan_path.exists():
+                        if rec_plan_path is not None and rec_plan_path.exists():
                             try:
                                 rec_plan = json.loads(rec_plan_path.read_text())
                             except (json.JSONDecodeError, OSError) as e:
@@ -4563,10 +4618,10 @@ class Harness:
                                         entry.name, rec.task_id,
                                     )
                                     self._preserved_worktrees.add(rec.task_id)
-                        rec_lock_path = self._resolve_recovery_artifact(
-                            entry, 'plan.lock',
+                        rec_lock_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.lock',
                         )
-                        if rec_lock_path.exists():
+                        if rec_lock_path is not None and rec_lock_path.exists():
                             rec_lock_path.unlink()
                             logger.info(
                                 'Recovery: cleared stale plan.lock for '
@@ -4618,16 +4673,27 @@ class Harness:
                         cleaned += 1
                         continue
 
-            plan_path = self._resolve_recovery_artifact(entry, 'plan.json')
+            # The task this entry was dispatched for. A cold worktree is named
+            # for it; a lane is named for its pool slot, so its id comes from
+            # the lane root's metadata.json — never from a plan.json, which is
+            # task-scoped and lives in the task root that id names.
+            recovery_id = (
+                TaskArtifacts.read_lane_task_id(
+                    TaskArtifacts.meta_root_for(worktree_base, entry.name),
+                )
+                if is_lane else task_id
+            )
+            plan_path = self._task_recovery_artifact(entry, recovery_id, 'plan.json')
 
-            if not plan_path.exists():
+            if recovery_id is None or plan_path is None or not plan_path.exists():
                 # Mid-invocation crash: an agent subprocess was in flight when
                 # the prior orchestrator died (no plan was written yet).  The
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
                 #
-                # For lanes: a v1 sidecar carries session_id/role/owner_pid
+                # For lanes this also covers a lane whose metadata names no
+                # task.  A v1 sidecar carries session_id/role/owner_pid
                 # but NO task_id, and the in-memory assignment map is empty
                 # after a restart, so a v1-only lane still can't be mapped
                 # back to its real task -- nothing is adopted for it.  A v2
@@ -4683,31 +4749,6 @@ class Harness:
                 cleaned += 1
                 continue
 
-            # For lanes, derive the real task id from plan.json.  A lane dir
-            # name (e.g. '_lane-0') never equals the real task_id by design —
-            # the lane dir is named after the pool slot, not the task.
-            # Cold path: recovery_id == task_id (entry.name) — byte-identical.
-            # Normalize to str: plan.json could store task_id as int; dispatch
-            # and restore_assignment key off str (mirroring the str() coercion
-            # in the orphan-reaper live_ids set).
-            recovery_id = (
-                str(plan.get('task_id'))
-                if (is_lane and plan.get('task_id') is not None)
-                else task_id
-            )
-
-            # For lanes: if plan.json has no task_id there is no recoverable
-            # identity — release the lane back to the pool.
-            if is_lane and not recovery_id:
-                logger.warning(
-                    'Recovery: lane %s plan.json has no task_id — '
-                    'releasing back to pool',
-                    task_id,
-                )
-                await self.git_ops.cleanup_worktree(entry, task_id)
-                cleaned += 1
-                continue
-
             # Validate plan belongs to this task (cold path only).
             # Lanes skip this check: lane name != task_id is expected by
             # design, so the cold numeric-mismatch cleanup must not fire.
@@ -4730,7 +4771,7 @@ class Harness:
             # task).  Compare the worktree's stored title to the LIVE DB
             # task's title and quarantine on a provable mismatch — this is the
             # exact line that would have caught 3770.
-            # For lanes, recovery_id is the real task id read from plan.json.
+            # For lanes, recovery_id is the real task id from lane metadata.
             if self.config.worktree_identity_guard_enabled:
                 live = await self.scheduler.get_task(recovery_id)
                 if live is None:
@@ -4821,7 +4862,9 @@ class Harness:
                 # 17-20 wasted Opus calls per 14d.  Keep the worktree, unlink
                 # plan.lock, and add to _preserved_worktrees so the next
                 # acquisition reuses it; _plan() will then take the
-                # revalidation branch via _old_plan_base.  We deliberately
+                # revalidation branch via the plan's own _base_commit
+                # (falling back to the lane's prior base for unstamped
+                # plans).  We deliberately
                 # do NOT pre-load into _recovered_plans because that bypasses
                 # _plan() entirely.
                 if plan.get('_session_id'):
@@ -4829,8 +4872,8 @@ class Harness:
                         f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
-                    lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-                    if lock_path.exists():
+                    lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+                    if lock_path is not None and lock_path.exists():
                         lock_path.unlink()
                         logger.info(
                             f'Recovery: cleared stale plan.lock for '
@@ -4866,8 +4909,8 @@ class Harness:
             self._recovered_plans[recovery_id] = plan
             self._adopt_recovered_session(entry, recovery_id)
             # Clear stale plan.lock so the new session doesn't immediately requeue
-            lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-            if lock_path.exists():
+            lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+            if lock_path is not None and lock_path.exists():
                 lock_path.unlink()
                 logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
             recovered += 1
@@ -9199,15 +9242,16 @@ class Harness:
         """Invoke the warm-lane GC reclaim helper once (single cadence tick).
 
         Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
-        which is already fail-soft: rc 127 when the script is absent (no-op),
-        non-zero on script error (logged at WARNING inside the helper), and
-        never raises.  This method therefore also never raises.
+        which is already fail-soft: rc 127 when no reclaim ran, non-zero on
+        script error (logged at WARNING inside the helper), and never raises.
+        This method therefore also never raises.
 
-        Logging is tiered to avoid noise on hosts where gc.sh is absent
-        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
-        default):
-          * rc==0   → INFO  (actual reclaim ran)
-          * rc==127 → DEBUG (script absent — expected no-op)
+        Logging is tiered against what git_ops already logs for the pass:
+          * rc==0   → DEBUG, because git_ops' preceding line reports the pass:
+            the INFO ``reclaim pass`` record, or an "uncounted" WARNING
+          * rc==127 → INFO, cause-free; git_ops' preceding line names the
+            cause: a lease deferral at INFO; a pool refusal, script not found
+            (naming both candidates) or unexpected error at WARNING
           * other   → WARNING (unexpected non-zero)
 
         Also folds in the interactive-worktree (``_iact-*``) crash-safety
@@ -9220,9 +9264,15 @@ class Harness:
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
-            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+            logger.debug(
+                'Warm-lane GC reclaim pass: script exited 0 (see the preceding '
+                '_run_warm_lane_gc_reclaim line)',
+            )
         elif rc == 127:
-            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+            logger.info(
+                'Warm-lane GC reclaim pass: no reclaim ran this tick (rc=127) — '
+                'the preceding _run_warm_lane_gc_reclaim line names the cause',
+            )
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
@@ -9621,17 +9671,40 @@ class Harness:
                 'will still attempt to file escalation',
                 task_id, exc_info=True,
             )
+        self._file_harness_l1(
+            task_id, category=category, summary=summary, detail=detail,
+        )
+
+    def _file_harness_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+        root_cause: str = '',
+    ) -> None:
+        """File one L1 for *task_id*, unless an open L1 already covers it.
+
+        Covering means an open L1 of *category*; with a *root_cause*, an open
+        L1 of *category* carrying that same root cause, so an unrelated L1 of
+        the category cannot hide this one.
+        """
         if not self._escalation_queue:
             logger.warning(
-                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
-                task_id,
+                'Harness L1 for task %s — no escalation queue, skipping the file: %s',
+                task_id, summary,
             )
             return
-        if self._escalation_queue.has_open_l1(task_id, category=category):
+        if root_cause:
+            covered = any(
+                esc.category == category and esc.root_cause == root_cause
+                for esc in self._escalation_queue.get_by_task(
+                    task_id, status='pending', level=1,
+                )
+            )
+        else:
+            covered = self._escalation_queue.has_open_l1(task_id, category=category)
+        if covered:
             logger.warning(
-                'Dispatch-gate block for task %s — open %s L1 already exists, '
-                'suppressing duplicate',
-                task_id, category,
+                'Harness L1 for task %s — an open %s L1 already covers it, '
+                'suppressing duplicate: %s',
+                task_id, category, summary,
             )
             return
 
@@ -9647,6 +9720,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            root_cause=root_cause,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
@@ -10689,6 +10763,7 @@ class Harness:
                 event_store=self.event_store,
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
+                task_verify=self._task_verify_dispatcher,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -11033,6 +11108,7 @@ class Harness:
         runner = DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,
+            predicate_recheck_stall_cap=self.config.deterministic.predicate_recheck_stall_cap,
         )
         outcome = await runner.run(assignment)
         return TaskReport(
@@ -11783,9 +11859,18 @@ class Harness:
             # here: classify_pins is consulted for BUCKETING and the streak
             # alarm's human-parked gate only (never for the veto answer), and
             # records=None carries its store-unavailable third state, which
-            # must never collapse into "no records".
+            # must never collapse into "no records"; where that gate can decide
+            # a filing the pending queue feeds it too, because a cluster L2 may
+            # sit under another task id (task 7716).
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
+                holder_candidates=pending_holder_candidates(
+                    getattr(self, '_escalation_queue', None), site,
+                    reason=reason,
+                    store_unavailable=store_unavailable,
+                    streak_escalation_enabled=cfg.streak_escalation_enabled,
+                    suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
+                ),
             )
             buckets = pins.buckets
 
@@ -12342,7 +12427,15 @@ class Harness:
             provenance_conflict_sink=self._provenance_conflict_sink,
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
+            runner_quarantine=self._runner_quarantine,
+            host_holder_reader=self._host_pool.holders,
+            on_host_readmitted=self._note_verify_host_readmitted,
         )
+        # Manage every remote host from the start, so a task-path bench before
+        # the first merge lands on a tracked host (task 6670).  Without a
+        # deployed sha no remote verify runs, and the build would refuse.
+        if self._deployed_sha is not None:
+            self._merge_worker.ensure_host_allocator(self.config)
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
         # verify subtree from a PREVIOUS run still alive under the warm
@@ -12384,6 +12477,37 @@ class Harness:
                 await self._merge_worker_task
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
+
+    def _bench_verify_host(self, name: str, exc: RunnerUnavailable) -> None:
+        """The task pool's bench sink: one RunnerUnavailable bench on the merge lane.
+
+        The allocator is ensured first, so the host is managed and the
+        unreachability thresholds come from config before the bench.  Without
+        a running merge worker there is no tracker to bench on and no reprobe
+        sweep to readmit the host: logged, no-op.  A merge-lane fault is
+        logged and never reaches the task verify, as the worker's readmit
+        hook never lets a task-pool fault reach the merge lane.
+        """
+        task = self._merge_worker_task
+        worker = self._merge_worker if task is not None and not task.done() else None
+        if worker is None:
+            logger.warning(
+                'Remote verify host %s is unavailable (%s), but no merge worker '
+                'is running to bench it', name, exc,
+            )
+            return
+        try:
+            worker.ensure_host_allocator(self.config)
+            worker.bench_unavailable_runner(name, exc)
+        except Exception:
+            logger.exception(
+                'Benching unavailable remote verify host %r on the merge lane raised; '
+                'the task verify goes on without the bench', name,
+            )
+
+    def _note_verify_host_readmitted(self, name: str) -> None:
+        """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""
+        self._host_pool.note_readmitted(name, self.config)
 
     async def _note_merge_all(
         self, task_id: str, base_sha: str, head_sha: str
@@ -13083,6 +13207,18 @@ class Harness:
 
         return _lookup
 
+    def _build_prefix_resolver(self) -> PrefixResolver | None:
+        """fused-memory's ``POST /resolve-prefix`` (PRD D7), or no uuid-prefix guard at all.
+
+        Under the D8 null sentinel fused-memory is absent by design, so every
+        resolution would be 'unavailable', and the guard's storm alarm would
+        file a blocking L1 about an outage nobody can fix.
+        """
+        url = self.config.fused_memory.url
+        if is_fm_null_sentinel(url):
+            return None
+        return PrefixResolverClient(base_url=url).resolve_prefix
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -13135,6 +13271,7 @@ class Harness:
                 project_id=self.config.fused_memory.project_id,
                 project_root=self.config.project_root,
             ),
+            prefix_resolver=self._build_prefix_resolver(),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
@@ -13739,12 +13876,18 @@ class Harness:
     async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
         return await read_already_landed_tick_view(self.git_ops)
 
+    async def _read_pending_escalations_by_task(self) -> PendingEscalationsByTask | None:
+        if self._escalation_queue is None:
+            return None
+        return await asyncio.to_thread(self._escalation_queue.get_pending_by_task)
+
     async def _already_landed_dispatch_gate(
         self,
         task_id: str,
         *,
         task: dict | None = None,
         tick_view: AlreadyLandedTickView | None = None,
+        pending_escalations: PendingEscalationsByTask | None = None,
     ) -> bool:
         """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
 
@@ -13940,6 +14083,15 @@ class Harness:
         is consulted only after every veto above, and only to abstain early —
         the safety argument lives in
         ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
+        ``pending_escalations`` (task 8073) is the consult's shared
+        pending-store snapshot, standing in for the per-candidate
+        ``get_by_task(task_id, status='pending')`` read: a task id it lacks
+        has no pending rows, and ``None`` means this gate reads the store
+        itself, so ``rows is None`` still arises exactly when a read failed.
+        Because the snapshot can be a whole consult old, every flip arm
+        re-reads the task's pending rows just before its done-write and
+        re-decides the escalation hold on them
+        (:meth:`_escalation_hold_before_flip`).
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         if task is None:
@@ -13960,166 +14112,15 @@ class Harness:
             return True
 
         if self._escalation_queue is not None:
-            # An open escalation at ANY level (not just L1 — the resolver's
-            # row (f) folds every level) is the deliberate
-            # human/automation-handoff signal, and a handoff is never
-            # second-guessed by an automatic done-flip.  `live_claimant=False`
-            # is deliberate and free: `vetoes_done_flip` is True for BOTH the
-            # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
-            # cannot change this site's answer — and this hot per-dispatch-tick
-            # path skips claimant resolution entirely for an identical result.
-            from escalation.pins import classify_pins  # noqa: PLC0415
-
-            try:
-                rows = self._escalation_queue.get_by_task(
-                    task_id, status='pending',
-                )
-            except Exception:
-                # `classify_pins`'s store-correctness contract, obligation 2:
-                # a read that FAILED must be passed as `records=None`, never
-                # substituted with `[]` — a false "no open escalations" is
-                # exactly the esc-3163 collapse (a genuinely-pinned task
-                # routed down the act-anyway branch).  Letting it propagate
-                # instead would make the disposition invisible: the
-                # scheduler's generic `_consult_already_landed` catch-all
-                # logs a traceback and fails open for the WHOLE gate, so
-                # "never phantom-done on an unreadable store" would be
-                # incidental rather than local and testable.
-                #
-                # `except Exception` is broad on purpose: `get_by_task`
-                # already absorbs per-file JSON/type errors internally, so
-                # what reaches here is filesystem-level (OSError) or an
-                # unexpected store-implementation fault — neither of which
-                # may abort a dispatch tick.
-                logger.warning(
-                    'already-landed dispatch gate: could not READ the '
-                    'escalation store for task %s — treating as '
-                    'store_unavailable and vetoing the auto-done flip '
-                    '(never phantom-done on an unreadable store); '
-                    'dispatching normally',
-                    task_id,
-                    exc_info=True,
-                )
-                rows = None
-
-            pinned = classify_pins(task_id, rows, live_claimant=False)
-
-            # The task's OWN arbitration escalation is a pending urgent L2,
-            # so `vetoes_done_flip` below is True for it — and that veto's
-            # answer is `return False`, which means "dispatch normally".  For
-            # a task under provenance arbitration that is precisely the
-            # outcome this gate's docstring forbids, so the hold must be
-            # decided FIRST.
-            #
-            # It reads the DURABLE store records (already in hand — no second
-            # read), not the `should_skip` memo above: that memo is in-memory
-            # only (see ProvenanceConflictSink's class docstring) and is empty
-            # on any process that did not itself file the conflict — after a
-            # fleet-redeploy/watchdog restart, or when a merge-queue writer
-            # site filed it.  Ordering alone cannot deliver the invariant;
-            # durability is what delivers it.
-            #
-            # `reopen_at` is the SAME `metadata.get('reopen_at')` the
-            # `should_skip` pre-check above already passes, so the durable
-            # hold and the in-memory memo invalidate on exactly one shared
-            # signal — a restart changes performance, not behaviour.
-            if self._provenance_conflict_sink.arbitration_pending(
-                rows, reopen_at=metadata.get('reopen_at'),
-            ):
-                # INV-4 ("storm escape is dedupe_count, never log spam"): the
-                # hold re-fires on EVERY dispatch tick for as long as the
-                # arbitration stands — and on a cold-memo process it
-                # short-circuits above `_mark_in_progress_done`, so nothing
-                # ever re-warms `should_skip` to quiet it.  Logging it
-                # unconditionally at INFO would therefore emit one line per
-                # tick, indefinitely, until a human resolved the L2.  Loud on
-                # the (task, reopen_at) TRANSITION, quiet on the repeats.
-                first_observation = self._provenance_conflict_sink.note_hold_observed(
-                    task_id, reopen_at=metadata.get('reopen_at'),
-                )
-                logger.log(
-                    logging.INFO if first_observation else logging.DEBUG,
-                    'already-landed dispatch gate: task %s is under provenance '
-                    'arbitration (pending provenance_conflict escalation at '
-                    'reopen_at=%s) — withholding it from dispatch rather than '
-                    're-attempting the already-rejected done-write; reopening '
-                    'the task again releases this hold',
-                    task_id,
-                    metadata.get('reopen_at'),
-                )
-                if first_observation:
-                    # The structured twin of that log line (task beta 3535):
-                    # same transition, same rows, no second store read.  The
-                    # SINK stays the authority for this arm's transition state
-                    # — it keys on (task_id, reopen_at), which the emitter's
-                    # veto signature cannot see, so a hold released and
-                    # re-established under an unchanged signature would
-                    # otherwise go unannounced.  `transition_gated_by_caller`
-                    # is how the adapter is told that.
-                    self._emit_recovery_disposition(
-                        task_id,
-                        site=RecoverySite.already_landed_gate,
-                        reason=LeaveReason.provenance_arbitration,
-                        shape=_already_landed_gate_shape(has_open_escalation=True),
-                        records=rows,
-                        transition_gated_by_caller=True,
-                    )
-                return True
-
-            # The hold does not bind this task (any more): drop its log-streak
-            # state so a hold that returns later announces itself loudly again
-            # rather than being folded into a stale streak — and so the sink's
-            # streak dict stays bounded by currently-held tasks.
-            self._provenance_conflict_sink.clear_hold_observed(task_id)
-
-            if pinned.vetoes_done_flip:
-                logger.info(
-                    'already-landed dispatch gate: task %s is NOT eligible for '
-                    'auto-done — pinned by open escalation(s) %s (any-level '
-                    'veto, PRD task-escalation-state-graph D4/E8); '
-                    'dispatching normally',
-                    task_id,
-                    ', '.join((*pinned.queue_handoff, *pinned.dead_l0))
-                    or '<store unavailable>',
-                )
-                # The machine-readable half of that same line.  This branch
-                # carries BOTH holds `vetoes_done_flip` covers, and they are
-                # different facts: records that pinned, versus a store that
-                # could not be read at all (`records=None`).  Collapsing them
-                # would re-create the esc-3163 ambiguity in the event stream
-                # itself — an empty id list reading as "nothing held it".
-                self._emit_recovery_disposition(
-                    task_id,
-                    site=RecoverySite.already_landed_gate,
-                    reason=(
-                        LeaveReason.escalation_store_unavailable
-                        if pinned.store_unavailable
-                        else LeaveReason.escalation_pinned
-                    ),
-                    shape=_already_landed_gate_shape(
-                        # Unknown, not False: on an unreadable store this site
-                        # does not know whether an escalation is open.
-                        has_open_escalation=None if pinned.store_unavailable else True,
-                    ),
-                    # The rows this gate ALREADY read — telemetry never adds a
-                    # second store read to a per-dispatch-tick path.
-                    records=rows,
-                    store_unavailable=pinned.store_unavailable,
-                )
-                return False
-
-            # NEITHER hold binds this task any more, so its veto streak has
-            # ended: pop it.  The twin of the sink's clear_hold_observed
-            # above, and it exists for the same bounding reason — this gate
-            # runs per dispatch TICK, so without a release edge the tracker
-            # would keep one entry per task ever vetoed here for the life of
-            # the process, contradicting the footprint bound stated in
-            # __init__.  A bare pop, never a resolve: already_landed_gate is
-            # deliberately absent from STREAK_CHARGING_SITES and so has no
-            # alarm of its own to stand down.
-            self._clear_recovery_veto_streak(
-                RecoverySite.already_landed_gate, task_id,
+            rows = (
+                list(pending_escalations.get(task_id, ()))
+                if pending_escalations is not None
+                else self._read_pending_escalation_rows(self._escalation_queue, task_id)
             )
+            held = self._escalation_hold(task_id, rows, metadata)
+            if held is not None:
+                return held
+        recheck_before_flip = pending_escalations is not None
 
         if tick_view is not None and await branch_absent_and_unmarked(
             tick_view, self.git_ops, branch,
@@ -14163,6 +14164,11 @@ class Harness:
                 task_id, metadata, site='dispatch-gate-already-on-main',
             ) is not None:
                 return False
+            held = self._escalation_hold_before_flip(
+                task_id, metadata, recheck=recheck_before_flip,
+            )
+            if held is not None:
+                return held
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 found_on_main_note(
@@ -14201,6 +14207,11 @@ class Harness:
                     task_id, metadata, site='dispatch-gate-marker-found',
                 ) is not None:
                     return False
+                held = self._escalation_hold_before_flip(
+                    task_id, metadata, recheck=recheck_before_flip,
+                )
+                if held is not None:
+                    return held
                 await self._mark_in_progress_done(
                     task_id, marker,
                     found_on_main_note(
@@ -14234,6 +14245,11 @@ class Harness:
                 task_id, metadata, site='dispatch-gate-content-equivalent',
             ) is not None:
                 return False
+            held = self._escalation_hold_before_flip(
+                task_id, metadata, recheck=recheck_before_flip,
+            )
+            if held is not None:
+                return held
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 found_on_main_note(
@@ -14246,6 +14262,200 @@ class Harness:
             return True
 
         return False
+
+    def _read_pending_escalation_rows(
+        self, queue: EscalationQueue, task_id: str,
+    ) -> list[Escalation] | None:
+        """The already-landed gate's pending read for one task; ``None`` iff it failed."""
+        try:
+            return queue.get_by_task(task_id, status='pending')
+        except Exception:
+            # `classify_pins`'s store-correctness contract, obligation 2:
+            # a read that FAILED must be passed as `records=None`, never
+            # substituted with `[]` — a false "no open escalations" is
+            # exactly the esc-3163 collapse (a genuinely-pinned task
+            # routed down the act-anyway branch).  Letting it propagate
+            # instead would make the disposition invisible: the
+            # scheduler's generic `_consult_already_landed` catch-all
+            # logs a traceback and fails open for the WHOLE gate, so
+            # "never phantom-done on an unreadable store" would be
+            # incidental rather than local and testable.
+            #
+            # `except Exception` is broad on purpose: `get_by_task`
+            # already absorbs per-file JSON/type errors internally, so
+            # what reaches here is filesystem-level (OSError) or an
+            # unexpected store-implementation fault — neither of which
+            # may abort a dispatch tick.
+            logger.warning(
+                'already-landed dispatch gate: could not READ the '
+                'escalation store for task %s — treating as '
+                'store_unavailable and vetoing the auto-done flip '
+                '(never phantom-done on an unreadable store); '
+                'dispatching normally',
+                task_id,
+                exc_info=True,
+            )
+            return None
+
+    def _escalation_hold_before_flip(
+        self, task_id: str, metadata: dict, *, recheck: bool,
+    ) -> bool | None:
+        """Re-decide :meth:`_escalation_hold` on fresh rows before a done-flip.
+
+        *recheck* is set when the gate's first decision came from a consult
+        snapshot (task 8073), which can be a whole consult old: a record filed,
+        or raised to a pinning severity in place, since the snapshot must still
+        stop the flip. Only rows the hold would act on stop it, so an
+        info-severity record filed meanwhile does not.
+        """
+        if not recheck or self._escalation_queue is None:
+            return None
+        return self._escalation_hold(
+            task_id,
+            self._read_pending_escalation_rows(self._escalation_queue, task_id),
+            metadata,
+        )
+
+    def _escalation_hold(
+        self, task_id: str, rows: list[Escalation] | None, metadata: dict,
+    ) -> bool | None:
+        """The already-landed gate's answer when *rows* hold the task, else ``None``.
+
+        *rows* are the task's pending escalations, ``None`` when the read
+        failed. ``True`` withholds dispatch (provenance arbitration); ``False``
+        abstains from the done-flip and dispatches normally (any-level pin, or
+        an unreadable store). Both the gate's first read and its pre-flip
+        re-read decide here, so they cannot disagree on what holds a task.
+        """
+        # An open escalation at ANY level (not just L1 — the resolver's
+        # row (f) folds every level) is the deliberate
+        # human/automation-handoff signal, and a handoff is never
+        # second-guessed by an automatic done-flip.  `live_claimant=False`
+        # is deliberate and free: `vetoes_done_flip` is True for BOTH the
+        # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
+        # cannot change this site's answer — and this hot per-dispatch-tick
+        # path skips claimant resolution entirely for an identical result.
+        from escalation.pins import classify_pins  # noqa: PLC0415
+
+        pinned = classify_pins(task_id, rows, live_claimant=False)
+
+        # The task's OWN arbitration escalation is a pending urgent L2,
+        # so `vetoes_done_flip` below is True for it — and that veto's
+        # answer is `return False`, which means "dispatch normally".  For
+        # a task under provenance arbitration that is precisely the
+        # outcome this gate's docstring forbids, so the hold must be
+        # decided FIRST.
+        #
+        # It reads the DURABLE store records (already in hand — no second
+        # read), not the gate's `should_skip` memo: that memo is in-memory
+        # only (see ProvenanceConflictSink's class docstring) and is empty
+        # on any process that did not itself file the conflict — after a
+        # fleet-redeploy/watchdog restart, or when a merge-queue writer
+        # site filed it.  Ordering alone cannot deliver the invariant;
+        # durability is what delivers it.
+        #
+        # `reopen_at` is the SAME `metadata.get('reopen_at')` the
+        # gate's `should_skip` pre-check already passes, so the durable
+        # hold and the in-memory memo invalidate on exactly one shared
+        # signal — a restart changes performance, not behaviour.
+        if self._provenance_conflict_sink.arbitration_pending(
+            rows, reopen_at=metadata.get('reopen_at'),
+        ):
+            # INV-4 ("storm escape is dedupe_count, never log spam"): the
+            # hold re-fires on EVERY dispatch tick for as long as the
+            # arbitration stands — and on a cold-memo process it
+            # short-circuits above `_mark_in_progress_done`, so nothing
+            # ever re-warms `should_skip` to quiet it.  Logging it
+            # unconditionally at INFO would therefore emit one line per
+            # tick, indefinitely, until a human resolved the L2.  Loud on
+            # the (task, reopen_at) TRANSITION, quiet on the repeats.
+            first_observation = self._provenance_conflict_sink.note_hold_observed(
+                task_id, reopen_at=metadata.get('reopen_at'),
+            )
+            logger.log(
+                logging.INFO if first_observation else logging.DEBUG,
+                'already-landed dispatch gate: task %s is under provenance '
+                'arbitration (pending provenance_conflict escalation at '
+                'reopen_at=%s) — withholding it from dispatch rather than '
+                're-attempting the already-rejected done-write; reopening '
+                'the task again releases this hold',
+                task_id,
+                metadata.get('reopen_at'),
+            )
+            if first_observation:
+                # The structured twin of that log line (task beta 3535):
+                # same transition, same rows, no second store read.  The
+                # SINK stays the authority for this arm's transition state
+                # — it keys on (task_id, reopen_at), which the emitter's
+                # veto signature cannot see, so a hold released and
+                # re-established under an unchanged signature would
+                # otherwise go unannounced.  `transition_gated_by_caller`
+                # is how the adapter is told that.
+                self._emit_recovery_disposition(
+                    task_id,
+                    site=RecoverySite.already_landed_gate,
+                    reason=LeaveReason.provenance_arbitration,
+                    shape=_already_landed_gate_shape(has_open_escalation=True),
+                    records=rows,
+                    transition_gated_by_caller=True,
+                )
+            return True
+
+        # The hold does not bind this task (any more): drop its log-streak
+        # state so a hold that returns later announces itself loudly again
+        # rather than being folded into a stale streak — and so the sink's
+        # streak dict stays bounded by currently-held tasks.
+        self._provenance_conflict_sink.clear_hold_observed(task_id)
+
+        if pinned.vetoes_done_flip:
+            logger.info(
+                'already-landed dispatch gate: task %s is NOT eligible for '
+                'auto-done — pinned by open escalation(s) %s (any-level '
+                'veto, PRD task-escalation-state-graph D4/E8); '
+                'dispatching normally',
+                task_id,
+                ', '.join((*pinned.queue_handoff, *pinned.dead_l0))
+                or '<store unavailable>',
+            )
+            # The machine-readable half of that same line.  This branch
+            # carries BOTH holds `vetoes_done_flip` covers, and they are
+            # different facts: records that pinned, versus a store that
+            # could not be read at all (`records=None`).  Collapsing them
+            # would re-create the esc-3163 ambiguity in the event stream
+            # itself — an empty id list reading as "nothing held it".
+            self._emit_recovery_disposition(
+                task_id,
+                site=RecoverySite.already_landed_gate,
+                reason=(
+                    LeaveReason.escalation_store_unavailable
+                    if pinned.store_unavailable
+                    else LeaveReason.escalation_pinned
+                ),
+                shape=_already_landed_gate_shape(
+                    # Unknown, not False: on an unreadable store this site
+                    # does not know whether an escalation is open.
+                    has_open_escalation=None if pinned.store_unavailable else True,
+                ),
+                # The rows this gate ALREADY read — telemetry never adds a
+                # second store read to a per-dispatch-tick path.
+                records=rows,
+                store_unavailable=pinned.store_unavailable,
+            )
+            return False
+
+        # NEITHER hold binds this task any more, so its veto streak has
+        # ended: pop it.  The twin of the sink's clear_hold_observed
+        # above, and it exists for the same bounding reason — this gate
+        # runs per dispatch TICK, so without a release edge the tracker
+        # would keep one entry per task ever vetoed here for the life of
+        # the process, contradicting the footprint bound stated in
+        # __init__.  A bare pop, never a resolve: already_landed_gate is
+        # deliberately absent from STREAK_CHARGING_SITES and so has no
+        # alarm of its own to stand down.
+        self._clear_recovery_veto_streak(
+            RecoverySite.already_landed_gate, task_id,
+        )
+        return None
 
     def _file_unattributed_landing_escalation(
         self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
@@ -16671,7 +16881,8 @@ class Harness:
             )
             return
 
-        action = self._resolve_escalation_action(escalation)
+        parent = self._cascade_parent(escalation)
+        action = self._resolve_escalation_action(escalation, parent)
 
         # Table B (ω3, task 2196): target_status and workflow routing are
         # sourced from escalation.action_effects.effect_for — the SAME
@@ -16747,10 +16958,11 @@ class Harness:
             # stranded sweep re-pends anyway — so there the guard delays the
             # resume rather than stopping it.
             #
-            # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
-            # fired _resolve_callback for the L2 first, then each member with
-            # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
-            # NOT in _escalation_events (a live workflow owns its own re-pend).
+            # Cascade member: resolved_by names a parent L2
+            # (escalation.models.cascade_parent_id; the cascade fired
+            # _resolve_callback for the L2 first, then for each member).
+            # Direct/orphan: NOT a cascade member AND task_id NOT in
+            # _escalation_events (a live workflow owns its own re-pend).
             #
             # Live slot with a grant (task 5650): the third arm delivers
             # `granted_files` and does not re-pend, because the live workflow
@@ -16770,11 +16982,7 @@ class Harness:
             # branch delivers the grant through `TaskWorkflow._set_task_scope`,
             # which also acquires the module locks the grant needs, so a
             # harness write there could only race it.
-            is_l2_cascade = (
-                isinstance(escalation.resolved_by, str)
-                and escalation.resolved_by.startswith('l2-cascade:')
-            )
-            if is_l2_cascade:
+            if cascade_parent_id(escalation.resolved_by) is not None:
                 # Scheduled via _schedule_coro_threadsafe so it works whether
                 # this callback fires on the orchestrator loop or off it (sync
                 # MCP resolve_issue on a FastMCP worker — where a bare
@@ -16827,6 +17035,10 @@ class Harness:
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
                 escalation_id=escalation.id,
+                recut=(
+                    self._restart_recut_ruling(escalation, parent)
+                    if action == 'restart' else None
+                ),
             ),
             label=(
                 f'action-teardown task {escalation.task_id} '
@@ -16841,19 +17053,31 @@ class Harness:
         action: str,
         *,
         escalation_id: str,
+        recut: recut_ruling.RecutRuling | None = None,
     ) -> None:
         """Async helper: execute a non-resume resolution action on a task.
 
         Implements C3.1 (status-precedes-kill) ordering:
           1. Terminal recheck — skip if the task is already done/cancelled.
-          2. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
-          3. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
-          4. Write ``target_status`` via scheduler.
-          5. Kill live workflow if active (soft → grace → hard).
-          6. In the finally block, once the kill window closes: clear the
-             suppression stamp, then (restart only) re-run step 2's clear so a
-             stamp resurrected by the dying workflow's own metadata write does
-             not survive the restart.
+          2. restart with ``recut`` only (task 5516): issue
+             ``metadata.recut_ruling`` so the next dispatch re-cuts the task
+             fresh off main (``orchestrator/recut_ruling.py``).  Written
+             before the status write, so any dispatch that reads 'pending'
+             also reads the ruling.  FAILS CLOSED: if the ruling cannot be
+             persisted the restart does not proceed — ``target_status``
+             becomes 'blocked', no restart-only step below runs (the kill
+             still does), and a RESTART_RECUT_UNRECORDED infra_issue L1 is
+             filed, rather than re-pending onto the stale plan and branch.
+          3. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
+          4. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
+          5. Write ``target_status`` via scheduler.
+          6. Kill live workflow if active (soft → grace → hard).
+          7. In the finally block, once the kill window closes: clear the
+             suppression stamp, then (restart only) re-run step 3's clear and
+             re-assert step 2's ruling, so neither a stamp resurrected nor a
+             ruling dropped by the dying workflow's own metadata write
+             survives the restart.  A re-assert that does not land fails
+             closed as step 2 does: a task still 'pending' is held 'blocked'.
 
         Preconditions per action:
           - restart: task must be non-terminal (checked at step 1); target='pending'.
@@ -16900,6 +17124,12 @@ class Harness:
             )
             return
 
+        restarting = action == 'restart'
+        if recut is not None and not await self._issue_restart_recut_ruling(
+            task_id, recut, escalation_id=escalation_id,
+        ):
+            restarting, target_status = False, 'blocked'
+
         # restart means "run this task again from scratch", so void any durable
         # merge-retry obligation first (task 3024).  A surviving
         # metadata.merge_retry_pending stamp makes the re-dispatched workflow
@@ -16915,7 +17145,7 @@ class Harness:
         # the stamp with a metadata write of its own before the kill lands — so
         # an idempotent second clear runs in the finally block once the kill
         # window has closed (see there).
-        if action == 'restart':
+        if restarting:
             await self._clear_merge_retry_pending_for_restart(task_id)
 
         logger.info(
@@ -16962,7 +17192,7 @@ class Harness:
             # runner re-fires the gate from scratch.  resume preserves stamps so
             # the runner's idempotency drives the gate to done instead (I2/B4/B5).
             # park/abandon/close_only are left untouched — stamps preserved.
-            if action == 'restart':
+            if restarting:
                 task = await self.scheduler.get_task(task_id)
                 if task is not None and Scheduler.is_deterministic(task):
                     await self.scheduler.update_task(
@@ -17033,8 +17263,12 @@ class Harness:
             # on the SetTaskStatusRejected early return (the task went terminal
             # mid-teardown), which is fine and mildly desirable: a done/cancelled
             # task should not carry a merge-retry obligation either.
-            if action == 'restart':
+            if restarting:
                 await self._clear_merge_retry_pending_for_restart(task_id)
+                if recut is not None:
+                    await self._reassert_restart_recut_ruling(
+                        task_id, recut, escalation_id=escalation_id,
+                    )
 
     async def _clear_merge_retry_pending_for_restart(self, task_id: str) -> None:
         """Drop ``metadata.merge_retry_pending`` so a restart re-plans from scratch.
@@ -17124,15 +17358,135 @@ class Harness:
             task_id,
         )
 
-    def _resolve_escalation_action(self, escalation) -> str:
+    async def _issue_restart_recut_ruling(
+        self, task_id: str, ruling: recut_ruling.RecutRuling, *, escalation_id: str,
+    ) -> bool:
+        """Persist a restart's re-cut ruling; False (and an L1 filed) if it did not land."""
+        failure = await recut_ruling.issue_ruling(
+            ruling, persist=functools.partial(self.scheduler.update_task, task_id),
+        )
+        if failure is None:
+            logger.info('RECUT ISSUED: task %s ruling %s', task_id, ruling.ruling_id)
+            return True
+        self._file_restart_recut_unrecorded(
+            task_id, ruling, failure, escalation_id=escalation_id,
+            consequence=(
+                'The task is held blocked rather than re-pended onto its stale plan '
+                'and branch.'
+            ),
+        )
+        return False
+
+    async def _reassert_restart_recut_ruling(
+        self, task_id: str, ruling: recut_ruling.RecutRuling, *, escalation_id: str,
+    ) -> None:
+        """Re-issue *ruling* if a write landing in the kill window dropped it.
+
+        A dying workflow's replace-mode metadata write that read the task
+        before the ruling landed deletes it, or restores an older ruling,
+        which would silently degrade the restart to a plain one. FAILS CLOSED
+        like the first write: if the re-issue does not land, a task still
+        'pending' is held 'blocked' and the L1 is filed.
+        """
+        task = await self.scheduler.get_task(task_id)
+        if task is None:
+            logger.warning(
+                'RECUT RE-CHECK: could not read task %s; ruling %s may have been '
+                'dropped in the kill window',
+                task_id, ruling.ruling_id,
+            )
+            return
+        failure = await recut_ruling.reassert_ruling(
+            task, ruling, persist=functools.partial(self.scheduler.update_task, task_id),
+        )
+        if failure is None:
+            return
+        if await self._block_if_still_pending(task_id):
+            consequence = (
+                'The ruling landed but was dropped in the kill window; the task is '
+                'held blocked rather than re-pended onto its stale plan and branch.'
+            )
+        else:
+            consequence = (
+                'The ruling landed but was dropped in the kill window, and the task '
+                'had already left pending, so a dispatch may reuse its stale plan '
+                'and branch.'
+            )
+        self._file_restart_recut_unrecorded(
+            task_id, ruling, failure, escalation_id=escalation_id, consequence=consequence,
+        )
+
+    async def _block_if_still_pending(self, task_id: str) -> bool:
+        """Write 'blocked' over a task that still reads 'pending'; True once written."""
+        if await self.scheduler.get_status(task_id) != 'pending':
+            return False
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'RECUT RE-CHECK: could not hold task %s blocked', task_id, exc_info=True,
+            )
+            return False
+        return True
+
+    def _file_restart_recut_unrecorded(
+        self,
+        task_id: str,
+        ruling: recut_ruling.RecutRuling,
+        failure: str,
+        *,
+        escalation_id: str,
+        consequence: str,
+    ) -> None:
+        logger.error(
+            'RECUT UNRECORDED: task %s ruling %s via %s: %s %s',
+            task_id, ruling.ruling_id, escalation_id, failure, consequence,
+        )
+        self._file_harness_l1(
+            task_id,
+            category='infra_issue',
+            root_cause=f'restart-recut-unrecorded:{task_id}',
+            summary=(
+                f'RESTART_RECUT_UNRECORDED: task {task_id} restart via {escalation_id} '
+                'demanded a re-cut that could not be recorded'
+            ),
+            detail=(
+                f'Writing metadata.recut_ruling (ruling {ruling.ruling_id}) failed: '
+                f'{failure}.\n{consequence} Remedy: once the task store is healthy, '
+                "re-issue resolve_issue(action='restart', recut=True) on a fresh "
+                'escalation.'
+            ),
+        )
+
+    def _cascade_parent(self, escalation) -> Escalation | None:
+        """The parent L2 a cascade member's ``resolved_by`` names, or None."""
+        parent_id = cascade_parent_id(escalation.resolved_by)
+        if parent_id is None or self._escalation_queue is None:
+            return None
+        return self._escalation_queue.get(parent_id)
+
+    @staticmethod
+    def _restart_recut_ruling(
+        escalation, parent: Escalation | None,
+    ) -> recut_ruling.RecutRuling | None:
+        """The ruling of the record whose resolution set ``recut``, ruled when it resolved."""
+        record = escalation if escalation.recut else parent
+        if record is None or not record.recut:
+            return None
+        return recut_ruling.ruling_on_record(
+            record.id, record.resolved_at, now=datetime.now(UTC),
+        )
+
+    @staticmethod
+    def _resolve_escalation_action(escalation, parent: Escalation | None = None) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
 
         Priority:
           1. The explicit ``resolution_action`` on the record (set by the MCP
              server at resolve_issue time — α1 path).
-          2. For cascade members (``resolved_by='l2-cascade:<parent_id>'``):
-             read the parent L2's ``resolution_action`` (already archived by
-             the time the member callback fires).  Falls through if absent.
+          2. For cascade members: the ``resolution_action`` of *parent*, the
+             L2 ``_cascade_parent`` read for *escalation* (already archived
+             by the time the member callback fires).  Falls through if absent.
           3. Legacy mapping (D10): ``status=='dismissed'`` → ``'close_only'``;
              ``status=='resolved'`` → ``'resume'``.
 
@@ -17143,20 +17497,10 @@ class Harness:
         if escalation.resolution_action is not None:
             return escalation.resolution_action
 
-        # 2) Cascade member: inherit parent L2's action.
-        if (
-            isinstance(escalation.resolved_by, str)
-            and escalation.resolved_by.startswith('l2-cascade:')
-        ):
-            parent_id = escalation.resolved_by.split(':', 1)[1]
-            parent = (
-                self._escalation_queue.get(parent_id)
-                if self._escalation_queue is not None
-                else None
-            )
-            if parent is not None and parent.resolution_action is not None:
-                return parent.resolution_action
-            # Fall through to legacy map (parent also lacks resolution_action).
+        # 2) Cascade member: inherit parent L2's action.  Falls through to the
+        #    legacy map when there is no parent or it lacks resolution_action.
+        if parent is not None and parent.resolution_action is not None:
+            return parent.resolution_action
 
         # 3) Legacy mapping.
         if escalation.status == 'dismissed':
@@ -17616,16 +17960,26 @@ class Harness:
     def _locate_plan_artifacts(self, task_id: str) -> TaskArtifacts | None:
         """Return *task_id*'s plan artifacts resolved new-then-old, or None.
 
-        The W11 ``.task-meta`` SIBLING first, the legacy ``<worktree>/.task``
-        second. Without the fallback arm every pre-relocation task would take
-        the "no plan" exit of :meth:`_fold_granted_files`.
-        :meth:`_resolve_recovery_artifact` is the read-only sibling of the same
-        contract, for single artifact paths.
+        The task's own ``.task-meta/task-<id>`` root first, the legacy
+        ``<worktree>/.task`` second. Without the fallback arm every
+        pre-relocation task would take the "no plan" exit of
+        :meth:`_fold_granted_files`. :meth:`_task_recovery_artifact` is the
+        read-only sibling of the same contract, for single artifact paths.
+
+        ``None`` also when ``task_root_for`` rejects *task_id*: there is no
+        addressable task root to read, so the caller takes its no-plan branch.
         """
         wt = self._resolve_task_worktree(task_id)
-        new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
-        if (new_root / 'plan.json').exists():
-            return TaskArtifacts(wt, meta_root=new_root)
+        try:
+            task_view = TaskArtifacts.for_task(wt, task_id)
+        except ValueError as exc:
+            logger.warning(
+                'granted-files fold: task %s names an unaddressable task id (%s) '
+                '— no plan to widen', task_id, exc,
+            )
+            return None
+        if task_view.artifact_path('plan.json').exists():
+            return task_view
         if (wt / '.task' / 'plan.json').exists():
             return TaskArtifacts(wt)
         return None
@@ -17850,11 +18204,9 @@ class Harness:
                 # an operator-visible line.
                 wt = self._resolve_task_worktree(task_id)
                 logger.warning(
-                    'granted-files fold: task %s has no plan.json at %s or %s '
-                    '— the grant %s was not delivered',
-                    task_id,
-                    TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name),
-                    wt / '.task', granted,
+                    'granted-files fold: task %s has no plan.json in its task '
+                    'root or at %s — the grant %s was not delivered',
+                    task_id, wt / '.task', granted,
                 )
                 return GrantDelivery.NO_PLAN_TO_WIDEN
 
