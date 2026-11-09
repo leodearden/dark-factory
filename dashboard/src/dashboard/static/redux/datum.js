@@ -271,11 +271,7 @@ function plainBoundSecondsFor(receipt) {
 // ── Has this endpoint delivered yet? ──
 // The one answer, for a caller that needs the hole rather than a value: the
 // 'not yet fetched' hole before endpointKey's first receipt, null once it has
-// one. It builds nothing but unknownDatum's hole, so the count of client-built
-// envelopes stated at the head of this file is unchanged.
-//
-// Module-unique, per the CANONICAL note: other classic scripts already declare
-// their own *_NOT_YET_FETCHED in the shared scope.
+// one.
 const DATUM_NOT_YET_FETCHED = 'not yet fetched';
 
 function undeliveredDatum(endpointKey, receipts) {
