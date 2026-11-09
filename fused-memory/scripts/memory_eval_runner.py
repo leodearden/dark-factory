@@ -70,7 +70,10 @@ from shared.memory_eval_verdicts import (
 
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH as FUSED_MEMORY_DEFAULT_CONFIG_PATH
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.utils.target_store_preflight import TargetStoreMissing, assert_queue_dir_populated
+from fused_memory.utils.target_store_preflight import (
+    TargetStoreUnpopulated,
+    assert_queue_dir_populated,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -703,7 +706,7 @@ def _preflight(args: argparse.Namespace) -> tuple[RunnerConfig, EscalationQueue,
         raise _PreflightRefused(f'fused-memory config refused (CONFIG_PATH={config_path}): {exc}') from exc
     try:
         assert_queue_dir_populated(queue_dir, operation='memory_eval_runner')
-    except TargetStoreMissing as exc:
+    except TargetStoreUnpopulated as exc:
         raise _PreflightRefused(f'recon escalation queue {queue_dir}: {exc}') from exc
     try:
         stamp = run_stamp()
