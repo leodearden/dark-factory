@@ -4731,6 +4731,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'Stage 1 report shows ''LLM calls: 2 | Tokens: 0'', the same zero-token telemetry pattern this entry describes for reconciliation stages.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 4e06d949-26f8-420e-8280-4e22befd1a3f
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Stage 1 Report Summary shows ''LLM calls: 4 | Tokens: 0'', matching the always-zero tokens_used telemetry against nonzero llm_calls.'
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -7861,6 +7867,24 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'The embedded recon stage report reads ''LLM calls: 2 | Tokens: 0'', the tokens_used=0 with nonzero llm_calls telemetry defect that this entry describes.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 8ffd06ae-c067-4f1a-a513-8ade12ae8ecd
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Stage 1 report shows ''LLM calls: 6 | Tokens: 0'', so the stage''s cost telemetry reports zero tokens despite nonzero LLM calls.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 036c00d4-1b26-4a29-bdf3-d8bed3a0c0bc
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Stage 1 report shows ''LLM calls: 2 | Tokens: 0'', the tokens_used=0 vs nonzero llm_calls pattern this entry describes.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: baa71efe-0485-44fb-bad0-1be89500e658
+    origin_phase: recon
+    manifested_phase: ops
+    note: 'The pasted stage report reads ''LLM calls: 2 | Tokens: 0'', showing tokens reported as zero alongside nonzero llm_calls. The digest only quotes this; the session itself does not exercise it.'
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -9634,6 +9658,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Three modulenotfounderror hits (turns 81, 251, 431) in a task worktree. This matches the worktree venv/interpreter provisioning gap: a dispatched agent''s shell has no venv, so a bare python is the system interpreter. The digest does not show which phase the agent was in.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: c43fe618-a74f-4229-b493-23453e337f2e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Two ModuleNotFoundError signals (turns 98, 124) occur inside a task worktree session. The digest does not show that the agent was in an architect explore phase, so the phase-specific part of this entry is unconfirmed. Partial match on the worktree ModuleNotFoundError pattern only.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -12555,6 +12585,19 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest renders the turn-39 guard trip as a bare 'blocked:' line with no matched substring or reason, which matches the bare-template rendering described in this entry. The source transcript is not available to confirm whether the guard itself emitted an empty reason.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: f07e4c12-4a51-4201-9e16-92b60c29578d
+    origin_phase: unknown
+    manifested_phase: ops
+    invariant_violated: structured-facts-at-failure
+    note: The digest's Guard Trips lines ('blocked:') and Not Found lines ('does not exist') show no matched substring or path, so the signal is a bare template with the evidence dropped. This is the known digest-rendering defect. The session itself gives no evidence of the underlying cause.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: eea9f72d-421f-4891-a9d3-1e5f5ec5680b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest renders the df_guard trip as a bare 'blocked:' with no matched substring, and the three not_found signals as bare 'does not exist' with no path. This is the bare-template rendering defect the entry describes.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -14864,6 +14907,12 @@ entries:
     origin_phase: recon
     manifested_phase: unknown
     note: The 'User Corrections' bucket captures a reconciliation Stage 1 run-review report (buffered memory events, stage cycle summaries) as if it were corrective user feedback. Turn 3 is the pasted report, not a user correction.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: ce9d1932-327d-4ec4-8d52-ba0974cb322d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Same pattern: raw reconciliation run-review JSON content captured as a ''User Corrections'' item. The digest''s only nonzero counter is not_found:1, which does not support a correction label.'
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -17462,6 +17511,48 @@ entries:
     origin_phase: recon
     manifested_phase: ops
     note: The 'User Corrections' bucket captures a pasted recon stage-report dump (Stage 1 Report stats, then a Stage 3 prompt header) while every signal_count reads zero except not_found=1, which is unrelated. This is the same mislabel described in the entry.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 193839ba-dc4d-454a-95d8-48a298488a1b
+    origin_phase: recon
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captured a pasted recon Stage 1 report (memory_consolidator stats dump) as a correction at turn 3, while all signal_counts except not_found (1, turn 44) read zero. This is the same digest mislabeling of non-corrective pasted recon stage-report content.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: e95cd3a1-3ed5-48ec-be60-06454421666e
+    origin_phase: recon
+    manifested_phase: ops
+    note: The digest's 'User Corrections' bucket holds a recon Stage 1 report summary (Stats JSON) and a Stage 2 task-prompt block, although every fired signal_count except one not_found is zero. This is the same pasted-stage-report mislabel the entry describes.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: ce9d1932-327d-4ec4-8d52-ba0974cb322d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest files a pasted recon stage-report dump (memory_consolidator Stage 1 summary with Stats JSON) under 'User Corrections' while every signal_count except not_found reads zero.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 4e06d949-26f8-420e-8280-4e22befd1a3f
+    origin_phase: recon
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket captures a pasted recon stage-report/Stage 2 task-sync prompt as a user correction, which is the mislabel this entry describes. Signal counts are nearly all zero (not_found=1 only).
+  - date: '2026-11-08'
+    project: dark_factory
+    session: baa71efe-0485-44fb-bad0-1be89500e658
+    origin_phase: recon
+    manifested_phase: ops
+    note: The digest's 'User Corrections' bucket holds a pasted Stage 1 recon stage-report summary (turn 3), while signal_counts show tool_error, self_correct, df_guard and interrupt all at zero. This is the same pasted-stage-report-as-correction mislabel.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 8f242461-c9f1-43e3-a27b-f80290a082e8
+    origin_phase: recon
+    manifested_phase: unknown
+    note: The '## User Corrections' bucket holds a pasted recon stage report ('Stage 1 Report', memory_consolidator stats) and a stage-3 prompt header, while every signal_count except not_found reads zero. The only non-zero counter is not_found, which is unrelated to the mislabeled block.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: edae7a0f-4b76-4139-b851-3f11c661012d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest files a recon Stage 2 prompt and Stage 1 stage-report summary under 'User Corrections' while every signal_count except not_found reads zero. This is the pasted-stage-report-as-correction pattern the entry describes.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -22373,6 +22464,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated-task worktree session with not_found signals at turns 48 ('no such file or directory'), 64 and 345 ('does not exist'), and no other diagnostic signal in the digest. Phase cannot be supported from the digest alone.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 2a58f410-d2f4-4107-96dd-8d12ecd9b258
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated worktree task (cwd .worktrees/8415) shows seven not_found signals, all 'no such file or directory' or 'modulenotfounderror', with no other diagnostic signal in the digest. This fits the entry's pattern. The digest does not show what the missing paths were, so the match is partial.
+  - date: '2026-11-08'
+    project: dark_factory
+    session: c43fe618-a74f-4229-b493-23453e337f2e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree session (cwd .worktrees/7668) shows five not_found signals ('does not exist' at turns 46, 55, 203; modulenotfounderror at turns 98, 124) with every other signal_count at zero and no diagnostic text beyond the bare markers. Phase is not determinable from the digest.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -23199,6 +23302,12 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: 'The digest''s Retry Loops bucket still lists the watcher''s bounded watcher-rearm.sh wait as ''Bash x3''. The call ended with the designed ceiling outcome (exit 124, WATCHER_REARM_OUTCOME: CEILING). The designed_outcome counter caught it, so tool_error stayed 0, but the bucket still files it as a retry loop.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 2ae29e04-7d40-43cd-8d7f-e0d242da4d3e
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'Retry Loops' section flags the watcher's designed bounded wait (watcher-rearm.sh, exit 124 ceiling) and its date-check re-arm calls as retry loops, though these are the designed once-per-rotation pattern.
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25317,6 +25426,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'The ''User Corrections'' entry at turn 3 is injected task or stage briefing text (''## Stage 2: Task-Knowledge Sync''), not a correction the user made.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 8ffd06ae-c067-4f1a-a513-8ade12ae8ecd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'The ''## User Corrections'' bucket holds an injected Stage 2 task-prompt briefing (''## Stage 2: Task-Knowledge Sync''), not a user correction. Only one user turn exists and the signal counts are zero.'
+  - date: '2026-11-08'
+    project: dark_factory
+    session: 036c00d4-1b26-4a29-bdf3-d8bed3a0c0bc
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'The digest''s ''User Corrections'' bucket (turn 3) captures an injected ''## Stage 2: Task-Knowledge Sync'' stage prompt, with all signal_counts except not_found at zero, as if it were user feedback.'
   filed_tickets:
   - ticket: tkt_0RW5FRC7ET51RZA763BVXH7ZAA
     project_root: /home/leo/src/dark-factory
@@ -43032,6 +43153,19 @@ candidates:
     origin_phase: implement
     manifested_phase: verify
     evidence_quote: Python 3.14.4 rc=0 40 failed, 5 warnings in 10.15s ... Python 3.13.9 rc=0 40 passed, 5 warnings in 8.49s
+- id: cand-20261108-1
+  title: Path-guard block emits an empty reason, leaving the agent no basis to act on the refusal
+  cause: A df_guard trip fired at turn 92 with the reason field blank, so the trip carries no structured fact about what was blocked or why. The agent has no way to tell whether to change its command, its path, or its approach, and must investigate blind.
+  area: guards
+  first_seen: '2026-11-08'
+  disposition: pending
+  sightings:
+  - date: '2026-11-08'
+    project: dark_factory
+    session: d8efb20b-7417-4c4d-b27b-f7b770dee7e3
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '- (turn 92) blocked:'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
