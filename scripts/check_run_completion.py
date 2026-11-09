@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import enum
 import json
+import math
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -27,7 +28,7 @@ from _task_db_scan import discover_project_roots
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
 from orchestrator.predicate_recheck import PredicateRecheck
 from pydantic import ValidationError
-from shared.mcp_session import SyncMcpSession
+from shared.mcp_session import McpCallError, McpFailureKind, SyncMcpSession
 from shared.task_metadata import TRIGGER_CHAIN_KEY, TriggerChain
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -108,17 +109,56 @@ def _compact_json(record: Mapping[str, Any]) -> str:
     return json.dumps(record, separators=(',', ':'))
 
 
+def _shown_share(share: Fraction) -> float:
+    """*share* cut, never rounded up, to SHARE_DIGITS: it prints as reaching a threshold only if it does."""
+    scale = 10**SHARE_DIGITS
+    return math.floor(share * scale) / scale
+
+
 @dataclass(frozen=True)
 class CompletionVerdict:
+    """A run's tier counts judged against a threshold; every other figure derives from those, so none disagree."""
+
     run_id: str
     threshold: float
-    share: float | None
-    landed: int
-    pending: int
-    total: int
-    vacuous: bool
-    passed: bool
     by_priority: Mapping[str, TierCounts]
+
+    def __post_init__(self) -> None:
+        problem = threshold_error(self.threshold)
+        if problem is not None:
+            raise ValueError(problem)
+        unknown = [tier for tier in self.by_priority if tier not in PRIORITY_WEIGHTS]
+        if unknown:
+            raise ValueError(f'tiers {unknown} are not among {", ".join(PRIORITY_WEIGHTS)}')
+        if any(count < 0 for counts in self.by_priority.values() for count in counts):
+            raise ValueError(f'a tier count is negative: {dict(self.by_priority)}')
+
+    @property
+    def landed(self) -> int:
+        return sum(PRIORITY_WEIGHTS[tier] * counts.done for tier, counts in self.by_priority.items())
+
+    @property
+    def pending(self) -> int:
+        return sum(PRIORITY_WEIGHTS[tier] * counts.open for tier, counts in self.by_priority.items())
+
+    @property
+    def total(self) -> int:
+        return sum(sum(counts) for counts in self.by_priority.values())
+
+    @property
+    def share(self) -> Fraction | None:
+        """The exact landed share of the weighed tasks; None when nothing is weighed."""
+        weighed = self.landed + self.pending
+        return Fraction(self.landed, weighed) if weighed else None
+
+    @property
+    def vacuous(self) -> bool:
+        return self.total > 0 and self.share is None
+
+    @property
+    def passed(self) -> bool:
+        share = self.share
+        return self.vacuous if share is None else share >= Fraction(str(self.threshold))
 
     @property
     def verdict(self) -> Verdict:
@@ -131,12 +171,13 @@ class CompletionVerdict:
         return FailureCode.EMPTY_RUN if self.total == 0 else None
 
     def to_dict(self) -> dict[str, Any]:
+        share = self.share
         return _verdict_record(
             self.run_id,
             self.verdict,
             self.threshold,
             self.error,
-            share=None if self.share is None else round(self.share, SHARE_DIGITS),
+            share=None if share is None else _shown_share(share),
             landed=self.landed,
             pending=self.pending,
             total=self.total,
@@ -174,26 +215,7 @@ def weighted_completion(
     tasks: Iterable[Mapping[str, object]], threshold: float, *, run_id: str,
 ) -> CompletionVerdict:
     """The priority-weighted landed share of *tasks*, judged against *threshold*."""
-    problem = threshold_error(threshold)
-    if problem is not None:
-        raise ValueError(problem)
-    by_priority = _tally(tasks)
-    landed = sum(PRIORITY_WEIGHTS[tier] * counts.done for tier, counts in by_priority.items())
-    pending = sum(PRIORITY_WEIGHTS[tier] * counts.open for tier, counts in by_priority.items())
-    total = sum(sum(counts) for counts in by_priority.values())
-    weighed = landed + pending
-    vacuous = total > 0 and weighed == 0
-    return CompletionVerdict(
-        run_id=run_id,
-        threshold=threshold,
-        share=landed / weighed if weighed else None,
-        landed=landed,
-        pending=pending,
-        total=total,
-        vacuous=vacuous,
-        passed=vacuous or (weighed > 0 and Fraction(landed, weighed) >= Fraction(str(threshold))),
-        by_priority=by_priority,
-    )
+    return CompletionVerdict(run_id=run_id, threshold=threshold, by_priority=_tally(tasks))
 
 
 CallTool = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
@@ -204,16 +226,6 @@ LOOKUP_TOOL: Final = 'find_tasks_by_metadata'
 LOOKUP_PAGE_SIZE: Final = 100
 MAX_LOOKUP_PAGES: Final = 200
 CALL_TIMEOUT_SECS: Final = 30.0
-
-
-def fused_memory_url(env: Mapping[str, str] = os.environ) -> str:
-    return env.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
-
-
-def call_fused_memory_tool(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """The default binding: one MCP session per call, at the URL configured now."""
-    with SyncMcpSession(fused_memory_url(), client_name='check-run-completion', timeout=CALL_TIMEOUT_SECS) as session:
-        return session.call_tool(name, arguments)
 
 
 class LookupFailed(Exception):
@@ -234,14 +246,49 @@ class MalformedReply(LookupFailed):
     code = FailureCode.MALFORMED_REPLY
 
 
+FAILURE_BY_MCP_KIND: Final[Mapping[McpFailureKind, type[LookupFailed]]] = MappingProxyType({
+    McpFailureKind.TRANSPORT: StoreUnreachable,
+    McpFailureKind.HTTP_STATUS: StoreUnreachable,
+    McpFailureKind.TOOL_ERROR: ToolErrorReply,
+    McpFailureKind.JSON_RPC_ERROR: ToolErrorReply,
+    McpFailureKind.REPLY_SHAPE: MalformedReply,
+    McpFailureKind.UNDECODABLE: MalformedReply,
+})
+
+
+def _call_site(name: str, arguments: Mapping[str, Any]) -> str:
+    return f'{name} for {arguments.get("project_root")}'
+
+
+def fused_memory_url(env: Mapping[str, str] = os.environ) -> str:
+    return env.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
+
+
+def call_fused_memory_tool(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """The default binding: one MCP session per call, at the URL configured now.
+
+    An MCP failure is raised as the LookupFailed its kind names, so a refusal never reads as unreachable.
+    """
+    try:
+        with SyncMcpSession(
+            fused_memory_url(), client_name='check-run-completion', timeout=CALL_TIMEOUT_SECS,
+        ) as session:
+            return session.call_tool(name, arguments)
+    except McpCallError as exc:
+        raise FAILURE_BY_MCP_KIND[exc.kind](f'{_call_site(name, arguments)}: {exc}') from exc
+
+
 def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _call(call_tool: CallTool, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
-    where = f'{name} for {arguments.get("project_root")}'
+    """*call_tool*'s reply, checked; a binding's LookupFailed passes through, any other raise is unreachable."""
+    where = _call_site(name, arguments)
     try:
         reply = call_tool(name, arguments)
+    except LookupFailed:
+        raise
     except Exception as exc:
         raise StoreUnreachable(f'{where}: {type(exc).__name__}: {exc}') from exc
     if not isinstance(reply, Mapping):
@@ -282,7 +329,7 @@ def _lookup_page(reply: Mapping[str, Any], where: str) -> _LookupPage:
 
 def _lookup_pages(call_tool: CallTool, arguments: Mapping[str, Any]) -> tuple[tuple[Mapping[str, Any], ...], int]:
     """Every row the lookup matches, paged by the returned count, and the first page's tasks_with_key."""
-    where = f'{LOOKUP_TOOL} for {arguments.get("project_root")}'
+    where = _call_site(LOOKUP_TOOL, arguments)
     rows: list[Mapping[str, Any]] = []
     tasks_with_key = 0
     for page_number in range(MAX_LOOKUP_PAGES):
@@ -592,14 +639,15 @@ def _chain_links(
 
 
 def _open_chains(links: Iterable[_ChainLink]) -> dict[tuple[str, str], dict[str, Mapping[str, Any]]]:
-    """Each open chain's first row per role, keyed by (skill, run_id).
+    """Each open chain's row per role, keyed by (skill, run_id).
 
-    A chain is open while one of its unsuperseded rows is ACTIVE (the C2 guard's rule); its
-    terminal rows stay attached, so a passed completion gate still reports under its
-    blocked human gate rather than reading as the interim form.
+    A chain is open while one of its unsuperseded rows is ACTIVE (the C2 guard's rule). Per
+    role an ACTIVE row wins, so a chain re-filed for the same run reports its live gates; a
+    terminal row stays attached when no live row shares its role, so a passed completion
+    gate still reports under its blocked human gate rather than reading as the interim form.
     """
     chains: dict[tuple[str, str], dict[str, Mapping[str, Any]]] = {}
-    for item in links:
+    for item in sorted(links, key=lambda item: item.row['status'] not in ACTIVE):
         if item.link.superseded_by is None:
             chains.setdefault((item.link.skill, item.link.run_id), {}).setdefault(item.link.role, item.row)
     return {

@@ -28,7 +28,8 @@ from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
-from shared.testing_mcp_stub import StubMcpServer
+from shared.mcp_session import McpCallError, McpFailureKind
+from shared.testing_mcp_stub import StubAnswer, StubMcpServer
 
 RUN = 'review-dark_factory-20261109-1'
 OTHER_RUN = 'hotspot-survey-dark_factory-20261101-1'
@@ -192,22 +193,49 @@ def test_a_threshold_of_one_is_accepted():
 
 
 def test_the_worst_case_verdict_json_fits_the_note_cap():
-    tier = crc.TierCounts(999999, 999999, 999998)
-    landed = sum(weight * tier.done for weight in crc.PRIORITY_WEIGHTS.values())
-    pending = sum(weight * tier.open for weight in crc.PRIORITY_WEIGHTS.values())
+    tier = crc.TierCounts(999999, 909091, 999999)
     verdict = crc.CompletionVerdict(
         run_id='hotspot-survey-dark_factory-20261004-99',
         threshold=0.6666666666666666,
-        share=10999989 / 21999967,
-        landed=landed,
-        pending=pending,
-        total=sum(tier) * len(crc.PRIORITY_WEIGHTS),
-        vacuous=False,
-        passed=False,
         by_priority={name: tier for name in crc.PRIORITY_WEIGHTS},
     )
+    rendered = verdict.to_dict()
 
+    assert all(len(str(rendered[key])) == 8 for key in ('landed', 'pending', 'total'))
+    assert len(str(rendered['share'])) == len('0.xxxx')
     assert len(verdict.to_json()) <= 400
+
+
+def test_a_share_just_short_of_the_threshold_never_prints_as_reaching_it():
+    verdict = crc.CompletionVerdict(run_id=RUN, threshold=0.7, by_priority={'low': crc.TierCounts(17499, 7501, 0)})
+    rendered = json.loads(verdict.to_json())
+
+    assert verdict.verdict == 'not_yet'
+    assert rendered['share'] == 0.6999
+    assert rendered['share'] < rendered['threshold']
+
+
+def test_an_exact_threshold_share_prints_as_the_threshold():
+    verdict = crc.CompletionVerdict(run_id=RUN, threshold=0.7, by_priority={'high': crc.TierCounts(7, 3, 0)})
+
+    assert verdict.to_dict()['share'] == 0.7
+
+
+@pytest.mark.parametrize(('threshold', 'by_priority'), [
+    (1.5, {'high': crc.TierCounts(1, 0, 0)}),
+    (0.7, {'urgent': crc.TierCounts(1, 0, 0)}),
+    (0.7, {'high': crc.TierCounts(1, -1, 0)}),
+], ids=['threshold_above_one', 'unknown_tier', 'negative_count'])
+def test_a_verdict_cannot_be_built_from_impossible_counts(threshold, by_priority):
+    with pytest.raises(ValueError):
+        crc.CompletionVerdict(run_id=RUN, threshold=threshold, by_priority=by_priority)
+
+
+def test_an_empty_verdict_can_never_pass():
+    verdict = crc.CompletionVerdict(run_id=RUN, threshold=0.7, by_priority={})
+
+    assert (verdict.passed, verdict.share, verdict.vacuous, verdict.total) == (False, None, False, 0)
+    assert verdict.to_dict()['verdict'] == 'error'
 
 
 # ── The real store: SqliteTaskBackend behind the real fused-memory tools ──
@@ -426,10 +454,26 @@ def test_a_raising_transport_is_store_unreachable_never_no_tasks():
     assert raised.value.code is crc.FailureCode.STORE_UNREACHABLE
 
 
+_LAST_PAGE = {'has_more': False}
+_ONE_ROW = [{'task_id': 1, 'status': 'pending'}]
+
+
 @pytest.mark.parametrize('reply', [
     {'results': [], 'tasks_with_key': 1, 'pagination': {'has_more': True, 'returned': 0}},
-    {'tasks_with_key': 1, 'pagination': {'has_more': False}},
-], ids=['has_more_on_an_empty_page', 'no_results'])
+    {'tasks_with_key': 1, 'pagination': _LAST_PAGE},
+    {'results': [], 'tasks_with_key': 1, 'pagination': {}},
+    {'results': [], 'tasks_with_key': '1', 'pagination': _LAST_PAGE},
+    {'results': [], 'tasks_with_key': True, 'pagination': _LAST_PAGE},
+    {'results': [{'task_id': '1', 'status': 'pending'}], 'tasks_with_key': 1, 'pagination': _LAST_PAGE},
+    {'results': [{'task_id': 1, 'status': None}], 'tasks_with_key': 1, 'pagination': _LAST_PAGE},
+    {'results': ['row'], 'tasks_with_key': 1, 'pagination': _LAST_PAGE},
+    {'results': _ONE_ROW, 'tasks_with_key': 1, 'pagination': {'has_more': True}},
+    ['not', 'an', 'object'],
+], ids=[
+    'has_more_on_an_empty_page', 'no_results', 'no_has_more', 'tasks_with_key_not_an_int',
+    'tasks_with_key_a_bool', 'task_id_not_an_int', 'status_not_a_str', 'row_not_an_object',
+    'has_more_past_the_page_cap', 'reply_not_an_object',
+])
 def test_a_malformed_reply_is_refused(reply):
     with pytest.raises(crc.MalformedReply) as raised:
         crc.run_tasks('/nowhere', RUN, call_tool=_answering(reply))
@@ -456,6 +500,29 @@ def test_the_default_binding_posts_to_the_configured_url(store, monkeypatch):
         and isinstance(request.body, dict) and request.body.get('method') == 'tools/call'
     ]
     assert [request.body['params']['name'] for request in tool_calls] == [LOOKUP]
+
+
+@pytest.mark.parametrize(('answer', 'failure'), [
+    (StubAnswer.IS_ERROR, crc.ToolErrorReply),
+    (StubAnswer.JSON_RPC_ERROR, crc.ToolErrorReply),
+    (StubAnswer.NON_JSON_TEXT, crc.MalformedReply),
+    (StubAnswer.NON_JSON_BODY, crc.MalformedReply),
+], ids=['is_error', 'json_rpc_error', 'non_json_text', 'non_json_body'])
+def test_the_default_binding_names_what_the_store_answered(monkeypatch, answer, failure):
+    with StubMcpServer(stateful=False, answer=answer) as stub:
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', stub.url)
+        with pytest.raises(crc.LookupFailed) as raised:
+            crc.run_tasks('/nowhere', RUN)
+
+    assert type(raised.value) is failure
+    assert isinstance(raised.value.__cause__, McpCallError)
+    assert LOOKUP in str(raised.value)
+
+
+def test_the_default_binding_maps_every_mcp_failure_kind():
+    assert set(crc.FAILURE_BY_MCP_KIND) == set(McpFailureKind)
+    assert crc.FAILURE_BY_MCP_KIND[McpFailureKind.TRANSPORT] is crc.StoreUnreachable
+    assert crc.FAILURE_BY_MCP_KIND[McpFailureKind.HTTP_STATUS] is crc.StoreUnreachable
 
 
 def test_the_fused_memory_url_comes_from_the_environment_or_the_dashboard_default():
@@ -606,6 +673,14 @@ def test_an_unreachable_store_could_not_be_checked(tmp_path):
         assert run.verdict[key] is None
 
 
+def test_a_tool_refused_over_the_wire_is_a_tool_error_not_an_unreachable_store(tmp_path):
+    with StubMcpServer(stateful=False, answer=StubAnswer.IS_ERROR) as stub:
+        run = run_script('--run', RUN, '--threshold', '0.7', '--project-root', str(tmp_path), url=stub.url)
+
+    _assert_could_not_check(run, 'tool_error')
+    assert any('scripted stub failure' in line for line in run.human)
+
+
 def test_an_all_cancelled_run_passes_vacuously_on_the_cli(store):
     store.seed_run(RUN, ('high', 'cancelled'), ('low', 'cancelled'))
 
@@ -623,7 +698,12 @@ def test_an_all_cancelled_run_passes_vacuously_on_the_cli(store):
     ['--run', RUN, '--threshold', 'abc', '--project-root', '/tmp'],
     ['--run', RUN, '--threshold', '0.7', '--project-root', '/tmp', '--project-root', '/var'],
     ['--run', RUN, '--pending'],
-], ids=['no_threshold', 'threshold_zero', 'threshold_above_one', 'threshold_not_a_number', 'two_roots', 'run_with_pending'])
+    ['--pending', '--threshold', '0.7'],
+    ['--run', RUN, '--threshold', '0.7', '--project-root', '/tmp', '--json'],
+], ids=[
+    'no_threshold', 'threshold_zero', 'threshold_above_one', 'threshold_not_a_number', 'two_roots',
+    'run_with_pending', 'threshold_with_pending', 'json_in_check_mode',
+])
 def test_a_usage_error_exits_two_with_no_verdict(args):
     run = run_script(*args, url=_closed_port_url())
 
@@ -641,7 +721,7 @@ PENDING_OPTION_HELP = 'report the open trigger chains instead'
     ['--run', RUN, '--threshold', '0.7', '--project-root', '/tmp', '--help'],
     ['--pending', '--help'],
 ], ids=['help', 'h', 'check_with_help', 'pending_with_help'])
-def test_help_in_check_mode_could_not_check(args):
+def test_help_runs_no_check_and_exits_two(args):
     run = run_script(*args, url=_closed_port_url())
 
     assert run.rc == COULD_NOT_CHECK
@@ -673,6 +753,20 @@ def _chain_link(role: str, skill: str, run_id: str, superseded_by: str | None) -
     return {'role': role, 'skill': skill, 'run_id': run_id, 'superseded_by': superseded_by}
 
 
+def predicate(args: list[str] | None) -> dict[str, Any]:
+    """A completion gate's before_done as §3 files it; None leaves the args out."""
+    before_done: dict[str, Any] = {
+        'kind': 'predicate',
+        'script': 'scripts/check_run_completion.py',
+        'script_root': 'factory',
+        'timeout_secs': 120,
+        'recheck_secs': 86400,
+    }
+    if args is not None:
+        before_done['args'] = args
+    return before_done
+
+
 def seed_chain(
     store: FixtureStore,
     *,
@@ -685,7 +779,7 @@ def seed_chain(
     human_status: str = 'pending',
     root: str | None = None,
     pad: str | None = None,
-    args: list[str] | None = None,
+    before_done: Mapping[str, Any] | None = None,
 ) -> Chain:
     """A final-form chain as skills/_shared/filing-the-trigger-chain.md §3 files it."""
     project = root or store.root
@@ -695,14 +789,9 @@ def seed_chain(
     gate_metadata: dict[str, Any] = {
         'trigger_chain': link,
         'milestone': {'mode': 'dated', 'at': NEXT_CHECK},
-        'before_done': {
-            'kind': 'predicate',
-            'script': 'scripts/check_run_completion.py',
-            'script_root': 'factory',
-            'args': args if args is not None else ['--run', run_id, '--threshold', threshold, '--project-root', project],
-            'timeout_secs': 120,
-            'recheck_secs': 86400,
-        },
+        'before_done': before_done or predicate(
+            ['--run', run_id, '--threshold', threshold, '--project-root', project],
+        ),
     }
     if streak is not None:
         gate_metadata['predicate_recheck'] = {
@@ -920,21 +1009,41 @@ def test_an_interim_chain_is_listed_with_its_human_gate(store):
     assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
 
 
-ASKING_FOR_HELP = pytest.mark.parametrize(
-    'help_args', [['--help'], ['-h'], ['--he']], ids=['help', 'h', 'abbreviated'],
-)
+def test_a_chain_refiled_for_the_same_run_reports_its_live_gates(store):
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    seed_chain(store, gate_status='cancelled', human_status='cancelled')
+    refiled = seed_chain(store, threshold='0.55')
+
+    run = pending(store, store.root)
+    [project] = pending_json(store, store.root)['projects']
+
+    assert project['state'] == 'open_chains'
+    [reported] = project['chains']
+    assert reported['completion_gate']['id'] == refiled.gate
+    assert reported['completion_gate']['status'] == 'pending'
+    assert reported['completion_gate']['threshold'] == 0.55
+    assert reported['human_gate'] == {'id': refiled.human, 'status': 'pending'}
+    _line_with(run, f'completion gate {refiled.gate}')
 
 
-def _seed_a_gate_asking_for_help(store: FixtureStore, help_args: list[str]) -> Chain:
+def test_with_no_project_root_the_report_says_so():
+    assert crc.render_text([]) == ['no project root to report: none named and none discovered']
+
+
+ASKING_FOR_HELP = [['--help'], ['-h'], ['--he']]
+ASKING_FOR_HELP_IDS = ['help', 'h', 'abbreviated']
+
+
+def _seed_beside_a_gate(store: FixtureStore, before_done: Mapping[str, Any]) -> Chain:
     store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
     seed_chain(store)
     store.seed_run(OTHER_RUN, ('low', 'done'))
-    return seed_chain(store, skill='hotspot-survey', run_id=OTHER_RUN, args=help_args)
+    return seed_chain(store, skill='hotspot-survey', run_id=OTHER_RUN, before_done=before_done)
 
 
-@ASKING_FOR_HELP
+@pytest.mark.parametrize('help_args', ASKING_FOR_HELP, ids=ASKING_FOR_HELP_IDS)
 def test_a_gate_asking_for_help_is_unreadable_not_the_whole_report(store, help_args):
-    helped = _seed_a_gate_asking_for_help(store, help_args)
+    helped = _seed_beside_a_gate(store, predicate(help_args))
 
     checked = check(store)
     run = pending(store, store.root)
@@ -945,9 +1054,11 @@ def test_a_gate_asking_for_help_is_unreadable_not_the_whole_report(store, help_a
     assert not any('usage:' in line or PENDING_OPTION_HELP in line for line in run.lines)
 
 
-@ASKING_FOR_HELP
-def test_a_gate_asking_for_help_is_unreadable_in_the_json_report(store, help_args):
-    _seed_a_gate_asking_for_help(store, help_args)
+@pytest.mark.parametrize(
+    'gate_args', [*ASKING_FOR_HELP, None, ['--pending']], ids=[*ASKING_FOR_HELP_IDS, 'no_args', 'pending'],
+)
+def test_a_gate_whose_args_run_no_check_is_unreadable_in_the_json_report(store, gate_args):
+    _seed_beside_a_gate(store, predicate(gate_args))
 
     checked = check(store)
     [project] = pending_json(store, store.root)['projects']
