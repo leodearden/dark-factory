@@ -11,6 +11,7 @@ contract therefore parses genuine rows, not a hand-copied shape.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import itertools
@@ -26,7 +27,15 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
-from shared.memory_eval_metrics import load_metric_series
+from shared.memory_eval_metrics import (
+    RUN_STAMP_ENV_VAR,
+    SCHEMA_VERSION,
+    Corpus,
+    MetricSeries,
+    load_metric_series,
+    stamp_datetime,
+    write_metric_series,
+)
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -204,6 +213,9 @@ class FakeMemory:
     async def delete_memory(self, *args: Any, **kwargs: Any) -> Any:
         self.write_calls.append('delete_memory')
         raise AssertionError('the write-after-miss producer must never write the corpus')
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _before(write: Any) -> str:
@@ -694,3 +706,116 @@ class TestSeriesAndArtifacts:
         await _run(memory, journal, tmp_path / 'evals')
 
         assert memory.write_calls == []
+
+
+EVAL_ID = 'e7-write-after-miss'
+
+
+def _empty_series(stamp: str) -> MetricSeries:
+    return MetricSeries(
+        schema_version=SCHEMA_VERSION, eval_id=EVAL_ID, run_stamp=stamp,
+        corpus=Corpus(project_id=PROJECT), metrics=[],
+    )
+
+
+def _sweep_argv(root: Path) -> list[str]:
+    """The runner's ``_sweep_argv`` shape for this producer."""
+    return ['--metrics-root', str(root), '--eval-id', EVAL_ID, '--project-id', PROJECT]
+
+
+def _stamp_an_hour_from_now() -> str:
+    return (datetime.now(UTC) + timedelta(hours=1)).strftime('%Y%m%dT%H%M%SZ')
+
+
+class TestPeriodAndCli:
+    """Periods tile on run stamps; the CLI takes the runner's argv and fails loudly."""
+
+    def test_the_period_starts_at_the_previous_runs_stamp(self, tmp_path):
+        previous, current = '20261108T220000Z', '20261109T220000Z'
+        write_metric_series(_empty_series(previous), tmp_path)
+
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24)
+
+        assert period == _mod().Period(stamp_datetime(previous), stamp_datetime(current))
+
+    def test_the_first_period_is_the_bootstrap_window(self, tmp_path):
+        current = '20261109T220000Z'
+
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=6)
+
+        end = stamp_datetime(current)
+        assert period == _mod().Period(end - timedelta(hours=6), end)
+
+    def test_an_artifact_at_or_after_this_stamp_is_not_a_previous_run(self, tmp_path):
+        current = '20261109T220000Z'
+        write_metric_series(_empty_series(current), tmp_path)
+        write_metric_series(_empty_series('20261110T220000Z'), tmp_path)
+
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24)
+
+        end = stamp_datetime(current)
+        assert period == _mod().Period(end - timedelta(hours=24), end)
+
+    def test_the_parser_takes_the_runners_argv_and_the_producers_own_flags(self, tmp_path):
+        parser = _mod().build_parser()
+
+        args = parser.parse_args([
+            *_sweep_argv(tmp_path),
+            '--journal', str(tmp_path / 'write_journal.db'),
+            '--initial-period-hours', '12',
+            '--config', str(tmp_path / 'config.yaml'),
+        ])
+
+        assert args.metrics_root == str(tmp_path)
+        assert args.eval_id == EVAL_ID
+        assert args.project_id == PROJECT
+        assert args.journal == str(tmp_path / 'write_journal.db')
+        assert args.initial_period_hours == 12
+        assert args.config == str(tmp_path / 'config.yaml')
+        assert parser.parse_args(_sweep_argv(tmp_path)).initial_period_hours == 24
+
+    def test_the_parser_has_no_mutation_or_skip_flag(self):
+        option_strings = {
+            option for action in _mod().build_parser()._actions for option in action.option_strings
+        }
+        assert '--apply' not in option_strings
+        assert '--no-metrics' not in option_strings
+
+    def test_a_missing_journal_exits_non_zero_and_writes_no_metrics(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        stamp = _stamp_an_hour_from_now()
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, stamp)
+        memory = FakeMemory(contents={})
+
+        async def open_fake_memory(config: Any) -> FakeMemory:
+            return memory
+
+        monkeypatch.setattr(_mod(), '_open_memory', open_fake_memory)
+        missing = tmp_path / 'absent' / 'write_journal.db'
+        root = tmp_path / 'evals'
+
+        exit_code = _mod().main([*_sweep_argv(root), '--journal', str(missing)])
+
+        assert exit_code != 0
+        assert str(missing) in capsys.readouterr().err
+        assert not (root / EVAL_ID / f'metrics-{stamp}.json').exists()
+
+    def test_a_full_cli_run_writes_the_pinned_stamps_metrics(self, tmp_path, monkeypatch):
+        _window, memory, _rows, journal = asyncio.run(_headline_fixture(tmp_path))
+        stamp = _stamp_an_hour_from_now()
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, stamp)
+
+        async def open_fake_memory(config: Any) -> FakeMemory:
+            return memory
+
+        monkeypatch.setattr(_mod(), '_open_memory', open_fake_memory)
+        root = tmp_path / 'evals'
+
+        exit_code = _mod().main([*_sweep_argv(root), '--journal', str(journal)])
+
+        assert exit_code == 0
+        series = load_metric_series(root / EVAL_ID / f'metrics-{stamp}.json')
+        assert [(metric.metric_id, metric.n) for metric in series.metrics] == [('write-after-miss', 2)]
+        assert memory.write_calls == []
+        assert memory.closed is True
