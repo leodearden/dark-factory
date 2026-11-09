@@ -26,7 +26,6 @@ from orchestrator.review_payload import Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
-
 PLAN_SCHEMA_VERSION = 1
 PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
 PLAN_BASE_COMMIT_KEY = '_base_commit'

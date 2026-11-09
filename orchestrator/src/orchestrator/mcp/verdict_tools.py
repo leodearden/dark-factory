@@ -135,10 +135,11 @@ def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
     return {
         'status': 'error',
         'message': (
-            'nothing was written: every issue needs a severity and a '
-            'description, and these do not: ' + '; '.join(deviations) + '. '
-            'Call submit_review_verdict again with severity and description on '
-            'every issue (or drop the issue) and the verdict will land.'
+            'nothing was written: every issue must be an object carrying a '
+            'severity and a description, and these are not: '
+            + '; '.join(deviations) + '. Call submit_review_verdict again with '
+            'severity and description on every issue (or drop the issue) and '
+            'the verdict will land.'
         ),
         'issue_contract': {'outcome': 'rejected', 'deviations': deviations},
     }
