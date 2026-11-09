@@ -36,6 +36,12 @@ async def root_blobs(repo: Path, tree: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(blobs))
 
 
+async def directories(repo: Path, tree: str) -> tuple[str, ...]:
+    """Every directory of *tree*, recursively, as a tree-root-relative path."""
+    listing = await _git(repo, ['ls-tree', '-r', '-d', '--name-only', '-z', tree])
+    return tuple(filter(None, listing.split('\0')))
+
+
 async def object_ids(repo: Path, tree: str, paths: Iterable[str]) -> dict[str, str | None]:
     """{path: object id} for each of *paths* in *tree*, None where the path is
     absent. One ``git cat-file --batch-check`` whatever the path count."""

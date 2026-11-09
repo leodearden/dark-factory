@@ -136,7 +136,7 @@ def _root(*members: str, exclude: tuple[str, ...] = ()) -> str:
 
 _GRAPH_MEMBERS = {
     'alpha': _member('Alpha', ('click>=8',)),
-    'beta': _member('beta', ('alpha[x]>=1; python_version>"3"',)),
+    'beta': _member('beta', ("alpha[x]>=1; python_version>'3'",)),
     'gamma': _member(
         'gamma', groups='[dependency-groups]\ndev = [{include-group = "lint"}]\nlint = ["beta"]\n',
     ),
