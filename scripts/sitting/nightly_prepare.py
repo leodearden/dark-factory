@@ -40,20 +40,31 @@ checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
 allowlisted reads therefore never depend on the ambient project config being
 approved for a headless run, and no other server starts.
 
-The account comes from the shared pool (``account_pool.build_pool``): one
-lease, read and handed straight back before the run, because nothing in the
-child can settle a slot. The known cost is that this run's spend is invisible
-to the gate. The leased token is written into the run's config dir and
-removed on every exit that reaches ``run``'s ``finally`` (a SIGKILL leaves
-it). With no lease the run is skipped (exit 1): it never uses the host login.
-The child's env is ``shared.secret_env.agent_subprocess_env`` of this
-process's, with the lease's ``CLAUDE_CODE_OAUTH_TOKEN`` on top, so it holds no
-API key or other secret, no endpoint selection and no Python-environment
-selection (OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
+The account comes from the fleet pool (``account_pool.build_pool``), and the
+run goes through the shared session runner,
+``shared.cli_invoke.invoke_with_cap_retry``, in roster order like every other
+session:
+
+- A seat at its usage limit, or one whose credentials are rejected (401/403),
+  hands the run to the next seat; a capped session that had made progress
+  resumes there.
+- It never parks: ``max_cap_retries`` is one pass over the pool, and a pool
+  with no admissible seat ends the run at once.
+- ``--timeout-secs`` bounds the whole run, failovers and the cooldowns
+  between them included.
+- The leased token lives in the run's config dir and is removed on every exit
+  that reaches ``run``'s ``finally`` (a SIGKILL leaves it).
+- An empty pool skips the night (exit 1): the host login is never a fallback.
+
+The runner builds the child's env as ``shared.secret_env.agent_subprocess_env``
+of this process's, with the seat's ``CLAUDE_CODE_OAUTH_TOKEN`` on top, so it
+holds no API key or other secret, no endpoint selection and no
+Python-environment selection (OPERATIONS.md §12, "Legibility trickle accounts
+(03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
-hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
-though the wrapper renders the page whatever this returns.
+found no seat that could take it or recorded nothing; 2 a configuration error.
+``main`` never raises, though the wrapper renders the page whatever this returns.
 """
 from __future__ import annotations
 
