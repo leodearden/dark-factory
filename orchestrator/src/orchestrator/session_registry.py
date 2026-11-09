@@ -77,7 +77,8 @@ SCHEMA_VERSION = 1
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).
 # 7: SessionRecord.launcher_identity and claude_owner_identity (task 8125).
-SCHEMA_MINOR = 7
+# 8: SessionRecord.t3_end (task 8126).
+SCHEMA_MINOR = 8
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -226,6 +227,23 @@ class DisplayKind(StrEnum):
     T3 = 't3'
 
 
+class T3End(StrEnum):
+    """The end-of-work act a T3-lane spawn asked for, None meaning none; see skills/spawn/SKILL.md "Ending a T3 session"."""
+
+    SETTLE = 'settle'
+    ARCHIVE = 'archive'
+
+
+def parse_t3_end_input(raw: str) -> T3End | None:
+    """Parse the ``CLAUDE_SPAWN_T3_END`` input strictly: '' or 'none' is None, a member's value is that member."""
+    if raw in ('', 'none'):
+        return None
+    try:
+        return T3End(raw)
+    except ValueError:
+        raise ValueError(f'CLAUDE_SPAWN_T3_END={raw!r} is not one of none|settle|archive') from None
+
+
 @dataclass
 class Display:
     """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
@@ -366,6 +384,16 @@ def _coerce_exit_request(value: Any) -> ExitRequest | None:
     )
 
 
+def _coerce_t3_end(value: Any) -> T3End | None:
+    """Read a stored ``t3_end``; anything but a member's exact wire string reads None. Never raises."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return T3End(value)
+    except ValueError:
+        return None
+
+
 def _identity_wire(identity: ProcessIdentity | None) -> dict[str, Any] | None:
     return None if identity is None else dataclasses.asdict(identity)
 
@@ -445,6 +473,10 @@ class SessionRecord:
         hands the registry 1 or empty; stamped at ``launching`` and preserved
         by every later read-modify-write. Anything but a JSON true reads back
         as False.
+    t3_end: the end-of-work act the spawn asked for, or None for none;
+        stamped at ``launching`` from the input spawn-claude.sh resolved and
+        preserved by every later read-modify-write. Anything but a member's
+        wire string reads back as None (see ``_coerce_t3_end``).
     exit_request: the Stop hook's last self-exit evaluation, or None; written
         only when the ``exit-requested`` marker is present on a proven-owner
         event. See ExitRequest and ``session_self_exit.py``.
@@ -478,6 +510,7 @@ class SessionRecord:
     claude_owner_pid: int | None = field(default=None, kw_only=True)
     claude_owner_identity: ProcessIdentity | None = field(default=None, kw_only=True)
     self_exit: bool = field(default=False, kw_only=True)
+    t3_end: T3End | None = field(default=None, kw_only=True)
     exit_request: ExitRequest | None = field(default=None, kw_only=True)
     exit_requested_at: str | None = field(default=None, kw_only=True)
 
@@ -509,6 +542,7 @@ class SessionRecord:
             'claude_owner_pid': self.claude_owner_pid,
             'claude_owner_identity': _identity_wire(self.claude_owner_identity),
             'self_exit': self.self_exit,
+            't3_end': None if self.t3_end is None else self.t3_end.value,
             'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
             'exit_requested_at': self.exit_requested_at,
         }
@@ -548,6 +582,7 @@ class SessionRecord:
                 data.get('claude_owner_identity'), claude_owner_pid
             ),
             self_exit=data.get('self_exit') is True,
+            t3_end=_coerce_t3_end(data.get('t3_end')),
             exit_request=_coerce_exit_request(data.get('exit_request')),
             exit_requested_at=exit_requested_at if isinstance(exit_requested_at, str) else None,
         )
@@ -5261,6 +5296,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
     launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
     self_exit = env.get('CLAUDE_SPAWN_SELF_EXIT') == '1'
+    t3_end = parse_t3_end_input(env.get('CLAUDE_SPAWN_T3_END', '') or '')
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
@@ -5282,6 +5318,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
         self_exit=self_exit,
+        t3_end=t3_end,
     )
     write_record(record)
     start_detached_reap()
