@@ -10926,6 +10926,21 @@ async def _run_node_id_group(
     return statuses
 
 
+def _node_ids_by_module(
+    tree: Path, mc_by_prefix: dict[str, ModuleConfig], ids: Collection[str],
+) -> dict[str, dict[str, str]]:
+    """``{prefix: {id: qualified id}}``, each id mapped on its own; an unmappable id is left out."""
+    by_prefix: dict[str, dict[str, str]] = {}
+    for node_id in ids:
+        mapped = _group_node_ids_by_subproject(
+            tree, mc_by_prefix, [node_id], log_label='run_node_ids',
+        )
+        if mapped:
+            [(prefix, [qualified])] = mapped.items()
+            by_prefix.setdefault(prefix, {})[node_id] = qualified
+    return by_prefix
+
+
 async def run_node_ids(
     tree: Path,
     config: OrchestratorConfig,
@@ -10954,27 +10969,27 @@ async def run_node_ids(
     re-run alone, serially, and reads ``'error'`` only if it is missing again;
     a group that wrote no report at all is not re-run.
 
-    *concurrent_groups* is accepted but not yet acted on.
+    *concurrent_groups* runs the module groups at once, each writing its own
+    report; the serial default is what an isolation-sensitive caller needs.
     """
     mc_by_prefix = {mc.prefix: mc for mc in module_configs}
-    statuses: dict[str, NodeIdStatus] = {}
-    qualified_by_prefix: dict[str, dict[str, str]] = {}
-    for node_id in ids:
-        groups = _group_node_ids_by_subproject(
-            tree, mc_by_prefix, [node_id], log_label='run_node_ids',
-        )
-        if not groups:
-            statuses[node_id] = 'error'
-            continue
-        prefix, [qualified] = next(iter(groups.items()))
-        qualified_by_prefix.setdefault(prefix, {})[node_id] = qualified
+    qualified_by_prefix = _node_ids_by_module(tree, mc_by_prefix, ids)
     token = uuid.uuid4().hex
-    for prefix, qualified_by_id in qualified_by_prefix.items():
-        report = _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}')
-        statuses.update(await _run_node_id_group(
-            tree, config, mc_by_prefix[prefix], qualified_by_id, report,
-        ))
-    return MappingProxyType({node_id: statuses[node_id] for node_id in ids})
+
+    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdStatus]]:
+        return _run_node_id_group(
+            tree, config, mc_by_prefix[prefix], qualified_by_prefix[prefix],
+            _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}'),
+        )
+
+    if concurrent_groups:
+        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+    else:
+        group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
+    statuses: dict[str, NodeIdStatus] = {}
+    for one_group in group_statuses:
+        statuses.update(one_group)
+    return MappingProxyType({node_id: statuses.get(node_id, 'error') for node_id in ids})
 
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
