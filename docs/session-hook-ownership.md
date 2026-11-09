@@ -158,13 +158,17 @@ When the recorded owner is judged dead
 re-stamps it with the new claude. An owner on another host is never
 reclaimed. An owner recorded with the event's own pid is re-stamped only when
 its identity is judged dead: a reboot or a reused pid handed that pid back.
-This dead-owner reclaim applies on two lanes:
+This dead-owner reclaim applies on three lanes:
 
 - an event reached through its session-id pointer;
 - an event reached through the hand-launched keying, whose slug embeds that
   same session id, so a record bound to it is proven the session's own. A
   forked inheritor's record is keyed the same way (see §Forked-inheritor
-  identity), so it shares this lane.
+  identity), so it shares this lane;
+- an event reached through its T3 thread pointer when the record is already
+  bound to the event's session id: a T3 resume in a new process whose
+  session-id pointer is missing. Without the reclaim the record would keep
+  its dead owner, and the thread's next nested claude would re-bind it.
 
 An event that adopts its `CLAUDE_SPAWN_SESSION_ID` does not reclaim: there a
 reclaim would also satisfy the self-exit owner-pid precondition in the same

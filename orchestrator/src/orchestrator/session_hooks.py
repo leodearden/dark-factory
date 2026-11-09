@@ -306,8 +306,9 @@ class _HookSlugResolution:
     INVARIANT: ``snapshot is None or snapshot.slug == slug``.
 
     ``session_id_keyed`` -- the slug was reached by this event's own session
-    id, either through its session-id pointer or through the hand-launched
-    keying that embeds it. A record bound to that id is therefore proven this
+    id: through its session-id pointer, through the hand-launched keying that
+    embeds it, or through a T3 thread pointer naming a record already bound
+    to it. A record bound to that id is therefore proven this
     session's, and a dead ``claude_owner_pid`` may be reclaimed;
     ``_bind_claude_session_id`` still requires the binding to equal the
     event's id.
@@ -377,7 +378,9 @@ def _adopt_t3_thread_slug(
     A T3 thread carries no ``CLAUDE_SPAWN_OWNER_PPID``, so the claude pids
     decide. Unbound: the thread's first claude binds, as does the recorded
     owner pid or any event once the recorded owner is judged DEAD; an event
-    whose pid is unresolvable adopts without binding. Bound to another
+    whose pid is unresolvable adopts without binding. Bound to this event's
+    session id: adopted as ``session_id_keyed``, so a dead owner is
+    reclaimed. Bound to another
     session id: the owner-only re-mint rule of ``_env_slug_ownership``, or,
     on SessionStart (*allow_remint*), a recorded owner judged DEAD re-binds.
     A nested claude always has a live owner, so it forks. See
@@ -396,7 +399,7 @@ def _adopt_t3_thread_slug(
             return _HookSlugResolution(slug, None, False, snapshot)
         return None
     if bound == _hook_session_id(hook_input):
-        return _HookSlugResolution(slug, None, True, snapshot)
+        return _HookSlugResolution(slug, None, True, snapshot, session_id_keyed=True)
     if (
         allow_remint
         and _is_owner_only_session_start(hook_input)
