@@ -1319,8 +1319,7 @@ class TestHarnessZeroProgressWiring:
                 str(i), _report(WorkflowOutcome.DONE, task_id=str(i)), False,
             )
 
-        queue.get_by_task.assert_not_called()
-        queue.has_open_l1.assert_not_called()
+        assert queue.method_calls == []
 
     async def test_run_id_guard_still_short_circuits(self, wired_harness):
         """The _run_id=None no-op hook (relied on by other suites) is preserved."""
@@ -1365,3 +1364,45 @@ class TestHarnessZeroProgressWiring:
 
         assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
         wired_harness.scheduler.record_requeue.assert_called_once()
+
+
+def _recovered_events(harness):
+    from orchestrator.event_store import EventType
+
+    return [
+        entry for (etype, entry) in harness.event_store.events
+        if etype == EventType.zero_progress_requeue_recovered
+    ]
+
+
+@pytest.mark.asyncio
+class TestHarnessZeroProgressAlarmSurvivesRestart:
+    """The fixture harness is the RESTARTED process: its tracker and memo are
+    empty, and the prior process's alarm exists only on the queue."""
+
+    @pytest.fixture
+    def restarted(self, wired_harness):
+        _file_alarm(wired_harness._escalation_queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+        return wired_harness
+
+    async def test_the_first_done_resolves_the_inherited_alarm(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
+        assert len(_recovered_events(restarted)) == 1
+
+        for _ in range(3):
+            await restarted._apply_retry_cap('3068', _report(), True)
+        assert len(_alerts(restarted)) == 1, 'the detector must re-arm'
+
+    async def test_a_requeue_that_invoked_an_agent_resolves_it(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(agent_invocations=1), True)
+
+        assert _alerts(restarted) == []
+
+    async def test_a_task_still_looping_keeps_exactly_one_alarm(self, restarted):
+        for _ in range(5):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        assert len(_alerts(restarted)) == 1
