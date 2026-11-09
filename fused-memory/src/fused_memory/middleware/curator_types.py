@@ -118,6 +118,19 @@ NON_CANCELLED_STATUSES: Final[tuple[str, ...]] = tuple(
 )
 
 
+def spawned_from_id(value: object) -> str | None:
+    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
+
+    The live store holds str, int and dict values; only the first two name a task.
+    This is the canonical form :attr:`CandidateTask.spawned_from` carries.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
 @dataclass
 class CandidateTask:
     """A task about to be created, fed to the curator for a drop/combine/create decision."""
@@ -127,7 +140,7 @@ class CandidateTask:
     details: str = ''
     files_to_modify: list[str] = field(default_factory=list)
     priority: str = DEFAULT_PRIORITY
-    spawned_from: str | None = None  # task id of the review-chain anchor
+    spawned_from: str | None = None  # the review-chain anchor's id, canonical per spawned_from_id
     spawn_context: str = 'manual'  # review | steward-triage | planning | agent_followup | manual
     # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
     # consulted by operational_ask_registry.match_candidate. Its routing axis

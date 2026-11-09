@@ -85,6 +85,7 @@ from fused_memory.middleware.curator_types import (
     exception_summary,
     followup_items_of,
     is_combine_eligible,
+    spawned_from_id,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -2710,7 +2711,7 @@ class TaskInterceptor:
             details=str(kwargs.get('details') or ''),
             files_to_modify=files,
             priority=str(kwargs.get('priority') or 'medium'),
-            spawned_from=meta.get('spawned_from'),
+            spawned_from=spawned_from_id(meta.get('spawned_from')),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
             items=followup_items_of(meta),
@@ -7589,9 +7590,7 @@ def _combine_fold(
     context = _CombineAuditContext(
         candidate_ticket_id=ticket_id,
         candidate_source=candidate_source if isinstance(candidate_source, str) else None,
-        candidate_spawned_from=(
-            None if candidate.spawned_from is None else str(candidate.spawned_from)
-        ),
+        candidate_spawned_from=candidate.spawned_from,
         batch_internal=decision.batch_target_index is not None,
         items_before=tuple(item.key for item in items_before),
         items_after=tuple(item.key for item in items_after or ()),
