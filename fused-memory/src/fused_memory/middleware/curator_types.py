@@ -155,6 +155,14 @@ class CandidateTask:
     # The submit stamp (§4.2). Not hashed: it is derived from fields already hashed.
     declared_scope: DeclaredScope | None = None
 
+    def __post_init__(self) -> None:
+        if self.spawned_from != spawned_from_id(self.spawned_from):
+            raise ValueError(
+                'CandidateTask.spawned_from must be a canonical task id (a stripped, '
+                'non-empty str, as spawned_from_id returns) or None, got '
+                f'{self.spawned_from!r} (type={type(self.spawned_from).__name__})'
+            )
+
     def payload_hash(self) -> str:
         """Stable hash over the fields a curator decision depends on.
 
