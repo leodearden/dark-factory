@@ -145,8 +145,15 @@ class GitCrossCheck:
 
 @dataclass(frozen=True)
 class LandingBatch:
+    """The emitted landings, git's disagreement over their range, and the cursor to resume from.
+
+    next_cursor is the merge_sha of the newest first-claim landing emitted, or the call's cursor
+    in full when none was; None only for a full-history call that found no landing on main.
+    """
+
     landings: tuple[Landing, ...]
     git_check: GitCrossCheck
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -311,12 +318,18 @@ def landings(
     upsert on (project_id, merge_sha, task_id). Ordinals are numbered over the full history, so
     they are stable across calls.
 
+    The next call's ``since_cursor`` is the batch's ``next_cursor``, never main's HEAD. A
+    landing's runs.db event trails main's ref update (α measured 38 s to 3m52s on df), so a
+    commit at or below HEAD may not be a recorded landing yet, and a cursor past it would skip
+    that landing for good. Until its event is written, such a merge counts in
+    ``git_check.merges_without_landing``.
+
     A late claim (a done row naming a sha an earlier event already claimed for another task)
     stays a landing, because the task left the merge queue with main advanced, but it forms its
     own unit of one with unmeasurable lines, and git_check counts it. ``project_id`` defaults
     to the repo root's project id. The call runs one blocking ``git rev-list`` bounded by
     ``git_timeout_s``, so a coroutine calls it through ``asyncio.to_thread``. The return is a
-    LandingBatch whose ``.landings`` are the rows.
+    LandingBatch whose ``.landings`` are the rows and ``.next_cursor`` the cursor to resume from.
 
     Raises CursorNotOnMain, UnrecognisedTrainEvent, and the git_lines errors (GitUnavailable for a non-repository).
     """
@@ -330,6 +343,7 @@ def landings(
         return not recorded.late_claim and recorded.merge_sha in position
 
     on_line = [position[r.merge_sha] for r in history if r.merge_sha in position]
+    cursor_position: int | None = None
     if since_cursor is None:
         range_start = min(on_line, default=len(line.shas))
         horizon: datetime | None = None
@@ -381,6 +395,12 @@ def landings(
     )
     off_first_parent = sum(1 for row in rows if not row.git_first_parent)
     late_claims = sum(1 for row in rows if row.late_claim)
+    newest = max(
+        (position[row.merge_sha] for row in rows if row.git_first_parent and not row.late_claim),
+        default=cursor_position,
+    )
     return LandingBatch(
-        tuple(rows), GitCrossCheck(off_first_parent, merges_without_landing, late_claims)
+        tuple(rows),
+        GitCrossCheck(off_first_parent, merges_without_landing, late_claims),
+        next_cursor=None if newest is None else line.shas[newest],
     )

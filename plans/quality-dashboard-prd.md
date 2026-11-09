@@ -268,13 +268,14 @@ negative, so an EWMA chart can never show improvement at these rates.
 ### Landing record (`shared/src/shared/quality_series/landings.py`)
 
 ```
-Landing = {project_id, merge_sha, task_id, landed_at (UTC ISO), ordinal (int, per project, by landed_at
+Landing = {project_id, merge_sha, task_id, landed_at (tz-aware UTC), ordinal (int, per project, by landed_at
            then merge_sha), source ('merge_finalized' | 'train_merged' | 'train_attributed'), unit_id (merge_sha of the verify
            unit's tip; == merge_sha for a plain landing), unit_size (int ≥ 1), git_first_parent (bool)}
            + late_claim, prev_landed_at, lines_base, base_sha (see the Correction below)
-landings(runs_db, repo, since_cursor) -> LandingBatch(landings, git_check)
+landings(runs_db, repo, since_cursor) -> LandingBatch(landings, git_check, next_cursor)
     # ordered; since_cursor=None is the full history; may re-emit late claims and off-first-parent
-    # landings, so consumers upsert on (project_id, merge_sha, task_id)
+    # landings, so consumers upsert on (project_id, merge_sha, task_id); the next call's
+    # since_cursor is next_cursor, never main's HEAD
 ```
 Invariants: one row per `(project_id, merge_sha, task_id)`; `unit_size == len(members)` for a train;
 every member of a unit shares `unit_id`; `git_first_parent` is False for a landing whose sha is not on
@@ -309,6 +310,14 @@ main's first-parent line (served as the disagreement count, never dropped).
 - (2026-11-09) Late claims and off-first-parent landings are emitted by `landed_at`, after the newest
   first-claim landing at or below the cursor, so a later cursor may re-emit one. Consumers upsert on
   `(project_id, merge_sha, task_id)`. This replaced the original sketch's "never re-emits a sha ≤ cursor".
+- (2026-11-09) **Which sha is the cursor.** A consumer resumes from `LandingBatch.next_cursor`: the
+  merge_sha of the newest first-claim landing emitted, or the call's cursor in full when none was. It
+  must never store main's HEAD. A landing's runs.db event trails main's ref update by 38 s to 3m52s
+  (measured above), so with a 600 s loop a commit at or below HEAD is routinely not yet a recorded
+  landing, and a HEAD cursor would skip it for good. Until its event is written, such a merge counts in
+  `git_check.merges_without_landing`, so that count is transient at the top of main. The Sketch's
+  "stale when main is ahead of the cursor" therefore means recorded landings above the cursor, not
+  first-parent commits. See `shared/src/shared/quality_series/landings.py::landings`.
 - (2026-11-09) A unit's members are consecutive in ordinal order, and
   `shared/src/shared/quality_series/rows.py::rows_for` refuses input that splits, shortens or repeats
   a unit, before any git work.

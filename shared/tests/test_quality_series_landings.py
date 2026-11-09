@@ -122,6 +122,31 @@ class TestCursor:
             [('107', s.m7), ('108', s.m8)], key=lambda pair: pair[1]
         )
 
+    def test_next_cursor_is_the_newest_emitted_first_claim(self, scenario: LandingScenario) -> None:
+        s = scenario
+        assert landings(s.db.conn, s.repo.root, since_cursor=None).next_cursor == s.m8
+        assert landings(s.db.conn, s.repo.root, since_cursor=s.m1).next_cursor == s.m8
+
+    def test_with_nothing_emitted_next_cursor_is_the_cursor_in_full(
+        self, scenario: LandingScenario
+    ) -> None:
+        s = scenario
+        batch = landings(s.db.conn, s.repo.root, since_cursor=s.m8[:12])
+        assert (batch.landings, batch.next_cursor) == ((), s.m8)
+
+    def test_next_cursor_never_passes_a_merge_whose_event_is_not_written_yet(
+        self, tmp_path: Path
+    ) -> None:
+        s = build_landing_scenario(tmp_path / 'proj')
+        m9 = s.repo.branch_merge('109', {'pkg/src/pkg/f/u.py': 'u = 1\n'})
+        before = landings(s.db.conn, s.repo.root, since_cursor=None)
+        assert before.next_cursor == s.m8 != s.repo.head()
+        assert before.git_check.merges_without_landing == 2
+        s.db.merge_done(at_hour(15.0), '109', m9)
+        after = landings(s.db.conn, s.repo.root, since_cursor=before.next_cursor)
+        assert [_key(row) for row in after.landings] == [('109', m9)]
+        assert after.next_cursor == m9
+
     def test_a_cursor_off_main_is_refused(self, scenario: LandingScenario) -> None:
         with pytest.raises(CursorNotOnMain):
             landings(scenario.db.conn, scenario.repo.root, since_cursor=scenario.side)

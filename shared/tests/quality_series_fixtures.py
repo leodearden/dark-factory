@@ -302,7 +302,11 @@ FileContents = Mapping[str, str | bytes]
 
 
 class GitRepoBuilder:
-    """A real repository on branch ``main`` whose helpers return the commit shas they make."""
+    """A real repository on branch ``main`` whose helpers return the commit shas they make.
+
+    ``data/`` and ``.worktrees/`` are excluded, as in a project checkout, so the runs.db and
+    task-meta files written under the root never enter a commit or move under an open connection.
+    """
 
     def __init__(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
@@ -312,6 +316,8 @@ class GitRepoBuilder:
         self.git('config', 'user.email', 'quality-series-test@example.com')
         self.git('config', 'user.name', 'Quality Series Test')
         self.git('config', 'commit.gpgsign', 'false')
+        with (root / '.git' / 'info' / 'exclude').open('a') as exclude:
+            exclude.write('data/\n.worktrees/\n')
 
     def git(self, *args: str) -> str:
         result = subprocess.run(

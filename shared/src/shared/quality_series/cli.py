@@ -246,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
           f'merges_without_landing={check.merges_without_landing}, '
           f'late_claims={check.late_claims})')
     print(ANCHORING)
+    print(f'# next cursor: {_render(batch.next_cursor)}')
     if deferred:
         print(f'# deferred: {deferred}')
     if args.week is not None:

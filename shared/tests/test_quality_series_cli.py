@@ -86,6 +86,7 @@ class TestSince:
         anchoring = next(line for line in lines if line.startswith('# anchoring:'))
         assert 'event timestamp' in anchoring
         assert '(previous landing, landing]' in anchoring
+        assert f'# next cursor: {project.m8}' in lines
 
 
 def test_week_summary_is_the_hand_computed_one(project, capsys) -> None:
