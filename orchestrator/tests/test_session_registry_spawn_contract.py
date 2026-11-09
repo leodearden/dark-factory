@@ -1,4 +1,4 @@
-"""The registry half of the /spawn contract: the result-handback outcome vocabulary and the self-exit input."""
+"""The registry half of the /spawn contract: the result-handback outcome vocabulary and the end-of-work inputs."""
 
 from __future__ import annotations
 
@@ -41,10 +41,16 @@ class TestResultOutcomeVocabulary:
 
 
 def _launch(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fleet_root: Path, self_exit: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fleet_root: Path,
+    self_exit: object = _UNSET,
+    *,
+    t3_end: object = _UNSET,
 ) -> tuple[str, sr.SessionRecord]:
     """Run the ``launching`` verb as spawn-claude.sh does; return the printed record dir and the record."""
     monkeypatch.delenv('CLAUDE_SPAWN_SELF_EXIT', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_T3_END', raising=False)
     launcher_pid = os.getpid()
     env = {
         'CLAUDE_FLEET_ROOT': str(fleet_root),
@@ -58,6 +64,8 @@ def _launch(
     }
     if self_exit is not _UNSET:
         env['CLAUDE_SPAWN_SELF_EXIT'] = str(self_exit)
+    if t3_end is not _UNSET:
+        env['CLAUDE_SPAWN_T3_END'] = str(t3_end)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     assert sr.main(['launching']) == 0
@@ -100,6 +108,73 @@ class TestSelfExitField:
         data['self_exit'] = stored
 
         assert sr.SessionRecord.from_dict(data).self_exit is expected
+
+
+class TestT3EndInput:
+    @pytest.mark.parametrize(('value', 'expected'), [
+        ('settle', sr.T3End.SETTLE), ('archive', sr.T3End.ARCHIVE), ('', None), ('none', None), (_UNSET, None),
+    ])
+    def test_the_input_stamps_the_end_of_work_act(self, monkeypatch, capsys, tmp_path, value, expected):
+        _, record = _launch(monkeypatch, capsys, tmp_path, t3_end=value)
+
+        assert record.t3_end is expected
+
+    @pytest.mark.parametrize('value', ['Archive', 'exit'])
+    def test_an_unknown_value_writes_no_record_and_names_itself(self, monkeypatch, capsys, caplog, tmp_path, value):
+        monkeypatch.delenv('CLAUDE_SPAWN_SELF_EXIT', raising=False)
+        for key, setting in {
+            'CLAUDE_FLEET_ROOT': str(tmp_path),
+            'CLAUDE_SPAWN_ROLE': 'prd',
+            'CLAUDE_SPAWN_PROJECT': 'df',
+            'CLAUDE_SPAWN_TASK_ID': '7179',
+            'CLAUDE_SPAWN_TITLE': 'prd:df#7179 S3',
+            'CLAUDE_SPAWN_CWD': str(tmp_path),
+            'CLAUDE_SPAWN_LAUNCHER_PID': str(os.getpid()),
+            'CLAUDE_SPAWN_T3_END': value,
+        }.items():
+            monkeypatch.setenv(key, setting)
+
+        assert sr.main(['launching']) == 0
+
+        assert not list(tmp_path.glob('sessions/*/record.json'))
+        assert capsys.readouterr().out == ''
+        assert 'CLAUDE_SPAWN_T3_END' in caplog.text
+        assert repr(value) in caplog.text
+
+    def test_t3_end_survives_the_exit_read_modify_write(self, monkeypatch, capsys, tmp_path):
+        record_dir, launched = _launch(monkeypatch, capsys, tmp_path, t3_end='archive')
+
+        assert sr.main(['exit', '--record', record_dir, '--code', '0']) == 0
+
+        exited = sr.read_record(launched.session_slug, root=tmp_path)
+        assert exited.status == sr.Status.EXITED
+        assert exited.exit_code == 0
+        assert exited.t3_end is sr.T3End.ARCHIVE
+
+
+class TestT3EndField:
+    def test_defaults_to_no_act(self):
+        assert sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING).t3_end is None
+
+    def test_a_record_written_before_the_field_existed_reads_none(self):
+        assert sr.SessionRecord.from_dict({'session_slug': 's', 'status': 'launching'}).t3_end is None
+
+    @pytest.mark.parametrize(('act', 'wire'), [(sr.T3End.SETTLE, 'settle'), (sr.T3End.ARCHIVE, 'archive'), (None, None)])
+    def test_is_stored_as_its_wire_string(self, act, wire):
+        stored = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING, t3_end=act).to_dict()['t3_end']
+
+        assert stored == wire
+        assert type(stored) is type(wire)
+
+    @pytest.mark.parametrize(('stored', 'expected'), [
+        ('settle', sr.T3End.SETTLE), ('archive', sr.T3End.ARCHIVE),
+        ('none', None), ('Settle', None), (1, None), (True, None), ({}, None),
+    ])
+    def test_only_a_member_wire_string_reads_back_as_an_act(self, stored, expected):
+        data = sr.SessionRecord(session_slug='s', status=sr.Status.EXITED).to_dict()
+        data['t3_end'] = stored
+
+        assert sr.SessionRecord.from_dict(data).t3_end is expected
 
 
 _AT = '2026-10-23T00:00:00+00:00'
