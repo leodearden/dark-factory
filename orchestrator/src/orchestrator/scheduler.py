@@ -2768,8 +2768,10 @@ class Scheduler:
             return TaskReadFailed(f'get_task dispatch raised {type(e).__name__}: {e}')
         read = parse_get_task_result(result)
         if isinstance(read, TaskFound):
-            self._normalize_task_metadata(read.task)
-        elif isinstance(read, TaskAbsent):
+            task = dict(read.task)
+            self._normalize_task_metadata(task)
+            return TaskFound(task)
+        if isinstance(read, TaskAbsent):
             logger.info('get_task(%s): fused-memory reports no such task', task_id)
         else:
             logger.warning('get_task(%s): could not read the task: %.300s', task_id, read.reason)

@@ -103,7 +103,7 @@ def _scheduler(tmp_path: Path, session: _GetTaskReplySession) -> Scheduler:
     ],
     ids=['task-not-found', 'invalid-task-id', 'server-backstop', 'bad-project-root'],
 )
-async def test_error_reply_is_absence_not_a_task_row(
+async def test_get_task_answers_none_for_any_error_reply(
     tmp_path: Path, envelope, task_id: str, payload: dict,
 ) -> None:
     session = _GetTaskReplySession(envelope(payload))
@@ -238,6 +238,18 @@ async def test_read_task_finds_a_row_with_metadata_normalised(tmp_path: Path) ->
 
     assert isinstance(read, TaskFound)
     assert read.task['metadata'] == {'files': ['a.py']}
+
+
+@pytest.mark.asyncio
+async def test_read_task_normalises_a_copy_and_leaves_the_reply_as_sent(tmp_path: Path) -> None:
+    reply = _structured_and_text(dict(WELL_FORMED_ROW))
+    scheduler = _scheduler(tmp_path, _GetTaskReplySession(reply))
+
+    read = await scheduler.read_task('42')
+
+    assert isinstance(read, TaskFound)
+    assert read.task['metadata'] == {'files': ['a.py']}
+    assert reply['structuredContent']['metadata'] == '{"files": ["a.py"]}'
 
 
 @pytest.mark.asyncio
