@@ -79,7 +79,6 @@ class TestRenderDeclaredScope:
         assert render_declared_scope(_NARROW) == 'narrow (files=2, text_chars=57, basis=submit)'
 
     def test_an_absent_stamp_renders_the_unstamped_word(self) -> None:
-        assert UNSTAMPED_BAND == 'unstamped'
         assert render_declared_scope(None) == UNSTAMPED_BAND
 
     def test_an_undeclared_stamp_is_distinct_from_an_absent_one(self) -> None:

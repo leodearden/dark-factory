@@ -237,9 +237,10 @@ class TestCombineEligibilityNoDivergence:
 
     Scope is deliberately narrow: these assertions drive
     ``_to_pool_entry`` and say nothing about the interceptor. Because
-    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
-    fail only if that call is deleted or re-forked into a second literal —
-    which is exactly the selection-side half of the 20.2% race.
+    ``_to_pool_entry`` reaches ``is_combine_eligible_status`` through
+    ``curator_types.is_combine_eligible``, they fail only if that route is
+    deleted or re-forked into a second literal — which is exactly the
+    selection-side half of the 20.2% race.
 
     The EXECUTION site (``task_interceptor._execute_combine``, the half that
     actually diverged and caused the incident) cannot be covered from here;
