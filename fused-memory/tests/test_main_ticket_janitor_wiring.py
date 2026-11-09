@@ -47,7 +47,7 @@ class _DeferThenHoldCurator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self._defer_next:
@@ -59,11 +59,6 @@ class _DeferThenHoldCurator:
 
     async def close(self) -> None:
         return None
-
-
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest.fixture

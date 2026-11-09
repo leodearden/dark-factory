@@ -16,7 +16,7 @@
 // destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope with no
 // fallback, and datum.js in turn destructures window.DF_ENDPOINT_STALENESS. So
 // the shim goes in first and the chain is required through it —
-// prd_grouping.test.mjs::loadPrdGrouping has the same shape.
+// prd_lanes_view.test.mjs::loadPrdLanesView has the same shape.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -43,7 +43,6 @@ const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShar
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
 const { terminalSelectingProjects, createTerminalWindowHooks } = snapshot;
-const { sameDatum } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH, servedDatum } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
@@ -65,7 +64,6 @@ const EXPECTED_FUNCTION_NAMES = [
   'terminalWindowEntrants',
   'terminalSelectingProjects',
   'createTerminalWindowHooks',
-  'sameDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -610,46 +608,6 @@ test('projectRows: an absent project or rows half is a reasoned hole', () => {
   assert.ok(noRows.reason);
 });
 
-// ── sameDatum: a fresh stamped copy against the Datum a caller holds ───────
-// projectRows stamps a new object on every call, so a render-to-render memo
-// cannot key on its identity. sameDatum says whether the copy would render
-// exactly as the held one: every field identical, the value by reference.
-
-test('sameDatum: two reads of one payload are distinct objects that are the same Datum', () => {
-  const data = sketchData();
-  const first = projectRows(data, 'dark-factory');
-  const second = projectRows(data, 'dark-factory');
-  assert.notEqual(first, second);
-  assert.equal(sameDatum(first, second), true);
-});
-
-test('sameDatum: a new payload is a different Datum, even with equal rows', () => {
-  const before = projectRows(sketchData(), 'dark-factory');
-  const reshipped = sketchData({
-    TASKS_SNAPSHOT: { 'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), structuredClone(FRESH_ROWS)) },
-  });
-  assert.equal(sameDatum(before, projectRows(reshipped, 'dark-factory')), false);
-});
-
-test('sameDatum: a new receipt over the same rows is a different Datum, so its age is re-read', () => {
-  const before = projectRows(sketchData(), 'dark-factory');
-  const later = sketchData({ __receipt: { [TASKS_ENDPOINT]: { servedAt: SERVED_AT, receivedAt: RECEIVED_AT + 3_000 } } });
-  assert.equal(sameDatum(before, projectRows(later, 'dark-factory')), false);
-});
-
-test('sameDatum: holes are the same while their reason is', () => {
-  const hole = () => projectRows(sketchData(), 'hive');
-  assert.equal(sameDatum(hole(), hole()), true);
-  assert.equal(sameDatum(hole(), unrequestedTerminalRows(undefined)), false);
-  assert.equal(sameDatum(unrequestedTerminalRows(undefined), unrequestedTerminalRows(undefined)), true);
-});
-
-test('sameDatum: a stamped copy is not the same Datum as its unstamped wire original', () => {
-  const data = sketchData();
-  assert.equal(sameDatum(data.TASKS_SNAPSHOT['dark-factory'].rows, projectRows(data, 'dark-factory')), false);
-  assert.equal(sameDatum(projectRows(data, 'dark-factory'), data.TASKS_SNAPSHOT['dark-factory'].rows), false);
-});
-
 // One row per non-terminal member — including the three the old filter bar
 // silently dropped (review, merge-deferred, infra-hold).
 const SNAPSHOT_ROWS = [
@@ -850,40 +808,22 @@ test('EVERY_VIEW: one row per status member is listed — review and infra-hold 
 
 const PROJECT_IDS = ['dark-factory', 'reify', 'hive'];
 
-test('terminalWindowProjects: the terminal view requests every project, in project order', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, []), PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['hive']), PROJECT_IDS);
+test('terminalWindowProjects: the terminal view requests every visible project, in project order', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }), PROJECT_IDS);
 });
 
-test('terminalWindowProjects: without the terminal view, only PRD-grouped projects request it', () => {
-  const filter = { in_flight: true, backlog: true, terminal: false };
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, filter, ['hive', 'dark-factory']), ['dark-factory', 'hive']);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify']), ['reify']);
-});
-
-test('terminalWindowProjects: a grouped id that is not a visible project is ignored', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['elsewhere', 'reify']), ['reify']);
-});
-
-test('terminalWindowProjects: nothing selected and nothing grouped requests nothing', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, []), []);
-  assert.deepEqual(terminalWindowProjects([], { terminal: true }, ['reify']), []);
-});
-
-test('terminalWindowProjects: each project is requested once', () => {
-  const wanted = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify', 'reify']);
-  assert.deepEqual(wanted, PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify', 'reify']), ['reify']);
+test('terminalWindowProjects: without the terminal view nothing requests it, the by-PRD lanes included', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { in_flight: true, backlog: true, terminal: false }), []);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}), []);
+  assert.deepEqual(terminalWindowProjects([], { terminal: true }), []);
 });
 
 test('terminalWindowProjects: its inputs are not mutated', () => {
   const projectIds = PROJECT_IDS.slice();
-  const filter = { terminal: false };
-  const grouped = ['hive', 'reify'];
-  terminalWindowProjects(projectIds, filter, grouped);
+  const filter = { terminal: true };
+  terminalWindowProjects(projectIds, filter);
   assert.deepEqual(projectIds, PROJECT_IDS);
-  assert.deepEqual(filter, { terminal: false });
-  assert.deepEqual(grouped, ['hive', 'reify']);
+  assert.deepEqual(filter, { terminal: true });
 });
 
 // ── terminalWindowEntrants: which wanted projects a request is owed ────────
@@ -901,16 +841,17 @@ test('terminalWindowEntrants: the first wanted set is requested whole, in its ow
 });
 
 test('terminalWindowEntrants: a project that left the set is requested again when it re-enters', () => {
-  const before = terminalWindowProjects(PROJECT_IDS, {}, ['hive']);
-  const left = terminalWindowProjects(PROJECT_IDS, {}, []);
+  const before = terminalWindowProjects(['dark-factory', 'hive'], { terminal: true });
+  const left = terminalWindowProjects(['dark-factory'], { terminal: true });
   assert.deepEqual(terminalWindowEntrants(before, left), []);
   assert.deepEqual(terminalWindowEntrants(left, before), ['hive']);
 });
 
-test('terminalWindowEntrants: toggling the terminal view on requests only the projects not yet grouped', () => {
-  const grouped = terminalWindowProjects(PROJECT_IDS, { terminal: false }, ['reify']);
-  const everything = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify']);
-  assert.deepEqual(terminalWindowEntrants(grouped, everything), ['dark-factory', 'hive']);
+test('terminalWindowEntrants: toggling the terminal view on requests every visible project, once', () => {
+  const off = terminalWindowProjects(PROJECT_IDS, { terminal: false });
+  const on = terminalWindowProjects(PROJECT_IDS, { terminal: true });
+  assert.deepEqual(terminalWindowEntrants(off, on), PROJECT_IDS);
+  assert.deepEqual(terminalWindowEntrants(on, on), []);
 });
 
 test('terminalWindowEntrants: its inputs are not mutated', () => {

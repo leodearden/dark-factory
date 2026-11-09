@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from _pending_tool_fixtures import _file
+from _tool_calls import call_tool
 
 from escalation.amendments import (
     MAX_AMENDMENT_DETAIL_CHARS,
@@ -303,14 +304,7 @@ class TestQueueAmend:
 
 
 async def _amend(server, **kw: Any) -> dict[str, Any]:
-    """``amend_escalation`` is an ASYNC tool: it awaits the storm reporter."""
-    tool = await server.get_tool('amend_escalation')
-    return await tool.fn(**kw)
-
-
-async def _sync_tool(server, name: str, **kw: Any) -> dict[str, Any]:
-    tool = await server.get_tool(name)
-    return tool.fn(**kw)
+    return await call_tool(server, 'amend_escalation', **kw)
 
 
 class _AmendThreadProbeQueue(EscalationQueue):
@@ -336,11 +330,11 @@ class TestAmendEscalationTool:
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = _framed_l2(queue)
         server = create_server(queue, startup_sweep=False)
-        triaged = await _sync_tool(
+        triaged = await call_tool(
             server, 'stamp_triage', escalation_id=l2.id, triage_note='probe',
         )
         assert 'error' not in triaged
-        before = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+        before = await call_tool(server, 'get_escalation', escalation_id=l2.id)
 
         response = await _amend(
             server, escalation_id=l2.id,
@@ -351,7 +345,7 @@ class TestAmendEscalationTool:
 
         assert response['amendment_recorded'] is True
         assert 'no_op_reason' not in response
-        after = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+        after = await call_tool(server, 'get_escalation', escalation_id=l2.id)
         assert {k: v for k, v in response.items() if k != 'amendment_recorded'} == after, (
             'the success response is the full amended record'
         )

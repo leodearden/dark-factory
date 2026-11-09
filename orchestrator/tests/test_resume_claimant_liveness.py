@@ -54,8 +54,8 @@ from escalation.queue import EscalationQueue
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.scheduler import ModuleLockTable
 
 # ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
 # ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in

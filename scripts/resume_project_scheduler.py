@@ -119,7 +119,7 @@ def resume(url: str, reason: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--url", required=True, help="the project's escalation MCP endpoint, e.g. http://127.0.0.1:8100/mcp")
     parser.add_argument("--reason", required=True, help="audit reason recorded on the scheduler_resumed event")
     args = parser.parse_args(argv)

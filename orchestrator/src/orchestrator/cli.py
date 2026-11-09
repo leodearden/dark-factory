@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 import click
 from dotenv import load_dotenv
 from shared.project_layout import runs_db, tasks_db
+from shared.spawn_temp_files import sweep_orphaned_spawn_temp_files
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
@@ -274,8 +275,18 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             err=True,
         )
         sys.exit(1)
-    harness = Harness(config, deployed_sha=deployed_sha)
     logger = logging.getLogger(__name__)
+    # Process start, before this process spawns any agent; the sweep is host-wide, so it
+    # also reclaims fused-memory's and scripts' orphans. See
+    # shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files.
+    try:
+        sweep_orphaned_spawn_temp_files()
+    except Exception:
+        logger.warning(
+            'Startup sweep of orphaned agent-spawn temp files failed (non-fatal, startup continues)',
+            exc_info=True,
+        )
+    harness = Harness(config, deployed_sha=deployed_sha)
 
     async def _main():
         # Route SIGTERM/SIGINT through asyncio so CancelledError flows into
@@ -1577,10 +1588,10 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.measurement import format_invocation_errors
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
-        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import run_architect_eval, run_eval
@@ -1755,11 +1766,13 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
-    from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.composite_report import (
         build_composite_report,
-        build_plan_quality_report,
         format_composite_table,
+    )
+    from orchestrator.evals.metrics import RoleUnderTest
+    from orchestrator.evals.plan_quality_report import (
+        build_plan_quality_report,
         format_plan_quality_table,
     )
 

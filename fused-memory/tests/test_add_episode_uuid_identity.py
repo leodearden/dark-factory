@@ -48,10 +48,13 @@ import contextlib
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 from _fm_helpers import (
@@ -62,7 +65,12 @@ from _fm_helpers import (
 )
 from _graphiti_fake import FakeGraphitiClient
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    GraphitiBackend,
+    build_embedder,
+    build_llm_client,
+)
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
@@ -780,6 +788,11 @@ class TestPlanningEpisodeIsFilteredFromSearch:
 #
 # Deselected by default (pyproject.toml's `-m 'not integration'`), so it
 # burdens neither CI nor a routine local run with OPENAI credits.
+#
+# Its config helper `_live_config` lives here too, with a hermetic guard over
+# that helper. The guard is neither live nor deselected: it runs in every
+# default suite, and is the in-pipeline evidence that the live test builds
+# graphiti's clients from config.
 # ---------------------------------------------------------------------------
 
 _LIVE_CONTENT = 'Task 3561 fixed the self-referential add_episode NodeNotFoundError.'
@@ -821,6 +834,152 @@ async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int,
         await client.aclose()
 
 
+def _live_config(base: FusedMemoryConfig, api_key: str) -> FusedMemoryConfig:
+    """Point *base* at the live FalkorDB with *api_key* on both OpenAI providers.
+
+    Production config.yaml sets ``api_key: ${OPENAI_API_KEY}`` on both.
+    """
+    config = base.model_copy(deep=True)
+    # Keyless, Graphiti substitutes graphiti_core's default clients (deprecated small
+    # model gpt-4.1-nano); see test_the_live_config_runs_graphiti_on_the_configured_clients.
+    llm_provider = config.llm.providers.openai
+    embedder_provider = config.embedder.providers.openai
+    assert llm_provider is not None and embedder_provider is not None, (
+        'base config must carry openai provider blocks for both llm and embedder; '
+        '_live_config sets api_key on both'
+    )
+    llm_provider.api_key = api_key
+    embedder_provider.api_key = api_key
+    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    return config
+
+
+def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config):
+    api_key = 'sk-hermetic-not-a-real-key'
+    config = _live_config(mock_config, api_key)
+
+    llm = build_llm_client(config)
+    assert llm is not None, (
+        'build_llm_client returned None, so graphiti_core.Graphiti substitutes '
+        'its default OpenAIClient(), whose small model is the hard-coded '
+        'gpt-4.1-nano (now 404 model_not_found, task 8072), not llm.model.'
+    )
+    assert (llm.model, llm.small_model, llm.config.api_key) == (
+        config.llm.model,
+        config.llm.model,
+        api_key,
+    )
+
+    embedder = build_embedder(config)
+    assert embedder is not None
+    assert (
+        embedder.config.embedding_model,
+        embedder.config.embedding_dim,
+        embedder.config.api_key,
+    ) == (config.embedder.model, config.embedder.dimensions, api_key)
+
+
+def _unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
+    """The skip reason when *exc* shows the provider's connect phase timed out
+    before any response; None for every other failure.
+    """
+    cause = exc.__cause__
+    if not (isinstance(exc, openai.APIConnectionError) and isinstance(cause, httpx.ConnectTimeout)):
+        return None
+    return (
+        f'{exc.request.url.host} was not reached: {type(cause).__name__} before any '
+        f'response, so no episode write was observed; a lasting outage is '
+        f"scripts/lane_dependency_probe.py's to report"
+    )
+
+
+_T = TypeVar('_T')
+
+
+async def _skip_if_provider_unreached(write: Awaitable[_T]) -> _T:
+    """Await *write*, skipping the test only when the provider was never reached."""
+    try:
+        return await write
+    except openai.APIError as exc:
+        if (reason := _unreached_provider_skip_reason(exc)) is None:
+            raise
+        pytest.skip(reason)
+
+
+async def _sdk_call(handler: Callable[[httpx.Request], httpx.Response]) -> None:
+    """Make one real SDK call over *handler*."""
+    async with openai.AsyncOpenAI(
+        api_key='sk-hermetic-not-a-real-key',
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        await client.chat.completions.create(
+            model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
+        )
+
+
+async def _raised_by(awaitable: Awaitable[object]) -> BaseException:
+    """What awaiting *awaitable* raised, a skip included: a skip is no Exception,
+    so pytest.raises would pass it through and report the guard skipped, not red.
+    """
+    try:
+        await awaitable
+    except (Exception, pytest.skip.Exception) as raised:
+        return raised
+    pytest.fail('the awaited call raised nothing')
+
+
+def _connect_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectTimeout('timed out', request=request)
+
+
+def _connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError('[Errno -3] Temporary failure in name resolution', request=request)
+
+
+def _read_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout('timed out', request=request)
+
+
+def _model_not_found(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        404,
+        json={
+            'error': {
+                'message': 'The model `gpt-4.1-nano` has been deprecated',
+                'type': 'invalid_request_error',
+                'param': None,
+                'code': 'model_not_found',
+            }
+        },
+        request=request,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_connect_timeout_skips_the_live_write():
+    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(_connect_timeout)))
+
+    assert isinstance(raised, pytest.skip.Exception), raised
+    assert 'api.openai.com' in str(raised)
+    assert 'ConnectTimeout' in str(raised)
+
+
+@pytest.mark.parametrize(
+    'handler',
+    [
+        pytest.param(_connect_error, id='connect-error'),
+        pytest.param(_read_timeout, id='read-timeout'),
+        pytest.param(_model_not_found, id='model-not-found'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_provider_failure_other_than_a_connect_timeout_stays_red(handler):
+    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(handler)))
+
+    assert isinstance(raised, openai.APIError), raised
+
+
 @falkor_skipif()
 @pytest.mark.integration
 @pytest.mark.skipif(
@@ -850,14 +1009,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     graph_name = unique_graph_name('3561_episode_uuid')
 
-    config = mock_config.model_copy(deep=True)
-    # mock_config's api_keys are the literal string 'test-key'. Clearing them
-    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
-    # the idiom test_recon_dedup_premise.py:130-133 established for the two
-    # tests in this suite that need real embeddings.
-    config.llm.providers.openai.api_key = None
-    config.embedder.providers.openai.api_key = None
-    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    config = _live_config(mock_config, os.environ['OPENAI_API_KEY'])
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default
@@ -880,8 +1032,8 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
-        result = await svc._execute_graphiti_write(
-            'add_episode', _enqueued_payload(svc)
+        result = await _skip_if_provider_unreached(
+            svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
         )
 
         real_uuid = result.episode.uuid

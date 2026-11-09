@@ -8,12 +8,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from shared.briefing_queries import BriefingScope
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
+from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
@@ -22,9 +25,34 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
 logger = logging.getLogger(__name__)
+
+IMPLEMENTER_ACTIONS: Mapping[ImplementerBriefVariant, str] = MappingProxyType({
+    ImplementerBriefVariant.WHOLE_PLAN: (
+        'Execute the next pending steps in TDD order. Commit after each step. '
+        'Call `mark_step_done(step_id, commit_sha)` to record progress. '
+        'Stop at a logical boundary.'
+    ),
+    ImplementerBriefVariant.ONE_STEP: (
+        'One-step mode: complete exactly ONE plan step this session — the next '
+        'pending item in `.task/plan.json`, prerequisites first, then steps. Do it '
+        'in TDD order, commit, call `mark_step_done(step_id, commit_sha)`, then '
+        'stop, even if more steps are pending; the orchestrator re-invokes you for '
+        'the next step.'
+    ),
+})
+"""The implementer brief's Action paragraph per ``config.implementer_brief_variant``."""
+
+
+def _implementer_action(variant: ImplementerBriefVariant) -> str:
+    """The Action paragraph *variant* selects, by the :func:`is_one_step` rule the cap and the bounds also use."""
+    return IMPLEMENTER_ACTIONS[
+        ImplementerBriefVariant.ONE_STEP if is_one_step(variant) else ImplementerBriefVariant.WHOLE_PLAN
+    ]
+
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
@@ -278,6 +306,42 @@ def _delivered_check_field(check: dict, name: str) -> str:
     else:
         items = [value]
     return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
+
+
+_FOLLOWUP_ITEMS_HEADING = f'## Follow-up Items (metadata.{FOLLOWUP_ITEMS_METADATA_KEY})'
+
+
+def _format_followup_items(raw: object) -> str:
+    """Render the task's follow-up items numbered (plans/follow-up-filing-shape-prd.md decision 1).
+
+    Fails open like :func:`_format_delivered_checks`: '' when absent, malformed entries counted visibly.
+    """
+    if not raw:
+        return ''
+    if not isinstance(raw, list):
+        return (
+            f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
+            f'⚠ `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` is malformed (a {type(raw).__name__}, not a '
+            'list), so its observations cannot be shown here; read them from the task record.'
+        )
+    items = [item for item in map(parse_item, raw) if item is not None]
+    lines = [
+        f'{number}. {item.summary} — files: {", ".join(item.files)} (observed in task {item.origin_task})'
+        for number, item in enumerate(items, start=1)
+    ]
+    malformed = len(raw) - len(items)
+    if malformed:
+        noun = 'entry' if malformed == 1 else 'entries'
+        lines.append(
+            f'⚠ {malformed} malformed {noun} on `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` could not be '
+            'rendered here; read the full list from the task record.'
+        )
+    numbered = '\n'.join(lines)
+    return (
+        f'{_FOLLOWUP_ITEMS_HEADING}\n\n'
+        'Each numbered item is one observation this task was filed to address; the plan must '
+        f'cover every one.\n\n{numbered}'
+    )
 
 
 def _caller_agent_id(task_id: str | None, role: str) -> str:
@@ -810,8 +874,7 @@ triage it.
 
 # Plan Schema Repair
 
-The plan for this task is on disk at `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+The plan for this task is on disk at `.task/plan.json`, but it has no
 non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
 here — read the file in full.
 
@@ -859,9 +922,8 @@ The implementation was reviewed and blocking issues were found.
 
 ## Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
-   and each step's status — it is not reproduced here.
+1. Read `.task/plan.json` for the current plan and each step's status — it
+   is not reproduced here.
 2. Add the steps that address the blocking issues with
    `add_plan_step(step_id, step_type, description)`, using step ids not
    already in the plan. New steps are recorded as pending.
@@ -955,7 +1017,9 @@ suggestions-only on this exact tree — call
         string is the one that can lie, because the retry ladder replays an
         assembled prompt verbatim into a fresh session
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
-        orchestrator/tests/test_briefing_progress_spot.py.
+        orchestrator/tests/test_briefing_progress_spot.py. The Action paragraph
+        follows config.implementer_brief_variant and, for the same reason, names
+        no step id.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1034,14 +1098,9 @@ Before writing any new code, walk the pending steps in plan order:
 {wip_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status — it is a
-   symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the
-   worktree-lane-lifecycle W11 relocation keeps plan/iteration state outside
-   the worktree for pooled lanes, and the symlink survives worktree resets),
-   so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to see prior iteration details.
+1. Read `.task/plan.json` to see the full plan with current status.
+2. Read `.task/iterations.jsonl` to see prior iteration details (absent until
+   the first iteration is logged).
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
 5. **Mandatory pre-flight — before writing any code for that step:** run
@@ -1058,7 +1117,7 @@ Before writing any new code, walk the pending steps in plan order:
 
 # Action
 
-Execute the next pending steps in TDD order. Commit after each step. Call `mark_step_done(step_id, commit_sha)` to record progress. Stop at a logical boundary.
+{_implementer_action(self.config.implementer_brief_variant)}
 """
 
     async def build_amender_prompt(
@@ -1147,9 +1206,7 @@ This task holds locks for the following modules:
    collide with another task's concurrent edits. Where the entries above are
    themselves single files, a new file is necessarily outside that list —
    that is expected, and not something to escalate.
-2. Do NOT modify the plan — it is durable at
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
-   `.task/plan.json` is a symlink into it) and frozen for this pass.
+2. Do NOT modify the plan (`.task/plan.json`) — it is frozen for this pass.
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
@@ -1162,11 +1219,8 @@ This task holds locks for the following modules:
 
 # Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-   worktree resets) and
-   `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to refresh context on what was already done.
+1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
+   what was already done.
 2. Run `git log --oneline -10` to see recent commits.
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
@@ -1414,11 +1468,9 @@ This task was paused because an agent escalated a blocking issue.
 ## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
-is preserved in the worktree. Read `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-worktree resets) and `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
-(NOT symlinked into the lane) to understand current progress, then continue
-from where the previous agent left off.
+is preserved in the worktree. Read `.task/plan.json` and
+`.task/iterations.jsonl` to understand current progress, then continue from
+where the previous agent left off.
 """
 
     async def build_steward_initial_prompt(
@@ -1445,6 +1497,10 @@ from where the previous agent left off.
             )
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
+        already_merged = already_merged_step(
+            LandedShaSearches.for_task(str(task.get('id', '?')), self.config.git),
+        )
+
         return f"""\
 {preamble}
 
@@ -1461,7 +1517,7 @@ from where the previous agent left off.
 # Action
 
 1. Understand the escalation and the task context.
-2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree; `git log --oneline main | head -20` is a sanity glance ONLY — never read a sha off it for `done_provenance`, per `skills/_shared/deriving-landed-sha.md`'s "never from HEAD or an eyeballed listing" rule). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **`done_provenance` must always include `kind`**: pass `done_provenance={{"kind": "found_on_main", "commit": "<landing-sha-on-main>", "note": "<one-sentence explanation>"}}` (both `commit` and `note` are required for this kind — there is no commit-less fallback), e.g. note "covered by sibling task" or "already merged prior to this session". If there is no distinct merge commit to cite (e.g. a fast-forward merge, or work covered by a sibling task), do **not** use the branch's own tip commit SHA — `git merge-base --is-ancestor` passes trivially for a branch that never advanced, whose tip is `main`'s own OLD base commit and carries none of this task's work. Cite instead the commit on `main` that actually carries or cites the work (this branch's own commit whose subject cites the task, or the sibling's landing commit), and record the branch tip in `note` (e.g. "landing confirmed by task citation on main; no separate merge commit (branch tip <tip-sha>)"). Derive that sha with the citation gate — `git log main --extended-regexp --format='%H %s' --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\\(\\b<TASK_ID>\\b[):]|.*\\btask/<TASK_ID>\\b)|^Merge task/<TASK_ID> into |\\(#?<TASK_ID>\\)|\\(task <TASK_ID>\\)'` — walking the rows most-recent-first and taking the first whose **subject** (the `%s` field) cites the task: `--grep` matches the whole message, so a body line can match spuriously. Prefer, among the rows that qualify, one whose diff touches this task's declared `metadata.files`. `skills/_shared/deriving-landed-sha.md`'s step-4 citation gate is the full ladder, including the case where NO row cites the task — that is a phantom branch, not a landing, so do not stamp anything and report it as not-landed instead. `escalation/src/escalation/server.py::_found_on_main_response` resolves the same question the same way — task 3103 changed its live-branch path from the branch tip to the citation commit for exactly this reason. If the landing commit came from this session calling `merge_request`, use `done_provenance={{"kind": "merged", "commit": "<merge-sha>"}}` instead. Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+2. {already_merged}
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.
@@ -1621,6 +1677,9 @@ A prior block-time investigation concluded the following; verify against the cur
 
         The descriptor contract itself lives in ``docs/task-authoring.md`` §3.3
         — pointed at, never restated (INV-9).
+
+        Then appends ``metadata.followup_items`` via :func:`_format_followup_items`, also exempt
+        from ``include_files=False``: the items are the task's charter, not a footprint guess.
         """
         metadata = task.get('metadata') or {}
         lines = []
@@ -1641,5 +1700,9 @@ A prior block-time investigation concluded the following; verify against the cur
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
         body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
-        checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
-        return f'{body}\n\n{checks_block}' if checks_block else body
+        blocks = (
+            body,
+            _format_delivered_checks(metadata.get('delivered_checks')),
+            _format_followup_items(metadata.get(FOLLOWUP_ITEMS_METADATA_KEY)),
+        )
+        return '\n\n'.join(block for block in blocks if block)

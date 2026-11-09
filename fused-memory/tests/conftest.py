@@ -92,6 +92,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     arm_leaked_drain_process_guard,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -110,15 +111,21 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, the drain-leak guard, async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
     module import time are tracked too and can be reaped like any other
     (task 4412).
+
+    ``shared.usage_gate`` is imported here because a module-level import after
+    this file's ``sys.path`` setup would need a new ``E402`` suppression.
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
 
 
@@ -304,6 +311,27 @@ def _no_inherited_project_registry(monkeypatch):
     never the launching checkout.
     """
     monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fm_data_dir(monkeypatch, tmp_path):
+    """Pin ``DARK_FACTORY_DATA_DIR`` at this test's ``tmp_path / 'data'`` (task 6456).
+
+    Unpinned, ``fused_memory.middleware.task_interceptor::_combine_audit_path``
+    appends every curator combine to ``<CWD>/data/combine_audit.jsonl``; run
+    from the repo root that is the live service's own audit file, since the
+    service's ``WorkingDirectory`` is the repo root.
+
+    Separate from ``_isolate_fm_config`` because this variable is a
+    module-level ``os.getenv``, not a config leaf.  The ``tmp_path / 'data'``
+    layout mirrors a deployment rooted at ``tmp_path``, which is where
+    ``_isolate_fm_config`` puts ``PROJECT_ROOT``.  ``setenv`` overwrites an
+    inherited value; a test-body ``setenv`` still wins, as
+    ``test_task_interceptor.py::audit_dir`` relies on.  See
+    ``test_data_dir_hermeticity.py`` and
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+    """
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest.fixture
@@ -823,6 +851,11 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
     it on, every decision write in a unit test would reach the real overreach
     judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -855,6 +888,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     )
     config.write_triage.enabled = False
     config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
     return config
 
 

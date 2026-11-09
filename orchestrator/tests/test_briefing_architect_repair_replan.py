@@ -22,7 +22,7 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
-from test_roles_ancestry_check import _tool_is_granted
+from _roles_helpers import tool_is_granted
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ARCHITECT
@@ -157,7 +157,7 @@ class TestArchitectPassToolContract:
         granted = set(ARCHITECT.allowed_tools)
         missing = sorted(
             qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
-            if not _tool_is_granted(qualified, granted)
+            if not tool_is_granted(qualified, granted)
         )
         assert not missing, f'prescribed plan tools absent from ARCHITECT.allowed_tools: {missing}'
 

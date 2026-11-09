@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import poll_until_dead
 from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,
@@ -74,32 +74,6 @@ class TestGetQueueStatsProjectScoping:
 # ── step-3: real-queue acceptance test ──────────────────────────────────────
 
 
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 20.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items have status='dead'.
-
-    Mirrors the helper in test_durable_queue.py: avoids a fixed wall-clock
-    sleep, which was a source of flakiness under xdist load.
-    """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        stats = await q.get_stats(group_id=group_id)
-        if stats['counts'].get('dead', 0) >= expected_dead:
-            return
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise AssertionError(
-                f'Timed out waiting for {expected_dead} dead item(s) '
-                f'(group_id={group_id!r}); last counts={stats["counts"]}'
-            )
-        await asyncio.sleep(0.05)
-
-
 class TestGetQueueStatsConsistencyWithDeadLetters:
     """Reproduces the reported symptom: get_queue_stats' dead count must agree
     with get_dead_letters for the same project, against a real durable queue.
@@ -136,7 +110,7 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
                 group_id='proj_b', operation='add_episode',
                 payload={'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'},
             )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q
@@ -266,7 +240,7 @@ class TestGetQueueStatsDeadByOperation:
                 group_id='proj_b', operation='add_memory_graphiti',
                 payload={'content': 'b0', 'group_id': 'proj_b'},
             )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q

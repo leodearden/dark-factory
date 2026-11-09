@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import json
+import subprocess
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +13,10 @@ import pytest
 from _fm_helpers import (
     _LOADED_SCRIPT_MODULE_NAMES,
     LoopFreedomProbe,
+    _init_git_repo,
+    git_stdout,
+    init_ab_commit_repo,
+    init_merge_history_repo,
     load_script_module,
     submit_and_resolve,
 )
@@ -915,6 +920,65 @@ class TestPollUntil:
 
         with pytest.raises(AssertionError, match='0.05'):
             await poll_until(lambda: False, timeout=0.05, interval=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared poll_until_dead() dead-letter waiter (task 4847)
+# ---------------------------------------------------------------------------
+# One waiter shared by the durable-queue suites. A scripted get_stats stands in
+# for the queue, so these pin call counts and the timeout message only.
+
+class _ScriptedStatsQueue:
+    """Answers get_stats with the next scripted counts; the last entry repeats."""
+
+    def __init__(self, counts_script: list[dict]):
+        self._script = counts_script
+        self.group_ids: list[str | None] = []
+
+    async def get_stats(self, group_id=None):
+        index = min(len(self.group_ids), len(self._script) - 1)
+        self.group_ids.append(group_id)
+        return {'counts': self._script[index]}
+
+
+class TestPollUntilDead:
+    """Unit tests for poll_until_dead(q, *, group_id, expected_dead, timeout)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_once_dead_count_reaches_expected(self):
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'pending': 2}, {'dead': 1, 'pending': 1}, {'dead': 2}])
+
+        await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=5.0)
+
+        assert q.group_ids == ['g1', 'g1', 'g1']
+
+    @pytest.mark.asyncio
+    async def test_timeout_names_expected_count_group_and_last_counts(self):
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'dead': 1, 'retry': 3}])
+
+        with pytest.raises(AssertionError) as exc_info:
+            await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=0.05)
+
+        message = str(exc_info.value)
+        assert 'Timed out waiting for 2 dead item(s)' in message
+        assert "group_id='g1'" in message
+        assert "'retry': 3" in message
+
+    @pytest.mark.asyncio
+    async def test_timeout_reports_latest_snapshot_not_a_merge_of_past_polls(self):
+        """get_stats GROUPs BY status, so a drained status vanishes from counts."""
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'pending': 1}, {'dead': 1}])
+
+        with pytest.raises(AssertionError) as exc_info:
+            await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=0.2)
+
+        assert "last counts={'dead': 1}" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2044,6 +2108,38 @@ class TestAwaitIndexOperational:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('header', 'offending_entry'),
+        [
+            pytest.param([(1, 'label'), (7,), (1, 'status')], (7,), id='short-pair'),
+            pytest.param([(1, 'label'), None, (1, 'status')], None, id='non-sequence'),
+            pytest.param(['label', 'status'], 'label', id='bare-str'),
+        ],
+    )
+    async def test_malformed_header_entry_raises_index_header_error_on_first_query(
+        self, header, offending_entry
+    ):
+        """A header entry that is not a (type, name) pair must fail as the named
+        shape error, not as a raw IndexError/TypeError or a mangled
+        missing-column report.
+        """
+        from _fm_helpers import IndexHeaderError, await_index_operational
+
+        graph = _FakeIndexGraph([_FakeIndexResult(header, [['x', _OPERATIONAL]])])
+
+        with pytest.raises(IndexHeaderError) as excinfo:
+            await await_index_operational(graph, timeout_s=5.0)
+
+        message = str(excinfo.value)
+        assert graph.calls == 1, f'expected a raise on the first query, got {graph.calls}'
+        assert 'not OPERATIONAL' not in message, (
+            f'the header-shape failure must not be dressed up as a timeout: {message!r}'
+        )
+        assert repr(offending_entry) in message, (
+            f'the error must name the entry it saw, {offending_entry!r}: {message!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_never_operational_raises_with_last_seen_statuses(self):
         """An index that never becomes ready raises AssertionError naming its last statuses.
 
@@ -2079,6 +2175,118 @@ class TestAwaitIndexOperational:
 
         with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared real-git repo builders (task 4847)
+# ---------------------------------------------------------------------------
+# Real git repos in tmp_path, read back through git itself, so the commit graph
+# test_stages.py's done-provenance tests rely on is pinned by observation.
+
+class TestGitStdout:
+    """Unit tests for git_stdout(path, *args)."""
+
+    def test_returns_stripped_stdout(self, tmp_path):
+        git_stdout(tmp_path, 'init', '-q')
+
+        assert git_stdout(tmp_path, 'rev-parse', '--is-inside-work-tree') == 'true'
+
+    def test_nonzero_exit_raises_called_process_error(self, tmp_path):
+        git_stdout(tmp_path, 'init', '-q')
+
+        with pytest.raises(subprocess.CalledProcessError):
+            git_stdout(tmp_path, 'rev-parse', '--verify', 'no-such-ref')
+
+
+def _hostile_global_git_config(tmp_path, monkeypatch) -> None:
+    """Point git's global config at one that forces signing through a failing
+    gpg program and routes every hook a builder's commands can trigger to
+    ``exit 1``, including the ones ``--no-verify`` does not bypass."""
+    hooks = tmp_path / 'hostile-hooks'
+    hooks.mkdir()
+    for hook in (
+        'pre-commit', 'commit-msg', 'pre-merge-commit', 'prepare-commit-msg', 'post-checkout',
+    ):
+        script = hooks / hook
+        script.write_text('#!/bin/sh\nexit 1\n')
+        script.chmod(0o755)
+    config = tmp_path / 'hostile-gitconfig'
+    config.write_text(
+        f'[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n[core]\n\thooksPath = {hooks}\n'
+    )
+    monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(config))
+
+
+class TestRepoBuildersIgnoreDeveloperGitConfig:
+    """Every builder survives a developer's global gpgsign and commit hooks."""
+
+    @pytest.mark.parametrize(
+        'builder', [_init_git_repo, init_ab_commit_repo, init_merge_history_repo],
+    )
+    def test_builder_succeeds_under_global_gpgsign_and_failing_hooks(
+        self, tmp_path, monkeypatch, builder,
+    ):
+        _hostile_global_git_config(tmp_path, monkeypatch)
+        repo = tmp_path / 'repo'
+
+        builder(repo)
+
+        assert git_stdout(repo, 'config', '--get', 'commit.gpgsign') == 'false'
+        assert git_stdout(repo, 'status', '--porcelain') == ''
+
+
+class TestProvenanceRepoBuilders:
+    """Unit tests for init_ab_commit_repo(path) and init_merge_history_repo(path)."""
+
+    def test_ab_commit_repo_is_one_root_commit_on_main_adding_a_and_b(self, tmp_path):
+        from _fm_helpers import init_ab_commit_repo
+
+        sha = init_ab_commit_repo(tmp_path)
+
+        assert sha == git_stdout(tmp_path, 'rev-parse', 'main')
+        assert git_stdout(tmp_path, 'rev-list', '--count', 'main') == '1'
+        assert git_stdout(tmp_path, 'ls-tree', '-r', '--name-only', sha).splitlines() == [
+            'a.txt',
+            'b.txt',
+        ]
+        assert git_stdout(tmp_path, 'config', '--get', 'commit.gpgsign') == 'false'
+
+    def test_merge_history_single_is_the_ab_commit_prefix(self, tmp_path):
+        from _fm_helpers import init_ab_commit_repo, init_merge_history_repo
+
+        merge_repo = tmp_path / 'm'
+        prefix_repo = tmp_path / 'p'
+        shas = init_merge_history_repo(merge_repo)
+        prefix_sha = init_ab_commit_repo(prefix_repo)
+
+        assert set(shas) == {'single', 'merge', 'conflict_merge'}
+        single = shas['single']
+        assert len(git_stdout(merge_repo, 'rev-list', '--parents', '-n', '1', single).split()) == 1
+        assert git_stdout(merge_repo, 'rev-parse', f'{single}^{{tree}}') == git_stdout(
+            prefix_repo, 'rev-parse', f'{prefix_sha}^{{tree}}'
+        )
+
+    def test_merge_history_merges_report_full_first_parent_file_lists(self, tmp_path):
+        from _fm_helpers import init_merge_history_repo
+
+        shas = init_merge_history_repo(tmp_path)
+        merge, conflict_merge = shas['merge'], shas['conflict_merge']
+
+        for sha in (merge, conflict_merge):
+            parents = git_stdout(tmp_path, 'rev-list', '--parents', '-n', '1', sha).split()[1:]
+            assert len(parents) == 2, f'{sha} must be a two-parent merge, got {parents}'
+        assert git_stdout(tmp_path, 'rev-parse', f'{merge}^1') == shas['single']
+        merge_files = set(
+            git_stdout(tmp_path, 'diff', '--name-only', f'{merge}^1', merge).splitlines()
+        )
+        assert merge_files == {'feature.py', *(f'extra_{i}.py' for i in range(1, 5))}
+        conflict_files = set(
+            git_stdout(
+                tmp_path, 'diff', '--name-only', f'{conflict_merge}^1', conflict_merge
+            ).splitlines()
+        )
+        assert {'a.txt', 'conflict_only.py'} <= conflict_files
+        assert git_stdout(tmp_path, 'rev-parse', 'main') == conflict_merge
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     VerifyScript,
     fails,
@@ -68,8 +69,10 @@ from _wait_hygiene_scan import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
@@ -4767,7 +4770,7 @@ class TestVerifyTeardownHelper:
 
         verify_task.cancel = _spy_cancel  # type: ignore[method-assign]
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-order')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-order', cancel=None)
 
         assert calls == ['abort', 'cancel'], calls
         # Asserted OUT HERE, where nothing can swallow it.
@@ -4786,7 +4789,7 @@ class TestVerifyTeardownHelper:
         verify_task = _never_finishes()
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited', cancel=None)
 
         assert verify_task.done()
         assert verify_task.cancelled()
@@ -4799,7 +4802,7 @@ class TestVerifyTeardownHelper:
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
         verify_task = _never_finishes()
 
-        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease')
+        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease', cancel=None)
 
         worker._abort_remote_verify.assert_not_awaited()
         assert verify_task.cancelled()
@@ -4813,7 +4816,7 @@ class TestVerifyTeardownHelper:
         runner.cancel_verify = AsyncMock(return_value=0)
         lease = HostLease(name='remote', runner=runner, is_local=False)
 
-        await worker._teardown_verify_task(lease, None, 'df3204-notask')
+        await worker._teardown_verify_task(lease, None, 'df3204-notask', cancel=None)
 
         runner.cancel_verify.assert_awaited_once()
 
@@ -4821,7 +4824,7 @@ class TestVerifyTeardownHelper:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
 
-        await worker._teardown_verify_task(None, None, 'df3204-both-none')
+        await worker._teardown_verify_task(None, None, 'df3204-both-none', cancel=None)
 
         worker._abort_remote_verify.assert_not_awaited()
 
@@ -4840,7 +4843,7 @@ class TestVerifyTeardownHelper:
         verify_task = asyncio.get_running_loop().create_task(_boom())
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
-        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser')
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser', cancel=None)
 
         assert verify_task.done()
 
@@ -4862,7 +4865,7 @@ class TestVerifyTeardownHelper:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
         await worker._teardown_verify_task(
-            lease, verify_task, 'df3204-defensive', shutdown_defensive=True,
+            lease, verify_task, 'df3204-defensive', cancel=None, shutdown_defensive=True,
         )
 
         worker._abort_remote_verify.assert_awaited_once()
@@ -4884,13 +4887,65 @@ class TestVerifyTeardownHelper:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
 
         with pytest.raises(asyncio.CancelledError):
-            await worker._teardown_verify_task(lease, verify_task, 'df3204-propagates')
+            await worker._teardown_verify_task(
+                lease, verify_task, 'df3204-propagates', cancel=None,
+            )
 
         # Clean up the task this deliberately-aborted teardown left behind.
         verify_task.cancel()
         with contextlib.suppress(BaseException):
             await verify_task
 
+    async def test_records_the_cancel_of_a_running_task_only(self, git_ops: GitOps) -> None:
+        """A deliberate cancel of a RUNNING verify writes one
+        ``merge_verify_cancelled`` row; a finished task, or a reap
+        (``cancel=None``), writes none.
+        """
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
+        clock = FakeClock(time=1000.0)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
+        cancel = VerifyCancel(VerifyCancelCause.SHUTDOWN, started_at=clock.time - 2.0, host='local')
+        finished = asyncio.get_running_loop().create_task(asyncio.sleep(0))
+        await finished
+
+        await worker._teardown_verify_task(None, _never_finishes(), 'tid', cancel=cancel)
+        await worker._teardown_verify_task(None, finished, 'tid-finished', cancel=cancel)
+        await worker._teardown_verify_task(None, _never_finishes(), 'tid-reap', cancel=None)
+
+        assert [
+            (row['task_id'], row['data'])
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
+        ] == [('tid', {'elapsed_ms': 2000, 'fraction': None, 'cause': 'shutdown', 'host': 'local'})]
+
+    async def test_a_second_canceller_of_one_dispatch_records_nothing(
+        self, git_ops: GitOps,
+    ) -> None:
+        """An abort trigger cancels the inner verify, then stop() drains the
+        entry's outer task while the trigger still cleans up: one dispatch,
+        one row.
+        """
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
+        clock = FakeClock(time=1000.0)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
+
+        def _cancel(cause: VerifyCancelCause) -> VerifyCancel:
+            return VerifyCancel(cause, started_at=clock.time - 1.0, host='local')
+
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.OPERATOR_HALT),
+        )
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.SHUTDOWN),
+        )
+
+        assert [
+            row['data']['cause']
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
+        ] == ['operator_halt']
 
 # ---------------------------------------------------------------------------
 # task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True

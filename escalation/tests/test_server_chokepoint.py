@@ -4,11 +4,9 @@ Exercises the auto-resolve path: when the target task is already 'done' or
 'cancelled', escalate_blocker / escalate_info should auto-resolve the
 escalation immediately rather than leaving it pending.
 
-Uses the same async FastMCP unit-test pattern as test_release_workflow.py:
-    tool = await server.get_tool('escalate_blocker')
-    result = await tool.fn(...)
-
-and the same tmp_path isolation as test_server_dedupe.py.
+Drives tools through the shared wrappers in ``_filing_tools.py`` and
+``_merge_tool_calls.py`` (thin delegates over ``_tool_calls.py::call_tool``),
+with the same tmp_path isolation as test_server_dedupe.py.
 """
 
 from __future__ import annotations

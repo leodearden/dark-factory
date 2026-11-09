@@ -26,6 +26,7 @@ from escalation.models import Escalation
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_runner import (
     LocalRunner,
@@ -1239,7 +1240,9 @@ async def _run_cold_shadow_verify_suite(
             event_store=event_store,
             task_id=req.task_id,
         )
-        return await pool.dispatch(merge_commit, spec)
+        return await pool.dispatch(
+            merge_commit, spec, dispatch_facts=MergeVerifyDispatchFacts.local_only(),
+        )
     finally:
         await git_ops.cleanup_merge_worktree(wt)
 
@@ -1352,7 +1355,9 @@ async def _run_cold_shadow_verify(
                 event_store=event_store,
                 task_id=req.task_id,
             )
-            verify = await pool.dispatch(merge_commit, spec)
+            verify = await pool.dispatch(
+                merge_commit, spec, dispatch_facts=MergeVerifyDispatchFacts.local_only(),
+            )
             return parse_per_test_results(verify.test_output or '')
     finally:
         await git_ops.cleanup_merge_worktree(wt)

@@ -1359,6 +1359,44 @@ unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
 directories; they never share or overwrite one.
 
+### Remote task verifies (`verify_task_*`, task 6670)
+
+An implement-phase task verify can run on a `verify_runners` host instead of
+locally. The orchestrator keeps one quarantine set and one queue per remote
+host for its whole process life. A host either lane benches is benched for
+both, as the same `ru`/`skew`/`divergence` bench above. A readmission on the
+merge lane (reprobe or operator clear) re-offers the host to its waiting
+task verifies at once, in `verify_admission_order`. While a task holds a host, that host's
+`get_merge_queue()` row carries `task_held_by: 'task:<id>'`. A task hold
+takes no merge slot. Four keys, all green tier, read per dispatch and at each
+remote grant (contract: `plans/remote-task-leg-verify-prd.md` §5.7):
+
+- `verify_task_host_policy` (default `local`): `local` runs every task
+  verify locally, byte-identical to before, and writes no dispatch record.
+  `data/verify-logs` is unchanged. `remote_modules` makes a verify eligible
+  when its executed module set intersects `verify_task_remote_modules`.
+  `remote_all` makes every verify eligible.
+- `verify_task_remote_modules` (default `[]`): the module prefixes eligible
+  under `remote_modules`. An empty list there is rejected at load and at
+  reload, naming both keys.
+- `verify_task_remote_red_confirms_locally` (default `false`): a remote red
+  re-runs the ordinary local verify, and the local verdict is returned.
+- `verify_task_remote_cross_check_every_n` (default `0`, off): every n-th
+  verify that returns a remote verdict, green or red, is re-run locally, with
+  the local verdict authoritative. The count is per orchestrator process and
+  covers exactly the verifies whose dispatch record has `reason` `remote`,
+  `cross_check` or `red_confirm`. A verify that ran local for any other
+  reason does not advance it.
+
+Off `local`, each verify the dispatcher considers leaves
+`data/verify-logs/<task>/attempt-N.dispatch-<stamp>.json`. Its `decision`
+(`remote`/`local`), `runner` and `reason` say where the verdict came from,
+and a remote run's streams sit beside it as `attempt-N.remote-<host>.*`.
+The workflow's `workflow_verify` row records the same `runner`. **Rollback**
+is one edit, `verify_task_host_policy: local`, then
+`mcp__escalation__reload_config`. The next dispatch runs locally, and a leg
+already running finishes where it is.
+
 ---
 
 ## 6. Config reload vs restart
@@ -1405,6 +1443,12 @@ takes no arguments: it always re-reads that process's own
   `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
   applies from the next verify leg — a scope already running keeps the weight
   it started with)
+- `verify_cgroup_memory.high_gib` / `.max_gib` / `.swap_max_gib` (the
+  integer-GiB `MemoryHigh` / `MemoryMax` / `MemorySwapMax` every verify scope
+  is spawned with when `verify_use_cgroup_scope` is on, one value for every
+  role; an unset leaf adds no property, and high may not exceed max; read at
+  each scope spawn, so a reload applies from the next verify leg). Normative
+  home: `orchestrator/src/orchestrator/config.py::VerifyCgroupMemoryConfig`.
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
@@ -1463,11 +1507,26 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `verify_task_host_policy`, `verify_task_remote_modules`,
+  `verify_task_remote_red_confirms_locally` and
+  `verify_task_remote_cross_check_every_n` (task 6670; default `local`, which
+  keeps every task verify local and writes nothing new). Read per dispatch and
+  at each remote grant, so rollback is one reload to `local`. See
+  [§"Remote task verifies"](#remote-task-verifies-verify_task_-task-6670).
 - `pre_merge_reverify` (default `false`; task 6580, Leo ruling 2026-10-09).
   The workflow merge phase rebases the task branch onto main and submits it
   with no task-role verify: the merge gate verifies every landing (task 1724),
   so that verdict had no reader. `true` restores the advisory post-rebase
   re-verify — a rollback switch only, read at each merge attempt.
+- `implementer_brief_variant` (default `whole-plan`; task 5385). `one-step`
+  makes each EXECUTE iteration's implementer complete exactly one plan step:
+  the iteration cap becomes the plan's item count + 3, and the implementer's
+  `max_turns`/`budget_usd` are a third of its resolved route — on every
+  implementer-role pass, so the amender and post-escalation resume passes are
+  cut too, and per-iteration eval metrics must count EXECUTE iterations
+  apart from them. An eval axis
+  (`<candidate>@one-step`, `plans/live-shadow-eval-prd.md` decision 14); no
+  production config sets it. Read at each brief, cap check and route.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -2627,33 +2686,35 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` path-filters its pyright stage (since task 2551 — see
-  `hooks/project-checks` for the authoritative logic), so what a commit
-  costs depends on what it stages:
-  - **No staged `.py` files** — pyright is skipped entirely; the hook
-    prints `pre-commit: pyright skipped (no Python changes)` and the
-    commit completes in seconds. A docs/plans-only commit needs no
-    bumped timeout: reach for a plain gated `git commit --only <paths>`
-    first.
-  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
-    package imports them, so the hook runs a full sweep across all seven
-    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`,
-    `shared`, `escalation`, `sampler`, `cockpit` — the members of
-    `type_check_command`). This is the 7x worst case and can comfortably
-    exceed two minutes.
-  - **Staged `.py` under exactly one of the other `PYRIGHT_PACKAGES`
-    (`fused-memory`, `orchestrator`, `dashboard`, `sampler`, `cockpit`)** — pyright runs once, for that package only.
-  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
-    root-level `conftest.py`) — pyright is skipped for the whole commit,
-    and unlike the no-Python case the hook prints *nothing*, so there is
-    no signal that it was skipped. This over-narrowing is deliberate
-    (root-level Python is itself unconfigured for pyright); if the changed
-    file is imported by a package, run `uv run pyright` there by hand.
+- On main, `pre-commit` runs the merge gate's own checks for what the
+  commit stages (task 8531; `scripts/hook_module_checks.py` derives the
+  list, `hooks/project-checks` runs it in parallel), so what a commit costs
+  depends on what it stages:
+  - **Staged `.py` under a registered module** — that module's
+    `lint_command` and `type_check_command` run verbatim, exactly as the
+    merge gate would run them, so a staged `scripts/*.py` now runs
+    `module:scripts:type`.
+  - **Staged `.py` under `shared/` or `escalation/`** — every module
+    imports them, so the type check of EVERY registered module runs. This
+    is the worst case.
+  - **A staged file under `plans/`, `docs/` or `review/`, or a
+    `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
+    whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
+    10 s warm and 45 s cold, as measured in
+    `plans/merge-pre-verify-screen-prd.md` §3, decision 4.
+  - **Nothing above** — the hook prints `pre-commit: merge-gate checks
+    skipped (no staged file maps to a module or the screen) in Ns`. A
+    commit like that needs no bumped timeout: reach for a plain gated
+    `git commit --only <paths>` first.
 
-  In the two middle cases — the only ones that actually invoke pyright —
-  pass a generous timeout (five minutes or more) to whatever you use to
-  run commit commands, or run it detached and poll, rather than letting a
-  default timeout kill it mid-hook.
+  The hook prints each unit it runs and the elapsed time. A module type
+  check can take minutes: the measurements are recorded at
+  `scripts/orchestrator.yaml::type_check_command` and
+  `shared/orchestrator.yaml::type_check_command` (orchestrator's pyright).
+  For any commit that runs a module check, pass a generous timeout (five
+  minutes or more) to whatever runs the commit, or run it detached and
+  poll, so a default timeout does not kill it mid-hook. `--no-verify` still
+  bypasses the hook, as it does for any git hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -2661,10 +2722,13 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless. Since task 2551 a
-  docs-only commit passes the hook cheaply anyway (pyright is skipped),
-  so this is a last resort for genuine index-lock contention — not a way
-  to dodge a slow hook.
+  no-code change. Reach for `--only` first regardless. A docs-only commit
+  pays for the screen (about 10 s warm) when it stages anything under
+  `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md` outside a
+  workspace package, root-level docs such as this file included. Other
+  docs-only commits skip the merge-gate checks. Either way, `--no-verify`
+  is a last resort for genuine index-lock contention, not a way to dodge
+  a slow hook.
 
 ---
 
@@ -3540,16 +3604,22 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean). Its one write
-   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
-   batch files there and runs `prepare_sitting.py record --from <file>`.
-   It is read-only otherwise, by construction: it runs
-   under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, reading no
-   settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
-   allow rule plus the absence of settings files confine the agent's own
-   file writes to that inbox. `prepare_sitting.py` confines in code what
+   ramifications, a recommendation or an explicit no-lean). It writes JSON
+   batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
+   `prepare_sitting.py record --from <file>`. Three layers confine it, all
+   in `nightly_prepare.py`. The write boundary is Landlock: the CLI runs
+   under it with the tree read-only except `data/sitting/`, `~/.cache/uv`,
+   `/tmp` and `.task/` (Landlock always grants its cwd's `.task/`, and the
+   run's cwd is the repo root because its prepare command is
+   repo-relative). Without Landlock the run is refused (`prepare=2`), never
+   launched unconfined; bwrap is not a fallback, since its mount order
+   leaves the host `/tmp` read-only. The CLI rules are the first gate, not the boundary: it runs
+   under `--permission-mode dontAsk` with an allowlist and an explicit
+   denylist of every apply verb, reading no settings file
+   (`--setting-sources ''`); the CLI matches those rules against raw
+   command text, so a shell-quoted spelling can pass a deny. Its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox, under
+   which `prepare_sitting.py` confines in code what
    `record` reads (a `.json` file directly in that inbox, never stdin or
    another path, so never an earlier night's batch) and where it writes
    (the default store in `data/sitting/`), and refuses everything but `brief`
@@ -3559,8 +3629,11 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    on the project config being approved for a headless run, and playwright
    never starts. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. With nothing leasable, it inherits the unit's
-   environment. It stops itself after 2700s.
+   is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/` holding the leased token, which is removed
+   on every exit short of a SIGKILL. With nothing leasable the night is
+   skipped (`prepare=1`, `no pool account free; skipping`): the run never
+   uses the host's own login. It stops itself after 2700s.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3575,6 +3648,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 | `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
+| `data/sitting/config/claude-config-nightly-prepare-<run>/` | The night's CLI config dir and session transcript, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -3599,7 +3673,7 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
+- `prepare=1` means the Fable run was skipped (no pool account free), failed, timed out, hit a usage limit or
   recorded nothing; its log line carries both stream tails, or, for a run
   that recorded nothing, the counts of what the inbox offered and could not decode. That is
   routine, not an incident:
@@ -3609,7 +3683,7 @@ systemctl --user list-timers return-brief.timer
   of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
   means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH.
+  PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 
@@ -3965,13 +4039,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -4000,7 +4082,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the

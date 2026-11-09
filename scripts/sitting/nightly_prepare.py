@@ -7,19 +7,29 @@ judgement reaches the page only through ``prepare_sitting.py record``, which
 writes ``data/sitting/``. The render that follows re-measures every figure
 itself, so a failed night costs thinner recommendations, never a wrong page.
 
-Recommend-only regardless of flags. The CLI runs under ``--permission-mode
-dontAsk`` with ``nightly_allowed_tools`` as the only tools it may use and
-``NIGHTLY_DENIED_TOOLS`` naming every apply verb. It reads no settings file
-(``setting_sources=[]``), so no ambient allow rule widens that list. Its one
-write channel is a fresh per-run inbox, ``data/sitting/inbox/<UTC stamp>/``:
-it Writes JSON batches there and runs ``prepare_sitting.py record --from
-<file>``. The child env also carries ``NIGHTLY_CONFINEMENT_ENV``, set to the
-run's inbox, under which ``prepare_sitting.py`` itself refuses any other subcommand, ``record`` from
-stdin or from outside that inbox, a non-default ``--preparation``, ``--ledger``
-and ``--apply-closes``. Two mechanisms confine the run: the CLI allow rule with no settings files
-limits its file writes to its inbox, and ``prepare_sitting.py`` limits in code what ``record`` reads
-(a ``.json`` file directly in the run's inbox, named by ``NIGHTLY_CONFINEMENT_ENV``) and where it writes
-(the default store).
+Recommend-only regardless of flags. Three layers confine the run:
+
+- Landlock is the write boundary. The CLI runs under
+  ``orchestrator/src/orchestrator/agents/sandbox_dispatch.py::wrap_command``
+  pinned to Landlock, so the whole tree is read-only except ``data/sitting/``
+  (the inbox, the store and the run's ``CLAUDE_CONFIG_DIR``), ``~/.cache/uv``,
+  ``/tmp`` and ``<root>/.task/``, which Landlock always grants in its cwd (the
+  run's cwd is the root, since ``PREPARE_COMMAND`` is repo-relative). Without
+  Landlock the run is refused, never launched unconfined; bwrap is not a
+  fallback, since its mount order leaves the host ``/tmp`` read-only.
+- The CLI rules are the first gate. It runs under ``--permission-mode dontAsk``
+  with ``nightly_allowed_tools`` as the only tools it may use, reading no
+  settings file (``setting_sources=[]``), and ``NIGHTLY_DENIED_TOOLS`` naming
+  every apply verb. They are not a write boundary: the CLI matches rules
+  against raw command text, so a shell-quoted ``--output`` passes the git
+  denies (``shared/src/shared/git_read_rules.py``). Through its own tools the
+  run Writes JSON batches to a fresh per-run inbox,
+  ``data/sitting/inbox/<UTC stamp>/``, and runs ``prepare_sitting.py record
+  --from <file>``.
+- ``prepare_sitting.py`` confines itself in code. The child env carries
+  ``NIGHTLY_CONFINEMENT_ENV``, set to the run's inbox, under which it refuses
+  any other subcommand, ``record`` from stdin or from outside that inbox, a
+  non-default ``--preparation``, ``--ledger`` and ``--apply-closes``.
 
 The outcome is measured from structured data, not from the agent's say-so:
 ``recorded`` counts the item keys whose store entry equals a preparation the
@@ -33,11 +43,13 @@ approved for a headless run, and no other server starts.
 The account comes from the shared pool (``account_pool.build_pool``): one
 lease, read and handed straight back before the run, because nothing in the
 child can settle a slot. The known cost is that this run's spend is invisible
-to the gate. With no lease the child inherits this process's environment as
-``shared.secret_env.agent_subprocess_env`` leaves it, and a lease replaces
-``CLAUDE_CODE_OAUTH_TOKEN`` on top of that. Either way the child holds no API
-key or other secret, no endpoint selection and no Python-environment selection
-(OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
+to the gate. The leased token is written into the run's config dir and
+removed on every exit that reaches ``run``'s ``finally`` (a SIGKILL leaves
+it). With no lease the run is skipped (exit 1): it never uses the host login.
+The child's env is ``shared.secret_env.agent_subprocess_env`` of this
+process's, with the lease's ``CLAUDE_CODE_OAUTH_TOKEN`` on top, so it holds no
+API key or other secret, no endpoint selection and no Python-environment
+selection (OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
 hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
@@ -70,8 +82,17 @@ if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
     sys.path.append(str(_REPO_ROOT / 'scripts' / 'legibility'))
 
 from legibility import account_pool  # noqa: E402
+from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
+    Backend,
+    SandboxUnavailable,
+    resolve_backend_or_refuse,
+    set_backend,
+    wrap_command,
+)
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
+from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
+from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
 from shared.secret_env import agent_subprocess_env  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
@@ -90,12 +111,13 @@ NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
+_GIT_READS = git_read_rules('show', 'log')
+
 NIGHTLY_READ_TOOLS: tuple[str, ...] = (
     'Read',
     'Grep',
     'Glob',
-    'Bash(git show:*)',
-    'Bash(git log:*)',
+    *_GIT_READS.allow,
     f'Bash({PREPARE_COMMAND} brief --json:*)',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_pending_escalations',
@@ -110,6 +132,8 @@ NIGHTLY_READ_TOOLS: tuple[str, ...] = (
 
 TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
+SITTING_DATA_PATH = preparation.DEFAULT_PREPARATION_PATH.parent
+
 
 def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
     """The reads, plus the one write the run has: files in *inbox* (``//`` marks an absolute path; the Write tool is gated by an ``Edit`` rule) and ``record --from``.
@@ -122,6 +146,7 @@ def nightly_allowed_tools(inbox: Path) -> tuple[str, ...]:
 
 NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
     'NotebookEdit',
+    *_GIT_READS.deny,
     'mcp__escalation__resolve_issue',
     'mcp__escalation__stamp_triage',
     'mcp__escalation__promote_to_l2',
@@ -171,6 +196,7 @@ class Settings:
     max_turns: int
     mcp_json: Path
     root: Path
+    sandbox_backend: Backend = 'landlock'
 
 
 class McpConfigUnusable(Exception):
@@ -196,7 +222,7 @@ class Completed:
 
 
 def run(settings: Settings, *, gate: Any = None) -> int:
-    """Lease an account, run the CLI once with the prompt on stdin, and judge how it ended."""
+    """Lease an account, run the CLI once under the OS sandbox with the prompt on stdin, and judge how it ended."""
     claude = shutil.which(settings.claude_bin)
     if claude is None:
         _log(f'claude binary not found or not executable: {settings.claude_bin!r}')
@@ -206,9 +232,38 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     except McpConfigUnusable as exc:
         _log(f'no usable MCP config: {exc}')
         return EXIT_CONFIG
+    set_backend(settings.sandbox_backend)
+    try:
+        resolve_backend_or_refuse()
+    except SandboxUnavailable as exc:
+        _log(f'refusing to run unconfined: {exc}')
+        return EXIT_CONFIG
     root = settings.root.resolve()
     inbox = _new_inbox(root)
-    env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox)
+    sitting_data = root / SITTING_DATA_PATH
+    config_dir = TaskConfigDir(f'nightly-prepare-{inbox.name}', base_dir=sitting_data / 'config')
+    try:
+        env = _child_env(gate if gate is not None else account_pool.build_pool(), inbox, config_dir)
+        if env is None:
+            config_dir.cleanup()
+            return EXIT_FAILED
+        return _run_confined(
+            claude=claude, settings=settings, mcp_config=mcp_config, env=env, root=root, inbox=inbox,
+            grants=(sitting_data, _ensure_uv_cache()),
+        )
+    finally:
+        config_dir.remove_credentials()
+
+
+def _ensure_uv_cache() -> Path:
+    """``~/.cache/uv``, created if absent: Landlock can grant only a directory that exists."""
+    uv_cache = Path.home() / '.cache' / 'uv'
+    uv_cache.mkdir(parents=True, exist_ok=True)
+    return uv_cache
+
+
+def _run_confined(*, claude: str, settings: Settings, mcp_config: dict[str, Any], env: dict[str, str],
+                  root: Path, inbox: Path, grants: Sequence[Path]) -> int:
     argv, temp_files = build_claude_argv(
         model=settings.model,
         max_budget_usd=settings.budget_usd,
@@ -226,10 +281,11 @@ def run(settings: Settings, *, gate: Any = None) -> int:
         setting_sources=[],
     )
     argv[0] = claude
+    confined = wrap_command(argv, root, [], writable_extras=[str(grant) for grant in grants])
     store_path = root / preparation.DEFAULT_PREPARATION_PATH
     held_before = _load_or_empty(store_path)
     try:
-        completed = _run_bounded(argv, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
+        completed = _run_bounded(confined, env, settings.timeout_secs, cwd=root, prompt=nightly_prompt(inbox, root))
     except OSError as exc:
         _log(f'claude could not be started ({claude!r}): {exc}')
         return EXIT_CONFIG
@@ -239,9 +295,11 @@ def run(settings: Settings, *, gate: Any = None) -> int:
     return _judge(completed, settings, _measure(inbox, store_path, held_before))
 
 
-def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT) -> int:
+def main(argv: Sequence[str] | None = None, *, gate: Any = None, root: Path = _REPO_ROOT,
+         sandbox_backend: Backend = 'landlock') -> int:
     args = _parser().parse_args(argv)
-    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json, root)
+    settings = Settings(args.claude_bin, args.model, args.budget_usd, args.timeout_secs, args.max_turns, args.mcp_json,
+                        root, sandbox_backend)
     try:
         return run(settings, gate=gate)
     except Exception as exc:
@@ -269,15 +327,18 @@ def _mcp_config(path: Path) -> dict[str, Any]:
     return {'mcpServers': {name: servers[name] for name in NIGHTLY_MCP_SERVERS}}
 
 
-def _child_env(gate: Any, inbox: Path) -> dict[str, str]:
+def _child_env(gate: Any, inbox: Path, config_dir: TaskConfigDir) -> dict[str, str] | None:
+    """The CLI's env with a leased account written into *config_dir*, or None when no pool account is free."""
     env = agent_subprocess_env(os.environ)
     env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
+    env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
     lease = gate.try_lease(reverse=True)
     if lease is None:
-        _log('no pool account available; the run inherits this environment')
-        return env
+        _log('no pool account free; skipping: the nightly never uses the host login')
+        return None
     try:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = lease.token
+        config_dir.write_credentials(lease.token)
         return env
     finally:
         gate.release_probe_slot(lease.token)

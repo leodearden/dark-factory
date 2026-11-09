@@ -22,6 +22,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
@@ -36,7 +37,6 @@ from dashboard.data.merge_queue import (
 )
 from dashboard.data.metrics import get_merge_active_series
 from dashboard.data.task_lookup import lookup_tasks
-from dashboard.data.utils import resolve_now
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 router = APIRouter()
@@ -49,7 +49,8 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     labels = config.project_labels
     pool: DbPool = request.app.state.db
     window = _parse_window(request.query_params)
-    render_at = resolve_now(None)
+    clock = app_clock(request.app)
+    render_at = clock()
 
     project_dbs = await _project_scoped_dbs_labeled(
         config,
@@ -100,7 +101,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     }
     # Resolved AFTER the fan-out, as api/tasks.py::api_tasks does: every
     # as_of above was stamped at or before this instant, never after it.
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(
         with_window(
             redux_api.shape_merge_queue(

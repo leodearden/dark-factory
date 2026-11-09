@@ -70,7 +70,7 @@ def _cell_text(score: ScoringResult) -> str:
     """One scored cell for a progress line: its metrics and spend, or why it has none."""
     if score.unmeasured is None:
         return _metrics_text(score.f1, score.blocking_recall, score.total_cost_usd)
-    from orchestrator.evals.report import format_invocation_errors
+    from orchestrator.evals.measurement import format_invocation_errors
 
     why = format_invocation_errors([score.unmeasured.to_record()])
     return f'UNMEASURED {why} ${score.total_cost_usd:.2f}'

@@ -44,6 +44,10 @@ from fused_memory.backends.metadata_lookup import (
     InvalidMetadataLookupError,
     validate_metadata_query,
 )
+from fused_memory.backends.task_projection import (
+    InvalidTaskProjectionField,
+    parse_task_projection,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -99,6 +103,7 @@ from fused_memory.middleware.task_interceptor import (
     TicketStoreNotConfiguredError,
     _is_ticket_id,
     _looks_like_task_id,
+    interceptor_write_succeeded,
 )
 from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
 from fused_memory.models.enums import (
@@ -117,6 +122,10 @@ from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
     ConsolidationProposal,
     record_proposal,
+)
+from fused_memory.reconciliation.enumeration_guard import (
+    enumeration_gate_for_filing,
+    enumeration_gate_for_update,
 )
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
@@ -1301,6 +1310,20 @@ def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
         'error': f'statuses must be a list of status strings; got {statuses!r}',
         'error_type': 'ValidationError',
     }
+
+
+def _validate_fields(fields: Any) -> dict[str, Any] | None:
+    """Return the INV-2 ValidationError payload unless ``fields`` is a valid ``get_tasks`` projection."""
+    try:
+        parse_task_projection(fields)
+    except InvalidTaskProjectionField as e:
+        return {
+            'error': str(e),
+            'error_type': 'ValidationError',
+            'field': e.field,
+            'allowed': list(e.allowed),
+        }
+    return None
 
 
 # find_tasks_by_metadata's page-size cap, and its include_value page budget in
@@ -8650,6 +8673,7 @@ def create_mcp_server(
         page_size: int | None = None,
         offset: int = 0,
         statuses: Any = None,
+        fields: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -8668,6 +8692,12 @@ def create_mcp_server(
                 results to matching tasks via a SQL ``status IN (...)`` predicate.  An
                 empty list (``[]``) is valid and returns no tasks.  A bare string is
                 rejected with a ValidationError.
+            fields: Optional row projection.  None returns full rows, unchanged.  Each
+                entry is a top-level row key or ``metadata.<key>`` (key matching
+                ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
+                metadata key absent on a task is omitted.  An invalid entry is a
+                ValidationError carrying ``field`` and ``allowed``.  Composes with
+                ``statuses`` and ``page_size``.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -8678,12 +8708,17 @@ def create_mcp_server(
         _statuses_error = _validate_statuses(statuses)
         if _statuses_error is not None:
             return _statuses_error
+        _fields_error = _validate_fields(fields)
+        if _fields_error is not None:
+            return _fields_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        result = await task_interceptor.get_tasks(
+            project_root=project_root, tag=tag, statuses=statuses, fields=fields,
+        )
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
@@ -9646,6 +9681,19 @@ def create_mcp_server(
         if _premise_err is not None:
             return _premise_err
 
+        # Enumeration liveness gate (task 3056) — see enumeration_guard's
+        # module docstring. Rebinds description/metadata to the cleaned payload.
+        _enumeration = await enumeration_gate_for_filing(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         # Routing-intent lint (task 2563) — declaration-only: a
         # task_kind='normal' submission whose text DECLARES a different
         # execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic;
@@ -9720,6 +9768,8 @@ def create_mcp_server(
         if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
             result.update(gitignored_deliverable_warning(_gitignored_finding))
             log_gitignored_deliverable_flagged(_gitignored_finding)
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
         return result
 
     @mcp.tool()
@@ -10588,9 +10638,24 @@ def create_mcp_server(
         if _mo_err is not None:
             return _mo_err
 
+        # Enumeration liveness gate (task 3056), update half: see the matching
+        # submit_task call site and enumeration_guard's module docstring.
+        _enumeration = await enumeration_gate_for_update(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+            metadata_mode=metadata_mode,
+            append=append,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
-        return await task_interceptor.update_task(
+        result = await task_interceptor.update_task(
             task_id=id,
             project_root=project_root,
             prompt=prompt,
@@ -10607,6 +10672,9 @@ def create_mcp_server(
             agent_id=agent_id,
             client_op_id=client_op_id,
         )
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()

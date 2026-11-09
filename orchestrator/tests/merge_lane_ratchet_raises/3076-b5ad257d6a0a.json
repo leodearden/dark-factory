@@ -1,0 +1,18 @@
+{
+  "task_id": "3076",
+  "reason": "review fix: best-effort record read + per-lane sweep so an unreadable record cannot abort a span or the IN_USE sweep (net-additive guard: LaneLifecycle._read_best_effort's except OSError)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 54,
+      "current": 56
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5036,
+      "current": 5038
+    }
+  ]
+}

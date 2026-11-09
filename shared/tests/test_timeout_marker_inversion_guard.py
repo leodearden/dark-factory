@@ -3,8 +3,8 @@
 The extractor, the band, the judgement, its failure messages and their
 rationale live in shared/src/shared/testing_timeout_markers.py.  This module
 supplies only this package's inputs: its tests root, the verify test_command
-its own orchestrator.yaml passes and its anti-vacuity floors.  It reads its
-grandfather allowlist from shared_timeout_marker_grandfathered.py.
+its own orchestrator.yaml passes and its anti-vacuity floors.  It judges with
+NO allowlist, so every in-band marker under this directory fails.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
-from shared_timeout_marker_grandfathered import INVERSION_BAND_GRANDFATHERED
 
 from shared.testing_timeout_markers import (
     InversionVerdict,
@@ -40,7 +39,7 @@ def _verdict() -> InversionVerdict:
     return judge_inversion_band(
         scan_timeout_marker_sites(_TESTS_DIR, _SANCTIONED),
         verify_test_command=yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command'],
-        grandfathered=INVERSION_BAND_GRANDFATHERED,
+        grandfathered=frozenset(),
         floors=_FLOORS,
     )
 
@@ -52,11 +51,6 @@ def test_the_verify_budget_is_configured() -> None:
 
 def test_no_new_timeout_marker_sits_in_the_inversion_band() -> None:
     failure = _verdict().new_offender_failure
-    assert failure is None, failure
-
-
-def test_grandfather_allowlist_has_no_stale_entries() -> None:
-    failure = _verdict().stale_failure
     assert failure is None, failure
 
 

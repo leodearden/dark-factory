@@ -68,7 +68,10 @@ class TaskBackendProtocol(Protocol):
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
-    ) -> GetTasksResult: ...
+        fields: Sequence[str] | None = None,
+    ) -> GetTasksResult:
+        """``fields`` projects each row; the contract is ``fused_memory/backends/task_projection.py``."""
+        ...
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None

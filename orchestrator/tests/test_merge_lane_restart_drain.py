@@ -27,7 +27,12 @@ from _merge_lane_fakes import (
     make_lane,
     running_lane,
 )
-from _orch_helpers import git_env_with_ceiling, wait_responsive
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    git_env_with_ceiling,
+    wait_responsive,
+)
 from df_pytest_isolation import git_redirect_env
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -410,15 +415,21 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
 
     async with running_lane(lane) as run:
         await queue.put(head)
-        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        await wait_responsive(
+            verifier.await_entry(1),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label='head verify under way',
+        )
         await queue.put(pred)
         await wait_responsive(
             _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='predecessor merged, waiting for the one host',
         )
         await queue.put(train)
         await wait_responsive(
             _until(lambda: _state(lane, train) == 'merging'),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train parked behind the predecessor',
         )
 
@@ -427,12 +438,15 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
         assert (await run.outcome(head)).status == 'done'
         await wait_responsive(
             _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train and predecessor both requeued',
         )
 
         lane.resume_admission()
         train_outcome = await wait_responsive(
-            asyncio.shield(train.result), label='train lands without parking on pred',
+            asyncio.shield(train.result),
+            timeout=MERGE_RESULT_TIMEOUT,
+            label='train lands without parking on pred',
         )
         pred_outcome = await run.outcome(pred)
 

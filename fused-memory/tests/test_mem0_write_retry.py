@@ -7,7 +7,9 @@ import dataclasses
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import openai
 import pytest
@@ -20,6 +22,7 @@ from _mem0_intent_fixtures import (
     seed_mem0_intent,
 )
 
+from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
     Mem0RetryPassSummary,
@@ -105,6 +108,34 @@ class TestMem0RetryPolicy:
     def test_default_policy_exists(self):
         assert isinstance(DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy)
 
+    def test_the_default_backlog_alarm_age_is_an_hour(self):
+        assert DEFAULT_MEM0_RETRY_POLICY.backlog_alarm_age_seconds == 3600
+
+    def test_the_default_backlog_is_checked_every_five_minutes(self):
+        assert DEFAULT_MEM0_RETRY_POLICY.backlog_check_interval_seconds == 300
+
+    def test_the_backlog_is_never_checked_more_often_than_a_retry_pass_runs(self):
+        policy = Mem0RetryPolicy(
+            initial_delay_seconds=30,
+            max_delay_seconds=900,
+            poll_interval_seconds=30,
+            batch_size=50,
+            backlog_alarm_age_seconds=60,
+        )
+
+        assert policy.backlog_check_interval_seconds == 30
+
+    @pytest.mark.parametrize('age', [0, -1])
+    def test_a_non_positive_backlog_alarm_age_is_rejected(self, age):
+        with pytest.raises(ValueError, match='backlog_alarm_age_seconds'):
+            Mem0RetryPolicy(
+                initial_delay_seconds=30,
+                max_delay_seconds=900,
+                poll_interval_seconds=30,
+                batch_size=50,
+                backlog_alarm_age_seconds=age,
+            )
+
     def test_initial_delay_above_the_cap_is_rejected(self):
         with pytest.raises(ValueError, match=r'901') as excinfo:
             Mem0RetryPolicy(
@@ -164,16 +195,19 @@ async def _seed_retrying(
     return intent_id, write_op_id
 
 
+_LANDED_LATE = Mem0AddOutcome(memory_ids=('mem0-late',), empty_result_error=None)
+
+
 class _Reissue:
     def __init__(self, error: BaseException | None = None) -> None:
         self.calls: list[dict] = []
         self._error = error
 
-    async def __call__(self, intent: dict) -> object:
+    async def __call__(self, intent: dict) -> Mem0AddOutcome:
         self.calls.append(intent)
         if self._error is not None:
             raise self._error
-        return {'results': [{'id': 'mem0-late'}]}
+        return _LANDED_LATE
 
 
 class _StampedElsewhere(_Reissue):
@@ -183,15 +217,31 @@ class _StampedElsewhere(_Reissue):
         super().__init__(error)
         self._journal = journal
 
-    async def __call__(self, intent: dict) -> object:
+    async def __call__(self, intent: dict) -> Mem0AddOutcome:
         await self._journal.resolve_mem0_intent(
             intent['id'], Mem0IntentStatus.FAILED, reason='stamped elsewhere'
         )
         return await super().__call__(intent)
 
 
-async def _run_pass(journal: WriteJournal, reissue: _Reissue) -> Mem0RetryPassSummary:
-    return await retry_due_mem0_intents(journal, reissue, policy=_PASS_POLICY, now=_NOW)
+class _OnLanded:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[tuple[Mapping[str, Any], Mem0AddOutcome]] = []
+        self._error = error
+
+    async def __call__(self, intent: Mapping[str, Any], outcome: Mem0AddOutcome) -> None:
+        self.calls.append((intent, outcome))
+        if self._error is not None:
+            raise self._error
+
+
+async def _run_pass(
+    journal: WriteJournal, reissue: _Reissue, on_landed: _OnLanded | None = None
+) -> Mem0RetryPassSummary:
+    hook = {} if on_landed is None else {'on_landed': on_landed}
+    return await retry_due_mem0_intents(
+        journal, reissue, policy=_PASS_POLICY, now=_NOW, **hook
+    )
 
 
 class TestRetryDueMem0Intents:
@@ -343,6 +393,83 @@ class TestRetryDueMem0Intents:
         )
 
 
+
+class TestTheLandingHook:
+    """``on_landed`` is told about each re-issue that lands, so a deferred
+    write's follow-on work (its supersedes marks) runs once the id exists."""
+
+    @pytest.mark.asyncio
+    async def test_a_landed_reissue_hands_the_intent_and_outcome_to_the_hook(self, journal):
+        intent_id, _ = await _seed_retrying(journal)
+        on_landed = _OnLanded()
+
+        summary = await _run_pass(journal, _Reissue(), on_landed)
+
+        ((intent, outcome),) = on_landed.calls
+        assert intent['id'] == intent_id
+        assert outcome == _LANDED_LATE
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'completed'
+        assert summary == Mem0RetryPassSummary(due=1, landed=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [rate_limit_error(), RuntimeError('qdrant schema mismatch')],
+        ids=['rescheduled', 'dead-lettered'],
+    )
+    async def test_a_reissue_that_did_not_land_is_not_reported(self, journal, error):
+        await _seed_retrying(journal)
+        on_landed = _OnLanded()
+
+        await _run_pass(journal, _Reissue(error), on_landed)
+
+        assert on_landed.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_reconciled_intent_is_not_reported(self, journal):
+        _, write_op_id = await _seed_retrying(journal)
+        await journal.log_backend_op(
+            write_op_id=write_op_id, backend='mem0', operation='add', success=True
+        )
+        on_landed = _OnLanded()
+
+        summary = await _run_pass(journal, _Reissue(), on_landed)
+
+        assert on_landed.calls == []
+        assert summary == Mem0RetryPassSummary(due=1, reconciled=1)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_is_logged_and_the_write_still_counts_landed(
+        self, journal, caplog
+    ):
+        intent_id, write_op_id = await _seed_retrying(journal)
+
+        with caplog.at_level(logging.ERROR):
+            summary = await _run_pass(
+                journal, _Reissue(), _OnLanded(RuntimeError('mark failed'))
+            )
+
+        assert summary == Mem0RetryPassSummary(due=1, landed=1)
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'completed'
+        assert any(
+            r.levelno == logging.ERROR
+            and intent_id in r.getMessage()
+            and write_op_id in r.getMessage()
+            and r.exc_info is not None
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_landed_reissue_whose_stamp_missed_is_still_reported(self, journal):
+        """The record exists whatever the journal row says, so its marks are due."""
+        intent_id, _ = await _seed_retrying(journal)
+        on_landed = _OnLanded()
+
+        summary = await _run_pass(journal, _StampedElsewhere(journal), on_landed)
+
+        assert [intent['id'] for intent, _ in on_landed.calls] == [intent_id]
+        assert summary == Mem0RetryPassSummary(due=1, unstamped=1)
+
 @pytest.mark.asyncio
 async def test_periodic_loop_survives_a_failing_pass_and_ends_on_cancel(caplog):
     calls = 0
@@ -357,7 +484,9 @@ async def test_periodic_loop_survives_a_failing_pass_and_ends_on_cancel(caplog):
             raise RuntimeError('journal locked')
 
     with caplog.at_level(logging.ERROR):
-        task = asyncio.create_task(run_periodic_mem0_retry(pass_fn, interval_seconds=0.01))
+        task = asyncio.create_task(
+            run_periodic_mem0_retry(pass_fn, interval_seconds=0.01, what='retry pass')
+        )
         # A genuine hang is bounded by the suite's per-test timeout.
         await third_call.wait()
         task.cancel()

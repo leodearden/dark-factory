@@ -19,6 +19,7 @@ import pytest
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.milestone_rearm import scheduled_fire_at
 
 from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
@@ -286,7 +287,9 @@ class TestRearmOnNotYet:
         assert write['mode'] == 'merge'
         payload = write['metadata']
         assert set(payload) == {'milestone', 'predicate_recheck', 'predicate_verdict'}
-        assert payload['milestone'] == {**DECLARED_MILESTONE, 'at': next_at}
+        assert payload['milestone'] == {
+            **DECLARED_MILESTONE, 'at': next_at, 'scheduled_fire_at': DATED['at'],
+        }
         assert payload['predicate_recheck'] == {
             'consecutive': 1,
             'first_rearmed_at': FIXED_NOW.isoformat(),
@@ -321,9 +324,9 @@ class TestRearmOnNotYet:
         assert record['consecutive'] == 2
         assert record['first_rearmed_at'] == FIXED_NOW.isoformat()
         assert record['last_checked_at'] == clock.now.isoformat()
-        assert scheduler.task['metadata']['milestone']['at'] == (
-            clock.now + timedelta(seconds=86400)
-        ).isoformat()
+        milestone = scheduler.task['metadata']['milestone']
+        assert milestone['at'] == (clock.now + timedelta(seconds=86400)).isoformat()
+        assert scheduled_fire_at(milestone) == DATED['at']
 
 
 @pytest.mark.asyncio
@@ -421,6 +424,27 @@ class TestRearmWriteFailures:
         assert 're-arm write' in escalation.summary
         assert len(scheduler.updates()) == 1
         assert 'gate_escalated_at' not in scheduler.updates()[0]
+        assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
+
+    async def test_an_unreadable_fire_time_escalates_instead_of_re_arming(
+        self, queue, event_store,
+    ):
+        milestone = {**DECLARED_MILESTONE, 'scheduled_fire_at': None}
+        scheduler = _scheduler(
+            _predicate_task(recheck_secs=86400, milestone=milestone), event_store,
+        )
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert [s['status'] for s in scheduler.statuses()] == ['blocked']
+        [escalation] = _pending(queue)
+        assert escalation.category == 'infra_issue'
+        assert 're-arm refused' in escalation.summary
+        assert 'ISO-8601 scheduled fire time' in escalation.detail
+        assert scheduler.updates() == []
         assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
 
 

@@ -185,11 +185,13 @@ a standing exemption for whatever it becomes:
     itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
     suffix only), so no invocation can point these deletes or writes at a
     ``fused``-prefixed production collection;
-  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
-    ``instance.db.add_history`` per instance before the first ``add`` (that
-    writer is process-shared, xdist-contended, and read-only in the sandbox —
-    see ``seed_arm``'s own docstring).  So the capability the preflight probes
-    for is not one the seeding path needs.
+  * it does not write mem0's shared SQLite history: ``run_bake_off`` sets
+    ``config.mem0.persist_history = False`` on its own config copy, so every
+    arm's mem0 instance keeps its history in a private in-memory DB and never
+    opens the shared ``$MEM0_DIR/history.db`` (process-shared, xdist-contended,
+    and read-only in the sandbox — see
+    ``fused_memory/config/schema.py::Mem0BackendConfig.persist_history``).  So
+    the capability the preflight probes for is not one the seeding path needs.
 
 THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
 (i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
@@ -3987,19 +3989,10 @@ async def seed_arm(
     """Write every record of one arm into its own ephemeral collection.
 
     Populates ``by_stored_id`` in place and returns the same object.
-
-    ``instance.db.add_history`` is stubbed first: mem0's SQLite history
-    writer is process-shared and xdist-contended (and read-only in the
-    sandbox).  It is not the question under test, and its failure would mask
-    the one that is — the same reason ``test_recon_dedup_premise.py:135`` and
-    the E1 probe stub it.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
     scope = Scope(project_id=seeded.project_id, agent_id=SEED_AGENT_ID)
-    instance = await backend._get_instance(scope)
-    instance.db.add_history = lambda *args, **kwargs: None
-
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _write(record: ArmRecord) -> None:
@@ -5646,6 +5639,7 @@ async def run_bake_off(
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
     config.mem0.collection_prefix = ephemeral_collection_prefix()
+    config.mem0.persist_history = False
     # Clearing the pinned key makes mem0's OpenAIEmbedding fall back to the
     # real OPENAI_API_KEY.  A stub constant vector would make every ranking in
     # this report meaningless.  `providers.openai` is optional in the schema

@@ -796,9 +796,10 @@ pairs dropped.
 ## `memory_eval_topic_registry.json`
 
 The probed-topic registry for the **E1 retrieval-health** eval
-(`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
-`fused-memory/scripts/memory_eval_retrieval_probe.py` via
-`load_topic_registry()`; its shape is contract-tested in
+(`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Loaded by
+`fused-memory/src/fused_memory/eval/topic_registry.py::load_topic_registry`,
+which the probe script, the metadata census, `retro_stamp_topics.py` and
+the LME harness all use; its shape is still contract-tested in
 `fused-memory/tests/test_memory_eval_retrieval_probe.py`, its
 `briefing_query` topics are pinned to their source in
 `fused-memory/tests/test_memory_eval_briefing_topics.py`, and its re-keyed

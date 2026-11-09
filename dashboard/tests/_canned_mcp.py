@@ -29,6 +29,13 @@ class CannedMCP:
       ``pagination`` envelope, matching ``test_active_tasks.py::_canned_mcp``:
       the unit's row read is unpaginated and the terminal window discards the
       envelope, so emitting one would fake a contract nothing here reads.
+    * ``get_tasks`` with ``fields`` projects each served row exactly as
+      ``fused_memory/backends/task_projection.py::TaskProjection.apply`` does
+      (PRD dashboard-prd-lanes §5.1): ``id`` always, the requested top-level
+      keys, and — when any ``metadata.<key>`` is requested — ``metadata``
+      holding only the requested keys PRESENT on the row. Requesting
+      ``metadata`` itself keeps the whole dict. Mirrored, not imported:
+      dashboard tests may not depend on fused-memory.
     * ``get_statuses`` slices a deterministic total order and answers with the
       five-key ``pagination`` envelope
       (``total``/``offset``/``page_size``/``returned``/``has_more``) exactly
@@ -58,6 +65,8 @@ class CannedMCP:
             disables it.
         task_delays: ``{int id: seconds}`` — how long ``get_task`` takes to
             answer for that id. Absent ids answer at once.
+        projection_delay: Seconds a ``get_tasks`` call carrying ``fields``
+            waits before answering. Zero answers at once.
 
     Mutable after construction so one instance can change behaviour between a
     test's two acquisitions. :attr:`fail_when` is a predicate over the
@@ -77,12 +86,14 @@ class CannedMCP:
         status_page_size: int | None = None,
         short_page_by: int = 0,
         task_delays: Mapping[int, float] | None = None,
+        projection_delay: float = 0.0,
     ) -> None:
         self.rows = [dict(row) for row in rows]
         self.status_map = dict(status_map or {})
         self.status_page_size = status_page_size
         self.short_page_by = short_page_by
         self.task_delays = dict(task_delays or {})
+        self.projection_delay = projection_delay
         self.fail_when: Callable[[dict], bool] = lambda call: False
         self.calls: list[dict] = []
         self.max_in_flight = 0
@@ -103,6 +114,8 @@ class CannedMCP:
         if tool == 'get_statuses':
             return self._statuses(args)
         if tool == 'get_tasks':
+            if args.get('fields') is not None:
+                await asyncio.sleep(self.projection_delay)
             return self._tasks(args)
         if tool == 'get_task':
             return await self._task(args)
@@ -139,6 +152,9 @@ class CannedMCP:
         if page_size is not None:
             start = args.get('offset') or 0
             selected = selected[start:start + page_size]
+        fields = args.get('fields')
+        if fields is not None:
+            selected = [_project(row, fields) for row in selected]
         return {'tasks': selected}
 
     async def _task(self, args: dict) -> dict:
@@ -156,6 +172,23 @@ class CannedMCP:
             'error': f'No tasks found for ID(s): {task_id}',
             'error_type': 'TaskNotFoundError',
         }
+
+
+_METADATA_FIELD_PREFIX = 'metadata.'
+
+
+def _project(row: dict, fields: list[str]) -> dict:
+    """*row* as α's ``TaskProjection.apply`` projects it for *fields*."""
+    row_keys = {'id'} | {entry for entry in fields if not entry.startswith(_METADATA_FIELD_PREFIX)}
+    projected = {key: value for key, value in row.items() if key in row_keys}
+    metadata_keys = [
+        entry.removeprefix(_METADATA_FIELD_PREFIX)
+        for entry in fields if entry.startswith(_METADATA_FIELD_PREFIX)
+    ]
+    if metadata_keys and 'metadata' not in row_keys:
+        metadata = row.get('metadata') or {}
+        projected['metadata'] = {key: metadata[key] for key in metadata_keys if key in metadata}
+    return projected
 
 
 def _raw_row(task_id, status, **overrides) -> dict:

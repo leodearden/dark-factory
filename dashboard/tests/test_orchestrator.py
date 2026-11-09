@@ -843,7 +843,7 @@ class TestReadMaxConcurrentTasks:
     def test_present_canonical_is_authoritative_even_without_the_key(self, tmp_path):
         """A canonical config that omits the key must NOT be masked by a legacy file.
 
-        Same rule config._discover_root_escalation_url documents: once the
+        Same rule config.discover_root_escalation_url documents: once the
         canonical file exists on disk it is authoritative, so a stale legacy
         spelling can never silently supply a cap the live config dropped.  The
         omitted key resolves to the orchestrator's own default — never to the

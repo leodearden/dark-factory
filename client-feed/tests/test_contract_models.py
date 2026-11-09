@@ -205,6 +205,14 @@ DEFECT_REPORTED: dict[str, Any] = {
     'restater': {'prompt_version': 'restate-v1'},
     'outcome': RESTATED,
 }
+DEFECT_RULED: dict[str, Any] = {
+    'seq': 3,
+    'at': AT,
+    'type': 'defect_ruled',
+    'block': 2,
+    'report': 1,
+    'kind': 'not_a_defect',
+}
 
 
 def event_dict(wire_type: str, seq: int = 1, **overrides: Any) -> dict[str, Any]:
@@ -246,6 +254,7 @@ NESTED_SAMPLES: list[tuple[str, dict[str, Any]]] = [
     ('Quarantined', QUARANTINED),
     ('Restater', {'prompt_version': 'restate-v1'}),
     ('DefectReported', DEFECT_REPORTED),
+    ('DefectRuled', DEFECT_RULED),
     (
         'EngagementProjection',
         {

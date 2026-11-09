@@ -39,7 +39,8 @@ each authority names how it is read:
   than client-promised, through
   ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``. Never
   ``MemoryService`` / ``GraphitiBackend``, whose handles can write.
-* **tasks.db** — an explicitly read-only ``file:...?mode=ro`` sqlite URI
+* **tasks.db** — ``shared/src/shared/tasks_db_readonly.py::connect_ro``, an
+  explicitly read-only ``file:...?mode=ro`` sqlite URI
   (:func:`_read_task_statuses_readonly`). NOT ``SqliteTaskBackend``: its read
   path opens a READ/WRITE connection and applies WAL pragmas plus a schema
   migration to whatever tasks.db it is pointed at, which for a cross-project
@@ -76,6 +77,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -84,6 +86,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.project_layout import tasks_db
+from shared.tasks_db_readonly import connect_ro
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.models.enums import MemoryCategory
@@ -1035,7 +1038,7 @@ _SQL_CHUNK = 500
 
 
 def _readonly_connect(db_path: Path) -> Any:
-    """Open *db_path* over an explicitly READ-ONLY sqlite URI.
+    """Open tickets.db at *db_path* over an explicitly READ-ONLY sqlite URI.
 
     ``mode=ro`` is enforced by sqlite itself: the connection cannot create the
     file, cannot migrate it, and cannot write a byte. That matters because this
@@ -1047,13 +1050,10 @@ def _readonly_connect(db_path: Path) -> Any:
     Raises on a missing/unopenable file; every caller maps that to
     UNVERIFIABLE rather than to an accusation.
 
-    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately:
-    ``fused-memory/scripts`` cannot import that ``scripts/`` sibling, this one
-    opener also serves tickets.db, and every caller degrades a failure to
-    UNVERIFIABLE, so a refusal's remedy would never reach the reader.
+    The task store opens through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro`` instead, whose
+    remedies are worded for a task store, so tickets.db keeps this opener.
     """
-    import sqlite3  # noqa: PLC0415
-
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5.0)
@@ -1072,15 +1072,17 @@ def _read_task_statuses_readonly(
 ) -> dict[str, str]:
     """Return ``{id: status}`` from *project_root*'s tasks.db, READ-ONLY.
 
-    Mirrors ``SqliteTaskBackend._statuses_from_conn``'s SQL and coercions
-    (backends/sqlite_task_backend.py:1576-1594) — same table, same ``tag``
-    filter, same int cast of the ids, same ``NULL`` -> ``'unknown'`` rule — but
-    over a connection that CANNOT write. Non-numeric ids are dropped exactly as
+    Mirrors the SQL and coercions of
+    ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_read_status_map``
+    — same table, same ``tag`` filter, same int cast of the ids, same ``NULL``
+    -> ``'unknown'`` rule — but over a ``connect_ro`` connection, which CANNOT
+    write and refuses a wrong file with a named reason. Non-numeric ids are dropped exactly as
     that helper drops them, and an id with no row is simply absent from the
     result, which the probe reports as unresolvable.
 
-    Raises on any sqlite failure; the caller maps that to UNVERIFIABLE for the
-    whole project rather than to a false accusation against its writers.
+    Raises on any sqlite failure or ``connect_ro`` refusal; the caller maps
+    that to UNVERIFIABLE for the whole project rather than to a false
+    accusation against its writers.
     """
     int_ids: list[str] = []
     for raw in ids:
@@ -1091,7 +1093,8 @@ def _read_task_statuses_readonly(
     if not int_ids:
         return {}
 
-    conn = _readonly_connect(tasks_db(project_root))
+    conn = connect_ro(tasks_db(project_root))
+    conn.row_factory = sqlite3.Row
     statuses: dict[str, str] = {}
     try:
         for chunk in _chunked(int_ids):
