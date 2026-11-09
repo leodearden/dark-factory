@@ -44,14 +44,12 @@ try:
     from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
-    from orchestrator.scheduler import Scheduler
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
     OrchestratorConfig: Any = None  # type: ignore[assignment,misc]
     InFlightMergeRegistry: Any = None  # type: ignore[assignment,misc]
     MergeOutcome: Any = None  # type: ignore[assignment,misc]
-    Scheduler: Any = None  # type: ignore[assignment,misc]
 
 
 pytestmark = [
@@ -530,9 +528,10 @@ class _GetTaskReplySession:
 
 
 def _real_scheduler_harness(tmp_path: Path, payload: dict[str, Any]) -> types.SimpleNamespace:
+    scheduler_mod = pytest.importorskip('orchestrator.scheduler')
     return types.SimpleNamespace(
         git_ops=_stub_git_ops(),
-        scheduler=Scheduler(
+        scheduler=scheduler_mod.Scheduler(
             OrchestratorConfig(project_root=tmp_path / 'repo'),
             mcp_session=_GetTaskReplySession(payload),
         ),
