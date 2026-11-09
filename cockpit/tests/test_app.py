@@ -542,8 +542,9 @@ class TestTimerIntegration:
 
     Everything in TestPollRefresh drives refresh_registry() directly. This
     test alone proves on_mount's set_interval wiring reaches disk end-to-end.
-    It waits on poll scans, not a wall-clock budget; the test body says why
-    two post-write scan starts bound the wait.
+    It waits on poll scans, not a wall-clock budget;
+    _wait_until_a_poll_scan_has_applied says why two post-write scan starts
+    bound the wait.
     """
 
     @pytest.mark.timeout(10)
@@ -562,13 +563,7 @@ class TestTimerIntegration:
             sr.write_record(record, root=tmp_path)
             starts_at_write = scanner.starts
 
-            # Poll scans never overlap, and each one's apply lands before the
-            # next can begin, so by the time a second post-write scan starts
-            # the first (which saw the record) is already on screen. The second
-            # half rests on cockpit/src/cockpit/app.py::CockpitApp._scan_registry_worker
-            # marshalling _apply_scan BEFORE its finally clears _scan_in_flight.
-            while table.row_count == 0 and scanner.starts < starts_at_write + 2:
-                await pilot.pause(app.poll_interval)
+            await _wait_until_a_poll_scan_has_applied(pilot, app, scanner, since=starts_at_write)
 
             assert table.row_count == 1, (
                 f'row_count={table.row_count} after '
