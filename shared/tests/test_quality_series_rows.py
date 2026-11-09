@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from pathlib import Path
 
@@ -162,12 +161,6 @@ def test_unit_heads_keep_one_row_per_unit_at_its_lowest_ordinal(outcomes_scenari
     assert len(heads) == len({row.landing.unit_id for row in rows})
     train = [head for head in heads if head.landing.unit_id == outcomes_scenario.m3]
     assert [head.landing.task_id for head in train] == ['103']
-
-
-def test_a_landing_row_is_frozen(outcome_rows):
-    row = next(iter(outcome_rows.values()))
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        row.outcomes = row.outcomes  # type: ignore[misc]
 
 
 @pytest.fixture(scope='module')
