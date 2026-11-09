@@ -9,7 +9,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import git_env_with_ceiling
 
-from orchestrator.verify_cache import tree_objects
+from orchestrator.verify_cache import tree_objects, workspace
 
 _ROOT_PYPROJECT = """\
 [project]
@@ -115,3 +115,117 @@ class TestTreeObjects:
         assert edited != tree
         assert after['alpha'] != before['alpha']
         assert after['beta'] == before['beta']
+
+    @pytest.mark.asyncio
+    async def test_directories_lists_every_directory_recursively(self, repo, tree):
+        assert set(await tree_objects.directories(repo, tree)) == {
+            'alpha', 'alpha/src', 'alpha/src/alpha', 'beta', 'docs', 'tools',
+        }
+
+
+def _member(name: str, dependencies: tuple[str, ...] = (), groups: str = '') -> str:
+    deps = ', '.join(f'"{dep}"' for dep in dependencies)
+    return f'[project]\nname = "{name}"\nversion = "0"\ndependencies = [{deps}]\n{groups}'
+
+
+def _root(*members: str, exclude: tuple[str, ...] = ()) -> str:
+    listed = ', '.join(f'"{member}"' for member in members)
+    excluded = ', '.join(f'"{member}"' for member in exclude)
+    return f'[tool.uv.workspace]\nmembers = [{listed}]\nexclude = [{excluded}]\n'
+
+
+_GRAPH_MEMBERS = {
+    'alpha': _member('Alpha', ('click>=8',)),
+    'beta': _member('beta', ('alpha[x]>=1; python_version>"3"',)),
+    'gamma': _member(
+        'gamma', groups='[dependency-groups]\ndev = [{include-group = "lint"}]\nlint = ["beta"]\n',
+    ),
+    'fused': _member('Fused_Memory'),
+    'epsilon': _member('epsilon', groups='[dependency-groups]\ndev = ["fused.memory"]\n'),
+}
+
+
+def _graph() -> workspace.WorkspaceGraph:
+    return workspace.WorkspaceGraph.from_manifests(_root(*_GRAPH_MEMBERS), _GRAPH_MEMBERS)
+
+
+class TestWorkspaceGraph:
+    def test_members_are_the_listed_workspace_members(self):
+        assert _graph().members == frozenset(_GRAPH_MEMBERS)
+
+    def test_a_member_name_is_pep_503_normalized(self):
+        assert _graph().names['fused'] == 'fused-memory'
+
+    def test_a_dependency_on_a_member_is_an_edge_whatever_its_specifier(self):
+        assert _graph().closure({'beta'}) == {'beta', 'alpha'}
+
+    def test_a_dependency_outside_the_workspace_is_no_edge(self):
+        assert _graph().closure({'alpha'}) == {'alpha'}
+
+    def test_a_dev_group_include_group_is_followed_transitively(self):
+        assert _graph().closure({'gamma'}) == {'gamma', 'beta', 'alpha'}
+
+    def test_a_dev_group_dependency_matches_by_normalized_name(self):
+        assert _graph().closure({'epsilon'}) == {'epsilon', 'fused'}
+
+    def test_an_include_group_cycle_terminates(self):
+        cyclic = {
+            'alpha': _member('alpha'),
+            'beta': _member(
+                'beta',
+                groups=(
+                    '[dependency-groups]\n'
+                    'dev = [{include-group = "lint"}, "alpha"]\n'
+                    'lint = [{include-group = "dev"}]\n'
+                ),
+            ),
+        }
+        graph = workspace.WorkspaceGraph.from_manifests(_root('alpha', 'beta'), cyclic)
+
+        assert graph.closure({'beta'}) == {'beta', 'alpha'}
+
+    def test_members_containing_matches_whole_path_segments(self):
+        assert _graph().members_containing(
+            {'beta/src/x.py', 'tests/scripts', 'alpha', 'alphabet/x.py'},
+        ) == {'beta', 'alpha'}
+
+    def test_a_root_without_a_workspace_is_an_empty_graph(self):
+        graph = workspace.WorkspaceGraph.from_manifests('[project]\nname = "solo"\n', {})
+
+        assert graph.members == frozenset()
+        assert graph.closure({'alpha'}) == frozenset()
+
+    def test_a_listed_member_without_a_pyproject_is_an_error_naming_it(self):
+        with pytest.raises(ValueError, match='beta'):
+            workspace.WorkspaceGraph.from_manifests(_root('alpha', 'beta'), {'alpha': _member('alpha')})
+
+    @pytest.mark.asyncio
+    async def test_read_workspace_reads_the_dispatched_tree(self, repo, tree):
+        graph = await workspace.read_workspace(repo, tree)
+
+        assert graph.closure({'beta'}) == {'alpha', 'beta'}
+
+    @pytest.mark.asyncio
+    async def test_a_glob_member_expands_against_the_trees_directories(self, tmp_path):
+        globbed = seed_repo(tmp_path / 'globbed', RepoSeed(
+            files=(
+                ('pyproject.toml', _root('pkgs/*', exclude=('pkgs/skip',))),
+                ('pkgs/one/pyproject.toml', _member('one')),
+                ('pkgs/one/sub/deeper/x.py', 'X = 1\n'),
+                ('pkgs/two/pyproject.toml', _member('two', ('one',))),
+                ('pkgs/skip/README.md', '# not a member\n'),
+            ),
+            message='globbed workspace',
+        ))
+        graph = await workspace.read_workspace(globbed, _git(globbed, 'rev-parse', 'HEAD^{tree}'))
+
+        assert graph.members == {'pkgs/one', 'pkgs/two'}
+        assert graph.closure({'pkgs/two'}) == {'pkgs/one', 'pkgs/two'}
+
+    @pytest.mark.asyncio
+    async def test_a_tree_without_a_root_pyproject_is_an_empty_graph(self, tmp_path):
+        bare = seed_repo(tmp_path / 'bare', RepoSeed(files=(('README.md', '# x\n'),), message='bare'))
+
+        graph = await workspace.read_workspace(bare, _git(bare, 'rev-parse', 'HEAD^{tree}'))
+
+        assert graph.members == frozenset()
