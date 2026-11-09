@@ -34,6 +34,10 @@ class Deviation(StrEnum):
     OFF_VOCABULARY = 'off_vocabulary'
 
 
+#: The name an off-contract issue intake is recorded under wherever it is seen:
+#: the verdict-tools fact journal's ``fact`` and the review gate's log ``event``.
+REVIEW_ISSUE_OFF_CONTRACT_FACT = 'review_issue_off_contract'
+
 #: Longest repr of a value a deviation description quotes, so the description
 #: fits the fact journal's per-item cap with its field path intact.
 DESCRIBED_VALUE_MAX_CHARS = 60

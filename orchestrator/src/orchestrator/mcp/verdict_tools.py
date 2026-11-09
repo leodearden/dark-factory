@@ -40,7 +40,11 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
-from orchestrator.review_issue_contract import IssueIntake, check_issues
+from orchestrator.review_issue_contract import (
+    REVIEW_ISSUE_OFF_CONTRACT_FACT,
+    IssueIntake,
+    check_issues,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +54,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION = 1
-
-#: The ``fact`` key of the journal line recording an off-contract issue intake,
-#: which shares the verdict-tools fact journal with the markup guard's facts.
-REVIEW_ISSUE_OFF_CONTRACT_FACT = 'review_issue_off_contract'
 
 
 def _envelope(role: str, session_id: str, payload: dict) -> dict:
