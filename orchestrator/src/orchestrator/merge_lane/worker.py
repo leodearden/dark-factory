@@ -13943,7 +13943,7 @@ class SpeculativeMergeWorker:
         if self._event_store:
             self._event_store.emit(
                 event_type, task_id=task_id, phase='merge',
-                data={k: str(v) for k, v in data.items()},
+                data={k: None if v is None else str(v) for k, v in data.items()},
             )
 
     def _note_verify_completed(
@@ -13975,9 +13975,16 @@ class SpeculativeMergeWorker:
         )
 
     def _emit_verdict_voided(
-        self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: VoidPoint,
+        self,
+        req: MergeRequest,
+        item: SpeculativeItem,
+        dead_link: str,
+        *,
+        point: VoidPoint,
+        anchor: RemergeBase | None = None,
     ) -> None:
-        """Emit ``verdict_voided`` with the voided item's commit and its base's killer.
+        """Emit ``verdict_voided`` with the voided item's commit, its base's
+        killer, and the *anchor* its replacement is re-merged onto.
 
         Not through :meth:`_emit_speculative`, which str()-ifies every value:
         ``killer`` is a nested ``{site, task_id}`` object.  Call it before the
@@ -13997,6 +14004,7 @@ class SpeculativeMergeWorker:
                     item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
                 ),
                 'killer': killer.to_wire() if killer is not None else None,
+                **(anchor.to_wire() if anchor is not None else {}),
             },
         )
 
@@ -20496,12 +20504,11 @@ class SpeculativeMergeWorker:
             return None
 
         # Capture the speculative flag BEFORE any _remerge reassignment so
-        # the InflightEntry carries the ORIGINAL speculative state for slot
-        # release (same pattern as old loop's item_was_speculative).
-        # item_permit travels alongside it (η) — _remerge always returns a
-        # non-speculative item (see the LATE-ARRIVAL ATTACH SYMMETRY note in
-        # the cascade handler above), so the ORIGINAL item's permit is the
-        # one this dispatch must release.
+        # the InflightEntry carries the ORIGINAL speculative state (same
+        # pattern as old loop's item_was_speculative).  item_permit (η)
+        # follows the item instead: a re-merge below rebinds it to the
+        # replacement's permit, which its claim decided
+        # (plans/merge-lane-policy-prd.md D1).
         item_was_speculative = item.speculative
         item_permit = item.permit
         iteration_did_remerge = False
@@ -20514,7 +20521,7 @@ class SpeculativeMergeWorker:
         # Mechanism-2 staleness re-merge (gated on `not _has_inflight_verify`) and
         # burned a 43-min verify on a base that had already been re-merged away.
         # If THIS item's base is a KNOWN-DEAD commit, discard the doomed build and
-        # re-merge it against real main instead of acquiring a host — this is the
+        # re-merge it onto its claimed base instead of acquiring a host — this is the
         # correctness backstop, the head-failure cascade's _record_dead_base being
         # the fast prompt-invalidation optimization (PRD §3.3).  Depth-agnostic: a
         # live deep base returns None from _chain_dead_link (untouched → normal
@@ -20562,11 +20569,14 @@ class SpeculativeMergeWorker:
             # merge_wt is a required non-None Path on a RealMergeItem (task ο);
             # _chain_dead_link returned non-None → item is a RealMergeItem here.
             await self._cleanup_owned_merge_worktree(item.merge_wt)
-            self._emit_verdict_voided(req, item, _dispatch_dead, point=VoidPoint.DISPATCH)
+            claim = self._claim_remerge_base(item, _dispatch_main, item_permit)
+            self._emit_verdict_voided(
+                req, item, _dispatch_dead, point=VoidPoint.DISPATCH, anchor=claim.anchor,
+            )
             logger.info(
                 'Task %s: dead-base straggler at dispatch (dead link %s) — '
-                're-merging against actual main instead of burning a verify',
-                req.task_id, _dispatch_dead,
+                're-merging (%s) instead of burning a verify',
+                req.task_id, _dispatch_dead, claim.anchor.reason.value,
             )
             # INV-3 dangling-edge fix (task 2885, enforcement (c) parity):
             # this doomed build's OWN merge commit is orphaned by the re-merge
@@ -20576,12 +20586,9 @@ class SpeculativeMergeWorker:
             # and the Mechanism-2 staleness discard just below), all of which
             # record the old commit dead for the identical reason.
             self._record_item_commit_dead(item, DeadBaseSite.DISPATCH_VOID)
-            # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
-            # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
-            # flesh: it exists to ESCAPE a base known dead, and
-            # frozen_prefix_tip() can itself BE that dead commit — re-merging
-            # onto the frozen tip here would be a churn loop.
-            item = await self._remerge(req, item.started_monotonic)
+            # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+            item = await self._remerge(req, item.started_monotonic, claim=claim)
+            item_permit = item.permit
             self._note_transition(
                 req.request_id, ItemLifecycleState.MERGING,
                 ItemLifecycleState.DISPATCHING, live_obj=item,
@@ -20601,8 +20608,9 @@ class SpeculativeMergeWorker:
                     started_at=self._clock.now(),
                     permit=item_permit,
                 )
-            # item: RealMergeItem re-based on live main — falls through to the
-            # normal host-acquire + verify dispatch below (no longer dead-based).
+            # item: RealMergeItem re-based on its claimed anchor — falls through
+            # to the normal host-acquire + verify dispatch below (no longer
+            # dead-based).
 
         # ── Chain re-merge (Mechanism 2 + chain-invalidation) ──────────────
         # Only when no REAL verify task is running (predecessor already finalized).
@@ -20633,8 +20641,8 @@ class SpeculativeMergeWorker:
         #
         # (c) Predecessor A FAILED before B dispatched:
         #     → _has_inflight_verify False, _n_failed=True.
-        #     → First branch fires with reason=previous_failed → _remerge vs
-        #       actual main → existing head-failure cascade invalidates B
+        #     → First branch fires with reason=previous_failed → _remerge onto
+        #       its claimed base → existing head-failure cascade invalidates B
         #       (DONE-WHEN 4, task 1862; tested by step-5/step-6).
         #
         # The `not item.speculative` γ guard on Mechanism 2 is the speculative
@@ -20698,23 +20706,23 @@ class SpeculativeMergeWorker:
                 # merge_wt is a required non-Optional Path on RealMergeItem — no
                 # truthy guard needed here (task ο).
                 await self._cleanup_owned_merge_worktree(item.merge_wt)
+                claim = self._claim_remerge_base(item, _dispatch_main, item_permit)
                 self._emit_speculative(
                     EventType.speculative_discard, req.task_id,
-                    reason=remerge_reason,
+                    reason=remerge_reason, **claim.anchor.to_wire(),
                 )
                 logger.info(
-                    'Task %s: discarding stale merge (%s), re-merging against actual main',
-                    req.task_id, remerge_reason,
+                    'Task %s: discarding stale merge (%s), re-merging (%s)',
+                    req.task_id, remerge_reason, claim.anchor.reason.value,
                 )
                 # INV-3 dangling-edge fix (task 2885 step-10, enforcement (c)):
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
                 # by the dispatch-time dead-base re-check.
                 self._record_item_commit_dead(item, DeadBaseSite.STALE_DISCARD)
-                # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
-                # staleness / chain-invalidation: targets real main, not
-                # frozen_prefix_tip().  PRD §5.3.
-                item = await self._remerge(req, item.started_monotonic)
+                # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+                item = await self._remerge(req, item.started_monotonic, claim=claim)
+                item_permit = item.permit
                 # MQ-reliability kappa (task 2169): "then back" — regardless of
                 # whether the re-merged item now falls through to a passthrough
                 # outcome (-> TERMINAL, wired by a later step) or proceeds to a

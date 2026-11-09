@@ -103,7 +103,7 @@
     "orchestrator/src/orchestrator/merge_lane/types.py": {"cognitive": 91, "function_local_imports": 0, "lines": 2351, "prose_lines": 1131, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/verify_base_detector.py": {"cognitive": 6, "function_local_imports": 0, "lines": 122, "prose_lines": 20, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/verify_cancellation.py": {"cognitive": 14, "function_local_imports": 0, "lines": 129, "prose_lines": 30, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/worker.py": {"cognitive": 1953, "function_local_imports": 2, "lines": 21214, "prose_lines": 11546, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/worker.py": {"cognitive": 1953, "function_local_imports": 2, "lines": 21222, "prose_lines": 11541, "reexport_names": 0},
     "orchestrator/src/orchestrator/offline_lane.py": {"cognitive": 34, "function_local_imports": 0, "lines": 380, "prose_lines": 174, "reexport_names": 0},
     "orchestrator/src/orchestrator/recover_main.py": {"cognitive": 3, "function_local_imports": 0, "lines": 79, "prose_lines": 26, "reexport_names": 0},
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 76, "function_local_imports": 0, "lines": 933, "prose_lines": 492, "reexport_names": 0},
