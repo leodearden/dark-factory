@@ -12,8 +12,9 @@ DS-2's ``enforce_transition``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
+from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState, VerifyBaseline
 
 __all__ = [
@@ -21,7 +22,9 @@ __all__ = [
     'DeployState',
     'VerifyBaseline',
     'IllegalDeployTransition',
+    'SCHEDULED_DEPLOY_PROVENANCE_KIND',
     'TransitionEscalationSink',
+    'awaits_scheduled_restart',
     'enforce_transition',
     'is_legal_transition',
 ]
@@ -70,12 +73,43 @@ _LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
     # scheduled -> escalated: an act-then-ask self-restart files its gate
     # escalation right after the detached restart is scheduled.
     (DeployPhase.SCHEDULED, DeployPhase.ESCALATED): True,
+    # scheduled -> verified: the settler observed the scheduled restart land.
+    (DeployPhase.SCHEDULED, DeployPhase.VERIFIED): True,
+    # scheduled -> failed: the settler observed the transient fail at fire time.
+    (DeployPhase.SCHEDULED, DeployPhase.FAILED): True,
 }
+
+SCHEDULED_DEPLOY_PROVENANCE_KIND = 'deterministic-deploy-scheduled'
+
+_RESTART_LANDED_PHASES = frozenset({DeployPhase.VERIFIED, DeployPhase.DONE})
 
 
 def is_legal_transition(old: DeployPhase, new: DeployPhase) -> bool:
     """Whether ``old -> new`` is a legal deploy-phase transition."""
     return _LEGAL.get((old, new), False)
+
+
+def awaits_scheduled_restart(metadata: object) -> bool:
+    """Whether a done task is a scheduled self-deploy whose restart has not landed.
+
+    A self-target deploy goes done when its restart is only scheduled; its
+    dependents wait until ``deploy_state.phase`` reaches VERIFIED or DONE,
+    which ``orchestrator/src/orchestrator/scheduled_deploy_settle.py`` writes.
+    A record with no ``deploy_state`` slice predates DS-1 and nothing can ever
+    advance it, so it does not hold; an unreadable slice holds.
+    """
+    if not isinstance(metadata, Mapping):
+        return False
+    provenance = metadata.get('done_provenance')
+    if not isinstance(provenance, Mapping) or provenance.get('kind') != SCHEDULED_DEPLOY_PROVENANCE_KIND:
+        return False
+    if 'deploy_state' not in metadata:
+        return False
+    try:
+        state = DeployState.from_metadata(metadata)
+    except ValidationError:
+        return True
+    return state is None or state.phase not in _RESTART_LANDED_PHASES
 
 
 class IllegalDeployTransition(RuntimeError):
