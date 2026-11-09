@@ -14,7 +14,6 @@ import json
 import pytest
 
 from shared.task_read import (
-    TASK_NOT_FOUND_ERROR_TYPE,
     TaskAbsent,
     TaskFound,
     TaskReadFailed,
@@ -50,7 +49,7 @@ def _is_error_body(payload: object) -> dict:
 
 
 ROW = {'id': '4888', 'status': 'pending', 'metadata': {'merge_lane': 'high'}}
-NOT_FOUND = {'error': 'any wording at all', 'error_type': TASK_NOT_FOUND_ERROR_TYPE}
+NOT_FOUND = {'error': 'any wording at all', 'error_type': 'TaskNotFoundError'}
 
 ENVELOPES = [_body, _structured_body]
 ENVELOPE_IDS = ['text_only', 'structured_content']
@@ -73,9 +72,6 @@ class TestTaskFound:
 
 
 class TestTaskAbsent:
-    def test_the_absence_error_type_is_task_not_found_error(self):
-        assert TASK_NOT_FOUND_ERROR_TYPE == 'TaskNotFoundError'
-
     @pytest.mark.parametrize('envelope', ENVELOPES, ids=ENVELOPE_IDS)
     def test_a_task_not_found_reply_is_absence(self, envelope):
         assert parse_get_task_result(envelope(NOT_FOUND)) == TaskAbsent()
