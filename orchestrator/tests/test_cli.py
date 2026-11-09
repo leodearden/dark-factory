@@ -539,7 +539,6 @@ def _wire_run_with_fake_harness(monkeypatch, fake_report):
 
     fake_harness = MagicMock()
     # AsyncMock so `await harness.run(...)` inside the real _main resolves.
-    from unittest.mock import AsyncMock
     fake_harness.run = AsyncMock(return_value=fake_report)
     monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
     return fake_harness
