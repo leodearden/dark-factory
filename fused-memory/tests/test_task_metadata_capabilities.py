@@ -43,12 +43,6 @@ async def test_an_error_status_carries_no_capabilities() -> None:
     assert 'task_metadata_capabilities' not in result
 
 
-@pytest.fixture(autouse=True)
-def passthrough_main_checkout(monkeypatch):
-    """These project roots are not git worktrees, so the real resolver would refuse them."""
-    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
-
-
 async def test_an_unknown_before_done_key_is_refused_at_submit(tmp_path: Path) -> None:
     script = tmp_path / 'run.sh'
     script.write_text('#!/bin/sh\nexit 0\n')

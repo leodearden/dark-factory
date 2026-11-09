@@ -5,6 +5,10 @@ by ``create_mcp_server``, so a test drives ``server._tool_manager.call_tool``
 against persisted rows. Import it as ``from _hermetic_task_stack import
 hermetic_task_stack``.
 
+The store's project root is *tmp_path*, which is not a git worktree, so for the
+stack's lifetime ``fused_memory.server.tools.resolve_main_checkout`` hands every
+project root back unchanged instead of refusing it.
+
 ``config.taskmaster`` is cleared so the curator's one-shot corpus backfill
 never fires, which keeps the stack hermetic whatever the ambient
 fused-memory/config/config.yaml says. That clearing is what sets it apart from
@@ -17,7 +21,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
@@ -40,8 +44,13 @@ async def hermetic_task_stack(tmp_path: Path) -> AsyncIterator[tuple[Any, TaskIn
     config.taskmaster = None
     interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
     try:
-        yield create_mcp_server(AsyncMock(), task_interceptor=interceptor), interceptor
+        with patch('fused_memory.server.tools.resolve_main_checkout', _project_root_unchanged):
+            yield create_mcp_server(AsyncMock(), task_interceptor=interceptor), interceptor
     finally:
         await interceptor.close()
         await event_buffer.close()
         await backend.close()
+
+
+def _project_root_unchanged(project_root: str | Path) -> str:
+    return str(project_root)

@@ -13,9 +13,10 @@ import logging
 from typing import Any
 
 import pytest
+from _fake_metadata_lookup_source import FakeMetadataLookupSource
 from shared.task_statuses import ACTIVE
 
-from fused_memory.backends.task_backend_types import MetadataLookupResult, MetadataLookupRow
+from fused_memory.backends.task_backend_types import MetadataLookupRow
 from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
 
 pytestmark = pytest.mark.asyncio
@@ -38,50 +39,6 @@ def _row(task_id: int, status: str, matched_value: object) -> MetadataLookupRow:
     }
 
 
-class _FakeSource:
-    """Serves *rows* by offset, at most *page_cap* per page, and records each call."""
-
-    def __init__(
-        self,
-        rows: list[MetadataLookupRow],
-        *,
-        page_cap: int | None = None,
-        malformed_ids: list[int] | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.rows = rows
-        self.page_cap = page_cap
-        self.malformed_ids = malformed_ids or []
-        self.error = error
-        self.calls: list[dict[str, Any]] = []
-
-    async def find_tasks_by_metadata(
-        self,
-        project_root: str,
-        key: str,
-        value: str | int | None = None,
-        *,
-        statuses: list[str] | None = None,
-        limit: int = 50,
-        offset: int = 0,
-        tag: str | None = None,
-        include_value: bool = False,
-    ) -> MetadataLookupResult:
-        self.calls.append({
-            'project_root': project_root, 'key': key, 'value': value, 'statuses': statuses,
-            'limit': limit, 'offset': offset, 'tag': tag, 'include_value': include_value,
-        })
-        if self.error is not None:
-            raise self.error
-        size = limit if self.page_cap is None else min(limit, self.page_cap)
-        return {
-            'results': self.rows[offset:offset + size],
-            'total': len(self.rows),
-            'tasks_with_key': len(self.rows),
-            'malformed_metadata_ids': list(self.malformed_ids),
-        }
-
-
 def _open_review_p1(**fields: str) -> list[MetadataLookupRow]:
     return [
         _row(11, 'pending', _chain('completion_gate', 'review-p-1', **fields)),
@@ -94,13 +51,13 @@ def _submission(role: str = 'completion_gate', run_id: str = 'review-p-2', **cha
 
 
 async def _check(
-    metadata: str | dict[str, Any] | None, source: _FakeSource, tag: str | None = None
+    metadata: str | dict[str, Any] | None, source: FakeMetadataLookupSource, tag: str | None = None
 ) -> dict[str, Any] | None:
     return await trigger_chain_open_error(metadata, '/p', source=source, tag=tag)
 
 
 async def test_an_open_chain_of_the_same_skill_refuses() -> None:
-    result = await _check(_submission(), _FakeSource(_open_review_p1()))
+    result = await _check(_submission(), FakeMetadataLookupSource(_open_review_p1()))
     assert result is not None
     assert result['error_type'] == 'TriggerChainOpen'
     assert result['open_chain'] == [
@@ -114,24 +71,24 @@ async def test_an_open_chain_of_the_same_skill_refuses() -> None:
 
 
 async def test_a_superseded_chain_does_not_refuse() -> None:
-    source = _FakeSource(_open_review_p1(superseded_by='review-p-2'))
+    source = FakeMetadataLookupSource(_open_review_p1(superseded_by='review-p-2'))
     assert await _check(_submission(), source) is None
 
 
 async def test_the_runs_own_chain_does_not_refuse() -> None:
-    source = _FakeSource(_open_review_p1()[:1])
+    source = FakeMetadataLookupSource(_open_review_p1()[:1])
     assert await _check(_submission('human_gate', 'review-p-1'), source) is None
 
 
 async def test_another_skills_chain_does_not_refuse() -> None:
     rows = [_row(21, 'pending', _chain('completion_gate', 'hotspot-survey-p-1', skill='hotspot-survey'))]
-    assert await _check(_submission(), _FakeSource(rows)) is None
+    assert await _check(_submission(), FakeMetadataLookupSource(rows)) is None
 
 
 @pytest.mark.parametrize('status', ['done', 'cancelled'])
 async def test_a_terminal_row_the_source_returns_does_not_refuse(status: str) -> None:
     rows = [_row(13, status, _chain('completion_gate', 'review-p-1'))]
-    assert await _check(_submission(), _FakeSource(rows)) is None
+    assert await _check(_submission(), FakeMetadataLookupSource(rows)) is None
 
 
 async def test_an_open_row_on_a_later_page_still_refuses() -> None:
@@ -139,7 +96,7 @@ async def test_an_open_row_on_a_later_page_still_refuses() -> None:
         _row(11, 'pending', _chain('completion_gate', 'review-p-1', superseded_by='review-p-2')),
         _row(12, 'deferred', _chain('human_gate', 'review-p-1')),
     ]
-    source = _FakeSource(rows, page_cap=1)
+    source = FakeMetadataLookupSource(rows, page_cap=1)
     result = await _check(_submission(), source)
     assert result is not None
     assert [entry['id'] for entry in result['open_chain']] == ['12']
@@ -147,14 +104,14 @@ async def test_an_open_row_on_a_later_page_still_refuses() -> None:
 
 
 async def test_a_submission_without_a_chain_never_reads() -> None:
-    source = _FakeSource(_open_review_p1())
+    source = FakeMetadataLookupSource(_open_review_p1())
     assert await _check({'x_note': 'unrelated'}, source) is None
     assert await _check(None, source) is None
     assert source.calls == []
 
 
 async def test_the_guard_owns_its_query() -> None:
-    source = _FakeSource([])
+    source = FakeMetadataLookupSource([])
     assert await _check(_submission(), source, tag='feature') is None
     assert len(source.calls) == 1
     call = source.calls[0]
@@ -167,24 +124,35 @@ async def test_the_guard_owns_its_query() -> None:
 
 
 async def test_a_read_error_fails_open_with_a_warning(caplog) -> None:
-    source = _FakeSource([], error=RuntimeError('store unavailable'))
+    source = FakeMetadataLookupSource([], error=RuntimeError('store unavailable'))
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         assert await _check(_submission(), source) is None
     assert 'fail-open' in caplog.text
+
+
+async def test_a_page_the_guard_cannot_collate_raises_instead_of_failing_open() -> None:
+    class _FieldRenamed(FakeMetadataLookupSource):
+        async def find_tasks_by_metadata(self, *args: Any, **kwargs: Any) -> Any:
+            page = await super().find_tasks_by_metadata(*args, **kwargs)
+            kept = {key: value for key, value in page.items() if key != 'malformed_metadata_ids'}
+            return {**kept, 'malformed_ids': page['malformed_metadata_ids']}
+
+    with pytest.raises(KeyError, match='malformed_metadata_ids'):
+        await _check(_submission(), _FieldRenamed(_open_review_p1()))
 
 
 @pytest.mark.parametrize('bad', ['review', {'role': 'human_gate', 'run_id': 'review-p-1'}])
 async def test_an_unreadable_stored_chain_is_skipped_with_a_warning(caplog, bad: object) -> None:
     rows = [_row(31, 'pending', bad), *_open_review_p1()]
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        result = await _check(_submission(), _FakeSource(rows))
+        result = await _check(_submission(), FakeMetadataLookupSource(rows))
     assert result is not None
     assert [entry['id'] for entry in result['open_chain']] == ['11', '12']
     assert '31' in caplog.text
 
 
 async def test_malformed_metadata_ids_are_warned(caplog) -> None:
-    source = _FakeSource([], malformed_ids=[41, 42])
+    source = FakeMetadataLookupSource([], malformed_ids=[41, 42])
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         assert await _check(_submission(), source) is None
     assert '41' in caplog.text
@@ -192,18 +160,13 @@ async def test_malformed_metadata_ids_are_warned(caplog) -> None:
 
 
 async def test_an_incomplete_read_is_warned(caplog) -> None:
-    class _Shrinking(_FakeSource):
-        async def find_tasks_by_metadata(self, *args: Any, **kwargs: Any) -> MetadataLookupResult:
-            page = await super().find_tasks_by_metadata(*args, **kwargs)
-            return {**page, 'total': page['total'] + 3}
-
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        assert await _check(_submission(), _Shrinking([])) is None
+        assert await _check(_submission(), FakeMetadataLookupSource([], total=3)) is None
     assert 'incomplete' in caplog.text
 
 
 async def test_json_string_metadata_is_judged_as_the_dict() -> None:
-    source = _FakeSource(_open_review_p1())
+    source = FakeMetadataLookupSource(_open_review_p1())
     as_dict = await _check(_submission(), source)
     as_json = await _check(json.dumps(_submission()), source)
     assert as_dict is not None
@@ -211,6 +174,6 @@ async def test_json_string_metadata_is_judged_as_the_dict() -> None:
 
 
 async def test_a_malformed_submission_is_left_to_the_deterministic_guard() -> None:
-    source = _FakeSource(_open_review_p1())
+    source = FakeMetadataLookupSource(_open_review_p1())
     assert await _check(_submission(skill='/review'), source) is None
     assert source.calls == []

@@ -21,12 +21,6 @@ from _hermetic_task_stack import hermetic_task_stack
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture(autouse=True)
-def passthrough_main_checkout(monkeypatch):
-    """These project roots are not git worktrees, so the real resolver would refuse them."""
-    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
-
-
 @pytest.fixture
 def project_root(tmp_path: Path) -> str:
     script = tmp_path / 'scripts' / 'check.py'

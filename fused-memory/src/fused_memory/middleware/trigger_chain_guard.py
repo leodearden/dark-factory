@@ -2,11 +2,12 @@
 
 PRD plans/completion-driven-triggers-prd.md C2: a chain task is refused while
 another run of the same skill has a non-terminal, unsuperseded chain task in
-the project. On a read error the guard fails OPEN with a WARNING, under the
-``no-silent-fail-soft`` waiver recorded in the PRD's §10 γ row: the cost is one
-duplicate chain, which the next run's supersede retires. Two concurrent chain
-submissions can both pass the read (TOCTOU), the bounded residual task 3588's
-guard also carries.
+the project. When the store read raises, the guard fails OPEN with a WARNING,
+under the ``no-silent-fail-soft`` waiver recorded in the PRD's §10 γ row: the
+cost is one duplicate chain, which the next run's supersede retires. A page the
+guard cannot collate is a code-contract break, not a store error, and raises.
+Two concurrent chain submissions can both pass the read (TOCTOU), the bounded
+residual task 3588's guard also carries.
 """
 
 from __future__ import annotations
@@ -21,10 +22,11 @@ from shared.task_metadata import TRIGGER_CHAIN_KEY, TriggerChain
 from shared.task_statuses import ACTIVE, TERMINAL
 
 from fused_memory.backends.metadata_lookup_pages import (
+    LOOKUP_PAGE_SIZE,
     MetadataLookupSource,
     metadata_lookup_pages,
 )
-from fused_memory.backends.task_backend_types import MetadataLookupRow
+from fused_memory.backends.task_backend_types import MetadataLookupResult, MetadataLookupRow
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
@@ -116,14 +118,15 @@ async def trigger_chain_open_error(
     """Refuse a chain task while another run's chain of the same skill is open.
 
     ``None`` for a submission without a valid ``trigger_chain`` (the
-    deterministic guard owns its shape) and, failing open, on a read error.
+    deterministic guard owns its shape) and, failing open, when the store read
+    raises.
     """
     submission = _submitted_chain(metadata)
     if submission is None:
         return None
     try:
-        rows = await _read_chain_rows(source, project_root, tag)
-    except Exception:
+        rows = await _read_chain_rows(_StoreReadErrorSource(source), project_root, tag)
+    except _StoreReadError:
         logger.warning(
             'trigger_chain_guard fail-open: the trigger_chain read failed for %s; '
             'the submission is accepted unchecked',
@@ -151,6 +154,48 @@ def _submitted_chain(metadata: str | dict[str, Any] | None) -> TriggerChain | No
         return TriggerChain.model_validate(raw)
     except (ValidationError, TypeError):
         return None
+
+
+class _StoreReadError(Exception):
+    """The store's own ``find_tasks_by_metadata`` raised; the one failure the guard fails open on."""
+
+
+@dataclass(frozen=True)
+class _StoreReadErrorSource:
+    """*source*, with what its read raises re-raised as :class:`_StoreReadError`.
+
+    A call the source's signature refuses raises before the read starts, so a
+    drifted signature propagates rather than failing the guard open.
+    """
+
+    source: MetadataLookupSource
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = LOOKUP_PAGE_SIZE,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        read = self.source.find_tasks_by_metadata(
+            project_root,
+            key,
+            value,
+            statuses=statuses,
+            limit=limit,
+            offset=offset,
+            tag=tag,
+            include_value=include_value,
+        )
+        try:
+            return await read
+        except Exception as exc:
+            raise _StoreReadError from exc
 
 
 async def _read_chain_rows(

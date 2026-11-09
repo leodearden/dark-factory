@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from _fake_metadata_lookup_source import FakeMetadataLookupSource
 
 from fused_memory.backends.metadata_lookup_pages import metadata_lookup_pages
 from fused_memory.backends.task_backend_types import MetadataLookupResult, MetadataLookupRow
@@ -24,43 +25,13 @@ def _row(task_id: int) -> MetadataLookupRow:
     }
 
 
-class _FakeSource:
-    def __init__(self, rows: list[MetadataLookupRow], *, total: int | None = None) -> None:
-        self.rows = rows
-        self.total = len(rows) if total is None else total
-        self.calls: list[dict[str, Any]] = []
-
-    async def find_tasks_by_metadata(
-        self,
-        project_root: str,
-        key: str,
-        value: str | int | None = None,
-        *,
-        statuses: list[str] | None = None,
-        limit: int = 50,
-        offset: int = 0,
-        tag: str | None = None,
-        include_value: bool = False,
-    ) -> MetadataLookupResult:
-        self.calls.append({
-            'project_root': project_root, 'key': key, 'value': value, 'statuses': statuses,
-            'limit': limit, 'offset': offset, 'tag': tag, 'include_value': include_value,
-        })
-        return {
-            'results': self.rows[offset:offset + limit],
-            'total': self.total,
-            'tasks_with_key': self.total,
-            'malformed_metadata_ids': [],
-        }
-
-
-async def _collect(source: _FakeSource, **kwargs: Any) -> list[MetadataLookupResult]:
+async def _collect(source: FakeMetadataLookupSource, **kwargs: Any) -> list[MetadataLookupResult]:
     return [page async for page in metadata_lookup_pages(source, '/p', 'k', **kwargs)]
 
 
 @pytest.mark.asyncio
 async def test_pages_to_the_end_in_task_order() -> None:
-    source = _FakeSource([_row(i) for i in range(1, 6)])
+    source = FakeMetadataLookupSource([_row(i) for i in range(1, 6)])
     pages = await _collect(source, page_size=2)
     assert len(pages) == 3
     assert [row['task_id'] for page in pages for row in page['results']] == [1, 2, 3, 4, 5]
@@ -69,7 +40,7 @@ async def test_pages_to_the_end_in_task_order() -> None:
 
 @pytest.mark.asyncio
 async def test_query_is_forwarded_unchanged_on_every_call() -> None:
-    source = _FakeSource([_row(i) for i in range(1, 4)])
+    source = FakeMetadataLookupSource([_row(i) for i in range(1, 4)])
     await _collect(
         source, statuses=['pending', 'deferred'], include_value=True, tag='t', page_size=2,
     )
@@ -86,7 +57,7 @@ async def test_query_is_forwarded_unchanged_on_every_call() -> None:
 
 @pytest.mark.asyncio
 async def test_zero_matches_yield_one_empty_page() -> None:
-    pages = await _collect(_FakeSource([]))
+    pages = await _collect(FakeMetadataLookupSource([]))
     assert len(pages) == 1
     assert pages[0]['results'] == []
     assert pages[0]['total'] == 0
@@ -94,7 +65,7 @@ async def test_zero_matches_yield_one_empty_page() -> None:
 
 @pytest.mark.asyncio
 async def test_a_corpus_that_shrank_mid_read_stops() -> None:
-    source = _FakeSource([_row(1)], total=5)
+    source = FakeMetadataLookupSource([_row(1)], total=5)
     pages = await _collect(source, page_size=1)
     assert [len(page['results']) for page in pages] == [1, 0]
     assert len(source.calls) == 2
