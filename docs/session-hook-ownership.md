@@ -74,6 +74,12 @@ marked exited only after `t3_thread_read` answers that it is gone or
 archived, because the listing omits live side-chat threads (T3 v0.1.6
 `ThreadManagementService.ts::listProjectThreads`). After one unreachable read,
 a sweep reads no further thread and marks none of them.
+A hand-claimed record has no `t3_environment_id`: T3 passes a thread's
+processes `T3CODE_THREAD_ID` only (T3 v0.1.6 `ClaudeAdapterV2.ts`), and the
+sweep treats an unset environment as its own. So every environment's lane
+sweeps hand-claimed records. With two T3 environments on one fleet root, one
+lane's read can find the other's live thread missing and mark its record
+exited. The record's next hook event then revives it.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::hook_session_slug`,
 `::_resolve_hook_slug`, `::_pointer_resolution`, `::_stamp_session_pointers`;
