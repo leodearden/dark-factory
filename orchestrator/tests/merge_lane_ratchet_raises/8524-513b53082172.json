@@ -1,0 +1,24 @@
+{
+  "task_id": "8524",
+  "reason": "step-14: _record_dead_base hands each recorded commit to SpeculationController.on_base_invalidated with the merger's live tip (plans/merge-lane-policy-prd.md D2), a second loop over the recorded shas",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1949,
+      "current": 1950
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_record_dead_base",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5116,
+      "current": 5117
+    }
+  ]
+}

@@ -155,6 +155,7 @@ from orchestrator.merge_lane.ports import (
 )
 from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
+    choose_remerge_base,
     claim_remerge_base,
     frontier_tip,
 )
@@ -10642,9 +10643,24 @@ class SpeculativeMergeWorker:
         void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
         *killer* names that site; the ledger keeps a commit's first killer.
+        Each commit is then handed to the merger's re-anchor hook,
+        :meth:`SpeculationController.on_base_invalidated`
+        (plans/merge-lane-policy-prd.md D2).
         """
         for sha in shas:
             self._dead_base_commits.record(sha, killer)
+        live_tip = self._merger_live_tip()
+        for sha in shas:
+            self._speculation_controller.on_base_invalidated(sha, live_tip)
+
+    def _merger_live_tip(self) -> str | None:
+        """The frontier tip the merger may stack on, or None.  Reads no main,
+        so :meth:`_record_dead_base` stays synchronous."""
+        frontier = self._verify_frontier_entries()
+        return choose_remerge_base(
+            '', frontier_tip(frontier) or '', self._dead_base_commits, frontier,
+            permit_available=True,
+        ).tip
 
     def _record_item_commit_dead(self, item: SpeculativeItem, site: DeadBaseSite) -> None:
         """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
