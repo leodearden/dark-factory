@@ -13,6 +13,7 @@ thread list, read and wait results).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -269,17 +270,33 @@ def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
     return str(record_dir)
 
 
-def stale_t3_record(env: Env, *, environment_id: str | None = None) -> str:
+def stale_t3_record(
+    env: Env,
+    *,
+    environment_id: str | None = None,
+    slug: str = 'sibling-df-1-1',
+    thread_id: str = 'th-vanished',
+) -> str:
     """A live, indexed t3 record of ``env.project`` whose thread no listing names."""
-    record_dir = spawn_record(env, 'sibling-df-1-1')
-    record = sr.read_record('sibling-df-1-1', root=env.fleet)
+    record_dir = spawn_record(env, slug)
+    record = sr.read_record(slug, root=env.fleet)
     record.display = sr.Display(
-        kind='t3', t3_thread_id='th-vanished', t3_environment_id=environment_id
+        kind='t3', t3_thread_id=thread_id, t3_environment_id=environment_id
     )
     sr.write_record(record, root=env.fleet)
-    sr.write_t3_thread_pointer('th-vanished', 'sibling-df-1-1', root=env.fleet)
+    sr.write_t3_thread_pointer(thread_id, slug, root=env.fleet)
     time.sleep(0.01)
     return record_dir
+
+
+def sweep_line_levels(caplog: pytest.LogCaptureFixture) -> list[int]:
+    """The level of each index-size line ``mark_t3_sessions_exited`` logged."""
+    return [
+        record.levelno
+        for record in caplog.records
+        if record.name == 'orchestrator.session_registry'
+        and record.getMessage().startswith('mark_t3_sessions_exited: marked')
+    ]
 
 
 def prompt_file(tmp_path: Path, text: str) -> str:
@@ -648,6 +665,32 @@ class TestLaunch:
         launch_line(capsys, tmp_path, env.project)
 
         assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
+    def test_after_one_unreachable_read_the_sweep_asks_about_no_further_thread(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        first = stale_t3_record(env, slug='sibling-df-1-1', thread_id='th-a')
+        second = stale_t3_record(env, slug='sibling-df-1-2', thread_id='th-b')
+        t3.tool_replies['t3_thread_read'] = ToolFailure('orchestration_error', 'busy')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-a', 'limit': 1}]
+        for record_dir in (first, second):
+            assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
+    def test_launch_logs_its_sweeps_index_line_at_info(
+        self,
+        env: Env,
+        t3: FakeT3Server,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            launch_line(capsys, tmp_path, env.project)
+
+        assert sweep_line_levels(caplog) == [logging.INFO]
 
     def test_a_record_of_another_environment_is_left_to_its_own_sweep(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1571,6 +1614,16 @@ class TestWait:
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_a_pass_whose_sweep_marks_nothing_logs_its_line_at_debug(
+        self, env: Env, t3: FakeT3Server, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            assert wait_for(env, '', FakeClock()) == 'finished code=0'
+
+        assert sweep_line_levels(caplog) == [logging.DEBUG]
 
     def test_a_pass_leaves_an_unlisted_thread_that_still_reads_present(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)

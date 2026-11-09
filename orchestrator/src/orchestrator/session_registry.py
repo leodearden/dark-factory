@@ -3419,6 +3419,7 @@ def mark_t3_sessions_exited(
     *,
     listed_at: datetime | None = None,
     thread_ended: Callable[[str], bool],
+    routine: bool = False,
 ) -> list[str]:
     """Mark EXITED every indexed T3-hosted record of *environment_id* whose thread has gone.
 
@@ -3432,7 +3433,9 @@ def mark_t3_sessions_exited(
     thread's absence.
 
     Returns the marked slugs. One unreadable or unwritable record is logged
-    and skipped, never fatal.
+    and skipped, never fatal. One line reports the index size, at INFO
+    unless *routine* -- one pass of a wait loop -- marked nothing, then at
+    DEBUG.
     """
     base = t3_thread_pointers_dir(root)
     entries = sorted(base.iterdir()) if base.is_dir() else []
@@ -3444,7 +3447,8 @@ def mark_t3_sessions_exited(
         slug = _mark_t3_session_gone(thread_id, environment_id, root, listed_at, thread_ended)
         if slug is not None:
             marked.append(slug)
-    logger.info(
+    logger.log(
+        logging.DEBUG if routine and not marked else logging.INFO,
         'mark_t3_sessions_exited: marked %d of %d indexed session(s) under %s',
         len(marked),
         len(thread_ids),

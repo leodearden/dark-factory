@@ -72,7 +72,8 @@ until a later reap indexes it.
 An indexed thread missing from the environment's `t3_thread_list` listing is
 marked exited only after `t3_thread_read` answers that it is gone or
 archived, because the listing omits live side-chat threads (T3 v0.1.6
-`ThreadManagementService.ts::listProjectThreads`).
+`ThreadManagementService.ts::listProjectThreads`). After one unreachable read,
+a sweep reads no further thread and marks none of them.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::hook_session_slug`,
 `::_resolve_hook_slug`, `::_pointer_resolution`, `::_stamp_session_pointers`;

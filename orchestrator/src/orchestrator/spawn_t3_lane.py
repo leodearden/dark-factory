@@ -563,7 +563,7 @@ def launch(
     if model and choice.enabled is False:
         return _provider_verdict(choice)
 
-    _sweep_listed_threads(client)
+    _sweep_listed_threads(client, routine=False)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
     strategy = WorkspaceStrategy.for_cwd(project, cwd)
     arguments = _launch_arguments(
@@ -981,7 +981,7 @@ def _observe(
     """The thread's state, then one sweep of its environment and the binding's upkeep."""
     observation = _observe_thread(client, thread_id)
     if client is not None:
-        _sweep_listed_threads(client)
+        _sweep_listed_threads(client, routine=True)
     if record_dir:
         _maintain_binding_softly(record_dir, cwd)
     return observation
@@ -1010,10 +1010,12 @@ def _needs_pause(slice_held: bool, record_dir: str) -> bool:
     return not slice_held and not result_is_final(record_dir)
 
 
-def _sweep_listed_threads(client: t3_mcp_client.T3McpClient) -> None:
+def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, *, routine: bool) -> None:
     """Sweep this environment's indexed t3 records against its active threads, only from a complete listing.
 
-    An unlisted thread's record is marked only once a read finds the thread gone or archived.
+    An unlisted thread's record is marked only once a read finds the thread
+    gone or archived. A *routine* sweep, one pass of ``wait``, logs its index
+    line at DEBUG unless it marked a record.
     """
     listed_at = datetime.now(UTC)
     threads = _paged(client, 't3_thread_list', {'allProjects': True}, 'threads')
@@ -1026,10 +1028,31 @@ def _sweep_listed_threads(client: t3_mcp_client.T3McpClient) -> None:
             client.environment_id,
             frozenset(map(str, thread_ids)),
             listed_at=listed_at,
-            thread_ended=lambda thread_id: _observe_thread(client, thread_id).state in ENDED_THREAD_STATES,
+            thread_ended=_ThreadEndConfirmer(client),
+            routine=routine,
         )
     except Exception as exc:
         logger.warning(f't3 session sweep failed: {exc}')
+
+
+class _ThreadEndConfirmer:
+    """One sweep's ``thread_ended``: whether a read finds the thread gone or archived.
+
+    After one unreachable read it reads no further thread and answers "not
+    confirmed", as an unreachable read itself does: each such read can cost a
+    full ``CALL_TIMEOUT_SECS``, and ``launch`` waits on its sweep.
+    """
+
+    def __init__(self, client: t3_mcp_client.T3McpClient) -> None:
+        self._client = client
+        self._unreachable = False
+
+    def __call__(self, thread_id: str) -> bool:
+        if self._unreachable:
+            return False
+        state = _observe_thread(self._client, thread_id).state
+        self._unreachable = state is ThreadState.UNREACHABLE
+        return state in ENDED_THREAD_STATES
 
 
 def _maintain_binding_softly(record_dir: str, cwd: str) -> None:

@@ -11881,6 +11881,40 @@ class TestMarkT3SessionsExited:
         ]
         assert re.search(r'\b3\b', line), line
 
+    @pytest.mark.parametrize(
+        ('routine', 'ended', 'level'),
+        [
+            pytest.param(False, False, logging.INFO, id='launch-sweep-marking-nothing'),
+            pytest.param(True, True, logging.INFO, id='routine-sweep-marking-one'),
+            pytest.param(True, False, logging.DEBUG, id='routine-sweep-marking-nothing'),
+        ],
+    )
+    def test_only_a_routine_sweep_that_marks_nothing_logs_its_line_at_debug(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        routine: bool,
+        ended: bool,
+        level: int,
+    ) -> None:
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT,
+                frozenset(),
+                root=tmp_path,
+                thread_ended=_ThreadEnded(answer=ended),
+                routine=routine,
+            )
+
+        assert [
+            record.levelno
+            for record in caplog.records
+            if record.name == 'orchestrator.session_registry'
+            and record.getMessage().startswith('mark_t3_sessions_exited: marked')
+        ] == [level]
+
 
 class TestT3RecordsAreExemptFromPidSweeps:
     def _stale_t3_record(self, tmp_path: Path, status: sr.Status) -> Path:
