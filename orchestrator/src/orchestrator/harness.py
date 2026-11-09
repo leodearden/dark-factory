@@ -5491,8 +5491,8 @@ class Harness:
         Returns ``(assigned, statuses)`` where ``assigned`` is the list of
         ``(lane_name, record, task_id)`` triples (``task_id`` narrowed non-None)
         and ``statuses`` the batched status map; returns ``None`` as the single
-        abort sentinel when there is no pool, no assigned records, or the status
-        read failed. Factoring this here keeps the None-guard / ASSIGNED-IN_USE
+        abort sentinel when there is no pool, the durable records are unreadable
+        (``OSError``), no record is assigned, or the status read failed. Factoring this here keeps the None-guard / ASSIGNED-IN_USE
         filter / resolver_failed-abort semantics of the two passes identical by
         construction (they cannot drift apart).
         """
@@ -5500,7 +5500,14 @@ class Harness:
         if pool is None:
             return None
 
-        records = self.git_ops._lane_lifecycle.all_records()
+        try:
+            records = self.git_ops._lane_lifecycle.all_records()
+        except OSError:
+            logger.warning(
+                'Durable warm-lane pass: lane records unreadable — aborting',
+                exc_info=True,
+            )
+            return None
         assigned: list[tuple[str, LaneRecord, str]] = []
         for lane_name, rec in records.items():
             if (
@@ -19370,8 +19377,8 @@ class Harness:
                 digest_dir = Path(self.config.project_root) / 'data' / 'digests'
 
             # (11b) Stale-lane census (leaf γ, task 2891) — best-effort; the
-            # method is already fail-safe (returns [] on a missing pool or a
-            # degraded status read) and runs inside this try/except so a census
+            # method is already fail-safe (returns [] on a missing pool,
+            # unreadable records or a degraded status read) and runs inside this try/except so a census
             # hiccup can never break the digest write.
             stale_lane_census = await self._stale_lane_assignment_census()
             # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.

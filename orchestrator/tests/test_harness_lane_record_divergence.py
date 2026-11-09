@@ -201,3 +201,19 @@ class TestDigestCarriesLaneRecordDivergence:
         section = _divergence_section(await _write_digest(harness))
 
         assert section[0] == '_none_'
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a 0o000 file')
+    async def test_unreadable_records_still_write_a_digest_marked_unavailable(
+        self, tmp_path, queue,
+    ):
+        harness = _pool_harness(tmp_path, queue)
+        _desync(harness)
+        record = next(harness.git_ops.worktree_base.glob('*/_lane-0.json'))
+
+        record.chmod(0o000)
+        try:
+            section = _divergence_section(await _write_digest(harness))
+        finally:
+            record.chmod(0o600)
+
+        assert 'unavailable' in section[0]
