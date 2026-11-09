@@ -521,20 +521,22 @@ class _ScanStartCountingScanner:
 
 
 async def _wait_until_a_poll_scan_has_applied(
-    pilot: Pilot, app: CockpitApp, scanner: _ScanStartCountingScanner, *, since: int
+    pilot: Pilot, scanner: _ScanStartCountingScanner, *, since: int, poll_interval: float
 ) -> None:
     """Return once the first poll scan to begin after *since* has been applied.
 
     Poll scans never overlap, and each one's apply lands before the next can
     begin, so by the time a second scan has begun after *since* the first has
-    been read and applied. The second half rests on
+    been read and applied, unless it raised: the poll worker swallows errors
+    (exit_on_error=False), so a scan that raises still counts but is never
+    applied. The overlap and ordering rest on
     cockpit/src/cockpit/app.py::CockpitApp._scan_registry_worker marshalling
     _apply_scan BEFORE its finally clears _scan_in_flight. There is no time
-    bound here: the calling test's pytest timeout guards liveness only (a poll
-    timer that never fires).
+    bound here: *poll_interval* only paces the re-checks, and the calling
+    test's pytest timeout guards liveness only (a poll timer that never fires).
     """
     while scanner.starts < since + 2:
-        await pilot.pause(app.poll_interval)
+        await pilot.pause(poll_interval)
 
 
 class TestTimerIntegration:
@@ -563,7 +565,9 @@ class TestTimerIntegration:
             sr.write_record(record, root=tmp_path)
             starts_at_write = scanner.starts
 
-            await _wait_until_a_poll_scan_has_applied(pilot, app, scanner, since=starts_at_write)
+            await _wait_until_a_poll_scan_has_applied(
+                pilot, scanner, since=starts_at_write, poll_interval=app.poll_interval
+            )
 
             assert table.row_count == 1, (
                 f'row_count={table.row_count} after '
@@ -674,7 +678,9 @@ class TestWriteDiscipline:
             table = app.query_one(SessionTable)
             starts_at_mount = scanner.starts
 
-            await _wait_until_a_poll_scan_has_applied(pilot, app, scanner, since=starts_at_mount)
+            await _wait_until_a_poll_scan_has_applied(
+                pilot, scanner, since=starts_at_mount, poll_interval=app.poll_interval
+            )
 
             table.move_cursor(row=table.get_row_index('write-disc-1'))
             await pilot.pause()
