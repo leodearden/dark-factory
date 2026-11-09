@@ -91,6 +91,9 @@ class IssueDeviation:
     """One way issue *index* departs from the contract, and what was recorded.
 
     ``recorded_as`` is None when the issue is unusable and so not recorded.
+    A deviation is a field recorded differently from how it arrived, so intake
+    output passes check_issues clean, and a deviation found at the review gate
+    means the artifact bypassed intake.
     """
 
     index: int
@@ -152,21 +155,26 @@ def _in_vocabulary(rule: _FieldRule, value: str) -> str:
     return rule.off_vocabulary_as
 
 
+def _recorded_form(
+    rule: _FieldRule, issue: Mapping[str, Any], value: object,
+) -> tuple[str | None, Deviation | None]:
+    if _is_missing(value):
+        return (None if rule.required else rule.when_missing(issue)), Deviation.MISSING
+    if not isinstance(value, str):
+        return (None if rule.required else str(value)), Deviation.NOT_A_STRING
+    if rule.vocabulary is None or value in rule.vocabulary:
+        return value, None
+    return _in_vocabulary(rule, value), Deviation.OFF_VOCABULARY
+
+
 def _check_field(
     index: int, field: IssueField, issue: Mapping[str, Any],
 ) -> tuple[str | None, IssueDeviation | None]:
-    rule = _RULES[field]
     value = issue.get(field)
-    if _is_missing(value):
-        recorded = None if rule.required else rule.when_missing(issue)
-        return recorded, IssueDeviation(index, field, Deviation.MISSING, value, recorded)
-    if not isinstance(value, str):
-        recorded = None if rule.required else str(value)
-        return recorded, IssueDeviation(index, field, Deviation.NOT_A_STRING, value, recorded)
-    if rule.vocabulary is None or value in rule.vocabulary:
-        return value, None
-    recorded = _in_vocabulary(rule, value)
-    return recorded, IssueDeviation(index, field, Deviation.OFF_VOCABULARY, value, recorded)
+    recorded, deviation = _recorded_form(_RULES[field], issue, value)
+    if deviation is None or (recorded is not None and recorded == value):
+        return recorded, None
+    return recorded, IssueDeviation(index, field, deviation, value, recorded)
 
 
 def _check_issue(
