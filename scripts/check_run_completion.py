@@ -328,7 +328,7 @@ class UsageError(Exception):
 
 
 class _Parser(argparse.ArgumentParser):
-    """Raises UsageError instead of exiting, so a gate's args can be read back safely."""
+    """Raises UsageError instead of exiting, and -h/--help is a plain flag, so parsing never prints or exits."""
 
     def error(self, message: str) -> NoReturn:
         raise UsageError(message, self.format_usage())
@@ -346,7 +346,10 @@ def _threshold(text: str) -> float:
 
 
 def _parser() -> _Parser:
-    parser = _Parser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = _Parser(
+        prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, add_help=False,
+    )
+    parser.add_argument('-h', '--help', action='store_true', help='show this help on stderr; runs no check and exits 2')
     parser.add_argument('--run', help='the run id the tasks carry as x_finding_run')
     parser.add_argument('--threshold', type=_threshold, help='the landed share that passes, in (0, 1]')
     parser.add_argument('--project-root', action='append', type=_absolute_root, help='the project to read')
@@ -376,6 +379,8 @@ class PendingRequest:
 def parse_args(argv: Sequence[str]) -> CheckRequest | PendingRequest:
     parser = _parser()
     args = parser.parse_args(list(argv))
+    if args.help:
+        raise UsageError('-h/--help prints this text and runs no check', parser.format_help())
     roots: list[str] = args.project_root or []
     if args.pending:
         if args.run is not None or args.threshold is not None:
