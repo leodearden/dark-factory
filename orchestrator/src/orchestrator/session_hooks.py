@@ -694,13 +694,7 @@ def _stamp_session_pointers(
         session_registry.write_claude_session_pointer(
             record.claude_session_id, record.session_slug, root=root
         )
-    display = record.display
-    if (
-        t3_thread_id is not None
-        and display is not None
-        and display.kind == session_registry.DisplayKind.T3
-        and display.t3_thread_id == t3_thread_id
-    ):
+    if t3_thread_id is not None and session_registry.t3_thread_of(record) == t3_thread_id:
         session_registry.write_t3_thread_pointer(t3_thread_id, record.session_slug, root=root)
     pid = probes.owning_claude_pid()
     if pid is None or record.claude_owner_pid != pid:

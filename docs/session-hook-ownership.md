@@ -61,12 +61,13 @@ spawn record, re-points every pointer, and folds the hand record. The lane's
 transcript discovery, which binds the record to the session whose transcript
 names the record dir (task 7489), is now the fallback. The thread pointers
 are also the index the T3 sweep iterates, so every terminal write drops one.
-A thread id that cannot name a pointer file is never claimed. The record
-reap and the orphan sweep index a live t3 record whose thread no pointer
-holds. They pid-sweep a t3 record that another live record displaced from its
-thread's pointer, and a t3 record with no usable thread id. So every live t3
-record is in at most one sweep. A record whose index write failed is in
-neither until a later sweep's retry succeeds.
+A thread id that cannot name a pointer file is never claimed. The reap's
+first phase indexes every live t3 record whose thread no pointer holds. The
+record reap and the orphan sweep only read the index: they pid-sweep a t3
+record that another live record displaced from its thread's pointer, and a
+t3 record with no usable thread id. So every live t3 record is in at most one
+sweep. A record not yet indexed, or whose index write failed, is in neither
+until a later reap indexes it.
 An indexed thread missing from the environment's `t3_thread_list` listing is
 marked exited only after `t3_thread_read` answers that it is gone or
 archived, because the listing omits live side-chat threads (T3 v0.1.6
@@ -76,7 +77,7 @@ Code: `orchestrator/src/orchestrator/session_hooks.py::hook_session_slug`,
 `::_resolve_hook_slug`, `::_pointer_resolution`, `::_stamp_session_pointers`;
 `orchestrator/src/orchestrator/session_registry.py::resolve_session_slug_for_claude_session_id`,
 `::resolve_session_slug_for_pid`, `::resolve_session_slug_for_t3_thread`,
-`::mark_t3_sessions_exited`;
+`::t3_thread_of`, `::index_unpointed_t3_records`, `::mark_t3_sessions_exited`;
 `orchestrator/src/orchestrator/spawn_t3_lane.py::bind_thread_pointer`.
 
 ## Owner or inheritor

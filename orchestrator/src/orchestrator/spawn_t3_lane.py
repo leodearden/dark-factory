@@ -717,11 +717,6 @@ def _record_vouching_for(
     return _read_record_softly(slug, root, 'hand-launched')
 
 
-def _t3_thread_of(record: session_registry.SessionRecord) -> str | None:
-    display = record.display
-    return display.t3_thread_id if display is not None and display.kind == session_registry.DisplayKind.T3 else None
-
-
 def _fold(hand: session_registry.SessionRecord, root: Path) -> None:
     try:
         session_registry.mark_session_folded(hand.session_slug, root=root)
@@ -767,7 +762,7 @@ def _bind_to(
     session_registry.write_claude_session_pointer(session_id, slug, root=root)
     if owner_pid is not None:
         session_registry.write_session_pointer(owner_pid, slug, root=root)
-    thread_id = _t3_thread_of(record)
+    thread_id = session_registry.t3_thread_of(record)
     if thread_id is not None:
         session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
     if hand is not None:
@@ -798,7 +793,7 @@ def bind_thread_pointer(record_dir: str, thread_id: str) -> Binding:
             return _UNBOUND
         return _bind_to(record_dir, holder.claude_session_id, holder, BindingSource.THREAD_POINTER)
     record = _read_record_softly(slug, root, 'spawn')
-    if record is None or _t3_thread_of(record) != thread_id:
+    if record is None or session_registry.t3_thread_of(record) != thread_id:
         return _UNBOUND
     session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
     if not record.claude_session_id:

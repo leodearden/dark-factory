@@ -3226,6 +3226,7 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     assert report['remaining_record_dirs'] == 1
     phases = report['phases']
     assert [phase['name'] for phase in phases] == [
+        'index_unpointed_t3_records',
         'mark_orphaned_sessions_exited',
         'mark_windowless_wm_sessions_exited',
         'reap_stale_records',
@@ -3257,10 +3258,10 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
 
     assert rc == 0
     assert not (sr.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
-    first_phase = json.loads(sr.reap_report_path(tmp_path).read_text())['phases'][0]
-    assert first_phase['name'] == 'mark_orphaned_sessions_exited'
-    assert 'OSError' in first_phase['error']
-    assert first_phase['count'] is None
+    phases = json.loads(sr.reap_report_path(tmp_path).read_text())['phases']
+    [failed] = [phase for phase in phases if phase['name'] == 'mark_orphaned_sessions_exited']
+    assert 'OSError' in failed['error']
+    assert failed['count'] is None
 
 
 def _write_report_started(root: Path, started_at: datetime) -> str:
@@ -11904,13 +11905,31 @@ class TestT3RecordsAreExemptFromPidSweeps:
 
         assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
         assert path.is_file()
+        assert not sr.t3_thread_pointers_dir(tmp_path).exists()
 
-    def test_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(self, tmp_path: Path) -> None:
+    def test_the_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
 
-        sr.reap_stale_records(root=tmp_path, now=_NOW)
+        assert sr.main(['reap']) == 0
 
         assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 't3-quiet'
+        assert sr.read_record('t3-quiet', root=tmp_path).status == sr.Status.RUNNING
+
+    def test_indexing_never_moves_a_held_pointer_or_indexes_a_terminal_record(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+        _t3_record(tmp_path, 'ended', 'th-2', cwd=str(tmp_path), status=sr.Status.EXITED)
+
+        assert sr.index_unpointed_t3_records(root=tmp_path) == []
+
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
+        assert not sr.t3_thread_pointer_path('th-2', tmp_path).exists()
 
     def test_a_t3_record_displaced_from_its_thread_pointer_is_pid_swept(
         self, tmp_path: Path
@@ -11938,6 +11957,7 @@ class TestT3RecordsAreExemptFromPidSweeps:
         sr.t3_thread_pointers_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
         sr.t3_thread_pointers_dir(tmp_path).write_text('not a dir')
 
+        assert sr.index_unpointed_t3_records(root=tmp_path) == []
         assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
         assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
         assert path.is_file()

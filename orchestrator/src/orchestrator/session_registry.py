@@ -1113,7 +1113,7 @@ def resolve_session_slug_for_t3_thread(
     """Return the slug of the live record T3 thread *thread_id* hosts, or None.
 
     Vouched more strictly than the other pointers: the named record must be
-    a t3 record naming *thread_id* AND non-terminal. That is the one
+    non-terminal and ``t3_thread_of`` it must be *thread_id*. That is the one
     definition of the index's invariant -- a terminal record has no pointer
     -- which the reap and every terminal write enforce through
     ``_is_stale_t3_thread_pointer``. Read-only; never raises.
@@ -1127,13 +1127,7 @@ def resolve_session_slug_for_t3_thread(
         record = read_record(slug, root=root)
     except (OSError, CorruptSessionRecord):
         return None
-    display = record.display
-    vouches = (
-        display is not None
-        and display.kind == DisplayKind.T3
-        and display.t3_thread_id == thread_id
-        and record.status not in TERMINAL_STATUSES
-    )
+    vouches = t3_thread_of(record) == thread_id and record.status not in TERMINAL_STATUSES
     return slug if vouches else None
 
 
@@ -2947,10 +2941,6 @@ def reap_stale_records(
       ``_t3_thread_sweep_owns`` holds, since its liveness is its thread.
     - otherwise -> kept.
 
-    Every non-terminal record is first passed to
-    ``_index_t3_record_if_unheld``, so this sweep also writes the thread
-    pointer of a live t3 record whose thread no pointer holds.
-
     Directories are visited in ``sorted(iterdir())`` order (directory-name
     order, not age order).
 
@@ -2984,7 +2974,6 @@ def reap_stale_records(
             if record.status in TERMINAL_STATUSES:
                 reason = 'terminal_ttl' if age > TERMINAL_TTL else None
             else:
-                _index_t3_record_if_unheld(record, slug, root)
                 stale = (
                     not _t3_thread_sweep_owns(record, slug, root)
                     and age > NON_TERMINAL_HEARTBEAT_TTL
@@ -3081,12 +3070,10 @@ def _drop_t3_thread_pointer_if_stale(record: SessionRecord, root: Path | str | N
 
     A failed unlink is logged, never raised: the reap retries it.
     """
-    display = record.display
-    if display is None or display.kind != DisplayKind.T3 or not display.t3_thread_id:
+    thread_id = t3_thread_of(record)
+    if thread_id is None:
         return
-    if not is_t3_thread_pointer_name(display.t3_thread_id):
-        return
-    path = t3_thread_pointer_path(display.t3_thread_id, root=root)
+    path = t3_thread_pointer_path(thread_id, root=root)
     if not _is_stale_t3_thread_pointer(path, root):
         return
     try:
@@ -3286,9 +3273,7 @@ def mark_orphaned_sessions_exited(
     ``_t3_thread_sweep_owns`` holds: its ``launcher_pid`` is the spawn
     script, which exits in sibling mode, and its hooks fall silent whenever
     the thread waits on a human. ``mark_t3_sessions_exited`` sweeps it by
-    thread instead. Every non-terminal record is first passed to
-    ``_index_t3_record_if_unheld``, so this sweep also writes the thread
-    pointer of a live t3 record whose thread no pointer holds.
+    thread instead.
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock. Returns the list of records this call marked (their post-mark,
@@ -3312,7 +3297,6 @@ def mark_orphaned_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
-        _index_t3_record_if_unheld(record, slug, root)
         if _t3_thread_sweep_owns(record, slug, root):
             continue
         if not _swept_as_dead(
@@ -3356,33 +3340,72 @@ def is_t3_record(record: SessionRecord) -> bool:
     return record.display is not None and record.display.kind == DisplayKind.T3
 
 
-def _indexable_t3_thread(record: SessionRecord) -> str | None:
-    """The thread id *record* is a t3 record of, when it can name a thread pointer."""
+def t3_thread_of(record: SessionRecord) -> str | None:
+    """The T3 thread *record* is a t3 record of, when that id can name a thread pointer; else None.
+
+    The one definition shared by the thread pointer's writers and by its
+    vouching check, ``resolve_session_slug_for_t3_thread``.
+    """
     if not is_t3_record(record) or record.display is None:
         return None
     thread_id = record.display.t3_thread_id
     return thread_id if thread_id and is_t3_thread_pointer_name(thread_id) else None
 
 
-def _index_t3_record_if_unheld(record: SessionRecord, slug: str, root: Path | str | None) -> None:
-    """Write the thread pointer of non-terminal t3 *record* when no live record holds its thread.
+def index_t3_record_if_unheld(
+    record: SessionRecord, slug: str, root: Path | str | None = None
+) -> bool:
+    """Write *slug* as the thread pointer of live t3 *record* when no live record holds its thread; whether it wrote.
 
-    A failed write is logged by the writer; the next sweep retries it.
+    A held pointer is never moved: the T3 lane's bind
+    (``orchestrator/src/orchestrator/spawn_t3_lane.py::_bind_to``) is the one
+    writer that re-points one. A failed write is logged by the writer, and
+    ``index_unpointed_t3_records`` retries it.
     """
-    thread_id = _indexable_t3_thread(record)
-    if thread_id is not None and resolve_session_slug_for_t3_thread(thread_id, root=root) is None:
-        write_t3_thread_pointer(thread_id, slug, root=root)
+    thread_id = t3_thread_of(record)
+    if (
+        thread_id is None
+        or record.status in TERMINAL_STATUSES
+        or resolve_session_slug_for_t3_thread(thread_id, root=root) is not None
+    ):
+        return False
+    return write_t3_thread_pointer(thread_id, slug, root=root)
+
+
+def index_unpointed_t3_records(root: Path | str | None = None) -> list[str]:
+    """Pass every record under ``<root>/sessions/`` to ``index_t3_record_if_unheld``; returns the slugs indexed.
+
+    ``run_reap``'s first phase. A live t3 record whose thread no pointer
+    holds -- one written before the index existed, or whose pointer write
+    failed -- joins the index ``mark_t3_sessions_exited`` iterates only here.
+    Until then ``_t3_thread_sweep_owns`` keeps it out of the pid sweeps. An
+    unreadable record is skipped, never fatal.
+    """
+    base = sessions_dir(root)
+    if not base.is_dir():
+        return []
+    indexed: list[str] = []
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        try:
+            record = read_record(slug_dir.name, root=root)
+        except (OSError, CorruptSessionRecord):
+            continue
+        if index_t3_record_if_unheld(record, slug_dir.name, root=root):
+            indexed.append(slug_dir.name)
+    return indexed
 
 
 def _t3_thread_sweep_owns(record: SessionRecord, slug: str, root: Path | str | None) -> bool:
     """Whether ``mark_t3_sessions_exited``, not a pid sweep, owns non-terminal *record*. Read-only.
 
     True for a t3 record whose thread pointer names *slug* or no live record.
-    An unheld thread stays owned, so a failed index write never hands a live
-    record to the pid sweeps. Only displacement by another live record, or a
-    thread id that cannot name a pointer, does.
+    An unheld thread stays owned, so a record ``index_unpointed_t3_records``
+    has not indexed yet is never handed to the pid sweeps. Only displacement
+    by another live record, or a thread id that cannot name a pointer, does.
     """
-    thread_id = _indexable_t3_thread(record)
+    thread_id = t3_thread_of(record)
     if thread_id is None:
         return False
     held_by = resolve_session_slug_for_t3_thread(thread_id, root=root)
@@ -3445,11 +3468,10 @@ def _mark_t3_session_gone(
         return None
 
     def still_this_environments(record: SessionRecord) -> bool:
-        display = record.display
         return (
-            display is not None
-            and display.t3_thread_id == thread_id
-            and display.t3_environment_id in (None, environment_id)
+            t3_thread_of(record) == thread_id
+            and record.display is not None
+            and record.display.t3_environment_id in (None, environment_id)
         )
 
     try:
@@ -3878,7 +3900,7 @@ def _a_reap_started_since(requested_at: datetime, root: Path | str | None) -> bo
 
 
 def run_reap(root: Path | str | None = None) -> ReapReport | None:
-    """Drain the registry: mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
+    """Drain the registry: index unpointed t3 records, mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
 
     The ``reap`` verb, for the operator and for ``_run_launching``'s detached
     child alike. Concurrent calls queue on ``reap_lock``. A call whose turn
@@ -3894,8 +3916,9 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
     terminal record does. ``mark_windowless_wm_sessions_exited`` runs here
     alongside ``mark_orphaned_sessions_exited`` because it marks exactly the
     live-pid / age<1h wm-display zombies the pid/TTL sweep is forced to keep.
-    ``reap_stale_session_pointers`` runs last so pointers to records removed
-    in this same pass go too.
+    ``index_unpointed_t3_records`` runs first; the sweeps after it only read
+    the thread index. ``reap_stale_session_pointers`` runs last so pointers
+    to records removed in this same pass go too.
 
     Each phase is timed and fail-soft on its own, so one phase's fault never
     skips the rest. The report is written atomically to
@@ -3909,6 +3932,7 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
             return None
         started_at = datetime.now(UTC)
         phases = (
+            _run_reap_phase('index_unpointed_t3_records', index_unpointed_t3_records, root),
             _run_reap_phase('mark_orphaned_sessions_exited', mark_orphaned_sessions_exited, root),
             _run_reap_phase(
                 'mark_windowless_wm_sessions_exited', mark_windowless_wm_sessions_exited, root
