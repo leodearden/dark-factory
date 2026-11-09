@@ -14,6 +14,9 @@ worker, over a remote host that really runs ``orchestrator verify-task``.
   worktree, with ``orchestrator.verify_hosts.RemoteRunner`` (the single
   construction site of both the pool's and the worker's runners) replaced by
   a recording constructor that wires in the transport.
+* :func:`open_workflow_scene` builds the same Harness over the workflow
+  fixture repo and gives it a real TaskWorkflow (:class:`WorkflowScene`),
+  built as ``Harness._run_slot`` builds one.
 
 The laptop runs on the same repository as the workstation, under its own
 ``git.worktree_dir`` (:data:`LAPTOP_WORKTREE_DIR`), so a leg can tell from its
@@ -36,7 +39,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -47,7 +50,8 @@ import yaml
 from _gate_fixtures import TEST_DEPLOYED_SHA, ensure_reply, is_ensure, is_gate_publish
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import branch_merge_request
-from _orch_helpers import wait_responsive
+from _orch_helpers import CANCEL_SCOPE_BARRIER_TIMEOUT, wait_responsive
+from _workflow_helpers import E2E_REPO_SEED, PLAN, AgentStub, FakeBriefing, FakeMcp, FakeScheduler
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
 
@@ -56,17 +60,21 @@ from orchestrator.config import (
     GitConfig,
     ModuleConfig,
     OrchestratorConfig,
+    SandboxConfig,
     VerifyRunnerConfig,
     apply_reload,
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.remote_gate import GateIdentity
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_verify_spec import TaskVerifySpec, build_task_verify_spec
 from orchestrator.verify import VerifyResult, admission_policy
 from orchestrator.verify_admission_gate import AdmissionGate, AdmissionPlan, gate_for
 from orchestrator.verify_cancel import kill_process_tree, read_worktree_path
 from orchestrator.verify_runner import RemoteRunner, result_to_json
+from orchestrator.workflow import TaskWorkflow, build_workflow
+from orchestrator.workflow_types import TerminalReport
 
 LAPTOP = 'laptop'
 LAPTOP_WORKTREE_DIR = '.laptop-worktrees'
@@ -499,8 +507,9 @@ class Legs:
         return bool(self.pids(label, where))
 
     def spawned_at(self, where: Where) -> list[str]:
-        """The labels that spawned at *where*."""
-        return sorted(p.name.rsplit('.', 2)[0] for p in self.root.glob(f'*.{where}.spawns'))
+        """The labels that logged a pid at *where* (a leg killed in its first step logs none)."""
+        labels = (p.name.rsplit('.', 2)[0] for p in self.root.glob(f'*.{where}.spawns'))
+        return sorted(label for label in labels if self.spawned(label, where))
 
     def _path(self, label: str, where: Where, kind: str) -> Path:
         return self.root / f'{label}.{where}.{kind}'
@@ -614,7 +623,6 @@ class Scene:
     harness: Harness
     repo: Path
     worktree: Path
-    tip: str
     laptop: LaptopHost
     runners: RecordingRunners
     children: ChildCli
@@ -628,6 +636,11 @@ class Scene:
     @property
     def config(self) -> OrchestratorConfig:
         return self.harness.config
+
+    @property
+    def tip(self) -> str:
+        """The task worktree's HEAD."""
+        return _git(self.worktree, 'rev-parse', 'HEAD')
 
     @property
     def pool(self) -> Any:
@@ -803,13 +816,12 @@ class Scene:
         return store.fetch_events_by_type(event_type)
 
 
-def _seed(tmp_path: Path) -> tuple[Path, Path, Path]:
-    files = tuple((f'{prefix}/test_x.py', '# placeholder\n') for prefix in (MODULE, SECOND_MODULE))
-    repo = seed_repo(tmp_path / 'repo', RepoSeed(
-        files=(*files, ('.gitignore', f'.task/\n{LAPTOP_WORKTREE_DIR}/\n')),
-        message='initial commit',
-    ))
-    return repo, repo / _GIT.worktree_dir / TASK_ID, repo / LAPTOP_WORKTREE_DIR
+_IGNORED = ('.gitignore', f'.task/\n{LAPTOP_WORKTREE_DIR}/\n')
+_MODULE_FILES = tuple((f'{prefix}/test_x.py', '# placeholder\n') for prefix in (MODULE, SECOND_MODULE))
+
+
+def _repo_path(tmp_path: Path) -> Path:
+    return tmp_path / 'repo'
 
 
 def _harness(config: OrchestratorConfig) -> Harness:
@@ -817,6 +829,48 @@ def _harness(config: OrchestratorConfig) -> Harness:
          patch('orchestrator.harness.Scheduler'), \
          patch('orchestrator.harness.BriefingAssembler'):
         return Harness(config, deployed_sha=TEST_DEPLOYED_SHA)
+
+
+@contextlib.asynccontextmanager
+async def _open_harness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    files: Sequence[tuple[str, str]],
+    task_id: str,
+    archive_root: Path,
+    provision: Callable[[Legs], str],
+    laptop_provision: str,
+    config_overrides: dict[str, Any],
+) -> AsyncIterator[Scene]:
+    """A Harness over a repo seeded with *files*; task *task_id*'s worktree is not created yet.
+
+    *provision* gives the workstation's cold pre-provision command, which may be a leg.
+    """
+    monkeypatch.setenv('ORCH_FLEET_DIR', str(tmp_path / 'fleet'))
+    patch_cli_seams(monkeypatch)
+    repo = seed_repo(_repo_path(tmp_path), RepoSeed(files=(*files, _IGNORED), message='initial commit'))
+    task_checkout, laptop_base = repo / _GIT.worktree_dir / task_id, repo / LAPTOP_WORKTREE_DIR
+    laptop = laptop_yaml(tmp_path, repo, laptop_provision)
+    legs = Legs(tmp_path / 'legs', task_checkout=task_checkout, laptop_base=laptop_base)
+    children = ChildCli()
+    host = LaptopHost(InProcessCli(laptop), children)
+    runners = RecordingRunners(host)
+    monkeypatch.setattr('orchestrator.verify_hosts.RemoteRunner', runners)
+    harness = _harness(
+        _workstation_config(tmp_path, repo, laptop, legs, provision(legs), config_overrides),
+    )
+    harness.event_store = EventStore(tmp_path / 'runs.db', run_id='iota')
+    scene = Scene(
+        tmp_path=tmp_path, harness=harness, repo=repo, worktree=task_checkout, laptop=host,
+        runners=runners, children=children, legs=legs, archive_root=archive_root,
+        laptop_worktree_base=laptop_base, task_id=task_id,
+    )
+    try:
+        yield scene
+    finally:
+        await scene.stop_worker()
+        await children.close()
 
 
 @contextlib.asynccontextmanager
@@ -833,30 +887,189 @@ async def open_scene(
     *provision* is the workstation's cold pre-provision command (what a spec
     carries); *laptop_provision* the laptop yaml's own.
     """
-    monkeypatch.setenv('ORCH_FLEET_DIR', str(tmp_path / 'fleet'))
-    patch_cli_seams(monkeypatch)
-    repo, task_checkout, laptop_base = _seed(tmp_path)
-    laptop = laptop_yaml(tmp_path, repo, laptop_provision)
-    legs = Legs(tmp_path / 'legs', task_checkout=task_checkout, laptop_base=laptop_base)
-    children = ChildCli()
-    host = LaptopHost(InProcessCli(laptop), children)
-    runners = RecordingRunners(host)
-    monkeypatch.setattr('orchestrator.verify_hosts.RemoteRunner', runners)
-    harness = _harness(
-        _workstation_config(tmp_path, repo, laptop, legs, provision, config_overrides),
-    )
-    harness.event_store = EventStore(tmp_path / 'runs.db', run_id='iota')
-    worktree = (await harness.git_ops.create_worktree(TASK_ID)).path
-    assert worktree == task_checkout, worktree
-    (worktree / MODULE / 'test_x.py').write_text('# changed on the task branch\n')
-    await harness.git_ops.commit(worktree, 'task change')
-    scene = Scene(
-        tmp_path=tmp_path, harness=harness, repo=repo, worktree=worktree,
-        tip=_git(worktree, 'rev-parse', 'HEAD'), laptop=host, runners=runners,
-        children=children, legs=legs, archive_root=tmp_path / 'verify-logs', laptop_worktree_base=laptop_base,
-    )
-    try:
+    async with _open_harness(
+        tmp_path, monkeypatch, files=_MODULE_FILES, task_id=TASK_ID,
+        archive_root=tmp_path / 'verify-logs', provision=lambda _legs: provision,
+        laptop_provision=laptop_provision, config_overrides=config_overrides,
+    ) as scene:
+        worktree = (await scene.harness.git_ops.create_worktree(TASK_ID)).path
+        assert worktree == scene.worktree, worktree
+        (worktree / MODULE / 'test_x.py').write_text('# changed on the task branch\n')
+        await scene.harness.git_ops.commit(worktree, 'task change')
         yield scene
-    finally:
-        await scene.stop_worker()
-        await children.close()
+
+
+# ---------------------------------------------------------------------------
+# A real TaskWorkflow over the scene
+# ---------------------------------------------------------------------------
+
+WORKFLOW_TASK_ID: str = PLAN['task_id']
+PROVISION_LEG = 'provision'
+_WORKFLOW_LOOP: dict[str, Any] = {
+    'max_concurrent_tasks': 1,
+    'max_execute_iterations': 5,
+    'max_verify_attempts': 3,
+    'max_review_cycles': 2,
+    'judge_after_each_iteration': False,
+    'max_amendment_rounds': 1,
+    'sandbox': SandboxConfig(enabled=False),
+}
+
+
+def _assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id=WORKFLOW_TASK_ID,
+        task={
+            'id': WORKFLOW_TASK_ID, 'title': PLAN['title'],
+            'description': 'Add a farewell(name) function to lib.py with tests',
+            'status': 'pending', 'metadata': {'files': ['lib']}, 'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+def pending_tasks() -> set[asyncio.Task[Any]]:
+    current = asyncio.current_task()
+    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+
+
+class PausingMergeBase:
+    """GitOps' ``merge_base_with_main``; once armed, each call waits to be resumed first."""
+
+    def __init__(self, real: Callable[[str], Awaitable[str | None]]) -> None:
+        self._real = real
+        self._armed = False
+        self._resumed = asyncio.Event()
+        self.paused = asyncio.Event()
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def resume(self) -> None:
+        self._resumed.set()
+
+    async def __call__(self, ref: str) -> str | None:
+        if self._armed:
+            self.paused.set()
+            await self._resumed.wait()
+        return await self._real(ref)
+
+
+@dataclass
+class WorkflowScene:
+    """A real TaskWorkflow on *scene*'s Harness, built as ``Harness._run_slot`` builds it.
+
+    Its merge queue is never drained, so a green run parks at MERGE until the
+    scene's cancel event (soft) or a cancel of its task (hard) ends it.
+    """
+
+    scene: Scene
+    agents: AgentStub
+    merge_base: PausingMergeBase
+    scheduler: FakeScheduler = field(default_factory=FakeScheduler)
+    merge_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    workflow: TaskWorkflow | None = field(default=None, init=False)
+    baseline: frozenset[asyncio.Task[Any]] = field(default=frozenset(), init=False)
+    _run: asyncio.Task[TerminalReport] | None = field(default=None, init=False)
+
+    def start(self, *, with_dispatcher: bool = True) -> asyncio.Task[TerminalReport]:
+        """Build the workflow (given the harness's dispatcher, unless not) and start its run()."""
+        harness = self.scene.harness
+        self.workflow = build_workflow(
+            assignment=_assignment(), config=harness.config, git_ops=harness.git_ops,
+            scheduler=self.scheduler, briefing=FakeBriefing(), mcp=FakeMcp(),
+            merge_queue=self.merge_queue, event_store=harness.event_store,
+            cancel_event=self.cancel_event,
+            task_verify=harness._task_verify_dispatcher if with_dispatcher else None,
+        )
+        self.baseline = frozenset(pending_tasks())
+        self._run = asyncio.create_task(self.workflow.run())
+        return self._run
+
+    @property
+    def run(self) -> asyncio.Task[TerminalReport]:
+        assert self._run is not None, 'start() first'
+        return self._run
+
+    async def until(self, predicate: Callable[[], bool], *, what: str) -> None:
+        """Poll *predicate* while run() is still running; its early end fails *what*."""
+        run = self.run
+
+        def ready() -> bool:
+            if run.done():
+                ended = 'cancelled' if run.cancelled() else repr(run.result())
+                raise AssertionError(f'run() ended ({ended}) before {what}')
+            return predicate()
+
+        await until(ready, what=what)
+
+    async def until_queued_on_both(self) -> None:
+        turns = self.scene.turns
+        await self.until(
+            lambda: self.scene.task_id in turns()['laptop_waiters']
+            and self.scene.task_id in turns()['local_waiters'],
+            what='the verify to queue on both gates',
+        )
+
+    async def until_parked_at_merge(self) -> None:
+        await self.until(lambda: not self.merge_queue.empty(), what='run() to park at MERGE')
+
+    def verify_rows(self) -> list[dict[str, Any]]:
+        return [row['data'] for row in self.scene.events(EventType.workflow_verify)]
+
+    def soft_cancel(self) -> None:
+        self.cancel_event.set()
+
+    def hard_cancel(self) -> None:
+        self.run.cancel()
+
+    async def report(self) -> TerminalReport:
+        """run()'s TerminalReport; a CancelledError escaping run() fails here."""
+        async with asyncio.timeout(CANCEL_SCOPE_BARRIER_TIMEOUT):
+            return await self.run
+
+    async def until_no_task_outlives_the_run(self) -> None:
+        """Every task started since :meth:`start` has ended (the poll runs in a task of its own)."""
+        caller = asyncio.current_task()
+        await until(
+            lambda: not pending_tasks() - self.baseline - {caller}, what='every run task to end',
+        )
+
+    async def close(self) -> None:
+        self.merge_base.resume()
+        if self._run is not None and not self._run.done():
+            self._run.cancel()
+            await asyncio.wait({self._run}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+
+
+@contextlib.asynccontextmanager
+async def open_workflow_scene(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, term_ignoring_provision: bool = False,
+    **config_overrides: Any,
+) -> AsyncIterator[WorkflowScene]:
+    """A WorkflowScene over a repo seeded with ``E2E_REPO_SEED``; the workflow makes task 42's worktree.
+
+    Its agents are :class:`AgentStub` and its verify-logs root is where the
+    workflow puts it, ``<project_root>/data/verify-logs``.  The worktree is
+    cold (it holds ``.task/``), so *term_ignoring_provision* makes every cold
+    verify run the :data:`PROVISION_LEG` leg, which traps SIGTERM.
+    """
+    def provision(legs: Legs) -> str:
+        return legs.command(PROVISION_LEG, ignore_term=True) if term_ignoring_provision else ''
+
+    async with _open_harness(
+        tmp_path, monkeypatch, files=E2E_REPO_SEED.files, task_id=WORKFLOW_TASK_ID,
+        archive_root=_repo_path(tmp_path) / 'data' / 'verify-logs', provision=provision,
+        laptop_provision='', config_overrides={**_WORKFLOW_LOOP, **config_overrides},
+    ) as scene:
+        agents = AgentStub()
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', agents.invoke_agent)
+        git_ops = scene.harness.git_ops
+        merge_base = PausingMergeBase(git_ops.merge_base_with_main)
+        monkeypatch.setattr(git_ops, 'merge_base_with_main', merge_base)
+        flow = WorkflowScene(scene, agents, merge_base)
+        try:
+            yield flow
+        finally:
+            await flow.close()

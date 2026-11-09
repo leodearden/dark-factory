@@ -1098,6 +1098,7 @@ async def _stage_the_race(flow: WorkflowScene, stage: str) -> tuple[dict[str, Tu
     laptop_holder, local_holder = await _hold_both(scene)
     flow.start()
     await flow.until_queued_on_both()
+    await flow.until(lambda: scene.legs.spawned(_LINT), what='the ungated local lint leg to spawn')
     if stage == 'queued_on_both':
         return {'holder': laptop_holder}, {'local-holder': local_holder}
     flow.merge_base.arm()
