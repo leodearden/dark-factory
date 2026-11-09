@@ -7,17 +7,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
-from shared.followup_items import FollowupBundleInvalid, FollowupItem, read_items
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FollowupBundleInvalid,
+    FollowupItem,
+    read_items,
+)
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.utils.clip_disclosure import elide_text
+
+logger = logging.getLogger(__name__)
 
 
 class CuratorFailureError(RuntimeError):
@@ -493,27 +501,46 @@ def render_declared_scope(scope: DeclaredScope | None) -> str:
     return f'{scope.band} (files={scope.files}, text_chars={scope.text_chars}, basis={scope.basis})'
 
 
+def _warn_discarded(key: str, error: object) -> None:
+    """The ``task_metadata.schema_warning`` census line for one unreadable stored key."""
+    logger.warning(
+        'task_metadata.schema_warning source=curator_types key=%s error=%s; value discarded',
+        key,
+        error,
+    )
+
+
 def declared_scope_of(metadata: Mapping[str, Any]) -> DeclaredScope | None:
-    """The stored stamp as its record; None when it is absent or is not a valid stamp."""
+    """The stored stamp as its record; None when it is absent, and with a census line when invalid."""
     stored = metadata.get(DECLARED_SCOPE_METADATA_KEY)
+    if stored is None:
+        return None
     if not isinstance(stored, Mapping):
+        _warn_discarded(DECLARED_SCOPE_METADATA_KEY, f'not an object (type={type(stored).__name__})')
         return None
     try:
         return DeclaredScope.model_validate(stored)
-    except ValueError:
+    except ValueError as exc:
+        _warn_discarded(DECLARED_SCOPE_METADATA_KEY, exc)
         return None
 
 
-def item_count_of(metadata: Mapping[str, Any]) -> int:
-    """How many items ``metadata.followup_items`` holds; 0 when it is absent or malformed.
+def followup_items_of(metadata: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
+    """``metadata.followup_items`` as items; () when absent, and with a census line when malformed.
 
-    The same reading ``task_interceptor.py::_candidate_items`` gives ``CandidateTask.items``, so
-    the pool and candidate sides count a list alike.
+    The curator's one reading of a stored list: ``CandidateTask.items`` and ``PoolEntry.item_count``
+    both come from here, so the candidate and pool sides read a list alike.
     """
     try:
-        return len(read_items(metadata))
-    except FollowupBundleInvalid:
-        return 0
+        return read_items(metadata)
+    except FollowupBundleInvalid as exc:
+        _warn_discarded(FOLLOWUP_ITEMS_METADATA_KEY, exc)
+        return ()
+
+
+def item_count_of(metadata: Mapping[str, Any]) -> int:
+    """How many items :func:`followup_items_of` reads from *metadata*."""
+    return len(followup_items_of(metadata))
 
 
 def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:

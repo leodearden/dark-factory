@@ -8,6 +8,7 @@ never offers a holder as a combine target.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from fused_memory.middleware.curator_types import (
     CandidateTask,
     PoolEntry,
     declared_scope_of,
+    followup_items_of,
     is_combine_eligible,
     is_combine_eligible_status,
     item_count_of,
@@ -34,15 +36,39 @@ _TWO_ITEMS = [
 ]
 
 
+_CURATOR_TYPES_LOGGER = 'fused_memory.middleware.curator_types'
+
+
+def _census_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The ``task_metadata.schema_warning`` census lines curator_types emitted."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _CURATOR_TYPES_LOGGER and record.levelno == logging.WARNING
+        and record.getMessage().startswith('task_metadata.schema_warning ')
+    ]
+
+
+@pytest.fixture
+def census(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
+    caplog.set_level(logging.WARNING, logger=_CURATOR_TYPES_LOGGER)
+    return caplog
+
+
 class TestDeclaredScopeOf:
     def test_a_stored_stamp_is_its_record(self) -> None:
         stamp = derive_declared_scope(['pkg/a.py'], 'd', '', basis='submit')
         assert declared_scope_of({DECLARED_SCOPE_METADATA_KEY: stamp.model_dump()}) == stamp
 
+    def test_an_absent_stamp_reads_as_none_without_a_census_line(
+        self, census: pytest.LogCaptureFixture,
+    ) -> None:
+        assert declared_scope_of({}) is None
+        assert _census_lines(census) == []
+
     @pytest.mark.parametrize(
         'metadata',
         [
-            pytest.param({}, id='absent'),
             pytest.param({DECLARED_SCOPE_METADATA_KEY: 'narrow'}, id='not-a-mapping'),
             pytest.param(
                 {DECLARED_SCOPE_METADATA_KEY: {**_NARROW.model_dump(), 'band': 'broad'}},
@@ -50,13 +76,19 @@ class TestDeclaredScopeOf:
             ),
         ],
     )
-    def test_no_valid_stamp_reads_as_none(self, metadata: dict[str, Any]) -> None:
+    def test_an_invalid_stamp_reads_as_none_with_a_census_line(
+        self, metadata: dict[str, Any], census: pytest.LogCaptureFixture,
+    ) -> None:
         assert declared_scope_of(metadata) is None
+        [line] = _census_lines(census)
+        assert DECLARED_SCOPE_METADATA_KEY in line
 
 
-class TestItemCountOf:
-    def test_a_valid_list_counts_its_items(self) -> None:
-        assert item_count_of({FOLLOWUP_ITEMS_METADATA_KEY: _TWO_ITEMS}) == 2
+class TestFollowupItemsOf:
+    def test_a_valid_list_is_its_items_and_its_count(self) -> None:
+        metadata = {FOLLOWUP_ITEMS_METADATA_KEY: _TWO_ITEMS}
+        assert [item.model_dump(mode='json') for item in followup_items_of(metadata)] == _TWO_ITEMS
+        assert item_count_of(metadata) == 2
 
     @pytest.mark.parametrize(
         'metadata',
@@ -66,12 +98,28 @@ class TestItemCountOf:
                 {'suggestion_hash': 'abc123', 'files': ['pkg/a.py'], 'spawned_from': '1'},
                 id='legacy-single',
             ),
+        ],
+    )
+    def test_no_list_reads_as_no_items_without_a_census_line(
+        self, metadata: dict[str, Any], census: pytest.LogCaptureFixture,
+    ) -> None:
+        assert followup_items_of(metadata) == ()
+        assert item_count_of(metadata) == 0
+        assert _census_lines(census) == []
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
             pytest.param({FOLLOWUP_ITEMS_METADATA_KEY: 'not-a-list'}, id='not-a-list'),
             pytest.param({FOLLOWUP_ITEMS_METADATA_KEY: [{'summary': 'no key'}]}, id='invalid-element'),
         ],
     )
-    def test_anything_but_a_valid_list_counts_zero(self, metadata: dict[str, Any]) -> None:
-        assert item_count_of(metadata) == 0
+    def test_a_malformed_list_reads_as_no_items_with_a_census_line(
+        self, metadata: dict[str, Any], census: pytest.LogCaptureFixture,
+    ) -> None:
+        assert followup_items_of(metadata) == ()
+        [line] = _census_lines(census)
+        assert FOLLOWUP_ITEMS_METADATA_KEY in line
 
 
 class TestRenderDeclaredScope:

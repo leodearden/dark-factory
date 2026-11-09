@@ -27,7 +27,6 @@ from shared.followup_items import (
     FollowupBundleInvalid,
     FollowupItem,
     merge_items,
-    read_items,
     task_items,
     with_derived_bundle_keys,
 )
@@ -84,6 +83,7 @@ from fused_memory.middleware.curator_types import (
     PreparedCandidate,
     declared_scope_of,
     exception_summary,
+    followup_items_of,
     is_combine_eligible,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
@@ -652,19 +652,6 @@ def _with_derived_bundle_keys(metadata: Any) -> Any:
     if readable is None or FOLLOWUP_ITEMS_METADATA_KEY not in readable:
         return metadata
     return with_derived_bundle_keys(readable)
-
-
-def _candidate_items(meta: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
-    """The candidate's follow-up items; () with a census line when a stored list is malformed."""
-    try:
-        return read_items(meta)
-    except FollowupBundleInvalid as exc:
-        logger.warning(
-            'task_metadata.schema_warning source=%s error=%s; candidate items discarded',
-            '_candidate_items',
-            exc,
-        )
-        return ()
 
 
 class TaskInterceptor:
@@ -2726,7 +2713,7 @@ class TaskInterceptor:
             spawned_from=meta.get('spawned_from'),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
-            items=_candidate_items(meta),
+            items=followup_items_of(meta),
             declared_scope=declared_scope_of(meta),
         )
 
