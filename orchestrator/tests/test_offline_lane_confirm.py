@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _lane_confirm_project import Sabotage, arm, disarm, lane_project, node_id, write_script
+from _lane_confirm_project import (
+    Sabotage,
+    arm,
+    disarm,
+    lane_project,
+    node_id,
+    write_pytest_config,
+    write_script,
+)
 
 from orchestrator.config import LaneCommand
 from orchestrator.offline_lane_confirm import (
@@ -789,6 +797,7 @@ class TestIntersectedRoundTrip:
 LANE = LaneCommand(name='lane', command='pytest -q tests', cwd='.')
 OPAQUE = LaneCommand(name='opaque', command='timeout 600 pytest -q tests', cwd='.')
 KILLED = LaneCommand(name='killed', command='kill -9 $$', cwd='.')
+POOLED_ADDOPTS = '-n 2 --dist loadgroup'
 HEAD = 'c0ffee1234'
 SPACING = timedelta(minutes=31)
 
@@ -850,10 +859,7 @@ class TestRealPytestGenericLeg:
     async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
         self, tmp_path: Path, store: RunRecordStore,
     ) -> None:
-        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok')
-        (project / 'pyproject.toml').write_text(
-            '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider -n 2 --dist loadgroup"\n',
-        )
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok', addopts=POOLED_ADDOPTS)
 
         detect = await _detect(store, LANE, project)
         assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
@@ -933,7 +939,7 @@ class TestRealPytestGenericLeg:
     ) -> None:
         project = tmp_path / 'wt'
         (project / 'tests').mkdir(parents=True)
-        (project / 'pyproject.toml').write_text('[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n')
+        write_pytest_config(project)
         (project / 'tests' / 'test_t.py').write_text(
             "import pytest\n\n\n@pytest.mark.parametrize('word', ['a] b'])\n"
             "def test_a(word):\n    assert word == 'ab'\n",

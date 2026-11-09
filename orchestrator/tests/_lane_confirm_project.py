@@ -15,7 +15,7 @@ from pathlib import Path
 
 LANE_FILE = 'tests/test_lane.py'
 
-_PYPROJECT = '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n'
+_BASE_ADDOPTS = '-p no:cacheprovider'
 
 _PRELUDE = '''\
 import pathlib
@@ -83,11 +83,19 @@ def node_id(test: str) -> str:
     return f'{LANE_FILE}::{test}'
 
 
-def lane_project(root: Path, *tests: str) -> Path:
-    """A pytest project at *root* whose lane file holds *tests*, in that order."""
+def write_pytest_config(project: Path, addopts: str = '') -> None:
+    options = f'{_BASE_ADDOPTS} {addopts}'.strip()
+    (project / 'pyproject.toml').write_text(
+        f'[tool.pytest.ini_options]\naddopts = "{options}"\n', encoding='utf-8',
+    )
+
+
+def lane_project(root: Path, *tests: str, addopts: str = '') -> Path:
+    """A pytest project at *root* whose lane file holds *tests*, in that order;
+    *addopts* extends the project's base pytest options."""
     tests_dir = root / 'tests'
     tests_dir.mkdir(parents=True)
-    (root / 'pyproject.toml').write_text(_PYPROJECT, encoding='utf-8')
+    write_pytest_config(root, addopts)
     (tests_dir / 'conftest.py').write_text(_CONFTEST, encoding='utf-8')
     body = '\n\n'.join(LANE_TESTS[test] for test in tests)
     (root / LANE_FILE).write_text(f'{_PRELUDE}\n\n{body}', encoding='utf-8')
