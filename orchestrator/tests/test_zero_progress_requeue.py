@@ -887,6 +887,93 @@ class TestResolveZeroProgressWrappers:
         assert recovered['data'] == {'streak': 7, 'resolved': 1, 'wrappers': 1}
 
 
+def _inherit(pending, *, filed_at):
+    from orchestrator.zero_progress_requeue import inherit_zero_progress_alarms
+
+    return inherit_zero_progress_alarms(pending, filed_at=filed_at)
+
+
+class TestInheritZeroProgressAlarms:
+    """A restarted process inherits the alarms its predecessor left pending.
+
+    The tracker and the filed-at memo die with the process; the pending queue
+    does not.  Seeding the memo from it is what lets the resolver's cheap gate
+    open on the inherited task's next progress outcome.
+    """
+
+    def test_a_prior_process_alarm_seeds_the_memo_at_zero(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
+    def test_the_inherited_alarm_resolves_on_the_first_progress_outcome(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at=memo,
+        ) is True
+        assert _status(queue, alarm.id) == 'resolved'
+        assert '3068' not in memo
+
+    def test_without_inheritance_the_same_progress_strands_the_alarm(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at={},
+        ) is False
+        assert _status(queue, alarm.id) == 'pending'
+
+    def test_a_sentinel_bound_wrapper_is_inherited(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '4000')
+        _submit(queue, 'esc-w', task_id=_sentinel('4000'), level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+
+        assert '4000' in _inherit(queue.get_pending(), filed_at={})
+
+    def test_records_of_other_classes_are_ignored(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, 'esc-4001-1', task_id='4001', level=1, agent_role='implementer')
+        _submit(
+            queue, 'esc-streak-4001-1', task_id='__recovery_veto_streak__4001',
+            level=1, agent_role='orchestrator-recovery-veto-streak',
+        )
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset()
+        assert memo == {}
+
+    def test_a_live_memo_entry_keeps_its_value(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo = {'3068': 7}
+
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert memo == {'3068': 7}
+
+
 # ---------------------------------------------------------------------------
 # Part C.3 — the config section
 # ---------------------------------------------------------------------------
