@@ -1335,6 +1335,37 @@ def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
     }
 
 
+NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
+
+
+def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
+    """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
+
+    A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
+    teardown error, is ``'error'``: the test got no verdict. A test that never
+    executed is ``'skipped'``; any other testcase ran and passed. Ids use the
+    spelling of :func:`_extract_test_ids_from_junit`.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root is None:
+        return None
+    statuses: dict[str, NodeIdStatus] = {}
+    for testcase in root.iter('testcase'):
+        if testcase.find('failure') is not None:
+            status: NodeIdStatus = 'fail'
+        elif testcase.find('error') is not None:
+            status = 'error'
+        elif _junit_testcase_never_ran(testcase):
+            status = 'skipped'
+        else:
+            status = 'pass'
+        statuses[_junit_testcase_id(testcase)] = status
+    return statuses
+
+
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     """The failing half of :func:`_extract_test_ids_from_junit`; ``None`` when no report parsed."""
     ids = _extract_test_ids_from_junit(path)
@@ -10838,41 +10869,39 @@ def _node_id_test_config(
     )
 
 
-NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
-
 #: Per-test timeout (seconds) injected into every ``run_node_ids`` run, so a
 #: hung test is bounded by it rather than by the verify command timeout.
 _NODE_ID_RUN_TIMEOUT_SECS: int = 300
 
 
+#: The status of a function id over its parametrizations: the first of these any of them has.
+_PARAMETRIZED_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'pass', 'skipped')
+
+
 def _node_id_statuses(
     report: Path, prefix: str, qualified_by_id: Mapping[str, str],
 ) -> dict[str, NodeIdStatus] | None:
-    """Each id's status as the junit *report* records it; ``None`` when no report parsed.
+    """The status of each id the junit *report* records; ``None`` when no report parsed.
 
-    An id matches a testcase spelled from its qualified id with the rootdir at
-    the tree root or at the module dir; an id no testcase matches is ``'error'``.
+    An id names the testcase spelled from its qualified id with the rootdir at
+    the tree root or at the module dir, and a function id without parameters
+    names every parametrization of it. An id that names no testcase is left out.
     """
-    ids = _extract_test_ids_from_junit(report)
-    if ids is None:
+    testcases = _junit_testcase_statuses(report)
+    if testcases is None:
         return None
-    outcomes = extract_test_outcomes_from_junit(report) or {}
-    failing, never_ran = set(ids.failing), set(ids.skipped)
-    passed = {test_id for test_id, outcome in outcomes.items() if outcome == 'passed'}
     statuses: dict[str, NodeIdStatus] = {}
     for node_id, qualified in qualified_by_id.items():
         spellings = {
             _junit_spelling(qualified),
             _junit_spelling(qualified.removeprefix(f'{prefix}/')),
         }
-        if spellings & failing:
-            statuses[node_id] = 'fail'
-        elif spellings & never_ran:
-            statuses[node_id] = 'skipped'
-        elif spellings & passed:
-            statuses[node_id] = 'pass'
-        else:
-            statuses[node_id] = 'error'
+        named: list[NodeIdStatus] = [
+            status for testcase, status in testcases.items()
+            if spellings & {testcase, testcase.partition('[')[0]}
+        ]
+        if named:
+            statuses[node_id] = min(named, key=_PARAMETRIZED_STATUS_PRECEDENCE.index)
     return statuses
 
 
@@ -10883,7 +10912,7 @@ async def _node_id_run(
     qualified_by_id: Mapping[str, str],
     report: Path,
 ) -> dict[str, NodeIdStatus] | None:
-    """One run of *qualified_by_id* into *report*, read back per id; ``None`` when it gave no verdict."""
+    """One run of *qualified_by_id* into *report*, read back per reported id; ``None`` when no report was read."""
     try:
         await run_verification(
             tree, config,
@@ -10902,6 +10931,29 @@ async def _node_id_run(
     return _node_id_statuses(report, module_config.prefix, qualified_by_id)
 
 
+_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdStatus] | None]]
+
+
+async def _bisect_refused_run(
+    run: _NodeIdSubsetRun, refused: Sequence[str],
+) -> dict[str, NodeIdStatus]:
+    """The statuses of the *refused* ids, a run that reported none of them, found by bisection.
+
+    The halves run in turn, and a half that reports nothing is split again.
+    When the first half reports, the cause lies in the second, so the second
+    is split without being run. An id refused alone reports nothing.
+    """
+    if len(refused) < 2:
+        return {}
+    first, second = refused[:len(refused) // 2], refused[len(refused) // 2:]
+    first_statuses = await run(first)
+    if first_statuses:
+        return first_statuses | await _bisect_refused_run(run, second)
+    first_statuses = await _bisect_refused_run(run, first)
+    second_statuses = await run(second) or await _bisect_refused_run(run, second)
+    return first_statuses | second_statuses
+
+
 async def _run_node_id_group(
     tree: Path,
     config: OrchestratorConfig,
@@ -10911,29 +10963,27 @@ async def _run_node_id_group(
 ) -> dict[str, NodeIdStatus]:
     """Every id of one module's group, run together into *report*, which is removed afterwards.
 
-    An id the group's written report does not record is re-run alone.
+    A run whose written report records none of its ids is bisected.
     """
     if report is None:
         logger.warning(
             'run_node_ids: no junit report path in %s for module %r — %s each read error',
             tree, module_config.prefix, list(qualified_by_id),
         )
-        statuses = None
-    else:
-        try:
-            statuses = await _node_id_run(tree, config, module_config, qualified_by_id, report)
-            if statuses is not None and len(qualified_by_id) > 1:
-                unreported = [node_id for node_id, status in statuses.items() if status == 'error']
-                for node_id in unreported:
-                    alone = await _node_id_run(
-                        tree, config, module_config, {node_id: qualified_by_id[node_id]}, report,
-                    )
-                    statuses[node_id] = 'error' if alone is None else alone[node_id]
-        finally:
-            _clear_junit_report(report)
-    if statuses is None:
         return {node_id: 'error' for node_id in qualified_by_id}
-    return statuses
+
+    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdStatus] | None:
+        subset = {node_id: qualified_by_id[node_id] for node_id in node_ids}
+        return await _node_id_run(tree, config, module_config, subset, report)
+
+    try:
+        statuses = await run(list(qualified_by_id))
+        if statuses == {}:
+            statuses = await _bisect_refused_run(run, list(qualified_by_id))
+    finally:
+        _clear_junit_report(report)
+    reported = statuses or {}
+    return {node_id: reported.get(node_id, 'error') for node_id in qualified_by_id}
 
 
 def _node_ids_by_module(
@@ -10964,8 +11014,13 @@ async def run_node_ids(
     ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
     never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
     verdict was obtained: the id maps to no module in *module_configs*, names
-    no single test (a module or class id matches no testcase), was never
-    reported, or its run raised or wrote no junit report.
+    no test function (a module or class id matches no testcase), was never
+    reported, errored in setup or teardown, or its run raised or wrote no
+    junit report.
+
+    A function id without its parameters names every parametrization:
+    ``'fail'`` if any failed, else ``'error'`` if any errored, else ``'pass'``
+    if any passed, else ``'skipped'``.
 
     Each id is mapped to its module on its own, so one unmappable id errors
     alone. The ids of one module run together, serially, scoped and with a
@@ -10975,9 +11030,12 @@ async def run_node_ids(
     mapping (``_group_node_ids_by_subproject``) and ``_node_id_test_config``.
 
     pytest refuses a whole argv for one not-found id, and a collection error
-    interrupts the session, so an id missing from a group's written report is
-    re-run alone, serially, and reads ``'error'`` only if it is missing again;
-    a group that wrote no report at all is not re-run.
+    interrupts the session even under ``--continue-on-collection-errors``, so
+    a run whose written report records none of its ids is bisected, serially.
+    Each id that refuses a run reads ``'error'`` and costs re-runs logarithmic
+    in the group's size, not one per sibling. A run that records any of its
+    ids finished its session, so an id it does not record is ``'error'``
+    without a re-run; a group that wrote no report at all is not re-run.
 
     *concurrent_groups* runs the module groups at once, each writing its own
     report; the serial default is what an isolation-sensitive caller needs.
