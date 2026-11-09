@@ -98,6 +98,129 @@ class TestSubmitReviewVerdict:
         assert artifacts.read_verdict('security') is None
 
 
+def _contract_issue(**overrides: Any) -> dict[str, Any]:
+    issue: dict[str, Any] = {
+        'severity': 'blocking',
+        'location': 'pkg/mod.py:3',
+        'category': 'correctness',
+        'description': 'the thing is broken',
+        'suggested_fix': 'fix the thing',
+    }
+    issue.update(overrides)
+    return issue
+
+
+def _contract_issue_without(field: str, **overrides: Any) -> dict[str, Any]:
+    issue = _contract_issue(**overrides)
+    del issue[field]
+    return issue
+
+
+def _submit_issues(artifacts: TaskArtifacts, issues: list, **overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        role='test_analyst',
+        session_id='s',
+        reviewer='test_analyst',
+        verdict='ISSUES_FOUND',
+        issues=issues,
+        summary='x',
+    )
+    kwargs.update(overrides)
+    return _submit_review_verdict(artifacts, **kwargs)
+
+
+class TestSubmitReviewVerdictIssueIntake:
+    """The intake checks each issue against the reviewer issue contract
+    (orchestrator/review_issue_contract.py): off-contract fields are
+    normalised and reported back; only an unusable issue refuses the call.
+    """
+
+    def test_off_contract_fields_are_normalised_and_reported(self, artifacts):
+        high = _contract_issue(severity='high', title='kept')
+        file_and_line = _contract_issue_without(
+            'location', file='pkg/mod.py', line=12,
+        )
+
+        result = _submit_issues(artifacts, [high, file_and_line])
+
+        assert result['status'] == 'ok'
+        assert result['role'] == 'test_analyst'
+        report = result['issue_contract']
+        assert report['outcome'] == 'normalised'
+        assert [d.split(':')[0] for d in report['deviations']] == [
+            'issues[0].severity', 'issues[1].location',
+        ]
+        assert 'submit_review_verdict' in result['message']
+        assert 'again' in result['message']
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        stored = envelope['verdict']['issues']
+        assert stored == [
+            {**high, 'severity': 'suggestion'},
+            {**file_and_line, 'location': 'pkg/mod.py:12'},
+        ]
+        assert stored[0]['title'] == 'kept'
+        assert (stored[1]['file'], stored[1]['line']) == ('pkg/mod.py', 12)
+
+    def test_issue_without_description_is_refused_and_nothing_written(self, artifacts):
+        result = _submit_issues(
+            artifacts, [_contract_issue(), _contract_issue_without('description')],
+        )
+
+        assert result['status'] == 'error'
+        assert 'issues[1].description' in result['message']
+        assert 'nothing was written' in result['message'].lower()
+        assert result['issue_contract']['outcome'] == 'rejected'
+        assert artifacts.read_verdict('test_analyst') is None
+
+    def test_issue_without_severity_is_refused_naming_it(self, artifacts):
+        result = _submit_issues(artifacts, [_contract_issue_without('severity')])
+
+        assert result['status'] == 'error'
+        assert 'issues[0].severity' in result['message']
+        assert result['issue_contract']['outcome'] == 'rejected'
+        assert artifacts.read_verdict('test_analyst') is None
+
+    def test_off_vocabulary_severity_alone_still_lands_the_verdict(self, artifacts):
+        """INV-6: a repairable issue must not strand the review gate."""
+        result = _submit_issues(artifacts, [_contract_issue(severity='major')])
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_verdict('test_analyst') is not None
+
+    def test_on_contract_issues_add_no_keys_to_the_ack(self, artifacts):
+        issues = [_contract_issue(), _contract_issue(severity='suggestion')]
+
+        result = _submit_issues(artifacts, issues)
+
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == issues
+
+    @pytest.mark.parametrize(
+        ('overrides', 'named'),
+        [
+            ({'reviewer': 'security'}, ('security', 'test_analyst')),
+            ({'verdict': 'GARBAGE'}, ('PASS', 'ISSUES_FOUND')),
+        ],
+    )
+    def test_identity_and_verdict_checks_run_before_the_issue_check(
+        self, artifacts, overrides, named,
+    ):
+        result = _submit_issues(
+            artifacts, [_contract_issue_without('description')], **overrides,
+        )
+
+        assert result['status'] == 'error'
+        for name in named:
+            assert name in result['message']
+        assert 'issues[' not in result['message']
+        assert 'issue_contract' not in result
+        assert artifacts.read_verdict('test_analyst') is None
+
+
 class TestSubmitCompletionVerdict:
     def test_writes_envelope_and_returns_ok(self, artifacts):
         result = _submit_completion_verdict(
