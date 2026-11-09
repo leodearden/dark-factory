@@ -22,7 +22,10 @@ LANE_FILE = 'tests/test_lane.py'
 
 _BASE_ADDOPTS = '-p no:cacheprovider --basetemp=.lane-basetemp'
 
+_TEMP_ROOT_RECORD = '.inherited-temproot'
+
 _PRELUDE = '''\
+import os
 import pathlib
 
 import pytest
@@ -59,6 +62,11 @@ LANE_TESTS = {
         "    assert word == 'xy'\n"
     ),
     'test_ok': 'def test_ok():\n    pass\n',
+    'test_records_its_temp_root': (
+        'def test_records_its_temp_root():\n'
+        f'    (_HERE / {_TEMP_ROOT_RECORD!r}).write_text('
+        "os.environ.get('PYTEST_DEBUG_TEMPROOT', ''), encoding='utf-8')\n"
+    ),
 }
 
 
@@ -86,6 +94,11 @@ def pytest_runtest_logfinish(nodeid, location):
 
 def node_id(test: str) -> str:
     return f'{LANE_FILE}::{test}'
+
+
+def inherited_temp_root(project: Path) -> str:
+    """The ``PYTEST_DEBUG_TEMPROOT`` that *project*'s ``test_records_its_temp_root`` saw."""
+    return (project / 'tests' / _TEMP_ROOT_RECORD).read_text(encoding='utf-8')
 
 
 def write_pytest_config(project: Path, addopts: str = '') -> None:

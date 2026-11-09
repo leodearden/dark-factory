@@ -23,6 +23,7 @@ from _lane_confirm_project import (
     Sabotage,
     arm,
     disarm,
+    inherited_temp_root,
     lane_project,
     node_id,
     write_pytest_config,
@@ -878,11 +879,18 @@ class TestRealPytestGenericLeg:
         seed_dead_session_dirs(host)
         before = listing(host)
         monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
-        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok', addopts=POOLED_ADDOPTS)
+        project = lane_project(
+            tmp_path / 'wt', 'test_grouped_flaky', 'test_records_its_temp_root', addopts=POOLED_ADDOPTS,
+        )
 
         detect = await _detect(store, LANE, project)
 
         assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+        assert inherited_temp_root(project) == str(host), (
+            'the pooled session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
+            'use the real host temp root and leave the stand-in untouched with or '
+            'without --basetemp: the assertion below would pass vacuously'
+        )
         after = listing(host)
         assert after == before, (
             "a nested lane session must not create, lock or clean dirs in the "
