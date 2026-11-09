@@ -300,6 +300,16 @@ class SkipReason(StrEnum):
     NO_MEMORY_ID = 'no_memory_id'
     CONTENT_UNAVAILABLE = 'content_unavailable'
     CANDIDATE_SEARCH_DEGRADED = 'candidate_search_degraded'
+    SHOWN_SET_INCOMPLETE = 'shown_set_incomplete'
+    """The match is outside every known shown set and some prior search cannot prove absence."""
+
+
+class Exposure(StrEnum):
+    """Whether a write's window was shown the entry the guard matched."""
+
+    SHOWN = 'shown'
+    NOT_SHOWN = 'not_shown'
+    UNKNOWN = 'unknown'
 
 
 @dataclass(frozen=True)
@@ -396,10 +406,18 @@ def admissible(results: Sequence[MemoryResult], write: WriteRow) -> list[MemoryR
     ]
 
 
-def was_shown(match: MemoryResult, searches: Sequence[SearchRow]) -> bool:
-    """Whether *match*, or the grouped parent it folds under, was in some search's shown set."""
+def was_shown(match: MemoryResult, searches: Sequence[SearchRow]) -> Exposure:
+    """Whether *match*, or the grouped parent it folds under, was in some search's shown set.
+
+    UNKNOWN when it is in no known shown set but some search is incomplete: that
+    search may have shown it, so absence is not proven.
+    """
     shown = frozenset().union(*(search.shown_ids for search in searches))
-    return match.id in shown or child_parent_id(match.metadata) in shown
+    if match.id in shown or child_parent_id(match.metadata) in shown:
+        return Exposure.SHOWN
+    if all(search.complete for search in searches):
+        return Exposure.NOT_SHOWN
+    return Exposure.UNKNOWN
 
 
 async def _adjudicate_write(
@@ -421,8 +439,13 @@ async def _adjudicate_write(
     match = find_near_duplicate_memory(
         admissible(candidates, write), threshold, category=MemoryCategory(write.category),
     )
-    if match is None or was_shown(match, prior):
+    if match is None:
         return None
+    exposure = was_shown(match, prior)
+    if exposure is Exposure.SHOWN:
+        return None
+    if exposure is Exposure.UNKNOWN:
+        return SkipReason.SHOWN_SET_INCOMPLETE
     return Incident(
         write_row_id=write.row_id,
         search_row_ids=tuple(search.row_id for search in prior),
