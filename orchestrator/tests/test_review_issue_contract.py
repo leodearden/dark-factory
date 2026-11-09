@@ -52,6 +52,44 @@ def _only_deviation(intake: IssueIntake) -> IssueDeviation:
     return intake.deviations[0]
 
 
+USABLE_FIXTURES: tuple[dict[str, object], ...] = (
+    _issue(severity='high'),
+    _issue(severity=' Blocking '),
+    _without(IssueField.LOCATION, file='pkg/mod.py', line=12),
+    _without(IssueField.LOCATION, file='pkg/mod.py'),
+    _without(IssueField.LOCATION, file='pkg/mod.py', line=True),
+    _without(IssueField.LOCATION),
+    _issue(location=42),
+    _issue(location=['a' * 500]),
+    _without(IssueField.CATEGORY),
+    _issue(category=None),
+    _issue(category='   '),
+    _without(IssueField.SUGGESTED_FIX),
+    _issue(suggested_fix=None),
+    _issue(),
+)
+
+
+@pytest.mark.parametrize('fixture', USABLE_FIXTURES)
+def test_the_normal_form_is_a_fixed_point(fixture):
+    first = check_issues([fixture])
+
+    second = check_issues(first.issues)
+
+    assert second.deviations == ()
+    assert second.issues == first.issues
+
+
+def test_the_normal_form_of_a_whole_list_is_a_fixed_point():
+    first = check_issues(USABLE_FIXTURES)
+
+    second = check_issues(first.issues)
+
+    assert len(first.issues) == len(USABLE_FIXTURES)
+    assert second.deviations == ()
+    assert second.issues == first.issues
+
+
 class TestOnContractIssue:
     def test_comes_back_equal_with_no_deviations(self):
         issue = _issue(title='a title', file='pkg/mod.py', line=3)
@@ -121,10 +159,32 @@ class TestLocationFallback:
             recorded_as=recorded,
         )
 
+    def test_empty_location_with_nothing_to_derive_is_on_contract(self):
+        issue = _issue(location='')
+
+        intake = check_issues([issue])
+
+        assert intake.issues == (issue,)
+        assert intake.deviations == ()
+
+    def test_empty_location_is_derived_from_file_and_line(self):
+        issue = _issue(location='', file='pkg/mod.py', line=12)
+
+        intake = check_issues([issue])
+
+        assert intake.issues[0]['location'] == 'pkg/mod.py:12'
+        assert _only_deviation(intake) == IssueDeviation(
+            index=0,
+            field=IssueField.LOCATION,
+            deviation=Deviation.MISSING,
+            received='',
+            recorded_as='pkg/mod.py:12',
+        )
+
 
 class TestOptionalFields:
     @pytest.mark.parametrize('field', [IssueField.CATEGORY, IssueField.SUGGESTED_FIX])
-    @pytest.mark.parametrize('absent_form', ['absent', None, '', '   '])
+    @pytest.mark.parametrize('absent_form', ['absent', None, '   '])
     def test_missing_optional_field_is_recorded_blank_and_flagged(self, field, absent_form):
         issue = _without(field) if absent_form == 'absent' else _issue(**{field: absent_form})
 
@@ -135,6 +195,15 @@ class TestOptionalFields:
         assert (deviation.field, deviation.deviation, deviation.recorded_as) == (
             field, Deviation.MISSING, '',
         )
+
+    @pytest.mark.parametrize('field', [IssueField.CATEGORY, IssueField.SUGGESTED_FIX])
+    def test_empty_optional_field_is_on_contract(self, field):
+        issue = _issue(**{field: ''})
+
+        intake = check_issues([issue])
+
+        assert intake.issues == (issue,)
+        assert intake.deviations == ()
 
     def test_present_non_string_optional_field_is_recorded_as_its_str(self):
         intake = check_issues([_issue(location=42)])
@@ -280,6 +349,21 @@ class TestAggregateReviewsFlagsOffContractIssues:
         assert aggregation.has_blocking_issues is False
         assert {**minor, 'reviewer': 'reviewer_comprehensive'} in aggregation.suggestions
         assert {**file_and_line, 'reviewer': 'reviewer_comprehensive'} in aggregation.suggestions
+
+    def test_an_intake_normalised_review_is_not_flagged(self, artifacts, caplog):
+        off_contract = [
+            _issue(severity='minor'),
+            _without(IssueField.LOCATION),
+            _without(IssueField.CATEGORY),
+            _issue(suggested_fix=None),
+        ]
+        normalised = list(check_issues(off_contract).issues)
+        artifacts.write_review('reviewer_comprehensive', self._review(*normalised))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
+            artifacts.aggregate_reviews()
+
+        assert self._off_contract_records(caplog) == []
 
     def test_an_on_contract_review_is_not_flagged(self, artifacts, caplog):
         artifacts.write_review('reviewer_comprehensive', self._review(_issue()))
