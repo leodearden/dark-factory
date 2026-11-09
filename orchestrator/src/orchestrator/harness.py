@@ -2930,6 +2930,7 @@ class Harness:
             task_tree_steps = (
                 StartupStep('2c', self._recover_crashed_tasks),
                 StartupStep('2c2', self._reconcile_lane_checkouts),
+                StartupStep('2c3-streak-alarms', self._inherit_pending_streak_alarms),
                 StartupStep('2d', self._reconcile_stranded_at_startup),
                 StartupStep('2e', self._reap_orphan_worktrees),
                 StartupStep('diff7', self._reconcile_terminal_lanes),
