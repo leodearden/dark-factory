@@ -10030,15 +10030,10 @@ class Harness:
             logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
 
     def _resolve_watcher_outage_l2(self, evidence: WatcherRecoveryEvidence) -> None:
-        """Resolve the open watcher-outage L2, recording *evidence* as its resolution.
+        """Resolve the pending watcher-outage L2 with *evidence*, unless the scheduler is paused.
 
-        Never resolves while any scheduler pause holds: the trips that file
-        this shared L2 (cost ceiling, watcher guard) install holds only a
-        human resume ends, and _enforce_cost_ceilings returns early while
-        paused, so a false resolve would never be re-filed.  The in-memory
-        pause class is first-wins, so it cannot attribute which trip filed
-        the L2.  After a resume, the next drained poll or healthy rotation
-        clears it.
+        While any scheduler pause holds, the L2 stays open.  After a resume,
+        the next drained poll or healthy rotation clears it.
 
         No-op when no outage L2 is pending.  Best-effort: failures are
         swallowed (a missing scheduler fails closed) so the supervisor loop

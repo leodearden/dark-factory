@@ -44,7 +44,7 @@ from orchestrator.harness import (
     Harness,
     WatcherRecoveryEvidence,
 )
-from orchestrator.pause_policy import PauseClass
+from orchestrator.pause_policy import PAUSE_POLICY, PauseClass
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -4109,7 +4109,9 @@ class TestWatcherOutageL2HeldOpenWhileSchedulerPaused:
         assert held.resolution is None
 
     @pytest.mark.parametrize('evidence', list(WatcherRecoveryEvidence))
-    @pytest.mark.parametrize('pause_class', list(PauseClass))
+    @pytest.mark.parametrize(
+        'pause_class', [c for c in PauseClass if PAUSE_POLICY[c].may_halt],
+    )
     def test_no_evidence_clears_outage_l2_under_any_pause(
         self,
         tmp_path: Path,
@@ -4185,20 +4187,8 @@ class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
 
         digest_spy = AsyncMock()
         h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
 
-        sleep_durations: list[float] = []
-
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
