@@ -86,11 +86,12 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
 def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
     """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
 
-    Dispatch reads each frozen entry's ``item`` and ``gate`` for the bases a
-    new item may stack on; ``None`` for both contributes no base commit.
+    Dispatch reads each frozen entry's ``item``, ``gate`` and ``chain`` for
+    the bases a new item may stack on; ``None`` for all three contributes no
+    base commit.
     """
     worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
-        lambda: [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+        lambda: [SimpleNamespace(item=None, gate=None, chain=None) for _ in range(frontier)]
     )
 
 

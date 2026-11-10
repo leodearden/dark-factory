@@ -164,6 +164,7 @@ from orchestrator.merge_lane.remerge_base import (
     choose_remerge_base,
     claim_remerge_base,
     entry_commit,
+    entry_successor_base,
     frontier_tip,
 )
 from orchestrator.merge_lane.request_ledger import (
@@ -10633,7 +10634,9 @@ class SpeculativeMergeWorker:
     def _newest_frozen_commit(self) -> str | None:
         """Return the newest frozen entry's merge_commit, or None (ε=1890).
 
-        The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`.
+        The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`,
+        over :func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`
+        (a chained entry's successors stack on its chain tip).
         Pure/synchronous.
         """
         return frontier_tip(self._frozen_inflight_entries())
@@ -10713,12 +10716,18 @@ class SpeculativeMergeWorker:
         ).tip
         if tip is None:
             return None
-        return LiveTip(tip, next(e.item.request for e in frontier if entry_commit(e) == tip))
+        return LiveTip(
+            tip, next(e.item.request for e in frontier if entry_successor_base(e) == tip),
+        )
 
     def _cascade_doomed_commits(self) -> frozenset[str]:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
-        and records dead whenever :meth:`_finalize_inflight` returns False."""
-        return frozenset(c for e in self._inflight if (c := entry_commit(e)) is not None)
+        and records dead whenever :meth:`_finalize_inflight` returns False:
+        each entry's own commit and, when it chained, its chain tip."""
+        return frozenset(
+            c for e in self._inflight
+            for c in (entry_commit(e), entry_successor_base(e)) if c is not None
+        )
 
     def _record_item_commit_dead(
         self, item: SpeculativeItem, site: DeadBaseSite, *, doomed: Collection[str] = (),
@@ -10790,8 +10799,8 @@ class SpeculativeMergeWorker:
     def _frozen_base_chain(self) -> Iterator[tuple[RealMergeItem, str | None]]:
         """Walk the frozen prefix's real merges as (item, predecessor_commit), oldest first.
 
-        *predecessor_commit* is the previous frozen real merge's merge commit,
-        or None for the head: the head's base is judged by INV-3 alone
+        *predecessor_commit* is the previous frozen real merge's successor base
+        (its merge commit, or its chain tip when it chained), or None for the head: the head's base is judged by INV-3 alone
         (:meth:`_chain_dead_link`), never against current main, which may
         legitimately move under an in-flight verify (PRD §5.3, task 5302).
 
@@ -10810,7 +10819,7 @@ class SpeculativeMergeWorker:
             if not isinstance(item, RealMergeItem) or not item.merge_result.merge_commit:
                 continue
             yield item, predecessor
-            predecessor = item.merge_result.merge_commit.strip()
+            predecessor = entry_successor_base(entry)
 
     def _chain_breaks(
         self, item: RealMergeItem, predecessor: str | None, main_sha: str,
@@ -20650,12 +20659,13 @@ class SpeculativeMergeWorker:
         return status
 
     def _frontier_base_commits(self) -> tuple[set[str], set[str]]:
-        """The frozen prefix's merge commits and gate-rebased heads a dispatch may be built on."""
+        """The frozen prefix's merge commits, chain tips and gate-rebased heads a
+        dispatch may be built on."""
         frozen = self._frozen_inflight_entries()
         stacked_on = {
             e.item.merge_result.merge_commit for e in frozen
             if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
-        }
+        } | {b for e in frozen if (b := entry_successor_base(e)) is not None}
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads
