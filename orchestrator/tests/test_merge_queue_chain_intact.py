@@ -28,6 +28,7 @@ import contextlib
 import dataclasses
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -933,7 +934,7 @@ class TestDispatchSitesReanchor:
         worker = _dispatching_worker(git_ops, store, monkeypatch)
         straggler, permit = await _dead_based_straggler(worker, git_ops, config)
         worker._register_item(straggler, ItemLifecycleState.DISPATCHING)
-        allocator = worker._host_allocator
+        allocator = cast(MagicMock, worker._host_allocator)
         lease = allocator.acquire.return_value
         allocator.acquire.return_value = None
 
