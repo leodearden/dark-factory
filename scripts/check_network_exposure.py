@@ -7,18 +7,29 @@ Stdlib only, so it runs under a plain system python3.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
+import enum
+import errno
 import fnmatch
+import itertools
+import json
 import socket
+import subprocess
 import types
-from collections.abc import Iterable, Mapping
-from typing import Final, TypeVar
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Final, TextIO, TypeVar
+
+from systemd_unit_parity import emit
 
 TOOL: Final = "network_exposure"
 
 SOCKET_UNIT_PATTERNS: Final = ("fused-memory.socket", "orchestrator-*.socket")
 LIST_SOCKETS_ARGV: Final = ("systemctl", "--user", "list-sockets", "-o", "json")
 IP_ADDR_ARGV: Final = ("ip", "-j", "addr")
+SOURCE_TIMEOUT_SECS: Final = 30
+DEFAULT_CONNECT_TIMEOUT_SECS: Final = 1.0
+PROBE_WORKERS: Final = 32
 
 _LOOPBACK_SCOPE: Final = "host"
 _LINK_SCOPE: Final = "link"
@@ -57,6 +68,9 @@ class HostAddress:
         if self.scope_id:
             return f"{self.ip}%{self.ifname}"
         return f"{self.ip} ({self.ifname})"
+
+
+LOOPBACK: Final = HostAddress(ip="127.0.0.1", family=socket.AF_INET, scope_id=0, ifname="lo")
 
 
 # Host port -> compose service, for every `ports` publish in
@@ -158,3 +172,181 @@ def host_addresses(links: object) -> list[HostAddress]:
         link = _require_object(raw, IP_ADDR_ARGV, "a link")
         seen.update(dict.fromkeys(_link_addresses(link)))
     return list(seen)
+
+
+class ExposureExit(enum.IntEnum):
+    """What the check's exit status means.
+
+    LOOPBACK_ONLY: every probed port refused every off-loopback connect and
+    accepted on 127.0.0.1, and both sources were read.
+    FINDING: anything else, including a source that could not be read.
+
+    2 is never produced under the [network_exposure] tag: it belongs to
+    argparse rejecting a flag and to python3 refusing a missing script.
+    setup-host.sh relies on that to believe a status only when the tag is present.
+    """
+
+    LOOPBACK_ONLY = 0
+    FINDING = 1
+
+
+class Outcome(enum.Enum):
+    ACCEPTED = "was accepted"
+    REFUSED = "was refused"
+    TIMED_OUT = "timed out"
+    FAILED = "failed"
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbeResult:
+    outcome: Outcome
+    errno_name: str = ""
+
+    @property
+    def description(self) -> str:
+        if self.outcome is Outcome.FAILED:
+            return f"failed with {self.errno_name}"
+        return self.outcome.value
+
+
+def _errno_name(exc: OSError) -> str:
+    if exc.errno is None:
+        return str(exc)
+    return errno.errorcode.get(exc.errno, str(exc.errno))
+
+
+def probe(family: socket.AddressFamily, sockaddr: tuple, timeout: float) -> ProbeResult:
+    """One TCP connect, classified."""
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+    except ConnectionRefusedError:
+        return ProbeResult(Outcome.REFUSED)
+    except TimeoutError:
+        return ProbeResult(Outcome.TIMED_OUT)
+    except OSError as exc:
+        return ProbeResult(Outcome.FAILED, _errno_name(exc))
+    return ProbeResult(Outcome.ACCEPTED)
+
+
+def read_json_source(argv: tuple[str, ...]) -> object:
+    """Run *argv* and parse its stdout as JSON, or raise SourceUnreadable saying why not."""
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=SOURCE_TIMEOUT_SECS, check=False
+        )
+    except FileNotFoundError:
+        raise SourceUnreadable(argv, "command not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise SourceUnreadable(argv, f"no answer within {SOURCE_TIMEOUT_SECS} s") from None
+    except OSError as exc:
+        raise SourceUnreadable(argv, f"could not start ({_errno_name(exc)})") from None
+    if completed.returncode != 0:
+        raise SourceUnreadable(argv, f"exited {completed.returncode}: {completed.stderr.strip()}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SourceUnreadable(argv, f"output is not JSON ({exc})") from None
+
+
+class FindingKind(enum.Enum):
+    EXPOSED = "exposed"
+    TIMED_OUT = "timed-out"
+    UNVERIFIED = "unverified"
+    NOT_LISTENING = "not-listening"
+
+
+_OFF_LOOPBACK_FINDINGS: Final = {
+    Outcome.ACCEPTED: FindingKind.EXPOSED,
+    Outcome.TIMED_OUT: FindingKind.TIMED_OUT,
+    Outcome.FAILED: FindingKind.UNVERIFIED,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class Target:
+    port: int
+    address: HostAddress
+
+
+@dataclasses.dataclass(frozen=True)
+class Finding:
+    kind: FindingKind
+    target: Target
+    owners: str
+    result: ProbeResult
+
+    def render(self) -> str:
+        subject = f"[{self.kind.value}] port {self.target.port} ({self.owners})"
+        label = self.target.address.label
+        if self.kind is FindingKind.EXPOSED:
+            return f"{subject} accepted a connect on {label}"
+        if self.kind is FindingKind.NOT_LISTENING:
+            return f"{subject}: a connect on {label} {self.result.description}, so nothing serves it on loopback"
+        return f"{subject}: a connect on {label} {self.result.description} instead of being refused"
+
+
+def _finding(target: Target, owners: str, result: ProbeResult) -> Finding | None:
+    if target.address == LOOPBACK:
+        kind = None if result.outcome is Outcome.ACCEPTED else FindingKind.NOT_LISTENING
+    else:
+        kind = _OFF_LOOPBACK_FINDINGS.get(result.outcome)
+    return None if kind is None else Finding(kind, target, owners, result)
+
+
+def _probe_target(target: Target, timeout: float) -> ProbeResult:
+    return probe(target.address.family, target.address.sockaddr(target.port), timeout)
+
+
+def _probe_all(targets: Sequence[Target], timeout: float) -> list[ProbeResult]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+        return list(pool.map(_probe_target, targets, itertools.repeat(timeout)))
+
+
+_Parsed = TypeVar("_Parsed")
+
+
+def _read_source(
+    argv: tuple[str, ...], parse: Callable[[object], list[_Parsed]]
+) -> tuple[list[_Parsed], SourceUnreadable | None]:
+    try:
+        return parse(read_json_source(argv)), None
+    except SourceUnreadable as exc:
+        return [], exc
+
+
+def _source_error_line(error: SourceUnreadable) -> str:
+    return f"[source-error] {' '.join(error.command)}: {error.reason}"
+
+
+def run(
+    *,
+    static_ports: Sequence[OwnedPort] = STATIC_PORTS,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECS,
+    out: TextIO,
+) -> ExposureExit:
+    """Probe every factory port on every off-loopback address and on 127.0.0.1; report and judge."""
+    socket_ports, socket_error = _read_source(LIST_SOCKETS_ARGV, socket_unit_ports)
+    addresses, address_error = _read_source(IP_ADDR_ARGV, host_addresses)
+    errors = [error for error in (socket_error, address_error) if error is not None]
+    owners = merge_owners(socket_ports, static_ports)
+    targets = [Target(port, address) for port in owners for address in (*addresses, LOOPBACK)]
+    results = _probe_all(targets, connect_timeout)
+    findings = [
+        finding
+        for target, result in zip(targets, results, strict=True)
+        if (finding := _finding(target, owners[target.port], result)) is not None
+    ]
+    emit(TOOL, f"probing {len(owners)} port(s) on {len(addresses)} non-loopback address(es) and 127.0.0.1", out=out)
+    return _report([*map(_source_error_line, errors), *(finding.render() for finding in findings)], out)
+
+
+def _report(failure_lines: Sequence[str], out: TextIO) -> ExposureExit:
+    for line in failure_lines:
+        emit(TOOL, line, out=out)
+    if failure_lines:
+        emit(TOOL, f"[finding] {len(failure_lines)} finding(s) above", out=out)
+        return ExposureExit.FINDING
+    emit(TOOL, "[ok] every probed port refuses off-loopback connects and accepts on 127.0.0.1", out=out)
+    return ExposureExit.LOOPBACK_ONLY
