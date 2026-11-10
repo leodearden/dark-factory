@@ -438,8 +438,10 @@ class _ClientsByModel:
         self.asked.append(model)
         if model in self.unavailable:
             return None
-        extra = {'edges': self.edges[model]} if model in self.edges else {}
-        self.clients[model] = _CountingLLM(model=model or CONFIGURED, **extra)
+        name = model or CONFIGURED
+        self.clients[model] = (
+            _CountingLLM(model=name, edges=self.edges[model]) if model in self.edges else _CountingLLM(model=name)
+        )
         return self.clients[model]
 
 

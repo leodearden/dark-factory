@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay ruling-class extraction under an arm, to measure lever O1 (task 9040).
+"""Replay ruling-class extraction under an arm, to measure levers O1 and O6 (task 9040).
 
 docs/ruling-overreach-guard-design-2026-10-01/design.md §6 names lever O1:
 ``custom_extraction_instructions`` for the ``decisions_and_rationale`` class.
@@ -9,8 +9,11 @@ re-extracted under each arm by graphiti_core 0.28.2's own
 utils/maintenance/node_operations.py::extract_nodes and
 utils/maintenance/edge_operations.py::extract_edges, unmodified, followed by
 graphiti's in-batch exact-fact dedupe (the driver-free fast path of
-edge_operations.py::resolve_extracted_edges). The arms differ only in the
-instructions they splice into those prompts; the model is a separate axis.
+edge_operations.py::resolve_extracted_edges). An arm is (instructions, model):
+control and o1 differ only in the instructions they splice into those prompts,
+on the configured model, and o6 is the control's instructions on O6_MODEL. So
+every arm shares one replay file, one blinded worksheet and one score against
+the control.
 
 Read-only and driver-free: graphiti is handed a GraphitiClients that holds
 only an LLM client, so no FalkorDriver is ever built (see
@@ -25,19 +28,25 @@ Usage (from fused-memory/)::
         --baseline-report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
         --arm control --arm o1 --out /tmp/9040-replay.jsonl
 
+    uv run python scripts/replay_overreach_extraction.py replay \\
+        --worksheet /tmp/9040-worksheet-4716.jsonl \\
+        --baseline-report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
+        --arm control --arm o6 --out /tmp/9040-replay-o6.jsonl
+
     uv run python scripts/replay_overreach_extraction.py worksheet \\
         --replay /tmp/9040-replay.jsonl --worksheet /tmp/9040-worksheet-4716.jsonl \\
         --out /tmp/9040-blind-worksheet.jsonl
 
     uv run python scripts/replay_overreach_extraction.py score \\
-        --replay ../docs/ruling-overreach-lever-reopen-2026-11-10/replay.json \\
+        --replay ../docs/ruling-overreach-lever-reopen-2026-11-10/replay.jsonl \\
         --verdicts ../docs/ruling-overreach-lever-reopen-2026-11-10/verdicts.json \\
         --baseline-report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
         --out ../docs/ruling-overreach-lever-reopen-2026-11-10/report.json
 
 ``replay`` resumes an existing --out: recorded (arm, episode) pairs are
-skipped and failure lines are retried. ``--model`` replays the same arms on
-another extraction model; give it its own --out. ``worksheet`` interleaves
+skipped and failure lines are retried. Each arm runs on a client for its own
+model, so arms on different models share one --out; an --out recording an arm
+on a model other than that arm's client's is refused. ``worksheet`` interleaves
 every arm's edges by sha256(edge_uuid) and names no arm, for blind
 adjudication; it carries episode bodies, so it is not committed. ``score``
 validates one verdict file over every arm's edges with the audit's own
@@ -123,7 +132,10 @@ CONTROL = 'control'
 
 @dataclass(frozen=True)
 class ReplayArm:
-    """What one arm splices into graphiti's extraction prompts; ``model`` None means the configured one."""
+    """What one arm splices into graphiti's extraction prompts, and the model it extracts on.
+
+    ``model`` None means config ``llm.model``, production's extraction model.
+    """
 
     name: str
     instructions: str | None
@@ -131,9 +143,13 @@ class ReplayArm:
     model: str | None = None
 
 
+O6_MODEL = 'gpt-6.1-sol'
+"""Lever O6's stronger extraction model, priced in design.md §5 from score_write_triage_pairs.py::LIST_PRICES."""
+
 ARMS: Mapping[str, ReplayArm] = MappingProxyType({
     CONTROL: ReplayArm(CONTROL, None, NO_INSTRUCTIONS),
     'o1': ReplayArm('o1', O1_INSTRUCTIONS, O1_INSTRUCTIONS_VERSION),
+    'o6': ReplayArm('o6', None, NO_INSTRUCTIONS, model=O6_MODEL),
 })
 
 EDGE_TYPE_MAP: Mapping[tuple[str, str], list[str]] = MappingProxyType({('Entity', 'Entity'): []})
@@ -184,6 +200,10 @@ class UnmeasurableClient(TypeError):
     """The LLM client carries no AttributingTokenUsageTracker, so its tokens cannot be measured."""
 
 
+class ArmModelMismatch(ValueError):
+    """An arm that names its model, handed a client on another one."""
+
+
 def build_arm_llm(cfg: FusedMemoryConfig, model: str | None) -> LLMClient | None:
     """The configured extraction client, on *model* when given; *cfg* itself is never modified."""
     arm_cfg = cfg.model_copy(deep=True)
@@ -219,6 +239,8 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
 
 async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -> ReplayResult:
     """Extract *episode* under *arm* through graphiti's own functions; no driver exists to reach."""
+    if arm.model is not None and llm.model != arm.model:
+        raise ArmModelMismatch(f'arm {arm.name} extracts on {arm.model}, but the client is on {llm.model}')
     clients = GraphitiClients.model_construct(llm_client=llm)
     current = _episodic_node(episode, uuid=episode.uuid, content=episode.content)
     previous = [
@@ -335,7 +357,7 @@ REPLAYED, FAILED = 'replayed', 'failed'
 _ERROR_CHARS = 500
 
 RecordKey = tuple[str, str, str]
-"""``(arm, graph, episode_uuid)``."""
+"""``(arm, graph, episode_uuid)``. An arm's name fixes its model, so the key needs no model."""
 
 
 class ReplayFileError(ValueError):
@@ -644,6 +666,8 @@ EXIT_OK, EXIT_UNAVAILABLE, EXIT_INVALID = 0, 1, 2
 
 LlmFactory = Callable[[str | None], LLMClient | None]
 ReaderFactory = Callable[[str], ReadOnlyGraphReader]
+ArmClients = tuple[tuple[ReplayArm, LLMClient], ...]
+"""Each selected arm with the client on its model."""
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -658,7 +682,6 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument('--baseline-report', required=True,
                         help="The 4716 report.json; the worksheet must match its sample.sizes.")
     replay.add_argument('--arm', action='append', required=True, choices=sorted(ARMS))
-    replay.add_argument('--model', default=None, help='Extraction model. Default: llm.model in config.')
     replay.add_argument('--graph-uri', default=None,
                         help='FalkorDB URI. Default: env FALKORDB_URI, then config.')
     replay.add_argument('--graph-host', default=None, help='FalkorDB host, instead of a URI.')
@@ -698,22 +721,34 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
     return rows
 
 
-def _model_conflicts(kept: Iterable[Mapping[str, Any]], arms: Iterable[ReplayArm], model: str | None) -> list[str]:
-    names = {arm.name for arm in arms}
+def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
+    """One client per distinct arm model, in first-seen order; None if any model has none."""
+    clients: dict[str | None, LLMClient] = {}
+    for model in dict.fromkeys(arm.model for arm in arms):
+        client = llm_factory(model)
+        if client is None:
+            logger.error('no extraction LLM for %s; nothing is written', model or 'the configured llm.model')
+            return None
+        clients[model] = client
+    return tuple((arm, clients[arm.model]) for arm in arms)
+
+
+def _model_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
+    model_of = {arm.name: llm.model for arm, llm in arm_clients}
     return sorted({
-        f'{r["arm"]} was replayed on {r["model"]}, not {model}'
-        for r in kept if r['arm'] in names and r['model'] != model
+        f'{r["arm"]} was replayed on {r["model"]}, not {model_of[r["arm"]]}'
+        for r in kept if r['arm'] in model_of and r['model'] != model_of[r['arm']]
     })
 
 
 async def _replay_rows(
-    rows: Sequence[Mapping[str, Any]], arms: Sequence[ReplayArm], llm: LLMClient,
+    rows: Sequence[Mapping[str, Any]], arm_clients: ArmClients,
     readers: Mapping[str, EpisodeContextReader], done: set[RecordKey], out: Path,
 ) -> int:
     failures = 0
     with out.open('a') as sink:
         for row in rows:
-            pending = [arm for arm in arms if (arm.name, row['graph'], row['uuid']) not in done]
+            pending = [(arm, llm) for arm, llm in arm_clients if (arm.name, row['graph'], row['uuid']) not in done]
             if not pending:
                 continue
             records: list[dict[str, Any]] = []
@@ -721,9 +756,9 @@ async def _replay_rows(
                 replay_input = await readers[row['graph']].read(row)
             except Exception as exc:
                 logger.warning('reading %s/%s failed', row['graph'], row['uuid'], exc_info=True)
-                records = [failed_record(arm, llm.model, row, exc) for arm in pending]
+                records = [failed_record(arm, llm.model, row, exc) for arm, llm in pending]
             else:
-                for arm in pending:
+                for arm, llm in pending:
                     try:
                         records.append(replayed_record(await replay_episode(llm, replay_input, arm), replay_input))
                     except Exception as exc:
@@ -745,19 +780,17 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     except (ReplayFileError, WorksheetMismatch) as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
-    llm = llm_factory(args.model)
-    if llm is None:
-        logger.error('no extraction LLM is configured; nothing is written')
+    arm_clients = _arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
+    if arm_clients is None:
         return EXIT_UNAVAILABLE
-    arms = [dataclasses.replace(ARMS[name], model=args.model) for name in dict.fromkeys(args.arm)]
-    if conflicts := _model_conflicts(kept, arms, llm.model):
+    if conflicts := _model_conflicts(kept, arm_clients):
         logger.error('this --out already holds other models, nothing is written: %s', conflicts)
         return EXIT_INVALID
     _write_atomically(out, _jsonl(kept))
     graph_readers = {graph: reader_factory(graph) for graph in dict.fromkeys(row['graph'] for row in rows)}
     try:
         failures = await _replay_rows(
-            rows, arms, llm, {g: EpisodeContextReader(r) for g, r in graph_readers.items()},
+            rows, arm_clients, {g: EpisodeContextReader(r) for g, r in graph_readers.items()},
             {record_key(r) for r in kept}, out,
         )
     finally:
@@ -838,8 +871,9 @@ def run(
 ) -> int:
     """Parse *argv* (default ``sys.argv[1:]``) and run one subcommand.
 
-    *llm_factory* maps the --model value to an extraction client (default:
-    build_arm_llm over the loaded config); *reader_factory* maps a graph name to
+    *llm_factory* maps each selected arm's model (None = the configured
+    llm.model) to an extraction client (default: build_arm_llm over the loaded
+    config); *reader_factory* maps a graph name to
     a ReadOnlyGraphReader (default: FalkorDB over GRAPH.RO_QUERY).
     """
     return asyncio.run(_run(_build_parser().parse_args(argv), llm_factory, reader_factory))
