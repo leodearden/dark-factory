@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiosqlite
 import pytest
+from _invocation_ledger import invocation_rows
 
 from fused_memory.config.schema import PathScopeAdjudicatorConfig
 
@@ -114,13 +113,6 @@ async def _adjudicate_with(adj, result):
 
 def _breaker_open_lines(caplog) -> int:
     return sum('zero-output-breaker OPEN' in r.getMessage() for r in caplog.records)
-
-
-async def _invocation_rows(db_path: Path) -> list[dict]:
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute('SELECT * FROM invocations') as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
 
 
 @pytest.mark.asyncio
@@ -646,24 +638,20 @@ class TestAdjudicatorInvocationLedger:
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
 
         db_path = tmp_path / 'curator_events.db'
-        store = CostStore(db_path)
-        await store.open()
-        try:
-            config = PathScopeAdjudicatorConfig()
+        config = PathScopeAdjudicatorConfig()
+        served = AgentResult(
+            success=True, output='',
+            structured_output={'verdict': 'allow', 'reason': 'incidental'},
+            duration_ms=1234, cost_usd=0.01,
+        )
+        async with CostStore(db_path) as store:
             adj = PathScopeAdjudicator(config, usage_gate=None, cost_store=store)
-            served = AgentResult(
-                success=True, output='',
-                structured_output={'verdict': 'allow', 'reason': 'incidental'},
-                duration_ms=1234, cost_usd=0.01,
-            )
             with patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=served)):
                 verdict = await _do_adjudicate(adj, project_id='proj-x')
-        finally:
-            await store.close()
 
         assert verdict.should_allow_creation is True
-        rows = await _invocation_rows(db_path)
+        rows = await invocation_rows(db_path)
         assert len(rows) == 1
         row = rows[0]
         assert row['role'] == 'path_scope_adjudicator'
@@ -679,25 +667,21 @@ class TestAdjudicatorInvocationLedger:
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
 
         db_path = tmp_path / 'curator_events.db'
-        store = CostStore(db_path)
-        await store.open()
-        try:
+        hung = AgentResult(
+            success=False, output='', structured_output=None,
+            timed_out=True, duration_ms=60_000,
+        )
+        async with CostStore(db_path) as store:
             adj = PathScopeAdjudicator(
                 PathScopeAdjudicatorConfig(), usage_gate=None, cost_store=store,
-            )
-            hung = AgentResult(
-                success=False, output='', structured_output=None,
-                timed_out=True, duration_ms=60_000,
             )
             with patch('shared.cli_invoke.invoke_claude_agent',
                        new=AsyncMock(return_value=hung)):
                 verdict = await _do_adjudicate(adj)
-        finally:
-            await store.close()
 
         assert verdict.failed is True
         assert verdict.should_allow_creation is False
-        rows = await _invocation_rows(db_path)
+        rows = await invocation_rows(db_path)
         assert len(rows) == 1
         assert rows[0]['duration_ms'] == 60_000
         assert rows[0]['role'] == 'path_scope_adjudicator'
