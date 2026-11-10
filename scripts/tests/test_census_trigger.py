@@ -1603,6 +1603,195 @@ def test_run_completion_check_against_a_closed_port_is_a_store_unreachable_error
 
 
 # ---------------------------------------------------------------------------
+# the trigger decides on completion (a) and the novelty spike (b), both under
+# the floor; max-interval and tasks-landed are retired
+# (plans/census-incremental-prd.md C7, row 13)
+# ---------------------------------------------------------------------------
+
+_FIRING = ct.Completion(ct.CompletionStatus.FIRE, RUN_ID, 70, share=0.8235)
+_NOT_YET = ct.Completion(ct.CompletionStatus.NOT_YET, RUN_ID, 70, share=0.5)
+_ERRORED = ct.Completion(
+    ct.CompletionStatus.ERROR, RUN_ID, 70, detail="exit 2, store_unreachable"
+)
+
+
+def _evaluate_completion(completion, *, watermark_days_ago=30):
+    return ct.evaluate(
+        now=NOW,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, watermark_days_ago),
+        completion=completion,
+        candidate_first_seens=_quiet_history(),
+        config=ct.CensusConfig(),
+    )
+
+
+def test_evaluate_a_firing_completion_fires_clear_of_the_floor():
+    decision = _evaluate_completion(_FIRING)
+
+    assert decision.fire is True
+    assert decision.completion is _FIRING
+
+
+@pytest.mark.parametrize("completion", [_NOT_YET, _ERRORED], ids=["not-yet", "error"])
+def test_evaluate_a_concluded_or_failed_non_firing_completion_does_not_fire(completion):
+    decision = _evaluate_completion(completion)
+
+    assert decision.fire is False
+    assert decision.completion is completion
+
+
+def test_evaluate_the_floor_blocks_a_firing_completion():
+    decision = _evaluate_completion(_FIRING, watermark_days_ago=3)
+
+    assert decision.fire is False
+    assert decision.reasons[-1] == (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+    )
+
+
+def test_evaluate_reasons_are_completion_novelty_floor_and_nothing_retired():
+    decision = _evaluate_completion(_NOT_YET)
+
+    completion_line, novelty_line, floor_line = decision.reasons
+    assert completion_line == _NOT_YET.reason
+    assert novelty_line.startswith("novelty-spike:")
+    assert floor_line.startswith("floor:")
+    assert not any(
+        r.startswith(("max-interval", "tasks-landed")) for r in decision.reasons
+    )
+
+
+_PREVIOUS_RUN = "census-p-20261001"
+
+
+def _completion_state(**overrides):
+    return {
+        "last_census_at": (NOW - timedelta(days=30)).isoformat(),
+        "last_census_report": "plans/confusion-census-prior.md",
+        "last_census_run_id": _PREVIOUS_RUN,
+        "session_watermark": (NOW - timedelta(days=30)).isoformat(),
+        **overrides,
+    }
+
+
+def test_decide_for_project_fires_when_the_previous_run_has_landed(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_completion_state())
+    runner = _ScriptedRunner(0, _verdict_json("pass", 0.9))
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+
+    assert decision.fire is True
+    [args] = runner.calls
+    assert args[:2] == ["--run", _PREVIOUS_RUN]
+    assert decision.completion.status is ct.CompletionStatus.FIRE
+
+
+def test_decide_for_project_does_not_fire_while_the_previous_run_is_landing(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_completion_state())
+    runner = _ScriptedRunner(75, _verdict_json("not_yet", 0.5))
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+
+    assert decision.fire is False
+    assert f"completion: 0.5 of {_PREVIOUS_RUN} (threshold 0.70)" in decision.reasons
+
+
+def test_decide_for_project_does_not_fire_when_the_check_fails(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_completion_state())
+    runner = _ScriptedRunner(2, _verdict_json("error", None, error="store_unreachable"))
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+
+    assert decision.fire is False
+    assert any(
+        r.startswith("completion:") and r.endswith("-> N/A") for r in decision.reasons
+    )
+
+
+def test_decide_for_project_a_stale_census_without_a_run_id_no_longer_fires(tmp_path):
+    """The old max-interval FIRE case: 30 days since the last census and the
+    floor clear. Elapsed time alone fires nothing any more."""
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_completion_state(last_census_run_id=None))
+    runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+
+    assert decision.fire is False
+    assert decision.completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
+    assert runner.calls == []
+    assert not any(r.startswith("max-interval") for r in decision.reasons)
+
+
+def test_decide_for_project_a_never_censused_project_has_no_previous_run(tmp_path):
+    _write_codebook(tmp_path, entries=[_entry_sighted("2026-06-01")])
+    runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
+
+    assert decision.completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
+    assert runner.calls == []
+
+
+def _entry_sighted(day):
+    return {
+        "id": "entry-a",
+        "title": "t",
+        "severity": "low",
+        "status": "open",
+        "origin_phase": "unknown",
+        "manifested_phase": "unknown",
+        "sightings": [_sighting(day)],
+    }
+
+
+def _real_now_state(**overrides):
+    month_ago = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    return {
+        "last_census_at": month_ago,
+        "last_census_report": "plans/confusion-census-prior.md",
+        "session_watermark": month_ago,
+        **overrides,
+    }
+
+
+def test_cli_evaluate_without_a_previous_run_prints_a_completion_na_line(tmp_path, capsys):
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_real_now_state())
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert any(
+        line.startswith("completion:") and line.endswith("-> N/A")
+        for line in out.splitlines()
+    ), out
+    assert "max-interval" not in out
+
+
+def test_cli_evaluate_prints_the_previous_runs_completion_share(
+    tmp_path, capsys, monkeypatch,
+):
+    """The task's user-observable signal, through the real default runner:
+    2 high done and 1 low pending weigh 6 landed of 7."""
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_real_now_state(last_census_run_id=_PREVIOUS_RUN))
+
+    with StubMcpServer(stateful=False, tools=_RunStore(_landed_run_rows())) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert f"completion: 0.8571 of {_PREVIOUS_RUN} (threshold 0.70) -> FIRE" in out
+    assert "DECISION: FIRE" in out
+
+
+# ---------------------------------------------------------------------------
 # step-17: RED — decide_for_project() end-to-end over the full §8.5 matrix
 # ---------------------------------------------------------------------------
 
@@ -1869,10 +2058,14 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     legibility_dir.mkdir(parents=True, exist_ok=True)
     (legibility_dir / "census-state.json").write_text("not json{", encoding="utf-8")
 
+    runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
+
     with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
 
     assert decision.fire is False
+    assert decision.completion is None
+    assert runner.calls == []
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
