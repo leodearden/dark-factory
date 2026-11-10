@@ -240,6 +240,31 @@ class TestLedgerRetentionDays:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestCompletionThresholdPct:
+    """``census.completion_threshold_pct`` — the completion share, as a
+    percentage, at which the previous run's filed tasks fire the census
+    (plans/census-incremental-prd.md C7 (a)), an unquoted int in 1..100."""
+
+    def test_default_is_seventy(self):
+        assert mod.Census().completion_threshold_pct == 70
+
+    def test_yaml_without_the_key_keeps_the_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {floor_days: 5}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 70
+
+    def test_yaml_value_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {completion_threshold_pct: 85}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 85
+
+    @pytest.mark.parametrize('bad_value', ['0', '101', '-5', "'70'", '70.5', 'true', 'null'])
+    def test_out_of_range_or_non_int_value_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{completion_threshold_pct: {bad_value}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestNoveltySpikeBaseline:
     """``census.novelty_spike`` — the relative (b) condition of
     plans/census-incremental-prd.md §4.7, every field an unquoted
