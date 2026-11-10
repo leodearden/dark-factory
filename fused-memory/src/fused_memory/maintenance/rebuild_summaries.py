@@ -50,6 +50,16 @@ class RebuildResult:
         """
         return self.entities_complete is True and self.edges_complete is True
 
+    @property
+    def completeness_summary(self) -> str:
+        """The four read verdicts as the key=value fragment every rebuild reporter logs."""
+        return (
+            f'entities_complete={self.entities_complete} '
+            f'entities_incomplete_kind={self.entities_incomplete_kind} '
+            f'edges_complete={self.edges_complete} '
+            f'edges_incomplete_kind={self.edges_incomplete_kind}'
+        )
+
 
 class RebuildSummariesManager:
     """Discovers and rebuilds stale Graphiti entity summaries.
@@ -118,12 +128,9 @@ async def run_rebuild_summaries(
         log_fn = logger.info if result.corpus_proven_complete else logger.warning
         log_fn(
             'run_rebuild_summaries complete: total=%d stale=%d rebuilt=%d '
-            'skipped=%d errors=%d dry_run=%s entities_complete=%s '
-            'entities_incomplete_kind=%s edges_complete=%s edges_incomplete_kind=%s',
+            'skipped=%d errors=%d dry_run=%s %s',
             result.total_entities, result.stale_entities, result.rebuilt,
-            result.skipped, result.errors, dry_run, result.entities_complete,
-            result.entities_incomplete_kind, result.edges_complete,
-            result.edges_incomplete_kind,
+            result.skipped, result.errors, dry_run, result.completeness_summary,
         )
         return result
 

@@ -1823,18 +1823,13 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
             else logger.info
         )
         log_fn(
-            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s '
-            'entities_complete=%s entities_incomplete_kind=%s edges_complete=%s '
-            'edges_incomplete_kind=%s',
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s %s',
             project_id,
             result.rebuilt,
             result.stale_entities,
             result.skipped,
             result.errors,
-            result.entities_complete,
-            result.entities_incomplete_kind,
-            result.edges_complete,
-            result.edges_incomplete_kind,
+            result.completeness_summary,
         )
 
 

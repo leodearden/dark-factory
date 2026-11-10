@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import pydantic_spec
+from _rebuild_service_results import rebuild_service_result
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.config.schema import FusedMemoryConfig
@@ -23,23 +24,6 @@ from fused_memory.maintenance.rebuild_summaries import (
 )
 
 
-def _service_result(**overrides: Any) -> dict[str, Any]:
-    """A MemoryService.rebuild_entity_summaries dict over a proven-complete corpus."""
-    return {
-        'total_entities': 3,
-        'stale_entities': 1,
-        'rebuilt': 1,
-        'skipped': 0,
-        'errors': 0,
-        'details': [],
-        'entities_complete': True,
-        'entities_incomplete_kind': None,
-        'edges_complete': True,
-        'edges_incomplete_kind': None,
-        **overrides,
-    }
-
-
 def _kind_for(verdict: bool | None) -> str | None:
     return INCOMPLETE_SHORT_READ if verdict is False else None
 
@@ -47,7 +31,7 @@ def _kind_for(verdict: bool | None) -> str | None:
 @pytest.mark.asyncio
 async def test_manager_carries_the_four_completeness_keys():
     service = MagicMock()
-    service.rebuild_entity_summaries = AsyncMock(return_value=_service_result(
+    service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
         edges_complete=False, edges_incomplete_kind=INCOMPLETE_SHORT_READ,
     ))
 
@@ -100,6 +84,20 @@ def test_corpus_proven_complete_only_when_both_reads_are_true(
     assert result.corpus_proven_complete is expected
 
 
+def test_completeness_summary_renders_all_four_verdicts_in_contract_order():
+    result = RebuildResult(
+        entities_complete=False,
+        entities_incomplete_kind=INCOMPLETE_SHORT_READ,
+        edges_complete=None,
+        edges_incomplete_kind=None,
+    )
+
+    assert result.completeness_summary == (
+        f'entities_complete=False entities_incomplete_kind={INCOMPLETE_SHORT_READ} '
+        'edges_complete=None edges_incomplete_kind=None'
+    )
+
+
 async def _cli_summary_records(
     make_fake_maintenance_service, caplog, service_result: dict[str, Any],
 ) -> list[logging.LogRecord]:
@@ -120,7 +118,7 @@ async def test_cli_summary_reports_a_proven_complete_corpus_at_info(
     make_fake_maintenance_service, caplog,
 ):
     records = await _cli_summary_records(
-        make_fake_maintenance_service, caplog, _service_result(),
+        make_fake_maintenance_service, caplog, rebuild_service_result(),
     )
 
     assert len(records) == 1
@@ -136,7 +134,7 @@ async def test_cli_summary_escalates_a_partial_corpus_to_warning(
 ):
     records = await _cli_summary_records(
         make_fake_maintenance_service, caplog,
-        _service_result(edges_complete=False, edges_incomplete_kind=INCOMPLETE_SHORT_READ),
+        rebuild_service_result(edges_complete=False, edges_incomplete_kind=INCOMPLETE_SHORT_READ),
     )
 
     assert len(records) == 1
@@ -152,7 +150,7 @@ async def test_cli_summary_escalates_an_unknown_verdict_to_warning(
 ):
     records = await _cli_summary_records(
         make_fake_maintenance_service, caplog,
-        _service_result(
+        rebuild_service_result(
             entities_complete=None, entities_incomplete_kind=None,
             edges_complete=None, edges_incomplete_kind=None,
         ),

@@ -26,6 +26,7 @@ import contextlib
 import logging
 
 import pytest
+from _rebuild_service_results import rebuild_service_result
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.config.schema import SummaryRebuildConfig
@@ -47,21 +48,7 @@ class _FakeMemoryService:
         if project_id in self._fail_for:
             raise RuntimeError('boom')
         self.calls.append({'project_id': project_id, 'force': force, **kwargs})
-        # Mirror memory_service.rebuild_entity_summaries's real return contract
-        # (errors is an int count, not a list) so callers that inspect the
-        # result see production-shaped data.
-        return {
-            'total_entities': 1,
-            'stale_entities': 1,
-            'rebuilt': 1,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-            'entities_complete': True,
-            'entities_incomplete_kind': None,
-            'edges_complete': True,
-            'edges_incomplete_kind': None,
-        }
+        return rebuild_service_result()
 
 
 @pytest.mark.asyncio
@@ -122,18 +109,10 @@ async def test_cycle_logs_summary_counts_per_project(caplog):
     class _ResultService:
         async def rebuild_entity_summaries(self, *, project_id, force=False, **kwargs):
             if project_id == 'proj_a':
-                return {
-                    'total_entities': 5, 'stale_entities': 2, 'rebuilt': 2,
-                    'skipped': 0, 'errors': 0, 'details': [],
-                    'entities_complete': True, 'entities_incomplete_kind': None,
-                    'edges_complete': True, 'edges_incomplete_kind': None,
-                }
-            return {
-                'total_entities': 5, 'stale_entities': 3, 'rebuilt': 2,
-                'skipped': 0, 'errors': 1, 'details': [],
-                'entities_complete': True, 'entities_incomplete_kind': None,
-                'edges_complete': True, 'edges_incomplete_kind': None,
-            }
+                return rebuild_service_result(total_entities=5, stale_entities=2, rebuilt=2)
+            return rebuild_service_result(
+                total_entities=5, stale_entities=3, rebuilt=2, errors=1,
+            )
 
     cfg = SummaryRebuildConfig(enabled=True, projects=['proj_a', 'proj_b'])
 
@@ -156,11 +135,7 @@ class _VerdictService:
         self._verdicts = verdicts
 
     async def rebuild_entity_summaries(self, *, project_id, force=False, **kwargs):
-        return {
-            'total_entities': 4, 'stale_entities': 1, 'rebuilt': 1,
-            'skipped': 0, 'errors': 0, 'details': [],
-            **self._verdicts,
-        }
+        return rebuild_service_result(total_entities=4, **self._verdicts)
 
 
 @pytest.mark.asyncio
@@ -194,7 +169,9 @@ async def test_cycle_warns_on_a_corpus_not_proven_complete(
     ]
     assert summary.levelno == logging.WARNING
     assert f'entities_complete={entities_complete}' in summary.getMessage()
+    assert f'entities_incomplete_kind={entities_incomplete_kind}' in summary.getMessage()
     assert f'edges_complete={edges_complete}' in summary.getMessage()
+    assert f'edges_incomplete_kind={edges_incomplete_kind}' in summary.getMessage()
 
 
 @pytest.mark.asyncio
