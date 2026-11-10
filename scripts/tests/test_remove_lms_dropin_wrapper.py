@@ -379,7 +379,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     thing on a live systemd box and in a DBUS-less container.  That is what
     keeps this module from being a total no-op in a sandbox -- the guard
     itself is genuinely exercised everywhere, and only the two subprocess
-    tests skip.  Mirrors tests/scripts/test_dashboard_service_template.py::
+    tests skip.  Mirrors tests/scripts/test_dashboard_unit_restart_policy.py::
     test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir.
 
       (a) systemctl absent from PATH.
