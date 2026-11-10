@@ -124,7 +124,7 @@ class _FixtureJournal:
 
     async def write(
         self,
-        caller: str,
+        caller: str | None,
         *,
         content: str,
         category: str = 'procedural_knowledge',
@@ -470,6 +470,7 @@ class TestAdjudication:
             assert call['categories'] == ['procedural_knowledge']
             assert call['anchor_topics'] is False
             assert call['project_id'] == PROJECT
+            assert call['limit'] == _mod().GUARD_SEARCH_DEPTH + 1
             assert 'causation_id' not in call
         assert {call['query'] for call in memory.search_calls} == {'W1 content', 'W2 content'}
 
@@ -590,6 +591,20 @@ class TestUnadjudicableWritesAreDisclosed:
 
         _assert_only_skipped_as(adjudication, 'NO_PRIOR_SEARCH')
 
+    @pytest.mark.asyncio
+    async def test_a_write_naming_no_agent_is_no_caller_not_no_prior_search(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.search(CALLER_A, [_hit('x')])
+            await fixture.write(
+                None, content='W content', category='observations_and_summaries',
+                memory_ids=['w'],
+            )
+        window = _read(fixture.db_path)
+
+        adjudication = await _adjudicate(window, FakeMemory(contents={'w': 'W content'}))
+
+        _assert_only_skipped_as(adjudication, 'NO_CALLER')
+
 
 async def _run(memory: FakeMemory, journal_path: Path, out_root: Path) -> Any:
     return await _mod().run_write_after_miss(
@@ -668,6 +683,7 @@ class TestSeriesAndArtifacts:
             'adjudicated': 2,
             'incidents': 1,
             'unattributed_searches': 0,
+            'unparsed_rows': 0,
             **{f'skipped_{reason.value}': 0 for reason in _mod().SkipReason},
         }
         assert {key: corpus.counts.get(key) for key in expected} == expected
@@ -708,7 +724,7 @@ class TestSeriesAndArtifacts:
         assert memory.write_calls == []
 
 
-EVAL_ID = 'e7-write-after-miss'
+EVAL_ID = _mod().EVAL_ID
 
 
 def _empty_series(stamp: str) -> MetricSeries:
@@ -786,20 +802,23 @@ class TestPeriodAndCli:
     ):
         stamp = _stamp_an_hour_from_now()
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, stamp)
-        memory = FakeMemory(contents={})
+        opened: list[Any] = []
 
         async def open_fake_memory(config: Any) -> FakeMemory:
-            return memory
+            opened.append(config)
+            return FakeMemory(contents={})
 
-        monkeypatch.setattr(_mod(), '_open_memory', open_fake_memory)
         missing = tmp_path / 'absent' / 'write_journal.db'
         root = tmp_path / 'evals'
 
-        exit_code = _mod().main([*_sweep_argv(root), '--journal', str(missing)])
+        exit_code = _mod().main(
+            [*_sweep_argv(root), '--journal', str(missing)], open_memory=open_fake_memory,
+        )
 
         assert exit_code != 0
         assert str(missing) in capsys.readouterr().err
         assert not (root / EVAL_ID / f'metrics-{stamp}.json').exists()
+        assert opened == []
 
     def test_a_full_cli_run_writes_the_pinned_stamps_metrics(self, tmp_path, monkeypatch):
         _window, memory, _rows, journal = asyncio.run(_headline_fixture(tmp_path))
@@ -809,10 +828,11 @@ class TestPeriodAndCli:
         async def open_fake_memory(config: Any) -> FakeMemory:
             return memory
 
-        monkeypatch.setattr(_mod(), '_open_memory', open_fake_memory)
         root = tmp_path / 'evals'
 
-        exit_code = _mod().main([*_sweep_argv(root), '--journal', str(journal)])
+        exit_code = _mod().main(
+            [*_sweep_argv(root), '--journal', str(journal)], open_memory=open_fake_memory,
+        )
 
         assert exit_code == 0
         series = load_metric_series(root / EVAL_ID / f'metrics-{stamp}.json')

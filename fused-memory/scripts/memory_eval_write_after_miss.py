@@ -46,7 +46,7 @@ import os
 import sqlite3
 import sys
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -327,6 +327,8 @@ def read_journal(db_path: str | Path, *, project_id: str, period: Period) -> Jou
 class SkipReason(StrEnum):
     """Why a write in the period was not adjudicated. Each one is counted, never dropped."""
 
+    NO_CALLER = 'no_caller'
+    """The write row names no agent, so it has no window to search in."""
     NO_PRIOR_SEARCH = 'no_prior_search'
     CATEGORY_NOT_COMPARABLE = 'category_not_comparable'
     NO_MEMORY_ID = 'no_memory_id'
@@ -383,6 +385,8 @@ def ineligibility(write: WriteRow, prior: Sequence[SearchRow]) -> SkipReason | N
         return SkipReason.CATEGORY_NOT_COMPARABLE
     if not write.memory_ids:
         return SkipReason.NO_MEMORY_ID
+    if write.caller_agent_id is None:
+        return SkipReason.NO_CALLER
     if not prior:
         return SkipReason.NO_PRIOR_SEARCH
     return None
@@ -659,6 +663,23 @@ async def run_write_after_miss(
 ) -> WriteAfterMissOutcome:
     """Read the period, adjudicate it, and write the incidents, metrics and report artifacts."""
     window = read_journal(journal_path, project_id=project_id, period=period)
+    return await produce_write_after_miss(
+        window, memory, out_root=out_root, project_id=project_id, stamp=stamp, period=period,
+        eval_id=eval_id,
+    )
+
+
+async def produce_write_after_miss(
+    window: JournalWindow,
+    memory: Any,
+    *,
+    out_root: str | Path,
+    project_id: str,
+    stamp: str,
+    period: Period,
+    eval_id: str = EVAL_ID,
+) -> WriteAfterMissOutcome:
+    """Adjudicate an already-read *window* and write the incidents, metrics and report artifacts."""
     adjudication = await adjudicate(window, memory, project_id=project_id)
     incidents_path = eval_dir(out_root, eval_id) / incidents_filename(stamp)
     series = build_series(
@@ -738,14 +759,17 @@ def _default_journal(config: FusedMemoryConfig) -> Path:
     return WriteJournal(data_dir if data_dir.is_absolute() else REPO_ROOT / data_dir).db_path
 
 
-async def _open_memory(config: FusedMemoryConfig) -> MemoryService:
-    """The one live-service factory. The caller closes what it returns."""
+MemoryFactory = Callable[[FusedMemoryConfig], Awaitable[Any]]
+
+
+async def open_memory(config: FusedMemoryConfig) -> MemoryService:
+    """The live-service factory ``main`` uses by default. The caller closes what it returns."""
     memory = MemoryService(config)
     await memory.initialize()
     return memory
 
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(args: argparse.Namespace, open_memory: MemoryFactory) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
     stamp = run_stamp()
@@ -754,11 +778,12 @@ async def _run(args: argparse.Namespace) -> int:
     )
     config = FusedMemoryConfig()
     journal_path = Path(args.journal) if args.journal else _default_journal(config)
-    memory = await _open_memory(config)
+    window = read_journal(journal_path, project_id=args.project_id, period=period)
+    memory = await open_memory(config)
     try:
-        outcome = await run_write_after_miss(
+        outcome = await produce_write_after_miss(
+            window,
             memory,
-            journal_path=journal_path,
             out_root=args.metrics_root,
             project_id=args.project_id,
             stamp=stamp,
@@ -771,12 +796,12 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, open_memory: MemoryFactory = open_memory) -> int:
     """Exit non-zero on an unreadable journal, so the runner files a produce failure."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = build_parser().parse_args(argv)
     try:
-        return asyncio.run(_run(args))
+        return asyncio.run(_run(args, open_memory))
     except JournalUnavailableError as exc:
         print(f'{args.eval_id}: {exc}', file=sys.stderr)
         return 1

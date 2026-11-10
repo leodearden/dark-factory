@@ -101,7 +101,7 @@ class RunnerConfig(BaseModel):
     model_config = ConfigDict(extra='forbid', frozen=True)
 
     project_id: str = Field(min_length=1)
-    """The project E4 and E6 measure. E1 takes no project: it probes its topic registry's own census set."""
+    """The project E4, E6 and E7 measure. E1 takes no project: it probes its topic registry's own census set."""
     runs_per_quarter: int
     false_alarm_budget: float
     min_samples: int

@@ -281,7 +281,7 @@ class TestDefaultProducers:
         verdict = next(v for v in run.result.verdicts if v.metric_id == 'write-after-miss')
         assert verdict.rule_kind == 'proportion'
 
-    def test_e4_and_e6_are_told_the_registry_eval_id(self, tmp_path):
+    def test_every_sweep_producer_is_told_the_registry_eval_id(self, tmp_path):
         for producer in _mod().DEFAULT_PRODUCERS[1:]:
             argv = producer.build_argv(tmp_path, producer.eval_id, 'dark_factory')
             assert _flag_value(argv, '--eval-id') == producer.eval_id
