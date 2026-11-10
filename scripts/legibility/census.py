@@ -65,7 +65,6 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import textwrap
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -901,61 +900,6 @@ def mark_entry_filed(cb: dict, entry_id: str) -> dict:
 
     codebook.assert_no_deletion(cb, result)
     return result
-
-
-# ---------------------------------------------------------------------------
-# advance_census_state — census-state.json's sole writer
-# ---------------------------------------------------------------------------
-
-def advance_census_state(
-    path,
-    *,
-    census_at: str,
-    run_id: str,
-    report_path: str,
-    as_of_sha: str,
-    session_watermark: str | None,
-) -> None:
-    """Write census-state.json to *path*, atomically, as exactly the five
-    keys ``{last_census_at, last_census_run_id, last_census_report,
-    last_census_as_of_sha, session_watermark}`` in that order
-    (``plans/census-incremental-prd.md`` §4.2). *census_at* is the run's
-    ``YYYY-MM-DD``, *report_path* is repo-relative, and *session_watermark*
-    is the exclusive end of the mined window (``None`` when the run had no
-    window). Every key is always written; the next trigger's completion arm
-    reads ``last_census_run_id``.
-
-    ``tempfile.mkstemp`` in *path*'s directory plus ``os.replace``: a crash
-    mid-write never leaves a partial file, and an existing one is fully
-    replaced, never merged.
-    """
-    state = {
-        "last_census_at": census_at,
-        "last_census_run_id": run_id,
-        "last_census_report": report_path,
-        "last_census_as_of_sha": as_of_sha,
-        "session_watermark": session_watermark,
-    }
-    directory = os.path.dirname(os.fspath(path)) or "."
-    # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
-    # writer -- deliberately belt-and-braces with run_census's own
-    # _ensure_output_parents, which serves a different purpose. That call
-    # buys FAIL-FAST (an un-creatable output path must cost nothing rather
-    # than a whole ~$100 mining run) and only covers run_census's four
-    # paths; this line makes the guarantee hold for EVERY caller of this
-    # function, present and future, so nobody can reintroduce the
-    # FileNotFoundError that mkstemp(dir=<missing>) raises just by writing
-    # census state from somewhere new. Idempotent, so the two do not fight.
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp_file, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.remove(tmp_file)
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2309,7 +2253,7 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
 
     The probe is bounded by *limit*; exhausting it raises ``RuntimeError``
     naming the directory. Raising here is safe precisely because this
-    write precedes ``codebook.dump``/``advance_census_state`` -- the
+    write precedes ``codebook.dump``/``census_state.advance`` -- the
     module's ordering invariant means an abort at this point leaves
     nothing persisted, so a re-run starts clean.
     """
@@ -2725,7 +2669,7 @@ def run_census(
     whole census: files one INFO escalation via *escalate_fn* naming the
     deferral, logs loudly, and returns immediately -- no batch is pulled
     from *batch_source*, no ``submit_fn``/``codebook.dump``/
-    ``advance_census_state`` call happens.
+    ``census_state.advance`` call happens.
 
     There is a SECOND headroom gate, after mining and before ``verify_fn``
     (``_stage_headroom_gate``, skipped when there is nothing to verify).
@@ -2804,7 +2748,7 @@ def run_census(
     ``codebook.validate`` again (raises and aborts before any artifact is
     written) -> write the JSON record beside *report_path*
     (``build_census_record``) and the
-    report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
+    report rendered from it -> ``codebook.dump`` -> ``census_state.advance``
     (watermark from the mining window) -> *gate*, the project's landing gate
     (``landing_gate.run_gate``) over the checkout now holding those outputs,
     at a HEAD that held still while it ran (it re-runs a bounded number of
@@ -2828,12 +2772,12 @@ def run_census(
     that project_root, which the report and
     ``CensusOutcome.cross_project_tickets`` name.
 
-    The report write, ``codebook.dump``, and ``advance_census_state`` run
+    The report write, ``codebook.dump``, and ``census_state.advance`` run
     in that fixed order, with nothing else in between the latter two, to
     keep as small as possible the window in which a mid-pipeline failure
     could leave on-disk state inconsistent: a failure before
     ``codebook.dump`` leaves at most the report written (harmless -- a
-    plain re-run regenerates it); a failure inside ``advance_census_state``
+    plain re-run regenerates it); a failure inside ``census_state.advance``
     itself (the one residual risk -- e.g. a disk-full atomic-write failure)
     leaves the codebook advanced ahead of census-state.json on disk.
     Recovery for that residual case is a plain re-run:
@@ -2890,7 +2834,7 @@ def run_census(
     empty. ONLY the external filing
     is stubbed -- mining, verification, synthesis, the matrix, the
     codebook merge and promotions, the report write, ``codebook.dump``
-    and ``advance_census_state`` all proceed exactly as on a normal run,
+    and ``census_state.advance`` all proceed exactly as on a normal run,
     so the payload file is a faithful preview of what a real run would
     file rather than the output of a half-executed census. The write sits
     at the same point in the sequence the filing loop occupies (after
@@ -2902,7 +2846,7 @@ def run_census(
 
     A dry run is consequently NOT resumable by re-running: the mining, the
     codebook merge, the promotions, ``codebook.dump`` and
-    ``advance_census_state`` all really happened and its sessions are
+    ``census_state.advance`` all really happened and its sessions are
     ledgered as coded, so a later census neither re-mines them nor files
     these confusions (they now code as ``matches``). The payload file is
     the sole remaining handle on
@@ -2960,19 +2904,20 @@ def run_census(
     # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
     #     census_state_path are four writers of the SAME run's outputs; a
     #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
-    #     a fifth output is added. Note this covers codebook.dump and
-    #     advance_census_state too, not just the two write_text calls: both
-    #     write atomically via `tempfile.mkstemp(dir=os.path.dirname(path))`,
-    #     which raises the same FileNotFoundError on a missing directory as
-    #     write_text does. reify tripped only the plans/ pair because main()
+    #     a fifth output is added. Note this covers codebook.dump too, not
+    #     just the two write_text calls: it writes atomically via
+    #     `tempfile.mkstemp(dir=os.path.dirname(path))`, which raises the same
+    #     FileNotFoundError on a missing directory as write_text does.
+    #     census_state.advance creates its own parent, so only the fail-fast
+    #     half applies to it. reify tripped only the plans/ pair because main()
     #     loads its config from <root>/docs/legibility/legibility.yaml, so
     #     that directory necessarily existed; a target reached via --config
     #     pointing elsewhere trips the codebook/state pair identically.
     #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
     #     none of this was ever hit before.
     #     This "one place" argument is honest only for run_census's OWN four
-    #     paths, so it is not the whole guard: advance_census_state also
-    #     creates its parent writer-side (mirroring trickle_state), which
+    #     paths, so it is not the whole guard: census_state.advance also
+    #     creates its parent writer-side (state_docs.write_state), which
     #     covers every OTHER caller too. codebook.dump has no such
     #     writer-side guard yet -- codebook.py sits outside this task's lock
     #     scope -- so nightly.py's codebook.dump call remains exposed to the
@@ -2983,7 +2928,7 @@ def run_census(
     #     project.
     #
     # Creating an empty directory is not persisted census state, so the
-    # documented report -> codebook.dump -> advance_census_state ordering
+    # documented report -> codebook.dump -> census_state.advance ordering
     # invariant (see this function's docstring and the comments at those
     # three sites) is untouched by this call.
     _ensure_output_parents(
@@ -3372,7 +3317,7 @@ def run_census(
     )
     refiled = disposition.refilings(outcomes, reverified, sighted=sighted)
 
-    # Positioned BEFORE codebook.dump()/advance_census_state() below
+    # Positioned BEFORE codebook.dump()/census_state.advance() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook. Filing itself is best-effort per finding
@@ -3534,9 +3479,10 @@ def run_census(
         ],
         area_map=area_map.to_record(),
     )
+    census_at = datetime.fromisoformat(date).date()
     # The record is written FIRST and the report rendered from that very text,
     # so the markdown can only ever say what the record holds. Both precede
-    # codebook.dump()/advance_census_state(): a failure here leaves at most
+    # codebook.dump()/census_state.advance(): a failure here leaves at most
     # these two files touched, and a re-run starts clean
     # (reviewer_comprehensive finding #4).
     record_path = Path(report_path).with_suffix(".json")
@@ -3544,20 +3490,20 @@ def run_census(
     record_path.write_text(record_text, encoding="utf-8")
     Path(report_path).write_text(render_report(json.loads(record_text)), encoding="utf-8")
 
-    # codebook.dump() and advance_census_state() are adjacent on purpose
+    # codebook.dump() and census_state.advance() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
     # between them, so the ONLY way census-state.json can end up lagging
     # behind an already-persisted codebook is a failure inside
-    # advance_census_state itself. Should that happen, recovery is a plain
+    # census_state.advance itself. Should that happen, recovery is a plain
     # re-run -- see this function's docstring for why that is safe.
     codebook.dump(updated_codebook, codebook_path)
-    advance_census_state(
+    census_state.advance(
         census_state_path,
-        census_at=date,
+        census_at=census_at,
         run_id=run_id,
         report_path=report_relpath,
         as_of_sha=as_of_sha,
-        session_watermark=selection.window.end.isoformat() if selection is not None else None,
+        session_watermark=selection.window.end if selection is not None else None,
     )
 
     verdict = gate()
@@ -3828,7 +3774,7 @@ def _build_default_verify_fn(
         cluster under adjudication -- and this repo's codebook is dominated by
         clusters ABOUT usage/weekly limits, so the markers match ordinary
         healthy content. Scanning pre-parse aborted the run on those clusters,
-        and because the abort precedes ``advance_census_state`` the next run
+        and because the abort precedes ``census_state.advance`` the next run
         re-mined the same window and aborted again: a permanent census stall
         plus a stream of false "the account is capped" escalations. The
         probe-confirmation closes the residual half of that class, where the
