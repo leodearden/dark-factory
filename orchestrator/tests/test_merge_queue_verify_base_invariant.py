@@ -673,7 +673,7 @@ class TestAdvisoryContractRegressionPins:
 
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None, (
+        assert isinstance(entry, InflightEntry), (
             'ADVISORY CONTRACT VIOLATED (task 3206, PRD §5.3): a phantom frozen '
             'tip must never refuse a dispatch whose base is the live main tip. '
             'This is the measured 5687 / 5830 shape — that dispatch passed and '
@@ -771,7 +771,7 @@ class TestAdvisoryContractRegressionPins:
                 f'acquire(); an enforcement flip that returns early here must '
                 f'hand the lease back explicitly (task 3206).'
             )
-        assert entry is not None and entry.lease is not None, (
+        assert isinstance(entry, InflightEntry) and entry.lease is not None, (
             'the acquired lease must be attached to the returned entry, not dropped'
         )
 
@@ -842,7 +842,7 @@ async def _straggler_dispatch(
     permit = await worker._speculation_ledger.acquire()
     straggler = dataclasses.replace(built, base_sha=_VB_DEAD, speculative=True, permit=permit)
     entry = await worker._dispatch_item(straggler)
-    assert entry is not None
+    assert isinstance(entry, InflightEntry)
     tip = tip_item.merge_result.merge_commit
     assert tip is not None
     return worker, entry, tip

@@ -143,7 +143,7 @@ async def _make_branch_with_file(
     return worktree
 
 
-RemergeCall = tuple[str, RemergeClaim | None, SpeculativeItem]
+RemergeCall = tuple[str, RemergeClaim, SpeculativeItem]
 
 
 def _record_remerges(
@@ -155,7 +155,7 @@ def _record_remerges(
     original = worker._remerge
 
     async def _recording(
-        req: MergeRequest, started: float | None, claim: RemergeClaim | None = None,
+        req: MergeRequest, started: float | None, *, claim: RemergeClaim,
     ) -> SpeculativeItem:
         out = await original(req, started, claim=claim)
         calls.append((req.task_id, claim, out))
@@ -168,12 +168,10 @@ def _record_remerges(
 def _one_remerge(
     calls: list[RemergeCall], task_id: str,
 ) -> tuple[RemergeClaim, SpeculativeItem]:
-    """The single re-merge of *task_id*, which must have been handed a claim."""
+    """The single re-merge of *task_id*: its claim and its replacement."""
     mine = [(claim, out) for tid, claim, out in calls if tid == task_id]
     assert len(mine) == 1, calls
-    claim, out = mine[0]
-    assert claim is not None, f'{task_id} was re-merged without a claim'
-    return claim, out
+    return mine[0]
 
 
 # THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in

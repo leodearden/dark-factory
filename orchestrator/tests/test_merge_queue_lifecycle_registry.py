@@ -54,7 +54,7 @@ from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -599,7 +599,7 @@ class TestRequeueToQueuedSites:
         worker.operator_halt('test: pre-dispatch halt')
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert not queue.empty(), 'req must be put back on the queue by the halt branch'
         # Take the request OFF the queue BEFORE reading the census: snapshot()
         # emits everything still sitting on `_queue` with a hardcoded 'queued'
@@ -662,7 +662,7 @@ class TestRequeueToQueuedSites:
         worker.operator_halt('test: pre-dispatch halt')
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert worker._lifecycle.current(req.request_id) is None
         assert len(fake_eq.filed) == 0, (
             f'unregistered requeue must stay silent: {fake_eq.filed!r}'
@@ -869,7 +869,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
         worker.operator_halt('test: pre-dispatch halt')
         entry_ph = await worker._dispatch_item(item_ph)
-        assert entry_ph is not None
+        assert isinstance(entry_ph, InflightEntry)
         assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
 
         expected = {req_cl.request_id, req_dv.request_id, req_ph.request_id}
@@ -2542,7 +2542,7 @@ class TestAbandonPredispatchRetiresRegistry:
 
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None and entry.status == InflightStatus.ABANDONED_PREDISPATCH
+        assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.ABANDONED_PREDISPATCH
         assert lane_state(worker, req.request_id) is None, (
             f'a retired request must leave the public census: '
             f'{lane_entry(worker, req.request_id)!r}'
