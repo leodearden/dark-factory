@@ -148,11 +148,29 @@ REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecSt
 # only report these, never synthesize them.
 AOF_GATE_SCRIPT = "scripts/falkordb_aof_gate.py"
 AOF_GATE_DRIFT = f"ExecStartPre= running {AOF_GATE_SCRIPT} (task 6330)"
+# The compose services whose `up` cannot recreate falkordb, named as defined
+# in fused-memory/docker/docker-compose.yml.
+UNGATED_COMPOSE_SERVICES: frozenset[str] = frozenset({"embedder"})
 BARE_COMPOSE_UP_DRIFT = (
-    "no ExecStartPre= running a bare `docker compose ... up` "
-    f"(it recreates falkordb without {AOF_GATE_SCRIPT})"
+    "no ExecStartPre= running a `docker compose ... up` that names services beyond "
+    f"UNGATED_COMPOSE_SERVICES {sorted(UNGATED_COMPOSE_SERVICES)} "
+    f"(it could recreate falkordb without {AOF_GATE_SCRIPT})"
 )
-_BARE_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+
+
+def compose_up_bypasses_aof_gate(line: str) -> bool:
+    """True when *line* runs a compose `up` that could recreate falkordb.
+
+    The services an `up` names are its non-option tokens; naming none brings up
+    every service. Anything outside UNGATED_COMPOSE_SERVICES counts, including
+    an option's separate value token, so an unrecognised `up` fails closed.
+    """
+    match = _COMPOSE_UP.search(line)
+    if match is None:
+        return False
+    services = {token for token in line[match.end():].split() if not token.startswith("-")}
+    return not services or not services <= UNGATED_COMPOSE_SERVICES
 
 
 def _log(message: str, *, stream=None) -> None:
@@ -219,9 +237,11 @@ def find_drift(
     Prefix misses are appended, in order, after the exact-match misses.
 
     With ``check_aof_gate``, a unit whose ExecStartPre= lines exist but none
-    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with a bare compose-up
-    ExecStartPre= reports BARE_COMPOSE_UP_DRIFT, appended last. A unit with no
-    ExecStartPre= at all is already reported by its prefix miss.
+    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with an ExecStartPre=
+    compose up naming services beyond UNGATED_COMPOSE_SERVICES (see
+    compose_up_bypasses_aof_gate) reports BARE_COMPOSE_UP_DRIFT, appended
+    last. A unit with no ExecStartPre= at all is already reported by its
+    prefix miss.
 
     Args:
         unit_text: The full text of the systemd unit file.
@@ -254,7 +274,7 @@ def _aof_gate_drift(service_lines: list[str]) -> list[str]:
     drift = []
     if not any(AOF_GATE_SCRIPT in line for line in exec_start_pre):
         drift.append(AOF_GATE_DRIFT)
-    if any(_BARE_COMPOSE_UP.search(line) for line in exec_start_pre):
+    if any(compose_up_bypasses_aof_gate(line) for line in exec_start_pre):
         drift.append(BARE_COMPOSE_UP_DRIFT)
     return drift
 
