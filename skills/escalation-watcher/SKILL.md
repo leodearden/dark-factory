@@ -745,7 +745,11 @@ gates"; that document defines them. Leo's classes follow, each with the record c
 it, and the gate slug where one corresponds:
 
 - Milestone gates and deterministic-runner filings (`milestone_gate`,
-  `deterministic_runner_filing`).
+  `deterministic_runner_filing`). **Leo's one exception to this floor:** a gate whose task's only
+  work is curating memories in place (its text says it is curator-sitting work, edits no
+  repository file, and names the memories to amend) is handled under self-execute line 14, with
+  every check that line requires, and reported afterwards (Leo, 2026-11-10, scoping_intake
+  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
