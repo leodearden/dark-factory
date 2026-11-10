@@ -77,8 +77,9 @@ Fields added after the first writer are ADDITIVE and do not bump it:
 ``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``,
 ``barren_escalated`` and ``completion_error_streak``.
 :meth:`TrickleState.from_json` reads an absent one as its default, and an
-absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a field would make every live state file
-read malformed on the first post-deploy probe.
+absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a
+field would make every live state file read malformed on the first
+post-deploy probe.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
 OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
