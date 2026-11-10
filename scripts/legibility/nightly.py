@@ -9,7 +9,7 @@ boundary test §8.8.
 
 Every stage is injected through :func:`run_nightly` (``selector``,
 ``digest_builder``, ``invoke`` for the LLM, ``committer`` for git,
-``census_launcher`` and ``status_fetcher`` for the census, ``poster`` for
+``census_launcher`` and ``completion_runner`` for the census, ``poster`` for
 the alarm (:func:`alarm.raise_alarm`), ``recorder``/``retry_recorder`` for
 run state). Each seam
 resolves ``None`` to its real implementation, so a production entrypoint
@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -449,7 +449,7 @@ def evaluate_census_step(
     cfg: LegibilityConfig,
     *,
     now=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner = census_trigger.run_completion_check,
     decide=census_trigger.decide_for_project,
     entrypoint_exists=None,
     launcher=None,
@@ -495,14 +495,13 @@ def evaluate_census_step(
         launcher = _default_census_launcher
 
     try:
-        decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+        decision = decide(cfg.project_root, now=now, completion_runner=completion_runner)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
         # and `census_line` is a one-line field on `NightlyResult`. An escaping
-        # exception's message is arbitrary -- a `StatusFetchUnavailable`
-        # chained from a large get_statuses payload, or a multi-line YAML /
-        # pydantic error -- so it is truncated (and its newlines escaped) by
+        # exception's message is arbitrary -- a large payload, or a multi-line
+        # YAML / pydantic error -- so it is truncated (and its newlines escaped) by
         # census_trigger's own log-hygiene helper rather than a second copy of
         # that logic here. Formatted once, so the two sinks cannot drift.
         detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
@@ -607,11 +606,11 @@ _RetryRecorder = Callable[..., trickle_state.TrickleState | None]
 @dataclass(frozen=True, kw_only=True)
 class _NightSeams:
     """:func:`run_nightly`'s injected stages with every ``None`` resolved to
-    the real one, except *invoke* and *status_fetcher*: the stage that owns
-    each builds its real one only when it runs."""
+    the real one, except *invoke*: the code stage builds its real one only
+    when it runs."""
 
     invoke: Callable[[str, str], str] | None
-    status_fetcher: Callable[[], Any] | None
+    completion_runner: census_trigger.CompletionRunner
     poster: alarm.Poster | None
     committer: Callable[..., unlanded.CommitResult]
     recorder: _Recorder
@@ -622,12 +621,15 @@ class _NightSeams:
 
     @classmethod
     def resolve(
-        cls, *, invoke, status_fetcher, poster, committer, recorder, retry_recorder,
+        cls, *, invoke, completion_runner, poster, committer, recorder, retry_recorder,
         selector, digest_builder, census_launcher,
     ) -> _NightSeams:
         return cls(
             invoke=invoke,
-            status_fetcher=status_fetcher,
+            completion_runner=(
+                completion_runner if completion_runner is not None
+                else census_trigger.run_completion_check
+            ),
             poster=poster,
             committer=committer if committer is not None else unlanded.commit_only,
             recorder=recorder if recorder is not None else trickle_state.write_night,
@@ -1235,7 +1237,7 @@ def run_nightly(
     target_date: date | None = None,
     now: datetime | None = None,
     invoke=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner | None = None,
     poster=None,
     committer=None,
     recorder=None,
@@ -1263,13 +1265,10 @@ def run_nightly(
     ``--project-id %i``), and left unrecorded under *config_path*, which
     names no project to record against.
 
-    *status_fetcher* defaults to the real MCP-backed ``get_statuses``
-    fetcher for ``cfg.project_root``
-    (:func:`census_trigger.default_status_fetcher`) -- inject to override.
-    ``None`` means "build the real one", NOT "no fetcher": that asymmetry
-    with every other seam here is what kept the census's tasks-landed
-    condition dead on the production path (task 4148). A test wanting the
-    fail-safe path injects a raising/empty fake instead.
+    *completion_runner* defaults to
+    :func:`census_trigger.run_completion_check`, the real
+    ``scripts/check_run_completion.py`` run the census trigger's completion
+    arm reads -- inject to override.
 
     *invoke* reads the same way (task 5488): ``None`` means "open ONE
     pooled session runner for the code stage and code every digest through
@@ -1303,7 +1302,7 @@ def run_nightly(
     The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
     seams = _NightSeams.resolve(
-        invoke=invoke, status_fetcher=status_fetcher, poster=poster, committer=committer,
+        invoke=invoke, completion_runner=completion_runner, poster=poster, committer=committer,
         recorder=recorder, retry_recorder=retry_recorder, selector=selector,
         digest_builder=digest_builder, census_launcher=census_launcher,
     )
@@ -1496,7 +1495,7 @@ def _code_and_land(
     ledger = _ledger_coded_sessions(cfg, merge.merged_records, target_date, now)
     census = _census_stage(
         cfg, resolved_config_path, target_date,
-        status_fetcher=seams.status_fetcher, census_launcher=seams.census_launcher,
+        completion_runner=seams.completion_runner, census_launcher=seams.census_launcher,
         now=now, pass_kind=pass_kind,
     )
     return _NightEnd(
@@ -1700,7 +1699,7 @@ def _census_stage(
     resolved_config_path: Path,
     target_date: date,
     *,
-    status_fetcher: Callable[[], Any] | None,
+    completion_runner: census_trigger.CompletionRunner,
     census_launcher: CensusLauncher,
     now: datetime | None,
     pass_kind: PassKind,
@@ -1708,7 +1707,7 @@ def _census_stage(
     """Evaluate the census trigger against the config THIS pass loaded (task
     3269); ``None`` on a retry pass, which never evaluates it: the scheduled
     pass already did, and a second evaluation could launch a second paid
-    census. The default status fetcher is built only here."""
+    census."""
     if pass_kind is PassKind.RETRY:
         logger.info(
             'legibility trickle: census trigger not evaluated on a retry pass '
@@ -1720,10 +1719,7 @@ def _census_stage(
     anchor = _census_anchor(state_path)  # read BEFORE the synchronous launch
     line, fire = evaluate_census_step(
         cfg, now=now,
-        status_fetcher=(
-            status_fetcher if status_fetcher is not None
-            else census_trigger.default_status_fetcher(cfg.project_root)
-        ),
+        completion_runner=completion_runner,
         launcher=census_launcher,
         config_path=resolved_config_path,
     )
@@ -1747,7 +1743,7 @@ def run_scheduled_night(
     target_date: date | None = None,
     now: datetime | None = None,
     invoke=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner | None = None,
     poster=None,
     committer=None,
     recorder=None,
@@ -1766,7 +1762,7 @@ def run_scheduled_night(
     def run_pass(pass_date: date | None, pass_kind: PassKind) -> NightlyResult:
         return run_nightly(
             config_path=config_path, project_id=project_id, projects_root=projects_root,
-            target_date=pass_date, now=now, invoke=invoke, status_fetcher=status_fetcher,
+            target_date=pass_date, now=now, invoke=invoke, completion_runner=completion_runner,
             poster=poster, committer=committer, recorder=recorder,
             retry_recorder=retry_recorder, selector=selector,
             digest_builder=digest_builder, census_launcher=census_launcher,

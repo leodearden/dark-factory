@@ -1285,57 +1285,6 @@ def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_pat
     assert data["session_watermark"] is None
 
 
-def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
-    """End-to-end proof that an UNKNOWN baseline disarms condition (b)
-    instead of arming it. A poisoned `0` baseline makes compute_tasks_landed
-    return `current_done - 0` -- every done task ever, ~24x over the 120
-    threshold -- as soon as the get_statuses fetch works (task 3291; see
-    census_trigger's module docstring for the replayed measurements). A
-    `null` baseline instead routes into the existing absent-baseline branch:
-    one WARNING, `None`, no fire."""
-    path = tmp_path / "census-state.json"
-    _advance(path, census_at="2026-07-31", done_count=None)
-
-    # A null baseline is UNKNOWN, not malformed -- the state file still loads.
-    status, data = census_trigger.load_census_state(path)
-    assert status == "ok"
-    # load_census_state returns tuple[str, dict | None] — the None is real for
-    # the "missing"/"malformed" statuses, so narrow it explicitly rather than
-    # subscripting an Optional.
-    assert data is not None
-    assert data["last_census_done_count"] is None
-
-    with caplog.at_level(logging.WARNING):
-        landed = census_trigger.compute_tasks_landed(
-            state=data,
-            # A perfectly VALID fetcher: the fail-safe here comes from the
-            # unknown baseline, not from any fetch problem.
-            status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
-        )
-
-    assert landed is None
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
-
-    # ... and with tasks_landed=None, condition (b) cannot fire even when
-    # days_since is well past tasks_landed_min_days. Condition (a)
-    # (max_interval_days) remains the unconditional backstop.
-    config = census_trigger.CensusConfig()
-    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
-    decision = census_trigger.evaluate(
-        now=now,
-        last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
-        floor_anchor=census_trigger.FloorAnchor(
-            census_trigger.FloorAnchorKind.SESSION_WATERMARK,
-            now - timedelta(days=config.tasks_landed_min_days + 1),
-        ),
-        tasks_landed=None,
-        candidate_first_seens=[],
-        config=config,
-    )
-
-    assert decision.fire is False
-
-
 @pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
     path = tmp_path / "census-state.json"
@@ -5939,8 +5888,8 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 
@@ -5951,7 +5900,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     assert opened_runners == [], "a no-fire decision must open no pooled runner"
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
-    assert "max-interval: not yet due" in out
+    assert "completion: not yet due" in out
 
 
 def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
@@ -6120,8 +6069,8 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 
@@ -6146,8 +6095,8 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=["max-interval: overdue -> FIRE"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=["completion: landed -> FIRE"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 

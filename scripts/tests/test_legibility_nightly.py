@@ -3,7 +3,7 @@ assembly (PRD task epsilon: plans/confusion-reduction-prd.md §5.5, decisions
 7/8, boundary test §8.8).
 
 Every stage is exercised through run_nightly's injected seams (selector,
-digest_builder, invoke, committer, census_launcher, status_fetcher, poster,
+digest_builder, invoke, committer, census_launcher, completion_runner, poster,
 recorder) — no test here ever touches a real LLM, the machine-operated main
 git checkout, a live escalation server, a real census, or real systemd. The
 main()-entry tests, which can inject nothing, spy the census.py subprocess.
@@ -692,7 +692,6 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path):
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
-        status_fetcher=None,
         poster=lambda url, arguments: None,
         selector=spy_select,
         digest_builder=spy_build,
@@ -766,12 +765,12 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
 def test_evaluate_census_step_no_fire_never_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=['max-interval: 1.0d (threshold 10d)'])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=False, reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'])
 
     launcher_calls = []
     line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=fake_decide,
+        cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
     )
 
@@ -783,13 +782,13 @@ def test_evaluate_census_step_no_fire_never_launches(tmp_path):
 def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_path, caplog):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
     with caplog.at_level('WARNING'):
         line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: False, launcher=lambda: launcher_calls.append(1),
         )
 
@@ -802,12 +801,12 @@ def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_pa
 def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
     line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=fake_decide,
+        cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True,
         launcher=lambda project_root, **kwargs: launcher_calls.append(1),
     )
@@ -831,9 +830,9 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     """
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(project_root, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=[
-            'tasks-landed: 130 landed since last census (threshold 120) -> FIRE',
+            'completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE',
         ])
 
     # Snapshots the journal as the census subprocess would start, then dies
@@ -846,7 +845,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
         line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=_dying_launcher,
         )
 
@@ -856,7 +855,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     assert any(
         'legibility trickle: census trigger: FIRE' in m for m in logged_at_launch
     ), logged_at_launch
-    assert any('tasks-landed: 130 landed' in m for m in logged_at_launch), logged_at_launch
+    assert any('completion: 0.9 of' in m for m in logged_at_launch), logged_at_launch
 
     # ...and a launcher that never returns cleanly cannot take it away.
     messages = [r.getMessage() for r in caplog.records]
@@ -872,12 +871,12 @@ def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
     an operator greps for the healthy one."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(project_root, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
         line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
 
@@ -904,7 +903,7 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     `entrypoint_exists` is even consulted."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(project_root, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     launcher_calls = []
@@ -916,7 +915,7 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
         line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=_recording_entrypoint_exists,
             launcher=lambda: launcher_calls.append(1),
         )
@@ -948,12 +947,12 @@ def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
     is the opposite of the legible failure this trigger exists for."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(project_root, *, now=None, completion_runner=None):
         raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
         line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
 
@@ -1068,8 +1067,8 @@ def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
     return None
 
 
-def _fire_decide(project_root, *, now=None, status_fetcher=None):
-    return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+def _fire_decide(project_root, *, now=None, completion_runner=None):
+    return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
 
 def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
@@ -1207,7 +1206,7 @@ def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path
         calls.append((project_root, config_path))
 
     _line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec,
     )
 
@@ -1228,7 +1227,7 @@ def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(
 
     for cfg in (cfg_a, cfg_b):
         nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=_fire_decide,
+            cfg, now=None, decide=_fire_decide,
             entrypoint_exists=lambda: True, launcher=rec,
         )
 
@@ -1244,7 +1243,7 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
         calls.append((project_root, config_path))
 
     nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec, config_path=config_path,
     )
 
@@ -1265,7 +1264,7 @@ def test_evaluate_census_step_forwards_the_configs_trickle_caps_to_launcher(tmp_
         calls.append(caps)
 
     nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec,
     )
 
@@ -1293,7 +1292,7 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
-        status_fetcher=lambda: {'statuses': {}},
+        completion_runner=_passing_completion_runner,
         poster=lambda url, arguments: None,
         census_launcher=launcher,
         pass_kind=nightly.PassKind.MANUAL,
@@ -1335,7 +1334,7 @@ def test_run_nightly_launches_the_census_once_through_the_injected_launcher(
 
 @pytest.mark.usefixtures('unreached_fused_memory')
 def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(tmp_path, monkeypatch):
-    """End to end: a max-interval FIRE through run_nightly and the REAL default
+    """End to end: a completion FIRE through run_nightly and the REAL default
     launcher carries the project's census.trickle_caps into census.py's argv,
     and no env: census.py opens its own pooled runner (task 6042), so a pinned
     env would hand it one account for every stage.
@@ -1352,15 +1351,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(tmp_path,
     )
     legibility_dir = root / 'docs' / 'legibility'
     now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
-    # 11 days stale with a null done-count: only max-interval can fire, and
-    # condition (b) never reaches a status fetcher.
-    (legibility_dir / 'census-state.json').write_text(
-        json.dumps({
-            'last_census_at': (now - timedelta(days=11)).isoformat(),
-            'last_census_done_count': None,
-        }),
-        encoding='utf-8',
-    )
+    _write_census_state(root, _completion_census_state(now))
     codebook.dump(
         {'version': 2, 'entries': [], 'candidates': []},
         legibility_dir / 'confusion-codebook.yaml',
@@ -1379,7 +1370,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(tmp_path,
         target_date=date(2026, 7, 13),
         now=now,
         invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
-        status_fetcher=lambda: {'statuses': {}},
+        completion_runner=_passing_completion_runner,
         poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -1453,6 +1444,13 @@ def _scripted_completion_runner(returncode, verdict, calls=None):
         return subprocess.CompletedProcess(list(args), returncode, stdout=json.dumps(verdict) + '\n')
 
     return _run
+
+
+_passing_completion_runner = _scripted_completion_runner(
+    0, {'verdict': 'pass', 'share': 0.9, 'vacuous': False},
+)
+"""The ``completion_runner=`` the e2e helpers default to: the previous run has
+landed, so a census-state carrying a run id FIREs on completion."""
 
 
 class TestRunNightlyDefaultsTheCompletionRunner:
@@ -1610,10 +1608,10 @@ def _recording_census_launcher(on_launch=None):
     return _launch, launches
 
 
-_OLD_CENSUS = {'last_census_at': '2026-06-01'}
-"""A census-state that FIREs on max-interval: no session_watermark, so the
-floor anchors on last_census_at, and no ``last_census_done_count``, so the
-trigger never reaches a status fetcher."""
+_OLD_CENSUS = {'last_census_at': '2026-06-01', 'last_census_run_id': _PREVIOUS_RUN}
+"""A census-state that FIREs on completion under
+:func:`_passing_completion_runner`: no session_watermark, so the floor anchors
+on last_census_at, weeks clear of it."""
 
 
 def _run_one_digest_night(tmp_path, **kwargs):
@@ -1628,7 +1626,7 @@ def _run_one_digest_night(tmp_path, **kwargs):
         cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
     poster, escalations = _capture_poster()
-    kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
+    kwargs.setdefault('completion_runner', _passing_completion_runner)
     kwargs.setdefault('census_launcher', _no_census_launch)
     kwargs.setdefault('poster', poster)
     kwargs.setdefault('pass_kind', nightly.PassKind.MANUAL)
@@ -2036,7 +2034,6 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2076,7 +2073,6 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2134,7 +2130,6 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
             poster=lambda url, arguments: None,
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -2170,7 +2165,6 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
             poster=lambda url, arguments: None,
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -2252,7 +2246,6 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
             poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -2332,7 +2325,6 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
             poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -2470,7 +2462,6 @@ def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_capped,
-        status_fetcher=None,
         poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2539,7 +2530,6 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_unparseable,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2604,7 +2594,6 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         committer=_failing_committer,
         pass_kind=nightly.PassKind.MANUAL,
@@ -2745,7 +2734,6 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
             target_date=target_date,
             now=fixed_now,
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
             poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -2828,7 +2816,6 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2907,7 +2894,6 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_then_match,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2970,7 +2956,6 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3015,7 +3000,6 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
         target_date=target_date,
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
         poster=_dead_poster,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3108,7 +3092,6 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3140,7 +3123,6 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3192,7 +3174,6 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         target_date=target_date,
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_empty,
-        status_fetcher=None,
         poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3244,7 +3225,6 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
             target_date=target_date,
             now=fixed_now,
             invoke=_fake_invoke_empty,
-            status_fetcher=None,
             poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
@@ -3316,7 +3296,6 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_unexpected_invoke,
-        status_fetcher=None,
         poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         digest_builder=_crashing_build_digests,
         pass_kind=nightly.PassKind.MANUAL,
@@ -3680,6 +3659,7 @@ _INVALID_SEVERITY_ERROR = "'apocalyptic' is not one of"
 def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      digest_builder=None, census_launcher=_no_census_launch,
+                     completion_runner=_passing_completion_runner,
                      census_state: dict | None = None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
                      unreadable_transcripts: bool = False,
@@ -3712,10 +3692,12 @@ def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
     night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
     is committed as the project's design-invariants doc, and *census_state*
     is written as the repo's census-state.json. *recorder* / *committer* /
-    *poster* / *invoke* / *digest_builder* / *census_launcher* are the
-    injected seams; *poster* and *census_launcher* default to no-ops, so a
-    test that does not care about escalations never builds a poster and no
-    night here can spawn census.py. *pass_kind* (default ``MANUAL``) is
+    *poster* / *invoke* / *digest_builder* / *census_launcher* /
+    *completion_runner* are the injected seams; *poster* and
+    *census_launcher* default to no-ops and *completion_runner* to
+    :func:`_passing_completion_runner`, so a test that does not care about
+    escalations never builds a poster, and no night here can spawn census.py
+    or reach fused-memory. *pass_kind* (default ``MANUAL``) is
     passed through. *unreadable_transcripts* is the exception: it strips
     every permission bit from the projects root for the run, so enumerating
     the transcripts raises inside sampling.
@@ -3754,9 +3736,9 @@ def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
         target_date=date(2026, 7, 13),
         now=now,
         invoke=invoke,
-        status_fetcher=None,
         poster=poster if poster is not None else (lambda url, arguments: None),
         census_launcher=census_launcher,
+        completion_runner=completion_runner,
         pass_kind=pass_kind,
     )
     if recorder is not None:
@@ -4701,12 +4683,14 @@ class _NightRunner:
     real one) and escalates at *max_barren_runs*. Every post is collected in
     ``escalations`` and then handed to *on_post*, which may raise to play a
     failed post. Every pass launches a census through *census_launcher*
-    (default a no-op)."""
+    (default a no-op) and reads the previous run's completion through
+    *completion_runner* (default :func:`_passing_completion_runner`)."""
 
     def __init__(
         self, tmp_path, *, recorder=None,
         max_barren_runs: int = trickle_state.DEFAULT_MAX_BARREN_RUNS,
         on_post=None, census_launcher=_no_census_launch,
+        completion_runner=_passing_completion_runner,
     ):
         self.tmp_path = tmp_path
         self.work_cwd = str(tmp_path / 'work')
@@ -4720,6 +4704,7 @@ class _NightRunner:
         self.max_barren_runs = max_barren_runs
         self.on_post = on_post
         self.census_launcher = census_launcher
+        self.completion_runner = completion_runner
 
     def _post(self, url, arguments):
         self.escalations.append((url, arguments))
@@ -4788,9 +4773,9 @@ class _NightRunner:
             target_date=date(2026, 7, day),
             now=datetime(2026, 7, on_night + 1, 3, 0, 0, tzinfo=UTC),
             invoke=invoke,
-            status_fetcher=None,
             poster=self._post,
             census_launcher=self.census_launcher,
+            completion_runner=self.completion_runner,
             max_barren_runs=self.max_barren_runs,
         )
 
@@ -5533,7 +5518,7 @@ class TestRunScheduledNight:
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
         now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
-        invoke, status_fetcher, poster = object(), object(), object()
+        invoke, completion_runner, poster = object(), object(), object()
         committer, recorder, retry_recorder = object(), object(), object()
         selector, digest_builder, census_launcher = (
             _sentinel_seam(), _sentinel_seam(), _sentinel_seam(),
@@ -5542,7 +5527,7 @@ class TestRunScheduledNight:
         nightly.run_scheduled_night(
             config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
             target_date=date(2026, 7, 14), now=now, invoke=invoke,
-            status_fetcher=status_fetcher, poster=poster, committer=committer,
+            completion_runner=completion_runner, poster=poster, committer=committer,
             recorder=recorder, retry_recorder=retry_recorder, selector=selector,
             digest_builder=digest_builder, census_launcher=census_launcher,
             max_barren_runs=5,
@@ -5550,7 +5535,7 @@ class TestRunScheduledNight:
 
         shared = dict(
             config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
-            now=now, invoke=invoke, status_fetcher=status_fetcher, poster=poster,
+            now=now, invoke=invoke, completion_runner=completion_runner, poster=poster,
             committer=committer, recorder=recorder, retry_recorder=retry_recorder,
             selector=selector, digest_builder=digest_builder,
             census_launcher=census_launcher, max_barren_runs=5,
@@ -5765,7 +5750,7 @@ def _run_manual_night(tmp_path, *, selector, poster, **seams):
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
-        status_fetcher=lambda: {'statuses': {}},
+        completion_runner=_passing_completion_runner,
         poster=poster,
         selector=selector,
         digest_builder=lambda selected, **kwargs: ([], []),
@@ -5894,7 +5879,7 @@ def test_an_injected_selector_s_suppressed_sample_is_a_budget_suppressed_night(t
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
-        status_fetcher=lambda: {'statuses': {}},
+        completion_runner=_passing_completion_runner,
         poster=poster,
         selector=_selector,
         pass_kind=nightly.PassKind.MANUAL,
@@ -6182,7 +6167,6 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_deletion_directive,
-            status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
             pass_kind=nightly.PassKind.MANUAL,
         )

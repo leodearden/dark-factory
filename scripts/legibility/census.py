@@ -4262,7 +4262,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
     mining/verify/synthesis, the fused-memory poster for ``submit_fn``,
     :func:`alarm.raise_alarm` (through *poster*) for ``escalate_fn``,
-    ``census_trigger.default_status_fetcher`` for the done-count baseline,
+    ``census_trigger.default_status_fetcher`` for the outcome feed's get_statuses snapshot,
     a :class:`census_window.WindowBatchSource` over the mining window,
     ``unlanded.commit_only`` for the scoped commit, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
@@ -4471,9 +4471,7 @@ def _run_configured_census(
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 
     if not args.force:
-        decision = census_trigger.decide_for_project(
-            project_root, now=now, status_fetcher=status_fetcher,
-        )
+        decision = census_trigger.decide_for_project(project_root, now=now)
         if not decision.fire:
             print(f"census: NO-FIRE for {cfg.project_id} -- pass --force to run anyway")
             for reason in decision.reasons:

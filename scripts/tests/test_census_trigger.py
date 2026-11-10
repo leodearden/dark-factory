@@ -32,6 +32,14 @@ def _anchor(kind, days_ago):
     return ct.FloorAnchor(kind=kind, at=NOW - timedelta(days=days_ago))
 
 
+RUN_ID = "census-p-20261101"
+_FIRING = ct.Completion(ct.CompletionStatus.FIRE, RUN_ID, 70, share=0.8235)
+_NOT_YET = ct.Completion(ct.CompletionStatus.NOT_YET, RUN_ID, 70, share=0.5)
+_ERRORED = ct.Completion(
+    ct.CompletionStatus.ERROR, RUN_ID, 70, detail="exit 2, store_unreachable"
+)
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — CensusConfig defaults + from_mapping merge
 # ---------------------------------------------------------------------------
@@ -254,65 +262,6 @@ def test_census_config_defaults_match_legibility_config_census_model():
 
 
 # ---------------------------------------------------------------------------
-# step-3: RED — evaluate() condition (a): max_interval_days
-# ---------------------------------------------------------------------------
-
-def _evaluate_a(*, last_census_at, tasks_landed=None, candidate_first_seens=None, config=None):
-    """Helper fixing the args condition (a)'s tests hold constant: has
-    censused, no spike, caller-controlled tasks_landed/config."""
-    return ct.evaluate(
-        now=NOW,
-        last_census_at=last_census_at,
-        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, last_census_at),
-        tasks_landed=tasks_landed,
-        candidate_first_seens=candidate_first_seens or [],
-        config=config or ct.CensusConfig(),
-    )
-
-
-def test_evaluate_condition_a_day_9_no_fire():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=9))
-    assert decision.fire is False
-
-
-def test_evaluate_condition_a_day_10_fires():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=10))
-    assert decision.fire is True
-    assert any("max-interval" in r for r in decision.reasons)
-
-
-def test_evaluate_condition_a_day_12_fires():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=12))
-    assert decision.fire is True
-    assert any("max-interval" in r for r in decision.reasons)
-
-
-# ---------------------------------------------------------------------------
-# step-5: RED — evaluate() condition (b): tasks_landed
-# ---------------------------------------------------------------------------
-
-def test_evaluate_condition_b_day_7_130_landed_fires():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=7), tasks_landed=130)
-    assert decision.fire is True
-    assert any("tasks-landed" in r for r in decision.reasons)
-
-
-def test_evaluate_condition_b_day_7_below_threshold_no_fire():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=7), tasks_landed=100)
-    assert decision.fire is False
-
-
-def test_evaluate_condition_b_day_6_min_days_not_met_no_fire():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=6), tasks_landed=130)
-    assert decision.fire is False
-
-
-def test_evaluate_condition_b_delta_unavailable_no_fire():
-    decision = _evaluate_a(last_census_at=NOW - timedelta(days=9), tasks_landed=None)
-    assert decision.fire is False
-
-
-# ---------------------------------------------------------------------------
 # relative novelty spike against a trailing baseline
 # (plans/census-incremental-prd.md §4.7 (b), §4.8 row 13)
 # ---------------------------------------------------------------------------
@@ -320,13 +269,13 @@ def test_evaluate_condition_b_delta_unavailable_no_fire():
 _TODAY = datetime.combine(NOW.date(), datetime.min.time(), tzinfo=UTC)
 
 
-def _first_seens_over_a_baseline_of_40(current_72h):
+def _first_seens_over_a_baseline_of_40(current_72h, today=_TODAY):
     """35 days of history whose every 72h window holds exactly 40 candidates
-    (period-3 daily counts 13, 13, 14), then today topped up so the window
-    ending at NOW holds `current_72h`."""
+    (period-3 daily counts 13, 13, 14), then *today* topped up so the window
+    ending at *today* noon holds `current_72h`."""
     daily = {days_ago: (13, 13, 14)[days_ago % 3] for days_ago in range(1, 36)}
     daily[0] = daily[3] + (current_72h - 40)
-    return [_TODAY - timedelta(days=days_ago) for days_ago, n in daily.items() for _ in range(n)]
+    return [today - timedelta(days=days_ago) for days_ago, n in daily.items() for _ in range(n)]
 
 
 def _quiet_history():
@@ -336,9 +285,8 @@ def _quiet_history():
 def _evaluate_novelty(first_seens, config=None, now=NOW):
     return ct.evaluate(
         now=now,
-        last_census_at=now - timedelta(days=6),
         floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, now - timedelta(days=6)),
-        tasks_landed=None,
+        completion=_NOT_YET,
         candidate_first_seens=first_seens,
         config=config or ct.CensusConfig(),
     )
@@ -474,12 +422,11 @@ def test_novelty_spike_replay_fires_on_the_relative_rule_not_the_absolute_one():
 # (plans/census-incremental-prd.md §4.7 Floor)
 # ---------------------------------------------------------------------------
 
-def _evaluate_floor(*, last_census_days_ago, floor_anchor, tasks_landed=None, config=None):
+def _evaluate_floor(*, floor_anchor, completion=_NOT_YET, config=None):
     return ct.evaluate(
         now=NOW,
-        last_census_at=NOW - timedelta(days=last_census_days_ago),
         floor_anchor=floor_anchor,
-        tasks_landed=tasks_landed,
+        completion=completion,
         candidate_first_seens=[],
         config=config or ct.CensusConfig(),
     )
@@ -491,8 +438,7 @@ def _floor_lines(decision):
 
 def test_evaluate_floor_blocks_inside_floor_days_of_its_anchor():
     decision = _evaluate_floor(
-        last_census_days_ago=12,
-        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 3),
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 3), completion=_FIRING,
     )
     assert decision.fire is False
     assert _floor_lines(decision) == [
@@ -500,20 +446,9 @@ def test_evaluate_floor_blocks_inside_floor_days_of_its_anchor():
     ]
 
 
-def test_evaluate_floor_blocks_tasks_landed_too():
-    decision = _evaluate_floor(
-        last_census_days_ago=8,
-        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 4),
-        tasks_landed=999,
-    )
-    assert decision.fire is False
-    assert any("BLOCKS" in line for line in _floor_lines(decision))
-
-
 def test_evaluate_floor_clear_still_names_its_anchor():
     decision = _evaluate_floor(
-        last_census_days_ago=12,
-        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6), completion=_FIRING,
     )
     assert decision.fire is True
     assert _floor_lines(decision) == ["floor: 6.0d since session watermark (floor 5d)"]
@@ -528,7 +463,7 @@ def test_evaluate_floor_clear_still_names_its_anchor():
     ],
 )
 def test_evaluate_floor_line_names_each_anchor_kind(kind, label):
-    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=_anchor(kind, 3))
+    decision = _evaluate_floor(floor_anchor=_anchor(kind, 3), completion=_FIRING)
     floor_lines = _floor_lines(decision)
     assert len(floor_lines) == 1
     assert label in floor_lines[0]
@@ -537,9 +472,8 @@ def test_evaluate_floor_line_names_each_anchor_kind(kind, label):
 
 def test_evaluate_floor_applies_to_a_never_censused_project():
     decision = _evaluate_floor(
-        last_census_days_ago=3,
         floor_anchor=_anchor(ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, 3),
-        config=ct.CensusConfig(max_interval_days=1),
+        completion=_FIRING,
     )
     assert decision.fire is False
     (floor_line,) = _floor_lines(decision)
@@ -547,7 +481,7 @@ def test_evaluate_floor_applies_to_a_never_censused_project():
 
 
 def test_evaluate_floor_without_an_anchor_blocks_and_says_so():
-    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=None)
+    decision = _evaluate_floor(floor_anchor=None, completion=_FIRING)
     assert decision.fire is False
     (floor_line,) = _floor_lines(decision)
     assert floor_line.startswith("floor: no anchor")
@@ -556,7 +490,6 @@ def test_evaluate_floor_without_an_anchor_blocks_and_says_so():
 
 def test_evaluate_floor_never_fires_by_itself():
     decision = _evaluate_floor(
-        last_census_days_ago=9,
         floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 100),
     )
     assert decision.fire is False
@@ -1372,9 +1305,6 @@ def test_default_status_fetcher_feeds_compute_tasks_landed_the_correct_delta(
 # C7 (a), D9, row 13)
 # ---------------------------------------------------------------------------
 
-RUN_ID = "census-p-20261101"
-
-
 def _verdict_json(verdict, share, *, error=None, vacuous=False):
     record = {
         "run": RUN_ID, "verdict": verdict, "share": share, "threshold": 0.7,
@@ -1549,6 +1479,14 @@ def _closed_port_url():
     return f"http://127.0.0.1:{port}"
 
 
+@pytest.fixture(autouse=True)
+def _no_live_fused_memory(monkeypatch):
+    """A decision that reaches the real completion check unasked meets a
+    closed port, never the host's live fused-memory; a test serving a stub
+    sets FUSED_MEMORY_MCP_URL itself."""
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", _closed_port_url())
+
+
 class _RunStore:
     """A find_tasks_by_metadata backend serving *rows* for every lookup, and
     recording each lookup's arguments."""
@@ -1607,13 +1545,6 @@ def test_run_completion_check_against_a_closed_port_is_a_store_unreachable_error
 # the floor; max-interval and tasks-landed are retired
 # (plans/census-incremental-prd.md C7, row 13)
 # ---------------------------------------------------------------------------
-
-_FIRING = ct.Completion(ct.CompletionStatus.FIRE, RUN_ID, 70, share=0.8235)
-_NOT_YET = ct.Completion(ct.CompletionStatus.NOT_YET, RUN_ID, 70, share=0.5)
-_ERRORED = ct.Completion(
-    ct.CompletionStatus.ERROR, RUN_ID, 70, detail="exit 2, store_unreachable"
-)
-
 
 def _evaluate_completion(completion, *, watermark_days_ago=30):
     return ct.evaluate(
@@ -1822,28 +1753,17 @@ def _done_statuses(count):
 
 
 def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_path):
-    _write_codebook(
-        tmp_path,
-        entries=[
-            {
-                "id": "entry-a",
-                "title": "t",
-                "severity": "low",
-                "status": "open",
-                "origin_phase": "unknown",
-                "manifested_phase": "unknown",
-                "sightings": [_sighting("2026-07-02")],  # NOW - 12 days
-            }
-        ],
-    )
+    _write_spike_codebook(tmp_path)
     # No census-state.json written -- never censused.
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW)
 
     assert decision.fire is True
-    assert any("max-interval" in r for r in decision.reasons)
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
     assert (
-        "floor: 12.5d since earliest codebook date (never censused) (floor 5d)"
+        "floor: 35.5d since earliest codebook date (never censused) (floor 5d)"
         in decision.reasons
     )
 
@@ -1863,7 +1783,7 @@ def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_
     )
     _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW)
 
     assert decision.fire is False
     assert (
@@ -1891,7 +1811,7 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
     )
     _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW)
 
     assert decision.fire is False
     floor_lines = [r for r in decision.reasons if r.startswith("floor:")]
@@ -1909,15 +1829,23 @@ def _watermarked_state(*, last_census_days_ago, watermark_days_ago) -> dict[str,
     }
 
 
+def _passing_runner():
+    return _ScriptedRunner(0, _verdict_json("pass", 0.9))
+
+
+def _landing_runner():
+    return _ScriptedRunner(75, _verdict_json("not_yet", 0.5))
+
+
 def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at(tmp_path):
     _write_codebook(tmp_path)
     _write_census_state(
         tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=3)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
 
-    assert "max-interval: 12.0d since last census (threshold 10d) -> FIRE" in decision.reasons
+    assert decision.completion.fires is True
     assert decision.fire is False
     assert (
         "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
@@ -1931,10 +1859,10 @@ def test_decide_for_project_floor_clears_on_an_old_watermark(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
 
     assert decision.fire is True
-    assert any(r.startswith("max-interval:") and "-> FIRE" in r for r in decision.reasons)
+    assert any(r.startswith("completion:") and r.endswith("-> FIRE") for r in decision.reasons)
     assert "floor: 12.0d since session watermark (floor 5d)" in decision.reasons
 
 
@@ -1950,7 +1878,7 @@ def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_a
     _write_codebook(tmp_path)
     _write_census_state(tmp_path, **state)
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
 
     assert decision.fire is True
     assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
@@ -1969,7 +1897,7 @@ def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_
     _write_spike_codebook(tmp_path)
     _write_census_state(tmp_path, **state)
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW)
 
     assert any(
         r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
@@ -1981,44 +1909,11 @@ def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_
     )
 
 
-def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
-    _write_codebook(tmp_path)
-    _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=9)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
-        last_census_done_count=500,
-    )
-    def fetcher():  # delta 50 < 120
-        return {"statuses": _done_statuses(550)}
-
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
-
-    assert decision.fire is False
-
-
-def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
-    _write_codebook(tmp_path)
-    _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=7)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
-        last_census_done_count=500,
-    )
-    def fetcher():  # delta 130 >= 120
-        return {"statuses": _done_statuses(630)}
-
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
-
-    assert decision.fire is True
-    assert any("tasks-landed" in r for r in decision.reasons)
-
-
-def _write_spike_codebook(project_root):
+def _write_spike_codebook(project_root, today=_TODAY):
     _write_codebook(
         project_root,
         candidates=_candidates_from_dates(
-            [fs.date().isoformat() for fs in _first_seens_over_a_baseline_of_40(90)]
+            [fs.date().isoformat() for fs in _first_seens_over_a_baseline_of_40(90, today)]
         ),
     )
 
@@ -2029,7 +1924,7 @@ def test_decide_for_project_row4_novelty_spike_fires(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_landing_runner())
 
     assert decision.fire is True
     assert any(
@@ -2043,7 +1938,7 @@ def test_decide_for_project_row5_floor_blocks_novelty_spike_no_fire(tmp_path):
         tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=3)
     )
 
-    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+    decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_landing_runner())
 
     assert decision.fire is False
     assert (
@@ -2069,134 +1964,27 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
-def test_decide_for_project_survives_a_raising_compute_tasks_landed(
-    tmp_path, caplog, monkeypatch
-):
-    """`decide_for_project` must never propagate — and must degrade condition
-    (b) ALONE, keeping (a) and (c) alive.
-
-    The callee is monkeypatched to raise rather than fed a bad baseline, and
-    that is deliberate: a bad baseline no longer raises, so a state-file-driven
-    test would silently become a duplicate of the compute_tasks_landed tests
-    above and this guard would ship untested. Injecting a raising callee pins
-    the contract independently of which inner fault happens to be possible
-    today.
-
-    The stakes are in the degradation granularity. Today the whole call chain
-    is unguarded, so via the `evaluate` CLI a single fault in (b) is caught only
-    by main()'s outermost catch-all, which discards the ENTIRE evaluation — the
-    max-interval backstop that exists precisely to survive a broken (b) is taken
-    out by the same fault."""
+def test_decide_for_project_survives_a_quoted_completion_threshold(tmp_path, caplog):
+    """A quoted `completion_threshold_pct: '70'` in a hand-edited
+    legibility.yaml is rejected alone, with one config WARNING, and the
+    evaluation still decides on the default threshold."""
     _write_codebook(tmp_path)
-    _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=9)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
-        last_census_done_count=500,
-    )
-
-    def _boom(*, state, status_fetcher):
-        raise RuntimeError("baseline exploded")
-
-    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+    _write_census_state(tmp_path, **_completion_state())
+    _write_legibility_yaml(tmp_path, "census:\n  completion_threshold_pct: '70'\n")
+    runner = _passing_runner()
 
     with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(
-            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
-        )
-
-    assert isinstance(decision, ct.Decision)
-    assert decision.fire is False
-
-    # Degraded to a fail-safe None delta, NOT to a fabricated number: this is
-    # the exact line evaluate() emits for `tasks_landed=None`.
-    assert any("tasks-landed: delta unavailable" in r for r in decision.reasons)
-    # ...while conditions (a) and (c) still evaluated — the whole point of
-    # degrading (b) alone.
-    assert any("max-interval" in r for r in decision.reasons)
-    assert any("novelty-spike" in r for r in decision.reasons)
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "RuntimeError" in warnings[0].getMessage()
-    assert "baseline exploded" in warnings[0].getMessage()
-
-
-def test_decide_for_project_survives_a_quoted_max_interval_days(tmp_path, caplog):
-    """task 4085 (amendment): the end-to-end pin for the config guard, and the
-    one that shows why per-field fallback is the right degradation.
-
-    `census: {max_interval_days: '10'}` in a hand-edited legibility.yaml used
-    to reach `evaluate()`'s `days_since >= config.max_interval_days` and raise
-    `TypeError: '>=' not supported between instances of 'float' and 'str'`
-    straight out of this function -- verified live before the fix -- defeating
-    its documented never-raises contract and, via the `evaluate` CLI's
-    outermost catch-all, discarding the WHOLE evaluation.
-
-    Here the state is day-11, so with the rejected field back at its default
-    of 10 the (a) max-interval backstop still FIRES. That is the property that
-    matters: a typo in one threshold must not disarm the backstop that exists
-    precisely to survive everything else being broken."""
-    _write_codebook(tmp_path)
-    _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=11)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
-        last_census_done_count=500,
-    )
-    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
-        "census:\n  max_interval_days: '10'\n", encoding="utf-8"
-    )
-
-    with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(
-            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
-        )
+        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
 
     assert isinstance(decision, ct.Decision)
     assert decision.fire is True
-    assert any("max-interval" in r for r in decision.reasons)
+    assert f"completion: 0.9 of {_PREVIOUS_RUN} (threshold 0.70) -> FIRE" in decision.reasons
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
-    assert "max_interval_days" in message
+    assert "completion_threshold_pct" in message
     assert "str" in message
-
-
-def test_decide_for_project_bounds_a_huge_tasks_landed_failure(
-    tmp_path, caplog, monkeypatch
-):
-    """task 4085 (amendment): the guard above must keep this module's
-    one-WARNING-one-line discipline. A `StatusFetchUnavailable` chained from a
-    big get_statuses payload carries an arbitrarily large message, and this
-    WARNING lands in the nightly journal as a single line."""
-    _write_codebook(tmp_path)
-    _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=9)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
-        last_census_done_count=500,
-    )
-
-    def _boom(*, state, status_fetcher):
-        raise ct.StatusFetchUnavailable("payload " + "x" * 50_000 + "\nsecond line")
-
-    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
-
-    with caplog.at_level(logging.WARNING):
-        decision = ct.decide_for_project(
-            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
-        )
-
-    assert decision.fire is False
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
-    assert len(message) < 1000
-    assert "\n" not in message
-    assert "StatusFetchUnavailable" in message
-    assert "repr truncated" in message
 
 
 # ---------------------------------------------------------------------------
@@ -2217,28 +2005,18 @@ def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_p
 
 
 def test_cli_evaluate_fire_inducing_fixture_prints_fire_and_exits_0(tmp_path, capsys):
-    twelve_days_ago = (datetime.now(UTC) - timedelta(days=12)).strftime("%Y-%m-%d")
-    _write_codebook(
-        tmp_path,
-        entries=[
-            {
-                "id": "entry-a",
-                "title": "t",
-                "severity": "low",
-                "status": "open",
-                "origin_phase": "unknown",
-                "manifested_phase": "unknown",
-                "sightings": [_sighting(twelve_days_ago)],
-            }
-        ],
-    )
+    today = datetime.combine(datetime.now(UTC).date(), datetime.min.time(), tzinfo=UTC)
+    _write_spike_codebook(tmp_path, today=today)
 
     exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "DECISION: FIRE" in captured.out
-    assert "max-interval" in captured.out
+    assert any(
+        line.startswith("novelty-spike:") and line.endswith("-> FIRE")
+        for line in captured.out.splitlines()
+    ), captured.out
 
 
 def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys):
