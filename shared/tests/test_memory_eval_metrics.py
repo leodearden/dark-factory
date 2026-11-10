@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +25,7 @@ from shared.memory_eval_metrics import (
     MetricSeries,
     TripwireItem,
     eval_dir,
+    format_stamp,
     load_metric_series,
     load_series_window,
     metrics_artifact_path,
@@ -696,6 +697,28 @@ class TestStampDatetime:
     def test_a_misshapen_stamp_gets_the_validate_stamp_refusal(self):
         with pytest.raises(MetricSchemaError, match='%Y%m%dT%H%M%SZ'):
             stamp_datetime('2026-07-04T03:15:00Z')
+
+
+class TestFormatStamp:
+    """``format_stamp`` renders a moment in the one stamp format: ``stamp_datetime``'s forward half.
+
+    A caller that needs a stamp for a moment other than now (a test pinning a
+    future run) formats it here rather than restating the format.
+    """
+
+    def test_round_trips_through_stamp_datetime_to_the_second(self):
+        moment = datetime(2026, 7, 4, 3, 15, 42, 900_000, tzinfo=UTC)
+        stamp = format_stamp(moment)
+        assert stamp == '20260704T031542Z'
+        assert stamp_datetime(stamp) == moment.replace(microsecond=0)
+
+    def test_an_offset_moment_is_rendered_in_utc(self):
+        moment = datetime(2026, 7, 4, 5, 15, tzinfo=timezone(timedelta(hours=2)))
+        assert format_stamp(moment) == '20260704T031500Z'
+
+    def test_a_naive_moment_is_refused(self):
+        with pytest.raises(ValueError, match='timezone-aware'):
+            format_stamp(datetime(2026, 7, 4, 3, 15))
 
 
 class TestDelegatesToSharedAtomicWriter:

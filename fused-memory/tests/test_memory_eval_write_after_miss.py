@@ -32,6 +32,7 @@ from shared.memory_eval_metrics import (
     SCHEMA_VERSION,
     Corpus,
     MetricSeries,
+    format_stamp,
     load_metric_series,
     stamp_datetime,
     write_metric_series,
@@ -740,7 +741,7 @@ def _sweep_argv(root: Path) -> list[str]:
 
 
 def _stamp_an_hour_from_now() -> str:
-    return (datetime.now(UTC) + timedelta(hours=1)).strftime('%Y%m%dT%H%M%SZ')
+    return format_stamp(datetime.now(UTC) + timedelta(hours=1))
 
 
 class TestPeriodAndCli:
