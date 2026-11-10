@@ -39,6 +39,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -7708,6 +7709,148 @@ async def test_update_task_invalid_metadata_mode_always_raises(
             metadata_mode='bogus',
         )
     assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'
+
+
+# ── fieldless update_task is refused (task 4867) ──
+
+
+async def _updated_at(backend, project_root, task_id='1') -> str:
+    task = await backend.get_task(task_id, project_root=project_root)
+    return task['updatedAt']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [
+        pytest.param({}, id='nothing-at-all'),
+        pytest.param({'append': True}, id='append-only'),
+        pytest.param({'append': False}, id='append-false-only'),
+        pytest.param({'metadata_mode': 'merge'}, id='metadata_mode-only'),
+        pytest.param({'tag': 'master'}, id='tag-only'),
+        pytest.param(
+            {'append': True, 'metadata_mode': 'additive', 'tag': 'master'},
+            id='every-non-mutating-parameter',
+        ),
+    ],
+)
+async def test_update_task_with_no_mutating_field_raises_and_writes_nothing(
+    backend, project_root, ignored_arguments,
+):
+    """A call whose only arguments are non-mutating must fail loudly.
+
+    Two L2 escalations (esc-3147-7, esc-3671-7) came from a caller's
+    misnamed ``metadata`` argument being dropped: the call wrote nothing and
+    still returned ``updated: True`` after bumping ``updated_at``.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, **ignored_arguments,
+        )
+
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert exc.value.task_id == '1'
+    assert set(exc.value.accepted_fields) == {
+        'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+        'dependencies',
+    }
+    for name in exc.value.accepted_fields:
+        assert name in str(exc.value), (
+            f'the message must name every field the caller could have '
+            f'supplied; {name!r} missing from {str(exc.value)!r}'
+        )
+    after = await backend.get_task('1', project_root=project_root)
+    assert after == before, 'a refused fieldless call must not touch the row'
+
+
+@pytest.mark.asyncio
+async def test_update_task_fieldless_refusal_precedes_the_existence_lookup(
+    backend, project_root,
+):
+    """The refusal is a floor, judged before the row is read."""
+    with pytest.raises(NoFieldsToUpdateError):
+        await backend.update_task('9999', project_root=project_root)
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_floor_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """``status`` is not a mutating field here, but it names the real mistake."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(StatusWriteAuthorityError):
+        await backend.update_task('1', project_root=project_root, status='done')
+
+
+@pytest.mark.asyncio
+async def test_update_task_bad_metadata_mode_outranks_the_fieldless_refusal(
+    backend, project_root,
+):
+    """A supplied-but-wrong argument is reported before an absent one."""
+    await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, metadata_mode='bogus',
+        )
+
+    assert not isinstance(exc.value, NoFieldsToUpdateError)
+    assert 'bogus' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_dependencies_list_is_a_real_write(
+    backend, project_root,
+):
+    """``dependencies=[]`` clears the list; it is not a fieldless call."""
+    await backend.add_task(project_root=project_root, title='a')
+    await backend.add_task(project_root=project_root, title='b')
+    await backend.update_task('2', project_root=project_root, dependencies=['1'])
+    assert (await backend.get_task('2', project_root=project_root))['dependencies']
+
+    await backend.update_task('2', project_root=project_root, dependencies=[])
+
+    assert (await backend.get_task('2', project_root=project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_metadata_object_is_a_real_write(
+    backend, project_root,
+):
+    """``metadata='{}'`` is a write (the orchestrator harness can produce it)."""
+    await backend.add_task(project_root=project_root, title='t')
+    before = await _updated_at(backend, project_root)
+    await asyncio.sleep(0.01)
+
+    result = await backend.update_task('1', project_root=project_root, metadata='{}')
+
+    assert result['updated'] is True
+    assert await _updated_at(backend, project_root) != before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field',
+    [
+        {'prompt': 'p'}, {'metadata': '{"k": "v"}'}, {'title': 'new'},
+        {'description': 'd'}, {'details': 'x'}, {'priority': 'high'},
+        {'dependencies': []},
+    ],
+    ids=lambda field: next(iter(field)),
+)
+async def test_update_task_each_mutating_field_alone_is_accepted(
+    backend, project_root, field,
+):
+    await backend.add_task(project_root=project_root, title='t')
+
+    result = await backend.update_task('1', project_root=project_root, **field)
+
+    assert result['updated'] is True
 
 
 # ── write-boundary validation (task 2162, update_task post-merge I3) ──

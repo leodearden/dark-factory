@@ -776,6 +776,36 @@ async def test_update_task_status_none_still_allowed(
     task_interceptor.update_task.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [{}, {'append': True}, {'metadata_mode': 'merge'}, {'tag': 'master'}],
+    ids=['bare', 'append-only', 'metadata_mode-only', 'tag-only'],
+)
+async def test_update_task_with_no_mutating_field_returns_typed_error(
+    real_task_stack, tmp_path, ignored_arguments,
+):
+    """Task 4867: a fieldless update_task reports failure, never ``updated``.
+
+    esc-3147-7 and esc-3671-7 came from a misnamed ``metadata`` argument being
+    dropped, so the call wrote nothing and still reported success. The
+    refusal reaches callers as the same ``error_type`` dict every other raw
+    backend refusal uses, through the real tool, interceptor and backend. No
+    task is created: the refusal is a floor that precedes the row lookup.
+    """
+    server, _interceptor = real_task_stack
+
+    result = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), **ignored_arguments},
+    )
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'metadata' in result['error'], result
+    assert 'updated' not in result, result
+
+
 # ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
