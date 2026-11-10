@@ -112,6 +112,36 @@ class TestTheArms:
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
+    def test_o6_is_the_controls_instructions_on_the_stronger_model(self) -> None:
+        o6, control = mod.ARMS['o6'], mod.ARMS['control']
+        assert (o6.instructions, o6.instructions_version) == (None, mod.NO_INSTRUCTIONS)
+        assert (control.instructions, control.instructions_version) == (None, mod.NO_INSTRUCTIONS)
+        assert o6.model == mod.O6_MODEL
+        assert control.model is None and mod.ARMS['o1'].model is None
+
+    @pytest.mark.asyncio
+    async def test_the_o6_arm_splices_nothing_and_runs_on_its_model(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL)
+        result = await _replay(llm, 'o6')
+        first_line = mod.O1_INSTRUCTIONS.strip().splitlines()[0]
+        assert first_line not in llm.prompt(NODE_PROMPT)
+        assert first_line not in llm.prompt(EDGE_PROMPT)
+        assert (result.arm, result.model) == ('o6', mod.O6_MODEL)
+
+    @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_on_another_model_before_any_call(self) -> None:
+        llm = _FakeLLM(model='m-small')
+        with pytest.raises(mod.ArmModelMismatch) as raised:
+            await _replay(llm, 'o6')
+        assert all(name in str(raised.value) for name in ('o6', mod.O6_MODEL, 'm-small'))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm', ['control', 'o1'])
+    async def test_an_arm_naming_no_model_takes_any_client(self, arm: str) -> None:
+        result = await _replay(_FakeLLM(model='m-anything'), arm)
+        assert result.model == 'm-anything'
+
 
 class TestTheEpisodeContext:
     @pytest.mark.asyncio
@@ -378,11 +408,39 @@ def _replay_argv(paths: dict[str, Path], *arms: str) -> list[str]:
     return argv
 
 
-def _run_replay(paths: dict[str, Path], llm: _FakeLLM, *arms: str) -> int:
+def _run_replay_on(paths: dict[str, Path], factory: Any, *arms: str) -> int:
     return mod.run(
-        _replay_argv(paths, *arms), llm_factory=lambda model: llm,
+        _replay_argv(paths, *arms), llm_factory=factory,
         reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()),
     )
+
+
+def _run_replay(paths: dict[str, Path], llm: _FakeLLM, *arms: str) -> int:
+    return _run_replay_on(paths, lambda model: llm, *arms)
+
+
+CONFIGURED = 'm-configured'
+
+
+class _ClientsByModel:
+    """An llm_factory building one _CountingLLM per model it is asked for; None is the configured model."""
+
+    def __init__(
+        self, *, unavailable: frozenset[str | None] = frozenset(),
+        edges: dict[str | None, tuple[tuple[str, str, str], ...]] | None = None,
+    ) -> None:
+        self.unavailable = unavailable
+        self.edges = edges or {}
+        self.asked: list[str | None] = []
+        self.clients: dict[str | None, _CountingLLM] = {}
+
+    def __call__(self, model: str | None) -> _CountingLLM | None:
+        self.asked.append(model)
+        if model in self.unavailable:
+            return None
+        extra = {'edges': self.edges[model]} if model in self.edges else {}
+        self.clients[model] = _CountingLLM(model=model or CONFIGURED, **extra)
+        return self.clients[model]
 
 
 def _records(path: Path) -> list[dict[str, Any]]:
@@ -460,18 +518,33 @@ class TestReplayCommand:
                        reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
         assert code == 1 and not paths['replay'].exists()
 
-    def test_the_model_axis_reaches_the_factory(self, tmp_path: Path) -> None:
+    def test_each_arm_model_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        asked: list[str | None] = []
+        factory = _ClientsByModel()
+        assert _run_replay_on(paths, factory, 'control', 'o6') == 0
+        assert factory.asked == [None, mod.O6_MODEL]
+        records = _records(paths['replay'])
+        assert sorted((r['arm'], r['uuid']) for r in records) == sorted(
+            (arm, row['uuid']) for arm in ('control', 'o6') for row in CLI_ROWS
+        )
+        assert {r['model'] for r in records if r['arm'] == 'control'} == {CONFIGURED}
+        assert {r['model'] for r in records if r['arm'] == 'o6'} == {mod.O6_MODEL}
 
-        def factory(model: str | None) -> _FakeLLM:
-            asked.append(model)
-            return _CountingLLM(model=model or 'configured')
+    def test_a_resume_adds_the_o6_arm_beside_a_recorded_control(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByModel(), 'control') == 0
+        second = _ClientsByModel()
+        assert _run_replay_on(paths, second, 'control', 'o6') == 0
+        assert second.clients[None].calls == []
+        assert sorted(second.clients[mod.O6_MODEL].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
+        assert len(_records(paths['replay'])) == 6
 
-        code = mod.run([*_replay_argv(paths, 'control'), '--model', 'm-strong'], llm_factory=factory,
-                       reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
-        assert code == 0 and asked == ['m-strong']
-        assert {r['model'] for r in _records(paths['replay'])} == {'m-strong'}
+    def test_an_arm_model_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        factory = _ClientsByModel(unavailable=frozenset({mod.O6_MODEL}))
+        assert _run_replay_on(paths, factory, 'control', 'o6') == 1
+        assert not paths['replay'].exists()
+        assert all(client.calls == [] for client in factory.clients.values())
 
     def test_a_second_model_for_a_recorded_arm_exits_2(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
@@ -775,3 +848,59 @@ class TestScoreFailsClosed:
         verdicts = _score_verdicts(records, labels)
         verdicts['sample'] = audit.SampleDefinition(cap=20).to_dict()
         self._assert_rejected(tmp_path, records, verdicts)
+
+
+# --------------------------------------------------------------------------- #
+# One replay file, one blind worksheet and one score across arm models
+# --------------------------------------------------------------------------- #
+
+CLI_SCORE_BASELINE = {
+    'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
+               REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
+    'sample': CLI_BASELINE['sample'] | {'window_days': 2.0},
+    'adjudicated': {'population_weighted': {'overreach_rate_minted': BASELINE_OVERREACH}},
+}
+OVERREACHING_FACT = 'Beta overrides Alpha'
+CONFIGURED_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'), ('Beta', 'Alpha', OVERREACHING_FACT))
+O6_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'),)
+
+
+class TestOneReplayAcrossArmModels:
+    def _replayed(self, tmp_path: Path) -> dict[str, Path]:
+        paths = _cli_inputs(tmp_path, baseline=CLI_SCORE_BASELINE)
+        assert _run_replay_on(paths, _ClientsByModel(edges={None: CONFIGURED_EDGES, mod.O6_MODEL: O6_EDGES}), 'control', 'o6') == 0
+        return paths
+
+    def test_the_worksheet_interleaves_both_models_edges_naming_no_arm(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        records = _records(paths['replay'])
+        for row in _records(paths['blind']):
+            replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
+            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == 3
+            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
+            assert hashes == sorted(hashes)
+            assert not {'arm', 'model'} & (row.keys() | {key for m in row['minted'] for key in m})
+        text = paths['blind'].read_text()
+        assert mod.O6_MODEL not in text and CONFIGURED not in text
+
+    def test_the_score_judges_o6_against_the_same_files_control(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        records = _records(paths['replay'])
+        labels = {
+            (r['graph'], m['edge_uuid']): 'overreach' if m['fact'] == OVERREACHING_FACT else 'holding'
+            for r in records for m in r['minted']
+        }
+        verdict_file, out = tmp_path / 'verdicts.json', tmp_path / 'out' / 'report.json'
+        verdict_file.write_text(json.dumps(_score_verdicts(records, labels)))
+        assert mod.run(['score', '--replay', str(paths['replay']), '--verdicts', str(verdict_file),
+                        '--baseline-report', str(paths['baseline']), '--out', str(out)]) == 0
+        report = json.loads(out.read_text())
+        control, o6 = report['arms']['control'], report['arms']['o6']
+        assert (control['model'], o6['model']) == (CONFIGURED, mod.O6_MODEL)
+        assert o6['instructions_version'] == mod.NO_INSTRUCTIONS
+        assert o6['population_weighted']['overreach_rate_minted']['rate'] == 0.0
+        assert control['population_weighted']['overreach_rate_minted']['rate'] == 0.5
+        assert report['comparison']['o6'] == mod.lever_decision(
+            control['population_weighted'], o6['population_weighted'],
+        )
