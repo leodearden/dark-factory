@@ -526,3 +526,252 @@ class TestWorksheetCommand:
         assert _run_replay(paths, _CountingLLM(failing=frozenset({'ep-b'})), 'control') == 1
         assert mod.run(_worksheet_argv(paths)) == 2
         assert not paths['blind'].exists()
+
+
+# --------------------------------------------------------------------------- #
+# The score: each arm at the 4716 cell weights, the O1 decision, fidelity
+# --------------------------------------------------------------------------- #
+
+audit = load_script_module(SCRIPTS / 'audit_ruling_overreach.py', mod_name='audit_ruling_overreach')
+
+DF, REIFY = 'dark_factory', 'reify'
+RULING, OTHER = 'ruling_lexeme', 'other_decisions'
+SCORE_EPISODES = ((DF, 'A1', RULING), (DF, 'A2', RULING), (REIFY, 'B1', OTHER), (REIFY, 'B2', OTHER))
+"""Window populations 20 and 4 over two sampled episodes each: cell weights 10 and 2, over 2 days."""
+
+BASELINE_OVERREACH = {'rate': 0.1238, 'ci': [0.0876, 0.1721], 'effective_n': 234.8}
+
+PASSING = {
+    'control': {DF: ('overreach', 'overreach', 'holding', 'holding', 'context'),
+                REIFY: ('overreach', 'holding', 'holding', 'holding', 'context')},
+    'o1': {DF: ('holding', 'holding', 'context', 'context', 'bookkeeping'),
+           REIFY: ('holding', 'holding', 'holding', 'context', 'bookkeeping')},
+}
+DILUTING_O1 = {DF: ('overreach',) * 2 + ('holding',) * 4 + ('context',) * 6,
+               REIFY: ('overreach',) + ('holding',) * 6 + ('context',) * 5}
+"""Under half the control's overreach per minted edge, but as much per day: it only mints more."""
+HOLDING_LOSING_O1 = {DF: ('holding',) + ('context',) * 3 + ('bookkeeping',),
+                     REIFY: ('holding',) * 2 + ('context',) * 2 + ('bookkeeping',)}
+
+ENTITIES = ('Alpha', 'Beta', 'Gamma', 'Delta')
+O1_ENTITIES_OF_A1 = ('alpha', '  BETA ', 'Epsilon')
+TOKENS = {'control': {'extract_nodes': (100, 10, 1), 'extract_edges': (300, 40, 1)},
+          'o1': {'extract_nodes': (150, 10, 1), 'extract_edges': (350, 40, 2)}}
+
+
+def _score_baseline(overreach: dict[str, Any] = BASELINE_OVERREACH) -> dict[str, Any]:
+    cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
+    return {
+        'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
+                   REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
+        'sample': {'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}}, 'window_days': 2.0},
+        'adjudicated': {'population_weighted': {'overreach_rate_minted': overreach}},
+    }
+
+
+def _score_records(
+    labels_by_arm: dict[str, dict[str, tuple[str, ...]]],
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str]]:
+    records, labels = [], {}
+    for arm, by_graph in labels_by_arm.items():
+        for graph, uuid, stratum in SCORE_EPISODES:
+            minted = []
+            for index, label in enumerate(by_graph[graph]):
+                edge_uuid = f'{arm}-{uuid}-{index}'
+                minted.append({'edge_uuid': edge_uuid, 'fact': f'fact {edge_uuid}',
+                               'source_name': 'S', 'target_name': 'T'})
+                labels[(graph, edge_uuid)] = label
+            entities = O1_ENTITIES_OF_A1 if (arm, uuid) == ('o1', 'A1') else ENTITIES
+            records.append({
+                'kind': 'replayed', 'arm': arm, 'model': 'gpt-4o-mini',
+                'instructions_version': mod.ARMS[arm].instructions_version,
+                'graph': graph, 'uuid': uuid, 'stratum': stratum, 'previous_count': 10,
+                'entities': list(entities), 'minted': minted,
+                'tokens': {stage: {'input_tokens': i, 'output_tokens': o, 'llm_calls': c}
+                           for stage, (i, o, c) in TOKENS[arm].items()},
+            })
+    return records, labels
+
+
+def _score_verdicts(records: list[dict[str, Any]], labels: dict[tuple[str, str], str]) -> dict[str, Any]:
+    return {
+        'sample': audit.SampleDefinition().to_dict(),
+        'verdicts': [
+            {'graph': r['graph'], 'episode_uuid': r['uuid'], 'edge_uuid': m['edge_uuid'],
+             'fact': m['fact'], 'label': labels[(r['graph'], m['edge_uuid'])],
+             'rationale': f"the span behind {m['edge_uuid']}"}
+            for r in records for m in r['minted']
+        ],
+    }
+
+
+def _run_score(
+    tmp_path: Path, records: list[dict[str, Any]], verdicts: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+) -> tuple[int, Path]:
+    replay, verdict_file = tmp_path / 'replay.jsonl', tmp_path / 'verdicts.json'
+    baseline_file, out = tmp_path / 'report-4716.json', tmp_path / 'out' / 'report.json'
+    replay.write_text(''.join(json.dumps(record) + '\n' for record in records))
+    verdict_file.write_text(json.dumps(verdicts))
+    baseline_file.write_text(json.dumps(baseline or _score_baseline()))
+    code = mod.run(['score', '--replay', str(replay), '--verdicts', str(verdict_file),
+                    '--baseline-report', str(baseline_file), '--out', str(out)])
+    return code, out
+
+
+def _scored(
+    tmp_path: Path, labels_by_arm: dict[str, dict[str, tuple[str, ...]]] = PASSING,
+    baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    records, labels = _score_records(labels_by_arm)
+    code, out = _run_score(tmp_path, records, _score_verdicts(records, labels), baseline)
+    assert code == 0
+    return json.loads(out.read_text())
+
+
+class TestOneCopyOfTheEstimators:
+    def test_validation_and_weighting_are_the_audits_own(self) -> None:
+        assert mod.load_verdicts is audit.load_verdicts
+        assert mod.adjudicated_rates is audit.adjudicated_rates
+        assert mod.population_weighted_rates is audit.population_weighted_rates
+        assert mod.weighted_rate is audit.weighted_rate
+
+
+class TestScorePerArm:
+    def test_overreach_is_weighted_by_the_baseline_cells(self, tmp_path: Path) -> None:
+        weighted = _scored(tmp_path)['arms']['control']['population_weighted']
+        assert weighted['overreach_rate_minted'] == audit.weighted_rate([(10.0, 4, 10), (2.0, 2, 10)])
+        assert weighted['overreach_rate_minted']['rate'] == 0.3667
+        assert (weighted['overreach_per_day'], weighted['minted_per_day']) == (22.0, 60.0)
+        assert weighted['weights'] == {DF: {RULING: 10.0}, REIFY: {OTHER: 2.0}}
+
+    def test_an_arm_without_overreach_rates_zero(self, tmp_path: Path) -> None:
+        weighted = _scored(tmp_path)['arms']['o1']['population_weighted']
+        assert weighted['overreach_rate_minted']['rate'] == 0.0
+        assert (weighted['overreach_per_day'], weighted['minted_per_day']) == (0.0, 60.0)
+
+    def test_holding_share_and_holdings_per_day_are_weighted_too(self, tmp_path: Path) -> None:
+        weighted = _scored(tmp_path)['arms']['control']['population_weighted']
+        assert weighted['holding_share'] == audit.weighted_rate([(10.0, 4, 10), (2.0, 6, 10)])
+        assert weighted['holding_share']['rate'] == 0.4333
+        assert weighted['holdings_per_day'] == 26.0
+
+    def test_unweighted_label_counts(self, tmp_path: Path) -> None:
+        rates = _scored(tmp_path)['arms']['control']['rates']
+        assert rates['all']['label_counts'] == {
+            'holding': 10, 'bookkeeping': 0, 'context': 4, 'overreach': 6, 'misbound': 0, 'unjudgeable': 0,
+        }
+        assert rates[RULING]['label_counts']['overreach'] == 4
+
+    def test_measures_with_no_meaning_for_a_replayed_edge_are_left_out(self, tmp_path: Path) -> None:
+        rates = _scored(tmp_path)['arms']['control']['rates']
+        assert set(rates['all']) == {
+            'label_counts', 'overreach_rate_minted', 'overreach_rate_substantive',
+            'episode_hit_rate', 'holding_share', 'misbound_count',
+        }
+
+    def test_entities_per_episode_and_overlap_with_the_control(self, tmp_path: Path) -> None:
+        arms = _scored(tmp_path)['arms']
+        assert arms['control']['entities'] == {'mean_per_episode': 4.0, 'mean_share_of_control': 1.0}
+        assert arms['o1']['entities'] == {'mean_per_episode': 3.75, 'mean_share_of_control': 0.875}
+
+    def test_tokens_are_totalled_per_prompt(self, tmp_path: Path) -> None:
+        arms = _scored(tmp_path)['arms']
+        assert arms['control']['tokens'] == {
+            'extract_nodes': {'input_tokens': 400, 'output_tokens': 40, 'llm_calls': 4},
+            'extract_edges': {'input_tokens': 1200, 'output_tokens': 160, 'llm_calls': 4},
+        }
+        assert arms['o1']['tokens']['extract_edges'] == {'input_tokens': 1400, 'output_tokens': 160, 'llm_calls': 8}
+
+    def test_each_arm_names_its_model_and_instructions(self, tmp_path: Path) -> None:
+        arms = _scored(tmp_path)['arms']
+        assert (arms['o1']['model'], arms['o1']['instructions_version']) == ('gpt-4o-mini', mod.O1_INSTRUCTIONS_VERSION)
+        assert (arms['o1']['episodes'], arms['o1']['minted']) == (4, 20)
+
+
+class TestTheO1Decision:
+    def test_the_bars_are_pre_registered(self) -> None:
+        assert (mod.OVERREACH_RATIO_MAX, mod.HOLDING_RETENTION_MIN) == (0.5, 0.8)
+
+    def test_o1_passes_when_it_halves_overreach_and_keeps_its_holdings(self, tmp_path: Path) -> None:
+        decision = _scored(tmp_path)['comparison']['o1']
+        assert decision['checks'] == {
+            'halves_overreach_per_minted': True, 'halves_overreach_per_day': True,
+            'upper_bound_below_control_point': True, 'retains_holdings': True,
+        }
+        assert decision['passes'] is True
+        assert (decision['overreach_ratio_minted'], decision['overreach_ratio_per_day'],
+                decision['holding_retention']) == (0.0, 0.0, 1.0)
+
+    def test_o1_fails_when_it_only_dilutes_overreach_by_minting_more(self, tmp_path: Path) -> None:
+        decision = _scored(tmp_path, PASSING | {'o1': DILUTING_O1})['comparison']['o1']
+        assert decision['checks'] == {
+            'halves_overreach_per_minted': True, 'halves_overreach_per_day': False,
+            'upper_bound_below_control_point': True, 'retains_holdings': True,
+        }
+        assert decision['passes'] is False
+
+    def test_o1_fails_when_it_loses_holdings(self, tmp_path: Path) -> None:
+        decision = _scored(tmp_path, PASSING | {'o1': HOLDING_LOSING_O1})['comparison']['o1']
+        assert decision['checks'] == {
+            'halves_overreach_per_minted': True, 'halves_overreach_per_day': True,
+            'upper_bound_below_control_point': True, 'retains_holdings': False,
+        }
+        assert decision['passes'] is False
+        assert decision['holding_retention'] == round(14.0 / 26.0, 4)
+
+    def test_the_comparison_states_its_bars(self, tmp_path: Path) -> None:
+        decision = _scored(tmp_path)['comparison']['o1']
+        assert decision['bars'] == {'overreach_ratio_max': 0.5, 'holding_retention_min': 0.8}
+
+
+class TestFidelity:
+    def test_the_baseline_interval_is_reported_beside_the_controls(self, tmp_path: Path) -> None:
+        report = _scored(tmp_path)
+        fidelity = report['fidelity']
+        assert fidelity['baseline'] == {'rate': 0.1238, 'ci': [0.0876, 0.1721]}
+        control = report['arms']['control']['population_weighted']['overreach_rate_minted']
+        assert fidelity['control'] == {'rate': control['rate'], 'ci': control['ci']}
+
+    @pytest.mark.parametrize(('baseline_ci', 'overlap'), [([0.30, 0.40], True), ([0.85, 0.95], False)])
+    def test_whether_the_intervals_overlap(self, tmp_path: Path, baseline_ci: list[float], overlap: bool) -> None:
+        baseline = _score_baseline({'rate': sum(baseline_ci) / 2, 'ci': baseline_ci, 'effective_n': 100.0})
+        assert _scored(tmp_path, baseline=baseline)['fidelity']['intervals_overlap'] is overlap
+
+
+class TestScoreFailsClosed:
+    def _assert_rejected(self, tmp_path: Path, records: list[dict[str, Any]], verdicts: dict[str, Any]) -> None:
+        code, out = _run_score(tmp_path, records, verdicts)
+        assert code == 2
+        assert not out.exists() and not out.parent.exists()
+
+    def test_a_replayed_edge_without_a_verdict(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        verdicts = _score_verdicts(records, labels)
+        verdicts['verdicts'] = verdicts['verdicts'][1:]
+        self._assert_rejected(tmp_path, records, verdicts)
+
+    def test_a_verdict_on_an_edge_no_arm_minted(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        verdicts = _score_verdicts(records, labels)
+        verdicts['verdicts'].append({'graph': DF, 'episode_uuid': 'A1', 'edge_uuid': 'ghost', 'fact': 'f',
+                                     'label': 'holding', 'rationale': 'a span'})
+        self._assert_rejected(tmp_path, records, verdicts)
+
+    def test_an_arm_missing_an_episode(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        short = [r for r in records if (r['arm'], r['uuid']) != ('o1', 'B2')]
+        self._assert_rejected(tmp_path, short, _score_verdicts(short, labels))
+
+    def test_a_replay_holding_a_failure_line(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        failed = {'kind': 'failed', 'arm': 'o1', 'model': 'gpt-4o-mini', 'graph': REIFY, 'uuid': 'B2',
+                  'stratum': OTHER, 'error_type': 'RuntimeError', 'error': 'provider down'}
+        kept = [r for r in records if (r['arm'], r['uuid']) != ('o1', 'B2')]
+        self._assert_rejected(tmp_path, [*kept, failed], _score_verdicts(kept, labels))
+
+    def test_a_verdict_file_adjudicated_under_another_sample(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        verdicts = _score_verdicts(records, labels)
+        verdicts['sample'] = audit.SampleDefinition(cap=20).to_dict()
+        self._assert_rejected(tmp_path, records, verdicts)
