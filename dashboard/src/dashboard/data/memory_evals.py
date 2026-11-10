@@ -48,8 +48,8 @@ is a list); semantic M1 rules such as a proportion outside [0,1] still pass
 through verbatim with no issue.
 
 The same rule governs the reader's INDEXES.  Every ``{key: record}`` build here
-(metrics by ``metric_id``, verdicts by ``(eval_id, metric_id)``, escalations by
-``dedupe_fingerprint``) would silently keep whichever record came last on a key
+(metrics by ``metric_id``, verdicts by ``(eval_id, metric_id, item)``,
+escalations by ``dedupe_fingerprint``) would silently keep whichever record came last on a key
 collision, so each one instead keeps the FIRST and names the drop
 (``duplicate_*``).  A dropped escalation is the sharpest case: last-wins would
 make the loser invisible everywhere in the payload — no row link and no
@@ -145,7 +145,7 @@ _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 _KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
 
 # The closed parity vocabulary — every value ``_parity`` can emit, plus the
-# ``storm_collapsed`` state ``_build_eval`` short-circuits to.  PUBLIC on
+# ``storm_collapsed`` state ``_verdict_row_fields`` short-circuits to.  PUBLIC on
 # purpose: it is the single source of truth the dashboard tab (task 3216) and
 # the parity gate (task 3217) should assert against, rather than each
 # hardcoding a subset that rots silently the moment a state is added here.
@@ -318,6 +318,10 @@ _MAX_DISCARDED_VALUE_REPR = 120
 # and `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded`.
 _MAX_EVAL_ID_LENGTH = 255
 
+# ``(eval_id, metric_id) -> {item -> entry}``; a window metric's entry has no
+# ``item`` and is keyed ``None``.
+_VerdictIndex = dict[tuple[str, str], dict[str | None, dict[str, Any]]]
+
 
 def _load_json(path: Path) -> Any:
     """Parse *path*, or raise for the caller's narrow handler to record."""
@@ -357,6 +361,12 @@ def _short_repr(value: Any) -> str:
     if len(text) <= _MAX_DISCARDED_VALUE_REPR:
         return text
     return text[:_MAX_DISCARDED_VALUE_REPR] + '…'
+
+
+def _verdict_identity(metric_id: Any, item: Any) -> str:
+    """How an issue detail names one verdict entry: its metric, then its item when it has one."""
+    named = f'metric {_short_repr(metric_id)}'
+    return named if item is None else f'{named} item {_short_repr(item)}'
 
 
 def _read_limits(
@@ -548,8 +558,12 @@ def _read_verdicts(
     root: Path,
     eval_dirs: list[Path],
     issues: list[dict[str, Any]],
-) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any] | None]:
-    """Index the ROOT verdicts artifact by ``(eval_id, metric_id)``.
+) -> tuple[_VerdictIndex, dict[str, Any] | None]:
+    """Index the ROOT verdicts artifact by ``(eval_id, metric_id, item)``.
+
+    That triple is the fingerprint identity, so a tripwire contributes one
+    entry per item; see ``shared/tests/fixtures/memory_eval_verdicts/README.md``
+    §"Entry granularity".
 
     Root-scoped, not per-eval: ``docs/prds/memory-eval-program.md`` pins
     ``fused-memory/data/memory-evals/verdicts-<STAMP>.json``, and the
@@ -566,8 +580,9 @@ def _read_verdicts(
     body that parses but is not an object — or is an object whose ``entries``
     is absent or not a list — is ``malformed_verdicts``, an individual
     non-object element is ``malformed_verdict_entry``, and elements that ARE
-    objects but carry no usable ``(eval_id, metric_id)`` pair are counted into
-    one ``unidentified_verdicts``.  The ``entries`` paths matter most: a
+    objects but carry no usable ``(eval_id, metric_id)`` pair, or an ``item``
+    that is present but not a non-empty string, are counted into one
+    ``unidentified_verdicts``.  The ``entries`` paths matter most: a
     discarded verdicts body leaves every row's verdict absent, which is
     indistinguishable from a healthy no-alarm tree unless the discard is
     recorded — and the record-level form is the same confusion one row at a
@@ -653,7 +668,7 @@ def _read_verdicts(
         )
         entries = []
 
-    index: dict[tuple[str, str], dict[str, Any]] = {}
+    index: _VerdictIndex = {}
     unkeyable = 0
     overlong_eval_id = 0
     for entry in entries:
@@ -668,10 +683,12 @@ def _read_verdicts(
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
+        item = entry.get('item')
         eval_id_overlong = isinstance(eval_id, str) and len(eval_id) > _MAX_EVAL_ID_LENGTH
         if (
             not isinstance(eval_id, str) or not isinstance(metric_id, str)
             or not eval_id or not metric_id
+            or not (item is None or (isinstance(item, str) and item))
             or eval_id_overlong
         ):
             # An object, but one that can never be keyed onto a row.  Dropping
@@ -688,17 +705,21 @@ def _read_verdicts(
             else:
                 unkeyable += 1
         else:
-            key = (eval_id, metric_id)
-            if key in index:
-                # Two judgements of one metric in one run: last-wins would pick
-                # the row's verdict AND its fingerprint (hence its escalation
-                # link) by array order alone.  First wins, and the drop is named.
+            items = index.setdefault((eval_id, metric_id), {})
+            if item in items:
+                # Two judgements of one fingerprint identity in one run:
+                # last-wins would pick the row's verdict AND its fingerprint
+                # (hence its escalation link) by array order alone.  First
+                # wins, and the drop is named.
                 _issue(
                     issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
-                    detail=f'metric {_short_repr(metric_id)} has more than one verdict entry; the first is used',
+                    detail=(
+                        f'{_verdict_identity(metric_id, item)} has more than one verdict '
+                        'entry; the first is used'
+                    ),
                 )
                 continue
-            index[key] = entry
+            items[item] = entry
     if unkeyable or overlong_eval_id:
         # Counted once per file rather than one issue apiece, mirroring
         # `_by_metric_id`: a systematically broken artifact should cost one row
@@ -707,10 +728,12 @@ def _read_verdicts(
             issues, 'unidentified_verdicts', path=path,
             detail=(
                 f'{unkeyable} verdict entr(ies) carry no usable "eval_id"/"metric_id" pair '
-                f'(absent, empty, or not a string) and {overlong_eval_id} carry an "eval_id" '
-                f'longer than {_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
+                '(absent, empty, or not a string) or carry an "item" that is not a non-empty '
+                f'string, and {overlong_eval_id} carry an "eval_id" longer than '
+                f'{_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
             ),
         )
+    _name_shared_fingerprints(index, path, issues)
 
     # Run-scoped, which is why it lives beside the entries rather than inside
     # them.  Surfaced only while TRIGGERED — an untriggered block is the
@@ -719,6 +742,35 @@ def _read_verdicts(
     if not isinstance(storm, dict) or not storm.get('triggered'):
         storm = None
     return index, storm
+
+
+def _name_shared_fingerprints(index: _VerdictIndex, path: Path, issues: list[dict[str, Any]]) -> None:
+    """Name every indexed verdict entry whose fingerprint an earlier one already carries.
+
+    A fingerprint names one ``(eval_id, metric_id, item)`` identity and the
+    escalation join is whole-string equality on it, so two entries sharing one
+    would both claim the same escalation.  ``_verdict_row_fields`` links it to
+    the first row that claims it; this makes the sharing itself visible.
+    """
+    holders: dict[str, tuple[str, str, str | None]] = {}
+    for (eval_id, metric_id), items in index.items():
+        for item, entry in items.items():
+            fingerprint = entry.get('fingerprint')
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            holder = holders.setdefault(fingerprint, (eval_id, metric_id, item))
+            if holder == (eval_id, metric_id, item):
+                continue
+            held_eval_id, held_metric_id, held_item = holder
+            _issue(
+                issues, 'duplicate_verdict_fingerprint', eval_id=eval_id, path=path,
+                detail=(
+                    f'{_verdict_identity(metric_id, item)} carries fingerprint {_short_repr(fingerprint)}, '
+                    f'as does {_verdict_identity(held_metric_id, held_item)} in eval '
+                    f'{_short_repr(held_eval_id)}; an escalation carrying it links only whichever '
+                    'of their rows comes first in the payload'
+                ),
+            )
 
 
 def _escalation_projection(escalation: Escalation) -> dict[str, Any]:
@@ -943,7 +995,8 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
 
     Reachability of ``unjudged_open``, which is not obvious: the row-level join
     only runs when the verdict ENTRY carries a fingerprint (see
-    ``_build_eval``), so a metric with NO entry at all can never link.  The
+    ``_verdict_row_fields``), so a row no ``(eval_id, metric_id, item)`` entry
+    names can never link.  The
     linked variant is reached only by an entry that has a ``fingerprint`` and
     no ``verdict`` field — exactly the case that used to claim a recovery that
     never happened.  The function stays total over both axes anyway, so no
@@ -956,10 +1009,112 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
     return f'{verdict_class}_open' if escalation else verdict_class
 
 
+def _item_order(item: str | None) -> tuple[bool, str]:
+    """Row order within one metric: the item-less (window) entry, then items lexically."""
+    return item is not None, item or ''
+
+
+def _verdict_row_fields(
+    entry: dict[str, Any] | None,
+    metric_id: str,
+    eval_dir: Path,
+    issues: list[dict[str, Any]],
+    escalation_index: dict[str, Escalation],
+    linked_fingerprints: set[str],
+    storm_suppressed: set[str],
+    storm: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The verdict half of one metric row: *entry*'s fields, its escalation link and its parity.
+
+    The fields are passed through UNMAPPED from the sole verdict source.  Their
+    ``value`` is what the evaluator judged, while the row's ``current_value``
+    is what the metrics artifact says: two sources, two fields, never
+    conflated.
+    """
+    # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
+    # dict makes every verdict field read as None below without a second
+    # code path.
+    judged: dict[str, Any] = entry or {}
+
+    # The join, in full: whole-string equality on the fingerprint.  It is
+    # NOT gated on the verdict — a metric that has recovered while its
+    # escalation is still open is a real transient state (the watcher has
+    # not closed it yet), and hiding the link there would make the
+    # escalation look orphaned in exactly the window an operator is most
+    # likely to be looking at it.
+    #
+    # While a storm is triggered the runner files ONE aggregate escalation
+    # instead of N per-metric ones, so per-metric links are suppressed
+    # here.  Showing them would invent links that were never filed.
+    #
+    # Suppressed is NOT unexplained: a per-metric escalation from an
+    # earlier run stays open while this run's storm collapses, and it must
+    # not then be reported as an escalation nothing accounts for.  The row
+    # renders no link; the fingerprint is recorded so
+    # ``unmatched_escalations`` can say WHY.
+    #
+    # A fingerprint links at most one row, the first to claim it, so an
+    # escalation keeps exactly one home even when two entries share its
+    # fingerprint (named by ``_name_shared_fingerprints``).
+    fingerprint = judged.get('fingerprint')
+    matched: Escalation | None = None
+    if isinstance(fingerprint, str) and fingerprint:
+        if storm is None:
+            matched = None if fingerprint in linked_fingerprints else escalation_index.get(fingerprint)
+            if matched is not None:
+                linked_fingerprints.add(fingerprint)
+        elif fingerprint in escalation_index:
+            storm_suppressed.add(fingerprint)
+    escalation = _escalation_projection(matched) if matched is not None else None
+
+    # Classified ONCE and reused for both the parity badge and the
+    # unrenderable-value check below, so the membership rule lives in
+    # exactly one place.
+    verdict = judged.get('verdict')
+    verdict_class = _verdict_class(verdict)
+    if verdict_class == 'unknown_verdict':
+        # A verdict outside the closed M2 set has no badge, so it is named
+        # rather than folded into the healthy label — the same standing as
+        # ``unknown_kind`` (no chart primitive) and
+        # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
+        # verdict is deliberately NOT named: "nothing judged this metric"
+        # is a legitimate state the payload already models as ``unjudged``
+        # parity, and at the artifact level as
+        # ``missing_verdicts``/``orphan_verdict``.
+        #
+        # ``eval_dir.parent`` IS the memory-evals root, which is where
+        # ``_read_verdicts`` locates the sole verdicts artifact — this
+        # value came out of that file, not out of the eval's own dir.
+        _issue(
+            issues, 'unknown_verdict', eval_id=eval_dir.name,
+            path=eval_dir.parent / 'verdicts-current.json',
+            detail=(
+                f'{_verdict_identity(metric_id, judged.get("item"))} has verdict '
+                f'{_short_repr(verdict)}, which is outside the M2 vocabulary and has no parity badge'
+            ),
+        )
+
+    return {
+        'verdict': verdict,
+        'verdict_detail': judged.get('detail'),
+        'value': judged.get('value'),
+        'item': judged.get('item'),
+        'limit_ref': judged.get('limit_ref'),
+        'fingerprint': fingerprint,
+        'run_stamp': judged.get('run_stamp'),
+        'escalation': escalation,
+        'parity': (
+            'storm_collapsed'
+            if storm is not None and verdict == 'alarm'
+            else _parity(verdict_class, escalation)
+        ),
+    }
+
+
 def _build_eval(
     eval_dir: Path,
     issues: list[dict[str, Any]],
-    verdict_index: dict[tuple[str, str], dict[str, Any]],
+    verdict_index: _VerdictIndex,
     consumed: set[tuple[str, str]],
     escalation_index: dict[str, Escalation],
     linked_fingerprints: set[str],
@@ -974,6 +1129,9 @@ def _build_eval(
     because the stamp is a zero-padded UTC string) — so the dashboard never
     invents a second ordering rule.  The x-axis label for each run is the
     artifact's in-body ``run_stamp``.
+
+    Each verdict entry gets its own row, so a tripwire's items are rows that
+    repeat the metric-level fields, each with its own ``trend`` object.
     """
     eval_id = eval_dir.name
     all_paths = sorted(eval_dir.glob('metrics-*.json'))
@@ -1139,97 +1297,28 @@ def _build_eval(
                     ),
                 )
 
-        # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
-        # dict makes every verdict field read as None below without a second
-        # code path.
-        entry = verdict_index.get((eval_id, metric_id))
-        if entry is not None:
+        entries = verdict_index.get((eval_id, metric_id), {})
+        if entries:
             consumed.add((eval_id, metric_id))
-        judged: dict[str, Any] = entry or {}
-
-        # The join, in full: whole-string equality on the fingerprint.  It is
-        # NOT gated on the verdict — a metric that has recovered while its
-        # escalation is still open is a real transient state (the watcher has
-        # not closed it yet), and hiding the link there would make the
-        # escalation look orphaned in exactly the window an operator is most
-        # likely to be looking at it.
-        #
-        # While a storm is triggered the runner files ONE aggregate escalation
-        # instead of N per-metric ones, so per-metric links are suppressed
-        # here.  Showing them would invent links that were never filed.
-        #
-        # Suppressed is NOT unexplained: a per-metric escalation from an
-        # earlier run stays open while this run's storm collapses, and it must
-        # not then be reported as an escalation nothing accounts for.  The row
-        # renders no link; the fingerprint is recorded so
-        # ``unmatched_escalations`` can say WHY.
-        fingerprint = judged.get('fingerprint')
-        matched: Escalation | None = None
-        if isinstance(fingerprint, str) and fingerprint:
-            if storm is None:
-                matched = escalation_index.get(fingerprint)
-                if matched is not None:
-                    linked_fingerprints.add(fingerprint)
-            elif fingerprint in escalation_index:
-                storm_suppressed.add(fingerprint)
-        escalation = _escalation_projection(matched) if matched is not None else None
-
-        # Classified ONCE and reused for both the parity badge and the
-        # unrenderable-value check below, so the membership rule lives in
-        # exactly one place.
-        verdict = judged.get('verdict')
-        verdict_class = _verdict_class(verdict)
-        if verdict_class == 'unknown_verdict':
-            # A verdict outside the closed M2 set has no badge, so it is named
-            # rather than folded into the healthy label — the same standing as
-            # ``unknown_kind`` (no chart primitive) and
-            # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
-            # verdict is deliberately NOT named: "nothing judged this metric"
-            # is a legitimate state the payload already models as ``unjudged``
-            # parity, and at the artifact level as
-            # ``missing_verdicts``/``orphan_verdict``.
-            #
-            # ``eval_dir.parent`` IS the memory-evals root, which is where
-            # ``_read_verdicts`` locates the sole verdicts artifact — this
-            # value came out of that file, not out of the eval's own dir.
-            _issue(
-                issues, 'unknown_verdict', eval_id=eval_id,
-                path=eval_dir.parent / 'verdicts-current.json',
-                detail=(
-                    f'metric {_short_repr(metric_id)} has verdict {_short_repr(verdict)}, '
-                    'which is outside the M2 vocabulary and has no parity badge'
+        # A metric no entry judges still gets its one (unjudged) row.
+        row_entries = [entries[item] for item in sorted(entries, key=_item_order)]
+        for entry in row_entries or [None]:
+            metrics.append({
+                'metric_id': metric_id,
+                'kind': kind,
+                # Looked up by metric_id, never zipped positionally: the two lists
+                # are ordered independently and a metric may be absent from either.
+                'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
+                'current_value': current.get('value'),
+                'n': current.get('n'),
+                'denominator': current.get('denominator'),
+                'direction': current.get('direction'),
+                'trend': {'labels': list(run_stamps), 'values': list(values)},
+                **_verdict_row_fields(
+                    entry, metric_id, eval_dir, issues,
+                    escalation_index, linked_fingerprints, storm_suppressed, storm,
                 ),
-            )
-
-        metrics.append({
-            'metric_id': metric_id,
-            'kind': kind,
-            # Looked up by metric_id, never zipped positionally: the two lists
-            # are ordered independently and a metric may be absent from either.
-            'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
-            'current_value': current.get('value'),
-            'n': current.get('n'),
-            'denominator': current.get('denominator'),
-            'direction': current.get('direction'),
-            'trend': {'labels': list(run_stamps), 'values': values},
-            # Verdict fields, passed through UNMAPPED from the sole verdict
-            # source.  `value` is what the evaluator judged; `current_value`
-            # above is what the metrics artifact says — two sources, two
-            # fields, never conflated.
-            'verdict': judged.get('verdict'),
-            'verdict_detail': judged.get('detail'),
-            'value': judged.get('value'),
-            'item': judged.get('item'),
-            'limit_ref': judged.get('limit_ref'),
-            'fingerprint': judged.get('fingerprint'),
-            'run_stamp': judged.get('run_stamp'),
-            'escalation': escalation,
-            'parity': (
-                'storm_collapsed'
-                if storm is not None and verdict == 'alarm'
-                else _parity(verdict_class, escalation)
-            ),
-        })
+            })
 
     return {
         'eval_id': eval_id,

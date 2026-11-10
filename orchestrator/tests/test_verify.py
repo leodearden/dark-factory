@@ -3029,6 +3029,57 @@ class TestRunVerificationJunitxmlInjection:
         )
         assert result.failing_test_ids is None
 
+    async def test_caller_named_report_replaces_the_prefix_keyed_one(self, tmp_path: Path):
+        config = self._make_config(tmp_path, breadth='full')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='merge',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_written_whatever_the_role_and_breadth(
+        self, tmp_path: Path,
+    ):
+        config = self._make_config(tmp_path, breadth='scoped')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='task',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_refused_with_a_segmented_test_leg(
+        self, tmp_path: Path,
+    ):
+        report = tmp_path / 'r.xml'
+
+        with pytest.raises(ValueError, match='segment_chained_test=True') as refused:
+            await run_verification(
+                tmp_path, self._make_config(tmp_path), self._module_config(),
+                max_retries=0, role='task', segment_chained_test=True, junit_report=report,
+            )
+
+        assert repr(report) in str(refused.value)
+
 
 # ---------------------------------------------------------------------------
 # Task 5627: run_verification records WHICH module produced its junit ids —

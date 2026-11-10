@@ -29,6 +29,9 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
+from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
+    RebuildResult,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -764,9 +767,6 @@ async def run_server():
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
-        from fused_memory.services.orchestrator_detector import (
-            is_orchestrator_live_for,
-        )
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
@@ -826,7 +826,6 @@ async def run_server():
         backlog_policy = BacklogPolicy(
             event_buffer,
             event_queue,
-            is_orchestrator_live_for,
             hard_limit=config.reconciliation.backlog_hard_limit,
             hard_limit_overrides=config.reconciliation.backlog_hard_limit_overrides,
             rate_limit_seconds=(
@@ -1799,16 +1798,17 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     tests can exercise the fan-out without waiting for
     ``cfg.interval_seconds``.
 
-    Each project's result dict (``rebuilt``/``stale_entities``/``skipped``/
-    ``errors``) is logged so an operator can see whether the sweep is
-    actually reducing staleness — at WARNING when the project reported any
-    per-entity errors, INFO otherwise.
+    Each project's result (``rebuilt``/``stale_entities``/``skipped``/
+    ``errors`` and the four read-completeness keys) is logged so an operator
+    can see whether the sweep is actually reducing staleness — at WARNING
+    when the project reported any per-entity errors OR its corpus is not
+    proven complete (either verdict not ``is True``), INFO otherwise.
     """
     if not cfg.enabled or not cfg.projects:
         return
     for project_id in cfg.projects:
         try:
-            result = await memory_service.rebuild_entity_summaries(
+            raw = await memory_service.rebuild_entity_summaries(
                 project_id=project_id,
                 force=cfg.force,
                 _source='periodic_maintenance',
@@ -1816,16 +1816,20 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
         except Exception:
             logger.exception('rebuild_entity_summaries failed for project %s', project_id)
             continue
-        result = result or {}
-        errors = result.get('errors', 0)
-        log_fn = logger.warning if errors else logger.info
+        result = RebuildResult.from_service_result(raw or {})
+        log_fn = (
+            logger.warning
+            if result.errors or not result.corpus_proven_complete
+            else logger.info
+        )
         log_fn(
-            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s',
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s %s',
             project_id,
-            result.get('rebuilt'),
-            result.get('stale_entities'),
-            result.get('skipped'),
-            errors,
+            result.rebuilt,
+            result.stale_entities,
+            result.skipped,
+            result.errors,
+            result.completeness_summary,
         )
 
 

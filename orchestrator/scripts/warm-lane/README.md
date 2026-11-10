@@ -1604,11 +1604,11 @@ also covers `--reseed`, whose seed call follows the free.
 
 **One exit code, two tokens.** A live reference exits **75**, the same
 EX_TEMPFAIL as a held flock, because both mean "lane busy, benign skip,
-nothing removed": `GitOps._run_thin_warm_lane` already logs 75 at DEBUG and
+nothing removed": `GitOps.thin_warm_lane` already logs 75 at DEBUG and
 every other non-zero at WARNING, and that mapping needs no new arm. The causes
 stay attributable through greppable first-line stderr tokens, spelled as in
 reify: `LANE_LOCK_CONTENDED:` for the flock and `LANE_LIVE_REF:` for the
-reference. `_run_thin_warm_lane` logs the stderr rather than routing on the
+reference. `GitOps.thin_warm_lane` logs the stderr rather than routing on the
 token.
 
 **Skip, never defer.** On a live reference thin exits at once. A wait here would
@@ -1631,7 +1631,7 @@ case is a negative that cannot short-circuit, paid on a never-raise tail.
   always gets 75.
 - A degraded `/proc` fails OPEN; `lib_live_refs.sh`'s env probe makes that
   attributable with a one-time stderr warning rather than silent, and
-  `_run_thin_warm_lane` logs the script's stderr on success too, so the warning
+  `GitOps.thin_warm_lane` logs the script's stderr on success too, so the warning
   reaches dark-factory's log.
 
 **Divergences from reify's post-5823 file.** `SCRIPT_DIR` by parameter

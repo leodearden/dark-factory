@@ -1,4 +1,4 @@
-"""``GitOps._run_thin_warm_lane`` against the REAL shipped thin-warm-lane.sh.
+"""``GitOps.thin_warm_lane`` against the REAL shipped thin-warm-lane.sh.
 
 Task 5307.  The script now refuses to thin a lane a live process references
 (its T4 gate; ``orchestrator/scripts/warm-lane/README.md`` "Delta 17") with the
@@ -69,7 +69,7 @@ async def test_a_live_reference_is_an_attributed_benign_skip_until_it_clears(
     git_ops: GitOps, lane: Path, holder: subprocess.Popen[bytes], caplog,
 ) -> None:
     with caplog.at_level(logging.DEBUG, logger='orchestrator.git_ops'):
-        refused_rc = await git_ops._run_thin_warm_lane(lane)
+        refused_rc = await git_ops.thin_warm_lane(lane)
 
     assert refused_rc == 75
     assert (lane / 'target' / 'DIVERGENT_MARKER').exists()
@@ -83,7 +83,7 @@ async def test_a_live_reference_is_an_attributed_benign_skip_until_it_clears(
 
     holder.kill()
     holder.wait()
-    thinned_rc = await git_ops._run_thin_warm_lane(lane)
+    thinned_rc = await git_ops.thin_warm_lane(lane)
 
     assert thinned_rc == 0
     assert not (lane / 'target').exists()
@@ -93,7 +93,7 @@ async def test_a_successful_thin_logs_the_scripts_stderr(
     git_ops: GitOps, lane: Path, caplog,
 ) -> None:
     with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
-        rc = await git_ops._run_thin_warm_lane(lane)
+        rc = await git_ops.thin_warm_lane(lane)
 
     assert rc == 0
     info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]

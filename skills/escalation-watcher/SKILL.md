@@ -325,6 +325,10 @@ Four steps, in this order:
 Close with one message: the handover path, the lease result and, when the session stops in AFK
 posture, that the queue is unwatched until a successor launches.
 
+When the stop is part of a `handoff` and this watcher is T3-hosted, the session then ends with the
+archive act, gated on the confirmed successor: `skills/spawn/SKILL.md` §`handoff` step 6, and
+"Ending a T3 session" in its T3 lane section.
+
 ### Self-operations need no permission
 
 These are the session's own mechanics: do them without asking (Leo, 2026-09-25). They are item 8

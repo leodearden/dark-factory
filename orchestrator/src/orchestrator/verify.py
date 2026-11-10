@@ -19,11 +19,20 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar, assert_never
 
 if TYPE_CHECKING:
@@ -1248,6 +1257,18 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
+def _junit_spelling(node_id: str) -> str:
+    """*node_id* as :func:`_junit_testcase_id` spells its testcase, when the rootdir is the id's root.
+
+    Mirrors ``_pytest/junitxml.py::mangle_test_address``.
+    """
+    path, bracket, params = node_id.partition('[')
+    names = path.split('::')
+    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[-1] += bracket + params
+    return f"{'.'.join(names[:-1])}::{names[-1]}"
+
+
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
     skipped = testcase.find('skipped')
     return (
@@ -1312,6 +1333,47 @@ def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
         for testcase in root.iter('testcase')
         if testcase.find('failure') is None and testcase.find('error') is None
     }
+
+
+NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
+
+#: The status of an id named by several testcases (its parametrizations, or a
+#: test that failed and then errored in teardown): the first of these any has.
+_NODE_ID_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
+
+
+def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
+    """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
+
+    A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
+    teardown error, is ``'error'``: the test got no verdict. A test that never
+    executed is ``'skipped'``; any other testcase ran and passed. Ids use the
+    spelling of :func:`_extract_test_ids_from_junit`. pytest writes a test that
+    fails and then errors in teardown as two testcases with one id; repeats
+    fold by ``_NODE_ID_STATUS_PRECEDENCE``, so that test stays ``'fail'``.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root is None:
+        return None
+    statuses: dict[str, NodeIdStatus] = {}
+    for testcase in root.iter('testcase'):
+        if testcase.find('failure') is not None:
+            status: NodeIdStatus = 'fail'
+        elif testcase.find('error') is not None:
+            status = 'error'
+        elif _junit_testcase_never_ran(testcase):
+            status = 'skipped'
+        else:
+            status = 'pass'
+        testcase_id = _junit_testcase_id(testcase)
+        prior = statuses.get(testcase_id)
+        statuses[testcase_id] = status if prior is None else _NODE_ID_STATUS_PRECEDENCE[min(
+            _NODE_ID_STATUS_PRECEDENCE.index(prior), _NODE_ID_STATUS_PRECEDENCE.index(status),
+        )]
+    return statuses
 
 
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
@@ -2874,13 +2936,15 @@ def _make_infix(module_prefix: 'str | None') -> str:
 
 
 def _prepare_junit_report_path(
-    worktree: Path, module_prefix: 'str | None',
+    worktree: Path, module_prefix: 'str | None', *, group: 'str | None' = None,
 ) -> 'Path | None':
     """Build the merge-verify junit report path under *worktree*, or None.
 
     Returns the absolute ``<worktree>/.df-verify-junit/report{infix}.xml`` path
     (creating ONLY the ``.df-verify-junit`` child dir) for a live worktree, or
     None WITHOUT creating anything when the worktree is gone or unwritable.
+    A *group* adds a second infix, so a caller's own report never shares the
+    merge verify's prefix-keyed one.
 
     Shape-2 husk guard (task 2922): a late merge-role verify writer can fire
     AFTER its worktree was torn down. The previous inline
@@ -2909,7 +2973,7 @@ def _prepare_junit_report_path(
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
-        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}.xml'
+        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}{_make_infix(group)}.xml'
     except OSError:
         return None
     return report
@@ -2960,6 +3024,8 @@ class _JunitReportPlan:
     - ``'attributing'``: a merge verify at full breadth. One leg-level report,
       parsed into ``VerifyResult.failing_test_ids`` and archived. Never
       written per segment (task 3478).
+    - A caller-named report is ``'attributing'`` at the caller's path, whatever
+      the role and breadth.
     - ``'cost'``: a task verify with an archive destination. Archived, never
       parsed, so task-path attribution is unchanged. A segmented leg writes
       one per segment instead, at :meth:`segment_path`.
@@ -2992,10 +3058,14 @@ class _JunitReportPlan:
         attempt_id: 'int | None',
         task_id: 'str | None',
         archive_root: 'Path | None',
+        report: 'Path | None' = None,
     ) -> '_JunitReportPlan':
         kind: Literal['attributing', 'cost'] | None = None
         leg_path: Path | None = None
-        if role == 'merge' and merge_breadth_full:
+        if report is not None:
+            kind = 'attributing'
+            leg_path = report
+        elif role == 'merge' and merge_breadth_full:
             kind = 'attributing'
             # Shape-2 husk guard (task 2922): None, rather than re-creating a
             # torn-down worktree as an empty husk for a late writer.
@@ -7145,8 +7215,14 @@ async def run_verification(
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
     admission_request: AdmissionRequest | None = None,
+    junit_report: Path | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    A caller-named *junit_report* is injected into the test leg at the existing
+    chokepoint, cleared before each pytest invocation, and parsed into
+    ``failing_test_ids``/``skipped_test_ids``. It is refused with
+    *segment_chained_test*, whose segments would each overwrite it.
 
     *admission_request* places the gated test leg in the admission gate's
     order (task 5628). A caller verifying several modules as one plan passes
@@ -7217,6 +7293,11 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if junit_report is not None and segment_chained_test:
+        raise ValueError(
+            f'a caller-named junit report cannot be written by a segmented test leg: '
+            f'junit_report={junit_report!r}, segment_chained_test={segment_chained_test!r}',
+        )
     if admission_request is not None and admission_request.role != role:
         raise ValueError(
             f'an admission request must carry its verify role: request role='
@@ -7259,6 +7340,7 @@ async def run_verification(
         attempt_id=attempt_id,
         task_id=task_id,
         archive_root=archive_root,
+        report=junit_report,
     )
 
     if is_merge_verify:
@@ -7495,9 +7577,11 @@ async def run_verification(
             # segments run.
             #
             # Co-occurrence guard (task 3478). An ATTRIBUTING junit report
-            # and segmentation are mutually exclusive by construction today:
-            # the former requires role=='merge' and breadth=='full', the
-            # latter `segment_chained_test=role != 'merge'`. So per-segment
+            # and segmentation do not co-occur today: a caller-named report
+            # with segment_chained_test is refused at entry, and the
+            # role-derived report requires role=='merge' and breadth=='full'
+            # while the one segmenting call site passes
+            # `segment_chained_test=role != 'merge'`. So per-segment
             # attribution junit is deliberately UNWIRED, and node-id
             # attribution on this path comes from _extract_failing_test_ids
             # over the aggregated segment stdout instead. The task-path COST
@@ -7515,11 +7599,13 @@ async def run_verification(
                 logger.warning(
                     'Segmented verify (%d segments) co-occurs with a junit report '
                     'path at %s, which will NOT be written: per-segment attribution '
-                    'junitxml is deliberately unwired (task 3478). These two were mutually '
-                    'exclusive by construction — attribution requires role==\'merge\' '
-                    'with merge_verify_breadth==\'full\', segmentation requires '
-                    'role!=\'merge\' — so reaching here means one of those gates '
-                    'changed. Do NOT resolve this by injecting one shared '
+                    'junitxml is deliberately unwired (task 3478). These two do not '
+                    'co-occur today — run_verification refuses a caller-named report '
+                    'with segment_chained_test, and the role-derived report requires '
+                    'role==\'merge\' with merge_verify_breadth==\'full\' while the one '
+                    'segmenting call site passes segment_chained_test only for '
+                    'role!=\'merge\' — so reaching here means that call site or one of '
+                    'those gates changed. Do NOT resolve this by injecting one shared '
                     '--junitxml: %d pytest runs writing one path is last-writer-wins, '
                     'a report describing only the final segment. Node-id attribution '
                     'for THIS run remains available via _extract_failing_test_ids '
@@ -10771,6 +10857,216 @@ def _group_node_ids_by_subproject(
     return groups
 
 
+def _node_id_test_config(
+    module_config: ModuleConfig,
+    node_ids: Sequence[str],
+    *,
+    tree: Path,
+    timeout_secs: int,
+) -> ModuleConfig:
+    """The module's test leg alone, scoped to *node_ids*, forced serial, with a per-test timeout."""
+    return replace(
+        module_config,
+        test_command=_with_pytest_timeout_str(
+            _serial_pytest_str(
+                _scope_to_keyword(module_config.test_command, 'pytest', list(node_ids)),
+                invocation_dir=tree,
+            ),
+            timeout_secs,
+        ),
+        lint_command=None,
+        type_check_command=None,
+    )
+
+
+#: Per-test timeout (seconds) injected into every ``run_node_ids`` run, so a
+#: hung test is bounded by it rather than by the verify command timeout.
+_NODE_ID_RUN_TIMEOUT_SECS: int = 300
+
+
+def _node_id_statuses(
+    report: Path, prefix: str, qualified_by_id: Mapping[str, str],
+) -> dict[str, NodeIdStatus] | None:
+    """The status of each id the junit *report* records; ``None`` when no report parsed.
+
+    An id names the testcase spelled from its qualified id with the rootdir at
+    the tree root or at the module dir, and a function id without parameters
+    names every parametrization of it. An id that names no testcase is left out.
+    """
+    testcases = _junit_testcase_statuses(report)
+    if testcases is None:
+        return None
+    statuses: dict[str, NodeIdStatus] = {}
+    for node_id, qualified in qualified_by_id.items():
+        spellings = {
+            _junit_spelling(qualified),
+            _junit_spelling(qualified.removeprefix(f'{prefix}/')),
+        }
+        named: list[NodeIdStatus] = [
+            status for testcase, status in testcases.items()
+            if spellings & {testcase, testcase.partition('[')[0]}
+        ]
+        if named:
+            statuses[node_id] = min(named, key=_NODE_ID_STATUS_PRECEDENCE.index)
+    return statuses
+
+
+async def _node_id_run(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path,
+) -> dict[str, NodeIdStatus] | None:
+    """One run of *qualified_by_id* into *report*, read back per reported id; ``None`` when no report was read."""
+    try:
+        await run_verification(
+            tree, config,
+            _node_id_test_config(
+                module_config, list(qualified_by_id.values()),
+                tree=tree, timeout_secs=_NODE_ID_RUN_TIMEOUT_SECS,
+            ),
+            max_retries=0, role='merge', junit_report=report,
+        )
+    except Exception:
+        logger.warning(
+            'run_node_ids: running %s in module %r raised — each reads error',
+            list(qualified_by_id), module_config.prefix, exc_info=True,
+        )
+        return None
+    return _node_id_statuses(report, module_config.prefix, qualified_by_id)
+
+
+_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdStatus] | None]]
+
+
+async def _bisect_refused_run(
+    run: _NodeIdSubsetRun, refused: Sequence[str],
+) -> dict[str, NodeIdStatus]:
+    """The statuses of the *refused* ids, a run that reported none of them, found by bisection.
+
+    The halves run in turn, and a half that reports nothing is split again.
+    When the first half reports, the cause lies in the second, so the second
+    is split without being run. An id refused alone reports nothing.
+    """
+    if len(refused) < 2:
+        return {}
+    first, second = refused[:len(refused) // 2], refused[len(refused) // 2:]
+    first_statuses = await run(first)
+    if first_statuses:
+        return first_statuses | await _bisect_refused_run(run, second)
+    first_statuses = await _bisect_refused_run(run, first)
+    second_statuses = await run(second) or await _bisect_refused_run(run, second)
+    return first_statuses | second_statuses
+
+
+async def _run_node_id_group(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path | None,
+) -> dict[str, NodeIdStatus]:
+    """Every id of one module's group, run together into *report*, which is removed afterwards.
+
+    A run whose written report records none of its ids is bisected.
+    """
+    if report is None:
+        logger.warning(
+            'run_node_ids: no junit report path in %s for module %r — %s each read error',
+            tree, module_config.prefix, list(qualified_by_id),
+        )
+        return {node_id: 'error' for node_id in qualified_by_id}
+
+    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdStatus] | None:
+        subset = {node_id: qualified_by_id[node_id] for node_id in node_ids}
+        return await _node_id_run(tree, config, module_config, subset, report)
+
+    try:
+        statuses = await run(list(qualified_by_id))
+        if statuses == {}:
+            statuses = await _bisect_refused_run(run, list(qualified_by_id))
+    finally:
+        _clear_junit_report(report)
+    reported = statuses or {}
+    return {node_id: reported.get(node_id, 'error') for node_id in qualified_by_id}
+
+
+def _node_ids_by_module(
+    tree: Path, mc_by_prefix: dict[str, ModuleConfig], ids: Collection[str],
+) -> dict[str, dict[str, str]]:
+    """``{prefix: {id: qualified id}}``, each id mapped on its own; an unmappable id is left out."""
+    by_prefix: dict[str, dict[str, str]] = {}
+    for node_id in ids:
+        mapped = _group_node_ids_by_subproject(
+            tree, mc_by_prefix, [node_id], log_label='run_node_ids',
+        )
+        if mapped:
+            [(prefix, [qualified])] = mapped.items()
+            by_prefix.setdefault(prefix, {})[node_id] = qualified
+    return by_prefix
+
+
+async def run_node_ids(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_configs: Sequence[ModuleConfig],
+    ids: Collection[str],
+    *,
+    concurrent_groups: bool = False,
+) -> Mapping[str, NodeIdStatus]:
+    """Run exactly the pytest node *ids* in *tree*; return each one's status, keyed as given.
+
+    ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
+    never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
+    verdict was obtained: the id maps to no module in *module_configs*, names
+    no test function (a module or class id matches no testcase), was never
+    reported, errored in setup or teardown, or its run raised or wrote no
+    junit report.
+
+    A function id without its parameters names every parametrization:
+    ``'fail'`` if any failed, else ``'error'`` if any errored, else
+    ``'skipped'`` if any was skipped, else ``'pass'`` (every parametrization
+    passed).
+
+    Each id is mapped to its module on its own, so one unmappable id errors
+    alone. The ids of one module run together, serially, scoped and with a
+    per-test timeout, through ``_node_id_test_config`` and
+    ``run_verification``'s junit chokepoint; each group writes its own report,
+    removed after it is read. The isolated-rerun discriminator shares the
+    mapping (``_group_node_ids_by_subproject``) and ``_node_id_test_config``.
+
+    pytest refuses a whole argv for one not-found id, and a collection error
+    interrupts the session even under ``--continue-on-collection-errors``, so
+    a run whose written report records none of its ids is bisected, serially.
+    Each id that refuses a run reads ``'error'`` and costs re-runs logarithmic
+    in the group's size, not one per sibling. A run that records any of its
+    ids finished its session, so an id it does not record is ``'error'``
+    without a re-run; a group that wrote no report at all is not re-run.
+
+    *concurrent_groups* runs the module groups at once, each writing its own
+    report; the serial default is what an isolation-sensitive caller needs.
+    """
+    mc_by_prefix = {mc.prefix: mc for mc in module_configs}
+    qualified_by_prefix = _node_ids_by_module(tree, mc_by_prefix, ids)
+    token = uuid.uuid4().hex
+
+    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdStatus]]:
+        return _run_node_id_group(
+            tree, config, mc_by_prefix[prefix], qualified_by_prefix[prefix],
+            _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}'),
+        )
+
+    if concurrent_groups:
+        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+    else:
+        group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
+    statuses: dict[str, NodeIdStatus] = {}
+    for one_group in group_statuses:
+        statuses.update(one_group)
+    return MappingProxyType({node_id: statuses.get(node_id, 'error') for node_id in ids})
+
+
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
@@ -10853,16 +11149,9 @@ async def _sweep_failure_reproduces_in_isolation(
             return None
 
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                _SWEEP_PREFILTER_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=worktree, timeout_secs=_SWEEP_PREFILTER_TIMEOUT_SECS,
             )
             result = await run_verification(
                 worktree, config, scoped_mc, max_retries=0, role='background',
@@ -11047,16 +11336,9 @@ async def confirm_main_tip_failure_is_real(
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=tmp_path,
-                ),
-                _SWEEP_CONFIRM_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=tmp_path, timeout_secs=_SWEEP_CONFIRM_TIMEOUT_SECS,
             )
             if not await _run_isolated_confirm_group(tmp_path, config, scoped_mc):
                 return True
@@ -11575,11 +11857,10 @@ async def confirm_isolated_rerun_verdict(
     ``git worktree add``/``remove``, no cleanup ``finally``.
 
     SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
-    re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
-    _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
-    with ``lint_command`` and ``type_check_command`` nulled, so only the named
-    tests run, serially, under the governing pyproject ``addopts`` minus xdist
-    and an explicit ``--timeout`` in place of its ini per-test default.
+    re-run through ``_node_id_test_config`` with ``policy.timeout_secs``, so
+    only the named tests run, serially, under the governing pyproject
+    ``addopts`` minus xdist and an explicit ``--timeout`` in place of its ini
+    per-test default.
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -11797,16 +12078,9 @@ async def confirm_isolated_rerun_verdict(
         # continuing and a full re-run's cost to lose.
         unconfirmable_observation: _RerunObservation | None = None
         for prefix, group_node_ids in groups.items():
-            mc = mc_by_prefix[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                policy.timeout_secs,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                mc_by_prefix[prefix], group_node_ids,
+                tree=worktree, timeout_secs=policy.timeout_secs,
             )
             observation = await policy.engine(
                 worktree, config, scoped_mc,

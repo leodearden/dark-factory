@@ -11409,6 +11409,8 @@ class MemoryService:
                             'rebuilt': result.get('rebuilt', 0),
                             'skipped': result.get('skipped', 0),
                             'errors': result.get('errors', 0),
+                            'entities_complete': result.get('entities_complete'),
+                            'edges_complete': result.get('edges_complete'),
                         } if success else None,
                         success=success,
                         error=error_msg,

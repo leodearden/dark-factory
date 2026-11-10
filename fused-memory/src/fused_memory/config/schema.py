@@ -2928,9 +2928,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write. The same cap bounds a contesting child\'s text '
+            'middle-band write. The same cap bounds every amendment\'s text '
             'in grouped search and get_memory_by_id reads '
-            '(server/grouped_read.py::_digest_entry).'
+            '(server/grouped_read.py::amendment_text).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

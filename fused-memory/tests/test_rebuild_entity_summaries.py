@@ -27,6 +27,7 @@ from _fm_helpers import (
     make_rebuild_detail,
     pydantic_spec,
 )
+from _rebuild_service_results import rebuild_service_result
 
 from fused_memory.backends.graphiti_client import (
     _ACTIVE_EDGE_PREDICATE,
@@ -1223,10 +1224,11 @@ class TestMemoryServiceRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_journal_result_summary_is_condensed(self, mock_config):
-        """Journal result_summary must contain only aggregate fields, not 'details'.
+        """Journal result_summary holds the aggregate counts and the two completeness booleans.
 
         The service builds the result internally. This test verifies the journal
-        only receives the condensed aggregate fields (not the full details list).
+        only receives the condensed aggregate counts plus entities_complete and
+        edges_complete, without the details list or the incomplete kinds.
         """
         svc = _make_svc(mock_config)
         # 4 stale entities out of 10 total: 3 rebuilt, 1 skipped_dry_run (force=False)
@@ -1263,7 +1265,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         result_summary = call_kwargs.get('result_summary')
         assert result_summary is not None, 'result_summary must be set on success'
-        # Must contain the five aggregate fields
+        # Must contain the aggregate counts
         assert 'total_entities' in result_summary
         assert 'stale_entities' in result_summary
         assert 'rebuilt' in result_summary
@@ -1281,9 +1283,14 @@ class TestMemoryServiceRebuildEntitySummaries:
         # Must contain 'skipped' aggregate field
         assert 'skipped' in result_summary
         assert result_summary['skipped'] == 0
-        # Key set must be exactly these five aggregate fields — no more, no less
+        # Both reads were COMPLETE_READ, so both verdicts are recorded as True
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is True
+        # Key set must be exactly the aggregate counts plus the two completeness
+        # booleans, without the incomplete kinds — no more, no less
         assert set(result_summary.keys()) == {
-            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors'
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors',
+            'entities_complete', 'edges_complete',
         }
 
 
@@ -1534,14 +1541,11 @@ class TestRebuildSummariesManager:
         """RebuildSummariesManager.run() calls service.rebuild_entity_summaries."""
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 4,
-            'stale_entities': 2,
-            'rebuilt': 2,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=4,
+            stale_entities=2,
+            rebuilt=2,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test_project')
         result = await manager.run()
         mock_service.rebuild_entity_summaries.assert_awaited_once_with(
@@ -1555,14 +1559,12 @@ class TestRebuildSummariesManager:
         """force and dry_run params are forwarded correctly to the service."""
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 2,
-            'stale_entities': 2,
-            'rebuilt': 0,
-            'skipped': 2,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=2,
+            stale_entities=2,
+            rebuilt=0,
+            skipped=2,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test_project')
         result = await manager.run(force=True, dry_run=True)
         mock_service.rebuild_entity_summaries.assert_awaited_once_with(
@@ -1576,14 +1578,11 @@ class TestRebuildSummariesManager:
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 0,
-            'stale_entities': 0,
-            'rebuilt': 0,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=0,
+            stale_entities=0,
+            rebuilt=0,
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1598,14 +1597,12 @@ class TestRebuildSummariesManager:
         from fused_memory.maintenance.rebuild_summaries import RebuildResult, run_rebuild_summaries
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 7,
-            'stale_entities': 3,
-            'rebuilt': 3,
-            'skipped': 0,
-            'errors': 0,
-            'details': [make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=7,
+            stale_entities=3,
+            rebuilt=3,
+            details=[make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1635,14 +1632,11 @@ class TestRebuildSummariesManager:
 
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 5,
-            'stale_entities': 3,
-            'rebuilt': 3,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=5,
+            stale_entities=3,
+            rebuilt=3,
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'), patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1668,14 +1662,11 @@ class TestRebuildSummariesManager:
 
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 3,
-            'stale_entities': 1,
-            'rebuilt': 1,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=3,
+            stale_entities=1,
+            rebuilt=1,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test')
         with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
             await manager.run()
@@ -2876,14 +2867,11 @@ class TestRebuildSummariesManagerWithService:
         """Return a MagicMock representing MemoryService with a mocked rebuild method."""
         from fused_memory.services.memory_service import MemoryService
         mock_svc = MagicMock(spec=MemoryService)
-        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 5,
-            'stale_entities': 2,
-            'rebuilt': 2,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=5,
+            stale_entities=2,
+            rebuilt=2,
+        ))
         return mock_svc
 
     def test_manager_accepts_service_argument(self):
@@ -2914,14 +2902,13 @@ class TestRebuildSummariesManagerWithService:
             RebuildSummariesManager,
         )
         mock_svc = self._make_mock_service()
-        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 10,
-            'stale_entities': 4,
-            'rebuilt': 3,
-            'skipped': 1,
-            'errors': 0,
-            'details': [{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt'}],
-        })
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=10,
+            stale_entities=4,
+            rebuilt=3,
+            skipped=1,
+            details=[{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt'}],
+        ))
         manager = RebuildSummariesManager(service=mock_svc, group_id='proj')
         result = await manager.run()
         assert isinstance(result, RebuildResult)
@@ -2940,14 +2927,11 @@ class TestRebuildSummariesManagerWithService:
 
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = MagicMock(spec=MemoryService)
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 3,
-            'stale_entities': 1,
-            'rebuilt': 1,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=3,
+            stale_entities=1,
+            rebuilt=1,
+        ))
         # Ensure service.graphiti.rebuild_entity_summaries does NOT exist
         # so if manager wrongly calls service.graphiti.rebuild_entity_summaries it'll error
         mock_service.graphiti = MagicMock()
@@ -3309,6 +3293,28 @@ class TestRebuildReportsReadCompleteness:
         assert result['entities_incomplete_kind'] is None
         assert result['edges_complete'] is False
         assert result['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+
+    @pytest.mark.asyncio
+    async def test_journal_records_both_read_verdicts(self, mock_config):
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        journal = MagicMock()
+        journal.log_write_op = AsyncMock()
+        svc.set_write_journal(journal)
+
+        await svc.rebuild_entity_summaries(project_id='test')
+
+        result_summary = journal.log_write_op.call_args.kwargs['result_summary']
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is False
+        assert 'entities_incomplete_kind' not in result_summary
+        assert 'edges_incomplete_kind' not in result_summary
 
     @pytest.mark.asyncio
     async def test_stale_dry_run_has_no_verdict(self, mock_config):

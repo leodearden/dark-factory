@@ -148,8 +148,8 @@ async def test_prompt_names_the_per_call_root(tmp_path):
 async def test_agent_cwd_is_the_per_call_root(tmp_path):
     """The agent runs IN the caller's root, not the global explore root.
 
-    Task 1989's rationale, re-pointed: the cwd's auto-loaded CLAUDE.md is the
-    agent's main passive codebase signal, so it must be the TARGET project's.
+    The cwd is the root the CLI confines its read tools to, so it must be the
+    TARGET project's.
     """
     root_a = make_git_root(tmp_path, 'root_a')
     config = _config()
