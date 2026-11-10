@@ -37,6 +37,7 @@ __all__ = [
     'QUALITY_REV_LIST_TIMEOUT_SECONDS',
     'QUALITY_SAMPLE_INTERVAL_SECONDS',
     'collect_quality',
+    'describe_unreadable',
 ]
 
 logger = logging.getLogger(__name__)
@@ -103,11 +104,16 @@ async def _measure_all(
         pool.shutdown(wait=False)
 
 
+def describe_unreadable(exc: TaskDbUnreadable) -> str:
+    """From its fields: the message's remedy is written for tasks.db, not runs.db."""
+    return f'{type(exc).__name__}: {exc.path}: {exc.reason.value}'
+
+
 def _failure_reason(exc: BaseException, per_root_budget_s: float) -> str:
     if isinstance(exc, TimeoutError):
         return f'quality sampling exceeded the {per_root_budget_s}s per-root budget'
     if isinstance(exc, TaskDbUnreadable):
-        return f'{type(exc).__name__}: {exc.path}: {exc.reason.value}'
+        return describe_unreadable(exc)
     return f'{type(exc).__name__}: {exc}'
 
 

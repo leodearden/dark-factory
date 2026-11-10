@@ -1,14 +1,19 @@
 """One project's per-landing quality series: the axis, each metric's points, bands, baseline and alarms.
 
-Every number comes from shared/src/shared/quality_series/stats.py (plans/quality-dashboard-prd.md
-decision 21); this module only chooses what each statistic is applied to and shapes the wire
-(decisions 13, 15 and 22, §Contract "Wire shape"). Statistics run over the project's full stored
-history; the window only slices what is served.
+The one access path for per-landing quality facts: read_quality_series serves what the quality
+sampler stored in quality.db, with the freshness its samples and runs.db's recorded landings
+support, and never runs git or computes a row (plans/quality-dashboard-prd.md decisions 13, 14,
+15 and 22). Every number comes from shared/src/shared/quality_series/stats.py (decision 21); this
+module only chooses what each statistic is applied to and shapes the wire (§Contract "Wire
+shape"). Statistics run over the project's full stored history; the window only slices what is
+served.
 """
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import sqlite3
 import statistics
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
@@ -16,8 +21,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
+from pathlib import Path
 
-from shared.quality_series.landings import GitCrossCheck
+import aiosqlite
+from shared.project_id import project_id_for_root
+from shared.project_layout import runs_db
+from shared.quality_series.landings import GitCrossCheck, recorded_landing_keys
 from shared.quality_series.rows import (
     CharterClassSource,
     LandingRow,
@@ -49,17 +58,27 @@ from shared.quality_series.stats import (
     regime_segments,
     wilson_interval,
 )
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
     DatumInvariant,
     DatumState,
+    aged_at,
     unknown_datum,
     validate_datum,
 )
+from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS, describe_unreadable
+from dashboard.data.quality_store import (
+    QualitySample,
+    SampleState,
+    newest_samples,
+    read_landing_rows,
+)
 
 __all__ = [
+    'QUALITY_FRESHNESS_BOUND_SECONDS',
     'Alarm',
     'AlarmDirection',
     'AxisPoint',
@@ -81,8 +100,11 @@ __all__ = [
     'Rolling',
     'Rule',
     'quality_series_view',
+    'read_quality_series',
     'validate_quality_series',
 ]
+
+QUALITY_FRESHNESS_BOUND_SECONDS = 2 * QUALITY_SAMPLE_INTERVAL_SECONDS
 
 HEADLINE_LANDINGS = 100
 """The headline block and the rolling band: the last this-many measured landings."""
@@ -1086,3 +1108,81 @@ def validate_quality_series(series: QualitySeries, served_at: datetime) -> None:
                 f'{metric.metric_id} alarms at ordinals {off_axis} not on the served axis',
             )
         validate_datum(metric.headline, served_at)
+
+
+def _never_measured(project_id: str, latest: QualitySample | None) -> str:
+    if latest is None:
+        return f'nothing has been sampled for project {project_id} yet'
+    return latest.reason or f'no value sample has been written for project {project_id}'
+
+
+def _cursor_landed_at(rows: Sequence[LandingRow], cursor_sha: str | None) -> datetime | None:
+    return next((row.landing.landed_at for row in reversed(rows)
+                 if row.landing.merge_sha == cursor_sha and not row.landing.late_claim), None)
+
+
+def _unsampled(root: Path, rows: Sequence[LandingRow], cursor_sha: str | None) -> str | None:
+    """Why runs.db says the stored series is behind: landings it records after the cursor that the
+    store lacks, or that runs.db cannot be read to confirm none; None when it is not behind."""
+    path = runs_db(root)
+    try:
+        conn = connect_ro(path)
+    except TaskDbUnreadable as exc:
+        return f'freshness cannot be confirmed: {describe_unreadable(exc)}'
+    except sqlite3.Error as exc:
+        return f'freshness cannot be confirmed: {path}: {type(exc).__name__}: {exc}'
+    try:
+        recorded = recorded_landing_keys(
+            conn, recorded_after=_cursor_landed_at(rows, cursor_sha) if cursor_sha else None,
+        )
+    except sqlite3.Error as exc:
+        return f'freshness cannot be confirmed: {path}: {type(exc).__name__}: {exc}'
+    finally:
+        conn.close()
+    pending = len(recorded - {(row.landing.merge_sha, row.landing.task_id) for row in rows})
+    if pending == 0:
+        return None
+    return f'{pending} landing{"" if pending == 1 else "s"} not yet sampled'
+
+
+def _read_at(
+    value: QualitySample, latest: QualitySample, unsampled: str | None, now: datetime,
+) -> Provenance:
+    """A gap after the newest value names why the series stopped; else runs.db's verdict; then age."""
+    reason = latest.reason if latest.state is SampleState.GAP else unsampled
+    state = DatumState.FRESH if reason is None else DatumState.STALE
+    read = aged_at(Datum(None, value.ts, state, reason, QUALITY_FRESHNESS_BOUND_SECONDS), now)
+    return Provenance(value.ts, read.state, read.reason, QUALITY_FRESHNESS_BOUND_SECONDS)
+
+
+async def read_quality_series(
+    db: aiosqlite.Connection | None,
+    root: Path,
+    window_landings: int | None,
+    *,
+    now: datetime,
+    events: Sequence[RegimeEvent] = (),
+) -> Datum[QualitySeries]:
+    """*root*'s stored series as read at *now*: unknown until a value sample exists, stale while
+    a newer gap, an unsampled recorded landing or the bound says so, otherwise fresh."""
+    if db is None:
+        return unknown_datum('quality.db does not exist yet: the quality sampler has not written it',
+                             QUALITY_FRESHNESS_BOUND_SECONDS)
+    project_id = project_id_for_root(root)
+    newest = await newest_samples(db, project_id)
+    if newest.latest is None or newest.latest_value is None:
+        return unknown_datum(_never_measured(project_id, newest.latest),
+                             QUALITY_FRESHNESS_BOUND_SECONDS)
+    value = newest.latest_value
+    rows = await read_landing_rows(db, project_id)
+    unsampled = await asyncio.to_thread(_unsampled, root, rows, value.cursor_sha)
+    provenance = _read_at(value, newest.latest, unsampled, now)
+    series = await asyncio.to_thread(
+        lambda: quality_series_view(rows, window_landings=window_landings, provenance=provenance,
+                                    events=events, git_check=value.git_check),
+    )
+    datum = Datum(series, provenance.as_of, provenance.state, provenance.reason,
+                  QUALITY_FRESHNESS_BOUND_SECONDS)
+    validate_datum(datum, now)
+    validate_quality_series(series, now)
+    return datum
