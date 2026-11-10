@@ -19,6 +19,7 @@ from _fm_helpers import load_script_module
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.config import ModelSize
+from graphiti_core.llm_client.token_tracker import TokenUsageTracker
 from graphiti_core.prompts.models import Message
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from pydantic import BaseModel
@@ -107,8 +108,11 @@ class TestTheArms:
         assert first_line not in llm.prompt(EDGE_PROMPT)
         assert mod.ARMS['control'].instructions is None
 
-    def test_the_o1_version_is_a_hash_of_its_text(self) -> None:
-        assert mod.O1_INSTRUCTIONS_VERSION.startswith('o1-v1-')
+    def test_the_o1_version_is_the_pre_registered_hash_of_its_text(self) -> None:
+        """Tripwire: design.md §2.1 pre-registered this version, and every o1 record in replay.jsonl
+        carries it. Changing O1_INSTRUCTIONS makes a new arm, with a new version and registration."""
+        text_hash = hashlib.sha256(mod.O1_INSTRUCTIONS.encode()).hexdigest()[:12]
+        assert mod.O1_INSTRUCTIONS_VERSION == 'o1-v1-99b813d73cba' == f'o1-v1-{text_hash}'
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
@@ -134,6 +138,14 @@ class TestTheArms:
         with pytest.raises(mod.ArmModelMismatch) as raised:
             await _replay(llm, 'o6')
         assert all(name in str(raised.value) for name in ('o6', mod.O6_MODEL, 'm-small'))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_client_whose_tokens_cannot_be_attributed_is_refused_before_any_call(self) -> None:
+        llm = _FakeLLM()
+        llm.token_tracker = TokenUsageTracker()
+        with pytest.raises(mod.UnmeasurableClient):
+            await _replay(llm)
         assert llm.calls == []
 
     @pytest.mark.asyncio
@@ -340,22 +352,28 @@ class TestCheckWorksheet:
         _worksheet_row('b1', graph='reify', stratum='other_decisions'),
     ]
 
+    def _check(self, **episodes: int) -> None:
+        mod.check_worksheet(self.ROWS, mod.baseline_cells(_sizes(**episodes)))
+
     def test_matching_cell_counts_pass(self) -> None:
-        mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=2, reify__other_decisions=1))
+        self._check(dark_factory__ruling_lexeme=2, reify__other_decisions=1)
 
     def test_a_short_cell_is_named(self) -> None:
         with pytest.raises(mod.WorksheetMismatch, match='dark_factory/ruling_lexeme'):
-            mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=3, reify__other_decisions=1))
+            self._check(dark_factory__ruling_lexeme=3, reify__other_decisions=1)
 
     def test_a_cell_the_baseline_lacks_is_named(self) -> None:
         with pytest.raises(mod.WorksheetMismatch, match='reify/other_decisions'):
-            mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=2))
+            self._check(dark_factory__ruling_lexeme=2)
 
     def test_a_baseline_cell_the_worksheet_lacks_is_named(self) -> None:
         with pytest.raises(mod.WorksheetMismatch, match='reify/decision_anchor'):
-            mod.check_worksheet(self.ROWS, _sizes(
-                dark_factory__ruling_lexeme=2, reify__other_decisions=1, reify__decision_anchor=8,
-            ))
+            self._check(dark_factory__ruling_lexeme=2, reify__other_decisions=1, reify__decision_anchor=8)
+
+    @pytest.mark.parametrize('report', [{}, {'sample': {}}, {'sample': {'sizes': {'dark_factory': {'x': {}}}}}])
+    def test_a_report_without_sample_sizes_is_a_replay_file_error(self, report: dict[str, Any]) -> None:
+        with pytest.raises(mod.ReplayFileError, match='sample.sizes'):
+            mod.baseline_cells(report)
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +532,30 @@ class TestReplayCommand:
         assert _run_replay(paths, llm) == 2
         assert not paths['replay'].exists() and llm.calls == []
 
+    def test_an_unmeasurable_client_exits_2_before_any_call(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        llm = _CountingLLM()
+        llm.token_tracker = TokenUsageTracker()
+        assert _run_replay(paths, llm) == 2
+        assert not paths['replay'].exists() and llm.calls == []
+
+    def test_a_client_on_another_model_than_its_arms_exits_2_before_any_call(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        llm = _CountingLLM(model='m-small')
+        assert _run_replay(paths, llm, 'control', 'o6') == 2
+        assert not paths['replay'].exists() and llm.calls == []
+
+    def test_a_defect_in_an_episode_read_is_raised_not_recorded_as_a_failure(self, tmp_path: Path) -> None:
+        class _Broken:
+            async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+                raise KeyError('a defect, not an outage')
+
+        paths = _cli_inputs(tmp_path)
+        with pytest.raises(KeyError):
+            mod.run(_replay_argv(paths), llm_factory=lambda model: _CountingLLM(),
+                    reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_Broken()))
+        assert _records(paths['replay']) == []
+
     def test_a_missing_client_exits_1(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         code = mod.run(_replay_argv(paths), llm_factory=lambda model: None,
@@ -627,6 +669,8 @@ DILUTING_O1 = {DF: ('overreach',) * 2 + ('holding',) * 4 + ('context',) * 6,
 """Under half the control's overreach per minted edge, but as much per day: it only mints more."""
 HOLDING_LOSING_O1 = {DF: ('holding',) + ('context',) * 3 + ('bookkeeping',),
                      REIFY: ('holding',) * 2 + ('context',) * 2 + ('bookkeeping',)}
+HALVING_O1 = {DF: ('overreach', 'holding', 'holding', 'context', 'bookkeeping'), REIFY: PASSING['o1'][REIFY]}
+"""20 weighted overreach edges to the control's 44, as many minted and as many holdings."""
 
 ENTITIES = ('Alpha', 'Beta', 'Gamma', 'Delta')
 O1_ENTITIES_OF_A1 = ('alpha', '  BETA ', 'Epsilon')
@@ -634,12 +678,12 @@ TOKENS = {'control': {'extract_nodes': (100, 10, 1), 'extract_edges': (300, 40, 
           'o1': {'extract_nodes': (150, 10, 1), 'extract_edges': (350, 40, 2)}}
 
 
-def _score_baseline(overreach: dict[str, Any] = BASELINE_OVERREACH) -> dict[str, Any]:
+def _score_baseline(overreach: dict[str, Any] = BASELINE_OVERREACH, *, window_days: float = 2.0) -> dict[str, Any]:
     cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
     return {
         'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
                    REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
-        'sample': {'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}}, 'window_days': 2.0},
+        'sample': {'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}}, 'window_days': window_days},
         'adjudicated': {'population_weighted': {'overreach_rate_minted': overreach}},
     }
 
@@ -725,6 +769,10 @@ class TestScorePerArm:
         assert weighted['overreach_rate_minted']['rate'] == 0.0
         assert (weighted['overreach_per_day'], weighted['minted_per_day']) == (0.0, 60.0)
 
+    def test_the_window_counts_are_unrounded_weighted_edge_counts(self, tmp_path: Path) -> None:
+        weighted = _scored(tmp_path)['arms']['control']['population_weighted']
+        assert weighted['window_counts'] == {'minted': 120.0, 'overreach': 44.0, 'holding': 52.0}
+
     def test_holding_share_and_holdings_per_day_are_weighted_too(self, tmp_path: Path) -> None:
         weighted = _scored(tmp_path)['arms']['control']['population_weighted']
         assert weighted['holding_share'] == audit.weighted_rate([(10.0, 4, 10), (2.0, 6, 10)])
@@ -795,6 +843,15 @@ class TestTheO1Decision:
         assert decision['passes'] is False
         assert decision['holding_retention'] == round(14.0 / 26.0, 4)
 
+    def test_it_compares_unrounded_counts_where_rounded_per_day_rates_collide(self, tmp_path: Path) -> None:
+        report = _scored(tmp_path, PASSING | {'o1': HALVING_O1}, baseline=_score_baseline(window_days=300.0))
+        control, o1 = (report['arms'][arm]['population_weighted'] for arm in ('control', 'o1'))
+        assert control['overreach_per_day'] == o1['overreach_per_day'] == 0.1
+        decision = report['comparison']['o1']
+        assert decision['overreach_ratio_per_day'] == decision['overreach_ratio_minted'] == round(20 / 44, 4)
+        assert decision['checks']['halves_overreach_per_day'] is True
+        assert decision['holding_retention'] == 1.0
+
     def test_the_comparison_states_its_bars(self, tmp_path: Path) -> None:
         decision = _scored(tmp_path)['comparison']['o1']
         assert decision['bars'] == {'overreach_ratio_max': 0.5, 'holding_retention_min': 0.8}
@@ -850,6 +907,14 @@ class TestScoreFailsClosed:
         verdicts = _score_verdicts(records, labels)
         verdicts['sample'] = audit.SampleDefinition(cap=20).to_dict()
         self._assert_rejected(tmp_path, records, verdicts)
+
+    def test_a_baseline_report_without_its_sample_sizes(self, tmp_path: Path) -> None:
+        records, labels = _score_records(PASSING)
+        baseline = _score_baseline()
+        del baseline['sample']['sizes']
+        code, out = _run_score(tmp_path, records, _score_verdicts(records, labels), baseline)
+        assert code == 2
+        assert not out.exists() and not out.parent.exists()
 
 
 # --------------------------------------------------------------------------- #

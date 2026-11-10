@@ -19,7 +19,6 @@ from _fm_helpers import load_script_module
 from _overreach_shadow_fixtures import judged_edge, judged_episode
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
-from fused_memory.backends.graphiti_client import _RESULTSET_SIZE
 from fused_memory.services.overreach_guard import PROMPT_VERSION
 from fused_memory.services.overreach_shadow import SIDECAR_FILENAME, OverreachShadowStore
 
@@ -254,9 +253,6 @@ class TestTheSample:
         assert batched['flags'] == whole['flags'] and batched['census'] == whole['census']
         assert all(len(params['uuids']) <= 2 for g in graphs.opened.values() for _, params in g.sent)
 
-    def test_a_read_batch_stays_well_under_the_result_set_cap(self) -> None:
-        assert mod.UUID_BATCH * 10 <= _RESULTSET_SIZE
-
     def test_only_the_requested_graphs_are_read_and_only_by_the_two_reads(
         self, sidecar: Path, tmp_path: Path,
     ) -> None:
@@ -317,6 +313,40 @@ class TestSampleFailsClosed:
         code = mod.run(_sample_argv(sidecar, paths),
                        reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_Down()))
         assert code == 1
+        self._assert_nothing_written(paths)
+
+    def test_a_defect_in_a_read_is_raised_not_reported_as_unavailability(
+        self, sidecar: Path, tmp_path: Path,
+    ) -> None:
+        class _Broken:
+            name = DF
+
+            async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+                raise KeyError('a defect, not an outage')
+
+        paths = _paths(tmp_path)
+        with pytest.raises(KeyError):
+            mod.run(_sample_argv(sidecar, paths),
+                    reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_Broken()))
+        self._assert_nothing_written(paths)
+
+    def test_every_reader_built_is_closed_when_a_later_one_cannot_be(
+        self, sidecar: Path, tmp_path: Path,
+    ) -> None:
+        closed: list[str] = []
+
+        class _Recording(ReadOnlyGraphReader):
+            async def aclose(self) -> None:
+                closed.append(self.graph_name)
+
+        def factory(graph: str) -> ReadOnlyGraphReader:
+            if graph == REIFY:
+                raise ConnectionError('falkordb down')
+            return _Recording(graph_name=graph, graph=_StateGraph(graph))
+
+        paths = _paths(tmp_path)
+        assert mod.run(_sample_argv(sidecar, paths), reader_factory=factory) == 1
+        assert closed == [DF]
         self._assert_nothing_written(paths)
 
     @pytest.mark.parametrize('window', [

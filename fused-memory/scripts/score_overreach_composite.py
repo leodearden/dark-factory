@@ -46,15 +46,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -63,11 +65,19 @@ from fused_memory.services.overreach_guard import LABELS, OVERREACH
 from fused_memory.services.overreach_shadow import HandedFlag, OverreachShadowStore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _graph_script_cli import (
+    GRAPH_UNAVAILABLE,
+    ReaderFactory,
+    UnreadableInput,
+    add_graph_arguments,
+    live_reader_factory,
+    read_json,
+    write_files_atomically,
+)
 from audit_ruling_overreach import (
     SampleDefinition,
     VerdictError,
     VerdictSet,
-    _resolve_uri,
     load_verdicts,
     rate,
     sample_key,
@@ -81,10 +91,15 @@ logger = logging.getLogger('score_overreach_composite')
 # What Stage 1 did with a flag, read from the edge as it stands
 # --------------------------------------------------------------------------- #
 
-RETIRED, KEPT, SUPERSEDED, GONE = 'retired', 'kept', 'superseded', 'gone'
-DECISIONS: tuple[str, ...] = (RETIRED, KEPT, SUPERSEDED, GONE)
 
-SAMPLED_DECISIONS: tuple[str, ...] = (RETIRED, KEPT)
+class Decision(StrEnum):
+    retired = 'retired'
+    kept = 'kept'
+    superseded = 'superseded'
+    gone = 'gone'
+
+
+SAMPLED_DECISIONS: tuple[Decision, ...] = (Decision.retired, Decision.kept)
 """The cells, per graph. A superseded or gone flag is counted and never sampled."""
 
 DEFAULT_CAP = 20
@@ -109,12 +124,12 @@ class EdgeState:
     target_name: str
 
 
-def decision_of(state: EdgeState | None) -> str:
+def decision_of(state: EdgeState | None) -> Decision:
     if state is None:
-        return GONE
+        return Decision.gone
     if state.invalid_at is None:
-        return KEPT
-    return RETIRED if state.expired_at is None else SUPERSEDED
+        return Decision.kept
+    return Decision.retired if state.expired_at is None else Decision.superseded
 
 
 def _text(value: Any) -> str | None:
@@ -165,7 +180,7 @@ class ClassifiedFlag:
         return self.handed.flag.episode_uuid
 
     @property
-    def decision(self) -> str:
+    def decision(self) -> Decision:
         return decision_of(self.state)
 
     def hash_key(self) -> str:
@@ -188,7 +203,7 @@ class ClassifiedFlag:
 
 def select_flags(flags: Iterable[ClassifiedFlag], cap: int) -> tuple[ClassifiedFlag, ...]:
     """One graph's sample: the first *cap* by hash of each sampled decision, cell by cell."""
-    cells: defaultdict[str, list[ClassifiedFlag]] = defaultdict(list)
+    cells: defaultdict[Decision, list[ClassifiedFlag]] = defaultdict(list)
     for flag in flags:
         cells[flag.decision].append(flag)
     return tuple(
@@ -231,7 +246,7 @@ def census(samples: Sequence[GraphSample], days: float) -> dict[str, Any]:
         counts = Counter(flag.decision for flag in sample.flags)
         by_graph[sample.graph] = {'handed': len(sample.flags)} | {
             decision: {'flags': counts[decision], 'per_day': round(counts[decision] / days, 2)}
-            for decision in DECISIONS
+            for decision in Decision
         }
     return {
         'window_days': days,
@@ -277,8 +292,13 @@ COMPOSITE_RECALL_LABEL = (
     'their bounds and is not the interval of any one estimator'
 )
 
-Cell = tuple[str, str]
+Cell = tuple[str, Decision]
 """``(graph, decision)``."""
+
+
+def _cell(flag: Mapping[str, str]) -> Cell:
+    """A sampled flag's cell; ValueError names a decision that is not one."""
+    return flag['graph'], Decision(flag['decision'])
 
 
 class InvalidInput(ValueError):
@@ -306,7 +326,7 @@ class CompositeSample:
                             for graph in by_graph for decision in SAMPLED_DECISIONS},
                 flags=tuple(document['flags']),
             )
-            sampled = Counter((flag['graph'], flag['decision']) for flag in sample.flags)
+            sampled = Counter(_cell(flag) for flag in sample.flags)
         except (KeyError, TypeError, ValueError) as exc:
             raise InvalidInput(f'not a composite sample: {exc!r}') from exc
         if over := sorted(cell for cell, n in sampled.items() if n > sample.population.get(cell, 0)):
@@ -337,17 +357,17 @@ class WeightedCells:
         labels = verdicts.by_edge
         counts: defaultdict[Cell, Counter[str]] = defaultdict(Counter)
         for flag in sample.flags:
-            counts[(flag['graph'], flag['decision'])][labels[(flag['graph'], flag['edge_uuid'])]] += 1
+            counts[_cell(flag)][labels[(flag['graph'], flag['edge_uuid'])]] += 1
         return cls(
             counts=dict(counts),
             weights={cell: sample.population[cell] / counter.total() for cell, counter in counts.items()},
             window_days=sample.window_days,
         )
 
-    def cells(self, decision: str | None = None) -> list[Cell]:
+    def cells(self, decision: Decision | None = None) -> list[Cell]:
         return [cell for cell in self.weights if decision in (None, cell[1])]
 
-    def share(self, label: str, decision: str | None = None) -> dict[str, Any]:
+    def share(self, label: str, decision: Decision | None = None) -> dict[str, Any]:
         """The weighted share of *decision*'s flags (every flag, by default) adjudicated *label*."""
         return weighted_rate(
             (self.weights[cell], self.counts[cell][label], self.counts[cell].total()) for cell in self.cells(decision)
@@ -356,15 +376,16 @@ class WeightedCells:
     def retired_share(self, label: str) -> dict[str, Any]:
         """Of the flags adjudicated *label*, the weighted share Stage 1 retired."""
         return weighted_rate(
-            (self.weights[cell], self.counts[cell][label] if cell[1] == RETIRED else 0, self.counts[cell][label])
+            (self.weights[cell], self.counts[cell][label] if cell[1] is Decision.retired else 0,
+             self.counts[cell][label])
             for cell in self.cells()
         )
 
     def retired_per_day(self, label: str) -> float:
-        weighted = sum(self.weights[cell] * self.counts[cell][label] for cell in self.cells(RETIRED))
+        weighted = sum(self.weights[cell] * self.counts[cell][label] for cell in self.cells(Decision.retired))
         return round(weighted / self.window_days, 2)
 
-    def unweighted_share(self, label: str, decision: str | None = None) -> dict[str, Any]:
+    def unweighted_share(self, label: str, decision: Decision | None = None) -> dict[str, Any]:
         cells = self.cells(decision)
         return rate(sum(self.counts[cell][label] for cell in cells), sum(self.counts[cell].total() for cell in cells))
 
@@ -410,7 +431,7 @@ def composite_score(
     sample: CompositeSample, verdicts: VerdictSet, judge_recall: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     cells = WeightedCells.of(sample, verdicts)
-    retire_precision = cells.share(OVERREACH, RETIRED)
+    retire_precision = cells.share(OVERREACH, Decision.retired)
     stage1_recall = cells.retired_share(OVERREACH)
     return {
         'sample': sample.definition.to_dict(),
@@ -422,11 +443,11 @@ def composite_score(
         'retire_precision': retire_precision,
         'flag_precision': cells.share(OVERREACH),
         'stage1_recall_on_flags': stage1_recall,
-        'holding_retired_share': cells.share(HOLDING, RETIRED),
+        'holding_retired_share': cells.share(HOLDING, Decision.retired),
         'holdings_retired_per_day': cells.retired_per_day(HOLDING),
         'overreach_retired_per_day': cells.retired_per_day(OVERREACH),
         'unweighted': {
-            'retire_precision': cells.unweighted_share(OVERREACH, RETIRED),
+            'retire_precision': cells.unweighted_share(OVERREACH, Decision.retired),
             'flag_precision': cells.unweighted_share(OVERREACH),
         },
         'composite_recall': composite_recall(judge_recall, stage1_recall) if judge_recall else None,
@@ -440,7 +461,9 @@ def composite_score(
 
 EXIT_OK, EXIT_UNAVAILABLE, EXIT_INVALID = 0, 1, 2
 
-ReaderFactory = Callable[[str], ReadOnlyGraphReader]
+
+class SidecarUnavailable(Exception):
+    """The sidecar cannot be opened read-only."""
 
 
 def _aware_instant(text: str) -> datetime:
@@ -479,9 +502,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sample.add_argument('--cap', type=int, default=DEFAULT_CAP, help='Flags per graph per sampled decision.')
     sample.add_argument('--out-sample', required=True, help='The frozen composite-sample.json.')
     sample.add_argument('--out-worksheet', required=True, help='The blind adjudication worksheet (JSONL).')
-    sample.add_argument('--graph-uri', default=None, help='FalkorDB URI. Default: env FALKORDB_URI, then config.')
-    sample.add_argument('--graph-host', default=None, help='FalkorDB host, instead of a URI.')
-    sample.add_argument('--graph-port', type=int, default=None, help='FalkorDB port, with --graph-host.')
+    add_graph_arguments(sample)
     score = commands.add_parser('score', help="Rate Stage 1's decision against the adjudicated sample.")
     score.add_argument('--sample', required=True, help='The frozen composite-sample.json.')
     score.add_argument('--verdicts', required=True, help='Verdicts on every sampled flag, in load_verdicts format.')
@@ -491,36 +512,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _live_reader_factory(args: argparse.Namespace) -> ReaderFactory:
-    if args.graph_host is not None or args.graph_port is not None:
-        return lambda graph: ReadOnlyGraphReader(graph_name=graph, host=args.graph_host, port=args.graph_port)
-    uri = _resolve_uri(args)
-    return lambda graph: ReadOnlyGraphReader(graph_name=graph, uri=uri)
-
-
-def _write_together(texts: Mapping[Path, str]) -> None:
-    """Stage every file before any replaces its target, so a failed write leaves none half-done."""
-    staged = {}
-    for path, text in texts.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staged[path] = path.with_name(path.name + '.tmp')
-        staged[path].write_text(text)
-    for path, tmp in staged.items():
-        tmp.replace(path)
-
-
 async def _read_samples(
     args: argparse.Namespace, definition: SampleDefinition, window: tuple[datetime, datetime],
     reader_factory: ReaderFactory,
 ) -> list[GraphSample]:
-    store = await OverreachShadowStore.open_read_only(args.sidecar)
-    readers = {graph: reader_factory(graph) for graph in dict.fromkeys(args.graph)}
-    try:
+    async with contextlib.AsyncExitStack() as opened:
+        try:
+            store = await OverreachShadowStore.open_read_only(args.sidecar)
+        except (OSError, sqlite3.Error) as exc:
+            raise SidecarUnavailable(str(exc)) from exc
+        opened.push_async_callback(store.close)
+        readers: dict[str, ReadOnlyGraphReader] = {}
+        for graph in dict.fromkeys(args.graph):
+            readers[graph] = reader_factory(graph)
+            opened.push_async_callback(readers[graph].aclose)
         return [await sample_graph(store, reader, graph, definition, window) for graph, reader in readers.items()]
-    finally:
-        await store.close()
-        for reader in readers.values():
-            await reader.aclose()
 
 
 async def _sample_command(args: argparse.Namespace, reader_factory: ReaderFactory) -> int:
@@ -531,32 +537,25 @@ async def _sample_command(args: argparse.Namespace, reader_factory: ReaderFactor
         return EXIT_INVALID
     try:
         samples = await _read_samples(args, definition, window, reader_factory)
-    except (OSError, sqlite3.Error) as exc:
+    except (SidecarUnavailable, sqlite3.Error) as exc:
         logger.error('the sidecar is unavailable, nothing is written: %s', exc)
         return EXIT_UNAVAILABLE
-    except Exception:
+    except GRAPH_UNAVAILABLE:
         logger.error('a graph read failed, nothing is written', exc_info=True)
         return EXIT_UNAVAILABLE
     document = sample_document(samples, definition, datetime.now(UTC).isoformat())
-    _write_together({
+    write_files_atomically({
         Path(args.out_sample): json.dumps(document, indent=2, sort_keys=True) + '\n',
         Path(args.out_worksheet): ''.join(json.dumps(row, sort_keys=True) + '\n' for row in worksheet_rows(samples)),
     })
     return EXIT_OK
 
 
-def _read_json(path: str) -> Any:
-    try:
-        return json.loads(Path(path).read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise InvalidInput(f'cannot read {path}: {exc}') from exc
-
-
 def _judge_recall(path: str | None) -> Mapping[str, Any] | None:
     if path is None:
         return None
     try:
-        recall = _read_json(path)['recall']
+        recall = read_json(path)['recall']
         return {'rate': recall['rate'], 'ci': recall['ci']}
     except (KeyError, TypeError) as exc:
         raise InvalidInput(f'{path} carries no judge recall: {exc!r}') from exc
@@ -564,21 +563,21 @@ def _judge_recall(path: str | None) -> Mapping[str, Any] | None:
 
 def _score_command(args: argparse.Namespace) -> int:
     try:
-        sample = CompositeSample.from_document(_read_json(args.sample))
+        sample = CompositeSample.from_document(read_json(args.sample))
         report = composite_score(
-            sample, validate_verdicts(_read_json(args.verdicts), sample), _judge_recall(args.judge_eval),
+            sample, validate_verdicts(read_json(args.verdicts), sample), _judge_recall(args.judge_eval),
         )
-    except (InvalidInput, VerdictError) as exc:
+    except (InvalidInput, UnreadableInput, VerdictError) as exc:
         logger.error('invalid inputs, nothing is written (%s): %s', type(exc).__name__, exc)
         return EXIT_INVALID
-    _write_together({Path(args.out): json.dumps(report, indent=2, sort_keys=True) + '\n'})
+    write_files_atomically({Path(args.out): json.dumps(report, indent=2, sort_keys=True) + '\n'})
     return EXIT_OK
 
 
 async def _run(args: argparse.Namespace, reader_factory: ReaderFactory | None) -> int:
     if args.command == 'score':
         return _score_command(args)
-    return await _sample_command(args, reader_factory or _live_reader_factory(args))
+    return await _sample_command(args, reader_factory or live_reader_factory(args))
 
 
 def run(argv: Sequence[str] | None = None, *, reader_factory: ReaderFactory | None = None) -> int:

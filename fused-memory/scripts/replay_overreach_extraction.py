@@ -55,12 +55,14 @@ estimators, and judges each lever arm against the control by the
 pre-registered rule beside OVERREACH_RATIO_MAX.
 
 Exit codes: 0 ran; 1 the LLM or graph is unavailable, or an episode failed
-(re-run to resume); 2 an input is invalid (nothing is written).
+(re-run to resume); 2 an input is invalid, or an arm's client cannot replay it
+(nothing is written).
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -71,6 +73,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -95,12 +98,21 @@ from fused_memory.backends.llm_token_usage import (
 from fused_memory.config.schema import FusedMemoryConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _graph_script_cli import (
+    GRAPH_UNAVAILABLE,
+    ReaderFactory,
+    UnreadableInput,
+    add_graph_arguments,
+    live_reader_factory,
+    read_json,
+    write_files_atomically,
+)
 from audit_ruling_overreach import (
     OutOfSampleVerdict,
     SampleDefinition,
     VerdictError,
     VerdictSet,
-    _resolve_uri,
+    WeightedStratum,
     adjudicated_rates,
     load_verdicts,
     population_weighted_rates,
@@ -237,10 +249,18 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
     return measurement.usage
 
 
-async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -> ReplayResult:
-    """Extract *episode* under *arm* through graphiti's own functions; no driver exists to reach."""
+async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
+    """Raise unless *llm* can replay *arm*: on the arm's model, with attributable tokens. Calls nothing."""
     if arm.model is not None and llm.model != arm.model:
         raise ArmModelMismatch(f'arm {arm.name} extracts on {arm.model}, but the client is on {llm.model}')
+    async with measure_llm_tokens(llm) as probe:
+        pass
+    _usage(probe)
+
+
+async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -> ReplayResult:
+    """Extract *episode* under *arm* through graphiti's own functions; no driver exists to reach."""
+    await check_arm_client(llm, arm)
     clients = GraphitiClients.model_construct(llm_client=llm)
     current = _episodic_node(episode, uuid=episode.uuid, content=episode.content)
     previous = [
@@ -335,14 +355,21 @@ def _cell_counts(rows: Iterable[Mapping[str, Any]]) -> Counter[str]:
     return Counter(f"{row['graph']}/{row['stratum']}" for row in rows)
 
 
-def check_worksheet(rows: Iterable[Mapping[str, Any]], baseline_report: Mapping[str, Any]) -> None:
-    """Raise WorksheetMismatch unless every cell holds the episodes ``sample.sizes`` says it sampled."""
-    found = _cell_counts(rows)
-    expected = Counter({
-        f'{graph}/{stratum}': cell['episodes']
-        for graph, by_stratum in baseline_report['sample']['sizes'].items()
-        for stratum, cell in by_stratum.items()
-    })
+def baseline_cells(baseline_report: Mapping[str, Any]) -> Counter[str]:
+    """``graph/stratum`` -> the episodes the baseline report's ``sample.sizes`` says it sampled."""
+    try:
+        return Counter({
+            f'{graph}/{stratum}': int(cell['episodes'])
+            for graph, by_stratum in baseline_report['sample']['sizes'].items()
+            for stratum, cell in by_stratum.items()
+        })
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ReplayFileError(f'the baseline report has no sample.sizes: {exc!r}') from exc
+
+
+def check_worksheet(rows: Iterable[Mapping[str, Any]], sampled: Mapping[str, int]) -> None:
+    """Raise WorksheetMismatch unless every cell holds the episodes *sampled* (baseline_cells) names."""
+    found, expected = _cell_counts(rows), Counter(sampled)
     differing = sorted(cell for cell in found.keys() | expected.keys() if found[cell] != expected[cell])
     if differing:
         raise WorksheetMismatch('worksheet episodes differ from the baseline sample in '
@@ -353,7 +380,12 @@ def check_worksheet(rows: Iterable[Mapping[str, Any]], baseline_report: Mapping[
 # The replay file: one JSONL record per (arm, episode), never episode text
 # --------------------------------------------------------------------------- #
 
-REPLAYED, FAILED = 'replayed', 'failed'
+
+class RecordKind(StrEnum):
+    replayed = 'replayed'
+    failed = 'failed'
+
+
 _ERROR_CHARS = 500
 
 RecordKey = tuple[str, str, str]
@@ -370,7 +402,7 @@ def record_key(record: Mapping[str, Any]) -> RecordKey:
 
 def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str, Any]:
     return {
-        'kind': REPLAYED, 'arm': result.arm, 'model': result.model,
+        'kind': RecordKind.replayed, 'arm': result.arm, 'model': result.model,
         'instructions_version': result.instructions_version,
         'graph': result.graph, 'uuid': result.uuid, 'stratum': result.stratum,
         'previous_count': len(replay_input.previous),
@@ -382,7 +414,7 @@ def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str
 
 def failed_record(arm: ReplayArm, model: str | None, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
     return {
-        'kind': FAILED, 'arm': arm.name, 'model': model,
+        'kind': RecordKind.failed, 'arm': arm.name, 'model': model,
         'graph': row['graph'], 'uuid': row['uuid'], 'stratum': row['stratum'],
         'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS],
     }
@@ -399,19 +431,14 @@ def _jsonl(records: Iterable[Mapping[str, Any]]) -> str:
     return ''.join(json.dumps(record, sort_keys=True) + '\n' for record in records)
 
 
-def _write_atomically(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staged = path.with_name(path.name + '.tmp')
-    staged.write_text(text)
-    staged.replace(path)
-
-
 def complete_replay(
     records: Iterable[Mapping[str, Any]], episodes: Iterable[tuple[str, str]],
 ) -> dict[str, dict[tuple[str, str], Mapping[str, Any]]]:
     """arm -> (graph, uuid) -> record, for a replay holding every episode under every arm and no failure."""
     records, wanted = list(records), set(episodes)
-    if failed := sorted(f'{r["arm"]}:{r["graph"]}/{r["uuid"]}' for r in records if r.get('kind') != REPLAYED):
+    if failed := sorted(
+        f'{r["arm"]}:{r["graph"]}/{r["uuid"]}' for r in records if r.get('kind') != RecordKind.replayed
+    ):
         raise ReplayFileError(f'the replay holds failure lines: {failed}')
     by_arm: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = {}
     for record in records:
@@ -452,16 +479,20 @@ EpisodeKey = tuple[str, str]
 
 @dataclass(frozen=True)
 class Baseline:
-    """What the score takes from the 4716 report.json: its cell populations and its own result."""
+    """What the score takes from the 4716 report.json: its sample, cell populations and own result."""
 
+    sample_cells: Mapping[str, int]
+    """baseline_cells of the report."""
     window_population: Mapping[str, Mapping[str, int]]
     window_days: float
     overreach_rate_minted: Mapping[str, Any]
 
     @classmethod
     def from_report(cls, report: Mapping[str, Any]) -> Baseline:
+        sample_cells = baseline_cells(report)
         try:
             return cls(
+                sample_cells=sample_cells,
                 window_population={
                     graph: {stratum: int(cell['window_population']) for stratum, cell in by_stratum.items()}
                     for graph, by_stratum in report['strata'].items()
@@ -517,20 +548,40 @@ def _per_day(weighted_count: float, window_days: float) -> float | None:
     return round(weighted_count / window_days, 1) if window_days else None
 
 
-def weighted_holdings(
+def _weighted_cells(
     rows: Sequence[Mapping[str, Any]], verdicts: VerdictSet,
-    weights: Mapping[str, Mapping[str, float]], window_days: float,
-) -> dict[str, Any]:
-    """Holding share and holdings/day at the cell *weights* population_weighted_rates derived."""
+    weights: Mapping[str, Mapping[str, float]], measure: str,
+) -> list[WeightedStratum]:
+    """``(weight, k, n)`` per sampled cell for one adjudicated_rates *measure* over minted edges."""
     cells = []
     for graph, by_stratum in weights.items():
         for stratum, weight in by_stratum.items():
             cell = [row for row in rows if (row['graph'], row['stratum']) == (graph, stratum)]
-            holding = adjudicated_rates(cell, verdicts)['all']['holding_share']
-            cells.append((weight, holding['k'], holding['n']))
+            measured = adjudicated_rates(cell, verdicts)['all'][measure]
+            cells.append((weight, measured['k'], measured['n']))
+    return cells
+
+
+def _window_count(cells: Iterable[WeightedStratum]) -> float:
+    return sum(weight * k for weight, k, _ in cells)
+
+
+def window_measures(
+    rows: Sequence[Mapping[str, Any]], verdicts: VerdictSet,
+    weights: Mapping[str, Mapping[str, float]], window_days: float,
+) -> dict[str, Any]:
+    """Holding share and holdings/day at the cell *weights* population_weighted_rates derived, and
+    the unrounded window counts of minted, overreach and holding edges that lever_decision compares."""
+    overreach = _weighted_cells(rows, verdicts, weights, 'overreach_rate_minted')
+    holding = _weighted_cells(rows, verdicts, weights, 'holding_share')
     return {
-        'holding_share': weighted_rate(cells),
-        'holdings_per_day': _per_day(sum(w * k for w, k, _ in cells), window_days),
+        'holding_share': weighted_rate(holding),
+        'holdings_per_day': _per_day(_window_count(holding), window_days),
+        'window_counts': {
+            'minted': sum(weight * n for weight, _, n in overreach),
+            'overreach': _window_count(overreach),
+            'holding': _window_count(holding),
+        },
     }
 
 
@@ -583,7 +634,7 @@ def arm_score(
             scope: {key: measured[key] for key in REPORTED_RATES}
             for scope, measured in adjudicated_rates(rows, verdicts).items()
         },
-        'population_weighted': weighted | weighted_holdings(
+        'population_weighted': weighted | window_measures(
             rows, verdicts, weighted['weights'], baseline.window_days,
         ),
         'entities': entity_overlap(replayed, control),
@@ -592,16 +643,30 @@ def arm_score(
 
 
 def _ratio(candidate: float | None, control: float | None) -> float | None:
-    return round(candidate / control, 4) if candidate is not None and control else None
+    return candidate / control if candidate is not None and control else None
+
+
+def _overreach_share(counts: Mapping[str, float]) -> float | None:
+    return _ratio(counts['overreach'], counts['minted'])
+
+
+def _shown(ratio: float | None) -> float | None:
+    return None if ratio is None else round(ratio, 4)
 
 
 def lever_decision(control: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """design §2.4, over two arms' ``population_weighted`` blocks."""
+    """design §2.4, over two arms' ``population_weighted`` blocks.
+
+    Every ratio is taken over the unrounded ``window_counts`` and rounded only
+    for display. Both arms share the baseline's window, so a ratio of window
+    counts is the ratio of their per-day rates.
+    """
+    control_counts, candidate_counts = control['window_counts'], candidate['window_counts']
     control_point = control['overreach_rate_minted']['rate']
     candidate_upper = (candidate['overreach_rate_minted']['ci'] or [None, None])[1]
-    per_minted = _ratio(candidate['overreach_rate_minted']['rate'], control_point)
-    per_day = _ratio(candidate['overreach_per_day'], control['overreach_per_day'])
-    retention = _ratio(candidate['holdings_per_day'], control['holdings_per_day'])
+    per_minted = _ratio(_overreach_share(candidate_counts), _overreach_share(control_counts))
+    per_day = _ratio(candidate_counts['overreach'], control_counts['overreach'])
+    retention = _ratio(candidate_counts['holding'], control_counts['holding'])
     checks = {
         'halves_overreach_per_minted': per_minted is not None and per_minted <= OVERREACH_RATIO_MAX,
         'halves_overreach_per_day': per_day is not None and per_day <= OVERREACH_RATIO_MAX,
@@ -611,8 +676,8 @@ def lever_decision(control: Mapping[str, Any], candidate: Mapping[str, Any]) -> 
         'retains_holdings': retention is not None and retention >= HOLDING_RETENTION_MIN,
     }
     return {
-        'overreach_ratio_minted': per_minted, 'overreach_ratio_per_day': per_day,
-        'holding_retention': retention,
+        'overreach_ratio_minted': _shown(per_minted), 'overreach_ratio_per_day': _shown(per_day),
+        'holding_retention': _shown(retention),
         'bars': {'overreach_ratio_max': OVERREACH_RATIO_MAX, 'holding_retention_min': HOLDING_RETENTION_MIN},
         'checks': checks, 'passes': all(checks.values()),
     }
@@ -642,7 +707,7 @@ def score_replay(
     by_arm = complete_replay(records, episodes)
     if CONTROL not in by_arm:
         raise ReplayFileError(f'every arm is judged against {CONTROL!r}, which this replay lacks')
-    check_worksheet(by_arm[CONTROL].values(), baseline_report)
+    check_worksheet(by_arm[CONTROL].values(), baseline.sample_cells)
     verdicts = validate_verdicts(verdict_obj, by_arm, episodes)
     arms = {arm: arm_score(replayed, by_arm[CONTROL], verdicts, baseline) for arm, replayed in sorted(by_arm.items())}
     control = arms[CONTROL]['population_weighted']
@@ -665,7 +730,6 @@ def score_replay(
 EXIT_OK, EXIT_UNAVAILABLE, EXIT_INVALID = 0, 1, 2
 
 LlmFactory = Callable[[str | None], LLMClient | None]
-ReaderFactory = Callable[[str], ReadOnlyGraphReader]
 ArmClients = tuple[tuple[ReplayArm, LLMClient], ...]
 """Each selected arm with the client on its model."""
 
@@ -682,10 +746,7 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument('--baseline-report', required=True,
                         help="The 4716 report.json; the worksheet must match its sample.sizes.")
     replay.add_argument('--arm', action='append', required=True, choices=sorted(ARMS))
-    replay.add_argument('--graph-uri', default=None,
-                        help='FalkorDB URI. Default: env FALKORDB_URI, then config.')
-    replay.add_argument('--graph-host', default=None, help='FalkorDB host, instead of a URI.')
-    replay.add_argument('--graph-port', type=int, default=None, help='FalkorDB port, with --graph-host.')
+    add_graph_arguments(replay)
     replay.add_argument('--out', required=True, help='Replay JSONL; an existing file is resumed.')
     worksheet = commands.add_parser('worksheet', help='Emit the blinded mixed-arm adjudication worksheet.')
     worksheet.add_argument('--replay', required=True)
@@ -701,23 +762,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _live_reader_factory(args: argparse.Namespace) -> ReaderFactory:
-    if args.graph_host is not None or args.graph_port is not None:
-        return lambda graph: ReadOnlyGraphReader(graph_name=graph, host=args.graph_host, port=args.graph_port)
-    uri = _resolve_uri(args)
-    return lambda graph: ReadOnlyGraphReader(graph_name=graph, uri=uri)
-
-
 def _live_llm_factory(model: str | None) -> LLMClient | None:
     return build_arm_llm(FusedMemoryConfig(), model)
 
 
 def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
     rows = _read_jsonl(args.worksheet)
-    try:
-        check_worksheet(rows, json.loads(Path(args.baseline_report).read_text()))
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
-        raise ReplayFileError(f'cannot read the baseline sample from {args.baseline_report}: {exc}') from exc
+    check_worksheet(rows, baseline_cells(read_json(args.baseline_report)))
     return rows
 
 
@@ -754,7 +805,7 @@ async def _replay_rows(
             records: list[dict[str, Any]] = []
             try:
                 replay_input = await readers[row['graph']].read(row)
-            except Exception as exc:
+            except (EpisodeMissing, *GRAPH_UNAVAILABLE) as exc:
                 logger.warning('reading %s/%s failed', row['graph'], row['uuid'], exc_info=True)
                 records = [failed_record(arm, llm.model, row, exc) for arm, llm in pending]
             else:
@@ -765,7 +816,7 @@ async def _replay_rows(
                         logger.warning('replaying %s/%s under %s failed', row['graph'], row['uuid'],
                                        arm.name, exc_info=True)
                         records.append(failed_record(arm, llm.model, row, exc))
-            failures += sum(1 for record in records if record['kind'] == FAILED)
+            failures += sum(1 for record in records if record['kind'] == RecordKind.failed)
             sink.write(_jsonl(records))
             sink.flush()
     return failures
@@ -776,26 +827,30 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     try:
         rows = _load_replay_inputs(args)
         out = Path(args.out)
-        kept = [r for r in _read_jsonl(out) if r.get('kind') == REPLAYED] if out.exists() else []
-    except (ReplayFileError, WorksheetMismatch) as exc:
+        kept = [r for r in _read_jsonl(out) if r.get('kind') == RecordKind.replayed] if out.exists() else []
+    except (ReplayFileError, UnreadableInput, WorksheetMismatch) as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
     arm_clients = _arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
     if arm_clients is None:
         return EXIT_UNAVAILABLE
+    try:
+        for arm, llm in arm_clients:
+            await check_arm_client(llm, arm)
+    except (ArmModelMismatch, UnmeasurableClient) as exc:
+        logger.error('an arm cannot be replayed on its client, nothing is written: %s', exc)
+        return EXIT_INVALID
     if conflicts := _model_conflicts(kept, arm_clients):
         logger.error('this --out already holds other models, nothing is written: %s', conflicts)
         return EXIT_INVALID
-    _write_atomically(out, _jsonl(kept))
-    graph_readers = {graph: reader_factory(graph) for graph in dict.fromkeys(row['graph'] for row in rows)}
-    try:
-        failures = await _replay_rows(
-            rows, arm_clients, {g: EpisodeContextReader(r) for g, r in graph_readers.items()},
-            {record_key(r) for r in kept}, out,
-        )
-    finally:
-        for reader in graph_readers.values():
-            await reader.aclose()
+    write_files_atomically({out: _jsonl(kept)})
+    async with contextlib.AsyncExitStack() as opened:
+        readers: dict[str, EpisodeContextReader] = {}
+        for graph in dict.fromkeys(row['graph'] for row in rows):
+            reader = reader_factory(graph)
+            opened.push_async_callback(reader.aclose)
+            readers[graph] = EpisodeContextReader(reader)
+        failures = await _replay_rows(rows, arm_clients, readers, {record_key(r) for r in kept}, out)
     if failures:
         logger.error('%d (arm, episode) replay(s) failed; re-run to resume them', failures)
         return EXIT_UNAVAILABLE
@@ -830,26 +885,19 @@ def _worksheet_command(args: argparse.Namespace) -> int:
     except ReplayFileError as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
-    _write_atomically(Path(args.out), _jsonl(blinded_rows(rows, by_arm)))
+    write_files_atomically({Path(args.out): _jsonl(blinded_rows(rows, by_arm))})
     return EXIT_OK
-
-
-def _read_json(path: str) -> Any:
-    try:
-        return json.loads(Path(path).read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReplayFileError(f'cannot read {path}: {exc}') from exc
 
 
 def _score_command(args: argparse.Namespace) -> int:
     try:
         report = score_replay(
-            _read_jsonl(args.replay), _read_json(args.verdicts), _read_json(args.baseline_report),
+            _read_jsonl(args.replay), read_json(args.verdicts), read_json(args.baseline_report),
         )
-    except (ReplayFileError, WorksheetMismatch, VerdictError) as exc:
+    except (ReplayFileError, UnreadableInput, WorksheetMismatch, VerdictError) as exc:
         logger.error('invalid inputs, nothing is written (%s): %s', type(exc).__name__, exc)
         return EXIT_INVALID
-    _write_atomically(Path(args.out), json.dumps(report, indent=2, sort_keys=True) + '\n')
+    write_files_atomically({Path(args.out): json.dumps(report, indent=2, sort_keys=True) + '\n'})
     return EXIT_OK
 
 
@@ -858,7 +906,7 @@ async def _run(
 ) -> int:
     if args.command == 'replay':
         return await _replay_command(
-            args, llm_factory or _live_llm_factory, reader_factory or _live_reader_factory(args),
+            args, llm_factory or _live_llm_factory, reader_factory or live_reader_factory(args),
         )
     if args.command == 'score':
         return _score_command(args)
