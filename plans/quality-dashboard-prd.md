@@ -499,24 +499,31 @@ SnapshotPoint = {as_of_sha, committed_at, params, complete, baseline: bool, memb
 `validate_datum` runs at shaping; a metric whose `measured_since` is after the window start serves
 `null` points before it and `headline.state='unknown'` with the reason naming the source date.
 
-**Correction (γ, 2026-11-10).** The shipped wire is a strict superset of the block above, and its
-single home is `dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire`:
-- Each axis point adds `git_first_parent` and `late_claim`. Off-first-parent landings and late claims
-  stay on the axis (sketch row 3).
-- Each metric adds `kind` (`rate` | `count` | `cost`), so a chart type is never inferred from an id.
-- A headline's value is `{form: rate | k_of_n | mean | median, n, k, value, lo, hi}`, not a bare
-  number. `k` is the event count of a rate and null otherwise. The band is the Wilson interval for a
-  rate, and a bootstrap seeded by the window's task ids for a count or a cost.
-- `before_after` entries add `metric`. `modules` entries are `{module, landings, tasks,
-  allocated_lines, allocated_usd, usd_per_100_lines, ranked}`.
-- `QualitySeries` adds a top-level `git_check = {off_first_parent, merges_without_landing,
-  late_claims, disagreement}` taken from the newest value sample, or null.
+**Correction (γ, 2026-11-10).** The shipped wire extends the block above, and it replaces two of
+its shapes: the headline value and the `modules` entries. Its single home is
+`dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire`.
+- Replaced: a headline's value is `{form: rate | k_of_n | mean | median, n, k, value, lo, hi}`,
+  not `number|{k,n}`. `k` is the event count of a rate and null otherwise. The band is the Wilson
+  interval for a rate, and a bootstrap seeded by the window's task ids for a count or a cost.
+- Replaced: `modules` entries are flat `{module, landings, tasks, allocated_lines, allocated_usd,
+  usd_per_100_lines, ranked}`. There is no `metrics` key.
+- Added: each axis point carries `git_first_parent` and `late_claim`. Off-first-parent landings and
+  late claims stay on the axis (sketch row 3).
+- Added: each metric carries `kind` (`rate` | `count` | `cost`), so a chart type is never inferred
+  from an id.
+- Added: `before_after` entries carry `metric`.
+- Added: `QualitySeries` carries a top-level `git_check = {off_first_parent,
+  merges_without_landing, late_claims, disagreement}` taken from the newest value sample, or null.
 
 "No producer has written here" (INV-13) is a structured state: `rule.measured_since` is null, the
 points are null, and the headline is `unknown` with a reason starting with that phrase. A series
 flips by data, with no code change. `charter_blocked` flips once any stored row carries
 `charter_class_source = 'charter_class'`; a source flips once it has a `SourceEpochs` epoch.
-`reverts` stays in that state until `late_events` has a writer.
+`reverts` stays in that state until `late_events` has a writer. `review_rounds_ge2` and
+`execute_iterations` have no source epoch: they are measured from the first stored landing that
+carries the value. Until one does, the source has a producer, so the headline does not say "no
+producer has written here". Its reason names what no stored landing carries, for example "no stored
+landing of this project carries a review round count" (`::Since`).
 
 Baseline, EWMA, CUSUM and the cost model run over the project's full stored history, and the window
 only slices what is served. The headline is always the last-100-measured block
