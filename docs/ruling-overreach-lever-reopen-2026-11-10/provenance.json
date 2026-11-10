@@ -10,6 +10,13 @@
     "verdicts": 644
   },
   "branch": "task/9040",
+  "composite_adjudication": {
+    "adjudicator": "the implementing agent for task 9040; single pass, no sub-agents",
+    "blinding": "The worksheet carries neither the Stage-1 decision nor the judge rationale. Before labelling, only composite-sample.json's census and sample blocks and the count of flags were read; no per-flag decision was seen until composite-report.json was written.",
+    "procedure": "Worksheet order (sha256 order as emitted), roughly twelve episodes at a time, each body read in full beside its flagged edge(s); one label and one span-quoting rationale per flag.",
+    "rubric": "docs/ruling-overreach-guard-design-2026-10-01/design.md \u00a72.6 with its \u00a72.10 garble conventions, as for verdicts.json",
+    "verdicts": 80
+  },
   "gate": "esc-6218-1",
   "runs": [
     {
@@ -157,6 +164,63 @@
       "invocations": 1,
       "output": "report.json, written by the script (json.dumps indent=2, sort_keys=True); not hand-edited. verdicts.json passed load_verdicts on the first run.",
       "step": "score"
+    },
+    {
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/score_overreach_composite.py",
+        "sample",
+        "--sidecar",
+        "/home/leo/src/dark-factory/data/queue/overreach_shadow.db",
+        "--graph",
+        "dark_factory",
+        "--graph",
+        "reify",
+        "--window-start",
+        "2026-10-24T00:00:00+00:00",
+        "--window-end",
+        "2026-11-10T00:00:00+00:00",
+        "--cap",
+        "20",
+        "--out-sample",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-sample.json",
+        "--out-worksheet",
+        "/tmp/9040-composite-worksheet.jsonl"
+      ],
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "finished_at": "2026-11-10T14:44:18Z",
+      "git_sha": "bb3bfac98e",
+      "invocations": 1,
+      "output": "composite-sample.json as the script wrote it (window, graphs and cap exactly as pre-registered in design.md \u00a72.5); the worksheet (72 episodes, 80 flags, bodies) stays in /tmp and is not committed.",
+      "reads": "sidecar opened with OverreachShadowStore.open_read_only; edge state and episode bodies read over GRAPH.RO_QUERY through ReadOnlyGraphReader (FALKORDB_URI unset, config default redis://localhost:6379)",
+      "started_at": "2026-11-10T14:44:14Z",
+      "step": "composite-sample"
+    },
+    {
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/score_overreach_composite.py",
+        "score",
+        "--sample",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-sample.json",
+        "--verdicts",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-verdicts.json",
+        "--judge-eval",
+        "../docs/ruling-overreach-guard-design-2026-10-01/judge-eval-offline-2026-11-09.json",
+        "--out",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-report.json"
+      ],
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "git_sha": "bb3bfac98e",
+      "invocations": 1,
+      "output": "composite-report.json, written by the script; not hand-edited. composite-verdicts.json passed load_verdicts on the first run.",
+      "step": "composite-score"
     }
   ],
   "task_id": "9040"
