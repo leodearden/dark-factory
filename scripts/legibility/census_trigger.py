@@ -108,11 +108,12 @@ import json
 import logging
 import os
 import statistics
+import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, overload
 
@@ -315,6 +316,164 @@ class CensusConfig:
             )
 
         return config
+
+
+# ---------------------------------------------------------------------------
+# completion — condition (a): the previous run's weighted completion
+# (plans/census-incremental-prd.md C7 (a))
+# ---------------------------------------------------------------------------
+
+class CompletionStatus(StrEnum):
+    FIRE = "fire"
+    NOT_YET = "not_yet"
+    NO_PREVIOUS_RUN = "no_previous_run"
+    FILED_NOTHING = "filed_nothing"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class Completion:
+    """What scripts/check_run_completion.py said about the previous census
+    run's filed tasks, parsed once at the subprocess boundary."""
+
+    status: CompletionStatus
+    run_id: str | None
+    threshold_pct: int
+    share: float | None = None
+    vacuous: bool = False
+    detail: str = ""
+
+    @property
+    def fires(self) -> bool:
+        return self.status is CompletionStatus.FIRE
+
+    @property
+    def reason(self) -> str:
+        threshold = f"(threshold {self.threshold_pct / 100:.2f})"
+        match self.status:
+            case CompletionStatus.FIRE | CompletionStatus.NOT_YET:
+                line = f"completion: {self._shown_share()} of {self.run_id} {threshold}"
+                return line + (" -> FIRE" if self.fires else "")
+            case CompletionStatus.NO_PREVIOUS_RUN:
+                return "completion: no previous run id (census-state has no last_census_run_id) -> N/A"
+            case CompletionStatus.FILED_NOTHING:
+                return f"completion: run {self.run_id} filed no tasks -> N/A"
+            case CompletionStatus.ERROR:
+                return f"completion: check of {self.run_id} failed ({self.detail}) -> N/A"
+
+    def _shown_share(self) -> str:
+        if self.share is not None:
+            return f"{self.share:g}"
+        return "vacuous" if self.vacuous else "unreadable"
+
+
+COMPLETION_SCRIPT = Path(__file__).resolve().parents[1] / "check_run_completion.py"
+COMPLETION_CHECK_TIMEOUT_SECS = 120
+CompletionRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+_EMPTY_RUN_ERROR = "empty_run"
+
+
+def run_completion_check(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run check_run_completion.py under this interpreter, capturing stdout;
+    its stderr diagnostics go straight to the caller's journal."""
+    return subprocess.run(
+        [sys.executable, str(COMPLETION_SCRIPT), *args],
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=COMPLETION_CHECK_TIMEOUT_SECS,
+        check=False,
+    )
+
+
+def _verdict_line(stdout: str | None) -> Mapping[str, Any] | None:
+    lines = [line for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        verdict = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return verdict if isinstance(verdict, dict) else None
+
+
+def _completion_from_exit(
+    run_id: str, threshold_pct: int, returncode: int, verdict: Mapping[str, Any] | None
+) -> Completion:
+    verdict = verdict or {}
+    share = verdict.get("share")
+    concluded = {os.EX_OK: CompletionStatus.FIRE, os.EX_TEMPFAIL: CompletionStatus.NOT_YET}
+    if returncode in concluded:
+        return Completion(
+            concluded[returncode],
+            run_id,
+            threshold_pct,
+            share=share if isinstance(share, float) else None,
+            vacuous=verdict.get("vacuous") is True,
+        )
+    error_code = verdict.get("error")
+    if returncode == 2 and error_code == _EMPTY_RUN_ERROR:
+        return Completion(CompletionStatus.FILED_NOTHING, run_id, threshold_pct)
+    named = (
+        "no verdict line" if not verdict
+        else error_code if isinstance(error_code, str)
+        else "no error code"
+    )
+    return Completion(
+        CompletionStatus.ERROR, run_id, threshold_pct, detail=f"exit {returncode}, {named}"
+    )
+
+
+def _warn_not_applicable(completion: Completion, check_output: str = "") -> None:
+    logger.warning(
+        "%s -- condition (a) fails safe (no fire on completion); the novelty spike "
+        "still evaluates (plans/census-incremental-prd.md C7 (a))%s",
+        completion.reason,
+        f"; check output: {_bounded_repr(check_output)}" if check_output else "",
+    )
+
+
+def check_completion(
+    run_id: str | None,
+    *,
+    project_root: str | Path,
+    threshold_pct: int,
+    runner: CompletionRunner,
+) -> Completion:
+    """Condition (a): whether the previous census run *run_id* has landed
+    *threshold_pct* percent of its filed tasks' weight in *project_root*,
+    and only there (D9). Never raises; every outcome that is not FIRE or
+    NOT_YET logs exactly one WARNING."""
+    if run_id is None:
+        completion = Completion(CompletionStatus.NO_PREVIOUS_RUN, None, threshold_pct)
+        _warn_not_applicable(completion)
+        return completion
+
+    args = [
+        "--run", run_id,
+        "--threshold", f"{threshold_pct / 100:g}",
+        "--project-root", str(Path(project_root).resolve()),
+    ]
+    try:
+        done = runner(args)
+    except Exception as exc:  # noqa: BLE001 - the trigger must never crash its caller
+        completion = Completion(
+            CompletionStatus.ERROR,
+            run_id,
+            threshold_pct,
+            detail=f"{type(exc).__name__}: {_bounded_repr(str(exc))}",
+        )
+        _warn_not_applicable(completion)
+        return completion
+
+    completion = _completion_from_exit(
+        run_id, threshold_pct, done.returncode, _verdict_line(done.stdout)
+    )
+    if completion.status is CompletionStatus.ERROR:
+        _warn_not_applicable(completion, (done.stdout or "").strip())
+    elif completion.status is CompletionStatus.FILED_NOTHING:
+        _warn_not_applicable(completion)
+    return completion
 
 
 # ---------------------------------------------------------------------------
