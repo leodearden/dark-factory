@@ -7,19 +7,17 @@ default is 1 (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`).
 The knob is green-tier (`config.py::RELOADABLE_FIELDS`), so it applies through
 `reload_config` without a restart.
 
-**Current setting: 2, since 2026-11-09.** The basis is Leo's load-monitor
-rule, applied in commit `738ac3ffa1` ("config: verify_admission_task_slots
-1 -> 2 (load-monitor rule, 2026-11-09 14:13Z)"); the measurements are under
-"2026-11-09" in the Value history below. The commit's revert triggers: *"Revert
-to 1 if PSI median > 50, local merge median > 46 min, or any oom_kill."* The
-value is applied by `reload_config` (green-tier, no restart).
+**Current setting.** The current value is whatever the key in the yaml reads.
+Its basis, how it was applied and its revert triggers are in the latest entry
+under "Value history" below; nothing else in this file restates it.
 
-Values so far: 1 -> 3 on 2026-09-03, -> 1 on 2026-09-08, -> 2 on 2026-09-23,
--> 1 on 2026-09-27, -> 2 on 2026-11-09.
+A change to the value touches two places besides the key, in the same commit:
 
-Every change to the value appends a dated entry under "Value history", plus a
-dated measurement section when the change rests on a measured gate. The yaml
-comment keeps only the current value's one-line rationale and a pointer here.
+1. append a dated entry under "Value history" (plus a dated measurement
+   section when the change rests on a measured gate);
+2. rewrite the yaml comment's current-value rationale, the "N since DATE"
+   sentence directly above the key, which points here.
+
 Each later re-measurement appends a dated section below and reuses the
 Reproduction commands (§6 of the 2026-09-27 section).
 
@@ -27,8 +25,9 @@ Reproduction commands (§6 of the 2026-09-27 section).
 
 ## Value history
 
-One entry per change to the value, plus one correction, oldest first. Where a
-later entry retracts or overrides an earlier one, both entries say so.
+One entry per change to the value, plus one correction, oldest first; the last
+entry is the current setting. Where a later entry retracts or overrides an
+earlier one, both entries say so.
 
 ### 2026-09-03 — 1 -> 3
 

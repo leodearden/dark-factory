@@ -918,7 +918,8 @@ verify_admission_pytest_n: "8"
 # schedulers paused and host PSI, root CPU and merge-lane busy under threshold
 # (commit 738ac3ffa1). Basis, revert triggers and the dated value history (two
 # earlier raises were measured and reverted): plans/verify-admission-task-slots-gate.md.
-# Append a dated entry there with any change to this value.
+# Any change to this value appends a dated entry there AND rewrites the
+# "N since DATE" sentence above, in the same commit.
 # GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
 # applies via reload_config with no restart, which matters: a restart destroys
 # the in-flight work this knob protects.
