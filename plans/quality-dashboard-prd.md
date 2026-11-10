@@ -186,6 +186,21 @@ negative, so an EWMA chart can never show improvement at these rates.
     runs inside the loop, resumable through the cursor; the loop runs `git` as the dashboard's first
     subprocess over project roots and only over roots in `config.all_project_roots` that are git
     checkouts.
+
+    **Correction (β, 2026-11-09).** `sample_state.cursor_sha` is the newest stored first-claim
+    on-line landing. A tick does not resume from `LandingBatch.next_cursor`: it resumes from the newest
+    stored first claim that landed at least `DISPATCH_ROW_SETTLE_SECONDS` (1800 s) before the tick
+    (`dashboard/src/dashboard/data/quality_sampler.py::collect_quality`,
+    `::DISPATCH_ROW_SETTLE_SECONDS`). So `landings()` re-emits a row younger than the dispatch-row lag
+    and the upsert re-measures it in place (the "β must re-measure" residual of §Contract → Per-landing
+    row), and a budget-truncated cold backfill resumes exactly from what was stored. The residual it
+    shares with α's `next_cursor`: a first claim whose landed_at order inverts its first-parent order
+    could be skipped (0 such inversions measured among 3,539 df first claims, 2026-11-09). Beside the
+    cursor, a value `sample_state` row carries `landings_sampled`, `landings_deferred` (emitted but past
+    that tick's git budget) and the three `GitCrossCheck` counts over the tick's emitted range; a gap
+    row carries only its verbatim reason. The key's `project_id` is
+    `shared/src/shared/project_id.py::project_id_for_root` of the root, passed to `landings()`
+    explicitly. `late_events` is created with no producer yet: α ships no revert detector.
 15. **Endpoint and window.** `dashboard/src/dashboard/api/quality.py` registered with one
     `app.include_router`: `GET /api/v2/dashboard/quality?project=<label>&window=<spec>` returning
     `{QUALITY: Datum[QualitySeries], QUALITY_MARKERS: Datum[list[Marker]], QUALITY_SNAPSHOTS:
@@ -595,6 +610,20 @@ apply (no load-sampler metric). No waivers.
    proven per session: `invocation_end` carries no session id.
 3. **Per-merge git cost** (inferred ~30 ms, unmeasured): β measures it and sets the per-root budget from
    the measurement. Decide during β.
+   **Resolved by β (2026-11-09)**, measured on the df main checkout at load ~30 on 32 cores through α's
+   public functions: `git rev-list --first-parent --parents` 0.23 s; a full-history `landings()`
+   0.57 s over 3,545 landings; `landed_lines` per unit median 13.7 ms, p90 44.8 ms, p99 137 ms, max
+   145 ms over the newest 200 units (oldest 200: median 16.8 ms, max 67 ms); a cold `rows_for` at a
+   60 s budget measured 3,112 of 3,545 rows in 62.2 s, then the remaining 433 in 7.5 s; reify's full
+   history (2,549 landings) took 40.1 s; max RSS 134 MB. Among 3,539 df first-claim on-line landings,
+   ordinal (landed_at) order and first-parent position order show 0 inversions. The choices, in
+   `dashboard/src/dashboard/data/quality_sampler.py`: `QUALITY_GIT_BUDGET_SECONDS` = 30 (at least 219
+   units even at p99, against df's ~1.6 landings per tick, so a steady-state tick is never truncated;
+   it also bounds how long a dashboard shutdown waits on an in-flight worker thread);
+   `QUALITY_REV_LIST_TIMEOUT_SECONDS` = 30; and the per-root backstop
+   `QUALITY_PER_ROOT_BUDGET_SECONDS` = 180 s, between its floor (rev-list 30 +
+   `FIRST_UNIT_GIT_FLOOR_S` 60 + runs.db reads of at most ~8 s) and its ceiling (half the 600 s tick,
+   300 s). A cold backfill takes ≈4 ticks for df and ≈3 for reify.
 4. **Module key for non-`<pkg>/src/<pkg>` layouts.** Resolved by α (2026-11-04): `<pkg>/src/<pkg2>/<rest>`
    keys as `<pkg>/<rest[0]>`; otherwise the first two components at depth ≥ 3, else the first
    (`crates/reify-core/src/lib.rs` → `crates/reify-core`). See
