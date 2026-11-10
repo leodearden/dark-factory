@@ -247,6 +247,21 @@ class PolicyAction(StrEnum):
     REPROBE_QUARANTINE = 'reprobe_quarantine'
 
 
+# The acts the ratified skeleton counts as reversible
+# (docs/escalation-standing-policy.md '## Reversible actions').
+REVERSIBLE_POLICY_ACTIONS: frozenset[PolicyAction] = frozenset({
+    PolicyAction.CLOSE_ONLY,
+    PolicyAction.RESUME,
+    PolicyAction.ADD_DEPENDENCY,
+    PolicyAction.UPDATE_TASK_AMENDMENT,
+    PolicyAction.FILE_TASK,
+})
+
+# Not reversible, but stampable under a named waiver (Leo, 2026-11-04;
+# plans/decision-stream-prd.md §3 decision 7).
+REVERSIBILITY_WAIVED_ACTIONS: frozenset[PolicyAction] = frozenset({PolicyAction.DONE_FLIP})
+
+
 _RESOLVE_ACTIONS: frozenset[str] = frozenset(action for action, _, _ in ACTION_EFFECTS)
 
 # A file-writing or main-moving class is audited at 100% until it has this
@@ -318,8 +333,8 @@ class PolicyRow:
 
     @property
     def reversible(self) -> bool:
-        """False only for a done flip (waived, Leo 2026-11-04; PRD §3 decision 7)."""
-        return PolicyAction.DONE_FLIP not in self.actions
+        """True iff every act the row allows is reversible; a waived act does not make a row reversible."""
+        return self.actions <= REVERSIBLE_POLICY_ACTIONS
 
     @property
     def audit_full_until(self) -> int:
