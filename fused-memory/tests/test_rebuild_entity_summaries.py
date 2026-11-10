@@ -851,6 +851,27 @@ class TestDetectStaleSummariesDryRun:
         assert all('RuntimeError' in r.message for r in warnings)
 
     @pytest.mark.asyncio
+    async def test_edge_fetch_failure_warns_under_the_callers_logger(
+        self, mock_config, make_backend, make_edge_backend, caplog
+    ):
+        """Every warning the probe emits follows ``log``, the per-node edge fetch's too."""
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
+        ], edges={})
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match='boom'):
+            await backend.detect_stale_dry_run(
+                group_id='test', log=logging.getLogger('test.stale_probe')
+            )
+
+        edge_warnings = {
+            r.name for r in caplog.records
+            if r.levelno == logging.WARNING and 'get_valid_edges_for_node' in r.getMessage()
+        }
+        assert edge_warnings == {'test.stale_probe'}
+
+    @pytest.mark.asyncio
     async def test_result_correctness_under_parallel_execution(
         self, mock_config, make_backend, make_edge_backend
     ):

@@ -5142,8 +5142,9 @@ class GraphitiBackend:
             max_concurrency: Maximum number of concurrent ``get_valid_edges_for_node``
                 requests in flight at once.  Defaults to 10.  Raise or lower to tune
                 the trade-off between latency and DB connection pressure.
-            log: Logger for the node read's EMPIRICAL warning, so a caller's
-                rebuild reports its short read beside its own log lines.
+            log: Logger for every warning the probe emits (the node read's
+                EMPIRICAL warning and each failed ``get_valid_edges_for_node``),
+                so a caller's rebuild reports them beside its own log lines.
 
         Returns:
             StaleProbeResult.  ``stale`` carries the same per-entity dict schema
@@ -5181,7 +5182,7 @@ class GraphitiBackend:
         gather_results = await gather_or_raise(
             (_fetch_one(e) for e in fetch_entities),
             label='detect_stale_dry_run: get_valid_edges_for_node failed',
-            logger=logger,
+            logger=log,
         )
 
         stale: list[dict] = []
