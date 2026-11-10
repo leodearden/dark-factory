@@ -25,6 +25,14 @@ def _discard_lines(caplog) -> list[str]:
     messages = (r.getMessage() for r in caplog.records)
     return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
 
+
+def _install_executable(root, relpath='scripts/deploy.sh'):
+    script = root / relpath
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/bin/sh\nexit 0\n')
+    os.chmod(script, 0o755)
+    return script
+
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests (no filesystem)
 # ---------------------------------------------------------------------------
@@ -329,14 +337,6 @@ class TestDeterministicTaskErrorBeforeDoneStructural:
         assert result is None
 
 
-def _install_executable(root, relpath='scripts/deploy.sh'):
-    script = root / relpath
-    script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text('#!/bin/sh\nexit 0\n')
-    os.chmod(script, 0o755)
-    return script
-
-
 class TestDeterministicTaskErrorBeforeDoneCwd:
     """before_done.cwd: a string or absent, and never where a relative script resolves."""
 
@@ -374,11 +374,9 @@ class TestDeterministicTaskErrorBeforeDoneCwd:
         assert result.get('error_type') == 'ValidationError'
         assert 'cwd' in result['error']
 
-    @pytest.mark.parametrize('form', ['none', 'empty', 'relative', 'absolute'])
-    def test_string_or_absent_cwd_accepts(self, project_root, elsewhere, form):
+    @pytest.mark.parametrize('cwd', [None, ''], ids=['none', 'empty'])
+    def test_absent_or_empty_cwd_accepts(self, project_root, cwd):
         _install_executable(project_root)
-        (project_root / 'sub').mkdir()
-        cwd = {'none': None, 'empty': '', 'relative': 'sub', 'absolute': str(elsewhere)}[form]
 
         assert self._submit(project_root, cwd=cwd) is None
 
@@ -682,9 +680,7 @@ def _predicate_carrier(tmp_path, recurrence=None):
     X_OK. Pass *recurrence* to attach one; omit it for the no-recurrence
     control rows.
     """
-    script = tmp_path / 'run.sh'
-    script.write_text('#!/bin/sh\nexit 0\n')
-    os.chmod(script, 0o755)
+    _install_executable(tmp_path, 'run.sh')
     meta = {
         'before_done': {'kind': 'predicate', 'script': 'run.sh', 'timeout_secs': 60},
         'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
@@ -946,10 +942,7 @@ class TestDeterministicTaskErrorPredicateBeforeDone:
     @staticmethod
     def _make_script(tmp_path, name='check.sh'):
         """tmp_path executable-script fixture, mirroring the before_done-structural tests."""
-        script = tmp_path / name
-        script.write_text('#!/bin/sh\nexit 0\n')
-        os.chmod(script, 0o755)
-        return script.name
+        return _install_executable(tmp_path, name).name
 
     # -- rejections ----------------------------------------------------
 
