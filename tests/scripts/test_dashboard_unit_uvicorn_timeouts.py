@@ -357,9 +357,8 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
     Each poller holds its own keep-alive connection and reuses it at its OWN
     interval, so a keep-alive above data.js's 3s data refresh but at-or-below
     tab_overview.jsx's 5s /api/load poll still exposes that race on the slower
-    socket — which is precisely the state this test used to certify as green
-    (see tests/scripts/dashboard_client_pollers.py::CLIENT_POLLERS).  Hence the
-    comparison is against slowest_client_poll().
+    socket (see tests/scripts/dashboard_client_pollers.py::CLIENT_POLLERS).
+    Hence the comparison is against slowest_client_poll().
 
     That comparison is against the connection-REUSE interval, which is not the
     same as the timer period: data.js delays each request by up to

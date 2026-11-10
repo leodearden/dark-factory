@@ -34,18 +34,13 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # test_template_renders_to_hardcoded_file renders the template rather than
 # restating its contents.
 #
-# CORRECTION (task 4087): deriving that value from data.js ALONE was the same
-# class of rot one level up.  The browser runs more than one recurring HTTP
-# poller, and each holds its own keep-alive connection and reuses it at its own
-# interval — so the bound must clear the SLOWEST of them, not whichever one this
-# module happened to know about.  tab_overview.jsx has polled /api/load every
-# 5000ms for the entire life of this invariant while the derivation saw only
-# data.js's 3000ms, leaving keep-alive=5 sitting exactly ON the boundary
-# (5000 > 5000 is false) with the suite green.  CLIENT_POLLERS below makes the
-# covered set explicit and slowest_client_poll() makes the bound relational
-# against all of it; tests/scripts/test_dashboard_client_pollers.py::
-# test_every_client_setinterval_is_registered_or_allowlisted makes an UNcovered
-# new poller a loud failure rather than a silent one.
+# The browser runs more than one recurring HTTP poller, and each holds its own
+# keep-alive connection and reuses it at its own interval, so the bound must
+# clear the SLOWEST of them.  CLIENT_POLLERS below names the covered set,
+# slowest_client_poll() reduces over it, and
+# tests/scripts/test_dashboard_client_pollers.py::
+# test_every_client_setinterval_is_registered_or_allowlisted makes an
+# unregistered new poller a loud failure rather than a silent one.
 REDUX_DIR = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux"
 POLL_JS = REDUX_DIR / "data.js"
 
@@ -55,11 +50,9 @@ POLL_JS = REDUX_DIR / "data.js"
 LOAD_POLL_JSX = REDUX_DIR / "tab_overview.jsx"
 
 # The poller names its period explicitly, so anchor on that name rather than on
-# whichever call site happens to consume it.  An earlier revision scraped the
-# sole ``setInterval(..., <literal>)`` in the file; that broke the moment the
-# poller was refactored to pass a named constant (and gained unrelated
-# setTimeout-based fetch deadlines), because the literal no longer appeared at
-# the call site.  Binding to the declaration is both stabler and more precise.
+# whichever call site happens to consume it.  A call-site literal is gone the
+# moment a poller passes a named constant instead, so bind to the declaration,
+# not to the literal: it is both stabler and more precise.
 #
 # The name is a PARAMETER rather than a module constant because more than one
 # client poller declares a period (see CLIENT_POLLERS below).  The patterns are
@@ -159,8 +152,7 @@ class ClientPoller(typing.NamedTuple):
 
 # Every recurring HTTP poller in the shipped client.  Membership is the property
 # that matters: an unregistered poller is one the keep-alive floor does not
-# clear, which is exactly how tab_overview.jsx's 5s /api/load poll went
-# unnoticed.  Periods are read from the live sources at run time (never restated
+# clear.  Periods are read from the live sources at run time (never restated
 # here), so there is no third copy to go stale.
 #
 # data.js registers its JITTER_MAX_MS too, because its timer period alone
@@ -291,15 +283,15 @@ def _strip_js_comments(source: str) -> str:
     protocol-relative ``"//cdn…"`` or a ``//`` inside a regex literal would
     still over-strip.
 
-    That residual is a real hole, NOT a safe direction.  An earlier version of
-    this docstring claimed over-stripping "can only HIDE a site, which the
-    stale-allowlist half then surfaces" — that is wrong, and worth recording so
-    nobody re-derives it: the stale check only fires for a site that ALREADY has
-    a NON_POLLING_TIMERS entry.  A newly added poller sharing a line with an
-    over-stripped ``//`` has no entry to go stale, so it would be hidden with
-    nothing to report it — precisely the silent-uncovered-poller failure this
-    guard exists to prevent.  If such a line ever appears, extend the stripper
-    to skip string/template spans rather than working around it.
+    That residual is a real hole, NOT a safe direction: the stale check only
+    fires for a site that ALREADY has a NON_POLLING_TIMERS entry.  A newly
+    added poller sharing a line with an over-stripped ``//`` has no entry to go
+    stale, so it would be hidden with nothing to report it — precisely the
+    silent-uncovered-poller failure that
+    tests/scripts/test_dashboard_client_pollers.py::
+    test_every_client_setinterval_is_registered_or_allowlisted exists to
+    prevent.  If such a line ever appears, extend the stripper to skip
+    string/template spans rather than working around it.
     """
     return _JS_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
 
@@ -361,8 +353,8 @@ def unclassified_setinterval_sites(
     constant name alone.  Matching on the name alone would wave through a
     ``setInterval(fetchX, POLL_INTERVAL_MS)`` in some other file — covered, says
     the guard; never read, says slowest_client_poll, which only ever opens the
-    paths CLIENT_POLLERS registers — re-creating this task's silent-coverage
-    hole one level down.  That is reachable rather than theoretical for .jsx:
+    paths CLIENT_POLLERS registers — re-creating the silent-coverage hole one
+    level down.  That is reachable rather than theoretical for .jsx:
     they load as ``type="text/babel"`` and Babel standalone evaluates each
     separately, so a same-named top-level ``const`` in a second .jsx need not
     collide with data.js's global (dashboard/tests/js/classic_script_scope.test.mjs).

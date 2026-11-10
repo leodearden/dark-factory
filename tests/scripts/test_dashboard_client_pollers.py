@@ -282,14 +282,10 @@ def test_host_load_poller_declares_a_named_interval() -> None:
     be read is a poller the bound cannot clear.
 
     Naming the period rather than leaving a bare ``setInterval(fetchLoad, 5000)``
-    literal is what makes that derivation stable.  That lesson was already
-    learned and recorded for data.js (see the comment above
-    tests/scripts/dashboard_client_pollers.py::_int_decl_pattern): scraping the
-    literal at the call site broke the moment the poller was refactored to pass
-    a named constant, and binding to the declaration is both stabler and more
-    precise.  The same reasoning
-    applies here, and the declaration additionally gives the JSX a place to
-    carry the "this feeds the systemd keep-alive bound" warning.
+    literal is what makes that derivation stable, for the reason in the comment
+    above tests/scripts/dashboard_client_pollers.py::_int_decl_pattern.  The
+    declaration also gives the JSX a place to carry the "this feeds the systemd
+    keep-alive bound" warning.
     """
     assert LOAD_POLL_JSX.is_file(), (
         f"Host-load poll source not found at {LOAD_POLL_JSX}. The keep-alive "
@@ -378,15 +374,13 @@ def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
     renamed constant fails loudly here instead of silently dropping a poller out
     of the max and quietly lowering the floor.
 
-    The defect this task exists to remove is a registry that covers only
-    data.js, so what is pinned is MEMBERSHIP: at least two entries, both
-    specific pollers present, and the reduction returning one of them.  The
-    relative ORDER of the two periods is deliberately left unpinned — an earlier
-    revision asserted the slowest was strictly slower than data.js's, which
-    reads as "the registry collapsed" but would also fire on a perfectly
-    legitimate retune (dropping /api/load to 2s, or raising the data refresh
-    past 5s) that leaves the registry complete and the bound correct.  A guard
-    that reports a false cause is worse than one that reports nothing.
+    What is pinned is MEMBERSHIP: at least two entries, both specific pollers
+    present, and the reduction returning one of them.  The relative ORDER of
+    the two periods is deliberately left unpinned: an order assertion would
+    also fire on a perfectly legitimate retune (dropping /api/load to 2s, or
+    raising the data refresh past 5s) that leaves the registry complete and the
+    bound correct.  A guard that reports a false cause is worse than one that
+    reports nothing.
     """
     assert len(CLIENT_POLLERS) >= 2, (
         f"CLIENT_POLLERS has {len(CLIENT_POLLERS)} entr(y/ies); the shipped "
@@ -460,12 +454,8 @@ def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
 def test_every_client_setinterval_is_registered_or_allowlisted() -> None:
     """Every recurring timer in the client must be classified, not merely absent.
 
-    This is the guard that would have caught the defect this module now carries
-    a correction for.  tab_overview.jsx polled /api/load every 5000ms for the
-    entire life of the keep-alive invariant; the derivation read data.js and
-    nothing else, so the second poller was never part of the bound and
-    keep-alive sat exactly ON its boundary (5000 > 5000 is false) with the whole
-    suite green.  Nothing failed, because nothing was looking.
+    An unregistered poller is one the keep-alive floor does not clear, and
+    nothing else would notice it.
 
     So membership is checked from the CLIENT side, not just the registry side:
     every setInterval under the shipped redux tree must be accounted for by one

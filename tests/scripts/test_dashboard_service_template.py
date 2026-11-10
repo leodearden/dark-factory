@@ -97,15 +97,9 @@ HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
 # which is the code setup-host.sh section 8 actually runs to install this unit.
 # Both sentinels are replaced globally, unanchored and literally.
 #
-# THE RENDER TEST CALLS THAT FUNCTION rather than replaying the substitution
-# here, and the reason is specific rather than tidiness. Until task 4793 the
-# installer used `sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" ... > "$UNIT_DIR/<unit>"`
-# and this module replayed it as two str.replace calls, justified by a comment
-# arguing the two spellings were semantically identical. That argument was
-# sound and the citation still rotted: "setup-host.sh lines 325-329" now points
-# into the orchestrator unit array, and the sed it named no longer exists at all.
-# A lockstep claim made THROUGH the installer's own function cannot drift from
-# the installer, and needs no line range to stay true.
+# The render test calls render_systemd_unit.render_template rather than
+# replaying the substitution here, so its lockstep claim is made THROUGH the
+# installer's own function and cannot drift from the installer.
 HARDCODED_SERVICE_REPO_ROOT = "/home/leo/src/dark-factory"
 HARDCODED_SERVICE_UV_PATH = "/home/leo/.local/bin/uv"
 
@@ -584,8 +578,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     is the function setup-host.sh section 8 runs to install this unit, so the
     two repo-side files are held in lockstep by the same code that renders the
     host-side one. A replayed copy of the substitution would be a third
-    spelling, unguarded, and the citation it needed to justify itself has
-    already rotted once — see the comment above HARDCODED_SERVICE_REPO_ROOT.
+    spelling, unguarded.
 
     If this test fails, the template and hardcoded file have drifted.  Re-render
     with::
