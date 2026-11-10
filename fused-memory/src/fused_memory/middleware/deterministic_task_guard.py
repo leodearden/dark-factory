@@ -21,11 +21,11 @@ these invariants is violated:
    ``script`` required string that resolves UNDER ``project_root`` — or, when
    ``script_root='factory'``, under the dark-factory root
    (``shared.repo_paths.resolve_dark_factory_root``) — exists, and is
-   executable (``os.access X_OK``); ``timeout_secs`` required positive int;
-   ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``;
-   ``script_root`` (when present) must be one of ``{'project', 'factory'}``,
-   and ``'factory'`` requires ``kind='predicate'``. An unresolvable
-   dark-factory root is a rejection.
+   executable (``os.access X_OK``); ``cwd`` (when present) must be a string;
+   ``timeout_secs`` required positive int; ``kind`` (when present) must be
+   one of ``{'deploy', 'predicate'}``; ``script_root`` (when present) must
+   be one of ``{'project', 'factory'}``, and ``'factory'`` requires
+   ``kind='predicate'``. An unresolvable dark-factory root is a rejection.
 4b. ``before_done``'s key set is closed to ``BeforeDone``'s declared fields.
    An unknown key is refused with ``error_type='UnsupportedTaskMetadata'``,
    naming the running capabilities, so a client meeting an older server
@@ -632,6 +632,16 @@ def _validate_before_done(
         return _validation_error(
             "before_done.script is required and must be a non-empty string path.",
             hint="Set 'script' to a relative path of an executable file under project_root.",
+        )
+
+    cwd = before_done.get('cwd')
+    if cwd is not None and not isinstance(cwd, str):
+        return _validation_error(
+            f"before_done.cwd must be a string path when present (got {type(cwd).__name__!r}).",
+            hint=(
+                "Omit 'cwd' to run the script from project_root, or set it to a "
+                'directory path; a relative cwd joins project_root.'
+            ),
         )
 
     try:
