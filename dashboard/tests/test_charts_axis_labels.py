@@ -981,3 +981,43 @@ def test_chart_flag_extractor_is_discriminating() -> None:
             'd.depth.values',
             'countAxis',
         ), f'the flag extractor reads a countAxis inside the quoted value {quoted} as the attribute.'
+
+
+@pytest.mark.parametrize(
+    'quoted',
+    ['title="a } b"', 'aria-label="a/>b"'],
+)
+def test_chart_site_readers_confine_each_site_to_its_own_opening_tag(quoted: str) -> None:
+    """A `}` or `/>` inside a quoted attribute neither ends nor derails the chart's tag."""
+    src = f'<LC {quoted} series={{[{{ values: d.depth.values }}]}} countAxis />'
+
+    assert _chart_flag(src, _LINE_CHART_TAG_RE, 'd.depth.values', 'countAxis'), (
+        f'the caller audit loses the chart whose quoted attribute is {quoted}: '
+        'a count axis that declares countAxis would be reported as renamed or '
+        'removed, and the audit would fail on the prose, not the chart.'
+    )
+
+
+def test_a_child_elements_attributes_are_not_the_charts() -> None:
+    """A chart with children is read from its opening tag only."""
+    with_flagged_child = '<LC series={[{ values: d.depth.values }]}>\n  <Legend countAxis />\n</LC>'
+    assert not _chart_flag(with_flagged_child, _LINE_CHART_TAG_RE, 'd.depth.values', 'countAxis'), (
+        "the flag extractor reads a child <Legend>'s countAxis as the chart's: a "
+        'fraction axis with such a child would pass the audit while snapping to 0%..400%.'
+    )
+
+    with_formatting_child = '<LC series={[{ values: d.depth.values }]}>\n  <Legend formatY={x} />\n</LC>'
+    assert _line_chart_format_y(with_formatting_child, 'd.depth.values') is None, (
+        "the prop extractor reads a child <Legend>'s formatY as the chart's: the "
+        'ratio guard would accept a site that in fact keeps the rounding default.'
+    )
+
+
+def test_chart_site_readers_strip_comments_before_walking() -> None:
+    """An apostrophe in a comment inside a multi-line prop must not derail the walk."""
+    src = "<LC\n  series={[\n    // don't snap: a ratio\n    { values: row.ratio },\n  ]}\n  countAxis\n/>"
+
+    assert _chart_flag(src, _LINE_CHART_TAG_RE, 'row.ratio', 'countAxis'), (
+        "an apostrophe in a comment inside the chart's series reads as an open "
+        'quote, so the audit would mis-span the chart and misreport its countAxis.'
+    )
