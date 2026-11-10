@@ -1421,9 +1421,11 @@ def extract_df_data_block(src: str, key: str) -> str:
 #
 # Spans one opening tag, attributes included, so a probe can confine itself to
 # that element.  `jsx_open_tag_end` is the walk from one known `<`;
-# `jsx_open_tags` reads every opening tag a pattern finds, comment-stripped.
-# Contracts: test_jsx_source_helpers.py::TestJsxOpenTagEnd and
-# test_jsx_source_helpers.py::TestJsxOpenTags.
+# `jsx_open_tags` reads every opening tag a pattern finds, comment-stripped;
+# `jsx_prop_expr` reads one prop's expression out of such a tag.
+# Contracts: test_jsx_source_helpers.py::TestJsxOpenTagEnd,
+# test_jsx_source_helpers.py::TestJsxOpenTags and
+# test_jsx_source_helpers.py::TestJsxPropExpr.
 # ---------------------------------------------------------------------------
 
 
@@ -1490,6 +1492,30 @@ def jsx_open_tags(src: str, pattern: re.Pattern[str]) -> list[str]:
             )
         tags.append(code[m.start() : end])
     return tags
+
+
+def jsx_prop_expr(opening_tag: str, prop: str) -> str | None:
+    """Return the expression inside *opening_tag*'s own ``prop={...}``, stripped.
+
+    ``None`` when the tag passes no braced *prop*.  The search and the brace
+    walk run over the `_mask_js` text, so a quoted brace or a quoted
+    ``prop={`` is not code, and only a prop at brace depth 0 counts: a nested
+    element's ``prop={...}`` is not this tag's.  Raises when the expression
+    never closes.  *opening_tag* is a `jsx_open_tags` result.
+    """
+    spans = _scan_js(opening_tag)
+    _assert_js_lexable(opening_tag, spans)
+    code = _mask_js(opening_tag, spans)
+    for m in re.finditer(rf'\b{re.escape(prop)}=\{{', code):
+        if code.count('{', 0, m.start()) != code.count('}', 0, m.start()):
+            continue
+        open_at = m.end() - 1
+        braced = walk_balanced(code, open_at)
+        assert braced, (
+            f'jsx_prop_expr: {prop}={{...}} never closes in {opening_tag[:80]!r}'
+        )
+        return opening_tag[open_at + 1 : open_at + len(braced) - 1].strip()
+    return None
 
 
 # ---------------------------------------------------------------------------

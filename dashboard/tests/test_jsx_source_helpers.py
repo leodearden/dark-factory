@@ -41,6 +41,7 @@ from _dashboard_helpers import (
     find_script_position,
     jsx_open_tag_end,
     jsx_open_tags,
+    jsx_prop_expr,
     strip_js_comments,
     walk_balanced,
 )
@@ -988,6 +989,37 @@ class TestJsxOpenTags:
     def test_a_match_not_starting_at_the_angle_is_rejected(self) -> None:
         with pytest.raises(ValueError):
             jsx_open_tags('<A />', re.compile(r'A\b'))
+
+
+class TestJsxPropExpr:
+    """The expression an opening tag passes in its own ``prop={...}``, read
+    quote-aware: a quoted brace or a quoted ``prop={`` is not code, and a
+    nested element's prop is not the tag's.
+    """
+
+    def test_returns_the_braced_expression_stripped(self) -> None:
+        assert jsx_prop_expr('<A x={ [{ v: 1 }] } />', 'x') == '[{ v: 1 }]'
+
+    def test_an_absent_or_string_valued_prop_is_none(self) -> None:
+        assert jsx_prop_expr('<A y={1} />', 'x') is None
+        assert jsx_prop_expr('<A x="1" />', 'x') is None
+
+    def test_only_the_whole_prop_name_matches(self) -> None:
+        assert jsx_prop_expr('<A xdatum={1} datum={2} />', 'datum') == '2'
+
+    def test_a_quoted_brace_inside_the_expression_does_not_end_it(self) -> None:
+        assert jsx_prop_expr("<A f={v => '}'} />", 'f') == "v => '}'"
+        assert jsx_prop_expr('<A f={v => `${v}%`} />', 'f') == 'v => `${v}%`'
+
+    def test_a_quoted_prop_in_another_attribute_is_not_the_prop(self) -> None:
+        assert jsx_prop_expr('<A t="x={1}" x={2} />', 'x') == '2'
+
+    def test_a_nested_elements_prop_is_not_the_tags(self) -> None:
+        assert jsx_prop_expr('<A legend={<B x={1} />} />', 'x') is None
+
+    def test_an_expression_that_never_closes_raises_quoting_the_tag(self) -> None:
+        with pytest.raises(AssertionError, match=r'<A x=\{1'):
+            jsx_prop_expr('<A x={1', 'x')
 
 
 class TestScriptOrderHelpers:

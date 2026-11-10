@@ -16,8 +16,8 @@ from _dashboard_helpers import (
     extract_function_body,
     jsx_open_tag_end,
     jsx_open_tags,
+    jsx_prop_expr,
     strip_js_comments,
-    walk_balanced,
 )
 
 # ---------------------------------------------------------------------------
@@ -509,25 +509,17 @@ def _burn_tab_body(tabs_jsx_body):
     return strip_js_comments(extract_function_body(tabs_jsx_body, 'BurnTab'))
 
 
-def _opening_tags(src, tag):
-    return jsx_open_tags(src, re.compile(rf'<{tag}\b'))
+def _opening_tags(src, tag_name):
+    return jsx_open_tags(src, re.compile(rf'<{tag_name}\b'))
 
 
-def _prop_expr(tag, name):
-    """The expression inside ``name={...}``, or None when the prop is absent."""
-    m = re.search(rf'\b{name}=\{{', tag)
-    if not m:
-        return None
-    return walk_balanced(tag, m.end() - 1)[1:-1].strip()
-
-
-def _prop_label(tag):
-    m = re.search(r'\blabel=["\']([^"\']*)["\']', tag)
+def _prop_label(opening_tag):
+    m = re.search(r'\blabel=["\']([^"\']*)["\']', opening_tag)
     return m.group(1) if m else None
 
 
 def _burn_tiles(body):
-    return {_prop_label(tag): tag for tag in _opening_tags(body, 'ST')}
+    return {_prop_label(opening_tag): opening_tag for opening_tag in _opening_tags(body, 'ST')}
 
 
 def _assert_served_datum(body, where, expr):
@@ -562,22 +554,22 @@ class TestBurnTabReadsServedDatums:
         body = _burn_tab_body(tabs_jsx_body)
         tiles = _burn_tiles(body)
         assert set(tiles) == _BURN_TILE_LABELS
-        for label, tag in tiles.items():
-            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(tag, 'datum'))
+        for label, opening_tag in tiles.items():
+            _assert_served_datum(body, f'the {label!r} tile', jsx_prop_expr(opening_tag, 'datum'))
 
     def test_every_pip_and_cell_renders_a_served_datum(self, tabs_jsx_body):
         """The per-project pips and table cells read the same served Datums as the tiles."""
         body = _burn_tab_body(tabs_jsx_body)
-        for name in ('Pip', 'DatumReading'):
-            tags = _opening_tags(body, name)
-            assert tags, f'BurnTab renders no <{name}>'
-            for tag in tags:
-                _assert_served_datum(body, f'a <{name}>', _prop_expr(tag, 'datum'))
+        for tag_name in ('Pip', 'DatumReading'):
+            opening_tags = _opening_tags(body, tag_name)
+            assert opening_tags, f'BurnTab renders no <{tag_name}>'
+            for opening_tag in opening_tags:
+                _assert_served_datum(body, f'a <{tag_name}>', jsx_prop_expr(opening_tag, 'datum'))
 
     def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
         """No client point estimate: the server refuses to synthesise one on sparse history."""
         body = _burn_tab_body(tabs_jsx_body)
-        assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
+        assert jsx_prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
 
 
 class TestBurnTileReader:
@@ -587,18 +579,18 @@ class TestBurnTileReader:
         tiles = _burn_tiles('<ST label="a } b" datum={d} />')
 
         assert set(tiles) == {'a } b'}
-        assert _prop_expr(tiles['a } b'], 'datum') == 'd'
+        assert jsx_prop_expr(tiles['a } b'], 'datum') == 'd'
 
     def test_a_childs_props_are_not_the_tiles(self):
         tile = _burn_tiles('<ST label="x" datum={d}>\n  <Pip datum={other} />\n</ST>')['x']
 
-        assert _prop_expr(tile, 'datum') == 'd'
+        assert jsx_prop_expr(tile, 'datum') == 'd'
         assert 'other' not in tile
 
     def test_a_comment_between_attributes_is_stripped(self):
         tiles = _burn_tiles("<ST\n  label=\"y\"\n  // don't\n  datum={d}\n/>")
 
-        assert _prop_expr(tiles['y'], 'datum') == 'd'
+        assert jsx_prop_expr(tiles['y'], 'datum') == 'd'
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +610,7 @@ class TestCompletedPerDayIsServerSeries:
         assert label_at != -1, "OrchTab no longer labels a 'Completed / day' spark"
         sparks = _opening_tags(body[label_at:], 'SP')
         assert sparks, "no <SP> follows OrchTab's 'Completed / day' label"
-        values = _prop_expr(sparks[0], 'values')
+        values = jsx_prop_expr(sparks[0], 'values')
         assert values and 'BURNDOWN_BY_PROJECT' in values and 'completed_per_day' in values, (
             f"the 'Completed / day' spark plots {values!r}, not the project's served "
             'completed_per_day series'

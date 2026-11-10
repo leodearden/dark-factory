@@ -58,6 +58,7 @@ from _dashboard_helpers import (
     extract_function_body,
     find_function_params,
     jsx_open_tags,
+    jsx_prop_expr,
 )
 
 # ---------------------------------------------------------------------------
@@ -179,28 +180,13 @@ def _tick_generator(body: str) -> str:
     return f'{ticks.group(1)}\n  {y_ticks.group(1)}'
 
 
-def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
-    """WorkflowPanel's own percent formatter, from its ``<C.StackedAreaChart>`` call.
-
-    Non-greedy up to ``} />``, which correctly steps over the ``${...}`` brace
-    pair inside the template literal.
-    """
-    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
-    m = re.search(r'<C\.StackedAreaChart\b[^>]*?formatY=\{(.*?)\}\s*/>', body)
-    assert m is not None, (
-        'WorkflowPanel no longer passes a `formatY={...}` to <C.StackedAreaChart> '
-        '— the 100%-normalized resolver-mix axis this task fixes has moved or '
-        'changed shape.'
-    )
-    return m.group(1).strip()
-
-
 # ---------------------------------------------------------------------------
 # Caller-audit extractors — the props (formatY) and flags (countAxis) that each
 # LineChart and StackedAreaChart CALL SITE passes, read out of the tab sources.
 # Each call site is read from its own opening tag, spanned by
 # `_dashboard_helpers.py::jsx_open_tag_end`, so a quoted `}` or `/>` cannot end
-# it and a child element's attributes are never the chart's.
+# it and a child element's attributes are never the chart's. A prop's
+# expression is read out of that tag by `_dashboard_helpers.py::jsx_prop_expr`.
 #
 # `_line_chart_format_y` returns None for a site that passes no formatter. That
 # None is load-bearing for the esc-per-done ratio guard, which requires the site
@@ -240,24 +226,11 @@ def _chart_prop(body: str, tag_re: re.Pattern, anchor: str, prop: str):
     Returns the expression text, or ``None`` when the site does not pass `prop`
     and therefore inherits the component's default.
     """
-    element = _anchored_chart_tag(body, tag_re, anchor)
-    m = re.search(rf'\b{prop}=\{{', element)
-    if m is None:
-        return None
-    depth = 1
-    i = m.end()
-    while i < len(element) and depth > 0:
-        if element[i] == '{':
-            depth += 1
-        elif element[i] == '}':
-            depth -= 1
-        i += 1
-    assert depth == 0, f'unbalanced {prop}={{...}} in the element anchored at {anchor!r}'
-    return element[m.end() : i - 1].strip()
+    return jsx_prop_expr(_anchored_chart_tag(body, tag_re, anchor), prop)
 
 
-def _attribute_names_only(element: str) -> str:
-    """`element` with every attribute VALUE blanked to spaces, offsets preserved.
+def _attribute_names_only(opening_tag: str) -> str:
+    """`opening_tag` with every attribute VALUE blanked to spaces, offsets preserved.
 
     Blanks braced expressions (``series={[{ countAxis: 1 }]}``) and quoted
     strings at brace depth 0 (``title="countAxis"``), keeping their delimiters,
@@ -266,7 +239,7 @@ def _attribute_names_only(element: str) -> str:
     depth = 0
     quote = None
     kept = []
-    for ch in element:
+    for ch in opening_tag:
         if quote is not None:
             kept.append(ch if ch == quote else ' ')
             if ch == quote:
@@ -305,6 +278,18 @@ def _chart_flag(body: str, tag_re: re.Pattern, anchor: str, prop: str) -> bool:
 def _line_chart_format_y(body: str, anchor: str):
     """The `formatY={...}` of the LineChart call site at `anchor`, or None (task 4232)."""
     return _chart_prop(body, _LINE_CHART_TAG_RE, anchor, 'formatY')
+
+
+def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
+    """WorkflowPanel's own percent formatter, from its ``<C.StackedAreaChart>`` call."""
+    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
+    format_y = _chart_prop(body, _STACKED_AREA_TAG_RE, 'labels={weeks}', 'formatY')
+    assert format_y is not None, (
+        'WorkflowPanel no longer passes a `formatY={...}` to <C.StackedAreaChart> '
+        '— the 100%-normalized resolver-mix axis this task fixes has moved or '
+        'changed shape.'
+    )
+    return format_y
 
 
 def _line_chart_axis_scalars(body: str) -> str:
