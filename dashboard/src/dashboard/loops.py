@@ -1,24 +1,26 @@
-"""The two wall-clock-aligned background samplers and the stores they own.
+"""The three wall-clock-aligned background samplers and the stores they own.
 
 The dashboard writes its own history: ``_burndown_loop`` writes one value
-or gap row per project from the task snapshot unit, and ``_metrics_loop``
-snapshots orchestrator/queue metrics, each on
-a fixed interval aligned to the wall clock so samples from separate
-processes land on the same tick boundaries. Both own a writable WAL-mode
-SQLite store, downsample old rows on a slower cadence, and checkpoint
-periodically so the WAL cannot grow without bound.
+or gap row per project from the task snapshot unit, ``_metrics_loop``
+snapshots orchestrator/queue metrics, and ``_quality_loop`` writes one
+value or gap sample per git-checkout project plus its new landing rows,
+each on a fixed interval aligned to the wall clock so samples from separate
+processes land on the same tick boundaries. Each owns a writable WAL-mode
+SQLite store and checkpoints it periodically so the WAL cannot grow without
+bound. Burndown and metrics also downsample old rows on a slower cadence;
+quality.db is outside the retention policy, so its loop never does.
 
-``_BurndownStore`` and ``_MetricsStore`` live here rather than in
-``app.py`` because they are these loops' writable stores — the loops are
-their only writer, and the migration each performs on ``open()`` exists so
-its loop can run. ``app.py``'s ``lifespan`` constructs both and spawns both
-loops, importing the four names back.
+``_BurndownStore``, ``_MetricsStore`` and ``_QualityStore`` live here rather
+than in ``app.py`` because they are these loops' writable stores — the loops
+are their only writer, and the migration a store performs on ``open()``
+exists so its loop can run. ``app.py``'s ``lifespan`` constructs all three
+and spawns the loops, importing the six names back.
 
-Those four names carry a leading underscore from when this was all one
-file, and they are now this module's interface rather than private detail.
-Read the underscore as vestigial, not as a private-use signal — the move
-that created this module was a pure extraction, with renaming outside its
-scope.
+Those names carry a leading underscore from when burndown and metrics
+lived in one file with the app, and the quality pair follows suit; all six
+are this module's interface rather than private detail. Read the underscore
+as vestigial, not as a private-use signal — the move that created this
+module was a pure extraction, with renaming outside its scope.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS, collect_quality
 from dashboard.data.quality_store import QUALITY_SCHEMA
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
@@ -260,3 +263,29 @@ async def _metrics_loop(
                 last_checkpoint = now
         except Exception:
             logger.warning('Metrics snapshot error', exc_info=True)
+
+
+async def _quality_loop(store: _QualityStore, config: DashboardConfig) -> None:
+    """Each tick, write one quality sample per git-checkout project root.
+
+    Delegates to ``collect_quality``. ``store`` and ``config`` are the
+    lifespan's own handles, never re-read from ``app.state`` (task 3771).
+    """
+    try:
+        await collect_quality(store.connection, config.all_project_roots)
+    except Exception:
+        logger.warning('Initial quality snapshot failed', exc_info=True)
+    last_checkpoint = 0.0
+    while True:
+        await _sleep_to_aligned_tick(QUALITY_SAMPLE_INTERVAL_SECONDS)
+        try:
+            await collect_quality(store.connection, config.all_project_roots)
+            now = time.monotonic()
+            if now - last_checkpoint > _CHECKPOINT_INTERVAL_SECONDS:
+                try:
+                    await store.checkpoint()
+                except Exception:
+                    logger.warning('Periodic WAL checkpoint failed (quality)', exc_info=True)
+                last_checkpoint = now
+        except Exception:
+            logger.warning('Quality snapshot error', exc_info=True)
