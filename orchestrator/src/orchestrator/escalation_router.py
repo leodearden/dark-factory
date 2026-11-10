@@ -625,8 +625,9 @@ def apply_reviewer_disposition(
 ) -> Applied:
     """Perform the reviewer's verdict on one of its task's notes (D2).  Never raises.
 
-    Only a close writes; on every other path the note stays pending, and the
-    exit router remains its backstop.
+    A close dismisses the note; ``work`` leaves it pending and stamps the
+    reviewer mark (``read_reviewer_mark``) that the exit router honours; every
+    other path writes nothing, and the exit router remains the backstop.
     """
     try:
         applied = _apply_reviewer(note, ports, task_id=task_id, enabled=enabled)

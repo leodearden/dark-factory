@@ -20,6 +20,7 @@ from _workflow_helpers import (
     _build_workflow_with_escalation,
     _init_repo,
     _make_git_ops,
+    agent_side_artifacts,
 )
 from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
@@ -30,7 +31,6 @@ from shared.cli_invoke import AgentResult
 from test_info_l0_router_workflow import _reaper_l1s_after_aging
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
-from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import (
     GitConfig,
     OrchestratorConfig,
@@ -128,14 +128,14 @@ class _DispositioningStub(AgentStub):
 
 
 class _LostVerdictStub(_DispositioningStub):
-    """A reviewer that writes an envelope the workflow discards (an off-contract verdict)."""
+    """A reviewer whose verdict file is present but off-contract, so the workflow discards it."""
 
     async def invoke_agent(self, prompt: str, system_prompt: str, cwd: Path, **kwargs) -> AgentResult:
         role = self._detect_role(system_prompt)
         if not role.startswith('reviewer'):
             return await super().invoke_agent(prompt, system_prompt, cwd, **kwargs)
         self.calls.append(role)
-        artifacts = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name))
+        artifacts = agent_side_artifacts(cwd)
         artifacts.write_verdict(role, _envelope(role, 'sid', {
             'reviewer': role, 'verdict': 'MAYBE', 'issues': [], 'summary': 's',
             'note_dispositions': self.note_dispositions,
@@ -373,14 +373,19 @@ class TestReviewLoopAppliesDispositions:
             )
 
     async def test_a_lost_verdict_carries_no_dispositions_and_the_exit_router_routes_the_note(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, caplog,
     ):
         stub = _LostVerdictStub()
         run = _FullRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
         stub.note_dispositions = [_disposition(note.id, 'addressed')]
 
-        assert await run.run() == WorkflowOutcome.BLOCKED
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            assert await run.run() == WorkflowOutcome.BLOCKED
+
+        assert not any('verdict absent' in record.getMessage() for record in caplog.records)
+        (review,) = run.workflow.artifacts.read_reviews().values()
+        assert review['verdict'] == 'ERROR'
 
         rows = run.rows(note.id)
         assert [row['by'] for row in rows] == ['workflow-finalizer']
