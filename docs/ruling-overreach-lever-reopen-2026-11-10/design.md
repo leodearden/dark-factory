@@ -515,9 +515,12 @@ ticket's copy of §6.2.
   change expected). It runs §6.2's trigger: the gpt-6.1-sol control replay,
   its blind adjudication and score, and the three checks against
   `r.arms.control`. On a pass it files the `always_escalates` routing task.
+  Priority medium: `tkt_0RWTVN4F9A2APEFBN010V3RTVG`.
 * **B2, the composite revisit gate** (area: the composite instrument). It runs
   §6.2's revisit clause on its schedule: a pre-registered fresh composite
   window, blind adjudication, score, and the two pull-back conditions.
+  Priority low, with a `dated` milestone at 2027-02-08T00:00:00+00:00:
+  `tkt_0RWTVNXGVV14Q5XZ58CCKFH24X`.
 
 ## 9. Sidecar retention (task 7487)
 
