@@ -1,13 +1,14 @@
-"""Advance a scheduled self-deploy's ``deploy_state`` once its restart is observed (task 7276).
+"""Advance a held scheduled self-deploy's ``deploy_state`` (task 7276).
 
 A self-target deterministic deploy goes done when its restart is only scheduled:
 a detached systemd-run transient restarts the fleet later, this orchestrator
 last.  Its dependents wait on ``deploy_state.phase``
 (``orchestrator/src/orchestrator/deploy_state.py::awaits_scheduled_restart``),
-and this module is what moves that phase: to VERIFIED once this process started
-after the transient fired and the transient has finished, to FAILED on the
-transient's fire-time escalation or a failed unit.  Rationale:
-``docs/deterministic-runner.md`` §2.
+and this module advances every phase that holds them, one hop per pass:
+SCHEDULED to VERIFIED once the restart landed or to FAILED on a fire-time
+failure; FAILED to ESCALATED, filing the born-at-L2 only when the transient
+filed none; ESCALATED to DONE once no own-role escalation is pending and the
+restart landed.  Rationale: ``docs/deterministic-runner.md`` §2.
 """
 
 from __future__ import annotations
@@ -19,7 +20,10 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
+from pydantic import ValidationError
+
 from orchestrator.deploy_state import (
+    RESTART_LANDED_PHASES,
     DeployPhase,
     DeployState,
     awaits_scheduled_restart,
@@ -27,6 +31,7 @@ from orchestrator.deploy_state import (
 )
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
+    file_deterministic_infra_issue,
     file_illegal_deploy_transition,
 )
 
@@ -36,6 +41,7 @@ if TYPE_CHECKING:
 __all__ = [
     'ScheduledDeploySettler',
     'ScheduledRestart',
+    'restart_landed',
     'settled_phase',
 ]
 
@@ -88,6 +94,24 @@ def _aware_datetime(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def restart_landed(
+    restart: ScheduledRestart, *, process_started_at: datetime, transient_active_state: str,
+) -> bool:
+    """Whether the scheduled restart ran to completion.
+
+    ``restart-all-orchestrators.sh`` restarts this orchestrator last, so this
+    process starting after the transient fired, with the transient finished
+    and not failed, means every unit was restarted.  An empty ActiveState is
+    the inspector's unreadable sentinel and never counts.
+    """
+    return (
+        process_started_at > restart.fires_at
+        and bool(transient_active_state)
+        and transient_active_state not in _UNIT_RUNNING_STATES
+        and transient_active_state != 'failed'
+    )
+
+
 def settled_phase(
     restart: ScheduledRestart,
     *,
@@ -95,20 +119,14 @@ def settled_phase(
     transient_active_state: str,
     fire_failures: int,
 ) -> DeployPhase:
-    """The phase the evidence supports: FAILED, VERIFIED, or still SCHEDULED.
-
-    ``restart-all-orchestrators.sh`` restarts this orchestrator last, so this
-    process starting after the transient fired, with the transient no longer
-    running, means every unit was restarted.  An empty ActiveState is the
-    inspector's unreadable sentinel and never verifies.
-    """
+    """The phase the evidence supports: FAILED, VERIFIED, or still SCHEDULED."""
     if fire_failures > 0 or transient_active_state == 'failed':
         return DeployPhase.FAILED
-    if process_started_at <= restart.fires_at:
-        return DeployPhase.SCHEDULED
-    if not transient_active_state or transient_active_state in _UNIT_RUNNING_STATES:
-        return DeployPhase.SCHEDULED
-    return DeployPhase.VERIFIED
+    if restart_landed(
+        restart, process_started_at=process_started_at, transient_active_state=transient_active_state,
+    ):
+        return DeployPhase.VERIFIED
+    return DeployPhase.SCHEDULED
 
 
 class TaskLookup(Protocol):
@@ -124,7 +142,7 @@ class TaskStore(Protocol):
 
 
 class ScheduledDeploySettler:
-    """One settle pass over every done task whose deploy is still SCHEDULED."""
+    """One settle pass over every done scheduled self-deploy whose phase holds its dependents."""
 
     def __init__(
         self,
@@ -154,7 +172,7 @@ class ScheduledDeploySettler:
             )
             return
         for row in rows:
-            if not _row_may_be_scheduled(row):
+            if not _row_may_hold(row):
                 continue
             task_id = str(row['task_id'])
             try:
@@ -164,8 +182,19 @@ class ScheduledDeploySettler:
 
     async def _settle(self, task_id: str) -> None:
         task = await self._store.get_task(task_id)
-        state = _held_scheduled_state(task)
+        state = _held_state(task_id, task)
         if task is None or state is None:
+            return
+        advance = {
+            DeployPhase.SCHEDULED: self._settle_scheduled,
+            DeployPhase.FAILED: self._route_failure,
+            DeployPhase.ESCALATED: self._release_if_resolved,
+        }.get(state.phase)
+        if advance is None:
+            logger.warning(
+                'scheduled-deploy settle: task %s is held at deploy_state.phase=%s, which no writer '
+                'advances; its dependents stay held until it is repaired by hand', task_id, state.phase,
+            )
             return
         restart = ScheduledRestart.from_metadata(task['metadata'])
         if restart is None:
@@ -174,21 +203,67 @@ class ScheduledDeploySettler:
                 'its dependents stay held', task_id,
             )
             return
-        inspection = await self._inspect(restart.transient_unit)
+        await advance(task_id, state, restart)
+
+    async def _settle_scheduled(self, task_id: str, state: DeployState, restart: ScheduledRestart) -> None:
+        """SCHEDULED -> VERIFIED or FAILED, on the restart evidence."""
+        active_state = await self._active_state(restart)
         failures = self._fire_failures(task_id, restart)
         phase = settled_phase(
             restart,
             process_started_at=self._process_started_at,
-            transient_active_state=str(inspection.get('ActiveState') or ''),
+            transient_active_state=active_state,
             fire_failures=len(failures),
         )
         if phase is DeployPhase.SCHEDULED:
             logger.debug(
                 'scheduled-deploy settle: task %s restart not yet observed (transient %s reads %r)',
-                task_id, restart.transient_unit, inspection.get('ActiveState'),
+                task_id, restart.transient_unit, active_state,
             )
             return
-        await self._write(task_id, state, phase, restart, failures)
+        changes = {'verified_at': self._clock().isoformat()} if phase is DeployPhase.VERIFIED else {}
+        if await self._write(task_id, state, phase, changes):
+            self._log_settled(task_id, phase, restart, failures)
+
+    async def _route_failure(self, task_id: str, state: DeployState, restart: ScheduledRestart) -> None:
+        """FAILED -> ESCALATED: a deploy failure always routes to a born-at-L2 escalation (DS-2)."""
+        escalations = self._fire_failures(task_id, restart) or self._file_failure(task_id, restart)
+        if await self._write(task_id, state, DeployPhase.ESCALATED, {'escalated_at': self._clock().isoformat()}):
+            logger.info(
+                'scheduled-deploy settle: task %s failed restart routed to escalation(s) %s; '
+                'its dependents stay held until none is pending',
+                task_id, escalations or 'already pending',
+            )
+
+    async def _release_if_resolved(self, task_id: str, state: DeployState, restart: ScheduledRestart) -> None:
+        """ESCALATED -> DONE once no own-role escalation is pending and the restart landed."""
+        pending = self._queue.get_by_task(task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE)
+        if pending:
+            logger.warning(
+                'scheduled-deploy settle: task %s is held at deploy_state.phase=escalated behind '
+                'pending escalation(s) %s; its dependents stay held until a human resolves them',
+                task_id, [record.id for record in pending],
+            )
+            return
+        active_state = await self._active_state(restart)
+        if not restart_landed(
+            restart, process_started_at=self._process_started_at, transient_active_state=active_state,
+        ):
+            logger.debug(
+                'scheduled-deploy settle: task %s escalation resolved but its restart is not yet '
+                'observed (transient %s reads %r)', task_id, restart.transient_unit, active_state,
+            )
+            return
+        if await self._write(task_id, state, DeployPhase.DONE, {}):
+            logger.info(
+                'scheduled-deploy settle: task %s released — no escalation pending and transient %s '
+                'fired at %s; its dependents are released',
+                task_id, restart.transient_unit, restart.fires_at.isoformat(),
+            )
+
+    async def _active_state(self, restart: ScheduledRestart) -> str:
+        inspection = await self._inspect(restart.transient_unit)
+        return str(inspection.get('ActiveState') or '')
 
     def _fire_failures(self, task_id: str, restart: ScheduledRestart) -> list[str]:
         """Ids of the RP-4 fire-time escalations filed for *task_id* since it was scheduled."""
@@ -199,29 +274,36 @@ class ScheduledDeploySettler:
             and _filed_at_or_after(record.timestamp, restart.scheduled_at)
         ]
 
+    def _file_failure(self, task_id: str, restart: ScheduledRestart) -> list[str]:
+        """File the born-at-L2 the transient's RP-4 wrapper did not; its id, if filed."""
+        filed = file_deterministic_infra_issue(
+            self._queue,
+            task_id,
+            summary=f'Scheduled self-restart failed: {restart.transient_unit}',
+            detail=(
+                f'The scheduled self-restart transient {restart.transient_unit} (fire time '
+                f'{restart.fires_at.isoformat()}) failed and filed no fire-time escalation. Task '
+                f'{task_id} is done but its dependents are held until this escalation is resolved. '
+                'Restart the fleet by hand (scripts/restart-all-orchestrators.sh), then resolve it.'
+            ),
+        )
+        return [filed] if filed else []
+
     async def _write(
-        self,
-        task_id: str,
-        state: DeployState,
-        phase: DeployPhase,
-        restart: ScheduledRestart,
-        failures: list[str],
-    ) -> None:
+        self, task_id: str, state: DeployState, phase: DeployPhase, changes: Mapping[str, object],
+    ) -> bool:
         enforce_transition(
             state.phase, phase, task_id=task_id,
             escalation_sink=partial(file_illegal_deploy_transition, self._queue),
         )
-        changes: dict[str, object] = {'phase': phase}
-        if phase is DeployPhase.VERIFIED:
-            changes['verified_at'] = self._clock().isoformat()
-        new_state = state.model_copy(update=changes)
-        if not await self._store.update_task(task_id, new_state.to_metadata(), metadata_mode='merge'):
-            logger.warning(
-                'scheduled-deploy settle: task %s deploy_state.phase=%s write refused; '
-                'retried next pass', task_id, phase,
-            )
-            return
-        self._log_settled(task_id, phase, restart, failures)
+        new_state = state.model_copy(update={'phase': phase, **changes})
+        if await self._store.update_task(task_id, new_state.to_metadata(), metadata_mode='merge'):
+            return True
+        logger.warning(
+            'scheduled-deploy settle: task %s deploy_state.phase=%s write refused; '
+            'retried next pass', task_id, phase,
+        )
+        return False
 
     def _log_settled(
         self, task_id: str, phase: DeployPhase, restart: ScheduledRestart, failures: list[str],
@@ -236,26 +318,32 @@ class ScheduledDeploySettler:
             return
         logger.error(
             'scheduled-deploy settle: task %s restart FAILED at fire time (transient %s, '
-            'escalations %s); its dependents stay held until a human acts on that escalation',
+            'escalations %s); its dependents stay held until no escalation for it is pending',
             task_id, restart.transient_unit, failures or 'none — the unit reads failed',
         )
 
 
-def _row_may_be_scheduled(row: dict) -> bool:
+def _row_may_hold(row: dict) -> bool:
     value = row.get('matched_value')
-    return not isinstance(value, dict) or value.get('phase') == DeployPhase.SCHEDULED
+    return not isinstance(value, dict) or value.get('phase') not in RESTART_LANDED_PHASES
 
 
-def _held_scheduled_state(task: dict | None) -> DeployState | None:
-    """*task*'s deploy state when it is a done scheduled self-deploy still at SCHEDULED."""
+def _held_state(task_id: str, task: dict | None) -> DeployState | None:
+    """*task*'s deploy state when it is a done scheduled self-deploy that still holds its dependents."""
     if not isinstance(task, dict) or task.get('status') != 'done':
         return None
     metadata = task.get('metadata')
     if not isinstance(metadata, dict) or not awaits_scheduled_restart(metadata):
         return None
-    state = DeployState.from_metadata(metadata)
-    if state is None or state.phase is not DeployPhase.SCHEDULED:
-        return None
+    try:
+        state = DeployState.from_metadata(metadata)
+    except ValidationError:
+        state = None
+    if state is None:
+        logger.warning(
+            'scheduled-deploy settle: task %s deploy_state is unreadable; its dependents stay held '
+            'until it is repaired by hand', task_id,
+        )
     return state
 
 

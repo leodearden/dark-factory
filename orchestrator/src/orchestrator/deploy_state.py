@@ -22,6 +22,7 @@ __all__ = [
     'DeployState',
     'VerifyBaseline',
     'IllegalDeployTransition',
+    'RESTART_LANDED_PHASES',
     'SCHEDULED_DEPLOY_PROVENANCE_KIND',
     'TransitionEscalationSink',
     'awaits_scheduled_restart',
@@ -81,7 +82,7 @@ _LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
 
 SCHEDULED_DEPLOY_PROVENANCE_KIND = 'deterministic-deploy-scheduled'
 
-_RESTART_LANDED_PHASES = frozenset({DeployPhase.VERIFIED, DeployPhase.DONE})
+RESTART_LANDED_PHASES = frozenset({DeployPhase.VERIFIED, DeployPhase.DONE})
 
 
 def is_legal_transition(old: DeployPhase, new: DeployPhase) -> bool:
@@ -93,9 +94,10 @@ def awaits_scheduled_restart(metadata: object) -> bool:
     """Whether a done task is a scheduled self-deploy whose restart has not landed.
 
     A self-target deploy goes done when its restart is only scheduled; its
-    dependents wait until ``deploy_state.phase`` reaches VERIFIED or DONE,
-    which ``orchestrator/src/orchestrator/scheduled_deploy_settle.py`` writes.
-    A record with no ``deploy_state`` slice predates DS-1 and nothing can ever
+    dependents wait until ``deploy_state.phase`` reaches VERIFIED or DONE.
+    ``orchestrator/src/orchestrator/scheduled_deploy_settle.py`` advances every
+    held phase, and a hold on FAILED or ESCALATED lasts until no own-role
+    escalation is pending.  A record with no ``deploy_state`` slice predates DS-1 and nothing can ever
     advance it, so it does not hold; an unreadable slice holds.
     """
     if not isinstance(metadata, Mapping):
@@ -109,7 +111,7 @@ def awaits_scheduled_restart(metadata: object) -> bool:
         state = DeployState.from_metadata(metadata)
     except ValidationError:
         return True
-    return state is None or state.phase not in _RESTART_LANDED_PHASES
+    return state is None or state.phase not in RESTART_LANDED_PHASES
 
 
 class IllegalDeployTransition(RuntimeError):
