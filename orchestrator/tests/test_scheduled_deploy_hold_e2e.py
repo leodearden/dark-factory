@@ -258,3 +258,18 @@ class TestStartupSettle:
         await _run_startup(tmp_path, session, monkeypatch, transient_state='inactive')
 
         assert _deploy_state(session)['phase'] == 'failed'
+
+    @pytest.mark.asyncio
+    async def test_startup_releases_a_2912_shaped_escalated_deploy(
+        self, tmp_path: Path, session: _DeploySession, monkeypatch,
+    ) -> None:
+        _register_dependent(session, DEPENDENT_ID, dep_id=SELF_DEPLOY_ID)
+        state = _deploy_state(session)
+        state['phase'] = 'escalated'
+        state['escalated_at'] = (datetime.fromisoformat(state['ran_at']) + timedelta(seconds=12)).isoformat()
+
+        await _run_startup(tmp_path, session, monkeypatch, transient_state='inactive')
+        assert _deploy_state(session)['phase'] == 'done'
+
+        harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
+        assert await _run_tick(harness) == DEPENDENT_ID

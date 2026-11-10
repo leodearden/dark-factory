@@ -10,6 +10,7 @@ fire-time escalation or a failed unit, otherwise left at SCHEDULED.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -20,6 +21,7 @@ from shared.deploy_state import DeployPhase
 from orchestrator.scheduled_deploy_settle import (
     ScheduledDeploySettler,
     ScheduledRestart,
+    restart_landed,
     settled_phase,
 )
 
@@ -27,6 +29,7 @@ T0 = datetime(2026, 11, 9, 10, 0, tzinfo=UTC)
 FIRE_DELAY = 60
 FIRES_AT = T0 + timedelta(seconds=FIRE_DELAY)
 STARTED_AFTER_FIRE = T0 + timedelta(minutes=5)
+ESCALATED_AT = T0 + timedelta(seconds=12)
 NOW = T0 + timedelta(minutes=10)
 TRANSIENT = 'orch-redeploy-restart-7238.service'
 
@@ -103,6 +106,34 @@ def test_settled_phase(started_at, active_state, fire_failures, expected) -> Non
     assert phase is expected
 
 
+@pytest.mark.parametrize(
+    ('started_at', 'active_state', 'expected'),
+    [
+        (T0, 'inactive', False),
+        (FIRES_AT, 'inactive', False),
+        (STARTED_AFTER_FIRE, 'active', False),
+        (STARTED_AFTER_FIRE, 'activating', False),
+        (STARTED_AFTER_FIRE, 'deactivating', False),
+        (STARTED_AFTER_FIRE, '', False),
+        (STARTED_AFTER_FIRE, 'failed', False),
+        (STARTED_AFTER_FIRE, 'inactive', True),
+    ],
+    ids=[
+        'started-before-fire',
+        'started-at-fire',
+        'sweep-running',
+        'sweep-activating',
+        'sweep-deactivating',
+        'inspect-wedged',
+        'transient-failed',
+        'collected-after-fire',
+    ],
+)
+def test_restart_landed(started_at, active_state, expected) -> None:
+    landed = restart_landed(_restart(), process_started_at=started_at, transient_active_state=active_state)
+    assert landed is expected
+
+
 # ---------------------------------------------------------------------------
 # settle_pass, with fakes for the task store, the lookup and the unit inspector
 # ---------------------------------------------------------------------------
@@ -159,6 +190,8 @@ class _Store:
 
     async def update_task(self, task_id: str, metadata: dict, *, metadata_mode: str) -> bool:
         self.updates.append((task_id, metadata, metadata_mode))
+        if self.update_ok:
+            self.tasks[task_id]['metadata'].update(metadata)
         return self.update_ok
 
 
@@ -191,19 +224,36 @@ def _settler(store, lookup, queue, *, active_state: str = 'inactive', started_at
     )
 
 
-def _rp4_escalation(queue: EscalationQueue, *, at: datetime, category: str = 'infra_issue') -> str:
+def _own_role_escalation(
+    queue: EscalationQueue,
+    *,
+    at: datetime,
+    category: str = 'infra_issue',
+    summary: str = 'RP-4: scheduled restart sweep failed',
+) -> str:
     esc = Escalation(
         id=queue.make_id('7238'),
         task_id='7238',
         agent_role='orchestrator-deterministic',
         severity='critical',
         category=category,
-        summary='RP-4: scheduled restart sweep failed',
+        summary=summary,
         timestamp=at.isoformat(),
         level=2,
     )
     queue.submit(esc)
     return esc.id
+
+
+def _escalated_task() -> dict:
+    """The 2912 shape: done, scheduled provenance, phase escalated after a completion-failure filing."""
+    task = _deploy_task(phase='escalated')
+    task['metadata']['deploy_state']['escalated_at'] = ESCALATED_AT.isoformat()
+    return task
+
+
+def _phases_written(store: _Store) -> list[str]:
+    return [metadata['deploy_state']['phase'] for _, metadata, _ in store.updates]
 
 
 async def _settle_one(tmp_path, task: dict, **settler_kwargs) -> _Store:
@@ -231,7 +281,7 @@ class TestSettlePass:
         task = _deploy_task()
         store = _Store({'7238': task})
         queue = EscalationQueue(tmp_path)
-        esc_id = _rp4_escalation(queue, at=T0 + timedelta(seconds=90))
+        esc_id = _own_role_escalation(queue, at=T0 + timedelta(seconds=90))
         before = len(queue.get_by_task('7238'))
 
         with caplog.at_level(logging.ERROR, logger='orchestrator.scheduled_deploy_settle'):
@@ -252,7 +302,7 @@ class TestSettlePass:
         task = _deploy_task()
         store = _Store({'7238': task})
         queue = EscalationQueue(tmp_path)
-        _rp4_escalation(queue, at=at, category=category)
+        _own_role_escalation(queue, at=at, category=category)
 
         await _settler(store, _Lookup([_row(task)]), queue).settle_pass()
 
@@ -265,11 +315,25 @@ class TestSettlePass:
         assert store.updates == []
 
     @pytest.mark.asyncio
-    async def test_a_row_already_past_scheduled_is_never_read(self, tmp_path) -> None:
-        task = _deploy_task(phase='verified')
+    @pytest.mark.parametrize('phase', ['verified', 'done'])
+    async def test_a_row_already_past_scheduled_is_never_read(self, tmp_path, phase) -> None:
+        task = _deploy_task(phase=phase)
         store = await _settle_one(tmp_path, task)
         assert store.reads == []
         assert store.updates == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'matched_value',
+        [{'phase': 'failed'}, {'phase': 'escalated'}, {'phase': 'ran'}, 'scheduled'],
+        ids=['failed', 'escalated', 'ran', 'non-dict'],
+    )
+    async def test_a_row_at_any_held_phase_is_read(self, tmp_path, matched_value) -> None:
+        task = _deploy_task()
+        store = _Store({'7238': task})
+        row = {**_row(task), 'matched_value': matched_value}
+        await _settler(store, _Lookup([row]), EscalationQueue(tmp_path)).settle_pass()
+        assert store.reads == ['7238']
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -323,3 +387,124 @@ class TestSettlePass:
             store = await _settle_one(tmp_path, task)
         assert store.updates == []
         assert any(r.levelno == logging.WARNING and '7238' in r.getMessage() for r in caplog.records)
+
+
+class TestHeldPhases:
+    """Every phase that holds a dependent is one the settler advances, or reports."""
+
+    @pytest.mark.asyncio
+    async def test_an_escalated_deploy_with_no_pending_escalation_is_released_once_the_restart_landed(
+        self, tmp_path, caplog,
+    ) -> None:
+        task = _escalated_task()
+        before = task['metadata']['deploy_state']
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.scheduled_deploy_settle'):
+            store = await _settle_one(tmp_path, task)
+
+        assert store.updates == [('7238', {'deploy_state': {**before, 'phase': 'done'}}, 'merge')]
+        assert before['escalated_at'] == ESCALATED_AT.isoformat()
+        assert before['verified_at'] is None
+        assert any(r.levelno == logging.INFO and '7238' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_pending_own_role_escalation_holds_an_escalated_deploy_loudly(self, tmp_path, caplog) -> None:
+        task = _escalated_task()
+        store = _Store({'7238': task})
+        queue = EscalationQueue(tmp_path)
+        esc_id = _own_role_escalation(queue, at=ESCALATED_AT, summary='self-deploy completion write failed')
+        settler = _settler(store, _Lookup([_row(task)]), queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduled_deploy_settle'):
+            await settler.settle_pass()
+
+        assert store.updates == []
+        assert any(
+            r.levelno == logging.WARNING and '7238' in r.getMessage() and esc_id in r.getMessage()
+            for r in caplog.records
+        )
+
+        queue.resolve(esc_id, 'done write had landed')
+        await settler.settle_pass()
+
+        assert _phases_written(store) == ['done']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('active_state', 'started_at'),
+        [('active', STARTED_AFTER_FIRE), ('inactive', T0)],
+        ids=['sweep-running', 'started-before-fire'],
+    )
+    async def test_an_escalated_deploy_waits_for_the_restart(self, tmp_path, active_state, started_at) -> None:
+        store = await _settle_one(tmp_path, _escalated_task(), active_state=active_state, started_at=started_at)
+        assert store.updates == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_deploy_is_routed_to_its_existing_escalation(self, tmp_path) -> None:
+        task = _deploy_task(phase='failed')
+        store = _Store({'7238': task})
+        queue = EscalationQueue(tmp_path)
+        _own_role_escalation(queue, at=T0 + timedelta(seconds=90))
+        before = len(queue.get_by_task('7238'))
+
+        await _settler(store, _Lookup([_row(task)]), queue).settle_pass()
+
+        [(_, metadata, mode)] = store.updates
+        assert (metadata['deploy_state']['phase'], mode) == ('escalated', 'merge')
+        assert metadata['deploy_state']['escalated_at'] == NOW.isoformat()
+        assert len(queue.get_by_task('7238')) == before
+
+    @pytest.mark.asyncio
+    async def test_a_failed_deploy_with_no_escalation_files_one(self, tmp_path) -> None:
+        task = _deploy_task(phase='failed')
+        store = _Store({'7238': task})
+        queue = EscalationQueue(tmp_path)
+
+        await _settler(store, _Lookup([_row(task)]), queue).settle_pass()
+
+        [record] = queue.get_by_task('7238')
+        assert (record.agent_role, record.category) == ('orchestrator-deterministic', 'infra_issue')
+        assert (record.level, record.severity) == (2, 'critical')
+        assert _phases_written(store) == ['escalated']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('metadata', 'named_phase'),
+        [
+            ({'deploy_state': {'phase': 'ran', 'ran_at': T0.isoformat()}}, r'\bran\b'),
+            ({'deploy_state': {'phase': 'bogus'}}, ''),
+        ],
+        ids=['ran', 'unreadable-slice'],
+    )
+    async def test_a_held_phase_no_writer_advances_is_reported_at_warning(
+        self, tmp_path, caplog, metadata, named_phase,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduled_deploy_settle'):
+            store = await _settle_one(tmp_path, _deploy_task(metadata=metadata))
+
+        assert store.updates == []
+        assert any(
+            r.levelno >= logging.WARNING and '7238' in r.getMessage() and re.search(named_phase, r.getMessage())
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_fire_time_failure_is_held_until_its_escalation_is_resolved(self, tmp_path) -> None:
+        task = _deploy_task()
+        store = _Store({'7238': task})
+        queue = EscalationQueue(tmp_path)
+        esc_id = _own_role_escalation(queue, at=T0 + timedelta(seconds=90))
+        settler = _settler(store, _Lookup([_row(task)]), queue)
+
+        await settler.settle_pass()
+        assert _phases_written(store) == ['failed']
+
+        await settler.settle_pass()
+        assert _phases_written(store) == ['failed', 'escalated']
+
+        await settler.settle_pass()
+        assert _phases_written(store) == ['failed', 'escalated']
+
+        queue.resolve(esc_id, 'restarted by hand')
+        await settler.settle_pass()
+        assert _phases_written(store) == ['failed', 'escalated', 'done']
