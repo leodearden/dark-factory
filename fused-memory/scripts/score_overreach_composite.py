@@ -27,6 +27,18 @@ The sample file carries neither episode bodies nor judge rationales; the
 worksheet carries bodies and facts but neither the decision nor the rationale,
 so it is not committed.
 
+``score`` validates the verdicts on every sampled flag with the audit's own
+load_verdicts, weights each (graph, decision) cell by its census population
+over its sampled flags, and rates Stage 1's retirements with the audit's
+weighted_rate against the §6.1 precision bars imported from
+eval_overreach_judge.py::
+
+    uv run python scripts/score_overreach_composite.py score \\
+        --sample ../docs/ruling-overreach-lever-reopen-2026-11-10/composite-sample.json \\
+        --verdicts ../docs/ruling-overreach-lever-reopen-2026-11-10/composite-verdicts.json \\
+        --judge-eval ../docs/ruling-overreach-guard-design-2026-10-01/judge-eval-offline-2026-11-09.json \\
+        --out ../docs/ruling-overreach-lever-reopen-2026-11-10/composite-report.json
+
 Exit codes: 0 ran; 1 the sidecar or a graph is unavailable; 2 an input is
 invalid. Nothing is written on error.
 """
@@ -47,10 +59,21 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
+from fused_memory.services.overreach_guard import LABELS, OVERREACH
 from fused_memory.services.overreach_shadow import HandedFlag, OverreachShadowStore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from audit_ruling_overreach import SampleDefinition, _resolve_uri, sample_key
+from audit_ruling_overreach import (
+    SampleDefinition,
+    VerdictError,
+    VerdictSet,
+    _resolve_uri,
+    load_verdicts,
+    rate,
+    sample_key,
+    weighted_rate,
+)
+from eval_overreach_judge import PRECISION_LOWER_MIN, PRECISION_MIN
 
 logger = logging.getLogger('score_overreach_composite')
 
@@ -243,16 +266,181 @@ def worksheet_rows(samples: Sequence[GraphSample]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# The score: Stage 1's decision against the adjudicated sample
+# --------------------------------------------------------------------------- #
+
+HOLDING = 'holding'
+
+COMPOSITE_RECALL_LABEL = (
+    'product of two frames: the offline judge recall on the 2026-08-25..2026-10-01 adjudicated '
+    "window times Stage-1 recall on the flags handed in this sample's window; the range multiplies "
+    'their bounds and is not the interval of any one estimator'
+)
+
+Cell = tuple[str, str]
+"""``(graph, decision)``."""
+
+
+class InvalidInput(ValueError):
+    """An argument or input file the composite must not be sampled or scored from."""
+
+
+@dataclass(frozen=True)
+class CompositeSample:
+    """A composite-sample.json, as the score reads it."""
+
+    definition: SampleDefinition
+    window_days: float
+    population: Mapping[Cell, int]
+    """Every handed flag in each sampled cell, from the census."""
+    flags: tuple[Mapping[str, str], ...]
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> CompositeSample:
+        try:
+            by_graph = document['census']['by_graph']
+            sample = cls(
+                definition=SampleDefinition.from_dict(document['sample']),
+                window_days=float(document['census']['window_days']),
+                population={(graph, decision): int(by_graph[graph][decision]['flags'])
+                            for graph in by_graph for decision in SAMPLED_DECISIONS},
+                flags=tuple(document['flags']),
+            )
+            sampled = Counter((flag['graph'], flag['decision']) for flag in sample.flags)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidInput(f'not a composite sample: {exc!r}') from exc
+        if over := sorted(cell for cell, n in sampled.items() if n > sample.population.get(cell, 0)):
+            raise InvalidInput(f'cells sampled beyond their census population: {over}')
+        return sample
+
+
+def validate_verdicts(obj: Any, sample: CompositeSample) -> VerdictSet:
+    """load_verdicts against the frozen sample: every sampled flag judged once, and nothing else.
+    No sampled episode is offered for staleness, so any other verdict is out of sample."""
+    return load_verdicts(
+        obj, expected_edges={(flag['graph'], flag['edge_uuid']): flag['episode_uuid'] for flag in sample.flags},
+        sampled_episodes=(), existing_edges=(), definition=sample.definition,
+    )
+
+
+@dataclass(frozen=True)
+class WeightedCells:
+    """Each sampled cell's adjudicated labels, and the weight each of its flags carries:
+    ``census population / sampled``."""
+
+    counts: Mapping[Cell, Counter[str]]
+    weights: Mapping[Cell, float]
+    window_days: float
+
+    @classmethod
+    def of(cls, sample: CompositeSample, verdicts: VerdictSet) -> WeightedCells:
+        labels = verdicts.by_edge
+        counts: defaultdict[Cell, Counter[str]] = defaultdict(Counter)
+        for flag in sample.flags:
+            counts[(flag['graph'], flag['decision'])][labels[(flag['graph'], flag['edge_uuid'])]] += 1
+        return cls(
+            counts=dict(counts),
+            weights={cell: sample.population[cell] / counter.total() for cell, counter in counts.items()},
+            window_days=sample.window_days,
+        )
+
+    def cells(self, decision: str | None = None) -> list[Cell]:
+        return [cell for cell in self.weights if decision in (None, cell[1])]
+
+    def share(self, label: str, decision: str | None = None) -> dict[str, Any]:
+        """The weighted share of *decision*'s flags (every flag, by default) adjudicated *label*."""
+        return weighted_rate(
+            (self.weights[cell], self.counts[cell][label], self.counts[cell].total()) for cell in self.cells(decision)
+        )
+
+    def retired_share(self, label: str) -> dict[str, Any]:
+        """Of the flags adjudicated *label*, the weighted share Stage 1 retired."""
+        return weighted_rate(
+            (self.weights[cell], self.counts[cell][label] if cell[1] == RETIRED else 0, self.counts[cell][label])
+            for cell in self.cells()
+        )
+
+    def retired_per_day(self, label: str) -> float:
+        weighted = sum(self.weights[cell] * self.counts[cell][label] for cell in self.cells(RETIRED))
+        return round(weighted / self.window_days, 2)
+
+    def unweighted_share(self, label: str, decision: str | None = None) -> dict[str, Any]:
+        cells = self.cells(decision)
+        return rate(sum(self.counts[cell][label] for cell in cells), sum(self.counts[cell].total() for cell in cells))
+
+
+def _by_graph(values: Mapping[Cell, Any]) -> dict[str, dict[str, Any]]:
+    nested: dict[str, dict[str, Any]] = {}
+    for (graph, decision), value in values.items():
+        nested.setdefault(graph, {})[decision] = value
+    return nested
+
+
+def _at_least(value: float | None, floor: float) -> bool:
+    return value is not None and value >= floor
+
+
+def stage1_decision(retire_precision: Mapping[str, Any]) -> dict[str, Any]:
+    """The 2026-10-01 design.md §6.1 precision bars, applied to what Stage 1 retired."""
+    checks = {
+        'retire_precision': _at_least(retire_precision['rate'], PRECISION_MIN),
+        'retire_precision_lower_bound': _at_least((retire_precision['ci'] or [None])[0], PRECISION_LOWER_MIN),
+    }
+    return {
+        'bars': {'precision_min': PRECISION_MIN, 'precision_lower_min': PRECISION_LOWER_MIN},
+        'checks': checks, 'passes': all(checks.values()),
+    }
+
+
+def _product(one: float | None, other: float | None) -> float | None:
+    return None if one is None or other is None else round(one * other, 4)
+
+
+def composite_recall(judge_recall: Mapping[str, Any], stage1_recall: Mapping[str, Any]) -> dict[str, Any]:
+    judge_ci, stage1_ci = judge_recall['ci'] or (None, None), stage1_recall['ci'] or (None, None)
+    return {
+        'point': _product(judge_recall['rate'], stage1_recall['rate']),
+        'range': [_product(judge_ci[0], stage1_ci[0]), _product(judge_ci[1], stage1_ci[1])],
+        'judge_recall': {'rate': judge_recall['rate'], 'ci': judge_recall['ci']},
+        'label': COMPOSITE_RECALL_LABEL,
+    }
+
+
+def composite_score(
+    sample: CompositeSample, verdicts: VerdictSet, judge_recall: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    cells = WeightedCells.of(sample, verdicts)
+    retire_precision = cells.share(OVERREACH, RETIRED)
+    stage1_recall = cells.retired_share(OVERREACH)
+    return {
+        'sample': sample.definition.to_dict(),
+        'verdicts': len(verdicts.verdicts),
+        'label_counts': _by_graph({
+            cell: {label: counter[label] for label in LABELS} for cell, counter in cells.counts.items()
+        }),
+        'weights': _by_graph({cell: round(weight, 4) for cell, weight in cells.weights.items()}),
+        'retire_precision': retire_precision,
+        'flag_precision': cells.share(OVERREACH),
+        'stage1_recall_on_flags': stage1_recall,
+        'holding_retired_share': cells.share(HOLDING, RETIRED),
+        'holdings_retired_per_day': cells.retired_per_day(HOLDING),
+        'overreach_retired_per_day': cells.retired_per_day(OVERREACH),
+        'unweighted': {
+            'retire_precision': cells.unweighted_share(OVERREACH, RETIRED),
+            'flag_precision': cells.unweighted_share(OVERREACH),
+        },
+        'composite_recall': composite_recall(judge_recall, stage1_recall) if judge_recall else None,
+        'decision': stage1_decision(retire_precision),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
 EXIT_OK, EXIT_UNAVAILABLE, EXIT_INVALID = 0, 1, 2
 
 ReaderFactory = Callable[[str], ReadOnlyGraphReader]
-
-
-class InvalidInput(ValueError):
-    """An argument or input file the composite must not be sampled or scored from."""
 
 
 def _aware_instant(text: str) -> datetime:
@@ -294,6 +482,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sample.add_argument('--graph-uri', default=None, help='FalkorDB URI. Default: env FALKORDB_URI, then config.')
     sample.add_argument('--graph-host', default=None, help='FalkorDB host, instead of a URI.')
     sample.add_argument('--graph-port', type=int, default=None, help='FalkorDB port, with --graph-host.')
+    score = commands.add_parser('score', help="Rate Stage 1's decision against the adjudicated sample.")
+    score.add_argument('--sample', required=True, help='The frozen composite-sample.json.')
+    score.add_argument('--verdicts', required=True, help='Verdicts on every sampled flag, in load_verdicts format.')
+    score.add_argument('--judge-eval', default=None,
+                       help="An eval_overreach_judge.py offline result; its recall makes the composite's.")
+    score.add_argument('--out', required=True, help='composite-report.json to write.')
     return parser
 
 
@@ -351,7 +545,39 @@ async def _sample_command(args: argparse.Namespace, reader_factory: ReaderFactor
     return EXIT_OK
 
 
+def _read_json(path: str) -> Any:
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InvalidInput(f'cannot read {path}: {exc}') from exc
+
+
+def _judge_recall(path: str | None) -> Mapping[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        recall = _read_json(path)['recall']
+        return {'rate': recall['rate'], 'ci': recall['ci']}
+    except (KeyError, TypeError) as exc:
+        raise InvalidInput(f'{path} carries no judge recall: {exc!r}') from exc
+
+
+def _score_command(args: argparse.Namespace) -> int:
+    try:
+        sample = CompositeSample.from_document(_read_json(args.sample))
+        report = composite_score(
+            sample, validate_verdicts(_read_json(args.verdicts), sample), _judge_recall(args.judge_eval),
+        )
+    except (InvalidInput, VerdictError) as exc:
+        logger.error('invalid inputs, nothing is written (%s): %s', type(exc).__name__, exc)
+        return EXIT_INVALID
+    _write_together({Path(args.out): json.dumps(report, indent=2, sort_keys=True) + '\n'})
+    return EXIT_OK
+
+
 async def _run(args: argparse.Namespace, reader_factory: ReaderFactory | None) -> int:
+    if args.command == 'score':
+        return _score_command(args)
     return await _sample_command(args, reader_factory or _live_reader_factory(args))
 
 
