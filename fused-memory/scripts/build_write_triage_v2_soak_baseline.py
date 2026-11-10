@@ -615,10 +615,25 @@ def _rating_entries(
     return entries, sorted(unrecoverable)
 
 
-def _refuse_inside(parser: argparse.ArgumentParser, scratch: Path, bundle: Path) -> None:
-    scratch, bundle = scratch.resolve(), bundle.resolve()
-    if scratch == bundle or bundle in scratch.parents:
-        parser.error(f'--scratch {scratch} is inside the read-only --bundle {bundle}')
+def _refuse_writes_inside(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse a run that would write into the read-only bundle, or rewrite a file of either input.
+
+    ``redigest`` rewrites every ``--verdicts`` path in place, so a mistyped one
+    naming a bundle or scratch file would otherwise be overwritten.
+    """
+    _refuse_inside(parser, ('--scratch', args.scratch), ('--bundle', args.bundle))
+    for path in args.verdicts if args.command == 'redigest' else ():
+        for root in (('--bundle', args.bundle), ('--scratch', args.scratch)):
+            _refuse_inside(parser, ('--verdicts', path), root)
+
+
+def _refuse_inside(
+    parser: argparse.ArgumentParser, written: tuple[str, Path], root: tuple[str, Path],
+) -> None:
+    (written_flag, written_path), (root_flag, root_path) = written, root
+    written_path, root_path = written_path.resolve(), root_path.resolve()
+    if written_path == root_path or root_path in written_path.parents:
+        parser.error(f'{written_flag} {written_path} is inside {root_flag} {root_path}')
 
 
 def _soak_key(scratch: _rounds.RatingScratch) -> dict[str, Any]:
@@ -840,7 +855,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _refuse_inside(parser, args.scratch, args.bundle)
+    _refuse_writes_inside(parser, args)
     if args.command == 'shards':
         args.history_db = args.history_db.expanduser()
         args.journal_db = args.journal_db.expanduser()

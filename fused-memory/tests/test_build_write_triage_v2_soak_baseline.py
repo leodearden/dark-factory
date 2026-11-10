@@ -1465,6 +1465,18 @@ class TestTheRedigestCommand:
 
         assert (_file_bytes(bundle.dir), _file_bytes(bundle.scratch)) == before
 
+    @pytest.mark.parametrize('inside', ['dir', 'scratch'])
+    def test_refuses_a_verdicts_path_inside_the_bundle_or_the_scratch(
+        self, bundle: _Bundle, assembled: list[dict[str, Any]], inside: str,
+    ) -> None:
+        self._write(getattr(bundle, inside) / 'verdicts.jsonl', self._stale(assembled))
+        before = (_file_bytes(bundle.dir), _file_bytes(bundle.scratch))
+
+        with pytest.raises(SystemExit):
+            self._redigest(bundle, getattr(bundle, inside) / 'verdicts.jsonl')
+
+        assert (_file_bytes(bundle.dir), _file_bytes(bundle.scratch)) == before
+
 
 LONGEST_RATED_LOSS_CHILD_CHARS = 1_394
 """The longest child among the committed soak corpora's LOSS YES rows.
