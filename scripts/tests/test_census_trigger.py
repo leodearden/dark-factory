@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
+import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -1362,6 +1364,242 @@ def test_default_status_fetcher_feeds_compute_tasks_landed_the_correct_delta(
         )
 
     assert result == 130
+
+
+# ---------------------------------------------------------------------------
+# completion — condition (a): the previous run's weighted completion, read
+# through scripts/check_run_completion.py (plans/census-incremental-prd.md
+# C7 (a), D9, row 13)
+# ---------------------------------------------------------------------------
+
+RUN_ID = "census-p-20261101"
+
+
+def _verdict_json(verdict, share, *, error=None, vacuous=False):
+    record = {
+        "run": RUN_ID, "verdict": verdict, "share": share, "threshold": 0.7,
+        "landed": None, "pending": None, "total": None, "vacuous": vacuous,
+        "by_priority": None,
+    }
+    if error is not None:
+        record["error"] = error
+    return json.dumps(record, separators=(",", ":"))
+
+
+class _ScriptedRunner:
+    """A completion runner answering one canned exit code and stdout, or
+    raising *raises*, and recording every argv it was handed."""
+
+    def __init__(self, returncode=0, stdout="", *, raises=None):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.raises = raises
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        if self.raises is not None:
+            raise self.raises
+        return subprocess.CompletedProcess(list(args), self.returncode, stdout=self.stdout)
+
+
+def _check(runner, project_root, *, run_id=RUN_ID, threshold_pct=70):
+    return ct.check_completion(
+        run_id, project_root=project_root, threshold_pct=threshold_pct, runner=runner,
+    )
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_check_completion_exit_0_fires_on_the_observed_project_only(tmp_path, caplog):
+    runner = _ScriptedRunner(0, "run x: 3 tasks\n" + _verdict_json("pass", 0.8235) + "\n")
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.FIRE
+    assert completion.fires is True
+    assert completion.reason == f"completion: 0.8235 of {RUN_ID} (threshold 0.70) -> FIRE"
+    assert runner.calls == [[
+        "--run", RUN_ID, "--threshold", "0.7", "--project-root", str(tmp_path.resolve()),
+    ]]
+    assert _warnings(caplog) == []
+
+
+def test_check_completion_exit_75_is_not_yet(tmp_path, caplog):
+    runner = _ScriptedRunner(75, _verdict_json("not_yet", 0.5) + "\n")
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.NOT_YET
+    assert completion.fires is False
+    assert completion.reason == f"completion: 0.5 of {RUN_ID} (threshold 0.70)"
+    assert _warnings(caplog) == []
+
+
+def test_check_completion_vacuous_pass_fires_and_says_vacuous(tmp_path):
+    runner = _ScriptedRunner(0, _verdict_json("pass", None, vacuous=True))
+
+    completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.FIRE
+    assert "vacuous" in completion.reason
+    assert completion.reason.endswith("-> FIRE")
+
+
+def test_check_completion_passes_the_configured_threshold_as_a_fraction(tmp_path):
+    runner = _ScriptedRunner(0, _verdict_json("pass", 0.9))
+
+    completion = _check(runner, tmp_path, threshold_pct=85)
+
+    assert runner.calls[0][2:4] == ["--threshold", "0.85"]
+    assert "(threshold 0.85)" in completion.reason
+
+
+def test_check_completion_empty_run_is_filed_nothing(tmp_path, caplog):
+    runner = _ScriptedRunner(2, "run x: could not check\n" + _verdict_json("error", None, error="empty_run"))
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.FILED_NOTHING
+    assert completion.fires is False
+    assert completion.reason == f"completion: run {RUN_ID} filed no tasks -> N/A"
+    assert len(_warnings(caplog)) == 1
+
+
+def test_check_completion_store_unreachable_is_an_error(tmp_path, caplog):
+    runner = _ScriptedRunner(2, _verdict_json("error", None, error="store_unreachable"))
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.ERROR
+    assert completion.fires is False
+    assert "2" in completion.reason
+    assert "store_unreachable" in completion.reason
+    assert completion.reason.endswith("-> N/A")
+    assert len(_warnings(caplog)) == 1
+
+
+def test_check_completion_garbage_stdout_is_an_error(tmp_path, caplog):
+    runner = _ScriptedRunner(1, "Traceback (most recent call last):\n  boom\n")
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.ERROR
+    assert completion.reason.endswith("-> N/A")
+    assert len(_warnings(caplog)) == 1
+
+
+def test_check_completion_exit_2_without_a_verdict_line_is_an_error_not_filed_nothing(
+    tmp_path, caplog,
+):
+    """A usage error also exits 2 but prints no JSON verdict, so exit 2 alone
+    never means the run filed nothing."""
+    runner = _ScriptedRunner(2, "")
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.ERROR
+    assert len(_warnings(caplog)) == 1
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [subprocess.TimeoutExpired(["check_run_completion"], 120), OSError("no such interpreter")],
+    ids=["timeout", "oserror"],
+)
+def test_check_completion_a_raising_runner_is_an_error_and_never_raises(
+    tmp_path, caplog, raised,
+):
+    runner = _ScriptedRunner(raises=raised)
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.ERROR
+    assert type(raised).__name__ in completion.reason
+    assert len(_warnings(caplog)) == 1
+
+
+def test_check_completion_without_a_previous_run_id_never_runs_the_check(tmp_path, caplog):
+    runner = _ScriptedRunner(0, _verdict_json("pass", 1.0))
+
+    with caplog.at_level(logging.WARNING):
+        completion = _check(runner, tmp_path, run_id=None)
+
+    assert completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
+    assert completion.fires is False
+    assert "previous run id" in completion.reason
+    assert completion.reason.endswith("-> N/A")
+    assert runner.calls == []
+    assert len(_warnings(caplog)) == 1
+
+
+def _closed_port_url():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+class _RunStore:
+    """A find_tasks_by_metadata backend serving *rows* for every lookup, and
+    recording each lookup's arguments."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.lookups = []
+
+    def __call__(self, name, arguments):
+        assert name == "find_tasks_by_metadata"
+        self.lookups.append(dict(arguments))
+        return {
+            "results": self.rows,
+            "pagination": {"has_more": False},
+            "tasks_with_key": len(self.rows),
+        }
+
+
+def _landed_run_rows():
+    return [
+        {"task_id": 1, "priority": "high", "status": "done"},
+        {"task_id": 2, "priority": "high", "status": "done"},
+        {"task_id": 3, "priority": "low", "status": "pending"},
+    ]
+
+
+def test_run_completion_check_runs_the_real_script_against_the_observed_project(
+    tmp_path, monkeypatch,
+):
+    store = _RunStore(_landed_run_rows())
+
+    with StubMcpServer(stateful=False, tools=store) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        completion = _check(ct.run_completion_check, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.FIRE, completion.reason
+    assert store.lookups
+    assert {lookup["key"] for lookup in store.lookups} == {"x_finding_run"}
+    assert {lookup["value"] for lookup in store.lookups} == {RUN_ID}
+    assert {lookup["project_root"] for lookup in store.lookups} == {str(tmp_path.resolve())}
+
+
+def test_run_completion_check_against_a_closed_port_is_a_store_unreachable_error(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", _closed_port_url())
+
+    completion = _check(ct.run_completion_check, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.ERROR
+    assert "store_unreachable" in completion.reason
 
 
 # ---------------------------------------------------------------------------
