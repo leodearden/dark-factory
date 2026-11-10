@@ -364,11 +364,13 @@ def test_every_task_read_has_one_access_path():
     )
 
 
-def test_every_grant_is_exercised():
-    uses = _real_uses()
-    stale = [
+def _stale_grants(
+    grants: Iterable[AccessGrant], uses: Mapping[str, Sequence[AccessUse]],
+) -> list[str]:
+    """Each granted name no real use exercises, as ``module::scope name``."""
+    return [
         f'{grant.module}::{grant.scope or "<whole module>"} {name}'
-        for grant in _GRANTS
+        for grant in grants
         for name in sorted(grant.names)
         if not any(
             use.name == name and grant.excuses(module, use)
@@ -377,9 +379,131 @@ def test_every_grant_is_exercised():
         )
     ]
 
+
+def test_every_grant_is_exercised():
+    stale = _stale_grants(_GRANTS, _real_uses())
+
     assert not stale, (
         'grant(s) that excuse no real use — a stale grant silently widens the '
         'allowlist for whatever arrives next, so narrow or delete it:\n  '
+        + '\n  '.join(stale)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The second vocabulary: runs.db's per-landing quality sources
+# ---------------------------------------------------------------------------
+
+GUARDED_QUALITY_SOURCES = frozenset({
+    'merge_finalized', 'train_merged', 'merge_blocked', 'review_completed', 'merge_verify',
+    'workflow_verify', 'flake_occurrence', 'flake_debt', 'flake_debt_due',
+})
+GUARDED_QUALITY_READS = frozenset({'landings', 'rows_for', 'recorded_landing_keys'})
+
+
+def find_quality_source_uses(source: str) -> list[AccessUse]:
+    raise NotImplementedError('the quality-source finder lands in step-16')
+
+
+_QUALITY_GRANTS: tuple[AccessGrant, ...] = ()
+
+
+def test_a_sql_constant_naming_a_quality_source_is_a_use():
+    source = (
+        'def recent(conn):\n'
+        "    return conn.execute(\"SELECT data FROM events WHERE event_type = 'train_merged'\")\n"
+    )
+    assert find_quality_source_uses(source) == [AccessUse(2, 'recent', 'train_merged')]
+
+
+def test_an_implicitly_concatenated_sql_string_is_one_use_per_named_source():
+    source = (
+        'class Q:\n'
+        '    def q(self):\n'
+        '        return (\n'
+        "            \"SELECT 1 FROM events WHERE event_type IN ('merge_finalized',\"\n"
+        "            \" 'train_merged') AND kind != 'merge_finalized'\"\n"
+        '        )\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'Q.q', 'merge_finalized'),
+        AccessUse(4, 'Q.q', 'train_merged'),
+    ]
+
+
+def test_docstrings_and_comments_naming_a_source_are_not_uses():
+    source = (
+        '"""Module docstring naming merge_finalized."""\n'
+        '# a comment naming train_merged\n'
+        'class C:\n'
+        '    """Reads review_completed, says the docstring."""\n'
+        '    def m(self):\n'
+        '        """And flake_occurrence."""\n'
+        '        return 1\n'
+    )
+    assert find_quality_source_uses(source) == []
+
+
+def test_a_source_is_matched_as_a_whole_word():
+    source = (
+        "DUE = 'flake_debt_due'\n"
+        "COLUMNS = 'SELECT flake_confirmed FROM t WHERE category = \"post_merge_verify\"'\n"
+    )
+    assert find_quality_source_uses(source) == [AccessUse(1, '<module>', 'flake_debt_due')]
+
+
+def test_a_read_imported_from_the_shared_producer_is_a_use_under_its_name():
+    source = (
+        'from shared.quality_series.landings import landings as L\n'
+        'from shared.quality_series.rows import rows_for\n'
+        'def tick(conn, root):\n'
+        '    return rows_for(L(conn, root, None), conn, root, 1.0)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'rows_for'),
+        AccessUse(4, 'tick', 'landings'),
+    ]
+
+
+def test_a_local_or_attribute_named_like_a_read_is_not_a_use():
+    source = (
+        'from elsewhere import rows_for\n'
+        'def f(batch):\n'
+        '    landings = batch.landings\n'
+        '    return rows_for(landings)\n'
+    )
+    assert find_quality_source_uses(source) == []
+
+
+def _real_quality_uses() -> dict[str, list[AccessUse]]:
+    return {
+        module: find_quality_source_uses(path.read_text())
+        for module, path in _scanned_modules().items()
+    }
+
+
+def test_every_quality_source_has_one_access_path():
+    found = violations(_real_quality_uses(), _QUALITY_GRANTS)
+
+    assert not found, (
+        'A per-landing quality source is read outside its access path. Per-landing quality '
+        'facts are served by data/quality_series.py and produced by data/quality_sampler.py '
+        '(plans/quality-dashboard-prd.md decisions 14, 15 and 22); read through them, or '
+        'record why this is a different datum in a grant:\n'
+        + '\n'.join(
+            f'  {module}:{use.line} {use.qualname} {use.name} — would need '
+            f'AccessGrant({module!r}, {use.qualname!r}, '
+            f'frozenset({{{use.name!r}}}), reason=...)'
+            for module, use in found
+        )
+    )
+
+
+def test_every_quality_grant_is_exercised():
+    stale = _stale_grants(_QUALITY_GRANTS, _real_quality_uses())
+
+    assert not stale, (
+        'quality grant(s) that excuse no real use — narrow or delete them:\n  '
         + '\n  '.join(stale)
     )
 
