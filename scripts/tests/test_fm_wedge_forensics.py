@@ -867,6 +867,8 @@ def test_cli_fails_loudly_when_nothing_in_the_input_parses():
 
     assert result.returncode != 0
     assert "--user" in result.stdout + result.stderr
+    # The capture it recommends must be one that can witness the port.
+    assert "-u fused-memory.socket" in result.stderr
 
 
 def test_cli_empty_stdin_also_fails_loudly():

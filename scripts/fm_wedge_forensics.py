@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Where did fused-memory's event loop stop, for how long, and what was it doing?
 
-Reads a `journalctl --user -u fused-memory.service` capture and reports the
-windows in which the unit's own journal went COMPLETELY SILENT — the shared
+Reads a journal capture of fused-memory, taken as Usage below shows, and
+reports the windows in which the unit's own journal went COMPLETELY SILENT — the shared
 signature of the 2026-09-15 23:55 and 2026-09-16 12:04 wedge episodes (task
 5544), in which fused-memory stopped serving every HTTP route while the
 process stayed up and its listening socket stayed bound.
@@ -60,6 +60,12 @@ import sys
 # measured, and the module docstring above records them; do not restate the
 # derivation anywhere else.
 DEFAULT_STALL_THRESHOLD_SECONDS = 90.0
+
+# The capture --help and every input-rejection message recommend.
+CAPTURE_COMMAND = (
+    "journalctl --user -u fused-memory.service -u fused-memory.socket "
+    "--since ... --until ... -o short-iso --no-pager"
+)
 
 
 # How a stall ENDED, and what it says about the loop.
@@ -663,8 +669,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Report fused-memory event-loop stalls from a journal capture on stdin. "
-            "Capture it with: journalctl --user -u fused-memory.service -u fused-memory.socket "
-            "--since ... --until ... -o short-iso --no-pager  "
+            f"Capture it with: {CAPTURE_COMMAND}  "
             "(--user is mandatory: system scope prints '-- No entries --')."
         ),
     )
@@ -687,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
     if not timestamped_lines(journal_text):
         print(
             "no journal lines parsed: every line lacked a leading short-iso timestamp. "
-            "Capture with `journalctl --user -u fused-memory.service -o short-iso` — "
+            f"Capture with `{CAPTURE_COMMAND}` — "
             "`--user` is mandatory, and system scope prints '-- No entries --'.",
             file=sys.stderr,
         )
