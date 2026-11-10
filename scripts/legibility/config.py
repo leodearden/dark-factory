@@ -122,12 +122,15 @@ class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
     points 6-7), the nightly trickle's census launch caps, the similarity
     stage, the length of the census mining window (which is also the
-    session ledger's retention), and the landing gate a census output must
-    pass before it lands."""
+    session ledger's retention), the landing gate a census output must
+    pass before it lands, and the completion share (as a percentage) at
+    which the previous run's filed tasks fire the census
+    (plans/census-incremental-prd.md C7 (a))."""
 
     model_config = ConfigDict(extra='allow')
 
     ledger_retention_days: int = Field(default=30, ge=1, strict=True)
+    completion_threshold_pct: int = Field(default=70, ge=1, le=100, strict=True)
     max_interval_days: int = 10
     tasks_landed_threshold: int = 120
     tasks_landed_min_days: int = 7
