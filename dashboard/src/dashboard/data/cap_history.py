@@ -547,7 +547,10 @@ def compute_capped_now_and_windows(
       :func:`merge_all_accounts_capped` on a **sorted** ``account_names`` list
       for deterministic merge-event ordering across reruns.  When the universe
       holds an account with no cap history in the window, no such instant
-      exists and the list is empty.
+      exists and the list is empty.  That check compares counts, not names,
+      because the gate exposes only ``account_count``: a seen account outside
+      the configured set (retired, or another project's) can stand in for a
+      configured account that has no cap history.
 
     Args:
         intervals: List of :class:`CapInterval` objects.  Both call sites

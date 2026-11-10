@@ -310,6 +310,49 @@ class TestReadCapIntervals:
         assert result == [CapInterval(account_name='acc-a', start=t1, end=reset2)]
 
     @pytest.mark.asyncio
+    async def test_redetection_with_unknown_reset_keeps_known_reset(self, tmp_path):
+        """A re-detection whose classifier parsed no resets_at must not forget the known one."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        t2 = now - timedelta(hours=5)
+        reset = now - timedelta(hours=4)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'redetect_unknown_reset.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset.isoformat()}),
+                ('acc-a', 'cap_hit', t2),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert result == [CapInterval(account_name='acc-a', start=t1, end=reset)]
+
+    @pytest.mark.asyncio
+    async def test_cap_hit_exactly_at_reset_opens_new_interval(self, tmp_path):
+        """The old cap is over at its reset instant, so a cap_hit landing there is a new cap."""
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+        t1 = now - timedelta(hours=6)
+        reset1 = now - timedelta(hours=4)
+        reset2 = now + timedelta(hours=1)
+        db_path = _make_db_with_events(
+            tmp_path,
+            'cap_at_reset.db',
+            [
+                ('acc-a', 'cap_hit', t1, {'resets_at': reset1.isoformat()}),
+                ('acc-a', 'cap_hit', reset1, {'resets_at': reset2.isoformat()}),
+            ],
+        )
+
+        result = await _read_intervals_at(db_path, now)
+
+        assert sorted(result, key=lambda iv: iv.start) == [
+            CapInterval(account_name='acc-a', start=t1, end=reset1),
+            CapInterval(account_name='acc-a', start=reset1, end=None),
+        ]
+
+    @pytest.mark.asyncio
     async def test_resets_at_not_after_cap_hit_is_unknown(self, tmp_path):
         """A resets_at at or before its own cap_hit is a parse artefact, not an end."""
         now = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
