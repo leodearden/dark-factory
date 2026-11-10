@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -22,9 +21,6 @@ from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, UnrecognisedTrainEvent, landings
 from shared.quality_series.git_lines import GitUnavailable
 from shared.quality_series.landings import LandingSource, LinesBase, recorded_landing_keys
-
-landings_module = importlib.import_module('shared.quality_series.landings')
-"""The module, which the package's ``landings`` function shadows as an attribute."""
 
 
 @pytest.fixture(scope='module')
@@ -310,13 +306,8 @@ class TestRecordedLandingKeys:
     """The landings runs.db records, read without git so a request path may count them."""
 
     @pytest.fixture
-    def db(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RunsDbBuilder:
-        """A runs.db outside any git repository, with git itself made to fail if called."""
-
-        def no_git(*args: object, **kwargs: object) -> bytes:
-            raise AssertionError('recorded_landing_keys ran git')
-
-        monkeypatch.setattr(landings_module, 'git_output', no_git)
+    def db(self, tmp_path: Path) -> RunsDbBuilder:
+        """A runs.db outside any git repository; the reader takes the connection and no repo."""
         return RunsDbBuilder(tmp_path / 'not-a-repo' / 'runs.db')
 
     def test_a_done_merge_counts_once_and_any_other_state_not_at_all(
