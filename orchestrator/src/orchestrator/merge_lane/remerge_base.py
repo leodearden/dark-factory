@@ -124,6 +124,11 @@ class RemergeClaim:
     permit: SpecPermit | None
 
     def __post_init__(self) -> None:
+        if self.permit is not None and self.permit.released:
+            raise ValueError(
+                'RemergeClaim must not hold a released permit; got '
+                f'reason={self.anchor.reason.value!r} permit={self.permit!r}',
+            )
         if self.anchor.speculative != (self.permit is not None):
             raise ValueError(
                 'RemergeClaim holds a permit iff its anchor is speculative; got '
@@ -142,10 +147,12 @@ def claim_remerge_base(
 ) -> RemergeClaim:
     """Decide the anchor once, with the permit already in hand.
 
-    The replacement keeps *held_permit*, or takes a free slot without
-    waiting; a permit it cannot use (a fall to main) is released here.
+    The replacement keeps *held_permit* while it is still live, or takes a
+    free slot without waiting; a permit it cannot use (a fall to main) is
+    released here.
     """
-    taken = held_permit if held_permit is not None else ledger.try_acquire()
+    held = held_permit if held_permit is not None and not held_permit.released else None
+    taken = held if held is not None else ledger.try_acquire()
     anchor = choose_remerge_base(
         main_sha, frozen_tip, dead_bases, frontier, permit_available=taken is not None,
     )

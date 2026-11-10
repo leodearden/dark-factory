@@ -54,6 +54,7 @@ from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.speculation_controller import PermitLedger
 from orchestrator.merge_lane.types import (
     InflightStatus,
+    ItemLifecycleState,
     MergeRequest,
     RemergeBase,
     RemergeReason,
@@ -920,6 +921,49 @@ class TestDispatchSitesReanchor:
         assert entry is not None and entry.permit is None
         row = _the_row(store, EventType.verdict_voided)
         assert (row['anchor_reason'], row['anchor_base']) == ('no_tip', None)
+
+    async def test_a_hostless_dispatch_parks_the_replacement_not_the_original(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        """The re-merge falls to main and frees the permit, then no host is
+        free: the replacement is parked, and it re-dispatches as-is, holding
+        no speculation slot."""
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+        worker._register_item(straggler, ItemLifecycleState.DISPATCHING)
+        allocator = worker._host_allocator
+        lease = allocator.acquire.return_value
+        allocator.acquire.return_value = None
+
+        assert await _dispatch(worker, straggler) is None
+        parked = worker._unhosted_redispatch_item(straggler)
+
+        assert permit.released is True
+        assert parked.base_sha == await git_ops.get_main_sha()
+        assert (parked.speculative, parked.permit) == (False, None)
+        allocator.acquire.return_value = lease
+        await _live_tip(worker, git_ops, config, verifies)
+        entry = await _dispatch(worker, parked)
+        assert entry is not None and entry.item is parked
+        assert entry.permit is None and not _ledger(worker).live
+
+    async def test_a_released_held_permit_is_never_reused_by_a_live_tip_claim(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+        _ledger(worker).release(permit)
+
+        entry = await _dispatch(worker, straggler)
+
+        assert _replacement(entry).remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
+        assert entry is not None and entry.permit is not permit
+        assert entry.permit in _ledger(worker).live
 
     async def test_a_vacated_tip_owner_sends_the_straggler_to_main(
         self, git_ops: GitOps, config: OrchestratorConfig,

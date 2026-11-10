@@ -15799,7 +15799,7 @@ class SpeculativeMergeWorker:
                     # cap_permit was already released in _dispatch_item; clear
                     # it to prevent a double-release on re-dispatch.
                     assert isinstance(item, RealMergeItem)
-                    item_back = dataclasses.replace(item, cap_permit=None)
+                    item_back = self._unhosted_redispatch_item(item)
                     self._note_transition(
                         item_back.request.request_id, ItemLifecycleState.DISPATCHING,
                         ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
@@ -16244,7 +16244,7 @@ class SpeculativeMergeWorker:
                     # a RealMergeItem ever needs a host lease, so item is always a
                     # RealMergeItem here (see the DISPATCH-FILL branch above).
                     assert isinstance(item, RealMergeItem)
-                    item_back = dataclasses.replace(item, cap_permit=None)
+                    item_back = self._unhosted_redispatch_item(item)
                     self._note_transition(
                         item_back.request.request_id, ItemLifecycleState.DISPATCHING,
                         ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
@@ -20459,6 +20459,18 @@ class SpeculativeMergeWorker:
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         return stacked_on, rebased_heads
 
+    def _unhosted_redispatch_item(self, item: RealMergeItem) -> RealMergeItem:
+        """The item to park after ``_dispatch_item`` found no host slot.
+
+        A dispatch-time re-merge has already superseded *item*: its merge
+        worktree is gone and its permit was released or handed over. The
+        replacement is the registry's live object, so park that; with no
+        re-merge the live object is *item* itself.
+        """
+        live = self._live_items.get(item.request.request_id)
+        parked = live if isinstance(live, RealMergeItem) else item
+        return dataclasses.replace(parked, cap_permit=None)
+
     async def _dispatch_item(
         self,
         item: SpeculativeItem,
@@ -20849,7 +20861,8 @@ class SpeculativeMergeWorker:
             # Reachable: the awaits since the free_host_count() guard let other
             # tasks run, and merge_drift.py::_run_drift_check takes slots too
             # (acquire_local/acquire_remote).  The caller parks the item on
-            # the redispatch park.
+            # the redispatch park -- the re-merged replacement when this
+            # dispatch re-merged (_unhosted_redispatch_item).
             return None
 
         # ── LEASE/PERMIT LEAK GUARD (task 3185 amend, robustness) ────────────

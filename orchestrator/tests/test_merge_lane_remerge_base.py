@@ -356,6 +356,10 @@ class TestRemergeClaimInvariant:
         with pytest.raises(ValueError, match=r'no_tip.*SpecPermit'):
             RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), SpecPermit())
 
+    def test_a_released_permit_is_no_permit(self) -> None:
+        with pytest.raises(ValueError, match=r'released permit'):
+            RemergeClaim(RemergeBase('t', RemergeReason.LIVE_TIP), SpecPermit(released=True))
+
 
 @pytest.mark.asyncio
 class TestClaimRemergeBase:
@@ -397,6 +401,20 @@ class TestClaimRemergeBase:
         assert claim.permit is not None
         assert ledger.live == frozenset({claim.permit})
         assert ledger.slot_available == 1
+
+    async def test_a_released_held_permit_is_treated_as_absent(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        ledger = _ledger(2)
+        stale = await ledger.acquire()
+        ledger.release(stale)
+        frontier = [_entry(config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending())]
+
+        claim = _claim(ledger, frontier, held=stale)
+
+        assert claim.anchor == RemergeBase('sha-a', RemergeReason.LIVE_TIP)
+        assert claim.permit is not stale
+        assert ledger.live == frozenset({claim.permit})
 
     async def test_a_live_tip_with_no_free_slot_falls_to_main(
         self, config: OrchestratorConfig, verifies: VerifyTasks,
