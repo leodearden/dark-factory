@@ -1495,6 +1495,15 @@ class MergeDeepConfig(BaseModel):
             'stall on finalising a green head. Read live per dispatch; must be > 0.'
         ),
     )
+    chain_reservation_timeout_secs: float = Field(
+        default=7200.0,
+        gt=0,
+        description=(
+            'Bound in seconds on how long a built chain\'s links stay reserved '
+            'for its tip verify. On expiry they go back to the ordinary pipeline '
+            'with a WARNING. Read live at each chain\'s confirm; must be > 0.'
+        ),
+    )
 
 
 class RetentionConfig(BaseModel):
