@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _pre_7518_digest import PRE_7518_DIGEST_CHARS
 
 from fused_memory.config.schema import WriteTriageConfig
 from fused_memory.models.enums import SourceStore
@@ -28,9 +29,6 @@ P = '11111111-1111-4111-8111-111111111111'
 AMENDING_ID = '22222222-2222-4222-8222-222222222221'
 SHORT_ID = '22222222-2222-4222-8222-222222222222'
 CONTESTING_ID = '22222222-2222-4222-8222-222222222223'
-
-#: Where the digest that grouped reads carried before task 7518 cut every amendment.
-PRE_7518_DIGEST_CHARS = 240
 
 PARENT_BODY = 'The merge-lane verify timeout is 600 seconds.'
 SHORT_BODY = 'Applies to coalesce-train verifies as well.'

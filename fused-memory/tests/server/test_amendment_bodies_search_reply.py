@@ -16,13 +16,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _pre_7518_digest import PRE_7518_DIGEST_CHARS
 from pydantic_core import to_jsonable_python
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
-    _AMENDMENT_LIST_CAP,
     AMENDMENT_KIND,
+    AMENDMENT_LIST_CAP,
     DEFAULT_AMENDMENT_TEXT_CHARS,
 )
 from fused_memory.server.tools import create_mcp_server
@@ -38,9 +39,6 @@ _RECORDING = (
     / 'grouped_search_amendment_bodies'
     / 'ten-amendments-over-the-cap.json'
 )
-
-#: Where the digest that grouped reads carried before task 7518 cut every amendment.
-PRE_7518_DIGEST_CHARS = 240
 
 _PARENT_ID = '11111111-1111-4111-8111-111111111111'
 _PARENT_BODY = 'The merge-lane verify timeout is 600 seconds.'
@@ -81,7 +79,7 @@ _AMENDMENT_ROWS = [
             'parent_id': _PARENT_ID,
         },
     }
-    for index in range(_AMENDMENT_LIST_CAP)
+    for index in range(AMENDMENT_LIST_CAP)
 ]
 
 _CHILD_COUNTS = {'': len(_AMENDMENT_ROWS), AMENDMENT_KIND: len(_AMENDMENT_ROWS), 'sighting': 0}
@@ -115,7 +113,7 @@ def _recorded_scenario_service() -> AsyncMock:
     return service
 
 
-@pytest.mark.parametrize('index', range(_AMENDMENT_LIST_CAP))
+@pytest.mark.parametrize('index', range(AMENDMENT_LIST_CAP))
 def test_each_amendment_hides_its_marker_past_the_old_digest_and_runs_past_the_cap(index: int):
     body = _amendment_body(index)
 

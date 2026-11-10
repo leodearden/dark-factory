@@ -103,7 +103,7 @@ AMENDMENT_BODY_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_a
 WORST_CASE_GROUPED_PARENT_CHARS = 41_000
 """The most one grouped parent may add to a briefing, about 10k tokens.
 
-Ten listed amendments (``grouped_read.py::_AMENDMENT_LIST_CAP``), each cut at
+Ten listed amendments (``grouped_read.py::AMENDMENT_LIST_CAP``), each cut at
 ``write_triage.judge_field_chars`` (4,000) plus its counted elision marker and
 bullet tag, then the parent's own bullet: 10 x (4,000 + ~20 + ~40) + ~100,
 about 40.7k chars. Moving the cap, the list cap or the render must move this

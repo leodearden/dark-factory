@@ -29,9 +29,9 @@ from fused_memory.memory_metadata import (
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import (
-    _AMENDMENT_LIST_CAP,
     _MAX_CONCURRENT_GROUP_READS,
     AMENDMENT_KIND,
+    AMENDMENT_LIST_CAP,
     CHILD_KINDS,
     CHILDREN_UNAVAILABLE_KEY,
     CONTESTED_METADATA_KEY,
@@ -193,8 +193,8 @@ class TestBuildGroupedDocument:
         assert first['created_at'] == '2026-08-01T00:00:00+00:00'
 
     @pytest.mark.asyncio
-    async def test_digest_ordering_is_deterministic(self):
-        """Digests sort by (created_at, id) so two runs over one corpus agree."""
+    async def test_amendment_entry_ordering_is_deterministic(self):
+        """Amendment entries sort by (created_at, id) so two runs over one corpus agree."""
         older = '2026-08-01T00:00:00+00:00'
         newer = '2026-08-09T00:00:00+00:00'
         # Deliberately scrolled out of order, and with a created_at TIE broken by id.
@@ -213,9 +213,9 @@ class TestBuildGroupedDocument:
             '00000000-0000-4000-8000-000000000001',  # oldest created_at first
             _AMEND_1,  # created_at tie → lower id first
             _AMEND_2,
-        ], f'Digests must sort by (created_at, id), got {order!r}'
+        ], f'Amendment entries must sort by (created_at, id), got {order!r}'
         assert order == [d['id'] for d in second['amendments']], (
-            'Two runs over the same corpus must produce the same digest order'
+            'Two runs over the same corpus must produce the same amendment order'
         )
 
     @pytest.mark.asyncio
@@ -461,7 +461,7 @@ class TestNeverSuppressCarveOuts:
         assert grouped[1]['content'] == 'a correction'
 
     @pytest.mark.asyncio
-    async def test_contested_child_is_also_marked_in_the_parents_digests(self):
+    async def test_contested_child_is_also_marked_in_the_parents_amendment_list(self):
         """Surfacing it in BOTH places is strictly more informative than either."""
         service = _stub_service([
             _child(
@@ -480,10 +480,10 @@ class TestNeverSuppressCarveOuts:
         assert block is not None
         by_id = {d['id']: d for d in block['amendments']}
         assert by_id[_AMEND_1].get('contested') is True, (
-            f'The contested amendment must be marked in the digest list, got {by_id[_AMEND_1]!r}'
+            f'The contested amendment must be marked in the amendment list, got {by_id[_AMEND_1]!r}'
         )
         assert 'contested' not in by_id[_AMEND_2], (
-            "An ordinary amendment's digest must OMIT the contested key entirely, "
+            "An ordinary amendment entry must OMIT the contested key entirely, "
             f'got {by_id[_AMEND_2]!r}'
         )
 
@@ -713,7 +713,7 @@ class TestSuppressionRequiresRepresentation:
     """
 
     _FANOUT = 50
-    _MATCHED_INDEX = 30  # beyond _AMENDMENT_LIST_CAP: excluded from the scroll
+    _MATCHED_INDEX = 30  # beyond AMENDMENT_LIST_CAP: excluded from the scroll
     _IN_CAP_INDEX = 2  # inside the cap: listed, but with its text CUT
 
     @classmethod
@@ -826,7 +826,7 @@ class TestSuppressionRequiresRepresentation:
             'amendment_count must stay the EXACT count API value, not len(digests) '
             f'and not len(digests) + pins, got {block!r}'
         )
-        assert len(block['amendments']) == _AMENDMENT_LIST_CAP, (
+        assert len(block['amendments']) == AMENDMENT_LIST_CAP, (
             f'Pinning must not widen the bounded digest list, got {block["amendments"]!r}'
         )
         assert block.get('truncated') is True, (
@@ -1176,7 +1176,7 @@ class TestBoundedListingHonesty:
 
     @staticmethod
     def _wide_amendment_fanout(extra: int = 5) -> list[dict]:
-        total = _AMENDMENT_LIST_CAP + extra
+        total = AMENDMENT_LIST_CAP + extra
         return [
             _child(
                 f'44444444-4444-4444-8444-{index:012d}',
@@ -1200,15 +1200,15 @@ class TestBoundedListingHonesty:
         block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
 
         assert block is not None
-        assert len(block['amendments']) == _AMENDMENT_LIST_CAP, (
-            f'The digest list must be bounded by _AMENDMENT_LIST_CAP '
-            f"({_AMENDMENT_LIST_CAP}), got {len(block['amendments'])}"
+        assert len(block['amendments']) == AMENDMENT_LIST_CAP, (
+            f'The amendment list must be bounded by AMENDMENT_LIST_CAP '
+            f"({AMENDMENT_LIST_CAP}), got {len(block['amendments'])}"
         )
         assert block.get('truncated') is True, (
             'A capped listing must carry truncated: True so it is never read as '
             f'exhaustive, got {block!r}. RED: no truncation marker yet.'
         )
-        assert block['amendment_count'] == _AMENDMENT_LIST_CAP + 5, (
+        assert block['amendment_count'] == AMENDMENT_LIST_CAP + 5, (
             'amendment_count must be the EXACT count from the count API, not '
             f"len(digests) ({len(block['amendments'])}), got "
             f"{block['amendment_count']}"
@@ -1376,7 +1376,7 @@ class TestChildRecordSchema:
                 f'strictly add-only on the read path, got {called} call(s)'
             )
 
-    # (Deliberately no test that _AMENDMENT_LIST_CAP is a positive int:
+    # (Deliberately no test that AMENDMENT_LIST_CAP is a positive int:
     # asserting a module's own private constant against itself exercises no
     # behaviour and no regression can break it.  Its real behaviour is pinned
     # by TestBoundedListingHonesty's test_wide_fanout_is_capped_and_marked_truncated;
@@ -1713,16 +1713,16 @@ class TestPointIdParentIsVerified:
         )
 
 
-class TestDigestCarriesOriginProjectTag:
-    """task 4008: an amendment digest carries its child's ORIGIN-project tag.
+class TestAmendmentEntryCarriesOriginProjectTag:
+    """task 4008: an amendment entry carries its child's ORIGIN-project tag.
 
-    A nested digest is agent-visible content: ``group_search_results`` hangs it
+    A nested amendment entry is agent-visible content: ``group_search_results`` hangs it
     inside a KEPT parent entry at ``entry['grouped']['amendments']``, and the
     orchestrator briefing renders that sub-object verbatim into a dispatched
     agent's ``# Context`` block.  The briefing's cross-project safeguard
     (``orchestrator/src/orchestrator/agents/memory_recall.py::filter_foreign_project_results``)
     reads a project tag off each entry's
-    ``metadata`` — so a digest that carries no ``metadata`` at all cannot be
+    ``metadata`` — so an entry that carries no ``metadata`` at all cannot be
     classified, and the deliberate keep-untagged policy keeps every one of
     them.  Emitting the tag here is what gives that safeguard a key to read.
 
@@ -1734,7 +1734,7 @@ class TestDigestCarriesOriginProjectTag:
     """
 
     @pytest.mark.asyncio
-    async def test_foreign_tagged_child_digest_carries_its_origin_tag(self):
+    async def test_foreign_tagged_child_entry_carries_its_origin_tag(self):
         service = _stub_service([
             _child(
                 _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
@@ -1747,13 +1747,13 @@ class TestDigestCarriesOriginProjectTag:
         assert block is not None
         entry = block['amendments'][0]
         assert entry.get('metadata') == {'src_project': 'reify'}, (
-            'A digest built from a child carrying src_project must carry that '
+            'An entry built from a child carrying src_project must carry that '
             'origin tag, or the briefing filter has no key to read on it — '
             f'got {entry!r}'
         )
 
     @pytest.mark.asyncio
-    async def test_native_tagged_child_digest_carries_its_tag_too(self):
+    async def test_native_tagged_child_entry_carries_its_tag_too(self):
         """The native case is tagged POSITIVELY, not left to keep-untagged."""
         service = _stub_service([
             _child(
@@ -1772,11 +1772,11 @@ class TestDigestCarriesOriginProjectTag:
         )
 
     @pytest.mark.asyncio
-    async def test_untagged_child_digest_emits_no_metadata_key_at_all(self):
+    async def test_untagged_child_entry_emits_no_metadata_key_at_all(self):
         """Omit-when-absent, as ``contested`` and ``truncated`` already do.
 
         The overwhelmingly common corpus carries no origin tag, and an empty
-        ``metadata: {}`` on every digest would be pure wire cost for a key
+        ``metadata: {}`` on every entry would be pure wire cost for a key
         that says nothing.
         """
         service = _stub_service([
@@ -1830,7 +1830,7 @@ class TestDigestCarriesOriginProjectTag:
         )
 
     @pytest.mark.asyncio
-    async def test_the_pre_existing_digest_fields_are_untouched(self):
+    async def test_the_pre_existing_entry_fields_are_untouched(self):
         service = _stub_service([
             _child(
                 _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
@@ -1922,7 +1922,7 @@ class TestPinnedChildCarriesOriginProjectTag:
         entry = by_id[_AMEND_1]
         assert entry['matched'] is True
         assert entry['content'] == 'a correction', (
-            f'PRECONDITION: the marked digest gains the FULL body, got {entry!r}'
+            f'PRECONDITION: the marked amendment entry gains the FULL body, got {entry!r}'
         )
         assert entry.get('metadata') == {'src_project': 'reify'}, (
             'In-place marking must not clobber the origin tag _amendment_entry set '

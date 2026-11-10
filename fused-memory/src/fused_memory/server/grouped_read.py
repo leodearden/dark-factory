@@ -99,8 +99,10 @@ def _require_positive_text_cap(amendment_text_chars: object) -> None:
         )
 
 #: Max amendments listed for one canonical.  A wider fan-out is reported by the
-#: EXACT count plus a ``truncated`` marker rather than by a longer list.
-_AMENDMENT_LIST_CAP = 10
+#: EXACT count plus a ``truncated`` marker rather than by a longer list.  Public
+#: because, with ``DEFAULT_AMENDMENT_TEXT_CHARS``, it bounds how much amendment
+#: text one grouped parent can carry to a reader.
+AMENDMENT_LIST_CAP = 10
 
 #: Set on a grouped block whose child reads FAILED.  Its presence is the record
 #: that the grouping is INCOMPLETE — a block carrying it is never used to
@@ -288,7 +290,7 @@ def _amendment_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
     were given.
 
     This orders the sample; it does not choose it.  The backend caps the scroll
-    at ``_AMENDMENT_LIST_CAP`` BEFORE this module ever sorts, so WHICH
+    at ``AMENDMENT_LIST_CAP`` BEFORE this module ever sorts, so WHICH
     cap-sized subset of a wide fan-out comes back is arbitrary.  That
     arbitrariness is precisely why a swallowed child can never be assumed
     present in the amendment list — see :func:`_pin_matched_child`.
@@ -386,7 +388,7 @@ async def _read_grouped_document(
         service.get_memories_by_metadata(
             project_id=project_id,
             filters={PARENT_ID_KEY: canonical_id, 'kind': AMENDMENT_KIND},
-            limit=_AMENDMENT_LIST_CAP,
+            limit=AMENDMENT_LIST_CAP,
         ),
     ))
     for outcome in (sighting_count, amendment_count, rows):
@@ -558,7 +560,7 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
 
     Suppressing a child is only honest when the block that replaces it actually
     carries it, and two live paths break that: a matched amendment beyond
-    ``_AMENDMENT_LIST_CAP`` (the retained sample is arbitrary — see
+    ``AMENDMENT_LIST_CAP`` (the retained sample is arbitrary — see
     :func:`_amendment_sort_key`) and ANY matched sighting, which the
     amendment-only scroll can never list.  In both, the matched id and its
     text would vanish from the response entirely.

@@ -27,7 +27,7 @@ unevenly:
   `write_triage.judge_field_chars`, 4,000 characters by default
   (`fused-memory/src/fused_memory/server/grouped_read.py::amendment_text`).
   Text past the cap is cut, and the counted elision marker says how much.
-  At most 10 amendments are listed (`::_AMENDMENT_LIST_CAP`).
+  At most 10 amendments are listed (`::AMENDMENT_LIST_CAP`).
 - A sighting (a restated write) appears only as a count, and briefings do not
   render that count: `orchestrator/src/orchestrator/agents/memory_recall.py::GROUPED_CHILD_KEYS`
   carries amendments and matched children, not `sighting_count`.
