@@ -171,6 +171,7 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    inherit_veto_streak_alarms,
     pending_holder_candidates,
     pin_buckets,
     render_shape,
@@ -261,6 +262,7 @@ from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
     emit_zero_progress_requeue_alert,
+    inherit_zero_progress_alarms,
     resolve_zero_progress_requeue_alert,
 )
 
@@ -366,6 +368,15 @@ _HARNESS_FILING_SESSION_ID: str = 'harness'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# The veto-streak charging sites each sweep's end-of-pass release stands down
+# (Harness._release_recovery_veto_streaks).  Startup adoption of inherited
+# alarms (Harness._inherit_pending_streak_alarms) reads the same definitions.
+_RECONCILE_RELEASE_SITES: tuple[RecoverySite, ...] = (RecoverySite.reconcile_sweep,)
+_DETERMINISTIC_RECON_RELEASE_SITES: tuple[RecoverySite, ...] = (
+    RecoverySite.deterministic_recon_sweep,
+    RecoverySite.deterministic_recon_deploy,
+)
 
 # Statuses a resolution-driven `resume` may re-pend (task 3540 / PRD
 # `plans/task-escalation-state-graph-prd.md` D8, spec E9).  Deliberately an
@@ -2572,7 +2583,7 @@ class Harness:
                 stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
                 max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
             ))
-        if self.config.deterministic_recon_sweep_enabled:
+        if self._deterministic_recon_sweep_runs():
             registry.register(BackgroundService(
                 name='deterministic-recon-sweep',
                 pass_fn=self._run_deterministic_recon_sweep,
@@ -2919,6 +2930,7 @@ class Harness:
             task_tree_steps = (
                 StartupStep('2c', self._recover_crashed_tasks),
                 StartupStep('2c2', self._reconcile_lane_checkouts),
+                StartupStep('2c3-streak-alarms', self._inherit_pending_streak_alarms),
                 StartupStep('2d', self._reconcile_stranded_at_startup),
                 StartupStep('2e', self._reap_orphan_worktrees),
                 StartupStep('diff7', self._reconcile_terminal_lanes),
@@ -11751,21 +11763,15 @@ class Harness:
             )
 
             if streak == 0:
-                # Progress. Resolve any alarm we filed, so an operator is not
-                # left holding a blocking L1 for a cleared condition and — more
-                # importantly — so the emitter's has_open_l1 dedup cannot let a
-                # stale pending alert suppress a genuine LATER recurrence.
-                # Ungated by `enabled`: disabling the detector must not strand
-                # an already-filed alarm.
-                if streak_before:
-                    resolve_zero_progress_requeue_alert(
-                        escalation_queue=self._escalation_queue,
-                        event_store=self.event_store,
-                        task_id=task_id,
-                        recovered_streak=streak_before,
-                        threshold=cfg.threshold,
-                        filed_at=self._zero_progress_filed_at,
-                    )
+                # Progress; the resolver's own cheap gate decides whether a disk check is due.
+                resolve_zero_progress_requeue_alert(
+                    escalation_queue=self._escalation_queue,
+                    event_store=self.event_store,
+                    task_id=task_id,
+                    recovered_streak=streak_before,
+                    threshold=cfg.threshold,
+                    filed_at=self._zero_progress_filed_at,
+                )
                 return
 
             if not cfg.enabled:
@@ -11788,6 +11794,54 @@ class Harness:
                 'Task %s: zero-progress requeue check failed (non-fatal): %s',
                 task_id, exc,
             )
+
+    def _inherit_pending_streak_alarms(self) -> None:
+        """Seed the streak detectors from the alarms a prior process left pending.
+
+        Startup step ``2c3-streak-alarms``.  Their trackers and filed-at memos
+        live in memory, so without this their resolvers cannot reach an alarm
+        filed before the restart.  Sync, so it runs atomically on the event
+        loop with respect to any background sweep ``start_all()`` launched.
+        """
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        pending_alarms = queue.get_pending()
+        zero_progress = inherit_zero_progress_alarms(
+            pending_alarms, filed_at=self._zero_progress_filed_at,
+        )
+        veto_streak = inherit_veto_streak_alarms(
+            pending_alarms,
+            filed_at=self._recovery_streak_memo(),
+            tracker=self._seeded_recovery_veto_tracker(),
+            sites=self._veto_streak_release_sites(),
+        )
+        logger.info(
+            'Inherited pending streak alarms from a prior process: %d zero-progress '
+            'requeue, %d recovery veto',
+            len(zero_progress), len(veto_streak),
+        )
+
+    def _veto_streak_release_sites(self) -> tuple[RecoverySite, ...]:
+        """Every veto-streak charging site some sweep in this process releases.
+
+        The reconcile sites always: the startup and idle reconciles run
+        whatever ``stranded_reconcile_enabled`` says.  The deterministic sites
+        only while their sweep runs, because an entry adopted at a site nothing
+        releases would hold its alarm open forever.
+        """
+        if self._deterministic_recon_sweep_runs():
+            return _RECONCILE_RELEASE_SITES + _DETERMINISTIC_RECON_RELEASE_SITES
+        return _RECONCILE_RELEASE_SITES
+
+    def _deterministic_recon_sweep_runs(self) -> bool:
+        """Whether this process registers the deterministic recon sweep.
+
+        The one answer both the sweep's registration and
+        :meth:`_veto_streak_release_sites` read, so a site is adopted only
+        where a sweep will release it.
+        """
+        return self.config.deterministic_recon_sweep_enabled
 
     def _emit_recovery_disposition(
         self,
@@ -11864,13 +11918,7 @@ class Harness:
             if cfg is None or not cfg.enabled:
                 return None
 
-            # getattr-tolerant: several narrow-scope test harnesses build a
-            # Harness via Harness.__new__(Harness), bypassing __init__ and its
-            # seeding above (the documented hazard at _get_ground_truth).
-            tracker = getattr(self, '_recovery_veto_tracker', None)
-            if tracker is None:
-                tracker = RecoveryVetoStreakTracker()
-                self._recovery_veto_tracker = tracker
+            tracker = self._seeded_recovery_veto_tracker()
 
             # Shared with the Scheduler's twin adapter rather than hand-rolled
             # here: classify_pins is consulted for BUCKETING and the streak
@@ -11988,6 +12036,19 @@ class Harness:
             )
             return None
 
+    def _seeded_recovery_veto_tracker(self) -> RecoveryVetoStreakTracker:
+        """The veto-streak tracker, seeded on demand.
+
+        getattr-tolerant: several narrow-scope test harnesses build a Harness
+        via ``Harness.__new__(Harness)``, bypassing ``__init__`` and its
+        seeding (the documented hazard at ``_get_ground_truth``).
+        """
+        tracker = getattr(self, '_recovery_veto_tracker', None)
+        if tracker is None:
+            tracker = RecoveryVetoStreakTracker()
+            self._recovery_veto_tracker = tracker
+        return tracker
+
     def _recovery_streak_memo(self) -> dict[str, int]:
         """The veto-streak filed_at memo, seeded on demand.
 
@@ -12066,7 +12127,7 @@ class Harness:
         self,
         tally: RecoverySweepTally,
         *,
-        sites: Sequence[RecoverySite] = (RecoverySite.reconcile_sweep,),
+        sites: Sequence[RecoverySite] = _RECONCILE_RELEASE_SITES,
     ) -> None:
         """End-of-pass: drop every streak this sweep did NOT re-observe.
 
@@ -16658,11 +16719,7 @@ class Harness:
         # keeps Source B's re-globbed get_pending() from re-observing an
         # escalation this pass just closed.
         self._release_recovery_veto_streaks(
-            recovery_tally,
-            sites=(
-                RecoverySite.deterministic_recon_sweep,
-                RecoverySite.deterministic_recon_deploy,
-            ),
+            recovery_tally, sites=_DETERMINISTIC_RECON_RELEASE_SITES,
         )
 
         pending = self._escalation_queue.get_pending()
