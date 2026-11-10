@@ -712,6 +712,7 @@ tasks:
       pattern: PROOF_BASE
       paths:
       - orchestrator/src/orchestrator/git_ops.py
+      - orchestrator/src/orchestrator/worktrees.py
       expect: present
   - name: proof-base-band-registered-in-protected-prefixes
     binding: capability→producer (wired) — git_ops.py::PROTECTED_PREFIXES keys the MAIN_PROBE/MAIN_SWEEP bands by WorktreeKind.*.value (the reaper-protection precedent PROOF_BASE copies)
@@ -721,6 +722,7 @@ tasks:
       pattern: WorktreeKind\.PROOF_BASE\.value
       paths:
       - orchestrator/src/orchestrator/git_ops.py
+      - orchestrator/src/orchestrator/worktrees.py
       expect: present
   - name: merge-base-recomputed-at-proof-time
     binding: capability→producer (wired) — orchestrator/src/orchestrator/git_ops.py::GitOps.merge_base_with_main (consumed by merge_lane/landing_evidence.py's base-vs-tip differential)

@@ -518,7 +518,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "async def remove_edges"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
+          paths: ["fused-memory/src/fused_memory/services/memory_service.py", "fused-memory/src/fused_memory/services/graph_mutations.py"]
           expect: present
       - name: "reach-through-guard"
         binding: "INV-10 — boundary row 16's AST scan flags a seeded fixture module"

@@ -161,7 +161,7 @@ loading the twin with `shared.capability_manifest.CapabilityManifestDoc`: all 62
 | Locked `delete_entity` | producer: λ upstream | PASS (λ upstream) |
 | Backends private | producer (μ): `self\.(graphiti|mem0)([^A-Za-z0-9_]|$)` absent from `memory_service.py` (87 lines today) | PASS (μ delivers) |
 | Sweep delete through the service | producer (μ): `\.delete_entity_node\(|def delete_entity_node` absent under `fm/reconciliation/` and in `graphiti_client.py` (the primitive survives as private `_detach_delete_entity_node`) | PASS (μ delivers) |
-| Journaled bulk edge removal | producer (μ): `MemoryService.remove_edges` (a delegate to `GraphMutations` after τ) | PASS (μ delivers) |
+| Journaled bulk edge removal | producer (μ): `MemoryService.remove_edges` (a delegate to `GraphMutations` after τ); grep `async def remove_edges` in `memory_service.py` or `graph_mutations.py` | PASS (μ delivers) |
 | Reach-through guard exercised | producer (μ): boundary row 16's AST scan flags a seeded fixture (INV-10) | PASS (μ delivers; manual) |
 
 ## ν — Scripts stop reaching through MemoryService's backends (S26-1: A)
