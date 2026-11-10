@@ -39,6 +39,7 @@ from orchestrator.config import (
     UnblockAutoConfig,
 )
 from orchestrator.escalation_router import REVIEWER_LEG_ID, read_hold
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.scheduler import TaskAssignment
@@ -153,6 +154,7 @@ class _NoteRecordingBriefing(FakeBriefing):
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         self._record(ReviewBriefing.DIFF_ONLY, open_info_notes)
         return await super().build_reviewer_prompt(reviewer_type, diff, context)
@@ -161,6 +163,7 @@ class _NoteRecordingBriefing(FakeBriefing):
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
         open_info_notes: Sequence[Escalation] | None = None,
+        rulings: Sequence[Ruling] = (),
     ) -> str:
         self._record(ReviewBriefing.CONTEXT_COMPLETE, open_info_notes)
         return await super().build_context_complete_reviewer_prompt(reviewer_type, subject, context)

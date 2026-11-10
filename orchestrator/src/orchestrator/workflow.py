@@ -124,6 +124,7 @@ from orchestrator.escalation_router import (
     reviewer_notes,
     router_owns,
 )
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -666,6 +667,7 @@ class _BriefingLike(Protocol):
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
         committed_work: list[dict] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -679,27 +681,32 @@ class _BriefingLike(Protocol):
         self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
         *, attempt_context: VerifyAttemptContext | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         open_info_notes: Sequence[Escalation] | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
@@ -708,10 +715,12 @@ class _BriefingLike(Protocol):
         context: str | None = ...,
         *, text_drift: TaskTextDrift | None = ...,
         integrity_refusal: DoneStepIntegrityVerdict | None = ...,
+        rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
         worktree: Path | None = ..., context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_plan_tightening_prompt(
         self, task: dict, plan: dict, not_touched: list[str],
@@ -722,10 +731,12 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_replan_prompt(
         self, task: dict, review_feedback: str, context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_simple_task_prompt(
         self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
+        *, rulings: Sequence[Ruling] = ...,
     ) -> str: ...
     async def build_completion_judge_prompt(
         self, plan: dict, iteration_log: list[dict], diff: str,
