@@ -7,12 +7,19 @@ The structured-source parsers are driven with JSON shaped like the live
 from __future__ import annotations
 
 import ast
+import collections.abc
+import io
+import json
+import os
 import pathlib
+import shlex
+import shutil
 import socket
 
 import check_network_exposure as exposure
 import pytest
 import yaml
+from shell_sections import stub_bin_dir, write_stub
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 COMPOSE_PATH = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
@@ -251,3 +258,259 @@ def test_merge_owners_names_every_owner_of_a_port_once_in_source_order():
         8002: "fused-memory.socket, compose service fused-mcp",
         8103: "fused-memory.socket",
     }
+
+
+# ---------------------------------------------------------------------------
+# run(): behavioural probes against in-process listeners, fake sources on PATH
+# ---------------------------------------------------------------------------
+
+FINDING_TOKENS = (
+    "[exposed]",
+    "[timed-out]",
+    "[unverified]",
+    "[not-listening]",
+    "[source-error]",
+    "[finding]",
+)
+
+
+class FakeHost:
+    """Fake `systemctl` / `ip` on PATH, each printing a JSON payload the test chose."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        self.bin_dir = stub_bin_dir(root)
+
+    def serve(self, command: str, payload: object) -> None:
+        data = self.root / f"{command}.json"
+        data.write_text(json.dumps(payload), encoding="utf-8")
+        argv_log = shlex.quote(str(self.root / f"{command}.argv"))
+        write_stub(self.bin_dir, command, f'printf "%s\\n" "$*" >> {argv_log}\ncat {shlex.quote(str(data))}\n')
+
+    def stub(self, command: str, body: str) -> None:
+        write_stub(self.bin_dir, command, body)
+
+    def argv(self, command: str) -> list[str]:
+        return (self.root / f"{command}.argv").read_text(encoding="utf-8").splitlines()
+
+
+def _fake_links(*extra: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        _link(1, "lo", _addr("inet", "127.0.0.1", "host"), _addr("inet6", "::1", "host")),
+        _link(2, "fake0", _addr("inet", "127.0.0.2", "global"), *extra),
+    ]
+
+
+def _row(port: int, unit: str, host: str = "127.0.0.1") -> dict[str, str]:
+    return {"listen": f"{host}:{port}", "unit": unit, "activates": unit.replace(".socket", ".service")}
+
+
+@pytest.fixture
+def fake_host(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
+    host = FakeHost(tmp_path)
+    host.serve("systemctl", [])
+    host.serve("ip", _fake_links())
+    monkeypatch.setenv("PATH", f"{host.bin_dir}:{os.environ['PATH']}")
+    return host
+
+
+@pytest.fixture
+def held() -> collections.abc.Iterator[list[socket.socket]]:
+    sockets: list[socket.socket] = []
+    yield sockets
+    for sock in sockets:
+        sock.close()
+
+
+def _listen(held: list[socket.socket], host: str) -> int:
+    server = socket.create_server((host, 0))
+    held.append(server)
+    return server.getsockname()[1]
+
+
+def _bound_not_listening(held: list[socket.socket]) -> int:
+    """A port that REFUSES for the whole test: held bound, never listening, no SO_REUSEADDR."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.append(sock)
+    sock.bind(("127.0.0.1", 0))
+    return sock.getsockname()[1]
+
+
+def _full_backlog(held: list[socket.socket]) -> int:
+    """A wildcard port whose accept queue is full, so the next connect times out."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.append(server)
+    server.bind(("0.0.0.0", 0))
+    server.listen(0)
+    port = server.getsockname()[1]
+    held.append(socket.create_connection(("127.0.0.1", port)))
+    return port
+
+
+def _run(
+    static_ports: collections.abc.Sequence[exposure.OwnedPort] = (),
+    connect_timeout: float = 1.0,
+) -> tuple[exposure.ExposureExit, list[str]]:
+    out = io.StringIO()
+    verdict = exposure.run(static_ports=static_ports, connect_timeout=connect_timeout, out=out)
+    lines = out.getvalue().splitlines()
+    assert lines, "run() printed nothing"
+    untagged = [line for line in lines if not line.startswith("[network_exposure] ")]
+    assert not untagged, f"untagged lines: {untagged}"
+    return verdict, lines
+
+
+def _line_index(lines: list[str], *needles: str) -> int:
+    matches = [i for i, line in enumerate(lines) if all(needle in line for needle in needles)]
+    assert len(matches) == 1, f"expected one line containing {needles}, got {matches} in {lines}"
+    return matches[0]
+
+
+def _findings(lines: list[str]) -> list[str]:
+    return [line for line in lines if any(token in line for token in FINDING_TOKENS)]
+
+
+def test_run_reports_loopback_only_for_a_loopback_listener(fake_host: FakeHost, held):
+    port = _listen(held, "127.0.0.1")
+    fake_host.serve("systemctl", [_row(port, "orchestrator-x.socket")])
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.LOOPBACK_ONLY == 0
+    assert _findings(lines) == []
+    _line_index(lines, "[ok]")
+    _line_index(lines, "probing 1 port(s) on 1 non-loopback address(es) and 127.0.0.1")
+    assert fake_host.argv("systemctl") == ["--user list-sockets -o json"]
+
+
+def test_run_names_an_exposed_socket_port_its_address_and_owner(fake_host: FakeHost, held):
+    port = _listen(held, "0.0.0.0")
+    fake_host.serve("systemctl", [_row(port, "fused-memory.socket", host="0.0.0.0")])
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.FINDING == 1
+    _line_index(lines, "[exposed]", f"port {port}", "127.0.0.2", "fused-memory.socket")
+    assert len(_findings(lines)) == 2, lines  # the [exposed] line and the [finding] verdict
+
+
+def test_run_probes_and_owns_static_ports(fake_host: FakeHost, held):
+    port = _listen(held, "0.0.0.0")
+
+    verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service falkordb"),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[exposed]", f"port {port}", "127.0.0.2", "compose service falkordb")
+
+
+def test_run_names_every_owner_of_a_port(fake_host: FakeHost, held):
+    port = _listen(held, "0.0.0.0")
+    fake_host.serve("systemctl", [_row(port, "fused-memory.socket", host="0.0.0.0")])
+
+    verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service fused-mcp"),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[exposed]", f"port {port}", "fused-memory.socket, compose service fused-mcp")
+
+
+def test_run_fails_a_port_nothing_accepts_on_loopback(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve("systemctl", [_row(port, "orchestrator-down.socket")])
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "orchestrator-down.socket", "127.0.0.1")
+    assert not [line for line in lines if "[exposed]" in line]
+
+
+def test_run_names_a_timeout_as_a_failure(fake_host: FakeHost, held):
+    port = _full_backlog(held)
+    fake_host.serve("systemctl", [_row(port, "fused-memory.socket", host="0.0.0.0")])
+
+    verdict, lines = _run(connect_timeout=0.3)
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[timed-out]", f"port {port}", "127.0.0.2")
+
+
+def test_run_probes_ipv6_addresses(fake_host: FakeHost, held):
+    if not socket.has_dualstack_ipv6():
+        pytest.skip("this host cannot bind a dual-stack IPv6 socket")
+    try:
+        server = socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=True)
+    except OSError as exc:
+        pytest.skip(f"this host cannot bind a dual-stack IPv6 socket: {exc}")
+    held.append(server)
+    port = server.getsockname()[1]
+    fake_host.serve("ip", _fake_links(_addr("inet6", "::1", "global")))
+    fake_host.serve("systemctl", [_row(port, "orchestrator-v6.socket", host="[::]")])
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[exposed]", f"port {port}", "::1 (fake0)")
+
+
+def test_run_reports_an_address_it_could_not_probe_as_unverified(fake_host: FakeHost, held):
+    port = _listen(held, "127.0.0.1")
+    fake_host.serve("ip", [_link(99999, "ghost0", _addr("inet6", "fe80::1", "link"))])
+    fake_host.serve("systemctl", [_row(port, "orchestrator-x.socket")])
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[unverified]", f"port {port}", "fe80::1%ghost0")
+
+
+def _systemctl_fails(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
+    host.stub("systemctl", 'echo "Failed to connect to bus: No medium found" >&2\nexit 1\n')
+
+
+def _ip_prints_garbage(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
+    host.stub("ip", "echo 'not json'\n")
+
+
+def _ip_absent(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PATH becomes the fake bin dir alone, holding systemctl and what its stub needs."""
+    (host.bin_dir / "ip").unlink()
+    for tool in ("bash", "cat"):
+        found = shutil.which(tool)
+        assert found is not None, f"{tool} is not on PATH"
+        (host.bin_dir / tool).symlink_to(found)
+    monkeypatch.setenv("PATH", str(host.bin_dir))
+
+
+@pytest.mark.parametrize(
+    ("break_source", "command", "reason"),
+    [
+        (_systemctl_fails, "systemctl --user list-sockets -o json", "Failed to connect to bus"),
+        (_ip_prints_garbage, "ip -j addr", "not JSON"),
+        (_ip_absent, "ip -j addr", "not found"),
+    ],
+    ids=["systemctl-exits-1", "ip-prints-non-json", "ip-absent"],
+)
+def test_run_reports_an_unreadable_source_and_still_probes_the_rest(
+    fake_host: FakeHost, held, monkeypatch: pytest.MonkeyPatch, break_source, command: str, reason: str
+):
+    port = _listen(held, "127.0.0.1")
+    break_source(fake_host, monkeypatch)
+
+    verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service falkordb"),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[source-error]", command, reason)
+    assert [line for line in _findings(lines) if f"port {port}" in line] == []
+
+
+def test_run_reports_findings_in_ascending_port_order(fake_host: FakeHost, held):
+    low, high = sorted((_listen(held, "0.0.0.0"), _listen(held, "0.0.0.0")))
+    fake_host.serve(
+        "systemctl",
+        [_row(high, "orchestrator-b.socket", "0.0.0.0"), _row(low, "orchestrator-a.socket", "0.0.0.0")],
+    )
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.FINDING
+    assert _line_index(lines, "[exposed]", f"port {low}") < _line_index(lines, "[exposed]", f"port {high}")
