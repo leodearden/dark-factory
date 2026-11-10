@@ -5,6 +5,7 @@ Design: plans/quality-dashboard-prd.md decision 14 and §Contract "Per-landing r
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, fields
@@ -286,11 +287,15 @@ async def upsert_landing_rows(
     await conn.executemany(_UPSERT_SQL, [_encode_row(row, stamp) for row in rows])
 
 
+def _decode_rows(records: Iterable[Iterable[Any]]) -> list[LandingRow]:
+    return [_decode_row(dict(zip(_ROW_COLUMNS, record, strict=True))) for record in records]
+
+
 async def read_landing_rows(conn: aiosqlite.Connection, project_id: str) -> list[LandingRow]:
-    """The project's stored rows in ordinal order."""
+    """The project's stored rows in ordinal order, decoded off the event loop."""
     async with conn.execute(_READ_ROWS_SQL, (project_id,)) as cursor:
         records = await cursor.fetchall()
-    return [_decode_row(dict(zip(_ROW_COLUMNS, record, strict=True))) for record in records]
+    return await asyncio.to_thread(_decode_rows, records)
 
 
 async def stored_cursor(
@@ -445,21 +450,27 @@ class NewestSamples:
     latest_value: QualitySample | None
 
 
-async def _newest_sample(
-    conn: aiosqlite.Connection, project_id: str, *, values_only: bool,
-) -> QualitySample | None:
-    where = ' AND state = ?' if values_only else ''
-    params = (project_id, SampleState.VALUE.value) if values_only else (project_id,)
-    async with conn.execute(
-        f'{_SELECT_SAMPLES}{where} ORDER BY ts DESC, id DESC LIMIT 1', params,
-    ) as cursor:
-        record = await cursor.fetchone()
-    return None if record is None else _decode_sample(record)
+_NEWEST_FIRST = 'ORDER BY ts DESC, id DESC'
+_NEWEST_SAMPLES_SQL = (
+    f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state WHERE id IN ('
+    f'(SELECT id FROM sample_state WHERE project_id = :project {_NEWEST_FIRST} LIMIT 1), '
+    f'(SELECT id FROM sample_state WHERE project_id = :project AND state = :value '
+    f'{_NEWEST_FIRST} LIMIT 1)) {_NEWEST_FIRST}'
+)
 
 
 async def newest_samples(conn: aiosqlite.Connection, project_id: str) -> NewestSamples:
-    """The newest sample and the newest value sample, in read_samples' order, without the rest."""
+    """The newest sample and the newest value sample, in read_samples' order, without the rest.
+
+    One statement reads both, so a tick committed between two reads cannot pair a superseded
+    gap with a newer value.
+    """
+    params = {'project': project_id, 'value': SampleState.VALUE.value}
+    async with conn.execute(_NEWEST_SAMPLES_SQL, params) as cursor:
+        newest_first = [_decode_sample(record) for record in await cursor.fetchall()]
     return NewestSamples(
-        latest=await _newest_sample(conn, project_id, values_only=False),
-        latest_value=await _newest_sample(conn, project_id, values_only=True),
+        latest=next(iter(newest_first), None),
+        latest_value=next(
+            (sample for sample in newest_first if sample.state is SampleState.VALUE), None,
+        ),
     )
