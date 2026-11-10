@@ -75,9 +75,14 @@ UNIT_DOWN = "unit-down"
 # scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict's own words,
 # reused verbatim so this output collates with its journal lines instead of
 # needing a translation step. 'wedged' is port-open-but-/alive-unanswered;
-# 'port-down' is the socket gone.
+# 'port-down' is the socket gone, which under socket activation is a deliberate
+# stop or disable rather than merely a down unit (see that function's docstring).
 WEDGED = "wedged"
 PORT_DOWN = "port-down"
+
+# fused-memory.socket's first commit (8ac33458c4). No host ran the socket before it, so an older
+# silence is from the regime in which the process bound port 8002 itself (OPERATIONS.md §"Socket activation").
+FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT = dt.datetime.fromisoformat("2026-09-25T13:06:26+01:00")
 
 # How many lines before the silence to keep as context. Enough to reach past
 # the HTTP access-log chatter into the application's own loggers on the
@@ -109,8 +114,7 @@ _WRITER_PATTERN = re.compile(r"^\S+ \S+ (?P<identifier>\S+)\[(?P<pid>\d+)\]:")
 
 _SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
 _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
-# A stall that BEGINS here began with the unit already down, so its socket was
-# unbound and a watchdog probe would have seen 'port-down' rather than 'wedged'.
+# A stall that BEGINS here began with the unit already down.
 # The stop-time accounting earns its place: systemd emits it as the unit
 # deactivates, which makes that the LAST line of a real stop sequence, so
 # without it a gap opening after a stop would still read 'wedged'.
@@ -293,8 +297,9 @@ class StallEpisode:
     def began_with_unit_down(self) -> bool:
         """Was the unit already stopped when this silence began?
 
-        The single fact both :attr:`outcome` and :attr:`watchdog_verdict` turn
-        on, asked once so the two can never disagree about it.
+        The fact :attr:`outcome` turns on and :attr:`watchdog_verdict` asks
+        first, asked once so the two can never disagree about it. It does not
+        settle the verdict alone: a down unit says nothing about its port.
         """
         return _carries_marker(self.last_line_before_stall, _UNIT_DOWN_MARKERS)
 
@@ -310,16 +315,26 @@ class StallEpisode:
         return SELF_RECOVERED
 
     @property
-    def watchdog_verdict(self) -> str:
+    def watchdog_verdict(self) -> str | None:
         """The verdict orchestrator-watchdog.py's probe would have returned
-        DURING this stall.
+        DURING this stall, or None when this capture cannot witness it.
 
         A stall that begins while the unit is running leaves the listening
         socket bound, so the port probe passes and only the /alive fetch —
-        served by the same blocked loop — fails: that is 'wedged'. A gap that
-        begins after the unit is already down is 'port-down' instead.
+        served by the same blocked loop — fails: that is 'wedged'.
+
+        A silence that begins with the unit already down is 'port-down' only
+        where the port is witnessed closed: before socket activation existed,
+        the stopped process took its own socket with it. Under socket
+        activation a restart or crash keeps fused-memory.socket bound and logs
+        nothing, so the probe could have read either verdict and this is None
+        (OPERATIONS.md §"fused-memory liveness revive").
         """
-        return PORT_DOWN if self.began_with_unit_down else WEDGED
+        if not self.began_with_unit_down:
+            return WEDGED
+        if self.stall_started_at < FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT:
+            return PORT_DOWN
+        return None
 
     @property
     def aftermath(self) -> tuple[str, ...]:
