@@ -11218,9 +11218,10 @@ class MemoryService:
             edges_incomplete_kind.  True: the read was proven complete.
             False: it was observed incomplete; the rebuild proceeded on what
             was fetched and the policy warned.  None: no verdict for that
-            read on this path, because the read was not issued or this is the
-            force=False dry_run probe (tkt_0RVHH0D37FVAWSMT1NVGSHDSZM).
-            Gate on ``is True``.  The raise/warn split is
+            read on this path, because the read was not issued.  The
+            force=False dry_run probe issues no whole-graph edge read, so its
+            edges_* are None and its entities_* carry the probe's node-read
+            verdict.  Gate on ``is True``.  The raise/warn split is
             fused-memory/src/fused_memory/backends/graphiti_client.py::apply_incompleteness_policy.
         """
         write_op_id = str(uuid_mod.uuid4())
@@ -11275,9 +11276,12 @@ class MemoryService:
                     )
             else:
                 if dry_run:
-                    probe = await self.graphiti.detect_stale_dry_run(group_id=project_id)
+                    probe = await self.graphiti.detect_stale_dry_run(
+                        group_id=project_id, log=logger
+                    )
                     stale = probe.stale
                     total_entities = probe.total_count
+                    entities_completeness = probe.entities_completeness
                 else:
                     detect_result = await self.graphiti.detect_stale_with_edges(
                         group_id=project_id, log=logger
