@@ -498,14 +498,15 @@ def _ip_absent(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_reports_an_unreadable_source_and_still_probes_the_rest(
     fake_host: FakeHost, held, monkeypatch: pytest.MonkeyPatch, break_source, command: str, reason: str
 ):
-    port = _listen(held, "127.0.0.1")
+    port = _bound_not_listening(held)
     break_source(fake_host, monkeypatch)
 
     verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service falkordb"),))
 
     assert verdict == exposure.ExposureExit.FINDING
     _line_index(lines, "[source-error]", command, reason)
-    assert [line for line in _findings(lines) if f"port {port}" in line] == []
+    _line_index(lines, "probing 1 port(s)")
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1")
 
 
 def test_run_reports_findings_in_ascending_port_order(fake_host: FakeHost, held):
