@@ -7,10 +7,20 @@ import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TypeVar
 
 import pytest
-from _quality_rows import NO_COST, NO_OUTCOMES, epochs_from, history
+from _quality_rows import (
+    NO_COST,
+    NO_OUTCOMES,
+    epochs_from,
+    history,
+    train,
+    write_landing_events,
+    write_quality_db,
+)
+from shared.project_id import project_id_for_root
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck, LinesBase
 from shared.quality_series.rows import (
@@ -37,16 +47,20 @@ from shared.quality_series.stats import (
     wilson_interval,
 )
 
-from dashboard.data.datum import DatumContractError, DatumState
+from dashboard.data.datum import DatumContractError, DatumState, validate_datum
+from dashboard.data.db import DbPool
 from dashboard.data.quality_series import (
+    QUALITY_FRESHNESS_BOUND_SECONDS,
     Alarm,
     AlarmDirection,
     Provenance,
     QualitySeriesContractError,
     QualitySeriesInvariant,
     quality_series_view,
+    read_quality_series,
     validate_quality_series,
 )
+from dashboard.data.quality_store import QualitySample
 
 T = TypeVar('T')
 T0 = datetime(2026, 9, 1, tzinfo=UTC)
@@ -785,3 +799,171 @@ def test_a_headline_breaking_the_envelope_is_refused() -> None:
 
     with pytest.raises(DatumContractError):
         validate_quality_series(broken, AS_OF)
+
+
+# --- read_quality_series: quality.db and runs.db under the project root ---------------------
+
+NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    project = tmp_path / 'dark_factory'
+    project.mkdir()
+    return project
+
+
+def _quality_db(root: Path) -> Path:
+    return root.parent / 'quality.db'
+
+
+def _value(root: Path, at: datetime, rows: Sequence[LandingRow]) -> QualitySample:
+    return QualitySample.value(
+        project_id_for_root(root), at, cursor_sha=rows[-1].landing.merge_sha,
+        landings_sampled=len(rows), landings_deferred=0, git_check=NO_DISAGREEMENT,
+    )
+
+
+def _gap(root: Path, at: datetime, reason: str) -> QualitySample:
+    return QualitySample.gap(project_id_for_root(root), at, reason)
+
+
+async def _read(root: Path, *, window: int | None = None, now: datetime = NOW):
+    pool = DbPool()
+    try:
+        db = await pool.get(_quality_db(root))
+        return await read_quality_series(db, root, window, now=now)
+    finally:
+        await pool.close_all()
+
+
+def _recent(n: int) -> list[LandingRow]:
+    """*n* landings ending a day before NOW, recorded in runs.db and stored alike."""
+    return history(n, start=NOW - timedelta(days=1) - timedelta(hours=2 * (n - 1)))
+
+
+async def _stored(root: Path, rows: Sequence[LandingRow], samples: Sequence[QualitySample]) -> None:
+    await write_quality_db(_quality_db(root), rows, samples)
+
+
+async def test_a_project_never_sampled_is_unknown(root: Path) -> None:
+    await _stored(root, [], [])
+
+    datum = await _read(root)
+
+    assert (datum.state, datum.value, datum.as_of) == (DatumState.UNKNOWN, None, None)
+    assert 'sampled' in (datum.reason or '')
+
+
+async def test_a_project_with_only_gaps_is_unknown_with_the_newest_gap_verbatim(root: Path) -> None:
+    await _stored(root, [], [
+        _gap(root, NOW - timedelta(minutes=20), 'GitUnavailable: an older failure'),
+        _gap(root, NOW - timedelta(minutes=10), 'GitUnavailable: no git binary to run'),
+    ])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == 'GitUnavailable: no git binary to run'
+
+
+async def test_an_absent_quality_db_is_unknown_naming_the_store(root: Path) -> None:
+    datum = await read_quality_series(None, root, 100, now=NOW)
+
+    assert datum.state is DatumState.UNKNOWN
+    assert 'quality.db' in (datum.reason or '')
+
+
+async def test_every_recorded_landing_stored_and_a_recent_value_is_fresh(root: Path) -> None:
+    rows = _recent(30)
+    write_landing_events(root, rows)
+    sampled_at = NOW - timedelta(minutes=5)
+    await _stored(root, rows, [_value(root, sampled_at, rows)])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.FRESH
+    assert datum.reason is None
+    assert datum.as_of == sampled_at
+    assert datum.freshness_bound_seconds == QUALITY_FRESHNESS_BOUND_SECONDS == 1200
+    assert datum.value is not None
+    assert len(datum.value.axis) == 30
+
+
+def _train_after(rows: Sequence[LandingRow]) -> list[LandingRow]:
+    newest = rows[-1].landing
+    return train(['7001', '7002', '7003'], 'sha-train', newest.ordinal + 1,
+                 newest.landed_at + timedelta(hours=1))
+
+
+async def test_recorded_landings_the_store_lacks_make_it_stale_until_stored(root: Path) -> None:
+    rows = _recent(30)
+    pending = _train_after(rows)
+    write_landing_events(root, [*rows, *pending])
+    await _stored(root, rows, [_value(root, NOW - timedelta(minutes=5), rows)])
+
+    behind = await _read(root)
+
+    assert behind.state is DatumState.STALE
+    assert behind.reason == '3 landings not yet sampled'
+    assert behind.value is not None
+    assert len(behind.value.axis) == 30
+
+    caught_up = [*rows, *pending]
+    await _stored(root, pending, [_value(root, NOW - timedelta(minutes=1), caught_up)])
+
+    cleared = await _read(root)
+
+    assert cleared.state is DatumState.FRESH
+    assert cleared.value is not None
+    assert len(cleared.value.axis) == 33
+
+
+async def test_a_gap_after_the_newest_value_is_stale_with_its_reason(root: Path) -> None:
+    rows = _recent(30)
+    write_landing_events(root, rows)
+    await _stored(root, rows, [
+        _value(root, NOW - timedelta(minutes=15), rows),
+        _gap(root, NOW - timedelta(minutes=5), 'OperationalError: database is locked'),
+    ])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    assert datum.reason == 'OperationalError: database is locked'
+    assert datum.as_of == NOW - timedelta(minutes=15)
+
+
+async def test_a_value_older_than_the_bound_is_stale(root: Path) -> None:
+    rows = _recent(30)
+    write_landing_events(root, rows)
+    await _stored(root, rows, [_value(root, NOW - timedelta(seconds=1201), rows)])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    assert '1200s' in (datum.reason or '')
+
+
+async def test_a_missing_runs_db_cannot_confirm_freshness(root: Path) -> None:
+    rows = _recent(30)
+    await _stored(root, rows, [_value(root, NOW - timedelta(minutes=5), rows)])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    assert 'runs.db' in (datum.reason or '')
+
+
+async def test_a_window_serves_the_newest_landings_and_passes_validation(root: Path) -> None:
+    rows = _recent(150)
+    write_landing_events(root, rows)
+    await _stored(root, rows, [_value(root, NOW - timedelta(minutes=5), rows)])
+
+    datum = await _read(root, window=100)
+
+    assert datum.value is not None
+    assert [point.ordinal for point in datum.value.axis] == list(range(50, 150))
+    validate_datum(datum, NOW)
+    validate_quality_series(datum.value, NOW)
