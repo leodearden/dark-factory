@@ -1464,3 +1464,33 @@ class TestTheRedigestCommand:
         assert self._redigest(bundle, path) == 0
 
         assert (_file_bytes(bundle.dir), _file_bytes(bundle.scratch)) == before
+
+
+LONGEST_RATED_LOSS_CHILD_CHARS = 1_394
+"""The longest child among the committed soak corpora's LOSS YES rows.
+
+Measured by ``redigest``'s summary (``longest_loss_child_chars``) from the
+2026-10-19 soak bundle. While the shipped amendment text cap is at least this,
+every rated child renders whole and every committed DIGEST reads YES.
+"""
+
+COMMITTED_SOAK_VERDICTS = [
+    pytest.param(SCRIPTS.parent / 'calibration' / name, id=name)
+    for name in ('write_triage_v2_soak_verdicts.jsonl', 'write_triage_v2_soak_verdicts_v2_2.jsonl')
+]
+
+
+class TestTheCommittedSoakDigest:
+    """The committed corpora carry DIGEST as the shipped amendment render gives it."""
+
+    def test_the_shipped_cap_shows_every_rated_loss_child_whole(self) -> None:
+        assert DEFAULT_AMENDMENT_TEXT_CHARS >= LONGEST_RATED_LOSS_CHILD_CHARS, (
+            'the cap fell below a rated child: run build_write_triage_v2_soak_baseline.py '
+            'redigest over the committed verdicts and regenerate the baselines')
+
+    @pytest.mark.parametrize('path', COMMITTED_SOAK_VERDICTS)
+    def test_every_rater_loss_yes_row_reads_digest_yes(self, path: Path) -> None:
+        loss = [row for row in _jsonl(path) if row['role'] != 'derived' and row.get('loss') == 'YES']
+
+        assert loss
+        assert [(row['entry_id'], row['rater']) for row in loss if row['digest'] != 'YES'] == []
