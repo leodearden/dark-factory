@@ -24,7 +24,7 @@ Normally the census runs unattended. Each nightly trickle run ends by evaluating
 - **(b) Novelty:** a novelty spike relative to its trailing baseline.
 - **Floor:** the minimum transcript window, measured from the session watermark. It never fires a census by itself, and elapsed time alone fires nothing. The tasks-landed condition and the 10-day `max_interval_days` backstop are retired, the backstop by decision (Leo, 2026-10-05). A `legibility.yaml` still carrying a retired key loads, and the key is ignored with one deprecation warning.
 
-When the completion check fails on 3 consecutive nightly evaluations (any exit but 0, 75, or 2 for a run that filed nothing), the trickle files one `escalate_info` for the project. Until the check answers again, the census can fire on the novelty spike alone. The next exit 0 or 75 resets the streak; a night with nothing to check carries it.
+When the completion check fails on 3 consecutive nightly evaluations (any exit but 0, 75, or 2 for a run that filed nothing), the trickle files one `escalate_info` for the project. If that post does not land, it is retried on each later night until one does. Until the check answers again, the census can fire on the novelty spike alone. The next exit 0 or 75 resets the streak; a night with nothing to check carries it.
 
 Run it by hand only in these two cases:
 
