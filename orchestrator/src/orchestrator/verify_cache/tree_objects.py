@@ -55,7 +55,7 @@ async def object_ids(repo: Path, tree: str, paths: Iterable[str]) -> dict[str, s
         repo, ['cat-file', '--batch-check=%(objectname) %(objecttype)'],
         input_text=''.join(f'{tree}:{path}\n' for path in wanted),
     )
-    lines = answer.splitlines()
+    lines = answer.split('\n')
     if len(lines) != len(wanted):
         raise TreeReadError(
             f'git cat-file --batch-check answered {len(lines)} lines for {len(wanted)} paths of {tree}',
