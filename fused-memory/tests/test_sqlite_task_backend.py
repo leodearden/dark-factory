@@ -1671,6 +1671,60 @@ async def test_stamp_audit_metadata_persists_and_preserves_sibling_keys(backend,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fields',
+    [
+        pytest.param({}, id='empty'),
+        pytest.param({'pending_since': '2000-01-01T00:00:00.000Z'}, id='only-pending_since'),
+        pytest.param(
+            {'pending_since': 'x', 'pending_since_backfilled': True},
+            id='only-machine-authored-keys',
+        ),
+    ],
+)
+async def test_stamp_audit_metadata_with_nothing_to_write_raises_and_writes_nothing(
+    backend, project_root, fields,
+):
+    """Task 4867: a stamp whose SANITISED fields are empty is the same false
+    success as a fieldless update_task (it rewrote the unchanged blob, bumped
+    ``updated_at`` and reported 'Stamped audit metadata'), so it raises the
+    same class, naming this operation."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'files': ['src/a.py']}),
+    )
+    before = await backend.get_task('1', project_root=project_root)
+    await asyncio.sleep(0.01)
+
+    with pytest.raises(NoFieldsToUpdateError) as exc:
+        await backend.stamp_audit_metadata('1', project_root, fields)
+
+    assert exc.value.operation == 'stamp_audit_metadata'
+    assert exc.value.task_id == '1'
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'stamp_audit_metadata' in str(exc.value)
+    assert await backend.get_task('1', project_root=project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_machine_authored_keys_do_not_block_a_real_field(
+    backend, project_root,
+):
+    """Only the sanitised remainder counts: a writable key beside a stripped
+    one still stamps, and the stripped one is not persisted."""
+    await backend.add_task(project_root=project_root, title='x')
+
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc'}, 'pending_since': 'forged'},
+    )
+
+    metadata = (await backend.get_task('1', project_root=project_root))['metadata']
+    assert metadata['done_provenance'] == {'kind': 'merged', 'commit': 'abc'}
+    assert metadata.get('pending_since') != 'forged'
+
+
+@pytest.mark.asyncio
 async def test_stamp_audit_metadata_second_stamp_merges_without_dropping_earlier(backend, project_root):
     """A second stamp (e.g. reopen_* fields) merges in without erasing the
     done_provenance a prior stamp wrote."""
@@ -7753,6 +7807,7 @@ async def test_update_task_with_no_mutating_field_raises_and_writes_nothing(
         )
 
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert exc.value.operation == 'update_task'
     assert exc.value.task_id == '1'
     assert set(exc.value.accepted_fields) == {
         'prompt', 'metadata', 'title', 'description', 'details', 'priority',
