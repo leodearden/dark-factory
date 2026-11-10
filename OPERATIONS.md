@@ -2554,6 +2554,15 @@ offline from the host cache (`~/.cache/huggingface`). It publishes on
 container stops instead of churning the shared GPU. `lms-arm@` units stay
 eval-only; nothing here calls `lms_serve.py`.
 
+Unlike the stores (`unless-stopped`), the embedder does not come back by itself
+after a docker daemon restart, a host reboot included, or after its fifth
+crash: Docker's `on-failure` policy skips both. It stays down until the next
+fused-memory start runs its `up`, or until you bring it back by hand:
+
+```bash
+docker compose -f fused-memory/docker/docker-compose.yml up -d --pull=never --no-deps embedder
+```
+
 Check it:
 
 ```bash
@@ -2566,22 +2575,32 @@ The `curl` is the readiness check. `ss -ltn` only shows the loopback bind, and
 the port is bound before the model serves.
 
 **Start and wait.** `fused-memory.service` carries two `-`-prefixed `ExecStartPre`
-lines for it. `up -d --pull=never embedder` runs before the store wait, so the
-107-123 s cold model load starts as early as possible; `--pull=never` makes a
-missing image fail fast instead of starting a multi-GB pull that would outlive
-`TimeoutStartSec`. A 15 s `wait-for-port` on `127.0.0.1:8420` runs after the store
-wait; it shows the docker-published port is up, not that the model is loaded.
-The waits run serially, and 280 s + 15 s stays under `TimeoutStartSec=300`, as
+lines for it. `up -d --pull=never --no-deps embedder` runs before the store wait,
+so the 107-123 s cold model load starts as early as possible. `--pull=never`
+makes a missing image fail fast instead of starting a multi-GB pull that would
+outlive `TimeoutStartSec`. `--no-deps` keeps that `up` from starting any other
+service, so falkordb still comes up only through the AOF gate. The `up` runs
+under `timeout 10`, which turns a hang (a stalled GPU hook, a wedged dockerd)
+into a failed exit. A 5 s `wait-for-port` on `127.0.0.1:8420` runs after the
+store wait; it shows the docker-published port is up, not that the model is
+loaded. Both lines carry `-`, so any embedder failure, including a hang the
+`timeout` cut short, leaves fused-memory starting degraded rather than failing
+its start.
+
+Worst case, the embedder hooks add 15 s to a start (10 s + 5 s). That fits
+inside the 20 s the 280 s store wait leaves under `TimeoutStartSec=300`, as
 `fused-memory/tests/test_systemd_unit_config.py::TestEmbedderStartHooks` pins.
-No wait inside that budget covers the cold load, so on a cold boot fused-memory
-starts before granite finishes loading, and β1's startup probe (task 6798)
-reports the gap. Both lines carry `-`, so a failed embedder leaves fused-memory
-starting degraded, never failing its start. A restart of fused-memory alone finds
+The sum leaves out the gate and the init path, so it bounds what the embedder
+adds, not the whole start. No wait inside that budget covers the cold load, so
+on a cold boot fused-memory starts before granite finishes loading, and β1's
+startup probe (task 6798) reports the gap. A restart of fused-memory alone finds
 the embedder already serving.
 
 `scripts/check_fused_memory_unit_parity.py` accepts an `ExecStartPre` compose `up`
 that names only `embedder` (its `UNGATED_COMPOSE_SERVICES`) and still flags any
-other compose `up` beside the FalkorDB AOF gate.
+other compose `up` beside the FalkorDB AOF gate. The `[drift]` report prints
+each flagged line and the tokens it read as services. An option's separate value
+is read as a service too, so write options as one token (`--pull=never`).
 
 **The cutover hold.** `scripts/fused-memory-cutover-hold.conf` is a drop-in whose
 one `ConditionPathExists=!` directive names the cutover lock file. That file is
@@ -2595,8 +2614,14 @@ than `$XDG_RUNTIME_DIR` or `/tmp` so it survives a reboot: the installed
 `orchestrator-*.service` units carry `Wants=fused-memory.service` and would start
 a held unit at boot if the lock vanished.
 
-Once installed, the drop-in makes `scripts/check_fused_memory_unit_parity.py`
-report an `[override]` and exit 1. That is expected while the hold is installed.
+Once α2 installs the drop-in, it stays installed; only the lock comes and goes.
+So from then on, every run of `scripts/check_fused_memory_unit_parity.py`
+reports an `[override]` naming it and exits 1, and exit 1 alone no longer
+separates real drift from this drop-in. Read the report. If its only finding is
+the `[override]` for the cutover hold, with no `[drift]` line and no other
+drop-in, the unit is at parity. A follow-up filed from task 6797 (ticket
+`tkt_0RWV3564630WNF15APKKRXVZMJ`) is to teach the checker to recognise this
+drop-in.
 
 Installing the compose service, the template lines and the drop-in on the host is
 a separate attended step (α2, task 6801); the tracked files alone change nothing
