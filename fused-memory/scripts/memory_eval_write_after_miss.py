@@ -15,22 +15,37 @@ ELIGIBILITY. A write is adjudicated when all of these hold:
 Every other write is counted under a skip reason, so
 ``writes = adjudicated + skipped``.
 
-INCIDENT. The production near-duplicate guard
+INCIDENT. The pure near-duplicate guard function
 (``fused_memory/server/near_duplicate_guard.py::find_near_duplicate_memory``),
-run at production's resolved threshold, finds an existing entry in the write's
-category that existed before the write. If no prior search in the window showed
-that entry, directly or through its grouped parent, the write is one incident.
+at its configured threshold (``resolve_near_dup_threshold``), finds an existing
+entry in the write's category that existed before the write. If no prior search
+in the window showed that entry, directly or through its grouped parent, the
+write is one incident.
+
+THE PREDICATE IS A YARDSTICK, NOT PRODUCTION'S DECISION. While
+``write_triage.enabled`` is on, ``fused_memory/server/tools.py::add_memory``
+routes every explicit Mem0-primary write through write triage, whose calibrated
+bands judge its own candidates, and never runs this guard. An incident means
+"the guard function calls this a near-duplicate of an entry the caller was not
+shown", not "production rejected or attached the write".
 
 CANDIDATES COME FROM A READ-ONLY LIVE SEARCH. The journal holds no cosine
-between a written content and existing entries. A search row's ``store_score``
-is relative to that search's query, and the guard's own pre-write search is not
-journalled. So the guard's search is re-run against the write's stored content,
-with no ``causation_id``, which means nothing is journalled. Entries deleted
-since the write cannot be seen, a stated undercount.
+between a written content and existing entries: a search row's ``store_score``
+is relative to that search's query. So a guard-shaped search (Mem0 only, the
+write's category, no topic anchoring) is run with the write's stored content,
+with no ``causation_id``, which means nothing is journalled. Three narrowings:
+- entries deleted since the write cannot be seen, a stated undercount;
+- entries written after it are dropped; when they still fill a search at
+  ``CANDIDATE_FETCH_CEILING`` and nothing matched, the write is skipped as
+  ``candidates_crowded_out`` rather than called clean;
+- candidates with no aware ``created_at`` cannot be placed before the write;
+  they are dropped and counted as ``undated_candidates``.
 
 PERIODS tile on run stamps: ``[previous e7 artifact's stamp, this stamp)``.
 Consecutive runs are therefore disjoint samples. ``--initial-period-hours``
-bootstraps the first run only.
+bootstraps the first run only. A period longer than ``--max-period-hours``
+keeps only its latest hours, so one outage cannot grow every later run past the
+runner's timeout; the dropped hours are disclosed as uncovered.
 
 The script never writes the corpus or the journal, and it asserts no alarm
 limit: the scheduled runner judges the series (G6).
@@ -45,11 +60,13 @@ import logging
 import os
 import sqlite3
 import sys
-from collections import Counter
+from bisect import bisect_left
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from operator import attrgetter
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -80,6 +97,7 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_threshold,
 )
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.read_telemetry import SEARCH_TELEMETRY_SCHEMA_VERSION
 from fused_memory.services.write_journal import WriteJournal
 
 EVAL_ID = 'e7-write-after-miss'
@@ -93,12 +111,27 @@ _DEFAULT_METRICS_ROOT = REPO_ROOT / 'fused-memory' / 'data' / 'memory-evals'
 INITIAL_PERIOD_HOURS = 24.0
 """The first run's period length. Every later period runs from the previous run's stamp."""
 
-GUARD_SEARCH_DEPTH = 5
-"""The candidate depth of the production guard's pre-write search.
+MAX_PERIOD_HOURS = 72.0
+"""The longest period one run adjudicates; older hours since the previous run are left uncovered.
 
-Mirrors the ``limit=5`` literal in ``fused_memory/server/tools.py::add_memory``.
-A replay asks for this many plus the write's own ids, because those are
-filtered out; the guard's max-cosine selection is otherwise unchanged.
+Adjudication costs one store read and one embedding search per eligible write,
+so an unbounded period after an outage could outrun the runner's per-producer
+timeout, fail, and widen the next period further.
+"""
+
+CANDIDATE_DEPTH = 5
+"""How many entries that predate the write a replay judges: the guard function's search depth.
+
+The ``limit=5`` of the guard's pre-write search in
+``fused_memory/server/tools.py::add_memory``. The first search asks for this
+many plus the write's own ids, because those are filtered out.
+"""
+
+CANDIDATE_FETCH_CEILING = 64
+"""The deepest search a replay runs to find ``CANDIDATE_DEPTH`` entries that predate the write.
+
+Entries written after the write, such as a loop's own later restatements, can
+outrank every earlier one. The replay doubles its depth past them up to here.
 """
 
 JOURNAL_BUSY_TIMEOUT_SECS = 30.0
@@ -138,16 +171,31 @@ class Period:
 
     start: datetime
     end: datetime
+    uncovered_start: datetime | None = None
+    """Where ``[uncovered_start, start)`` begins: hours since the previous run that the cap left unevaluated."""
 
     def __post_init__(self) -> None:
-        if self.start.tzinfo is None or self.end.tzinfo is None:
+        bounds = (self.start, self.end, self.uncovered_start or self.start)
+        if any(bound.tzinfo is None for bound in bounds):
             raise ValueError(
-                f'Period bounds must be timezone-aware: start={self.start!r}, end={self.end!r}'
+                f'Period bounds must be timezone-aware: start={self.start!r}, end={self.end!r}, '
+                f'uncovered_start={self.uncovered_start!r}'
             )
         if not self.start < self.end:
             raise ValueError(
                 f'Period start {self.start.isoformat()} is not before end {self.end.isoformat()}'
             )
+        if self.uncovered_start is not None and not self.uncovered_start < self.start:
+            raise ValueError(
+                f'uncovered_start {self.uncovered_start.isoformat()} is not before '
+                f'start {self.start.isoformat()}'
+            )
+
+    @property
+    def uncovered_seconds(self) -> int:
+        if self.uncovered_start is None:
+            return 0
+        return round((self.start - self.uncovered_start).total_seconds())
 
 
 @dataclass(frozen=True)
@@ -169,7 +217,8 @@ class SearchRow:
     complete: bool
     """False when the row cannot prove what it did NOT show.
 
-    That is: no telemetry envelope, a telemetry fault, or a truncated result list.
+    That is: no telemetry envelope, one of another schema version, a telemetry
+    fault, or a truncated result list.
     """
     created_at: datetime
 
@@ -296,7 +345,7 @@ def _search_row(project_id: str, row: tuple) -> SearchRow | None:
         caller_agent_id=caller,
         shown_ids=_shown_ids(summary),
         complete=(
-            'schema_version' in summary
+            summary.get('schema_version') == SEARCH_TELEMETRY_SCHEMA_VERSION
             and not summary.get('telemetry_error')
             and not summary.get('results_truncated')
         ),
@@ -340,6 +389,8 @@ class SkipReason(StrEnum):
     CANDIDATE_SEARCH_DEGRADED = 'candidate_search_degraded'
     SHOWN_SET_INCOMPLETE = 'shown_set_incomplete'
     """The match is outside every known shown set and some prior search cannot prove absence."""
+    CANDIDATES_CROWDED_OUT = 'candidates_crowded_out'
+    """Nothing matched, but later entries still filled the ceiling-depth search: an earlier match may lie deeper."""
 
 
 class Exposure(StrEnum):
@@ -371,16 +422,31 @@ class Adjudication:
     adjudicated: int
     skipped: Mapping[SkipReason, int]
     """Every reason, present at zero too."""
+    undated_candidates: int
+    """Candidates dropped from adjudicated writes because they carry no aware ``created_at``."""
 
 
-def prior_searches(write: WriteRow, searches: Sequence[SearchRow]) -> tuple[SearchRow, ...]:
+SearchesByWindow = Mapping[tuple[str, str], tuple[SearchRow, ...]]
+
+_created_at = attrgetter('created_at')
+
+
+def searches_by_window(searches: Sequence[SearchRow]) -> SearchesByWindow:
+    """Each ``(project_id, caller)`` window's searches in time order, grouped once per run."""
+    grouped: defaultdict[tuple[str, str], list[SearchRow]] = defaultdict(list)
+    for search in searches:
+        grouped[(search.project_id, search.caller_agent_id)].append(search)
+    return MappingProxyType({
+        window: tuple(sorted(rows, key=_created_at)) for window, rows in grouped.items()
+    })
+
+
+def prior_searches(write: WriteRow, by_window: SearchesByWindow) -> tuple[SearchRow, ...]:
     """The write's window: same project and caller, strictly before the write."""
-    return tuple(
-        search for search in searches
-        if search.project_id == write.project_id
-        and search.caller_agent_id == write.caller_agent_id
-        and search.created_at < write.created_at
-    )
+    if write.caller_agent_id is None:
+        return ()
+    rows = by_window.get((write.project_id, write.caller_agent_id), ())
+    return rows[:bisect_left(rows, write.created_at, key=_created_at)]
 
 
 def ineligibility(write: WriteRow, prior: Sequence[SearchRow]) -> SkipReason | None:
@@ -404,46 +470,71 @@ async def _stored_content(memory: Any, write: WriteRow, project_id: str) -> str 
     return None
 
 
+@dataclass(frozen=True)
+class CandidateWindow:
+    """What one candidate search found for a write, split by when each entry was created."""
+
+    admissible: tuple[MemoryResult, ...]
+    """Entries that already existed when the write landed, excluding its own ids."""
+    undated: int
+    """Entries with no aware ``created_at``, which cannot be placed before or after the write."""
+    crowded: bool = False
+    """The ceiling-depth search was full yet held fewer than ``CANDIDATE_DEPTH`` admissible entries."""
+
+
+def _created_at_of(result: MemoryResult) -> datetime | None:
+    try:
+        created = datetime.fromisoformat(result.created_at) if result.created_at else None
+    except ValueError:
+        return None
+    return created if created is not None and created.tzinfo is not None else None
+
+
+def candidate_window(results: Sequence[MemoryResult], write: WriteRow) -> CandidateWindow:
+    """*results* without the write's own ids, split into entries that predate it and undated ones."""
+    others = [result for result in results if result.id not in write.memory_ids]
+    created = [_created_at_of(result) for result in others]
+    return CandidateWindow(
+        admissible=tuple(
+            result for result, moment in zip(others, created, strict=True)
+            if moment is not None and moment < write.created_at
+        ),
+        undated=sum(moment is None for moment in created),
+    )
+
+
 async def fetch_candidates(
     memory: Any, write: WriteRow, *, project_id: str,
-) -> list[MemoryResult] | SkipReason:
-    """Re-run the guard's search with the write's stored content, journalling nothing.
+) -> CandidateWindow | SkipReason:
+    """Search the write's stored content for entries that predate it, journalling nothing.
 
     No ``causation_id`` is passed, so ``MemoryService.search`` writes no journal
-    row. ``anchor_topics=False`` matches the guard: a pinned canonical carries
-    no cosine and would only spend a candidate slot.
+    row. ``anchor_topics=False`` matches the guard function's search: a pinned
+    canonical carries no cosine and would only spend a candidate slot. The depth
+    doubles while later entries crowd out earlier ones, up to
+    ``CANDIDATE_FETCH_CEILING``.
     """
     content = await _stored_content(memory, write, project_id)
     if content is None:
         return SkipReason.CONTENT_UNAVAILABLE
-    results = await memory.search(
-        query=content,
-        project_id=project_id,
-        categories=[write.category],
-        stores=['mem0'],
-        limit=GUARD_SEARCH_DEPTH + len(write.memory_ids),
-        anchor_topics=False,
-    )
-    if getattr(results, 'degraded', False):
-        return SkipReason.CANDIDATE_SEARCH_DEGRADED
-    return list(results)
-
-
-def _created_before(result: MemoryResult, moment: datetime) -> bool:
-    try:
-        created = datetime.fromisoformat(result.created_at) if result.created_at else None
-    except ValueError:
-        created = None
-    return created is not None and created.tzinfo is not None and created < moment
-
-
-def admissible(results: Sequence[MemoryResult], write: WriteRow) -> list[MemoryResult]:
-    """Candidates that already existed when *write* landed: not its own ids, dated before it."""
-    own = set(write.memory_ids)
-    return [
-        result for result in results
-        if result.id not in own and _created_before(result, write.created_at)
-    ]
+    limit = CANDIDATE_DEPTH + len(write.memory_ids)
+    while True:
+        results = await memory.search(
+            query=content,
+            project_id=project_id,
+            categories=[write.category],
+            stores=['mem0'],
+            limit=limit,
+            anchor_topics=False,
+        )
+        if getattr(results, 'degraded', False):
+            return SkipReason.CANDIDATE_SEARCH_DEGRADED
+        window = candidate_window(results, write)
+        if len(window.admissible) >= CANDIDATE_DEPTH or len(results) < limit:
+            return window
+        if limit >= CANDIDATE_FETCH_CEILING:
+            return replace(window, crowded=True)
+        limit = min(limit * 2, CANDIDATE_FETCH_CEILING)
 
 
 def was_shown(match: MemoryResult, searches: Sequence[SearchRow]) -> Exposure:
@@ -460,27 +551,45 @@ def was_shown(match: MemoryResult, searches: Sequence[SearchRow]) -> Exposure:
     return Exposure.UNKNOWN
 
 
+@dataclass(frozen=True)
+class _WriteVerdict:
+    outcome: Incident | SkipReason | None
+    """The write's incident, the reason it was skipped, or ``None`` for a clean adjudication."""
+    undated_candidates: int = 0
+
+
 async def _adjudicate_write(
     write: WriteRow,
-    searches: Sequence[SearchRow],
+    prior: Sequence[SearchRow],
     memory: Any,
     *,
     project_id: str,
     threshold: float,
-) -> Incident | SkipReason | None:
-    """The write's incident, the reason it was skipped, or ``None`` for a clean adjudication."""
-    prior = prior_searches(write, searches)
+) -> _WriteVerdict:
     reason = ineligibility(write, prior)
     if reason is not None:
-        return reason
+        return _WriteVerdict(reason)
     candidates = await fetch_candidates(memory, write, project_id=project_id)
     if isinstance(candidates, SkipReason):
-        return candidates
+        return _WriteVerdict(candidates)
+    return _WriteVerdict(
+        _judge(write, prior, candidates, threshold=threshold),
+        undated_candidates=candidates.undated,
+    )
+
+
+def _judge(
+    write: WriteRow,
+    prior: Sequence[SearchRow],
+    candidates: CandidateWindow,
+    *,
+    threshold: float,
+) -> Incident | SkipReason | None:
     match = find_near_duplicate_memory(
-        admissible(candidates, write), threshold, category=MemoryCategory(write.category),
+        list(candidates.admissible), threshold, category=MemoryCategory(write.category),
     )
     if match is None:
-        return None
+        return SkipReason.CANDIDATES_CROWDED_OUT if candidates.crowded else None
     exposure = was_shown(match, prior)
     if exposure is Exposure.SHOWN:
         return None
@@ -500,25 +609,30 @@ async def _adjudicate_write(
 
 
 async def adjudicate(window: JournalWindow, memory: Any, *, project_id: str) -> Adjudication:
-    """Adjudicate every write in *window* against the production guard at its resolved threshold."""
+    """Adjudicate every write in *window* with the near-duplicate guard function at its configured threshold."""
     threshold = resolve_near_dup_threshold(memory)
+    by_window = searches_by_window(window.searches)
     incidents: list[Incident] = []
     skipped: Counter[SkipReason] = Counter()
     adjudicated = 0
+    undated = 0
     for write in window.writes:
         verdict = await _adjudicate_write(
-            write, window.searches, memory, project_id=project_id, threshold=threshold,
+            write, prior_searches(write, by_window), memory,
+            project_id=project_id, threshold=threshold,
         )
-        if isinstance(verdict, SkipReason):
-            skipped[verdict] += 1
+        if isinstance(verdict.outcome, SkipReason):
+            skipped[verdict.outcome] += 1
             continue
         adjudicated += 1
-        if verdict is not None:
-            incidents.append(verdict)
+        undated += verdict.undated_candidates
+        if verdict.outcome is not None:
+            incidents.append(verdict.outcome)
     return Adjudication(
         incidents=tuple(incidents),
         adjudicated=adjudicated,
         skipped=MappingProxyType({reason: skipped[reason] for reason in SkipReason}),
+        undated_candidates=undated,
     )
 
 
@@ -531,14 +645,18 @@ def incidents_filename(stamp: str) -> str:
     return f'incidents-{validate_stamp(stamp, what="incidents stamp")}.json'
 
 
-def corpus_counts(adjudication: Adjudication, window: JournalWindow) -> dict[str, int]:
+def corpus_counts(
+    adjudication: Adjudication, window: JournalWindow, period: Period,
+) -> dict[str, int]:
     """Every narrowing between the period's rows and the metric's denominator, at zero too."""
     return {
+        'uncovered_period_seconds': period.uncovered_seconds,
         'writes_in_period': len(window.writes),
         'searches_in_period': len(window.searches),
         'unattributed_searches': window.unattributed_searches,
         'unparsed_rows': window.unparsed_rows,
         'adjudicated': adjudication.adjudicated,
+        'undated_candidates': adjudication.undated_candidates,
         'incidents': len(adjudication.incidents),
         **{f'skipped_{reason.value}': count for reason, count in adjudication.skipped.items()},
     }
@@ -548,6 +666,7 @@ def build_series(
     adjudication: Adjudication,
     window: JournalWindow,
     *,
+    period: Period,
     project_id: str,
     stamp: str,
     details_path: str,
@@ -569,7 +688,7 @@ def build_series(
         schema_version=SCHEMA_VERSION,
         eval_id=eval_id,
         run_stamp=stamp,
-        corpus=Corpus(project_id=project_id, counts=corpus_counts(adjudication, window)),
+        corpus=Corpus(project_id=project_id, counts=corpus_counts(adjudication, window, period)),
         metrics=metrics,
     )
 
@@ -598,6 +717,7 @@ def incidents_payload(
         'project_id': project_id,
         'period_start': period.start.isoformat(),
         'period_end': period.end.isoformat(),
+        'uncovered_start': period.uncovered_start.isoformat() if period.uncovered_start else None,
         'adjudicated': adjudication.adjudicated,
         'skipped': {reason.value: count for reason, count in adjudication.skipped.items()},
         'incidents': [_incident_record(incident) for incident in adjudication.incidents],
@@ -633,8 +753,13 @@ def render_report(
         render_series_report(series).rstrip('\n'),
         '',
         f'period: [{period.start.isoformat()}, {period.end.isoformat()})',
-        _measurement_line(adjudication, writes),
     ]
+    if period.uncovered_start is not None:
+        lines.append(
+            f'uncovered: [{period.uncovered_start.isoformat()}, {period.start.isoformat()}) '
+            'since the previous run, past --max-period-hours; not evaluated'
+        )
+    lines.append(_measurement_line(adjudication, writes))
     if adjudication.incidents:
         lines.append(f'incidents ({len(adjudication.incidents)}):')
         lines.extend(_incident_line(incident) for incident in adjudication.incidents)
@@ -687,7 +812,7 @@ async def produce_write_after_miss(
     adjudication = await adjudicate(window, memory, project_id=project_id)
     incidents_path = eval_dir(out_root, eval_id) / incidents_filename(stamp)
     series = build_series(
-        adjudication, window,
+        adjudication, window, period=period,
         project_id=project_id, stamp=stamp, details_path=incidents_path.name, eval_id=eval_id,
     )
     incidents_path.parent.mkdir(parents=True, exist_ok=True)
@@ -708,17 +833,28 @@ async def produce_write_after_miss(
 
 
 def evaluation_period(
-    root: str | Path, eval_id: str, stamp: str, *, initial_period_hours: float,
+    root: str | Path,
+    eval_id: str,
+    stamp: str,
+    *,
+    initial_period_hours: float,
+    max_period_hours: float,
 ) -> Period:
     """``[previous run's stamp, stamp)``, so consecutive runs are disjoint samples.
 
-    With no earlier artifact, the period is the *initial_period_hours* before *stamp*.
+    With no earlier artifact, the period is the *initial_period_hours* before
+    *stamp*. A period longer than *max_period_hours* starts that long before
+    *stamp* instead, and names the previous stamp as its ``uncovered_start``.
     """
     end = stamp_datetime(stamp)
     previous = load_series_window(root, eval_id, limit=1, before_stamp=stamp)
-    if previous:
-        return Period(stamp_datetime(previous[-1].run_stamp), end)
-    return Period(end - timedelta(hours=initial_period_hours), end)
+    if not previous:
+        return Period(end - timedelta(hours=initial_period_hours), end)
+    start = stamp_datetime(previous[-1].run_stamp)
+    earliest = end - timedelta(hours=max_period_hours)
+    if start < earliest:
+        return Period(earliest, end, uncovered_start=start)
+    return Period(start, end)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -750,6 +886,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=INITIAL_PERIOD_HOURS,
         help='First-run bootstrap only: the period length when no earlier artifact exists. '
              'Later periods run from the previous run stamp (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--max-period-hours', dest='max_period_hours', type=float, default=MAX_PERIOD_HOURS,
+        help='The longest period one run adjudicates; earlier hours since the previous run '
+             'are reported as uncovered (default: %(default)s)',
     )
     parser.add_argument(
         '--config', default=None,
@@ -793,7 +934,8 @@ async def _run(args: argparse.Namespace, open_memory: MemoryFactory) -> int:
         os.environ['CONFIG_PATH'] = str(args.config)
     stamp = run_stamp()
     period = evaluation_period(
-        args.metrics_root, args.eval_id, stamp, initial_period_hours=args.initial_period_hours,
+        args.metrics_root, args.eval_id, stamp,
+        initial_period_hours=args.initial_period_hours, max_period_hours=args.max_period_hours,
     )
     config = FusedMemoryConfig()
     journal_path = Path(args.journal) if args.journal else _default_journal(config)

@@ -42,6 +42,7 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.services.memory_service import SearchResults
 from fused_memory.services.read_telemetry import (
+    SEARCH_TELEMETRY_SCHEMA_VERSION,
     fallback_search_summary,
     summarize_search_query,
     summarize_search_results,
@@ -148,6 +149,20 @@ class _FixtureJournal:
         )
         return row_id
 
+    async def raw_write(self, *, params: dict, result_summary: dict | str) -> str:
+        """An ``add_memory`` row with blobs of any shape, such as the durable queue's ``str(result)``."""
+        row_id = self._next_id('raw-write')
+        await self._journal.log_write_op(
+            write_op_id=row_id,
+            operation='add_memory',
+            kind='write',
+            project_id=PROJECT,
+            agent_id=CALLER_A,
+            params=params,
+            result_summary=result_summary,
+        )
+        return row_id
+
 
 @contextlib.asynccontextmanager
 async def _fixture_journal(tmp_path: Path) -> AsyncIterator[_FixtureJournal]:
@@ -168,8 +183,9 @@ class FakeMemory:
     """A read-only ``MemoryService`` double: the seams the producer reads, and write methods that raise.
 
     Candidates are keyed by the query content, which is the write's stored
-    content, so a test states "searching W1's content returns these entries".
-    The threshold is set on the config path the production resolver reads.
+    content, so a test states "searching W1's content returns these entries",
+    best first; a search returns the first ``limit`` of them, as a vector store does.
+    The threshold is set on the config path ``resolve_near_dup_threshold`` reads.
     """
 
     def __init__(
@@ -198,7 +214,7 @@ class FakeMemory:
     async def search(self, **kwargs: Any) -> SearchResults:
         self.search_calls.append(kwargs)
         return SearchResults(
-            self._candidates.get(kwargs['query'], []),
+            self._candidates.get(kwargs['query'], [])[:kwargs['limit']],
             degraded=self._degraded,
             failed_stores=['mem0'] if self._degraded else None,
         )
@@ -295,6 +311,36 @@ class TestJournalReader:
 
         completeness = {search.row_id: search.complete for search in window.searches}
         assert completeness == {errored: False, truncated: False}
+
+    @pytest.mark.asyncio
+    async def test_a_search_row_of_another_telemetry_schema_version_is_incomplete(self, tmp_path):
+        reshaped = {
+            **summarize_search_results([_hit('hit-1')]),
+            'schema_version': SEARCH_TELEMETRY_SCHEMA_VERSION + 1,
+        }
+        async with _fixture_journal(tmp_path) as fixture:
+            row_id = await fixture.search(CALLER_A, result_summary=reshaped)
+
+        window = _read(fixture.db_path)
+
+        assert [(search.row_id, search.complete) for search in window.searches] == [(row_id, False)]
+
+    @pytest.mark.asyncio
+    async def test_rows_without_their_producers_shape_are_counted_not_raised(self, tmp_path):
+        async with _fixture_journal(tmp_path) as fixture:
+            await fixture.raw_write(
+                params={'content': 'queued', 'category': 'procedural_knowledge'},
+                result_summary="{'memory_ids': ['m-1']}",
+            )
+            await fixture.raw_write(
+                params={'content': 'no category'},
+                result_summary={'memory_ids': ['m-2'], 'stores': ['mem0'], 'stores_pending': []},
+            )
+
+        window = _read(fixture.db_path)
+
+        assert window.writes == ()
+        assert window.unparsed_rows == 2
 
     @pytest.mark.asyncio
     async def test_an_unattributed_search_is_disclosed_not_returned(self, tmp_path):
@@ -430,6 +476,44 @@ class TestAdjudication:
         assert adjudication.incidents == ()
 
     @pytest.mark.asyncio
+    async def test_an_undated_candidate_is_dropped_and_counted(self, tmp_path):
+        window = await _single_write_fixture(tmp_path)
+        memory = FakeMemory(
+            contents={'w': 'W content'},
+            candidates={'W content': [_hit('undated', score=0.99, created_at=None)]},
+        )
+
+        adjudication = await _adjudicate(window, memory)
+
+        assert adjudication.adjudicated == 1
+        assert adjudication.incidents == ()
+        assert adjudication.undated_candidates == 1
+
+    @pytest.mark.asyncio
+    async def test_later_entries_cannot_crowd_out_a_pre_existing_match(self, tmp_path):
+        window = await _single_write_fixture(tmp_path)
+        write = window.writes[0]
+        depth = _mod().CANDIDATE_DEPTH
+        restatements = [
+            _hit(f'later-{index}', score=0.99 - index * 0.001, created_at=_after(write))
+            for index in range(depth + 1)
+        ]
+        memory = FakeMemory(
+            contents={'w': 'W content'},
+            candidates={'W content': [
+                _hit('w', score=1.0, created_at=write.created_at.isoformat()),
+                *restatements,
+                _hit('y', score=0.95, created_at=_before(write)),
+            ]},
+        )
+
+        adjudication = await _adjudicate(window, memory)
+
+        assert [incident.matched_memory_id for incident in adjudication.incidents] == ['y']
+        limits = [call['limit'] for call in memory.search_calls]
+        assert limits == sorted(set(limits)) and len(limits) > 1
+
+    @pytest.mark.asyncio
     async def test_a_candidate_below_the_configured_threshold_is_no_incident(self, tmp_path):
         window = await _single_write_fixture(tmp_path)
         write = window.writes[0]
@@ -471,7 +555,7 @@ class TestAdjudication:
             assert call['categories'] == ['procedural_knowledge']
             assert call['anchor_topics'] is False
             assert call['project_id'] == PROJECT
-            assert call['limit'] == _mod().GUARD_SEARCH_DEPTH + 1
+            assert call['limit'] == _mod().CANDIDATE_DEPTH + 1
             assert 'causation_id' not in call
         assert {call['query'] for call in memory.search_calls} == {'W1 content', 'W2 content'}
 
@@ -522,6 +606,23 @@ class TestUnadjudicableWritesAreDisclosed:
         )
 
         _assert_only_skipped_as(adjudication, 'CANDIDATE_SEARCH_DEGRADED')
+
+    @pytest.mark.asyncio
+    async def test_a_window_still_crowded_at_the_ceiling_is_skipped_not_clean(self, tmp_path):
+        window = await _single_write_fixture(tmp_path)
+        write = window.writes[0]
+        memory = FakeMemory(
+            contents={'w': 'W content'},
+            candidates={'W content': [
+                _hit(f'later-{index}', score=0.8, created_at=_after(write))
+                for index in range(_mod().CANDIDATE_FETCH_CEILING)
+            ]},
+        )
+
+        adjudication = await _adjudicate(window, memory)
+
+        _assert_only_skipped_as(adjudication, 'CANDIDATES_CROWDED_OUT')
+        assert memory.search_calls[-1]['limit'] == _mod().CANDIDATE_FETCH_CEILING
 
     @pytest.mark.asyncio
     async def test_an_unseen_match_behind_an_incomplete_search_is_never_an_incident(self, tmp_path):
@@ -685,9 +786,31 @@ class TestSeriesAndArtifacts:
             'incidents': 1,
             'unattributed_searches': 0,
             'unparsed_rows': 0,
+            'undated_candidates': 0,
+            'uncovered_period_seconds': 0,
             **{f'skipped_{reason.value}': 0 for reason in _mod().SkipReason},
         }
         assert {key: corpus.counts.get(key) for key in expected} == expected
+
+    @pytest.mark.asyncio
+    async def test_hours_a_capped_period_left_uncovered_are_disclosed(self, tmp_path):
+        _window, memory, _rows, journal = await _headline_fixture(tmp_path)
+        covered = _period_around_now()
+        uncovered_start = covered.start - timedelta(hours=30)
+        period = _mod().Period(covered.start, covered.end, uncovered_start=uncovered_start)
+
+        outcome = await _mod().run_write_after_miss(
+            memory, journal_path=journal, out_root=tmp_path / 'evals', project_id=PROJECT,
+            stamp=STAMP, period=period,
+        )
+
+        assert outcome.series.corpus.counts['uncovered_period_seconds'] == 30 * 3600
+        uncovered_line = next(
+            line for line in outcome.report.splitlines() if line.startswith('uncovered:')
+        )
+        assert uncovered_start.isoformat() in uncovered_line
+        payload = json.loads(outcome.incidents_path.read_text(encoding='utf-8'))
+        assert payload['uncovered_start'] == uncovered_start.isoformat()
 
     @pytest.mark.asyncio
     async def test_nothing_adjudicated_writes_a_series_with_no_metric(self, tmp_path):
@@ -751,14 +874,27 @@ class TestPeriodAndCli:
         previous, current = '20261108T220000Z', '20261109T220000Z'
         write_metric_series(_empty_series(previous), tmp_path)
 
-        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24)
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24, max_period_hours=72)
 
         assert period == _mod().Period(stamp_datetime(previous), stamp_datetime(current))
+
+    def test_a_period_past_the_cap_keeps_its_latest_hours_and_names_the_gap(self, tmp_path):
+        previous, current = '20261104T220000Z', '20261109T220000Z'
+        write_metric_series(_empty_series(previous), tmp_path)
+
+        period = _mod().evaluation_period(
+            tmp_path, EVAL_ID, current, initial_period_hours=24, max_period_hours=72,
+        )
+
+        end = stamp_datetime(current)
+        assert period == _mod().Period(
+            end - timedelta(hours=72), end, uncovered_start=stamp_datetime(previous),
+        )
 
     def test_the_first_period_is_the_bootstrap_window(self, tmp_path):
         current = '20261109T220000Z'
 
-        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=6)
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=6, max_period_hours=72)
 
         end = stamp_datetime(current)
         assert period == _mod().Period(end - timedelta(hours=6), end)
@@ -768,7 +904,7 @@ class TestPeriodAndCli:
         write_metric_series(_empty_series(current), tmp_path)
         write_metric_series(_empty_series('20261110T220000Z'), tmp_path)
 
-        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24)
+        period = _mod().evaluation_period(tmp_path, EVAL_ID, current, initial_period_hours=24, max_period_hours=72)
 
         end = stamp_datetime(current)
         assert period == _mod().Period(end - timedelta(hours=24), end)
@@ -780,6 +916,7 @@ class TestPeriodAndCli:
             *_sweep_argv(tmp_path),
             '--journal', str(tmp_path / 'write_journal.db'),
             '--initial-period-hours', '12',
+            '--max-period-hours', '48',
             '--config', str(tmp_path / 'config.yaml'),
         ])
 
@@ -788,8 +925,10 @@ class TestPeriodAndCli:
         assert args.project_id == PROJECT
         assert args.journal == str(tmp_path / 'write_journal.db')
         assert args.initial_period_hours == 12
+        assert args.max_period_hours == 48
         assert args.config == str(tmp_path / 'config.yaml')
-        assert parser.parse_args(_sweep_argv(tmp_path)).initial_period_hours == 24
+        defaults = parser.parse_args(_sweep_argv(tmp_path))
+        assert (defaults.initial_period_hours, defaults.max_period_hours) == (24, 72)
 
     def test_a_missing_journal_exits_non_zero_and_writes_no_metrics(
         self, tmp_path, monkeypatch, capsys,

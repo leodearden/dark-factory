@@ -14,6 +14,7 @@ import shutil
 import sys
 import textwrap
 import types
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -225,11 +226,13 @@ def _write_after_miss_series(stamp: str, *, incidents: int, adjudicated: int):
         incidents=(incident,) * incidents,
         adjudicated=adjudicated,
         skipped={reason: 0 for reason in producer.SkipReason},
+        undated_candidates=0,
     )
     window = producer.JournalWindow(writes=(), searches=(), unattributed_searches=0, unparsed_rows=0)
+    end = stamp_datetime(stamp)
     return producer.build_series(
-        adjudication, window, project_id='dark_factory', stamp=stamp,
-        details_path=producer.incidents_filename(stamp),
+        adjudication, window, period=producer.Period(end - timedelta(hours=24), end),
+        project_id='dark_factory', stamp=stamp, details_path=producer.incidents_filename(stamp),
     )
 
 
