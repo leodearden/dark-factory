@@ -939,6 +939,9 @@ class TestComputeOverlapMs:
 
 from dashboard.data.cap_history import compute_capped_now_and_windows  # noqa: E402
 
+_T1 = datetime(2026, 11, 10, 9, 0, tzinfo=UTC)
+_T2 = _T1 + timedelta(hours=1)
+
 
 class TestComputeCappedNowAndWindows:
     """Tests for compute_capped_now_and_windows(intervals).
@@ -1051,6 +1054,44 @@ class TestComputeCappedNowAndWindows:
         assert capped_now == 1, (
             f'Both accounts open-ended: expected capped_now=1, got {capped_now}'
         )
+
+    def test_unseen_configured_account_means_no_open_window(self):
+        """A configured account with no cap history was never capped: no all-capped window."""
+        intervals = [CapInterval('a', _T1, None), CapInterval('b', _T1, None)]
+        assert compute_capped_now_and_windows(intervals, total_accounts=3) == (0, [])
+
+    def test_unseen_configured_account_means_no_closed_window(self):
+        intervals = [CapInterval('a', _T1, _T2), CapInterval('b', _T1, _T2)]
+        _, windows = compute_capped_now_and_windows(intervals, total_accounts=3)
+        assert windows == []
+
+    def test_total_accounts_equal_to_seen_still_merges(self):
+        intervals = [CapInterval('a', _T1, None), CapInterval('b', _T1, None)]
+        assert compute_capped_now_and_windows(intervals, total_accounts=2) == (1, [(_T1, None)])
+
+    @pytest.mark.parametrize(
+        ('intervals', 'total_accounts'),
+        [
+            pytest.param([], None, id='empty'),
+            pytest.param([CapInterval('a', _T1, None)], 3, id='one-open-of-3'),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], None, id='two-open-no-total'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], 2, id='two-open-of-2'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, _T2)], None, id='open-and-closed'
+            ),
+            pytest.param(
+                [CapInterval('a', _T1, None), CapInterval('b', _T1, None)], 3, id='two-open-of-3'
+            ),
+        ],
+    )
+    def test_capped_now_agrees_with_open_ended_window(self, intervals, total_accounts):
+        """Both outputs describe one account universe, so they cannot disagree."""
+        capped_now, windows = compute_capped_now_and_windows(intervals, total_accounts)
+        assert capped_now == (1 if windows and windows[-1][1] is None else 0)
 
 
 # ---------------------------------------------------------------------------

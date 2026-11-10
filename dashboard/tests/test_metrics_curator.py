@@ -2423,3 +2423,25 @@ async def test_sample_curator_restart_redetected_caps_do_not_zero_active_ms(
 
     assert result['p50_active_ms'] == _ONE_MINUTE_TICKET_MS
     assert result['capped_now'] == 0
+
+
+@pytest.mark.asyncio
+async def test_sample_curator_unseen_configured_account_keeps_active_ms(tmp_path: Path, config):
+    """Two of three configured accounts are genuinely capped; the third never was.
+
+    capped_now and the all-capped windows must describe the same three-account
+    universe, so neither reports 'every account capped' and the ticket's full
+    minute stays active.
+    """
+    now = datetime.now(UTC)
+    reset = {'resets_at': (now + timedelta(days=2)).isoformat()}
+    cap_events = [
+        (account, 'cap_hit', now - timedelta(hours=2), reset) for account in ('acc-a', 'acc-b')
+    ]
+
+    result = await _sample_one_minute_ticket(
+        tmp_path, config, now=now, cap_events=cap_events, account_count=3
+    )
+
+    assert result['capped_now'] == 0
+    assert result['p50_active_ms'] == _ONE_MINUTE_TICKET_MS
