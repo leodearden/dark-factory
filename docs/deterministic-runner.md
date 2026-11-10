@@ -119,6 +119,21 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   transient unit name and fire delay; return DONE (done = *scheduled*, not
   *verified*).  A crash between the stamp and done write is recovered by
   (b-self) driving to done with scheduled provenance.
+- A dependent of such a task is held (verdict kind `scheduled_deploy`, park
+  reason `deps_unsatisfied:scheduled_deploy`) until its `deploy_state.phase`
+  reaches `verified` or `done`
+  (`orchestrator/src/orchestrator/deploy_state.py::awaits_scheduled_restart`).
+  `orchestrator/src/orchestrator/scheduled_deploy_settle.py::ScheduledDeploySettler`
+  advances the phase at the next orchestrator startup and on the
+  deterministic-recon cadence: to `verified` once this process started after
+  the transient fired and the transient unit has finished
+  (`scripts/restart-all-orchestrators.sh` restarts the dispatching unit
+  last); to `failed` when the transient's RP-4 wrapper filed its fire-time
+  escalation or the unit reads `failed`.  A `failed` deploy keeps its
+  dependents held until a human acts on that escalation.  Accepted
+  residuals: an RP-4 submit that itself failed reads as `verified`; and
+  right after an unrelated restart the record cache is cold, so a record
+  deferred past the per-tick fetch budget fails open for that tick.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
   running the blocking cross-unit deploy.  The detached restart is already
