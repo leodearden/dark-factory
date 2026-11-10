@@ -5120,7 +5120,8 @@ class TestFormatFlaggedFirstItemEdgeCase:
         )
 
     def test_budget_too_small_for_the_marker_raises(self):
-        with pytest.raises(ValueError):
+        """A budget that cannot hold the counted marker is refused, not rendered as a footer-only body."""
+        with pytest.raises(ValueError, match='elision marker'):
             _format_flagged([{'description': 'y' * 100}], budget_chars=10)
 
 
