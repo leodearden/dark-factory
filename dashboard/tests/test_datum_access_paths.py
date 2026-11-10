@@ -6,7 +6,9 @@ greps with one executed check: ``fetch_tasks``, ``fetch_task_page``,
 only where an :class:`AccessGrant` below says so, and the one named exemption
 is ``app.py::_fanout_probe_completion``. The apparatus — a finder, fixture tests
 of its matcher, then acceptance tests over a scan set that fails loudly — is
-``test_clock_discipline.py``'s.
+``test_clock_discipline.py``'s. A second vocabulary, runs.db's per-landing quality
+sources named in SQL text plus the shared producer's reads, is guarded the same way
+under :data:`_QUALITY_GRANTS` (``plans/quality-dashboard-prd.md`` decisions 14 and 15).
 
 The old-path census (sketch #14) follows in the same shape: :data:`_RETIRED`
 is one typed table of the paths PRD decision 16 deleted, each kind checked by
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -322,7 +325,7 @@ def _scanned_modules() -> dict[str, Path]:
         f'only {len(modules)} modules found under {_PACKAGE_DIR} — fewer than '
         f'the {_MIN_SCANNED_MODULES} this guard was written against'
     )
-    missing = sorted({grant.module for grant in _GRANTS} - set(modules))
+    missing = sorted({grant.module for grant in (*_GRANTS, *_QUALITY_GRANTS)} - set(modules))
     assert not missing, f'granted module(s) missing from the scan: {missing}'
     return modules
 
@@ -401,11 +404,81 @@ GUARDED_QUALITY_SOURCES = frozenset({
 GUARDED_QUALITY_READS = frozenset({'landings', 'rows_for', 'recorded_landing_keys'})
 
 
+_QUALITY_SOURCE_WORD = re.compile(r'\b(' + '|'.join(sorted(GUARDED_QUALITY_SOURCES)) + r')\b')
+_PRODUCER_PACKAGE = 'shared.quality_series'
+
+
+class _QualityUseFinder(_UseFinder):
+    """Collects each quality source a non-docstring string names, and Loads of imported reads."""
+
+    def __init__(self, aliases: Mapping[str, str], docstrings: frozenset[int]) -> None:
+        super().__init__(aliases)
+        self._docstrings = docstrings
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str) and id(node) not in self._docstrings:
+            for name in sorted(set(_QUALITY_SOURCE_WORD.findall(node.value))):
+                self._record(node, name)
+
+
+def _docstring_ids(tree: ast.Module) -> frozenset[int]:
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return frozenset(
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, owners) and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    )
+
+
 def find_quality_source_uses(source: str) -> list[AccessUse]:
-    raise NotImplementedError('the quality-source finder lands in step-16')
+    """Every quality source named in a string constant that is not a docstring (one use per
+    source per constant, whole words only), and every Load of a read imported from the shared
+    producer, under its imported name."""
+    tree = ast.parse(source)
+    aliases = {
+        alias.asname or alias.name: alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+        and (node.module == _PRODUCER_PACKAGE or node.module.startswith(f'{_PRODUCER_PACKAGE}.'))
+        for alias in node.names
+        if alias.name in GUARDED_QUALITY_READS
+    }
+    finder = _QualityUseFinder(aliases, _docstring_ids(tree))
+    finder.visit(tree)
+    return finder.uses
 
 
-_QUALITY_GRANTS: tuple[AccessGrant, ...] = ()
+_MERGE_QUEUE_TRAINS = (
+    "the merge-queue tab's train listing and train throughput over its look-back window: "
+    'a merge-queue fact, not a per-landing quality fact'
+)
+
+_QUALITY_GRANTS: tuple[AccessGrant, ...] = (
+    AccessGrant(
+        'data/quality_series.py', None,
+        frozenset({'merge_blocked', 'merge_verify', 'review_completed', 'flake_occurrence',
+                   'recorded_landing_keys'}),
+        'the one access implementation of per-landing quality facts: its rules name their '
+        'sources and it counts recorded landings not yet sampled (plans/quality-dashboard-prd.md '
+        'decisions 14, 15, 22)',
+    ),
+    AccessGrant(
+        'data/quality_sampler.py', '_measure_root', frozenset({'landings', 'rows_for'}),
+        'the producer that turns runs.db and git into quality.db rows (decision 14)',
+    ),
+    AccessGrant('data/merge_queue.py', 'recent_train_events._query',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+    AccessGrant('data/merge_queue.py', 'train_throughput_stats._query',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+    AccessGrant('data/merge_queue.py', 'train_throughput_stats',
+                frozenset({'train_merged'}), _MERGE_QUEUE_TRAINS),
+)
 
 
 def test_a_sql_constant_naming_a_quality_source_is_a_use():
