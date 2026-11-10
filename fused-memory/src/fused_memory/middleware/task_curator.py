@@ -3370,23 +3370,11 @@ _SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'
 _SIBLING_LOOKUP_PAGE = 100
 
 
-def _spawned_from_id(value: object) -> str | None:
-    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
-
-    The live store holds str, int and dict values; only the first two name a task.
-    """
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return None
-
-
 def _followup_parent_id(candidate: CandidateTask) -> str | None:
     """The parent whose follow-ups form *candidate*'s sibling stream, if it has one."""
     if candidate.spawn_context != _SIBLING_STREAM_SPAWN_CONTEXT:
         return None
-    return _spawned_from_id(candidate.spawned_from)
+    return candidate.spawned_from
 
 
 def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
