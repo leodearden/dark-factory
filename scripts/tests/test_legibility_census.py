@@ -5825,7 +5825,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6006,7 +6006,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6032,7 +6032,7 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=["completion: landed -> FIRE"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6042,6 +6042,33 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     assert exit_code == 0
     assert len(fake_run_census.calls) == 1
     assert fake_run_census.calls[0]["force"] is False
+
+
+def test_main_gate_decides_on_the_config_main_loaded(tmp_path, monkeypatch):
+    """Task 3269 / PRD D8: the gate decides on the --config main() loaded, a
+    file outside the project root, never on a re-read of the root's own."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside_config = _census_project(project_root, config_path=tmp_path / "outside.yaml")
+    with outside_config.open("a", encoding="utf-8") as f:
+        f.write("census:\n  floor_days: 3\n")
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    received = []
+
+    def fake_decide(cfg, *, now=None, completion_runner=None):
+        received.append(cfg)
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    exit_code = mod.main(["--project-root", str(project_root), "--config", str(outside_config)])
+
+    assert exit_code == 0
+    assert fake_run_census.calls == []
+    assert len(received) == 1
+    assert isinstance(received[0], config_mod.LegibilityConfig)
+    assert received[0].census.floor_days == 3
 
 
 def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):

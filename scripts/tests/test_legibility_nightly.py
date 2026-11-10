@@ -765,7 +765,7 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
 def test_evaluate_census_step_no_fire_never_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(
             fire=False,
             reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'],
@@ -790,7 +790,7 @@ def test_evaluate_census_step_no_fire_never_launches(tmp_path):
 def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_path, caplog):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
@@ -809,7 +809,7 @@ def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_pa
 def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
@@ -821,6 +821,25 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_evaluate_census_step_decides_on_the_config_it_was_handed(tmp_path):
+    """Task 3269 / PRD D8: the trigger decides on the very config the trickle
+    loaded from its pinned config_path, never a re-read of one."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    received = []
+
+    def recording_decide(cfg, *, now=None, completion_runner=None):
+        received.append(cfg)
+        return census_trigger.Decision(fire=False, reasons=['completion: N/A'])
+
+    nightly.evaluate_census_step(
+        cfg, now=None, decide=recording_decide,
+        entrypoint_exists=lambda: True, launcher=lambda **kwargs: None,
+    )
+
+    assert len(received) == 1
+    assert received[0] is cfg
 
 
 def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplog):
@@ -838,7 +857,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     """
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=[
             'completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE',
         ])
@@ -879,7 +898,7 @@ def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
     an operator greps for the healthy one."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
@@ -911,7 +930,7 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     `entrypoint_exists` is even consulted."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     launcher_calls = []
@@ -956,7 +975,7 @@ def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
     is the opposite of the legible failure this trigger exists for."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
@@ -1076,7 +1095,7 @@ def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
     return None
 
 
-def _fire_decide(project_root, *, now=None, completion_runner=None):
+def _fire_decide(cfg, *, now=None, completion_runner=None):
     return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
 
