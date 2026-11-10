@@ -29,11 +29,21 @@ Usage (from fused-memory/)::
         --replay /tmp/9040-replay.jsonl --worksheet /tmp/9040-worksheet-4716.jsonl \\
         --out /tmp/9040-blind-worksheet.jsonl
 
+    uv run python scripts/replay_overreach_extraction.py score \\
+        --replay ../docs/ruling-overreach-lever-reopen-2026-11-10/replay.json \\
+        --verdicts ../docs/ruling-overreach-lever-reopen-2026-11-10/verdicts.json \\
+        --baseline-report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
+        --out ../docs/ruling-overreach-lever-reopen-2026-11-10/report.json
+
 ``replay`` resumes an existing --out: recorded (arm, episode) pairs are
 skipped and failure lines are retried. ``--model`` replays the same arms on
 another extraction model; give it its own --out. ``worksheet`` interleaves
 every arm's edges by sha256(edge_uuid) and names no arm, for blind
-adjudication; it carries episode bodies, so it is not committed.
+adjudication; it carries episode bodies, so it is not committed. ``score``
+validates one verdict file over every arm's edges with the audit's own
+load_verdicts, rates each arm at the 4716 cell weights with the audit's own
+estimators, and judges each lever arm against the control by the
+pre-registered rule beside OVERREACH_RATIO_MAX.
 
 Exit codes: 0 ran; 1 the LLM or graph is unavailable, or an episode failed
 (re-run to resume); 2 an input is invalid (nothing is written).
@@ -76,7 +86,17 @@ from fused_memory.backends.llm_token_usage import (
 from fused_memory.config.schema import FusedMemoryConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from audit_ruling_overreach import _resolve_uri
+from audit_ruling_overreach import (
+    OutOfSampleVerdict,
+    SampleDefinition,
+    VerdictError,
+    VerdictSet,
+    _resolve_uri,
+    adjudicated_rates,
+    load_verdicts,
+    population_weighted_rates,
+    weighted_rate,
+)
 
 logger = logging.getLogger('replay_overreach_extraction')
 
@@ -98,6 +118,8 @@ O1_INSTRUCTIONS_VERSION = 'o1-v1-' + hashlib.sha256(O1_INSTRUCTIONS.encode()).he
 
 NO_INSTRUCTIONS = 'none'
 
+CONTROL = 'control'
+
 
 @dataclass(frozen=True)
 class ReplayArm:
@@ -110,7 +132,7 @@ class ReplayArm:
 
 
 ARMS: Mapping[str, ReplayArm] = MappingProxyType({
-    'control': ReplayArm('control', None, NO_INSTRUCTIONS),
+    CONTROL: ReplayArm(CONTROL, None, NO_INSTRUCTIONS),
     'o1': ReplayArm('o1', O1_INSTRUCTIONS, O1_INSTRUCTIONS_VERSION),
 })
 
@@ -386,6 +408,235 @@ def complete_replay(
 
 
 # --------------------------------------------------------------------------- #
+# The score: each arm at the 4716 cell weights, and the O1 decision (design §2.3-§2.4)
+# --------------------------------------------------------------------------- #
+
+OVERREACH_RATIO_MAX = 0.5
+"""A lever passes only if its overreach, per minted edge and per day, is at most this share of
+the control's: the 2026-10-01 design.md §6.1 revisit clause's 'at least halved'."""
+
+HOLDING_RETENTION_MIN = 0.8
+"""A lever passes only if its weighted holdings/day are at least this share of the control's."""
+
+REPORTED_RATES = (
+    'label_counts', 'overreach_rate_minted', 'overreach_rate_substantive',
+    'episode_hit_rate', 'holding_share', 'misbound_count',
+)
+"""The adjudicated_rates measures that mean something for an edge no graph ever held."""
+
+EpisodeKey = tuple[str, str]
+"""``(graph, episode_uuid)``."""
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """What the score takes from the 4716 report.json: its cell populations and its own result."""
+
+    window_population: Mapping[str, Mapping[str, int]]
+    window_days: float
+    overreach_rate_minted: Mapping[str, Any]
+
+    @classmethod
+    def from_report(cls, report: Mapping[str, Any]) -> Baseline:
+        try:
+            return cls(
+                window_population={
+                    graph: {stratum: int(cell['window_population']) for stratum, cell in by_stratum.items()}
+                    for graph, by_stratum in report['strata'].items()
+                },
+                window_days=float(report['sample']['window_days']),
+                overreach_rate_minted=report['adjudicated']['population_weighted']['overreach_rate_minted'],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReplayFileError(f'the baseline report lacks {exc}') from exc
+
+
+def _audit_row(record: Mapping[str, Any]) -> dict[str, Any]:
+    """An audit worksheet row for one replayed episode; no graph ever served or kept its edges."""
+    return {
+        'graph': record['graph'], 'uuid': record['uuid'], 'stratum': record['stratum'],
+        'minted': [dict(edge, served=None, live_strict=None) for edge in record['minted']],
+    }
+
+
+ReplayByArm = Mapping[str, Mapping[EpisodeKey, Mapping[str, Any]]]
+"""arm -> episode -> replayed record, as complete_replay returns it."""
+
+
+def _minted_edges(by_arm: ReplayByArm) -> dict[tuple[str, str], str]:
+    """``(graph, edge_uuid)`` -> episode uuid, over every arm; one uuid minted twice is ambiguous."""
+    edges: dict[tuple[str, str], str] = {}
+    for replayed in by_arm.values():
+        for record in replayed.values():
+            for edge in record['minted']:
+                key = (record['graph'], edge['edge_uuid'])
+                if key in edges:
+                    raise ReplayFileError(f'edge {key} was minted twice, so no verdict can say which')
+                edges[key] = record['uuid']
+    return edges
+
+
+def validate_verdicts(obj: Any, by_arm: ReplayByArm, episodes: Iterable[EpisodeKey]) -> VerdictSet:
+    """load_verdicts once over every arm's edges. A replayed edge was never in a graph, so the
+    verdict load_verdicts would call stale names an edge no arm minted."""
+    verdicts = load_verdicts(
+        obj, expected_edges=_minted_edges(by_arm), sampled_episodes=episodes,
+        existing_edges=(), definition=SampleDefinition(),
+    )
+    if verdicts.stale:
+        raise OutOfSampleVerdict(
+            f'{len(verdicts.stale)} verdict(s) judge an edge no arm minted',
+            [v.edge_uuid for v in verdicts.stale],
+        )
+    return verdicts
+
+
+def _per_day(weighted_count: float, window_days: float) -> float | None:
+    return round(weighted_count / window_days, 1) if window_days else None
+
+
+def weighted_holdings(
+    rows: Sequence[Mapping[str, Any]], verdicts: VerdictSet,
+    weights: Mapping[str, Mapping[str, float]], window_days: float,
+) -> dict[str, Any]:
+    """Holding share and holdings/day at the cell *weights* population_weighted_rates derived."""
+    cells = []
+    for graph, by_stratum in weights.items():
+        for stratum, weight in by_stratum.items():
+            cell = [row for row in rows if (row['graph'], row['stratum']) == (graph, stratum)]
+            holding = adjudicated_rates(cell, verdicts)['all']['holding_share']
+            cells.append((weight, holding['k'], holding['n']))
+    return {
+        'holding_share': weighted_rate(cells),
+        'holdings_per_day': _per_day(sum(w * k for w, k, _ in cells), window_days),
+    }
+
+
+def _entity_names(record: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset(_normalize_string_exact(name) for name in record['entities'])
+
+
+def entity_overlap(
+    replayed: Mapping[EpisodeKey, Mapping[str, Any]], control: Mapping[EpisodeKey, Mapping[str, Any]],
+) -> dict[str, float | None]:
+    """Entities per episode, and the mean per-episode share of the control's names this arm kept."""
+    shares = [
+        len(_entity_names(replayed[episode]) & names) / len(names)
+        for episode, record in control.items() if (names := _entity_names(record))
+    ]
+    counts = [len(record['entities']) for record in replayed.values()]
+    return {
+        'mean_per_episode': round(sum(counts) / len(counts), 4),
+        'mean_share_of_control': round(sum(shares) / len(shares), 4) if shares else None,
+    }
+
+
+def token_totals(records: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    totals: dict[str, Counter[str]] = {}
+    for record in records:
+        for stage, usage in record['tokens'].items():
+            totals.setdefault(stage, Counter()).update(usage)
+    return {stage: dict(total) for stage, total in sorted(totals.items())}
+
+
+def _only(records: Iterable[Mapping[str, Any]], field: str) -> Any:
+    values = {record[field] for record in records}
+    if len(values) != 1:
+        raise ReplayFileError(f'one arm holds records with {field} {sorted(map(str, values))}')
+    return values.pop()
+
+
+def arm_score(
+    replayed: Mapping[EpisodeKey, Mapping[str, Any]], control: Mapping[EpisodeKey, Mapping[str, Any]],
+    verdicts: VerdictSet, baseline: Baseline,
+) -> dict[str, Any]:
+    rows = [_audit_row(record) for record in replayed.values()]
+    weighted = population_weighted_rates(rows, verdicts, baseline.window_population, baseline.window_days)
+    return {
+        'model': _only(replayed.values(), 'model'),
+        'instructions_version': _only(replayed.values(), 'instructions_version'),
+        'episodes': len(rows),
+        'minted': sum(len(row['minted']) for row in rows),
+        'rates': {
+            scope: {key: measured[key] for key in REPORTED_RATES}
+            for scope, measured in adjudicated_rates(rows, verdicts).items()
+        },
+        'population_weighted': weighted | weighted_holdings(
+            rows, verdicts, weighted['weights'], baseline.window_days,
+        ),
+        'entities': entity_overlap(replayed, control),
+        'tokens': token_totals(replayed.values()),
+    }
+
+
+def _ratio(candidate: float | None, control: float | None) -> float | None:
+    return round(candidate / control, 4) if candidate is not None and control else None
+
+
+def lever_decision(control: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """design §2.4, over two arms' ``population_weighted`` blocks."""
+    control_point = control['overreach_rate_minted']['rate']
+    candidate_upper = (candidate['overreach_rate_minted']['ci'] or [None, None])[1]
+    per_minted = _ratio(candidate['overreach_rate_minted']['rate'], control_point)
+    per_day = _ratio(candidate['overreach_per_day'], control['overreach_per_day'])
+    retention = _ratio(candidate['holdings_per_day'], control['holdings_per_day'])
+    checks = {
+        'halves_overreach_per_minted': per_minted is not None and per_minted <= OVERREACH_RATIO_MAX,
+        'halves_overreach_per_day': per_day is not None and per_day <= OVERREACH_RATIO_MAX,
+        'upper_bound_below_control_point': (
+            candidate_upper is not None and control_point is not None and candidate_upper < control_point
+        ),
+        'retains_holdings': retention is not None and retention >= HOLDING_RETENTION_MIN,
+    }
+    return {
+        'overreach_ratio_minted': per_minted, 'overreach_ratio_per_day': per_day,
+        'holding_retention': retention,
+        'bars': {'overreach_ratio_max': OVERREACH_RATIO_MAX, 'holding_retention_min': HOLDING_RETENTION_MIN},
+        'checks': checks, 'passes': all(checks.values()),
+    }
+
+
+def _overlap(one: Sequence[float] | None, other: Sequence[float] | None) -> bool | None:
+    if not one or not other:
+        return None
+    return one[0] <= other[1] and other[0] <= one[1]
+
+
+def fidelity(baseline: Mapping[str, Any], control: Mapping[str, Any]) -> dict[str, Any]:
+    """The control against the production rate it should reproduce, each with its interval."""
+    return {
+        'baseline': {'rate': baseline['rate'], 'ci': baseline['ci']},
+        'control': {'rate': control['rate'], 'ci': control['ci']},
+        'intervals_overlap': _overlap(baseline['ci'], control['ci']),
+    }
+
+
+def score_replay(
+    records: Sequence[Mapping[str, Any]], verdict_obj: Any, baseline_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Every arm scored against one verdict file, then each lever arm judged against the control."""
+    baseline = Baseline.from_report(baseline_report)
+    episodes = list(dict.fromkeys((record['graph'], record['uuid']) for record in records))
+    by_arm = complete_replay(records, episodes)
+    if CONTROL not in by_arm:
+        raise ReplayFileError(f'every arm is judged against {CONTROL!r}, which this replay lacks')
+    check_worksheet(by_arm[CONTROL].values(), baseline_report)
+    verdicts = validate_verdicts(verdict_obj, by_arm, episodes)
+    arms = {arm: arm_score(replayed, by_arm[CONTROL], verdicts, baseline) for arm, replayed in sorted(by_arm.items())}
+    control = arms[CONTROL]['population_weighted']
+    return {
+        'sample': verdicts.definition.to_dict(),
+        'verdicts': len(verdicts.verdicts),
+        'arms': arms,
+        'comparison': {
+            arm: lever_decision(control, scored['population_weighted'])
+            for arm, scored in arms.items() if arm != CONTROL
+        },
+        'fidelity': fidelity(baseline.overreach_rate_minted, control['overreach_rate_minted']),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -417,6 +668,13 @@ def _build_parser() -> argparse.ArgumentParser:
     worksheet.add_argument('--replay', required=True)
     worksheet.add_argument('--worksheet', required=True, help='The worksheet the replay ran over.')
     worksheet.add_argument('--out', required=True)
+    score = commands.add_parser('score', help='Rate every arm against the adjudicated verdicts.')
+    score.add_argument('--replay', required=True)
+    score.add_argument('--verdicts', required=True,
+                       help='Verdicts on every replayed edge, in audit_ruling_overreach.py format.')
+    score.add_argument('--baseline-report', required=True,
+                       help='The 4716 report.json, for its cell populations and its own rate.')
+    score.add_argument('--out', required=True, help='report.json to write.')
     return parser
 
 
@@ -543,6 +801,25 @@ def _worksheet_command(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _read_json(path: str) -> Any:
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReplayFileError(f'cannot read {path}: {exc}') from exc
+
+
+def _score_command(args: argparse.Namespace) -> int:
+    try:
+        report = score_replay(
+            _read_jsonl(args.replay), _read_json(args.verdicts), _read_json(args.baseline_report),
+        )
+    except (ReplayFileError, WorksheetMismatch, VerdictError) as exc:
+        logger.error('invalid inputs, nothing is written (%s): %s', type(exc).__name__, exc)
+        return EXIT_INVALID
+    _write_atomically(Path(args.out), json.dumps(report, indent=2, sort_keys=True) + '\n')
+    return EXIT_OK
+
+
 async def _run(
     args: argparse.Namespace, llm_factory: LlmFactory | None, reader_factory: ReaderFactory | None,
 ) -> int:
@@ -550,6 +827,8 @@ async def _run(
         return await _replay_command(
             args, llm_factory or _live_llm_factory, reader_factory or _live_reader_factory(args),
         )
+    if args.command == 'score':
+        return _score_command(args)
     return _worksheet_command(args)
 
 
