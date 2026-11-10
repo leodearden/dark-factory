@@ -72,7 +72,12 @@ CREATE TABLE IF NOT EXISTS policy_state (
 
 
 class RegistryError(RuntimeError):
-    """The registry file could not be read or written."""
+    """The registry file at *path* could not be read or written; *cause* says why."""
+
+    def __init__(self, path: Path, cause: str) -> None:
+        super().__init__(f'verify-cache registry {path}: {cause}')
+        self.path = path
+        self.cause = cause
 
 
 def registry_db_path(project_root: Path) -> Path:
@@ -203,7 +208,7 @@ class Registry:
             finally:
                 conn.close()
         except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
-            raise RegistryError(f'verify-cache registry {self._db_path}: {exc}') from exc
+            raise RegistryError(self._db_path, str(exc)) from exc
 
     def _summary(self) -> RegistrySummary:
         if not self._db_path.exists():
@@ -216,7 +221,7 @@ class Registry:
             finally:
                 conn.close()
         except (sqlite3.Error, OSError, ValueError) as exc:
-            raise RegistryError(f'verify-cache registry {self._db_path}: {exc}') from exc
+            raise RegistryError(self._db_path, str(exc)) from exc
 
 
 def _open(db_path: Path, busy_timeout_ms: int) -> sqlite3.Connection:
