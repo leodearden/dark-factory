@@ -222,9 +222,8 @@ def _make_fake_escalate_fn():
 
 def _make_fake_status_fetcher(done_count):
     """Fake `status_fetcher() -> dict` seam, shaped like the real
-    get_statuses envelope census_trigger.compute_tasks_landed already
-    reads (`{"statuses": {id: status}}`, done count = count of "done"
-    values) so census.py's own done-count baseline logic mirrors zeta's."""
+    get_statuses envelope census_trigger.extract_statuses reads
+    (`{"statuses": {id: status}}`), with *done_count* done tasks."""
     def fake_status_fetcher():
         return {"statuses": {f"t{i}": "done" for i in range(done_count)}}
 
@@ -1242,34 +1241,6 @@ def test_advance_census_state_writes_exactly_the_five_keys_in_order(tmp_path):
     }
 
 
-def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_path):
-    path = tmp_path / "census-state.json"
-
-    _advance(path, done_count=0)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert "last_census_done_count" in data, "must never be dropped as falsy"
-    assert data["last_census_done_count"] == 0
-    assert isinstance(data["last_census_done_count"], int)
-
-
-def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
-    """Task 3291: when the done-count could not be OBSERVED, the honest
-    baseline is `null` -- not a fabricated 0 (that is the defect being
-    fixed), not a carried-forward stale value (a quieter guess), and not an
-    omitted key (which would violate the 2579/eta MUST-persist contract).
-    `null` honours that contract literally -- the key is still always
-    present -- while being truthful about the state being unknown."""
-    path = tmp_path / "census-state.json"
-
-    _advance(path, done_count=None)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
-    assert data["last_census_done_count"] is None
-    assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
-
-
 def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_path):
     """A run with no mining window (an injected batch source) has no
     watermark; the key is still written, as null."""
@@ -1286,7 +1257,7 @@ def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_pat
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
     path = tmp_path / "census-state.json"
 
-    _advance(path, done_count=7, session_watermark=watermark)
+    _advance(path, session_watermark=watermark)
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
@@ -1296,17 +1267,16 @@ def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, 
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
     assert data["last_census_as_of_sha"] == "a" * 40
     assert data["session_watermark"] == watermark
-    assert data["last_census_done_count"] == 7
 
 
 def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
     path = tmp_path / "census-state.json"
     path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
 
-    _advance(path, done_count=3)
+    _advance(path)
 
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["last_census_done_count"] == 3
+    assert list(data) == _STATE_KEYS
     assert "stale" not in data, "pre-existing state must be FULLY replaced"
 
     leftovers = [p for p in tmp_path.iterdir() if p.name != "census-state.json"]
@@ -3432,7 +3402,6 @@ def _census_repo(tmp_path):
         report_path="plans/confusion-census-2026-06-01.md",
         as_of_sha="b" * 40,
         session_watermark=None,
-        done_count=0,
     )
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "initial")

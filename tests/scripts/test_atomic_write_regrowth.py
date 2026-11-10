@@ -330,10 +330,9 @@ _ALLOWED_RENAMERS = {
     ('scripts/legibility/census.py', 'advance_census_state'):
         'Out of task 3223 enumerated scope; left alone deliberately. '
         'mkstemp(prefix=\'.census-state-\') + os.replace. This module is '
-        'census-state.json\'s SOLE writer, so a migration must keep the '
-        'always-present ``last_census_done_count`` key — serialised as JSON '
-        'null when the count could not be observed, never omitted as falsy — '
-        'which is what lets zeta\'s compute_tasks_landed fail safe.',
+        'census-state.json\'s SOLE writer, so a migration must keep its '
+        'atomicity: the census trigger reads that file every night, and a '
+        'torn write would read as malformed and fail the trigger safe.',
     ('scripts/legibility/codebook.py', 'dump'):
         'Out of task 3223 enumerated scope; left alone deliberately. '
         'mkstemp(prefix=\'.codebook-\') + os.replace of a canonical '
