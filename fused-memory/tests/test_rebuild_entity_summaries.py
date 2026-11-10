@@ -983,13 +983,11 @@ class TestDetectStaleSummariesDryRun:
 
     def test_probe_result_is_frozen_and_keyword_only(self):
         result = StaleProbeResult(stale=[], total_count=0, entities_completeness=COMPLETE_READ)
-        positional: list = [[], 0, COMPLETE_READ]
 
         for field in dataclasses.fields(StaleProbeResult):
             with pytest.raises(dataclasses.FrozenInstanceError):
                 setattr(result, field.name, None)
-        with pytest.raises(TypeError):
-            StaleProbeResult(*positional)
+        pytest.raises(TypeError, StaleProbeResult, [], 0, COMPLETE_READ)
 
 
 # ---------------------------------------------------------------------------
