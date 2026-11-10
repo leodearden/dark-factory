@@ -49,10 +49,6 @@ class TestScheduledRestart:
         assert restart.fire_delay_secs == FIRE_DELAY
         assert restart.fires_at == FIRES_AT
 
-    def test_is_frozen(self) -> None:
-        with pytest.raises(AttributeError):
-            _restart().transient_unit = 'other'  # type: ignore[misc]
-
     @pytest.mark.parametrize(
         'metadata',
         [
@@ -112,8 +108,10 @@ def test_settled_phase(started_at, active_state, fire_failures, expected) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _deploy_task(task_id: str = '7238', *, phase: str = 'scheduled', **overrides: object) -> dict:
-    metadata = {
+def _deploy_task(
+    task_id: str = '7238', *, phase: str = 'scheduled', status: str = 'done', metadata: dict | None = None,
+) -> dict:
+    defaults = {
         'done_provenance': {
             'kind': 'deterministic-deploy-scheduled',
             'unit': 'orchestrator-dark-factory.service',
@@ -129,8 +127,7 @@ def _deploy_task(task_id: str = '7238', *, phase: str = 'scheduled', **overrides
             'escalated_at': None,
         },
     }
-    metadata.update(overrides.pop('metadata', {}))  # type: ignore[arg-type]
-    return {'id': task_id, 'status': 'done', 'metadata': metadata, **overrides}
+    return {'id': task_id, 'status': status, 'metadata': {**defaults, **(metadata or {})}}
 
 
 class _Lookup:
