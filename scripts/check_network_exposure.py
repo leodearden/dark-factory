@@ -7,6 +7,7 @@ Stdlib only, so it runs under a plain system python3.
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import dataclasses
 import enum
@@ -16,6 +17,7 @@ import itertools
 import json
 import socket
 import subprocess
+import sys
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Final, TextIO, TypeVar
@@ -350,3 +352,26 @@ def _report(failure_lines: Sequence[str], out: TextIO) -> ExposureExit:
         return ExposureExit.FINDING
     emit(TOOL, "[ok] every probed port refuses off-loopback connects and accepts on 127.0.0.1", out=out)
     return ExposureExit.LOOPBACK_ONLY
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Exit 0 only if every factory port refuses TCP connects on every "
+            "non-loopback address of this host and accepts on 127.0.0.1; "
+            "every report line is tagged [network_exposure]."
+        )
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=DEFAULT_CONNECT_TIMEOUT_SECS,
+        metavar="SECS",
+        help="per-connect timeout; a timeout is reported as a failure (default: %(default)s)",
+    )
+    args = parser.parse_args(argv)
+    return int(run(connect_timeout=args.connect_timeout, out=sys.stdout))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
