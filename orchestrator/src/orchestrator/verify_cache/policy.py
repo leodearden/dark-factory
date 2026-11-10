@@ -7,17 +7,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
 
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache.keys import UnitKey
-from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.registry import Entry, Registry, RegistryView
 from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
-
-Role = Literal['task', 'merge', 'background']
 
 
 class Decision(StrEnum):
@@ -66,7 +63,7 @@ async def consult(registry: Registry | None, keys: Sequence[UnitKey]) -> Registr
 
 def decide(
     modes: VerifyCacheConfig,
-    role: Role,
+    role: VerifyRole,
     key: UnitKey,
     view: RegistryView | Unavailable,
     *,
@@ -103,7 +100,7 @@ class Admission:
     reason: str
 
 
-def admissible(modes: VerifyCacheConfig, role: Role, leg: LegResult) -> Admission:
+def admissible(modes: VerifyCacheConfig, role: VerifyRole, leg: LegResult) -> Admission:
     """Whether *leg*'s green may be recorded in *role*'s registry."""
     refusal = _refusal(modes.mode_for(role), role, leg)
     if refusal is not None:
@@ -115,7 +112,7 @@ def admissible(modes: VerifyCacheConfig, role: Role, leg: LegResult) -> Admissio
 
 
 def _decide(
-    mode: CacheMode, role: Role, key: UnitKey, view: RegistryView | Unavailable, *, never_cache: bool, now: datetime,
+    mode: CacheMode, role: VerifyRole, key: UnitKey, view: RegistryView | Unavailable, *, never_cache: bool, now: datetime,
 ) -> CacheDecision:
     if mode is CacheMode.OFF:
         return _miss(f'verify cache is off for the {role} role')
@@ -131,7 +128,7 @@ def _decide(
     entry = view.entries.get((key.unit_id, key.key))
     if entry is None:
         return _miss(f'no recorded green for {key.unit_id} at key {key.key}')
-    replay = f'green entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
+    replay = f'the green of {entry.unit_id} at key {entry.key} (evidence event {entry.evidence_event_id})'
     if mode is CacheMode.ON:
         return CacheDecision(Decision.HIT, entry, f'replaying {replay}')
     return CacheDecision(Decision.WOULD_HIT, entry, f'log mode: would replay {replay}')
@@ -141,7 +138,7 @@ def _miss(reason: str) -> CacheDecision:
     return CacheDecision(Decision.MISS, None, reason)
 
 
-def _refusal(mode: CacheMode, role: Role, leg: LegResult) -> str | None:
+def _refusal(mode: CacheMode, role: VerifyRole, leg: LegResult) -> str | None:
     if mode is CacheMode.OFF:
         return f'verify cache is off for the {role} role'
     if leg.never_cache:
@@ -158,6 +155,6 @@ def _refusal(mode: CacheMode, role: Role, leg: LegResult) -> str | None:
         return None
     if leg.junit_tests is None or leg.collected is None:
         return f'test counts unknown: junit_tests={leg.junit_tests} collected={leg.collected}'
-    if leg.junit_tests < leg.collected:
-        return f'junit reported {leg.junit_tests} tests of {leg.collected} collected: a truncated run'
+    if leg.junit_tests != leg.collected:
+        return f'junit reported {leg.junit_tests} tests but {leg.collected} were collected'
     return None

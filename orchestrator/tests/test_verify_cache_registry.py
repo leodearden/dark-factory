@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,52 @@ class TestEntries:
         assert await store.evict_key(key.key, 'audit leak') == 0
         assert await store.evict_key('f' * 64, 'unknown') == 0
         assert (await store.view([key])).entries == {}
+
+    @pytest.mark.asyncio
+    async def test_an_evicted_entrys_id_is_never_reused(self, store):
+        evicted = await store.record_green(_key(tree='a'), evidence_event_id=7, run_id='r1', sha='abc')
+        await store.evict_key(evicted.key, 'audit leak')
+
+        recorded = await store.record_green(_key(tree='b'), evidence_event_id=8, run_id='r2', sha='def')
+
+        assert recorded.entry_id != evicted.entry_id
+
+
+class TestPrune:
+    @pytest.mark.asyncio
+    async def test_prune_drops_only_greens_and_consumptions_older_than_their_cutoffs(self, db_path):
+        clock = [_NOW - timedelta(days=30)]
+        store = registry.Registry(db_path, clock=lambda: clock[0])
+        old = await store.record_green(_key(tree='a'), evidence_event_id=7, run_id='r1', sha='abc')
+        await store.consume('land-old', [old])
+        clock[0] = _NOW
+        fresh = await store.record_green(_key(tree='b'), evidence_event_id=8, run_id='r2', sha='def')
+        await store.consume('land-fresh', [fresh])
+
+        pruned = await store.prune(
+            entries_recorded_before=_NOW - timedelta(days=7), consumed_before=_NOW - timedelta(days=7),
+        )
+
+        assert pruned == registry.Pruned(entries=1, consumed=1)
+        assert (await store.view([_key(tree='a'), _key(tree='b')])).entries == {(fresh.unit_id, fresh.key): fresh}
+        assert await store.consumed_for('land-old') == ()
+        assert await store.consumed_for('land-fresh') == (fresh,)
+
+    @pytest.mark.asyncio
+    async def test_prune_compares_instants_not_offsets(self, store):
+        await store.record_green(_key(), evidence_event_id=7, run_id='r1', sha='abc')
+        an_hour_later_elsewhere = (_NOW + timedelta(hours=1)).astimezone(timezone(timedelta(hours=-5)))
+
+        pruned = await store.prune(
+            entries_recorded_before=an_hour_later_elsewhere, consumed_before=an_hour_later_elsewhere,
+        )
+
+        assert pruned.entries == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_needs_timezone_aware_cutoffs(self, store):
+        with pytest.raises(ValueError, match='entries_recorded_before'):
+            await store.prune(entries_recorded_before=datetime(2026, 11, 10), consumed_before=_NOW)
 
 
 class TestConsumption:
@@ -184,3 +231,48 @@ class TestStoreFile:
 
         with pytest.raises(registry.RegistryError, match=re.escape(str(db_path))):
             await calls[operation]()
+
+
+def _write_raw(db_path: Path, sql: str, params: tuple) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.execute(sql, params)
+    finally:
+        conn.close()
+
+
+class TestCorruptRows:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('operation', ['policy_state', 'summary'])
+    @pytest.mark.parametrize(('streak', 'leaks', 'named'), [
+        (-1, '[]', 'policy_state.streak must be >= 0, got -1'),
+        (0, '5', 'int'),
+        ('x', '[]', 'str'),
+    ])
+    async def test_a_policy_row_breaking_its_invariants_is_a_registry_error_naming_why(
+        self, store, db_path, operation, streak, leaks, named,
+    ):
+        await store.policy_state()
+        _write_raw(
+            db_path, 'INSERT INTO policy_state (id, streak, leaks) VALUES (1, ?, ?)', (streak, leaks),
+        )
+
+        with pytest.raises(registry.RegistryError, match=named):
+            await getattr(store, operation)()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('column', 'value', 'named'), [
+        ('spec_hash', 'other', "spec_hash 'other'"),
+        ('inputs', '5', 'int'),
+        ('tier', 'galaxy', 'galaxy'),
+    ])
+    async def test_an_entry_row_breaking_its_invariants_is_a_registry_error_naming_why(
+        self, store, db_path, column, value, named,
+    ):
+        key = _key()
+        await store.record_green(key, evidence_event_id=7, run_id='r1', sha='abc')
+        _write_raw(db_path, f'UPDATE entries SET {column} = ?', (value,))
+
+        with pytest.raises(registry.RegistryError, match=named):
+            await store.view([key])

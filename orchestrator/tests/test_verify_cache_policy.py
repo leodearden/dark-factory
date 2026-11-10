@@ -59,7 +59,7 @@ class TestDecide:
     def test_an_on_role_with_an_entry_replays_it(self):
         decision = _decide(_TASK_ON, 'task', _WITH_ENTRY)
 
-        _assert(decision, policy.Decision.HIT)
+        _assert(decision, policy.Decision.HIT, _KEY.unit_id, _KEY.key, 'evidence event 7')
         assert decision.entry is not None
         assert decision.entry == _ENTRY
         assert decision.entry.evidence_event_id == 7
@@ -165,6 +165,7 @@ class TestAdmissible:
         ({'timed_out': True}, ('timed out',)),
         ({'flake_suppressed': True}, ('flake',)),
         ({'junit_tests': 3}, ('3', '5')),
+        ({'junit_tests': 7}, ('7', '5')),
         ({'junit_tests': None}, ('None',)),
         ({'collected': None}, ('None',)),
     ])

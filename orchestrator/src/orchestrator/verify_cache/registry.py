@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from shared.project_layout import orchestrator_data_dir
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
@@ -27,12 +27,15 @@ _T = TypeVar('_T')
 #: I5: the cache is disabled only on the evidence of at least this many leaks.
 MIN_DISABLING_LEAKS = 2
 
+#: What a damaged file or a row breaking an invariant raises while being read or written.
+_UNREADABLE = (sqlite3.Error, OSError, RuntimeError, ValueError, TypeError, KeyError)
+
 _ENTRY_COLUMNS = (
     'entry_id, unit_id, key, tier, spec_hash, inputs, evidence_event_id, run_id, sha, recorded_at'
 )
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
-    entry_id INTEGER PRIMARY KEY,
+    entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
     unit_id TEXT NOT NULL,
     key TEXT NOT NULL,
     tier TEXT NOT NULL,
@@ -141,6 +144,11 @@ class RegistryView:
     policy: PolicyState
 
 
+class Pruned(NamedTuple):
+    entries: int
+    consumed: int
+
+
 @dataclass(frozen=True)
 class RegistrySummary:
     path: Path
@@ -185,6 +193,16 @@ class Registry:
         logger.warning('verify_cache.evict key=%s entries=%d reason=%s', key, removed, reason)
         return removed
 
+    async def prune(self, *, entries_recorded_before: datetime, consumed_before: datetime) -> Pruned:
+        """Delete greens last recorded before *entries_recorded_before*, and
+        consumption records older than *consumed_before* (the audit horizon).
+        A pruned green is re-earned by the next run of its unit."""
+        _require_aware('entries_recorded_before', entries_recorded_before)
+        _require_aware('consumed_before', consumed_before)
+        pruned = await self._call(lambda conn: _prune(conn, entries_recorded_before, consumed_before))
+        logger.info('verify_cache.prune entries=%d consumed=%d', pruned.entries, pruned.consumed)
+        return pruned
+
     async def policy_state(self) -> PolicyState:
         return await self._call(_policy_state)
 
@@ -207,7 +225,7 @@ class Registry:
                     return operation(conn)
             finally:
                 conn.close()
-        except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+        except _UNREADABLE as exc:
             raise RegistryError(self._db_path, str(exc)) from exc
 
     def _summary(self) -> RegistrySummary:
@@ -220,7 +238,7 @@ class Registry:
                 return _summarize(conn, self._db_path)
             finally:
                 conn.close()
-        except (sqlite3.Error, OSError, ValueError) as exc:
+        except _UNREADABLE as exc:
             raise RegistryError(self._db_path, str(exc)) from exc
 
 
@@ -280,6 +298,16 @@ def _consume(conn: sqlite3.Connection, landing_sha: str, entries: tuple[Entry, .
             for entry in entries
         ],
     )
+
+
+def _prune(conn: sqlite3.Connection, entries_before: datetime, consumed_before: datetime) -> Pruned:
+    entries = conn.execute(
+        'DELETE FROM entries WHERE julianday(recorded_at) < julianday(?)', (entries_before.isoformat(),),
+    ).rowcount
+    consumed = conn.execute(
+        'DELETE FROM consumed WHERE julianday(consumed_at) < julianday(?)', (consumed_before.isoformat(),),
+    ).rowcount
+    return Pruned(entries, consumed)
 
 
 def _consumed_for(conn: sqlite3.Connection, landing_sha: str) -> tuple[Entry, ...]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -88,6 +89,21 @@ class TestVerifyCacheStatus:
         assert 'UNREADABLE' in result.output, result.output
         assert 'not a database' in result.output, result.output
         assert 'tree=0' not in result.output, result.output
+        assert 'policy:' not in result.output, result.output
+
+    def test_a_policy_row_of_the_wrong_type_is_unreadable_not_a_traceback(self, tmp_path):
+        asyncio.run(_store(tmp_path).policy_state())
+        conn = sqlite3.connect(registry.registry_db_path(tmp_path))
+        try:
+            with conn:
+                conn.execute("INSERT INTO policy_state (id, streak, leaks) VALUES (1, 0, '5')")
+        finally:
+            conn.close()
+
+        result = _status(_config(tmp_path))
+
+        assert result.exit_code == 0, result.output
+        assert 'UNREADABLE' in result.output, result.output
         assert 'policy:' not in result.output, result.output
 
     def test_no_config_and_no_env_exits_one_with_an_error(self, monkeypatch):
