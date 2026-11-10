@@ -186,7 +186,8 @@ def deps_verdict(
     which deals exclusively with non-terminal deps already present in
     *tasks_by_id*).  If the dep is present in *tasks_by_id*,
     *terminal_dep_records* is never consulted (*tasks_by_id* wins).  If the
-    dep is absent from BOTH, the arm skips it.
+    dep is absent from BOTH, the arm skips it, except that the scheduled-deploy
+    arm waits on a dep in *deferred_terminal_deps* (above).
 
     Handles three dependency formats:
       - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``

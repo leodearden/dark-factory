@@ -4743,7 +4743,9 @@ class Scheduler:
         *tasks_by_id* (task 2692, δ/ε follow-up — the active-only
         ``get_tasks`` fetch excludes done/cancelled producers). When ``None``
         (the default), the fallback is inert — byte-identical to before this
-        param existed.
+        param existed.  *deferred_terminal_deps* travels with it: the TERMINAL
+        deps whose record the backfill's fetch budget deferred before caching
+        (``dependency_verdict.py::deps_verdict``).
 
         Park GC evaluates the same three caches through
         ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
