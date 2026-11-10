@@ -334,3 +334,185 @@ class TestSampleFailsClosed:
         paths = _paths(tmp_path)
         assert mod.run(_sample_argv(sidecar, paths, cap=0), reader_factory=_Graphs()) == 2
         self._assert_nothing_written(paths)
+
+
+# --------------------------------------------------------------------------- #
+# The score: Stage 1's decision against the adjudicated sample
+# --------------------------------------------------------------------------- #
+
+judge_eval = load_script_module(SCRIPTS / 'eval_overreach_judge.py', mod_name='eval_overreach_judge')
+
+COMPOSITE_DEFINITION = audit.SampleDefinition(
+    window_start=WINDOW_START, window_end=WINDOW_END, cap=20,
+    strata=('retired', 'kept'), hash_rule='sha256(graph:edge_uuid)',
+)
+
+Cells = dict[tuple[str, str], tuple[int, tuple[str, ...]]]
+"""(graph, decision) -> (census population, the sampled flags' labels)."""
+
+FAILING: Cells = {
+    (DF, 'retired'): (30, ('overreach', 'overreach', 'holding')),
+    (DF, 'kept'): (50, ('overreach', 'holding', 'holding', 'context', 'context')),
+    (REIFY, 'retired'): (4, ('overreach', 'context')),
+    (REIFY, 'kept'): (10, ('overreach', 'overreach')),
+}
+"""Cell weights 10, 10, 2 and 5 over a 10-day window."""
+
+PASSING: Cells = {
+    (DF, 'retired'): (30, ('overreach',) * 10),
+    (DF, 'kept'): (50, ('holding',) * 5),
+    (REIFY, 'retired'): (20, ('overreach',) * 10),
+    (REIFY, 'kept'): (10, ('context',) * 2),
+}
+
+JUDGE_EVAL = {'mode': 'offline', 'recall': {'rate': 0.1467, 'ci': [0.0583, 0.3231], 'effective_n': 27.0}}
+
+
+def _composite(cells: Cells) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A composite-sample.json and a verdict file labelling every sampled flag."""
+    by_graph: dict[str, dict[str, Any]] = {
+        graph: {'handed': 0} | {d: {'flags': 0, 'per_day': 0.0} for d in ('retired', 'kept', 'superseded', 'gone')}
+        for graph in (DF, REIFY)
+    }
+    by_graph[DF]['superseded'] = {'flags': 7, 'per_day': 0.7}
+    flags, verdicts = [], []
+    for (graph, decision), (population, labels) in cells.items():
+        by_graph[graph][decision] = {'flags': population, 'per_day': population / 10}
+        for index, label in enumerate(labels):
+            flag = {'graph': graph, 'edge_uuid': f'{graph}-{decision}-{index}',
+                    'episode_uuid': f'ep-{decision}-{index // 2}', 'fact': f'fact {decision} {index}',
+                    'decision': decision, 'handed_at': IN_WINDOW.isoformat()}
+            flags.append(flag)
+            verdicts.append({'graph': graph, 'episode_uuid': flag['episode_uuid'], 'edge_uuid': flag['edge_uuid'],
+                             'fact': flag['fact'], 'label': label, 'rationale': f"span of {flag['edge_uuid']}"})
+    for counts in by_graph.values():
+        counts['handed'] = sum(counts[d]['flags'] for d in ('retired', 'kept', 'superseded', 'gone'))
+    sample = {
+        'sample': COMPOSITE_DEFINITION.to_dict(), 'graphs': [DF, REIFY], 'sampled_at': IN_WINDOW.isoformat(),
+        'census': {'window_days': 10.0, 'by_graph': by_graph, 'prompt_versions': [PROMPT_VERSION]},
+        'flags': flags,
+    }
+    return sample, {'sample': COMPOSITE_DEFINITION.to_dict(), 'verdicts': verdicts}
+
+
+def _run_composite_score(
+    tmp_path: Path, sample: dict[str, Any], verdicts: dict[str, Any], *, judge: dict[str, Any] | None = None,
+) -> tuple[int, Path]:
+    sample_file, verdict_file = tmp_path / 'composite-sample.json', tmp_path / 'composite-verdicts.json'
+    out = tmp_path / 'out' / 'composite-report.json'
+    sample_file.write_text(json.dumps(sample))
+    verdict_file.write_text(json.dumps(verdicts))
+    argv = ['score', '--sample', str(sample_file), '--verdicts', str(verdict_file), '--out', str(out)]
+    if judge is not None:
+        judge_file = tmp_path / 'judge-eval.json'
+        judge_file.write_text(json.dumps(judge))
+        argv += ['--judge-eval', str(judge_file)]
+    return mod.run(argv), out
+
+
+def _composite_scored(tmp_path: Path, cells: Cells = FAILING, *, judge: dict[str, Any] | None = None) -> dict[str, Any]:
+    code, out = _run_composite_score(tmp_path, *_composite(cells), judge=judge)
+    assert code == 0
+    return json.loads(out.read_text())
+
+
+class TestOneCopyOfTheBars:
+    def test_the_precision_bars_and_estimators_are_imported(self) -> None:
+        assert mod.PRECISION_MIN is judge_eval.PRECISION_MIN
+        assert mod.PRECISION_LOWER_MIN is judge_eval.PRECISION_LOWER_MIN
+        assert mod.weighted_rate is audit.weighted_rate and mod.load_verdicts is audit.load_verdicts
+
+
+class TestCompositeScore:
+    def test_cell_weights_are_census_population_over_sampled(self, tmp_path: Path) -> None:
+        assert _composite_scored(tmp_path)['weights'] == {
+            DF: {'retired': 10.0, 'kept': 10.0}, REIFY: {'retired': 2.0, 'kept': 5.0},
+        }
+
+    def test_retire_precision_is_weighted_overreach_among_the_retired(self, tmp_path: Path) -> None:
+        score = _composite_scored(tmp_path)
+        assert score['retire_precision'] == audit.weighted_rate([(10.0, 2, 3), (2.0, 1, 2)])
+        assert score['unweighted']['retire_precision'] == audit.rate(3, 5)
+
+    def test_flag_precision_is_weighted_overreach_over_every_cell(self, tmp_path: Path) -> None:
+        assert _composite_scored(tmp_path)['flag_precision'] == audit.weighted_rate(
+            [(10.0, 2, 3), (10.0, 1, 5), (2.0, 1, 2), (5.0, 2, 2)],
+        )
+
+    def test_stage1_recall_is_weighted_retired_overreach_over_flagged_overreach(self, tmp_path: Path) -> None:
+        score = _composite_scored(tmp_path)
+        assert score['stage1_recall_on_flags'] == audit.weighted_rate(
+            [(10.0, 2, 2), (10.0, 0, 1), (2.0, 1, 1), (5.0, 0, 2)],
+        )
+        assert score['stage1_recall_on_flags']['rate'] == round(22 / 42, 4)
+
+    def test_what_stage1_retires_per_day(self, tmp_path: Path) -> None:
+        score = _composite_scored(tmp_path)
+        assert score['holding_retired_share'] == audit.weighted_rate([(10.0, 1, 3), (2.0, 0, 2)])
+        assert (score['holdings_retired_per_day'], score['overreach_retired_per_day']) == (1.0, 2.2)
+
+    def test_label_counts_per_cell(self, tmp_path: Path) -> None:
+        counts = _composite_scored(tmp_path)['label_counts']
+        assert counts[DF]['retired'] == {
+            'holding': 1, 'bookkeeping': 0, 'context': 0, 'overreach': 2, 'misbound': 0, 'unjudgeable': 0,
+        }
+        assert counts[REIFY]['kept']['overreach'] == 2
+
+    def test_composite_recall_is_a_labelled_product_of_two_frames(self, tmp_path: Path) -> None:
+        score = _composite_scored(tmp_path, judge=JUDGE_EVAL)
+        stage1, judge = score['stage1_recall_on_flags'], JUDGE_EVAL['recall']
+        composite = score['composite_recall']
+        assert composite['point'] == round(judge['rate'] * stage1['rate'], 4)
+        assert composite['range'] == [round(judge['ci'][0] * stage1['ci'][0], 4),
+                                      round(judge['ci'][1] * stage1['ci'][1], 4)]
+        assert 'product of two frames' in composite['label']
+        assert composite['judge_recall'] == {'rate': judge['rate'], 'ci': judge['ci']}
+
+    def test_without_a_judge_eval_there_is_no_composite_recall(self, tmp_path: Path) -> None:
+        assert _composite_scored(tmp_path)['composite_recall'] is None
+
+
+class TestCompositeDecision:
+    def test_it_fails_below_the_precision_bar(self, tmp_path: Path) -> None:
+        decision = _composite_scored(tmp_path, FAILING)['decision']
+        assert decision['checks'] == {'retire_precision': False, 'retire_precision_lower_bound': False}
+        assert decision['passes'] is False
+
+    def test_it_passes_above_both_bars(self, tmp_path: Path) -> None:
+        score = _composite_scored(tmp_path, PASSING)
+        assert score['retire_precision']['rate'] == 1.0 and score['retire_precision']['ci'][0] >= 0.65
+        assert score['decision']['checks'] == {'retire_precision': True, 'retire_precision_lower_bound': True}
+        assert score['decision']['passes'] is True
+
+    def test_the_decision_states_its_bars(self, tmp_path: Path) -> None:
+        assert _composite_scored(tmp_path)['decision']['bars'] == {
+            'precision_min': 0.80, 'precision_lower_min': 0.65,
+        }
+
+
+class TestCompositeScoreFailsClosed:
+    def _assert_rejected(self, tmp_path: Path, sample: dict[str, Any], verdicts: dict[str, Any]) -> None:
+        code, out = _run_composite_score(tmp_path, sample, verdicts)
+        assert code == 2
+        assert not out.exists() and not out.parent.exists()
+
+    def test_a_sampled_flag_without_a_verdict(self, tmp_path: Path) -> None:
+        sample, verdicts = _composite(FAILING)
+        verdicts['verdicts'] = verdicts['verdicts'][1:]
+        self._assert_rejected(tmp_path, sample, verdicts)
+
+    def test_a_verdict_outside_the_sample(self, tmp_path: Path) -> None:
+        sample, verdicts = _composite(FAILING)
+        stray = dict(verdicts['verdicts'][0], edge_uuid='ghost')
+        verdicts['verdicts'].append(stray)
+        self._assert_rejected(tmp_path, sample, verdicts)
+
+    def test_an_unknown_label(self, tmp_path: Path) -> None:
+        sample, verdicts = _composite(FAILING)
+        verdicts['verdicts'][0]['label'] = 'maybe'
+        self._assert_rejected(tmp_path, sample, verdicts)
+
+    def test_a_verdict_file_adjudicated_under_another_sample(self, tmp_path: Path) -> None:
+        sample, verdicts = _composite(FAILING)
+        verdicts['sample'] = dict(verdicts['sample'], cap=8)
+        self._assert_rejected(tmp_path, sample, verdicts)
