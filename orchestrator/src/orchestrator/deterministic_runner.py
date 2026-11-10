@@ -595,6 +595,46 @@ def file_illegal_deploy_transition(
     )
 
 
+def file_deterministic_infra_issue(
+    escalation_queue: EscalationQueue,
+    task_id: str,
+    *,
+    summary: str,
+    detail: str,
+    category: str = 'infra_issue',
+) -> str | None:
+    """File a born-at-L2 escalation unless one of ours is pending; its id, or None when skipped.
+
+    Dedup rationale: ``DeterministicRunner._file_infra_issue_and_block``.
+    """
+    existing_pending = escalation_queue.get_by_task(
+        task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+    )
+    if existing_pending:
+        logger.info(
+            'DeterministicRunner: task %s already has %d pending escalation(s) — '
+            'skipping re-file (%s dedup guard)',
+            task_id, len(existing_pending), category,
+        )
+        return None
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category=category,
+        summary=summary[:200],
+        detail=detail,
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.info(
+        'DeterministicRunner: filed L2 %s escalation %s for task %s',
+        category, esc.id, task_id,
+    )
+    return esc.id
+
+
 def build_milestone_gate_escalation_fields(
     task: dict | None, metadata: dict,
 ) -> tuple[str, str, list]:
@@ -1148,31 +1188,9 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        file_deterministic_infra_issue(
+            self.escalation_queue, task_id, summary=summary, detail=detail, category=category,
         )
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (%s dedup guard)',
-                task_id, len(existing_pending), category,
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=DETERMINISTIC_AGENT_ROLE,
-                severity='critical',
-                category=category,
-                summary=summary[:200],
-                detail=detail,
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 %s escalation %s for task %s',
-                category, esc.id, task_id,
-            )
 
         if metadata is not None and metadata.get('before_done') is not None:
             _current_deploy_state = DeployState.from_metadata(metadata)
