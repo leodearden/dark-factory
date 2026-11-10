@@ -297,7 +297,7 @@ def _scheduled_deploy_verdict(
             # Fail-open, as in the delivered-check arm below.
             continue
         metadata = dep_task.get('metadata')
-        if not awaits_scheduled_restart(metadata):
+        if not isinstance(metadata, dict) or not awaits_scheduled_restart(metadata):
             continue
         deploy_slice = metadata.get('deploy_state')
         logger.debug(
