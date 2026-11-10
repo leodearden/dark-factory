@@ -21,6 +21,7 @@ import sys
 import check_network_exposure as exposure
 import pytest
 import yaml
+from setup_host_sections import checker_repo, run_section, slice_section, usage_error_checker
 from shell_sections import stub_bin_dir, write_stub
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -581,3 +582,79 @@ def test_cli_missing_script_exits_2_without_the_tag(tmp_path: pathlib.Path):
 
 def test_script_is_executable():
     assert os.access(SCRIPT_PATH, os.X_OK), f"{SCRIPT_PATH} is not executable"
+
+
+# ---------------------------------------------------------------------------
+# setup-host.sh §11: the status is believed only with the tag
+# ---------------------------------------------------------------------------
+
+_GATE_START = "_net_exposure_script="
+_GATE_END = "\nfi\n"
+
+
+def _stub_checker(report: str, status: int) -> str:
+    return f"import sys\nprint({report!r})\nsys.exit({status})\n"
+
+
+def _run_gate(
+    tmp_path: pathlib.Path, *, body: str | None, with_checker: bool = True
+) -> subprocess.CompletedProcess:
+    repo = checker_repo(tmp_path, SCRIPT_PATH.name, body=body, with_checker=with_checker)
+    result = run_section(
+        tmp_path, slice_section(_GATE_START, _GATE_END), repo_root=repo, unit_dir=tmp_path / "units"
+    )
+    assert result.returncode == 0, (
+        f"fail() only printfs; the health-check section must not abort.\n{result.stdout}\n{result.stderr}"
+    )
+    return result
+
+
+def test_gate_slice_runs_the_checker():
+    block = slice_section(_GATE_START, _GATE_END)
+    assert "python3" in block, block
+
+
+def test_gate_reports_ok_for_a_tagged_loopback_only_report(tmp_path: pathlib.Path):
+    result = _run_gate(tmp_path, body=_stub_checker(f"{REPORT_TAG} [ok] loopback only", 0))
+
+    assert "OK " in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+
+
+def test_gate_fails_on_a_tagged_finding_and_reprints_the_report(tmp_path: pathlib.Path):
+    report = f"{REPORT_TAG} [exposed] port 8002 (fused-memory.socket) accepted a connect on 192.168.1.105"
+    result = _run_gate(tmp_path, body=_stub_checker(report, 1))
+
+    assert report in result.stdout, result.stdout
+    assert f"FAIL   see the {REPORT_TAG} report above." in result.stdout, result.stdout
+    assert "OK " not in result.stdout, result.stdout
+
+
+def test_gate_fails_on_a_tagged_exit_2(tmp_path: pathlib.Path):
+    result = _run_gate(tmp_path, body=_stub_checker(f"{REPORT_TAG} [ok] loopback only", 2))
+
+    assert "FAIL " in result.stdout, result.stdout
+    assert "OK " not in result.stdout, result.stdout
+
+
+def test_gate_does_not_believe_an_untagged_report(tmp_path: pathlib.Path):
+    result = _run_gate(tmp_path, body=_stub_checker("[ok] loopback only", 0))
+
+    assert f"produced no {REPORT_TAG} report" in result.stdout, result.stdout
+    assert "OK " not in result.stdout, result.stdout
+
+
+def test_gate_fails_on_a_usage_error(tmp_path: pathlib.Path):
+    body = usage_error_checker(SCRIPT_PATH.name, "[-h] [--connect-timeout SECS]", "--connect-timeout")
+    result = _run_gate(tmp_path, body=body)
+
+    assert f"produced no {REPORT_TAG} report" in result.stdout, result.stdout
+    assert "OK " not in result.stdout, result.stdout
+
+
+def test_gate_fails_when_the_checker_is_missing(tmp_path: pathlib.Path):
+    result = _run_gate(tmp_path, body=None, with_checker=False)
+
+    missing = tmp_path / "repo" / "scripts" / SCRIPT_PATH.name
+    assert f"FAIL Network exposure check missing: {missing}" in result.stdout, result.stdout
+    assert "OK " not in result.stdout, result.stdout
