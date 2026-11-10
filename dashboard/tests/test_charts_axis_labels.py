@@ -57,6 +57,7 @@ import pytest
 from _dashboard_helpers import (
     extract_function_body,
     find_function_params,
+    jsx_open_tags,
 )
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,9 @@ def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
 # ---------------------------------------------------------------------------
 # Caller-audit extractors — the props (formatY) and flags (countAxis) that each
 # LineChart and StackedAreaChart CALL SITE passes, read out of the tab sources.
+# Each call site is read from its own opening tag, spanned by
+# `_dashboard_helpers.py::jsx_open_tag_end`, so a quoted `}` or `/>` cannot end
+# it and a child element's attributes are never the chart's.
 #
 # `_line_chart_format_y` returns None for a site that passes no formatter. That
 # None is load-bearing for the esc-per-done ratio guard, which requires the site
@@ -211,40 +215,17 @@ _LINE_CHART_TAG_RE = re.compile(r'<(?:LC|LineChart|C\.LineChart)\b')
 _STACKED_AREA_TAG_RE = re.compile(r'<(?:SA|C\.StackedAreaChart)\b')
 
 
-def _jsx_elements(body: str, tag_re: re.Pattern) -> list:
-    """Every self-closing JSX element in `body` whose tag matches `tag_re`.
-
-    Walks to the element's own `/>` at brace depth 0, so a `series={[{...}]}`
-    prop containing braces (or a `${...}` inside a template literal) cannot end
-    the element early. A regex cannot do this: these props nest.
-    """
-    out = []
-    for m in tag_re.finditer(body):
-        depth = 0
-        i = m.end()
-        while i < len(body):
-            ch = body[i]
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-            elif depth == 0 and ch == '/' and body[i + 1 : i + 2] == '>':
-                out.append(body[m.start() : i + 2])
-                break
-            i += 1
-    return out
-
-
-def _anchored_chart_element(body: str, tag_re: re.Pattern, anchor: str) -> str:
-    """The one chart element in `body` whose tag matches `tag_re` and whose props mention `anchor`.
+def _anchored_chart_tag(body: str, tag_re: re.Pattern, anchor: str) -> str:
+    """The OPENING TAG, where every prop lives, of the one chart call site in
+    `body` whose tag matches `tag_re` and whose props mention `anchor`.
 
     `body` is an already-sliced COMPONENT body: several tabs render more than
     one chart, and the anchor (a series expression such as ``MEMORY_OPS.reads``)
     is what names the axis.
     """
-    matches = [el for el in _jsx_elements(body, tag_re) if anchor in el]
+    matches = [tag for tag in jsx_open_tags(body, tag_re) if anchor in tag]
     assert len(matches) == 1, (
-        f'expected exactly one chart element matching {tag_re.pattern!r} whose '
+        f'expected exactly one chart tag matching {tag_re.pattern!r} whose '
         f'props mention {anchor!r}, found {len(matches)}. The chart was renamed, '
         'removed, or its series expression changed — either way the caller-audit '
         'assertion that depends on it must FAIL rather than quietly measure a '
@@ -259,7 +240,7 @@ def _chart_prop(body: str, tag_re: re.Pattern, anchor: str, prop: str):
     Returns the expression text, or ``None`` when the site does not pass `prop`
     and therefore inherits the component's default.
     """
-    element = _anchored_chart_element(body, tag_re, anchor)
+    element = _anchored_chart_tag(body, tag_re, anchor)
     m = re.search(rf'\b{prop}=\{{', element)
     if m is None:
         return None
@@ -311,9 +292,9 @@ def _chart_flag(body: str, tag_re: re.Pattern, anchor: str, prop: str) -> bool:
     attribute names are scanned (see `_attribute_names_only`), so the token
     inside a braced expression or a quoted string is not an attribute.
     """
-    attributes = _attribute_names_only(_anchored_chart_element(body, tag_re, anchor))
+    attributes = _attribute_names_only(_anchored_chart_tag(body, tag_re, anchor))
     assert re.search(rf'(?<![\w.]){prop}\s*=', attributes) is None, (
-        f'the chart element anchored at {anchor!r} assigns `{prop}=...`. The '
+        f'the chart tag anchored at {anchor!r} assigns `{prop}=...`. The '
         f'caller audit requires the shorthand `{prop}` attribute, so that its '
         'presence is the whole decision; an assigned value could be false or '
         'computed, and would be misread as present or absent.'
