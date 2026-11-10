@@ -20,6 +20,7 @@ from _quality_rows import (
     write_landing_events,
     write_quality_db,
 )
+from _runs_db_fixture import EventRow
 from shared.project_id import project_id_for_root
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck, LinesBase
@@ -954,6 +955,65 @@ async def test_a_missing_runs_db_cannot_confirm_freshness(root: Path) -> None:
 
     assert datum.state is DatumState.STALE
     assert 'runs.db' in (datum.reason or '')
+
+
+PENDING_TRAIN: EventRow = (NOW - timedelta(hours=3), '9001', 'train_merged', {'verdict': 'pending'})
+"""Neither a coalesced nor an attributed train: the landing rule refuses it."""
+
+NAIVE_LANDING: EventRow = ('2026-11-09T11:00:00', '9002', 'merge_finalized',
+                           {'state': 'done', 'merge_sha': 'sha-naive'})
+"""A done landing whose timestamp carries no offset: the landing rule refuses to guess one."""
+
+
+async def test_a_train_event_the_landing_rule_refuses_cannot_confirm_freshness(root: Path) -> None:
+    rows = _recent(40)
+    write_landing_events(root, rows, extra_events=[PENDING_TRAIN])
+    await _stored(root, rows, [_value(root, NOW - timedelta(minutes=5), rows)])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    reason = datum.reason or ''
+    assert reason.startswith('freshness cannot be confirmed')
+    assert 'runs.db' in reason
+    assert 'UnrecognisedTrainEvent' in reason
+    assert datum.value is not None
+    assert len(datum.value.axis) == 40
+    validate_datum(datum, NOW)
+
+
+async def test_a_gap_after_the_value_still_names_itself_over_a_refused_train_event(
+    root: Path,
+) -> None:
+    rows = _recent(40)
+    write_landing_events(root, rows, extra_events=[PENDING_TRAIN])
+    gap_reason = 'UnrecognisedTrainEvent: train_merged events with neither … (event ids=[41])'
+    await _stored(root, rows, [
+        _value(root, NOW - timedelta(minutes=15), rows),
+        _gap(root, NOW - timedelta(minutes=5), gap_reason),
+    ])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    assert datum.reason == gap_reason
+    assert datum.value is not None
+    assert len(datum.value.axis) == 40
+
+
+async def test_a_landing_timestamp_without_an_offset_cannot_confirm_freshness(root: Path) -> None:
+    rows = _recent(40)
+    write_landing_events(root, rows, extra_events=[NAIVE_LANDING])
+    await _stored(root, rows, [_value(root, NOW - timedelta(minutes=5), rows)])
+
+    datum = await _read(root)
+
+    assert datum.state is DatumState.STALE
+    reason = datum.reason or ''
+    assert reason.startswith('freshness cannot be confirmed')
+    assert 'ValueError' in reason
+    assert datum.value is not None
+    assert len(datum.value.axis) == 40
 
 
 async def test_a_window_serves_the_newest_landings_and_passes_validation(root: Path) -> None:

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 from _dt_helpers import fixed_clock, installed_clock
 from _quality_rows import history, write_landing_events, write_quality_db
+from _runs_db_fixture import EventRow
 from shared.quality_series.landings import GitCrossCheck
 
 from dashboard.api.quality import _QUALITY_WINDOWS
@@ -67,16 +69,16 @@ DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
 STORED = 120
 
 
-@pytest.fixture
-def quality_client(client, tmp_path: Path) -> Iterator[Any]:
+@contextmanager
+def _seeded(client: Any, tmp_path: Path, extra_events: Iterable[EventRow] = ()) -> Iterator[Any]:
     """The app over a root named 'dark_factory' holding STORED sampled landings, beside an
-    unsampled 'other-proj', serving at NOW."""
+    unsampled 'other-proj', serving at NOW; runs.db also holds *extra_events* verbatim."""
     root, other = tmp_path / 'dark_factory', tmp_path / 'other-proj'
     root.mkdir()
     other.mkdir()
     config = DashboardConfig(project_root=root, known_project_roots=[other])
     rows = history(STORED, start=NOW - timedelta(days=1) - timedelta(hours=2 * (STORED - 1)))
-    write_landing_events(root, rows)
+    write_landing_events(root, rows, extra_events)
     sample = QualitySample.value(
         'dark_factory', NOW - timedelta(minutes=5), cursor_sha=rows[-1].landing.merge_sha,
         landings_sampled=STORED, landings_deferred=0, git_check=GitCrossCheck(0, 0, 0),
@@ -85,6 +87,12 @@ def quality_client(client, tmp_path: Path) -> Iterator[Any]:
     client.app.state.config = config
     with installed_clock(client.app, fixed_clock(NOW)):
         yield client
+
+
+@pytest.fixture
+def quality_client(client, tmp_path: Path) -> Iterator[Any]:
+    with _seeded(client, tmp_path) as seeded:
+        yield seeded
 
 
 def _get(client: Any, query: str) -> dict[str, Any]:
@@ -148,3 +156,16 @@ def test_a_declined_window_echoes_the_request_and_serves_the_default(quality_cli
 
     assert body['WINDOW'] == {'requested': '7d', 'served': '100', 'landings': 100}
     assert len(body['QUALITY']['value']['axis']) == 100
+
+
+PENDING_TRAIN: EventRow = (NOW - timedelta(hours=3), '9001', 'train_merged', {'verdict': 'pending'})
+"""Neither a coalesced nor an attributed train: the landing rule refuses it."""
+
+
+def test_a_train_event_the_landing_rule_refuses_is_served_stale(client, tmp_path: Path) -> None:
+    with _seeded(client, tmp_path, [PENDING_TRAIN]) as seeded:
+        quality = _get(seeded, 'project=dark_factory&window=100')['QUALITY']
+
+    assert quality['state'] == 'stale'
+    assert 'UnrecognisedTrainEvent' in quality['reason']
+    assert len(quality['value']['axis']) == 100

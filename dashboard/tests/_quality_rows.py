@@ -155,12 +155,17 @@ def _unit_event(members: list[Landing]) -> EventRow:
     })
 
 
-def write_landing_events(root: Path, landings: Iterable[LandingRow]) -> Path:
+def write_landing_events(
+    root: Path, landings: Iterable[LandingRow], extra_events: Iterable[EventRow] = (),
+) -> Path:
     """*root*'s runs.db recording each landing: a done merge_finalized per plain landing, one
-    train_merged per train, stamped at landed_at."""
+    train_merged per train, stamped at landed_at; then *extra_events* verbatim.
+
+    runs.db is written once, so a row the landing rule refuses rides in *extra_events*.
+    """
     ordered = sorted((row.landing for row in landings), key=lambda landing: landing.ordinal)
     events = [
         _unit_event(list(members))
         for _, members in groupby(ordered, key=lambda landing: landing.unit_id)
     ]
-    return write_quality_runs_db(root, events)
+    return write_quality_runs_db(root, [*events, *extra_events])
