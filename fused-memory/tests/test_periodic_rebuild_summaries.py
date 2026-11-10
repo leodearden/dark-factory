@@ -27,6 +27,7 @@ import logging
 
 import pytest
 
+from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.config.schema import SummaryRebuildConfig
 from fused_memory.server import main as server_main
 
@@ -56,6 +57,10 @@ class _FakeMemoryService:
             'skipped': 0,
             'errors': 0,
             'details': [],
+            'entities_complete': True,
+            'entities_incomplete_kind': None,
+            'edges_complete': True,
+            'edges_incomplete_kind': None,
         }
 
 
@@ -120,10 +125,14 @@ async def test_cycle_logs_summary_counts_per_project(caplog):
                 return {
                     'total_entities': 5, 'stale_entities': 2, 'rebuilt': 2,
                     'skipped': 0, 'errors': 0, 'details': [],
+                    'entities_complete': True, 'entities_incomplete_kind': None,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
                 }
             return {
                 'total_entities': 5, 'stale_entities': 3, 'rebuilt': 2,
                 'skipped': 0, 'errors': 1, 'details': [],
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': True, 'edges_incomplete_kind': None,
             }
 
     cfg = SummaryRebuildConfig(enabled=True, projects=['proj_a', 'proj_b'])
@@ -138,6 +147,73 @@ async def test_cycle_logs_summary_counts_per_project(caplog):
     assert any('rebuilt' in r.getMessage() for r in proj_a_records)
     # Project reporting per-entity errors escalates to WARNING.
     assert any(r.levelno == logging.WARNING for r in proj_b_records)
+
+
+class _VerdictService:
+    """Returns a clean (errors=0) rebuild carrying the given read verdicts."""
+
+    def __init__(self, **verdicts) -> None:
+        self._verdicts = verdicts
+
+    async def rebuild_entity_summaries(self, *, project_id, force=False, **kwargs):
+        return {
+            'total_entities': 4, 'stale_entities': 1, 'rebuilt': 1,
+            'skipped': 0, 'errors': 0, 'details': [],
+            **self._verdicts,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('entities_complete', 'entities_incomplete_kind', 'edges_complete', 'edges_incomplete_kind'),
+    [
+        (False, INCOMPLETE_SHORT_READ, True, None),
+        (True, None, False, INCOMPLETE_SHORT_READ),
+        (None, None, True, None),
+        (True, None, None, None),
+    ],
+)
+async def test_cycle_warns_on_a_corpus_not_proven_complete(
+    caplog, entities_complete, entities_incomplete_kind, edges_complete, edges_incomplete_kind,
+):
+    service = _VerdictService(
+        entities_complete=entities_complete,
+        entities_incomplete_kind=entities_incomplete_kind,
+        edges_complete=edges_complete,
+        edges_incomplete_kind=edges_incomplete_kind,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await server_main._run_rebuild_summaries_cycle(
+            service, SummaryRebuildConfig(enabled=True, projects=['proj_partial']),
+        )
+
+    (summary,) = [
+        r for r in caplog.records
+        if 'proj_partial' in r.getMessage() and 'rebuilt' in r.getMessage()
+    ]
+    assert summary.levelno == logging.WARNING
+    assert f'entities_complete={entities_complete}' in summary.getMessage()
+    assert f'edges_complete={edges_complete}' in summary.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_cycle_logs_a_proven_complete_clean_project_at_info_with_its_verdicts(caplog):
+    service = _VerdictService(
+        entities_complete=True, entities_incomplete_kind=None,
+        edges_complete=True, edges_incomplete_kind=None,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await server_main._run_rebuild_summaries_cycle(
+            service, SummaryRebuildConfig(enabled=True, projects=['proj_clean']),
+        )
+
+    records = [r for r in caplog.records if 'proj_clean' in r.getMessage()]
+    assert not [r for r in records if r.levelno >= logging.WARNING]
+    (summary,) = [r for r in records if r.levelno == logging.INFO]
+    assert 'entities_complete=True' in summary.getMessage()
+    assert 'edges_complete=True' in summary.getMessage()
 
 
 @pytest.mark.asyncio
