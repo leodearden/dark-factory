@@ -1,4 +1,14 @@
 {
+  "adjudication": {
+    "adjudicator": "the implementing agent for task 9040 (the agent that ran the replay); single pass, no sub-agents",
+    "blinding_residuals": [
+      "Before labelling, the adjudicator saw per-arm totals (control minted 292, o1 352; entity totals) while checking the replay output for failures, and the first control record, whose edges belong to the first worksheet episode (dark_factory 64905a27, eight \"re-landed along with\" pair edges among them). No other per-edge arm membership was seen before scoring.",
+      "One prior label set was consulted for convention only: the 4716 verdicts for episode 274663b3 (a priority-override record), to confirm that a recorded status is bookkeeping."
+    ],
+    "procedure": "Episodes labelled in worksheet order (dark_factory then reify, ruling_lexeme, decision_anchor, other_decisions), four at a time, each body read in full beside its interleaved edges; one label and one span-quoting rationale per edge. Labels were keyed by (episode index, edge index) and mapped to edge uuids by a script over the worksheet.",
+    "rubric": "docs/ruling-overreach-guard-design-2026-10-01/design.md \u00a72.6, verbatim, with that document's \u00a72.10 garble conventions (inverted causal link, misattributed actor or quantity on the wrong thing -> overreach (ii); faithful fact on the wrong endpoint -> misbound)",
+    "verdicts": 644
+  },
   "branch": "task/9040",
   "gate": "esc-6218-1",
   "runs": [
@@ -104,6 +114,49 @@
       "started_at": "2026-11-10T13:52:08Z",
       "step": "replay",
       "temperature": 0.0
+    },
+    {
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/replay_overreach_extraction.py",
+        "worksheet",
+        "--replay",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/replay.jsonl",
+        "--worksheet",
+        "/tmp/9040-worksheet-4716.jsonl",
+        "--out",
+        "/tmp/9040-blind-worksheet.jsonl"
+      ],
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "git_sha": "8ccd703f23",
+      "output": "/tmp/9040-blind-worksheet.jsonl, not committed: it carries episode bodies. 48 rows, 644 edges, no arm key.",
+      "step": "worksheet"
+    },
+    {
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/replay_overreach_extraction.py",
+        "score",
+        "--replay",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/replay.jsonl",
+        "--verdicts",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/verdicts.json",
+        "--baseline-report",
+        "../docs/ruling-overreach-guard-design-2026-10-01/report.json",
+        "--out",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/report.json"
+      ],
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "git_sha": "8ccd703f23",
+      "invocations": 1,
+      "output": "report.json, written by the script (json.dumps indent=2, sort_keys=True); not hand-edited. verdicts.json passed load_verdicts on the first run.",
+      "step": "score"
     }
   ],
   "task_id": "9040"
