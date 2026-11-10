@@ -54,6 +54,7 @@ from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
+from orchestrator.verify_cache.modes import CacheMode
 
 logger = logging.getLogger(__name__)
 
@@ -1415,6 +1416,28 @@ class SpeculationProbeConfig(BaseModel):
                 f'probe_depths entries must all be positive integers; got {v!r}'
             )
         return v
+
+
+class VerifyCacheConfig(BaseModel):
+    """How far the verify-result cache may act, per verify role
+    (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
+
+    Each role's mode is its own green-tier reload leaf. The kill switch is not
+    here: it lives in the registry's policy_state.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    task_mode: CacheMode = CacheMode.OFF
+    merge_mode: CacheMode = CacheMode.OFF
+
+    def mode_for(self, role: Literal['task', 'merge', 'background']) -> CacheMode:
+        """*role*'s mode; the cache has no background role, so that is always OFF."""
+        if role == 'task':
+            return self.task_mode
+        if role == 'merge':
+            return self.merge_mode
+        return CacheMode.OFF
 
 
 class MergeDeepConfig(BaseModel):
@@ -3264,8 +3287,10 @@ _OVERRIDABLE_FIELDS = frozenset({
     'verify_command_timeout_secs',
     'verify_cold_command_timeout_secs',
     'concurrent_verify', 'sequential_lint_first', 'verify_env',
-    'scope_cargo',
+    'scope_cargo', 'verify_cache',
 })
+
+_MODULE_VERIFY_CACHE_VALUES = ('default', 'never')
 
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
@@ -3301,6 +3326,15 @@ class ModuleConfig:
     sequential_lint_first: bool | None = None
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
+    # 'never' keeps every unit of this module out of the verify-result cache.
+    verify_cache: Literal['default', 'never'] = 'default'
+
+    def __post_init__(self) -> None:
+        if self.verify_cache not in _MODULE_VERIFY_CACHE_VALUES:
+            raise ValueError(
+                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
+                f'expected one of {_MODULE_VERIFY_CACHE_VALUES}',
+            )
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -5480,6 +5514,10 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
+    # An absent stanza is OFF for both roles.
+    verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
+
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
     # producer hook lives in TaskWorkflow._invoke's finally and resolves its
@@ -6691,6 +6729,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
     # (-> 0) without a restart. See MergeDeepConfig for the rest.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # Verify-result cache (task 5652): read per verify decision, so green tier;
+    # each role's mode is its own leaf, so a task-only edit applies alone.
+    _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate
