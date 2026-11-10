@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -607,12 +606,14 @@ class TestAdjudicateMcpScoping:
 class TestAdjudicatorInvocationLedger:
     """Every adjudicator CLI call carries the curator ledger keys, so it lands one row in the CostStore invocations ledger."""
 
-    async def test_passes_ledger_keys(self):
+    async def test_passes_ledger_keys(self, tmp_path):
+        from shared.cost_store import CostStore
+
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
 
         gate = MagicMock()
         gate.run_id = 'fm-run-1'
-        store_sentinel: Any = object()
+        store_sentinel = CostStore(tmp_path / 'unused.db')
         adj = PathScopeAdjudicator(
             PathScopeAdjudicatorConfig(), usage_gate=gate, cost_store=store_sentinel,
         )
