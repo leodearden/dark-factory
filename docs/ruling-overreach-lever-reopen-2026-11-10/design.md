@@ -561,7 +561,11 @@ each task's copy of §6.2.
   `replay --arm control --arm o6` into one file, one blind worksheet over both
   arms adjudicated in one sitting, then `score`. The decision is that
   report's `comparison.o6`. On a pass it files the `always_escalates` routing
-  task. Priority medium.
+  task. Priority medium. Task 9065's description first pinned the dead
+  `--model` run against fixed `r.arms.control` numbers. On 2026-11-10 it was
+  replaced in full through `update_task` with the arm run above, a verbatim
+  copy of §6.2's corrected trigger clause, and §7's temperature residual.
+  The read-back still lists 9040 as a dependency.
 * **B2, task 9066, the composite revisit gate** (area: the composite
   instrument). It runs §6.2's revisit clause on its schedule: a
   pre-registered fresh composite window, blind adjudication, score, and the
