@@ -2600,7 +2600,9 @@ report an `[override]` and exit 1. That is expected while the hold is installed.
 
 Installing the compose service, the template lines and the drop-in on the host is
 a separate attended step (α2, task 6801); the tracked files alone change nothing
-on the host.
+on the host. Until α2 starts the embedder, `scripts/check_network_exposure.py`
+(whose `COMPOSE_PUBLISHED_PORTS` mirrors every compose publish, 8420 included)
+reports `[not-listening]` for 8420; that finding is expected until then.
 
 ### Dashboard unit-parity check
 
