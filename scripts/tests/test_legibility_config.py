@@ -94,9 +94,7 @@ class TestNestedDefaults:
 
     def test_census_defaults(self, tmp_path):
         cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
-        assert cfg.census.max_interval_days == 10
-        assert cfg.census.tasks_landed_threshold == 120
-        assert cfg.census.tasks_landed_min_days == 7
+        assert cfg.census.completion_threshold_pct == 70
         assert cfg.census.novelty_spike.count == 4
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
@@ -263,6 +261,22 @@ class TestCompletionThresholdPct:
         text = MINIMAL_YAML + f'census: {{completion_threshold_pct: {bad_value}}}\n'
         with pytest.raises(ValidationError):
             mod.load_config(_write(tmp_path, text))
+
+    def test_retired_trigger_keys_still_load(self, tmp_path):
+        """extra='allow' keeps a not-yet-migrated project's legibility.yaml
+        loadable; the census trigger names the retired keys instead."""
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              max_interval_days: 10
+              tasks_landed_threshold: 120
+              tasks_landed_min_days: 7
+            """)
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 70
+        assert not any(
+            name in type(cfg.census).model_fields
+            for name in ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+        )
 
 
 class TestNoveltySpikeBaseline:

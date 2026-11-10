@@ -239,6 +239,75 @@ def test_census_config_from_mapping_rejects_a_completion_threshold_outside_1_to_
 
 
 # ---------------------------------------------------------------------------
+# retired census keys (plans/census-incremental-prd.md C7, L8b, row 13): a
+# not-yet-migrated legibility.yaml is accepted, the keys are ignored, and
+# one deprecation WARNING names them
+# ---------------------------------------------------------------------------
+
+_RETIRED_KEYS = ("max_interval_days", "tasks_landed_threshold", "tasks_landed_min_days")
+
+
+def _is_deprecation(message):
+    return "retired" in message and "ignored" in message
+
+
+def test_census_config_from_mapping_ignores_a_retired_key_with_one_deprecation_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"max_interval_days": 1})
+
+    assert config == ct.CensusConfig()
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "max_interval_days" in warning
+    assert _is_deprecation(warning)
+    assert "unusable value" not in warning
+
+
+def test_census_config_from_mapping_names_every_retired_key_apart_from_rejected_values(caplog):
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(
+            {
+                "max_interval_days": 10,
+                "tasks_landed_threshold": 120,
+                "tasks_landed_min_days": 7,
+                "floor_days": -1,
+            }
+        )
+
+    assert config == ct.CensusConfig()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    deprecations = [m for m in warnings if _is_deprecation(m)]
+    rejections = [m for m in warnings if "unusable value" in m]
+    assert len(warnings) == 2
+    [deprecation] = deprecations
+    for key in _RETIRED_KEYS:
+        assert key in deprecation
+    [rejection] = rejections
+    assert "floor_days" in rejection
+    assert not any(key in rejection for key in _RETIRED_KEYS)
+
+
+@pytest.mark.parametrize("junk", ["ten", True, None, [10]])
+def test_census_config_from_mapping_never_rejects_a_retired_keys_value(junk, caplog):
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"tasks_landed_threshold": junk})
+
+    assert config == ct.CensusConfig()
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert _is_deprecation(warning)
+    assert "unusable value" not in warning
+
+
+def test_dark_factorys_shipped_legibility_yaml_is_migrated(caplog):
+    repo_root = Path(__file__).resolve().parents[2]
+
+    with caplog.at_level(logging.WARNING):
+        config = ct.load_census_config(repo_root)
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert config.completion_threshold_pct == 70
+
+
+# ---------------------------------------------------------------------------
 # amendment pass (review finding #3): CensusConfig defaults must not
 # silently drift from task β's legibility.config.Census model, now that β
 # has landed and lives alongside this module in scripts/legibility/.
@@ -1962,6 +2031,27 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     assert decision.completion is None
     assert runner.calls == []
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_decide_for_project_ignores_a_retired_max_interval_days_and_says_so(tmp_path, caplog):
+    """A legibility.yaml still pinning `max_interval_days: 1` against a
+    census 30 days stale once fired daily; now it fires nothing and is named
+    once in a deprecation WARNING."""
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_completion_state(last_census_run_id=None))
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
+
+    assert decision.fire is False
+    assert not any(r.startswith("max-interval") for r in decision.reasons)
+    naming = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "max_interval_days" in r.getMessage()
+    ]
+    assert len(naming) == 1
+    assert _is_deprecation(naming[0].getMessage())
 
 
 def test_decide_for_project_survives_a_quoted_completion_threshold(tmp_path, caplog):
