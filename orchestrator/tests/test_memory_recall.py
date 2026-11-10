@@ -13,12 +13,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import re
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 from _briefing_helpers import (
+    AMENDMENT_BODY_FIXTURES,
     SUPERSEDED_CHILD_FIXTURES,
+    WORST_CASE_GROUPED_PARENT_CHARS,
     _edge,
     _grouped_block,
     _grouped_parent,
@@ -772,6 +775,52 @@ def _line_index(lines: list[str], predicate) -> int:
     index = next((index for index, line in enumerate(lines) if predicate(line)), None)
     assert index is not None, lines
     return index
+
+
+_AMENDMENT_BULLET = '  - [amendment · '
+_COUNTED_CUT = re.compile(r'…\[\+\d+ chars elided\]$')
+
+#: Where the digest that grouped reads carried before task 7518 cut every amendment.
+_PRE_7518_DIGEST_CHARS = 240
+
+
+def _amendment_body_parent() -> dict:
+    reply = parse_search_reply(
+        recorded_search_text('ten-amendments-over-the-cap', fixtures=AMENDMENT_BODY_FIXTURES),
+    )
+    assert isinstance(reply, SearchReply), reply
+    [parent] = reply.results
+    return parent
+
+
+class TestAmendmentBodyRender:
+    """A parent's amendments render as their text up to the cap, and the worst case is bounded.
+
+    The input is a reply recorded from the real fused-memory ``search`` tool
+    (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): one parent
+    with the ten amendments a grouped document lists at most, each longer than
+    the amendment text cap.
+    """
+
+    def test_each_amendment_shows_its_late_detail_and_a_counted_cut(self):
+        lines = render_memory_results((_amendment_body_parent(),)).splitlines()
+
+        bullets = [line for line in lines if line.startswith(_AMENDMENT_BULLET)]
+        assert len(bullets) == 10, lines
+        for index, bullet in enumerate(bullets):
+            text = bullet.split('] ', 1)[1]
+            assert text.index(f'DETAIL-{index:02d}') > _PRE_7518_DIGEST_CHARS, text
+            assert _COUNTED_CUT.search(text), text[-60:]
+
+    def test_the_worst_case_parent_renders_within_its_ceiling(self):
+        parent = _amendment_body_parent()
+        amendments = parent['grouped']['amendments']
+
+        rendered = render_memory_results((parent,))
+
+        assert len(amendments) == 10
+        assert len(rendered) >= sum(len(child['content']) for child in amendments)
+        assert len(rendered) <= WORST_CASE_GROUPED_PARENT_CHARS, len(rendered)
 
 
 class TestContestingChildRender:

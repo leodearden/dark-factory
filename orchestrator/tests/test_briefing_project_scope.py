@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from _briefing_helpers import (
+    AMENDMENT_BODY_FIXTURES,
+    WORST_CASE_GROUPED_PARENT_CHARS,
     _edge,
     _entity_envelope,
     _grouped_parent,
@@ -1129,3 +1131,37 @@ class TestSearchReplyShapes:
         assert 'Own fact.' in conventions
         assert 'filtered out' not in context
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+_BRIEFING_OVERHEAD_CHARS = 2_000
+"""What a ``# Context`` block adds around its results: headings, caveat, notices."""
+
+
+@pytest.mark.asyncio
+class TestTheWorstCaseBriefingIsBounded:
+    """Every search answered with its limit's worth of the worst-case grouped parent.
+
+    The parent is a reply recorded from the real fused-memory ``search`` tool
+    (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): ten
+    amendments, each cut at the amendment text cap. The ceiling is the
+    whole-briefing worst case the cap decision accepts.
+    """
+
+    async def test_the_context_block_stays_within_its_ceiling(
+        self, briefing: BriefingAssembler,
+    ):
+        recorded = recorded_search_text(
+            'ten-amendments-over-the-cap', fixtures=AMENDMENT_BODY_FIXTURES,
+        )
+        [parent] = json.loads(recorded)['results']
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['name'] == 'get_entity':
+                return _entity_envelope(nodes=[], edges=[])
+            return _mcp_search_envelope([parent] * params['arguments']['limit'])
+
+        context = await _recall(briefing, AsyncMock(side_effect=dispatch))
+
+        fired = sum(spec.limit for spec, _query in queries_for(_SCOPE))
+        assert context.count('DETAIL-09') == fired, context[:2_000]
+        assert len(context) <= fired * WORST_CASE_GROUPED_PARENT_CHARS + _BRIEFING_OVERHEAD_CHARS
