@@ -84,12 +84,6 @@ from _fm_helpers import (  # noqa: E402
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
 )
-from _fm_httpx_leaks import (  # noqa: E402
-    _leaked_async_httpx_clients,
-    _warn_if_drain_closed_a_foreign_client,
-    reap_leaked_async_httpx_clients,
-    track_async_httpx_clients,
-)
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
@@ -123,11 +117,14 @@ def pytest_configure(config):
     module import time are tracked too and can be reaped like any other
     (task 4412).
 
-    ``shared.usage_gate`` is imported here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+    ``shared.usage_gate`` here, and ``_fm_httpx_leaks`` here and in the two
+    httpx-reaping fixtures, are imported function-locally because a
+    module-level import after this file's ``sys.path`` setup would need a new
+    ``E402`` suppression, which ``scripts/inline_suppressions.py`` refuses.
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
+    from _fm_httpx_leaks import track_async_httpx_clients
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
@@ -510,6 +507,12 @@ def _reap_leaked_async_httpx_clients_sync():
     innocent test's teardown. A warning keeps it loud without letting the
     BACKSTOP arm become a flake source itself.
     """
+    from _fm_httpx_leaks import (
+        _leaked_async_httpx_clients,
+        _warn_if_drain_closed_a_foreign_client,
+        reap_leaked_async_httpx_clients,
+    )
+
     # Snapshot at SETUP (this arm is set up first, before the test body runs):
     # the clients already leaked by someone else. Weak refs, so the snapshot
     # never keeps a client alive or changes its GC timing.
@@ -553,6 +556,8 @@ async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync
     ``_fm_httpx_leaks.py``: it never fails a test, and is a cheap no-op for the
     vast majority of tests that leak nothing.
     """
+    from _fm_httpx_leaks import reap_leaked_async_httpx_clients
+
     yield
     await reap_leaked_async_httpx_clients()
 
