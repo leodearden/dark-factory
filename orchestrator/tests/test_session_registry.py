@@ -83,6 +83,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'claude_launch_session_id': 'uuid-claude-launch-0',
         'claude_owner_pid': 424242,
         'self_exit': True,
+        't3_end': sr.T3End.SETTLE,
         'exit_request': sr.ExitRequest(
             state=sr.ExitRequestState.ATTEMPTED,
             reason=None,
