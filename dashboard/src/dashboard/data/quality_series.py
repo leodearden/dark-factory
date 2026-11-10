@@ -26,7 +26,11 @@ from pathlib import Path
 import aiosqlite
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
-from shared.quality_series.landings import GitCrossCheck, recorded_landing_keys
+from shared.quality_series.landings import (
+    GitCrossCheck,
+    UnrecognisedTrainEvent,
+    recorded_landing_keys,
+)
 from shared.quality_series.rows import (
     CharterClassSource,
     LandingRow,
@@ -1123,7 +1127,8 @@ def _cursor_landed_at(rows: Sequence[LandingRow], cursor_sha: str | None) -> dat
 
 def _unsampled(root: Path, rows: Sequence[LandingRow], cursor_sha: str | None) -> str | None:
     """Why runs.db says the stored series is behind: landings it records after the cursor that the
-    store lacks, or that runs.db cannot be read to confirm none; None when it is not behind."""
+    store lacks, or that runs.db cannot be read, or holds a landing event the landing rule refuses,
+    to confirm none; None when it is not behind."""
     path = runs_db(root)
     try:
         conn = connect_ro(path)
@@ -1135,7 +1140,7 @@ def _unsampled(root: Path, rows: Sequence[LandingRow], cursor_sha: str | None) -
         recorded = recorded_landing_keys(
             conn, recorded_after=_cursor_landed_at(rows, cursor_sha) if cursor_sha else None,
         )
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, UnrecognisedTrainEvent, ValueError) as exc:
         return f'freshness cannot be confirmed: {path}: {type(exc).__name__}: {exc}'
     finally:
         conn.close()

@@ -217,8 +217,9 @@ negative, so an EWMA chart can never show improvement at these rates.
       (`shared/src/shared/quality_series/landings.py::recorded_landing_keys`, which reuses α's
       landing-recognition SQL) and subtracts the stored keys. A train of 3 is one commit, so it
       reads "3 landings not yet sampled". A rev-parse could not count that, and it differs from the
-      cursor after any non-landing commit. When runs.db cannot be read, the datum is `stale` with a
-      reason naming the store, never `fresh`.
+      cursor after any non-landing commit. When runs.db cannot be read, or holds a landing event the
+      landing rule refuses (an unrecognised train_merged payload, a timestamp without an offset),
+      the datum is `stale` with a reason naming the store, never `fresh`.
     - The read side is `dashboard/src/dashboard/data/quality_series.py::read_quality_series`. It is
       `unknown` until a value sample exists: with no sample it says nothing was sampled, and with
       only gaps it gives the newest gap's reason verbatim. It is `stale` when a gap follows the
