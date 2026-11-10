@@ -5815,8 +5815,8 @@ class Scheduler:
         deferral, not silent dropping.
 
         Budget priority: a held scheduled-deploy re-validation goes first
-        of all, since deferring it serves no record and a missing record
-        fails open, releasing the hold. Then (task 2977,
+        of all, since only a fresh read can release its hold (a deferred
+        one is served from cache, see below). Then (task 2977,
         reviewer_comprehensive performance amendment): genuinely-NEW
         dep_ids (absent from
         ``_terminal_dep_record_cache`` entirely — typically a dependent's
@@ -5842,19 +5842,23 @@ class Scheduler:
 
         Fetches are issued concurrently via ``asyncio.gather`` over
         ``self.get_task`` (the lean per-id fetch primitive), which already
-        returns ``None`` on failure/absence. A dep that fails to fetch is
-        left out of ``ctx.terminal_dep_records`` (and NOT cached, so it's
-        retried next tick) for this tick's fail-safe wait — but a pending
-        dependent's delivered-check gate and scheduled-deploy hold on THAT
-        dep are bypassed (fail-open) rather than withheld for this tick,
-        since every consumer treats "dep record unavailable" as "not
-        checked" (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
-        This is a conscious trade-off (reviewer_comprehensive robustness
-        amendment): the alternative (fail-safe-WAIT whenever a terminal
-        dep record can't be fetched) risks permanently deadlocking a
-        dependent whose dep record genuinely can never be fetched. A
-        bounded WARNING is logged for every such fetch failure so the
-        bypass is operator-visible instead of silent. The whole
+        returns ``None`` on failure/absence. A cached held scheduled-deploy
+        record is served into ``ctx.terminal_dep_records`` before its
+        re-fetch, so a re-fetch that returns ``None``, raises, or is
+        deferred by the budget leaves that held record in place: the hold
+        is released only by a fresh read showing a landed phase (fail-safe,
+        WARNING ``hold retained``). Only a not-yet-cached terminal dep that
+        fails to fetch fails open: it is left out of
+        ``ctx.terminal_dep_records`` (and NOT cached, so it's retried next
+        tick), and a pending dependent's delivered-check gate or
+        scheduled-deploy hold on it is bypassed this tick, since every
+        consumer treats "dep record unavailable" as "not checked"
+        (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
+        That cold-cache window is a conscious trade-off
+        (reviewer_comprehensive robustness amendment): fail-safe-WAIT on
+        every unfetchable record risks permanently deadlocking a dependent
+        whose dep record genuinely can never be fetched. A bounded WARNING
+        names every such bypass. The whole
         collection+fetch is further wrapped in try/except so an
         unexpected failure logs a WARNING and leaves
         ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
@@ -5877,25 +5881,28 @@ class Scheduler:
             if not needed:
                 return _CONTINUE
 
-            _held_to_fetch: list[str] = []
+            _held_to_fetch: set[str] = set()
             _new_to_fetch: list[str] = []
             _revalidate_to_fetch: list[str] = []
             for _dep_id in needed:
                 _cached_record = self._terminal_dep_record_cache.get(_dep_id)
-                # A warmed record is served from cache ONLY while immutable.
+                # A warmed record skips the re-fetch ONLY while immutable.
                 # The cache is never evicted, so a mutable record served from
-                # it would be stale forever: a corrected check descriptor
-                # (task 2977, freezing task 2975's digest self-heal) or a
-                # scheduled self-deploy's phase (task 7276, holding its
-                # dependents forever). Documented boundary: adding
-                # delivered_checks to a previously-checkless, already-warmed
-                # record is NOT observed until an orchestrator restart.
+                # it alone would be stale forever: a corrected check
+                # descriptor (task 2977, freezing task 2975's digest
+                # self-heal) or a scheduled self-deploy's phase (task 7276,
+                # holding its dependents forever). A held record is served
+                # AND re-fetched: only an affirmative fresh read replaces it.
+                # Documented boundary: adding delivered_checks to a
+                # previously-checkless, already-warmed record is NOT
+                # observed until an orchestrator restart.
                 if _cached_record is None:
                     _new_to_fetch.append(_dep_id)
                 elif _terminal_record_is_immutable(_cached_record):
                     ctx.terminal_dep_records[_dep_id] = _cached_record
                 elif awaits_scheduled_restart(_cached_record.get('metadata')):
-                    _held_to_fetch.append(_dep_id)
+                    ctx.terminal_dep_records[_dep_id] = _cached_record
+                    _held_to_fetch.add(_dep_id)
                 else:
                     _revalidate_to_fetch.append(_dep_id)
             if not (_held_to_fetch or _new_to_fetch or _revalidate_to_fetch):
@@ -5932,13 +5939,22 @@ class Scheduler:
                 if _record is not None:
                     ctx.terminal_dep_records[_dep_id] = _record
                     self._terminal_dep_record_cache[_dep_id] = _record
+                elif _dep_id in _held_to_fetch:
+                    logger.warning(
+                        'acquire_next: terminal dep %s record fetch '
+                        'returned None (transient?) — hold retained: the '
+                        'cached scheduled-deploy record is served and its '
+                        'dependents stay held this tick; will retry next tick.',
+                        _dep_id,
+                    )
                 else:
                     logger.warning(
                         'acquire_next: terminal dep %s record fetch '
                         'returned None (transient?) — any pending '
-                        "dependent's delivered-check gate or scheduled-deploy "
-                        'hold on this dep is bypassed (fail-open, not '
-                        'affirmatively passed) this tick; will retry next tick.',
+                        "dependent's delivered-check gate on this dep, or "
+                        'scheduled-deploy hold on this not-yet-cached dep, '
+                        'is bypassed (fail-open, not affirmatively passed) '
+                        'this tick; will retry next tick.',
                         _dep_id,
                     )
         except Exception:
