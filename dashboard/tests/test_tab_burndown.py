@@ -105,8 +105,7 @@ def _element_at(src, pos):
         lt = src.rfind('<', 0, cursor)
         if lt == -1:
             raise AssertionError(
-                f'no enclosing JSX tag found for the prop at offset {pos} '
-                f'(line {src.count(chr(10), 0, pos) + 1})'
+                f'no enclosing JSX tag found for the prop {src[pos : pos + 80]!r}'
             )
         m = _TAG_START_RE.match(src, lt)
         if m:
@@ -137,7 +136,7 @@ def _chart_sites(src):
             and end > lm.start()
             and _TAG_BOUNDARY_RE.search(src, start + 1, end) is None
         ), (
-            f'<{tag}> element at line {src.count(chr(10), 0, start) + 1} does not '
+            f'<{tag}> element {src[start : start + 80]!r} does not '
             'close as one flat opening tag holding this labels prop, so this probe '
             'cannot attribute its props (a nested element\'s labels/values would be '
             'read as its own). Teach _chart_sites to parse it rather than deleting '
