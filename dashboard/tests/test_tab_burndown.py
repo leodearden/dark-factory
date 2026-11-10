@@ -300,6 +300,36 @@ class TestChartSitesProbe:
         with pytest.raises(AssertionError):
             _chart_sites(src)
 
+    @pytest.mark.parametrize(
+        ('src', 'snippet', 'wrong_line'),
+        [
+            (
+                '/* one\n two\n three\n four */\n'
+                '<LC labels={d.labels} legend={<Leg />} series={[{ values: d.values }]} />',
+                '<LC labels={d.labels} legend={<Leg />}',
+                'line 2',
+            ),
+            ('/* a\n b */\nlabels={d.labels}', 'labels={d.labels}', 'line 2'),
+        ],
+        ids=['nested-element-after-a-block-comment', 'no-enclosing-tag-after-a-block-comment'],
+    )
+    def test_the_failure_quotes_the_text_it_cannot_attribute(self, src, snippet, wrong_line):
+        with pytest.raises(AssertionError) as exc:
+            _chart_sites(src)
+
+        # Only the first line is the probe's own message: pytest's assertion
+        # rewriting appends the operands, and for a source this short that
+        # repeats the whole of src.
+        message = str(exc.value).splitlines()[0]
+        assert snippet in message, (
+            f'the failure does not quote {snippet!r}, so the next agent cannot tell '
+            f"which of tabs.jsx's call sites it is about: {message!r}"
+        )
+        assert wrong_line not in message, (
+            f'the failure points at {wrong_line!r}, a line counted over comment-stripped '
+            f'text that lands on the block comment, not the call site: {message!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # app.jsx — passes displayWindow (not `window`) into BurnTab
