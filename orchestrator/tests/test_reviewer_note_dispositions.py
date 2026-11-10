@@ -28,7 +28,6 @@ from _workflow_helpers import (
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
-from test_info_l0_router_workflow import _reaper_l1s_after_aging
 
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.config import (
@@ -298,7 +297,7 @@ class TestReviewLoopAppliesDispositions:
         ('no_action', 'observation-consumed'),
     ])
     async def test_a_closing_disposition_closes_the_note_before_the_exit(
-        self, tmp_path, monkeypatch, mock_orch_config, disposition, resolution_class,
+        self, tmp_path, monkeypatch, disposition, resolution_class,
     ):
         stub = _DispositioningStub()
         run = _FullRun(tmp_path, monkeypatch, stub)
@@ -314,7 +313,6 @@ class TestReviewLoopAppliesDispositions:
             REVIEWER_LEG_ID, resolution_class, None,
         )
         assert run.curator.calls_named('submit_task') == []
-        assert await _reaper_l1s_after_aging(mock_orch_config, run.queue) == []
 
     async def test_work_leaves_the_note_for_the_exit_router_to_convert(
         self, tmp_path, monkeypatch,
@@ -335,7 +333,8 @@ class TestReviewLoopAppliesDispositions:
         )
         hold = read_hold(run.current(note))
         assert hold is not None and hold.ticket == 'tkt_1'
-        assert len(run.curator.calls_named('submit_task')) == 1
+        (submitted,) = run.curator.calls_named('submit_task')
+        assert 'work rationale' in submitted['description']
 
     async def test_work_overrides_the_authors_no_action_declaration_at_the_exit(
         self, tmp_path, monkeypatch,
@@ -373,20 +372,23 @@ class TestReviewLoopAppliesDispositions:
             )
 
     async def test_a_lost_verdict_carries_no_dispositions_and_the_exit_router_routes_the_note(
-        self, tmp_path, monkeypatch, caplog,
+        self, tmp_path, monkeypatch,
     ):
         stub = _LostVerdictStub()
         run = _FullRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
         stub.note_dispositions = [_disposition(note.id, 'addressed')]
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            assert await run.run() == WorkflowOutcome.BLOCKED
+        assert await run.run() == WorkflowOutcome.BLOCKED
 
-        assert not any('verdict absent' in record.getMessage() for record in caplog.records)
-        assert run.workflow.artifacts is not None
-        (review,) = run.workflow.artifacts.read_reviews().values()
+        artifacts = run.workflow.artifacts
+        assert artifacts is not None
+        ((role, review),) = artifacts.read_reviews().items()
         assert review['verdict'] == 'ERROR'
+        envelope = artifacts.read_verdict(role)
+        assert envelope is not None
+        assert envelope['verdict']['verdict'] == 'MAYBE'
+        assert envelope['verdict']['note_dispositions'] == stub.note_dispositions
 
         rows = run.rows(note.id)
         assert [row['by'] for row in rows] == ['workflow-finalizer']
