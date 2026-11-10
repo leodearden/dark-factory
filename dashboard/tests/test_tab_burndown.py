@@ -15,6 +15,7 @@ from _dashboard_helpers import (
     destructure_bindings,
     extract_function_body,
     jsx_open_tag_end,
+    jsx_open_tags,
     strip_js_comments,
     walk_balanced,
 )
@@ -456,44 +457,25 @@ def _burn_tab_body(tabs_jsx_body):
     return strip_js_comments(extract_function_body(tabs_jsx_body, 'BurnTab'))
 
 
-def _self_closing_elements(src, tag):
-    """Every flat ``<tag ... />`` element's attribute text, braces respected.
-
-    Walks brace depth so an arrow's ``=>`` or a nested JSX value inside a
-    ``{...}`` prop cannot end the element early; only a ``/>`` at depth 0 does.
-    """
-    elements = []
-    for m in re.finditer(rf'<{tag}\b', src):
-        depth = 0
-        for i in range(m.end(), len(src)):
-            c = src[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-            elif depth == 0 and src.startswith('/>', i):
-                elements.append(src[m.end():i])
-                break
-        else:
-            raise AssertionError(f'<{tag} at offset {m.start()} is never closed')
-    return elements
+def _opening_tags(src, tag):
+    return jsx_open_tags(src, re.compile(rf'<{tag}\b'))
 
 
-def _prop_expr(attrs, name):
+def _prop_expr(tag, name):
     """The expression inside ``name={...}``, or None when the prop is absent."""
-    m = re.search(rf'\b{name}=\{{', attrs)
+    m = re.search(rf'\b{name}=\{{', tag)
     if not m:
         return None
-    return walk_balanced(attrs, m.end() - 1)[1:-1].strip()
+    return walk_balanced(tag, m.end() - 1)[1:-1].strip()
 
 
-def _prop_label(attrs):
-    m = re.search(r'\blabel=["\']([^"\']*)["\']', attrs)
+def _prop_label(tag):
+    m = re.search(r'\blabel=["\']([^"\']*)["\']', tag)
     return m.group(1) if m else None
 
 
 def _burn_tiles(body):
-    return {_prop_label(a): a for a in _self_closing_elements(body, 'ST')}
+    return {_prop_label(tag): tag for tag in _opening_tags(body, 'ST')}
 
 
 def _assert_served_datum(body, where, expr):
@@ -528,17 +510,17 @@ class TestBurnTabReadsServedDatums:
         body = _burn_tab_body(tabs_jsx_body)
         tiles = _burn_tiles(body)
         assert set(tiles) == _BURN_TILE_LABELS
-        for label, attrs in tiles.items():
-            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(attrs, 'datum'))
+        for label, tag in tiles.items():
+            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(tag, 'datum'))
 
     def test_every_pip_and_cell_renders_a_served_datum(self, tabs_jsx_body):
         """The per-project pips and table cells read the same served Datums as the tiles."""
         body = _burn_tab_body(tabs_jsx_body)
-        for tag in ('Pip', 'DatumReading'):
-            elements = _self_closing_elements(body, tag)
-            assert elements, f'BurnTab renders no <{tag}>'
-            for attrs in elements:
-                _assert_served_datum(body, f'a <{tag}>', _prop_expr(attrs, 'datum'))
+        for name in ('Pip', 'DatumReading'):
+            tags = _opening_tags(body, name)
+            assert tags, f'BurnTab renders no <{name}>'
+            for tag in tags:
+                _assert_served_datum(body, f'a <{name}>', _prop_expr(tag, 'datum'))
 
     def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
         """No client point estimate: the server refuses to synthesise one on sparse history."""
@@ -582,7 +564,7 @@ class TestCompletedPerDayIsServerSeries:
         body = strip_js_comments(extract_function_body(tabs_jsx_body, 'OrchTab'))
         label_at = body.find('Completed / day')
         assert label_at != -1, "OrchTab no longer labels a 'Completed / day' spark"
-        sparks = _self_closing_elements(body[label_at:], 'SP')
+        sparks = _opening_tags(body[label_at:], 'SP')
         assert sparks, "no <SP> follows OrchTab's 'Completed / day' label"
         values = _prop_expr(sparks[0], 'values')
         assert values and 'BURNDOWN_BY_PROJECT' in values and 'completed_per_day' in values, (
