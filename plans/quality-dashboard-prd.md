@@ -198,7 +198,10 @@ negative, so an EWMA chart can never show improvement at these rates.
     could be skipped (0 such inversions measured among 3,539 df first claims, 2026-11-09). Beside the
     cursor, a value `sample_state` row carries `landings_sampled`, `landings_deferred` (emitted but past
     that tick's git budget) and the three `GitCrossCheck` counts over the tick's emitted range; a gap
-    row carries only its verbatim reason. The key's `project_id` is
+    row carries only its reason, the producer's error verbatim with two exceptions: a
+    `TaskDbUnreadable` refusal is rendered from its `path` and `reason` fields, because its message's
+    remedy is written for tasks.db, not runs.db; and a tick whose own write fails records a gap
+    naming that failure, so every git-checkout root still gets one row per tick. The key's `project_id` is
     `shared/src/shared/project_id.py::project_id_for_root` of the root, passed to `landings()`
     explicitly. `late_events` is created with no producer yet: α ships no revert detector.
 15. **Endpoint and window.** `dashboard/src/dashboard/api/quality.py` registered with one

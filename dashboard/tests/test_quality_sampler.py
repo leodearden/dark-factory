@@ -9,10 +9,13 @@ from collections.abc import AsyncIterator
 from contextlib import closing, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
+from _dashboard_helpers import drive_loop_until, yielding_noop_sleep
 from _quality_fixture import QualityProject, build_quality_project
+from shared.async_sqlite_base import CheckpointResult
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
 from shared.quality_series.landings import GitCrossCheck
@@ -21,6 +24,7 @@ from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.config import DashboardConfig
 from dashboard.data.quality_sampler import (
+    QUALITY_GIT_BUDGET_SECONDS,
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_REV_LIST_TIMEOUT_SECONDS,
     QUALITY_SAMPLE_INTERVAL_SECONDS,
@@ -163,6 +167,7 @@ async def _assert_one_gap(
 async def test_an_absent_runs_db_is_a_gap_naming_the_refusal(
     conn: aiosqlite.Connection, project: QualityProject,
 ) -> None:
+    """The refusal's own fields, not its remedy prose, which is written for tasks.db."""
     runs_db(project.root).unlink()
     with pytest.raises(TaskDbUnreadable) as refusal:
         connect_ro(runs_db(project.root))
@@ -170,7 +175,42 @@ async def test_an_absent_runs_db_is_a_gap_naming_the_refusal(
 
     await collect_quality(conn, [project.root], now=now)
 
-    await _assert_one_gap(conn, project, now, f'TaskDbUnreadable: {refusal.value}')
+    await _assert_one_gap(conn, project, now, f'TaskDbUnreadable: {refusal.value.path}: absent')
+
+
+async def test_a_sample_write_that_fails_leaves_a_gap_naming_the_failure(
+    conn: aiosqlite.Connection, project: QualityProject,
+) -> None:
+    await conn.execute(
+        "CREATE TRIGGER refuse_landings BEFORE INSERT ON landings"
+        " BEGIN SELECT RAISE(ABORT, 'landings refused'); END"
+    )
+    await conn.commit()
+    now = _settled(project)
+
+    await collect_quality(conn, [project.root], now=now)
+
+    await _assert_one_gap(
+        conn, project, now, 'sample write failed: IntegrityError: landings refused',
+    )
+
+
+async def test_each_root_gets_its_own_sample_when_one_fails_and_one_measures(
+    conn: aiosqlite.Connection, tmp_path: Path,
+) -> None:
+    measured = build_quality_project(tmp_path / 'measured', first_landed_at=FIRST_LANDED_AT)
+    failing = build_quality_project(tmp_path / 'failing', first_landed_at=FIRST_LANDED_AT)
+    runs_db(failing.root).unlink()
+    now = _settled(measured)
+
+    await collect_quality(conn, [failing.root, measured.root], now=now)
+
+    [gap] = await read_samples(conn, project_id_for_root(failing.root))
+    [value] = await read_samples(conn, project_id_for_root(measured.root))
+    assert (gap.reason or '').startswith('TaskDbUnreadable: ')
+    assert (value.cursor_sha, value.landings_sampled) == (measured.train_sha, 3)
+    assert await _task_ids(conn, measured) == ['101', '102', '103']
+    assert await _task_ids(conn, failing) == []
 
 
 async def test_a_missing_git_binary_is_a_gap_naming_it(
@@ -221,7 +261,7 @@ async def test_a_root_overrunning_the_backstop_is_a_gap_naming_the_budget(
 
 
 def test_the_backstop_sits_between_the_producers_own_bound_and_half_the_tick() -> None:
-    floor = FIRST_UNIT_GIT_FLOOR_S + QUALITY_REV_LIST_TIMEOUT_SECONDS
+    floor = QUALITY_REV_LIST_TIMEOUT_SECONDS + max(FIRST_UNIT_GIT_FLOOR_S, QUALITY_GIT_BUDGET_SECONDS)
 
     assert floor < QUALITY_PER_ROOT_BUDGET_SECONDS <= QUALITY_SAMPLE_INTERVAL_SECONDS / 2
 
@@ -252,3 +292,56 @@ async def test_the_quality_loop_samples_a_landing_within_its_first_tick(
         pid, first.ts, cursor_sha=project.train_sha, landings_sampled=3, landings_deferred=0,
         git_check=GitCrossCheck(off_first_parent=0, merges_without_landing=1, late_claims=0),
     ), f'expected a value sample naming the train merge as cursor, got {first}'
+
+
+def _stub_checkpoint(store: _QualityStore, on_call: asyncio.Event | None = None) -> AsyncMock:
+    async def _checkpoint(*_args: object, **_kwargs: object) -> CheckpointResult:
+        if on_call is not None:
+            on_call.set()
+        return CheckpointResult(0, 0, 0)
+
+    stub = AsyncMock(side_effect=_checkpoint)
+    store.checkpoint = stub
+    return stub
+
+
+async def test_the_quality_loop_checkpoints_its_store(tmp_path: Path) -> None:
+    """The WAL checkpoint every sampler store owes (the pragma-triad directive), on the quality loop."""
+    checkpointed = asyncio.Event()
+    async with _QualityStore(tmp_path / 'quality.db') as store:
+        stub = _stub_checkpoint(store, checkpointed)
+        with (
+            patch('dashboard.loops.collect_quality', new=AsyncMock(return_value=None)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
+        ):
+            await drive_loop_until(
+                _quality_loop(store, DashboardConfig(project_root=tmp_path)), checkpointed,
+            )
+
+    assert stub.called, '_quality_loop never called store.checkpoint()'
+
+
+async def test_the_quality_loop_checkpoints_at_most_once_per_interval(tmp_path: Path) -> None:
+    ticks = 0
+    six_ticks = asyncio.Event()
+
+    async def _count_tick(*_args: object, **_kwargs: object) -> None:
+        nonlocal ticks
+        ticks += 1
+        if ticks >= 6:
+            six_ticks.set()
+
+    async with _QualityStore(tmp_path / 'quality.db') as store:
+        stub = _stub_checkpoint(store)
+        with (
+            patch('dashboard.loops.collect_quality', new=AsyncMock(side_effect=_count_tick)),
+            patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+            patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
+        ):
+            await drive_loop_until(
+                _quality_loop(store, DashboardConfig(project_root=tmp_path)), six_ticks,
+            )
+
+    assert six_ticks.is_set(), f'the loop ran only {ticks} ticks, so the bound below is vacuous'
+    assert stub.call_count <= 1, f'{stub.call_count} checkpoints inside one 3600 s interval'
