@@ -286,6 +286,29 @@ class TestChartSitesProbe:
 
         assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
 
+    def test_an_apostrophe_in_a_comment_does_not_derail_the_walk(self):
+        src = (
+            '<LC\n'
+            '  labels={d.labels}\n'
+            '  series={[\n'
+            "    // don't snap: a ratio\n"
+            '    { values: d.values },\n'
+            '  ]}\n'
+            '/>'
+        )
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
+    def test_a_commented_out_chart_is_not_a_site(self):
+        src = (
+            '// <LC labels={x.labels} series={[{ values: y.values }]} />\n'
+            '<LC labels={d.labels} series={[{ values: d.values }]} />'
+        )
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
     @pytest.mark.parametrize(
         'src',
         [
@@ -296,7 +319,7 @@ class TestChartSitesProbe:
         ids=['nested-before-labels', 'nested-after-labels', 'never-closed'],
     )
     def test_a_tag_whose_props_cannot_be_attributed_fails_loudly(self, src):
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match='cannot attribute its props'):
             _chart_sites(src)
 
     @pytest.mark.parametrize(
