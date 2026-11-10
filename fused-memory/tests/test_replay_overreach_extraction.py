@@ -7,6 +7,8 @@ the replay never needs one.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -324,3 +326,203 @@ class TestCheckWorksheet:
             mod.check_worksheet(self.ROWS, _sizes(
                 dark_factory__ruling_lexeme=2, reify__other_decisions=1, reify__decision_anchor=8,
             ))
+
+
+# --------------------------------------------------------------------------- #
+# The CLI: replay and worksheet, end to end in tmp_path
+# --------------------------------------------------------------------------- #
+
+CLI_ROWS = [
+    _worksheet_row('ep-a'), _worksheet_row('ep-b'),
+    _worksheet_row('ep-c', graph='reify', stratum='other_decisions'),
+]
+CLI_BASELINE = _sizes(dark_factory__ruling_lexeme=2, reify__other_decisions=1)
+
+
+class _CountingLLM(_FakeLLM):
+    """A _FakeLLM that fails for any episode whose body names one of *failing*."""
+
+    def __init__(self, failing: frozenset[str] = frozenset(), **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.failing = failing
+
+    async def generate_response(self, messages: list[Message], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        text = '\n'.join(message.content for message in messages)
+        if any(f'the body of {uuid}' in text for uuid in self.failing):
+            raise RuntimeError('provider down')
+        return await super().generate_response(messages, *args, **kwargs)
+
+    def episodes_called(self) -> list[str]:
+        return [
+            uuid for name, messages in self.calls if name == NODE_PROMPT
+            for uuid in ('ep-a', 'ep-b', 'ep-c') if f'the body of {uuid}' in messages[1].content
+        ]
+
+
+def _cli_inputs(tmp_path: Path, rows: list[dict[str, Any]] = CLI_ROWS,
+                baseline: dict[str, Any] = CLI_BASELINE) -> dict[str, Path]:
+    paths = {
+        'worksheet': tmp_path / 'worksheet-4716.jsonl', 'baseline': tmp_path / 'report.json',
+        'replay': tmp_path / 'out' / 'replay.jsonl', 'blind': tmp_path / 'out' / 'blind.jsonl',
+    }
+    paths['worksheet'].write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    paths['baseline'].write_text(json.dumps(baseline))
+    return paths
+
+
+def _replay_argv(paths: dict[str, Path], *arms: str) -> list[str]:
+    argv = ['replay', '--worksheet', str(paths['worksheet']), '--baseline-report', str(paths['baseline']),
+            '--out', str(paths['replay'])]
+    for arm in arms or ('control', 'o1'):
+        argv += ['--arm', arm]
+    return argv
+
+
+def _run_replay(paths: dict[str, Path], llm: _FakeLLM, *arms: str) -> int:
+    return mod.run(
+        _replay_argv(paths, *arms), llm_factory=lambda model: llm,
+        reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()),
+    )
+
+
+def _records(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+class TestReplayCommand:
+    def test_one_record_per_arm_and_episode(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM()) == 0
+        records = _records(paths['replay'])
+        assert sorted((r['arm'], r['uuid']) for r in records) == sorted(
+            (arm, row['uuid']) for arm in ('control', 'o1') for row in CLI_ROWS
+        )
+        assert all(r['kind'] == 'replayed' for r in records)
+
+    def test_a_record_carries_its_arm_model_episode_edges_and_tokens(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM(model='m-small'), 'o1') == 0
+        record = _records(paths['replay'])[0]
+        assert (record['arm'], record['model'], record['instructions_version']) == (
+            'o1', 'm-small', mod.O1_INSTRUCTIONS_VERSION,
+        )
+        assert (record['graph'], record['uuid'], record['stratum']) == ('dark_factory', 'ep-a', 'ruling_lexeme')
+        assert record['entities'] == ['Alpha', 'Beta']
+        assert [(m['fact'], m['source_name'], m['target_name']) for m in record['minted']] == [
+            ('Alpha adopts Beta', 'Alpha', 'Beta'),
+        ]
+        assert record['previous_count'] == 3
+        assert record['tokens']['extract_nodes'] == {'input_tokens': 100, 'output_tokens': 10, 'llm_calls': 1}
+
+    def test_no_episode_text_is_recorded(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM()) == 0
+        text = paths['replay'].read_text()
+        assert 'the body of' not in text
+        assert not any(previous in text for previous in ('first', 'second', 'third'))
+
+    def test_a_rerun_skips_what_is_recorded(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM(), 'control') == 0
+        second = _CountingLLM()
+        assert _run_replay(paths, second, 'control', 'o1') == 0
+        assert sorted(second.episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
+        assert len(_records(paths['replay'])) == 6
+
+    def test_a_failed_episode_is_recorded_and_the_run_finishes_then_exits_1(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        llm = _CountingLLM(failing=frozenset({'ep-b'}))
+        assert _run_replay(paths, llm, 'control') == 1
+        records = _records(paths['replay'])
+        assert [(r['kind'], r['uuid']) for r in records] == [
+            ('replayed', 'ep-a'), ('failed', 'ep-b'), ('replayed', 'ep-c'),
+        ]
+        assert records[1]['error_type'] == 'RuntimeError'
+
+    def test_a_resumed_run_retries_only_the_failure_and_drops_its_line(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM(failing=frozenset({'ep-b'})), 'control') == 1
+        retry = _CountingLLM()
+        assert _run_replay(paths, retry, 'control') == 0
+        assert retry.episodes_called() == ['ep-b']
+        records = _records(paths['replay'])
+        assert all(r['kind'] == 'replayed' for r in records) and len(records) == 3
+
+    def test_a_worksheet_off_the_baseline_sample_exits_2_and_writes_nothing(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path, baseline=_sizes(dark_factory__ruling_lexeme=8, reify__other_decisions=1))
+        llm = _CountingLLM()
+        assert _run_replay(paths, llm) == 2
+        assert not paths['replay'].exists() and llm.calls == []
+
+    def test_a_missing_client_exits_1(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        code = mod.run(_replay_argv(paths), llm_factory=lambda model: None,
+                       reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
+        assert code == 1 and not paths['replay'].exists()
+
+    def test_the_model_axis_reaches_the_factory(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        asked: list[str | None] = []
+
+        def factory(model: str | None) -> _FakeLLM:
+            asked.append(model)
+            return _CountingLLM(model=model or 'configured')
+
+        code = mod.run([*_replay_argv(paths, 'control'), '--model', 'm-strong'], llm_factory=factory,
+                       reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
+        assert code == 0 and asked == ['m-strong']
+        assert {r['model'] for r in _records(paths['replay'])} == {'m-strong'}
+
+    def test_a_second_model_for_a_recorded_arm_exits_2(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM(model='m-small'), 'control') == 0
+        before = paths['replay'].read_text()
+        assert _run_replay(paths, _CountingLLM(model='m-other'), 'control') == 2
+        assert paths['replay'].read_text() == before
+
+
+def _worksheet_argv(paths: dict[str, Path]) -> list[str]:
+    return ['worksheet', '--replay', str(paths['replay']), '--worksheet', str(paths['worksheet']),
+            '--out', str(paths['blind'])]
+
+
+class TestWorksheetCommand:
+    def _replayed(self, tmp_path: Path) -> dict[str, Path]:
+        paths = _cli_inputs(tmp_path)
+        llm = _CountingLLM(edges=(('Alpha', 'Beta', 'Alpha adopts Beta'), ('Beta', 'Alpha', 'Beta serves Alpha')))
+        assert _run_replay(paths, llm) == 0
+        return paths
+
+    def test_one_row_per_episode_with_its_body_and_every_arms_edges(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        rows = _records(paths['blind'])
+        assert [(r['graph'], r['uuid'], r['stratum']) for r in rows] == [
+            (row['graph'], row['uuid'], row['stratum']) for row in CLI_ROWS
+        ]
+        assert rows[0]['content'] == 'the body of ep-a'
+        replayed = {(r['uuid'], m['edge_uuid']) for r in _records(paths['replay']) for m in r['minted']}
+        assert {(r['uuid'], m['edge_uuid']) for r in rows for m in r['minted']} == replayed
+        assert all(len(r['minted']) == 4 for r in rows)
+
+    def test_edges_are_interleaved_by_hash_and_carry_no_arm(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        for row in _records(paths['blind']):
+            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
+            assert hashes == sorted(hashes)
+            assert 'arm' not in row and all('arm' not in m for m in row['minted'])
+        assert 'control' not in paths['blind'].read_text()
+
+    def test_the_worksheet_is_byte_identical_across_runs(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        first = paths['blind'].read_bytes()
+        assert mod.run(_worksheet_argv(paths)) == 0
+        assert paths['blind'].read_bytes() == first
+
+    def test_an_incomplete_replay_exits_2_and_writes_nothing(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay(paths, _CountingLLM(failing=frozenset({'ep-b'})), 'control') == 1
+        assert mod.run(_worksheet_argv(paths)) == 2
+        assert not paths['blind'].exists()
