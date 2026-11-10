@@ -256,6 +256,7 @@ for _p in (_FM_SRC, _SHARED_SRC):
 from shared.cli_invoke import (  # noqa: E402
     AgentFailureKind,
     AgentResult,
+    claude_binary_spec,
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
@@ -723,7 +724,7 @@ def _classify(result: AgentResult, has_payload: bool, timeout: float) -> tuple[s
 def _cli_version() -> str:
     try:
         proc = subprocess.run(
-            ['claude', '--version'], capture_output=True, timeout=30, check=False,
+            [claude_binary_spec(), '--version'], capture_output=True, timeout=30, check=False,
         )
         return (proc.stdout or b'').decode(errors='replace').strip() or '(unknown)'
     except (OSError, subprocess.TimeoutExpired):
@@ -776,7 +777,7 @@ def main() -> int:
 
     print('=' * 78)
     print('probe_schema_max_turns — MANUAL diagnostic, spends real tokens (tasks 3241, 4344)')
-    print(f'claude --version : {_cli_version()}')
+    print(f'{claude_binary_spec()} --version : {_cli_version()}')
     caps = args.max_turns or "each shape's production cap"
     print(f'matrix           : max_turns={caps} x repeat={args.repeat}')
     print(f'cwd              : {codebase_root}')
