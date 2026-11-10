@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _escalation_server_capture import create_server_kwargs
 from escalation.models import Escalation
 from escalation.pins import _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
@@ -319,35 +320,7 @@ class TestEscalationServerWiring:
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 0
 
-        # The server task must look alive, or _start_escalation_server's
-        # did-it-crash check re-raises from a MagicMock 'exception'.
-        serve_task = MagicMock()
-        serve_task.done.return_value = False
-
-        # Patching asyncio.create_task means the _serve() coroutine is built
-        # but never scheduled or awaited.  Capture and close it: a coroutine
-        # GC'd un-awaited raises an *unraisable* exception at collection time,
-        # which pytest attributes to whichever test happens to be running in
-        # this xdist worker when the GC fires — a spurious failure in an
-        # unrelated file (observed against
-        # test_harness_already_landed_gate_wiring.py).  close() on a
-        # never-started coroutine is the sanctioned way to retire it.
-        created_coros: list = []
-
-        def _capture_task(coro, **kwargs):
-            created_coros.append(coro)
-            return serve_task
-
-        with patch('orchestrator.harness.create_server') as mock_create, \
-             patch('asyncio.create_task', side_effect=_capture_task), \
-             patch('asyncio.sleep', new=AsyncMock()):
-            await h._start_escalation_server()
-
-        for coro in created_coros:
-            coro.close()
-
-        assert mock_create.called, '_start_escalation_server did not reach create_server'
-        kwargs = mock_create.call_args.kwargs
+        kwargs = await create_server_kwargs(h)
         assert 'task_claimant_lookup' in kwargs, (
             f'task_claimant_lookup not passed to create_server; got {sorted(kwargs)}'
         )
