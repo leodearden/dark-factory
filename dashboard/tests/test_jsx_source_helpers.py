@@ -24,6 +24,7 @@ here: blanking real code would disarm every absence assertion downstream.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from _dashboard_helpers import (
     find_function_params,
     find_script_position,
     jsx_open_tag_end,
+    jsx_open_tags,
     strip_js_comments,
     walk_balanced,
 )
@@ -945,6 +947,47 @@ class TestJsxOpenTagEnd:
         """Past the tag name, as the census's old walk took it, is now loud."""
         with pytest.raises(ValueError, match=r'start=4\b'):
             jsx_open_tag_end('<Pip datum={d} />', 4)
+
+
+class TestJsxOpenTags:
+    """Every opening tag matching a pattern, in source order, read from the
+    comment-stripped source: a tag with children yields its opening tag only,
+    and a tag the walk cannot close raises rather than being dropped.
+    """
+
+    _A = re.compile(r'<A\b')
+
+    def test_returns_each_opening_tag_whole_in_source_order(self) -> None:
+        src = '<A x={1} /> <B/> <A y="2">c</A>'
+
+        assert jsx_open_tags(src, self._A) == ['<A x={1} />', '<A y="2">']
+
+    def test_a_quoted_brace_or_self_close_does_not_end_the_tag(self) -> None:
+        src = '<A t="a } b" u="c/>d" v={1} />'
+
+        assert jsx_open_tags(src, self._A) == [src]
+
+    def test_a_comment_inside_an_attribute_expression_is_stripped(self) -> None:
+        src = "<A\n  s={[\n    // don't\n    1,\n  ]}\n/>"
+        tags = jsx_open_tags(src, self._A)
+
+        assert len(tags) == 1
+        assert "don't" not in tags[0]
+        assert tags[0].endswith('/>')
+
+    def test_a_commented_out_tag_is_not_returned(self) -> None:
+        assert jsx_open_tags('// <A x={1} />\n<A y={2} />', self._A) == ['<A y={2} />']
+
+    def test_a_tag_the_walk_cannot_close_raises_quoting_it(self) -> None:
+        with pytest.raises(AssertionError, match=r'<A x=\{1\}'):
+            jsx_open_tags('<A x={1}', self._A)
+
+    def test_no_match_is_an_empty_list(self) -> None:
+        assert jsx_open_tags('<B x={1} />', self._A) == []
+
+    def test_a_match_not_starting_at_the_angle_is_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            jsx_open_tags('<A />', re.compile(r'A\b'))
 
 
 class TestScriptOrderHelpers:
