@@ -124,16 +124,28 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   reaches `verified` or `done`
   (`orchestrator/src/orchestrator/deploy_state.py::awaits_scheduled_restart`).
   `orchestrator/src/orchestrator/scheduled_deploy_settle.py::ScheduledDeploySettler`
-  advances the phase at the next orchestrator startup and on the
-  deterministic-recon cadence: to `verified` once this process started after
-  the transient fired and the transient unit has finished
-  (`scripts/restart-all-orchestrators.sh` restarts the dispatching unit
-  last); to `failed` when the transient's RP-4 wrapper filed its fire-time
-  escalation or the unit reads `failed`.  A `failed` deploy keeps its
-  dependents held until a human acts on that escalation.  Accepted
-  residuals: an RP-4 submit that itself failed reads as `verified`; and
-  right after an unrelated restart the record cache is cold, so a record
-  deferred past the per-tick fetch budget fails open for that tick.
+  advances every phase that holds a dependent, one hop per pass, at the next
+  orchestrator startup and on the deterministic-recon cadence:
+  - `scheduled` → `verified` once this process started after the transient
+    fired and the transient unit has finished
+    (`scripts/restart-all-orchestrators.sh` restarts the dispatching unit
+    last); `scheduled` → `failed` when the transient's RP-4 wrapper filed its
+    fire-time escalation or the unit reads `failed`.
+  - `failed` → `escalated`.  The settler files the born-at-L2 itself
+    (`orchestrator/src/orchestrator/deterministic_runner.py::file_deterministic_infra_issue`)
+    only when no own-role fire-failure record exists.
+  - `escalated` → `done` once no own-role escalation for the task is pending
+    and the restart has landed.  This also releases a deploy that went done
+    after a completion-failure escalation and sits at phase `escalated` (the
+    task 2912 shape).
+  - A held phase no writer advances (e.g. `ran`, or an unreadable slice) is
+    reported at WARNING on every settle pass and must be repaired by hand.
+
+  The dispatch tick keeps serving a held record from its cache when the
+  re-fetch fails or is deferred past the per-tick fetch budget
+  (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`);
+  only a not-yet-cached dep fails open, for that tick.  Accepted residual: an
+  RP-4 submit that itself failed reads as `verified`.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
   running the blocking cross-unit deploy.  The detached restart is already
