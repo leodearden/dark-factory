@@ -33,9 +33,11 @@ from shared.quality_series.rows import (
 
 __all__ = [
     'QUALITY_SCHEMA',
+    'NewestSamples',
     'QualitySample',
     'SampleState',
     'insert_sample',
+    'newest_samples',
     'read_landing_rows',
     'read_samples',
     'stored_cursor',
@@ -414,20 +416,50 @@ async def insert_sample(conn: aiosqlite.Connection, sample: QualitySample) -> No
     )
 
 
+def _decode_sample(record: Iterable[Any]) -> QualitySample:
+    """A stored sample, re-checked by QualitySample's invariant."""
+    (pid, ts, state, reason, cursor_sha, sampled, deferred,
+     off_first_parent, merges_without_landing, late_claims) = record
+    return QualitySample(
+        project_id=pid, ts=parse_utc(ts), state=SampleState(state), reason=reason,
+        cursor_sha=cursor_sha, landings_sampled=sampled, landings_deferred=deferred,
+        git_check=_decode_git_check(off_first_parent, merges_without_landing, late_claims),
+    )
+
+
+_SELECT_SAMPLES = f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state WHERE project_id = ?'
+
+
 async def read_samples(conn: aiosqlite.Connection, project_id: str) -> list[QualitySample]:
     """The project's samples in time order, each re-checked by QualitySample's invariant."""
-    async with conn.execute(
-        f'SELECT {", ".join(_SAMPLE_COLUMNS)} FROM sample_state'
-        ' WHERE project_id = ? ORDER BY ts, id',
-        (project_id,),
-    ) as cursor:
+    async with conn.execute(f'{_SELECT_SAMPLES} ORDER BY ts, id', (project_id,)) as cursor:
         records = await cursor.fetchall()
-    return [
-        QualitySample(
-            project_id=pid, ts=parse_utc(ts), state=SampleState(state), reason=reason,
-            cursor_sha=cursor_sha, landings_sampled=sampled, landings_deferred=deferred,
-            git_check=_decode_git_check(off_first_parent, merges_without_landing, late_claims),
-        )
-        for (pid, ts, state, reason, cursor_sha, sampled, deferred,
-             off_first_parent, merges_without_landing, late_claims) in records
-    ]
+    return [_decode_sample(record) for record in records]
+
+
+@dataclass(frozen=True)
+class NewestSamples:
+    """The project's newest sample of any state, and its newest value; None when it has none."""
+
+    latest: QualitySample | None
+    latest_value: QualitySample | None
+
+
+async def _newest_sample(
+    conn: aiosqlite.Connection, project_id: str, *, values_only: bool,
+) -> QualitySample | None:
+    where = ' AND state = ?' if values_only else ''
+    params = (project_id, SampleState.VALUE.value) if values_only else (project_id,)
+    async with conn.execute(
+        f'{_SELECT_SAMPLES}{where} ORDER BY ts DESC, id DESC LIMIT 1', params,
+    ) as cursor:
+        record = await cursor.fetchone()
+    return None if record is None else _decode_sample(record)
+
+
+async def newest_samples(conn: aiosqlite.Connection, project_id: str) -> NewestSamples:
+    """The newest sample and the newest value sample, in read_samples' order, without the rest."""
+    return NewestSamples(
+        latest=await _newest_sample(conn, project_id, values_only=False),
+        latest_value=await _newest_sample(conn, project_id, values_only=True),
+    )
