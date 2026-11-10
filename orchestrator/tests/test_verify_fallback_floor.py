@@ -7,16 +7,19 @@ tests. Rationale: docs/fallback-test-floor.md.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 import pytest
 
-from orchestrator.config import ModuleConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_fallback_floor import (
     apply_fallback_test_floor,
     fallback_test_floor_reason,
     has_configured_suite,
 )
+from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan, derive_verify_plan
 
 REIFY_TEST_COMMAND = './scripts/verify.sh test --scope branch --include-infra'
 
@@ -151,3 +154,90 @@ class TestFallbackTestFloorDecision:
     @pytest.mark.parametrize('test_command', ['true', 'uv run pytest', REIFY_TEST_COMMAND])
     def test_has_configured_suite_accepts_any_declared_command(self, test_command):
         assert has_configured_suite(test_command) is True
+
+
+def _config(test_command: str) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=Path('/fake'),
+        test_command=test_command,
+        lint_command='ruff check',
+        type_check_command='pyright',
+    )
+
+
+def _fallback_plan(
+    files: list[str], test_command: str, role: Literal['merge', 'task'],
+) -> VerifyPlan:
+    return derive_verify_plan(files, [], _config(test_command), lambda _path: None, role=role)
+
+
+def _run_for(plan: VerifyPlan, leg_prefix: str) -> PlannedRun:
+    (run,) = [
+        r for r in plan.runs
+        if r.module_prefix == '__fallback__' and r.reason.startswith(leg_prefix)
+    ]
+    return run
+
+
+class TestFallbackPlanRecordsFloor:
+    @pytest.mark.parametrize('role', ROLES)
+    def test_reify_9839_records_configured_suite_floor(self, role):
+        run = _run_for(_fallback_plan(REIFY_9839_FILES, REIFY_TEST_COMMAND, role), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
+        assert run.scoped_targets == ()
+        assert '7041' in run.reason
+
+    @pytest.mark.parametrize('role', ROLES)
+    def test_reify_9761_polyglot_records_non_python_floor(self, role):
+        run = _run_for(_fallback_plan(REIFY_9761_FILES, REIFY_TEST_COMMAND, role), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
+        assert REIFY_9761_RS_FILE in run.reason
+
+    def test_bare_default_source_only_runs_whole_at_merge_role(self):
+        run = _run_for(_fallback_plan(['pkg/helpers.py'], 'pytest', 'merge'), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command('pytest')
+
+    def test_bare_default_source_only_keeps_the_task_role_skip(self):
+        run = _run_for(_fallback_plan(['pkg/helpers.py'], 'pytest', 'task'), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.SKIPPED
+        assert run.cmd is None
+        assert run.reason == 'pytest: no collectable test files touched — nothing to run'
+
+    def test_bare_default_data_module_runs_whole_at_merge_role(self):
+        run = _run_for(_fallback_plan(['tests/some_data.py'], 'pytest', 'merge'), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command('pytest')
+
+    def test_bare_default_data_module_keeps_the_task_1852_skip(self):
+        run = _run_for(_fallback_plan(['tests/some_data.py'], 'pytest', 'task'), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.SKIPPED
+        assert '1852' in run.reason
+
+    @pytest.mark.parametrize('role', ROLES)
+    def test_configured_suite_with_collectable_test_keeps_its_verbatim_reason(self, role):
+        run = _run_for(_fallback_plan(['tests/test_widget.py'], REIFY_TEST_COMMAND, role), 'pytest:')
+
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
+        assert 'verbatim' in run.reason
+        assert '7041' not in run.reason
+
+    @pytest.mark.parametrize('leg_prefix', ['lint:', 'pyright:'])
+    @pytest.mark.parametrize('files', [REIFY_9839_FILES, REIFY_9761_FILES])
+    def test_floor_leaves_lint_and_type_runs_file_scoped_at_both_roles(self, files, leg_prefix):
+        task_run = _run_for(_fallback_plan(files, REIFY_TEST_COMMAND, 'task'), leg_prefix)
+        merge_run = _run_for(_fallback_plan(files, REIFY_TEST_COMMAND, 'merge'), leg_prefix)
+        py_files = tuple(f for f in files if f.endswith('.py'))
+
+        assert task_run == merge_run
+        assert task_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert task_run.scoped_targets == py_files
