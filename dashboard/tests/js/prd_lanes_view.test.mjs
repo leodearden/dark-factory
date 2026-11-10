@@ -242,7 +242,7 @@ test('signalCell: an unrecognised mark shows the raw mark rather than guess', ()
   assert.equal(signalCell({ mark: 'withdrawn', cause: null, reason: null, leaves: [] }).text, 'withdrawn');
 });
 
-test('signalCell: the detail is the served reason, else null', () => {
+test('signalCell: with no leaves, the detail is the served reason, else null', () => {
   const unknown = { mark: 'unknown', cause: 'no_sidecar', reason: 'no capability-manifest sidecar', leaves: [] };
   assert.equal(signalCell(unknown).detail, 'no capability-manifest sidecar');
   assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves: [] }).detail, null);
@@ -273,16 +273,34 @@ test('signalCell: a done leaf with no served done kind shows no parenthesis', ()
   assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves }).detail, 'a #1 done');
 });
 
-test('signalCell: an unbound_label mark puts its reason first, then each leaf, an unbound one with no id', () => {
+test('signalCell: an unbound_label mark puts its reason first, then each leaf, an unbound one as its label alone', () => {
   const reason = "signal leaf bound to no task: label 'γ'";
   const leaves = [
     { label: 'γ', task_id: null, status: null, done_kind: null },
     { label: 'δ', task_id: 1234, status: 'pending', done_kind: null },
   ];
   const { detail } = signalCell({ mark: 'unknown', cause: 'unbound_label', reason, leaves });
-  const expected = "signal leaf bound to no task: label 'γ'\nγ not in the store\nδ #1234 pending";
+  const expected = "signal leaf bound to no task: label 'γ'\nγ\nδ #1234 pending";
   assert.equal(detail, expected);
   assert.equal(figureTitle('RULE', detail), `${expected}\n\nRULE`);
+});
+
+test('signalCell: an external_leaf mark shows the external leaf as its label alone, leaving the why to the reason', () => {
+  const reason = "signal leaf is an external task: label 'γ' is bound to reify:12";
+  const leaves = [{ label: 'γ', task_id: null, status: null, done_kind: null }];
+  assert.equal(
+    signalCell({ mark: 'unknown', cause: 'external_leaf', reason, leaves }).detail,
+    "signal leaf is an external task: label 'γ' is bound to reify:12\nγ",
+  );
+});
+
+test('signalCell: a served done kind shows in parentheses whatever the leaf status, the server owning when it is sent', () => {
+  const leaves = [{ label: 'a', task_id: 1, status: 'in-progress', done_kind: 'merged' }];
+  assert.equal(signalCell({ mark: 'not_yet', cause: null, reason: null, leaves }).detail, 'a #1 in-progress (merged)');
+});
+
+test('signalCell: a signal serving no leaves list throws rather than hide the leaves', () => {
+  assert.throws(() => signalCell({ mark: 'delivered', cause: null, reason: null }), TypeError);
 });
 
 test('signalCell: a leaf_not_in_store mark names the bound id of a leaf the store does not hold', () => {

@@ -109,17 +109,19 @@ function storeStatusText(status) {
   return status === null ? 'not in the store' : status;
 }
 
+// A leaf bound to no local task has no store status to show; the served
+// reason line above it says why.
 function signalLeafText(leaf) {
-  const id = leaf.task_id === null ? '' : ` #${leaf.task_id}`;
-  const kind = leaf.status === 'done' && leaf.done_kind ? ` (${leaf.done_kind})` : '';
-  return `${leaf.label}${id} ${storeStatusText(leaf.status)}${kind}`;
+  if (leaf.task_id === null) return leaf.label;
+  const kind = leaf.done_kind === null ? '' : ` (${leaf.done_kind})`;
+  return `${leaf.label} #${leaf.task_id} ${storeStatusText(leaf.status)}${kind}`;
 }
 
 function signalCell(signal) {
   const text = Object.prototype.hasOwnProperty.call(SIGNAL_MARK_TEXT, signal.mark)
     ? SIGNAL_MARK_TEXT[signal.mark]
     : signal.mark;
-  const lines = [signal.reason, ...(signal.leaves || []).map(signalLeafText)].filter(Boolean);
+  const lines = [signal.reason, ...signal.leaves.map(signalLeafText)].filter(Boolean);
   return { text, detail: lines.length === 0 ? null : lines.join('\n') };
 }
 
