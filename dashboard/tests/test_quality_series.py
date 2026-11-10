@@ -3,17 +3,36 @@
 from __future__ import annotations
 
 import json
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from _quality_rows import NO_COST, NO_OUTCOMES, epochs_from, history
-from shared.quality_series.landings import LinesBase
-from shared.quality_series.rows import LandingRow, Outcomes
+from shared.quality_series.git_lines import ModuleLines
+from shared.quality_series.landings import GitCrossCheck, LinesBase
+from shared.quality_series.rows import (
+    CharterClass,
+    CharterClassSource,
+    Cost,
+    LandingRow,
+    Outcomes,
+)
 from shared.quality_series.stats import (
+    CostEffect,
+    Effect,
+    NotYet,
     RegimeEvent,
+    before_after_cost,
+    before_after_rate,
     block_rate_datum,
+    bootstrap_interval,
+    content_seed,
+    cost_fit,
     ewma_limits,
+    log_residuals,
+    reference_cost,
     wilson_interval,
 )
 
@@ -69,9 +88,12 @@ def _every(period: int, n: int) -> list[int]:
     return [1 if i % period == 0 else 0 for i in range(n)]
 
 
-def _wire(rows: list[LandingRow], *, window: int | None = None, events=()) -> dict:
+def _wire(
+    rows: list[LandingRow], *, window: int | None = None, events=(),
+    git_check: GitCrossCheck | None = None,
+) -> dict:
     return quality_series_view(
-        rows, window_landings=window, provenance=FRESH, events=events,
+        rows, window_landings=window, provenance=FRESH, events=events, git_check=git_check,
     ).to_wire()
 
 
@@ -331,3 +353,359 @@ def test_nothing_is_served_as_zero_for_an_unmeasured_landing() -> None:
 
     for metric in RATE_METRICS:
         assert 0 not in wire['metrics'][metric]['points'], metric
+
+
+# --- counts, costs, the cost model, modules, before/after and the no-producer states ---------
+
+INVOCATION_METRICS = ('implementer_invocations', 'turns', 'all_role_usd')
+
+
+def _unit_outcome(rejections: int, reverifies: int) -> Outcomes:
+    return replace(
+        NO_OUTCOMES, rejected=rejections > 0, rejection_events=rejections,
+        reverify_count=reverifies, verify_failed_rows=0,
+    )
+
+
+def _costed(
+    usd: float, lines: int = 100, *, invocations: int = 1, turns: int | None = None,
+    iterations: int | None = None, src: int | None = None,
+) -> Cost:
+    """A landing that cost *usd* over *invocations* implementer invocations and landed *lines*."""
+    src_lines = lines if src is None else src
+    return replace(
+        NO_COST, all_role_usd=usd, by_role=(('implementer', usd),),
+        implementer_invocations=invocations, turns=turns, execute_iterations=iterations,
+        code_lines=lines, src_lines=src_lines, test_lines=lines - src_lines,
+    )
+
+
+def test_unit_counts_are_carried_once_at_the_unit_head() -> None:
+    train_members = {1, 2, 3}
+    rows = history(
+        5, start=T0, units=[1, 3, 1],
+        outcome=lambda i: _unit_outcome(2, 1) if i in train_members else _unit_outcome(0, 0),
+    )
+
+    metrics = _wire(rows)['metrics']
+
+    assert metrics['rejections_per_landing']['points'] == [0, 2, 0, 0, 0]
+    assert metrics['reverifies_per_landing']['points'] == [0, 1, 0, 0, 0]
+    assert metrics['rejections_per_landing']['kind'] == 'count'
+
+
+def test_a_unit_count_is_unmeasured_on_every_member_when_its_source_is() -> None:
+    rows = history(4, start=T0, units=[1, 3])
+
+    points = _metric(rows, 'reverifies_per_landing')['points']
+
+    assert points == [None] * 4
+
+
+def test_a_count_headline_is_the_mean_with_a_seeded_bootstrap_band() -> None:
+    rows = history(130, start=T0, cost=lambda i: _costed(1.0, invocations=1 + i % 4))
+    block = rows[-100:]
+    values = [float(row.cost.implementer_invocations) for row in block]
+    lo, hi = bootstrap_interval(
+        values, statistics.fmean, content_seed(row.landing.task_id for row in block),
+    )
+
+    headline = _metric(rows, 'implementer_invocations')['headline']
+
+    assert headline['state'] == 'fresh'
+    assert headline['value'] == {
+        'form': 'mean', 'n': 100, 'k': None, 'value': statistics.fmean(values),
+        'lo': lo, 'hi': hi,
+    }
+
+
+def test_invocation_sourced_metrics_cover_orchestrated_landings_only() -> None:
+    orchestrated = [i % 3 != 0 for i in range(60)]
+    rows = history(
+        60, start=T0,
+        cost=lambda i: _costed(2.0, invocations=2, turns=40, iterations=3) if orchestrated[i]
+        else NO_COST,
+    )
+
+    metrics = _wire(rows)['metrics']
+
+    per_landing = {'implementer_invocations': 2, 'turns': 40, 'all_role_usd': 2.0,
+                   'execute_iterations': 3}
+    for metric, value in per_landing.items():
+        assert metrics[metric]['points'] == [
+            value if measured else None for measured in orchestrated
+        ], metric
+        assert metrics[metric]['headline']['value']['n'] == sum(orchestrated), metric
+    for metric in INVOCATION_METRICS:
+        assert 'orchestrated landings only' in metrics[metric]['rule']['excludes'], metric
+
+
+def test_a_cost_headline_is_the_median_with_a_seeded_bootstrap_band() -> None:
+    rows = history(130, start=T0, cost=lambda i: _costed(0.5 + (i * 7) % 11))
+    block = rows[-100:]
+    values = [row.cost.all_role_usd for row in block]
+    lo, hi = bootstrap_interval(
+        values, statistics.median, content_seed(row.landing.task_id for row in block),
+    )
+
+    served = _metric(rows, 'all_role_usd')
+
+    assert served['kind'] == 'cost'
+    assert served['headline']['value'] == {
+        'form': 'median', 'n': 100, 'k': None, 'value': statistics.median(values),
+        'lo': lo, 'hi': hi,
+    }
+
+
+def _unit_lines(u: int) -> int:
+    return 10 + (u * 37) % 400
+
+
+def _unit_usd(u: int, *, scale: float = 1.0) -> float:
+    """A unit's cost: a power law in its lines with a repeating ±20% wobble."""
+    wobble = 1 + 0.1 * ((u * 7) % 5 - 2)
+    return scale * 0.05 * _unit_lines(u) ** 0.7 * wobble
+
+
+TRAIN_EVERY = 10
+"""Every TRAIN_EVERY-th unit is a train of two, splitting the unit's cost between members."""
+
+
+def _costed_units(n_units: int, *, shift_at: int | None = None) -> list[LandingRow]:
+    """*n_units* verify units, trains included; from unit *shift_at* on each costs three times more."""
+    sizes = [2 if u % TRAIN_EVERY == 5 else 1 for u in range(n_units)]
+    unit_of = [u for u, size in enumerate(sizes) for _ in range(size)]
+
+    def cost(i: int) -> Cost:
+        u = unit_of[i]
+        scale = 3.0 if shift_at is not None and u >= shift_at else 1.0
+        return _costed(_unit_usd(u, scale=scale) / sizes[u], _unit_lines(u))
+
+    return history(len(unit_of), start=T0, units=sizes, cost=cost)
+
+
+def _unit_points(rows: Sequence[LandingRow]) -> tuple[list[int], list[float]]:
+    """Per verify unit: the head's lines and the members' summed cost."""
+    lines: dict[str, int] = {}
+    costs: dict[str, float] = {}
+    for row in rows:
+        unit = row.landing.unit_id
+        lines.setdefault(unit, row.cost.code_lines)
+        costs[unit] = costs.get(unit, 0.0) + row.cost.all_role_usd
+    return list(lines.values()), list(costs.values())
+
+
+def test_the_cost_model_fits_per_unit_points_over_the_first_two_hundred_units() -> None:
+    rows = _costed_units(250)
+    lines, costs = _unit_points(rows)
+    a, b = cost_fit(lines[:200], costs[:200])
+
+    cost_model = _wire(rows)['cost_model']
+
+    assert cost_model == {
+        'a': a, 'b': b,
+        'reference_cost_100': reference_cost(lines[:200], costs[:200]),
+        'residual_median': statistics.median(
+            r for r in log_residuals(lines[:200], costs[:200], a, b) if r is not None
+        ),
+        'state': 'frozen',
+    }
+
+
+def test_a_cost_model_is_provisional_from_one_hundred_units_and_absent_below() -> None:
+    provisional = _wire(_costed_units(150))['cost_model']
+    absent = _wire(_costed_units(80))['cost_model']
+
+    assert provisional['state'] == 'provisional'
+    assert provisional['b'] is not None
+    assert absent == {
+        'a': None, 'b': None, 'reference_cost_100': None, 'residual_median': None, 'state': None,
+    }
+
+
+def test_a_cost_shift_raises_a_sign_of_residual_alarm() -> None:
+    rows = _costed_units(300, shift_at=250)
+    first_shifted = next(
+        row.landing.ordinal for row in rows if row.landing.unit_id == 'sha-00250'
+    )
+
+    alarms = _metric(rows, 'all_role_usd')['alarms']
+
+    assert [alarm for alarm in alarms if alarm['ordinal'] < first_shifted] == []
+    assert any(alarm['direction'] == 'up' for alarm in alarms)
+
+
+def _module_cost(i: int) -> Cost:
+    return {
+        0: _costed(9.0, 900),
+        1: _costed(4.0, 500, src=400),
+        2: _costed(2.0, 400),
+        3: _costed(1.0, 50, src=0),
+        4: _costed(3.0, 600),
+        5: _costed(3.0, 600),
+        6: _costed(2.0, 200),
+    }[i]
+
+
+def _module_lines(i: int) -> tuple[ModuleLines, ...]:
+    return {
+        0: (ModuleLines('dashboard/data', 900),),
+        1: (ModuleLines('dashboard/data', 300), ModuleLines('shared/quality_series', 100)),
+        2: (ModuleLines('dashboard/data', 400),),
+        3: (),
+        4: (ModuleLines('dashboard/data', 600),),
+        5: (ModuleLines('dashboard/data', 600),),
+        6: (ModuleLines('shared/quality_series', 200),),
+    }[i]
+
+
+def test_modules_allocate_per_unit_lines_and_cost_over_the_last_four_weeks() -> None:
+    rows = history(
+        7, start=T0, step=timedelta(days=7), units=[1, 1, 1, 1, 2, 1],
+        cost=_module_cost, modules=_module_lines,
+    )
+
+    modules = _wire(rows)['modules']
+
+    assert modules == [
+        {'module': 'dashboard/data', 'landings': 4, 'tasks': 4, 'allocated_lines': 1375.0,
+         'allocated_usd': 11.0, 'usd_per_100_lines': 0.8, 'ranked': True},
+        {'module': 'shared/quality_series', 'landings': 2, 'tasks': 2, 'allocated_lines': 325.0,
+         'allocated_usd': 3.0, 'usd_per_100_lines': None, 'ranked': False},
+        {'module': None, 'landings': 1, 'tasks': 1, 'allocated_lines': 50.0,
+         'allocated_usd': 1.0, 'usd_per_100_lines': None, 'ranked': False},
+    ]
+
+
+def test_no_events_serve_no_before_after() -> None:
+    rows = history(200, start=T0, outcome=_rejections(_every(5, 200)))
+
+    assert _wire(rows)['before_after'] == []
+
+
+def _rejected_around(n: int, boundary: int) -> tuple[list[LandingRow], list[int], RegimeEvent]:
+    xs = _every(5, boundary) + _every(3, n - boundary)
+    rows = history(n, start=T0, outcome=_rejections(xs))
+    event = RegimeEvent('m1', at=rows[boundary].landing.landed_at, series=('rejected',))
+    return rows, xs, event
+
+
+LANDINGS_PER_DAY = 12.0
+"""history()'s default step of two hours."""
+
+
+def test_a_rate_comparison_is_not_yet_under_one_hundred_landings_after() -> None:
+    rows, xs, event = _rejected_around(200, 150)
+    expected = before_after_rate(xs[:150], xs[150:], landings_per_day=LANDINGS_PER_DAY)
+    assert isinstance(expected, NotYet)
+
+    [comparison] = _wire(rows, events=[event])['before_after']
+
+    assert comparison == {
+        'marker_id': 'm1', 'metric': 'rejected', 'n_before': 150, 'n_after': 50,
+        'effect': None, 'lo': None, 'hi': None, 'state': 'not_yet',
+        'eta_days': pytest.approx(expected.eta_days), 'min_detectable': expected.min_detectable,
+    }
+
+
+def test_a_rate_comparison_is_measured_from_one_hundred_landings_after() -> None:
+    rows, xs, event = _rejected_around(300, 150)
+    expected = before_after_rate(xs[:150], xs[150:])
+    assert isinstance(expected, Effect)
+
+    [comparison] = _wire(rows, events=[event])['before_after']
+
+    assert comparison == {
+        'marker_id': 'm1', 'metric': 'rejected', 'n_before': 150, 'n_after': 150,
+        'effect': expected.d, 'lo': expected.lo, 'hi': expected.hi, 'state': 'measured',
+        'eta_days': None, 'min_detectable': None,
+    }
+
+
+def test_a_cost_comparison_is_the_bootstrap_ratio_over_unit_points() -> None:
+    rows = _costed_units(300, shift_at=150)
+    boundary = next(i for i, row in enumerate(rows) if row.landing.unit_id == 'sha-00150')
+    event = RegimeEvent('m2', at=rows[boundary].landing.landed_at, series=('all_role_usd',))
+    lines, costs = _unit_points(rows)
+    expected = before_after_cost(
+        lines[:150], costs[:150], lines[150:], costs[150:],
+        seed=content_seed(row.landing.task_id for row in rows),
+    )
+    assert isinstance(expected, CostEffect)
+
+    [comparison] = _wire(rows, events=[event])['before_after']
+
+    assert comparison == {
+        'marker_id': 'm2', 'metric': 'all_role_usd', 'n_before': 150, 'n_after': 150,
+        'effect': expected.ratio, 'lo': expected.lo, 'hi': expected.hi, 'state': 'measured',
+        'eta_days': None, 'min_detectable': None,
+    }
+
+
+def _charter(cls: CharterClass | None, source: CharterClassSource | None) -> Cost:
+    return replace(NO_COST, charter_class=cls, charter_class_source=source)
+
+
+def test_charter_blocks_from_the_regex_backfill_alone_are_no_producer() -> None:
+    rows = history(
+        40, start=T0,
+        cost=lambda i: _charter(CharterClass.UNDER_SPECIFIED, CharterClassSource.REGEX_BACKFILL)
+        if i % 5 == 0 else NO_COST,
+    )
+
+    served = _metric(rows, 'charter_blocked')
+
+    assert served['rule']['measured_since'] is None
+    assert served['points'] == [None] * 40
+    assert served['headline']['state'] == 'unknown'
+    assert served['headline']['reason'].startswith('no producer has written here')
+    assert 'task_results.charter_class' in served['headline']['reason']
+
+
+def test_charter_blocks_are_measured_once_the_typed_class_is_written() -> None:
+    def cost(i: int) -> Cost:
+        if i == 35:
+            return _charter(CharterClass.STALE_CHARTER, CharterClassSource.CHARTER_CLASS)
+        if i % 5 == 0:
+            return _charter(CharterClass.UNDER_SPECIFIED, CharterClassSource.REGEX_BACKFILL)
+        return NO_COST
+
+    rows = history(40, start=T0, cost=cost)
+
+    served = _metric(rows, 'charter_blocked')
+
+    assert served['points'] == [1 if i % 5 == 0 else 0 for i in range(40)]
+    assert served['rule']['measured_since'] == T0.isoformat()
+    assert served['headline']['value']['k'] == 8
+
+
+def test_reverts_are_no_producer_until_late_events_has_a_writer() -> None:
+    rows = history(60, start=T0, outcome=_rejections(_every(5, 60)))
+
+    served = _metric(rows, 'reverts')
+
+    assert served['points'] == [None] * 60
+    assert served['headline']['state'] == 'unknown'
+    assert served['headline']['reason'].startswith('no producer has written here')
+    assert 'late_events' in served['headline']['reason']
+
+
+def test_the_git_cross_check_is_served_beside_the_series() -> None:
+    rows = history(3, start=T0)
+
+    served = _wire(rows, git_check=GitCrossCheck(2, 1, 0))['git_check']
+
+    assert served == {
+        'off_first_parent': 2, 'merges_without_landing': 1, 'late_claims': 0, 'disagreement': 3,
+    }
+    assert _wire(rows)['git_check'] is None
+
+
+def test_counts_costs_and_comparisons_serve_byte_equal_twice() -> None:
+    rows = _costed_units(300, shift_at=150)
+    events = [RegimeEvent('m2', at=rows[160].landing.landed_at)]
+
+    first = json.dumps(_wire(rows, window=100, events=events), sort_keys=True)
+    second = json.dumps(_wire(rows, window=100, events=events), sort_keys=True)
+
+    assert first == second
