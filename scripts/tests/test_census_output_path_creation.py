@@ -10,9 +10,9 @@ saturation (~12.5h, ~$100) and then died on its first output write with
 reify simply has no ``plans/`` directory. Every persisted output of a run
 is affected, not just that one file: ``report_path`` and the dry-run
 payloads go through ``Path.write_text``, while ``codebook.dump`` and
-``advance_census_state`` write atomically via
-``tempfile.mkstemp(dir=os.path.dirname(path))``, which raises the same
-``FileNotFoundError`` on a missing directory. dark-factory's own tree
+``census_state.advance`` write atomically through a temp file in the
+target's own directory, which raises the same ``FileNotFoundError`` on a
+missing directory unless the writer creates it. dark-factory's own tree
 happens to contain ``plans/`` and ``docs/legibility/``, which is the only
 reason this was never hit before.
 
@@ -154,10 +154,9 @@ def test_run_census_creates_missing_dry_run_payloads_parent_dir(tmp_path):
 
 def test_run_census_creates_missing_codebook_and_state_parent_dirs(tmp_path):
     """The SECOND copy of the defect. ``codebook.dump`` and
-    ``advance_census_state`` write atomically via
-    ``tempfile.mkstemp(dir=os.path.dirname(path))``, which raises
-    ``FileNotFoundError`` on a missing directory exactly as ``write_text``
-    does. reify never reached this pair only because ``main()`` loads its
+    ``census_state.advance`` write atomically through a temp file in the
+    target's own directory, which raises ``FileNotFoundError`` on a missing
+    directory exactly as ``write_text`` does unless the writer creates it. reify never reached this pair only because ``main()`` loads its
     config from ``<root>/docs/legibility/legibility.yaml``, so that
     directory necessarily existed; a target reached via ``--config``
     pointing elsewhere trips it at the same sunk cost."""
@@ -213,35 +212,3 @@ def test_run_census_deferred_at_headroom_creates_no_output_dirs(tmp_path):
     assert outcome.status == "deferred"
     assert not (tmp_path / "plans").exists()
     assert not (tmp_path / "docs" / "legibility").exists()
-
-
-def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
-    """The writer-side half of the guarantee, unit-tested directly.
-
-    ``run_census``'s ``_ensure_output_parents`` buys FAIL-FAST but covers
-    only that function's own four paths. ``advance_census_state`` is
-    census-state.json's SOLE writer and is callable from anywhere, so it
-    creates its own parent too (mirroring trickle_state's atomic writer) —
-    otherwise ``tempfile.mkstemp(dir=<missing>)`` raises the very
-    FileNotFoundError this task exists to remove, for any future caller
-    that does not route through run_census.
-    """
-    state_path = tmp_path / "docs" / "legibility" / "census-state.json"
-    assert not state_path.parent.exists()
-
-    mod.advance_census_state(
-        state_path,
-        census_at="2026-08-03",
-        run_id="census-target_project-20260803",
-        report_path="plans/confusion-census-2026-08-03.md",
-        as_of_sha="a" * 40,
-        session_watermark=None,
-    )
-
-    assert json.loads(state_path.read_text(encoding="utf-8")) == {
-        "last_census_at": "2026-08-03",
-        "last_census_run_id": "census-target_project-20260803",
-        "last_census_report": "plans/confusion-census-2026-08-03.md",
-        "last_census_as_of_sha": "a" * 40,
-        "session_watermark": None,
-    }
