@@ -88,7 +88,7 @@ tasks:
       kind: manual
       reason: timing; proved by η's integration gate on the fixture repo
 - label: γ2
-  task_id: null
+  task_id: 9123
   title: Remote runners decide against a dispatcher-shipped registry view (Amendment A5)
   capabilities:
   - name: decision-against-a-view
