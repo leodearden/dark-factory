@@ -166,12 +166,14 @@ _TASK_REF_SCHEMA = {
     "required": ["project_root", "task_id"],
 }
 
+ENTRY_SEVERITIES: tuple[str, ...] = ("high", "medium", "low")
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
         "title": {"type": "string"},
-        "severity": {"enum": ["high", "medium", "low"]},
+        "severity": {"enum": list(ENTRY_SEVERITIES)},
         "status": {"enum": STATUSES},
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
