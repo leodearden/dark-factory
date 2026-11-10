@@ -114,15 +114,20 @@ _WRITER_PATTERN = re.compile(r"^\S+ \S+ (?P<identifier>\S+)\[(?P<pid>\d+)\]:")
 
 _SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
 _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
+_SOCKET_CLOSED_MARKERS = ("Closed fused-memory.socket",)
+_SOCKET_LIFECYCLE_MARKERS = ("Listening on fused-memory.socket", *_SOCKET_CLOSED_MARKERS)
 # A stall that BEGINS here began with the unit already down.
 # The stop-time accounting earns its place: systemd emits it as the unit
 # deactivates, which makes that the LAST line of a real stop sequence, so
 # without it a gap opening after a stop would still read 'wedged'.
+# The socket closes only after the service's own stop, so in a capture that
+# includes the socket unit its `Closed` line is the last line of a deliberate stop.
 _UNIT_DOWN_MARKERS = (
     "Stopped fused-memory",
     "Main process exited",
     "with signal SIGKILL",
     _CONSUMED_PATTERN,
+    *_SOCKET_CLOSED_MARKERS,
 )
 
 # The observed boundaries of the two recovery terms. Teardown ends at
@@ -278,12 +283,15 @@ class StallEpisode:
 
     *restart_sequence* is the systemd restart THIS stall triggered, and is
     empty when it triggered none. *pre_stall_context* is the tail of what came
-    before the silence.
+    before the silence. *last_socket_line_before_stall* is fused-memory.socket's
+    last `Listening on`/`Closed` line at or before the silence began, None when
+    the capture carries none.
     """
 
     stall_started_at: dt.datetime
     stall_ended_at: dt.datetime
     last_line_before_stall: str
+    last_socket_line_before_stall: str | None
     pre_stall_context: tuple[str, ...]
     restart_sequence: tuple[tuple[dt.datetime, str], ...]
     unit_process_names: frozenset[str]
@@ -324,17 +332,27 @@ class StallEpisode:
         served by the same blocked loop — fails: that is 'wedged'.
 
         A silence that begins with the unit already down is 'port-down' only
-        where the port is witnessed closed: before socket activation existed,
-        the stopped process took its own socket with it. Under socket
-        activation a restart or crash keeps fused-memory.socket bound and logs
-        nothing, so the probe could have read either verdict and this is None
-        (OPERATIONS.md §"fused-memory liveness revive").
+        where :attr:`port_witnessed_closed`. There are two witnesses. One is the
+        capture predating socket activation, when the stopped process took its
+        own socket with it. The other is fused-memory.socket's own latest
+        `Closed` line. Otherwise this is None: under socket activation a
+        restart or crash keeps the socket bound and logs nothing on it, so the
+        probe could have read either verdict (OPERATIONS.md §"fused-memory
+        liveness revive").
         """
         if not self.began_with_unit_down:
             return WEDGED
-        if self.stall_started_at < FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT:
-            return PORT_DOWN
-        return None
+        return PORT_DOWN if self.port_witnessed_closed else None
+
+    @property
+    def port_witnessed_closed(self) -> bool:
+        """Does this capture witness port 8002 closed when a down-unit silence began?"""
+        if not self.began_with_unit_down:
+            return False
+        socket_line = self.last_socket_line_before_stall
+        return self.stall_started_at < FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT or (
+            socket_line is not None and _carries_marker(socket_line, _SOCKET_CLOSED_MARKERS)
+        )
 
     @property
     def aftermath(self) -> tuple[str, ...]:
@@ -456,6 +474,18 @@ def restart_sequence_after(lines: list[tuple[dt.datetime, str]], stall_end: int)
     return tuple(sequence)
 
 
+def _last_line_carrying(
+    lines: list[tuple[dt.datetime, str]],
+    end: int,
+    markers: tuple[str | re.Pattern[str], ...],
+) -> str | None:
+    """The last of the first *end* lines that carries any of *markers*, or None."""
+    for _, line in reversed(lines[:end]):
+        if _carries_marker(line, markers):
+            return line
+    return None
+
+
 def _elapsed(start: dt.datetime | None, end: dt.datetime | None) -> float | None:
     """Seconds between two observed timestamps, or None if either never happened."""
     if start is None or end is None:
@@ -499,6 +529,9 @@ def analyze(
                 stall_started_at=lines[index - 1][0],
                 stall_ended_at=lines[index][0],
                 last_line_before_stall=lines[index - 1][1],
+                last_socket_line_before_stall=_last_line_carrying(
+                    lines, index, _SOCKET_LIFECYCLE_MARKERS
+                ),
                 pre_stall_context=tuple(
                     line for _, line in lines[max(0, index - context_lines):index]
                 ),
