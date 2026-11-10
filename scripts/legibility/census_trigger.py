@@ -373,7 +373,7 @@ def check_completion(
     ]
     try:
         done = runner(args)
-    except Exception as exc:  # noqa: BLE001 - the trigger must never crash its caller
+    except Exception as exc:
         completion = Completion(
             CompletionStatus.ERROR,
             run_id,
