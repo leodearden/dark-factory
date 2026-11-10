@@ -535,7 +535,7 @@ async def _migrate_one_project(
     # this task's headline claim is read off exactly that line.
     try:
         tasks_result = await call_tool_with_retry(
-            client, 'get_tasks', {'project_root': project_root, 'with_subtasks': True},
+            client, 'get_tasks', {'project_root': project_root},
         )
     except Exception as exc:
         print(
