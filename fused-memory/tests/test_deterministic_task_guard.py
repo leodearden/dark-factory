@@ -329,6 +329,60 @@ class TestDeterministicTaskErrorBeforeDoneStructural:
         assert result is None
 
 
+def _install_executable(root, relpath='scripts/deploy.sh'):
+    script = root / relpath
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text('#!/bin/sh\nexit 0\n')
+    os.chmod(script, 0o755)
+    return script
+
+
+class TestDeterministicTaskErrorBeforeDoneCwd:
+    """before_done.cwd: a string or absent, and never where a relative script resolves."""
+
+    @pytest.fixture
+    def project_root(self, tmp_path):
+        root = tmp_path / 'project'
+        root.mkdir()
+        return root
+
+    @pytest.fixture
+    def elsewhere(self, tmp_path):
+        outside = tmp_path / 'elsewhere'
+        outside.mkdir()
+        return outside
+
+    @staticmethod
+    def _submit(project_root, **before_done):
+        return deterministic_task_error(
+            'deterministic',
+            {'before_done': {'script': 'scripts/deploy.sh', 'timeout_secs': 60, **before_done}},
+            str(project_root),
+        )
+
+    @pytest.mark.parametrize(
+        'cwd',
+        [5, True, ['scripts'], {'dir': 'x'}, 0, False, []],
+        ids=['int', 'true', 'list', 'dict', 'zero', 'false', 'empty-list'],
+    )
+    def test_non_string_cwd_rejects(self, project_root, cwd):
+        _install_executable(project_root)
+
+        result = self._submit(project_root, cwd=cwd)
+
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'cwd' in result['error']
+
+    @pytest.mark.parametrize('form', ['none', 'empty', 'relative', 'absolute'])
+    def test_string_or_absent_cwd_accepts(self, project_root, elsewhere, form):
+        _install_executable(project_root)
+        (project_root / 'sub').mkdir()
+        cwd = {'none': None, 'empty': '', 'relative': 'sub', 'absolute': str(elsewhere)}[form]
+
+        assert self._submit(project_root, cwd=cwd) is None
+
+
 # ---------------------------------------------------------------------------
 # Step-5: inject_task_kind tests
 # ---------------------------------------------------------------------------
