@@ -460,6 +460,10 @@ _GATE_LINE = (
 )
 _BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, _BARE_COMPOSE_UP_LINE)
 _GATE_PLUS_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_BARE_COMPOSE_UP_LINE}")
+_EMBEDDER_UP_LINE = (
+    "ExecStartPre=-/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml "
+    "up -d --pull=never embedder"
+)
 
 
 def test_find_drift_flags_a_unit_that_brings_the_stores_up_without_the_aof_gate():
@@ -475,6 +479,36 @@ def test_find_drift_flags_a_bare_compose_up_beside_the_gate():
     mod = _load_checker()
 
     assert mod.find_drift(_GATE_PLUS_BARE_COMPOSE_UP_UNIT) == [mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_find_drift_accepts_an_embedder_only_compose_up_beside_the_gate():
+    mod = _load_checker()
+
+    unit = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_EMBEDDER_UP_LINE}")
+
+    assert mod.find_drift(unit) == []
+
+
+@pytest.mark.parametrize(
+    "compose_up_args",
+    ["up -d", "up -d embedder falkordb", "up -d qdrant", "up -d --pull never embedder"],
+)
+def test_find_drift_flags_a_compose_up_that_can_reach_falkordb(compose_up_args: str):
+    mod = _load_checker()
+    compose_up_line = _EMBEDDER_UP_LINE.replace("up -d --pull=never embedder", compose_up_args)
+    assert compose_up_line != _EMBEDDER_UP_LINE
+
+    unit = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{compose_up_line}")
+
+    assert mod.find_drift(unit) == [mod.BARE_COMPOSE_UP_DRIFT]
+
+
+def test_compose_up_bypasses_aof_gate_reads_only_ungated_services():
+    mod = _load_checker()
+
+    assert mod.compose_up_bypasses_aof_gate(_EMBEDDER_UP_LINE) is False
+    assert mod.compose_up_bypasses_aof_gate(_BARE_COMPOSE_UP_LINE) is True
+    assert mod.compose_up_bypasses_aof_gate(_GATE_LINE) is False
 
 
 def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
