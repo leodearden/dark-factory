@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import socket
+import types
+from collections.abc import Iterable, Mapping
 from typing import Final, TypeVar
 
 TOOL: Final = "network_exposure"
@@ -55,6 +57,35 @@ class HostAddress:
         if self.scope_id:
             return f"{self.ip}%{self.ifname}"
         return f"{self.ip} ({self.ifname})"
+
+
+# Host port -> compose service, for every `ports` publish in
+# fused-memory/docker/docker-compose.yml; pinned there by
+# tests/scripts/test_check_network_exposure.py.
+COMPOSE_PUBLISHED_PORTS: Final[Mapping[int, str]] = types.MappingProxyType(
+    {6379: "falkordb", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp"}
+)
+RECON_REPORT_PORT: Final = 8003
+
+STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
+    *(
+        OwnedPort(port=port, owner=f"compose service {service}")
+        for port, service in COMPOSE_PUBLISHED_PORTS.items()
+    ),
+    OwnedPort(
+        port=RECON_REPORT_PORT,
+        owner="fused-memory recon-report (ServerConfig.recon_report_port)",
+    ),
+)
+
+
+def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, str]:
+    """Port -> every owner of it, once each in source order, sorted by port."""
+    owners: dict[int, dict[str, None]] = {}
+    for source in sources:
+        for owned in source:
+            owners.setdefault(owned.port, {})[owned.owner] = None
+    return {port: ", ".join(owners[port]) for port in sorted(owners)}
 
 
 def _require_list(value: object, command: tuple[str, ...], what: str) -> list[object]:

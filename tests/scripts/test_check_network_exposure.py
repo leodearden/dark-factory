@@ -213,7 +213,7 @@ def test_compose_table_equals_every_compose_publish():
 
 
 def test_recon_report_port_equals_the_server_config_default():
-    assert exposure.RECON_REPORT_PORT == _field_default("ServerConfig", "recon_report_port")
+    assert _field_default("ServerConfig", "recon_report_port") == exposure.RECON_REPORT_PORT
 
 
 def test_config_yaml_does_not_move_the_recon_report_port():
