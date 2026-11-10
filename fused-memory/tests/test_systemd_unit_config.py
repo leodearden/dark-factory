@@ -251,3 +251,66 @@ class TestSocketActivation:
         hooks = [d for d in service if d.startswith("ExecStopPost=")]
         assert len(hooks) == 1
         assert hooks[0].endswith("/scripts/stop-socket-unless-restarting.sh %n")
+
+
+# ---------------------------------------------------------------------------
+# Local embedder start hooks and cutover hold (task 6797)
+# ---------------------------------------------------------------------------
+
+_SERVICE_TEMPLATE = _FM_DIR.parent / "scripts" / "fused-memory.service.template"
+_HOLD_DROPIN = _FM_DIR.parent / "scripts" / "fused-memory-cutover-hold.conf"
+
+
+def _exec_start_pre(unit_path: Path) -> list[str]:
+    return [d for d in _parse_systemd_unit(unit_path)["Service"] if d.startswith("ExecStartPre=")]
+
+
+def _wait_timeout(line: str) -> int:
+    argv = line.split()
+    return int(argv[argv.index("--timeout") + 1])
+
+
+class TestEmbedderStartHooks:
+    """The embedder hooks never block fused-memory's start and fit the start timeout."""
+
+    def test_both_embedder_lines_carry_the_ignore_failure_prefix(self) -> None:
+        embedder_lines = [l for l in _exec_start_pre(_SERVICE_TEMPLATE) if "embedder" in l or ":8420" in l]
+        assert len(embedder_lines) == 2
+        assert all(l.startswith("ExecStartPre=-") for l in embedder_lines)
+
+    def test_embedder_is_started_before_the_store_wait_and_waited_on_after(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        up = next(i for i, l in enumerate(lines) if l.endswith("up -d embedder"))
+        store_wait = next(i for i, l in enumerate(lines) if "127.0.0.1:6379" in l)
+        embedder_wait = next(i for i, l in enumerate(lines) if "127.0.0.1:8420" in l)
+        assert up < store_wait < embedder_wait
+
+    def test_existing_store_lines_are_unprefixed_so_store_failure_still_fails_the_start(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        store_wait = next(l for l in lines if "127.0.0.1:6379" in l)
+        assert store_wait.startswith("ExecStartPre=/")
+
+    def test_serial_waits_fit_inside_the_start_timeout(self) -> None:
+        service = _parse_systemd_unit(_SERVICE_TEMPLATE)["Service"]
+        start_timeout = int(next(d for d in service if d.startswith("TimeoutStartSec=")).split("=", 1)[1])
+        waits = [_wait_timeout(l) for l in _exec_start_pre(_SERVICE_TEMPLATE) if "wait-for-port" in l]
+        assert sum(waits) < start_timeout
+
+
+class TestCutoverHoldDropin:
+    """The drop-in holds both units while the lock exists, and the lock survives a reboot."""
+
+    def _condition(self) -> str:
+        unit = _parse_systemd_unit(_HOLD_DROPIN)
+        assert list(unit) == ["Unit"]
+        assert len(unit["Unit"]) == 1
+        return unit["Unit"][0]
+
+    def test_condition_is_negated_path_existence(self) -> None:
+        assert self._condition().startswith("ConditionPathExists=!")
+
+    def test_lock_path_is_reboot_surviving_and_host_portable(self) -> None:
+        lock = self._condition().split("!", 1)[1]
+        assert lock.startswith("%h/.local/state/")
+        assert not lock.startswith(("/tmp", "/run", "/var/run"))
+        assert "XDG_RUNTIME_DIR" not in lock
