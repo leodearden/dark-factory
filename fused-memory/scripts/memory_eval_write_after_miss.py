@@ -190,7 +190,7 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
         connection = sqlite3.connect(
             f'{db_path.resolve().as_uri()}?mode=ro', uri=True, timeout=JOURNAL_BUSY_TIMEOUT_SECS,
         )
-    except sqlite3.Error as exc:  # pragma: no cover - OS-level failure
+    except sqlite3.Error as exc:
         raise JournalUnavailableError(f'cannot open {db_path} read-only: {exc}') from exc
     connection.execute('PRAGMA query_only=ON')
     return connection
