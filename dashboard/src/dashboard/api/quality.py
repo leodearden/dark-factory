@@ -83,6 +83,13 @@ async def _quality(
                        exc_info=broken)
         return unknown_datum(f'the quality series broke the {broken.invariant.value} '
                              f'invariant: {broken}', QUALITY_FRESHNESS_BOUND_SECONDS)
+    except Exception as exc:
+        logger.warning('unexpected error while reading the quality series for %s, which is served '
+                       'as UNKNOWN for this render; this is a BUG, not an outage', root,
+                       exc_info=True)
+        return unknown_datum(f'unexpected error while reading the quality series: '
+                             f'{type(exc).__name__}: {exc} (see the WARNING and its traceback)',
+                             QUALITY_FRESHNESS_BOUND_SECONDS)
 
 
 @router.get('/api/v2/dashboard/quality')
