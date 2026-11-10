@@ -997,6 +997,34 @@ class TestDispatchSitesReanchor:
         assert cleaned[0] == straggler.merge_wt
         assert cleaned[1] != straggler.merge_wt
 
+    async def test_a_launch_that_raises_moves_the_merger_off_the_orphaned_replacement(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        """The merger held the straggler's commit, so the re-merge re-pointed
+        it at the replacement; the launch then raised.  The replacement's
+        commit is recorded dead and the merger moves back to the live tip,
+        rather than stacking its next request on a commit nothing will land."""
+        worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+        _ledger(worker).release(permit)
+        await _merger_holding(worker, config, git_repo, _straggler_commit(straggler))
+        allocator = _fake_local_allocator()
+        allocator.acquire.side_effect = RuntimeError('acquire blew up')
+        monkeypatch.setattr(worker, '_host_allocator', allocator)
+        cleanup = AsyncMock()
+        monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', cleanup)
+
+        with pytest.raises(RuntimeError, match='acquire blew up'):
+            await _dispatch(worker, straggler)
+
+        replacement_wt = cleanup.await_args_list[-1].args[0]
+        rc, orphan, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=replacement_wt)
+        assert rc == 0
+        assert orphan.strip() in worker._dead_base_commits
+        assert _speculation(worker)['spec_base'] == tip
+
     async def test_a_re_anchor_that_conflicts_with_the_live_tip_is_a_terminal_conflict(
         self, git_ops: GitOps, config: OrchestratorConfig,
         monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,

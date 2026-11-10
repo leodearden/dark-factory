@@ -20863,14 +20863,15 @@ class SpeculativeMergeWorker:
         return replacement
 
     async def _discard_unlaunched_replacement(self, replacement: RealMergeItem) -> None:
-        """Free the permit and worktree of a dispatch-time re-merge's
-        *replacement* whose launch raised: the caller resolves the item it
-        handed to :meth:`_dispatch_item`, which never held them."""
+        """Free the permit and worktree of a dispatch-time re-merge's unlaunched
+        *replacement*, which the caller never held, and record its commit dead so
+        a merger re-pointed onto it by :meth:`_reanchor_merger_on` moves off."""
         if replacement.permit is not None:
             with contextlib.suppress(BaseException):
                 self._speculation_ledger.release(replacement.permit)
         with contextlib.suppress(BaseException):
             await self._cleanup_owned_merge_worktree(replacement.merge_wt)
+        self._record_item_commit_dead(replacement, DeadBaseSite.DISPATCH_VOID)
 
     async def _launch_verify(
         self,
