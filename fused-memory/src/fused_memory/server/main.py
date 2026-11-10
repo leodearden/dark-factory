@@ -29,7 +29,9 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
-from fused_memory.maintenance.rebuild_summaries import RebuildResult  # noqa: E402
+from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
+    RebuildResult,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
