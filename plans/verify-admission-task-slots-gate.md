@@ -186,6 +186,32 @@ Unlike 2026-09-27, this change rests on a threshold rule over current host
 load, not on an equal-arm before/after gate, so it has no measurement section
 below.
 
+### 2026-11-10 — 2 -> 3 (progressive-slot rule)
+
+Operator decision, Leo, 2026-11-09: use the host's CPUs to maximise
+throughput. Raise one slot at a time, at most once every 2 h, while the 2 h
+mean task-leg admission wait is at least 5 min and mean idle CPU is at least
+0.5 threads of 32. Ceiling 5. This supersedes Q-R's "never 3" and its PSI > 50
+revert. Applied by `reload_config` at 2026-11-10 ~21:00Z.
+
+Measured at 2026-11-10 20:56Z, reify, solar-challenge and
+solar-challenge-platform schedulers still paused:
+
+| Measure | Value | Rule |
+|---|---|---|
+| task-leg admission wait, 2 h mean | 5.1 min (n 20) | >= 5 |
+| mean idle threads since the previous tick (30 min) | 5.2 of 32 | >= 0.5 |
+| host PSI cpu some avg10, 2 h median | 24.7 | — |
+| local merge-verify median since 10:00Z | 34.3 min (n 18) | baseline |
+| landings since 10:00Z | 18 (about 3.3 per 2 h) | baseline |
+| MemAvailable | 67 GB | — |
+| oom_kill | 0 | — |
+
+Step-down triggers (to 2): local merge-verify median above 41 min (20% over
+the 34.3 baseline) or above 46 min; landings per 2 h below the baseline over
+at least 4 ticks; any oom_kill; MemAvailable below 16 GB; or reify or a solar
+project resuming.
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise
