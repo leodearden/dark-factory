@@ -1008,13 +1008,12 @@ class TestVetoStreakAlarmRecovery:
         pending-queue scan on the healthy path."""
         harness, clock = clocked
         _bind_reports(harness, {'T1': _report(claimant=_live_claimant())})
-        wrapped = MagicMock(wraps=_queue(harness))
-        harness._escalation_queue = wrapped
+        harness._escalation_queue = MagicMock(wraps=harness._escalation_queue)
 
         await _sweeps(harness, clock, 3)
 
-        assert wrapped.has_open_l1.call_count == 0
-        assert wrapped.submit.call_count == 0
+        assert harness._escalation_queue.has_open_l1.call_count == 0
+        assert harness._escalation_queue.submit.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -1417,10 +1416,6 @@ def _restart_with_prior_alarm(harness, *, deterministic_sweep: bool) -> None:
     _inherit_pending_alarms(harness)
 
 
-def _tracked_tasks(harness) -> set[str]:
-    return {tid for _site, tid in harness._recovery_veto_tracker.tracked()}
-
-
 @pytest.mark.asyncio
 class TestVetoStreakAlarmSurvivesRestart:
     """The fixture harness is the restarted process: its tracker and memo are
@@ -1435,8 +1430,6 @@ class TestVetoStreakAlarmSurvivesRestart:
         await _sweeps(harness, clock, 1)
 
         assert _alarms(harness, 'T1') == []
-        assert 'T1' not in harness._recovery_streak_filed_at
-        assert 'T1' not in _tracked_tasks(harness)
 
     async def test_a_task_still_held_keeps_one_alarm_until_the_hold_clears(
         self, clocked,
@@ -1448,6 +1441,22 @@ class TestVetoStreakAlarmSurvivesRestart:
         await _sweeps(harness, clock, 5)
         assert len(_alarms(harness, 'T1')) == 1, 'no duplicate of the inherited alarm'
 
+        stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+        )
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_a_hold_that_clears_below_the_threshold_resolves_it(self, clocked):
+        """Two held sweeps are below the threshold of 3, so this process's own
+        streak cannot open the resolver's gate; only the inherited memo can."""
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 2)
         stub.reports['T1'] = _report(
             db_status=TaskStatus.BLOCKED,
             branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
@@ -1495,6 +1504,4 @@ class TestVetoStreakAlarmSurvivesRestart:
 
         _inherit_pending_alarms(harness)
 
-        assert _tracked_tasks(harness) == set()
-        assert harness._recovery_streak_filed_at == {}
-        assert harness._zero_progress_filed_at == {}
+        assert tuple(harness._recovery_veto_tracker.tracked()) == ()

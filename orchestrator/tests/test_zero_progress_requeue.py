@@ -1406,3 +1406,13 @@ class TestHarnessZeroProgressAlarmSurvivesRestart:
             await restarted._apply_retry_cap('3068', _report(), True)
 
         assert len(_alerts(restarted)) == 1
+
+    async def test_progress_after_a_below_threshold_loop_resolves_it(self, restarted):
+        """Two requeues are below the threshold of 3, so this process's own
+        streak cannot open the resolver's gate; only the inherited memo can."""
+        for _ in range(2):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
