@@ -25,9 +25,13 @@ consecutive `Project reconciliation loop started for dark_factory` lines at
 
 Usage — pipe a capture in:
 
-    journalctl --user -u fused-memory.service \\
+    journalctl --user -u fused-memory.service -u fused-memory.socket \\
         --since "2026-09-16 12:03" --until "2026-09-16 12:10" \\
         -o short-iso --no-pager | scripts/fm_wedge_forensics.py
+
+Include the socket unit. Under socket activation its `Closed` line is the only
+witness of a deliberate stop, so without it a down-unit silence reports no
+watchdog verdict.
 
 `--user` IS MANDATORY. fused-memory.service is a systemd --user unit, so a
 system-scope `journalctl -u fused-memory.service` prints "-- No entries --"
@@ -625,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Report fused-memory event-loop stalls from a journal capture on stdin. "
-            "Capture it with: journalctl --user -u fused-memory.service "
+            "Capture it with: journalctl --user -u fused-memory.service -u fused-memory.socket "
             "--since ... --until ... -o short-iso --no-pager  "
             "(--user is mandatory: system scope prints '-- No entries --')."
         ),
