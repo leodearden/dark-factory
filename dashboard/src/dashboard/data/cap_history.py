@@ -533,18 +533,21 @@ def compute_capped_now_and_windows(
     """Derive (capped_now, capped_windows) from a single intervals list.
 
     Consolidates logic that was previously duplicated in api_curator and
-    _sample_curator.  Uses asymmetric semantics:
+    _sample_curator.  Both outputs use ONE account universe, of size
+    ``max(total_accounts, #accounts seen in intervals)`` (see
+    :func:`summarize_accounts`), so ``capped_now == 1`` exactly when
+    ``capped_windows`` ends open-ended:
 
-    - *capped_now* is 1 iff the account universe is non-empty AND no account
-      is currently usable (``available == 0``), where universe size =
-      ``max(total_accounts, #accounts seen in intervals)``.  Pass
-      ``total_accounts`` (the gate's ``account_count``) so healthy accounts
-      with no recent cap events are counted as available; omit it (``None``)
-      to fall back to the cap-history universe (preserves existing behaviour
-      when the gate is not reachable).
-    - *capped_windows* uses "all accounts simultaneously capped" semantics via
+    - *capped_now* is 1 iff the universe is non-empty AND no account is
+      currently usable (``available == 0``).  Pass ``total_accounts`` (the
+      gate's ``account_count``) so healthy accounts with no recent cap events
+      are counted as available; omit it (``None``) to fall back to the
+      cap-history universe (used when the gate is not reachable).
+    - *capped_windows* are the instants when ALL accounts were capped, via
       :func:`merge_all_accounts_capped` on a **sorted** ``account_names`` list
-      for deterministic merge-event ordering across reruns.
+      for deterministic merge-event ordering across reruns.  When the universe
+      holds an account with no cap history in the window, no such instant
+      exists and the list is empty.
 
     Args:
         intervals: List of :class:`CapInterval` objects.  Both call sites
@@ -561,6 +564,7 @@ def compute_capped_now_and_windows(
     """
     summary = summarize_accounts(intervals, total_accounts=total_accounts)
     capped_now = 1 if summary['total'] > 0 and summary['available'] == 0 else 0
-    # Reuse account_names from summary — avoids a third pass over intervals.
+    if summary['total'] > len(summary['account_names']):
+        return capped_now, []
     capped_windows = merge_all_accounts_capped(intervals, summary['account_names'])
     return capped_now, capped_windows
