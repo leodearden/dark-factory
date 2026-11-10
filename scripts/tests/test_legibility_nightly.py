@@ -5527,10 +5527,10 @@ class TestRunScheduledNight:
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
         now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
-        invoke, completion_runner, poster = object(), object(), object()
+        invoke, poster = object(), object()
         committer, recorder, retry_recorder = object(), object(), object()
-        selector, digest_builder, census_launcher = (
-            _sentinel_seam(), _sentinel_seam(), _sentinel_seam(),
+        selector, digest_builder, census_launcher, completion_runner = (
+            _sentinel_seam(), _sentinel_seam(), _sentinel_seam(), _sentinel_seam(),
         )
 
         nightly.run_scheduled_night(

@@ -999,7 +999,7 @@ class _ScriptedRunner:
         return subprocess.CompletedProcess(list(args), self.returncode, stdout=self.stdout)
 
 
-def _check(runner, project_root, *, run_id=RUN_ID, threshold_pct=70):
+def _check(runner, project_root, *, run_id: str | None = RUN_ID, threshold_pct=70):
     return ct.check_completion(
         run_id, project_root=project_root, threshold_pct=threshold_pct, runner=runner,
     )
@@ -1281,6 +1281,7 @@ def test_decide_for_project_fires_when_the_previous_run_has_landed(tmp_path):
     assert decision.fire is True
     [args] = runner.calls
     assert args[:2] == ["--run", _PREVIOUS_RUN]
+    assert decision.completion is not None
     assert decision.completion.status is ct.CompletionStatus.FIRE
 
 
@@ -1318,6 +1319,7 @@ def test_decide_for_project_a_stale_census_without_a_run_id_no_longer_fires(tmp_
     decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
 
     assert decision.fire is False
+    assert decision.completion is not None
     assert decision.completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
     assert runner.calls == []
     assert not any(r.startswith("max-interval") for r in decision.reasons)
@@ -1329,6 +1331,7 @@ def test_decide_for_project_a_never_censused_project_has_no_previous_run(tmp_pat
 
     decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=runner)
 
+    assert decision.completion is not None
     assert decision.completion.status is ct.CompletionStatus.NO_PREVIOUS_RUN
     assert runner.calls == []
 
@@ -1505,6 +1508,7 @@ def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at
 
     decision = ct.decide_for_project(tmp_path, now=NOW, completion_runner=_passing_runner())
 
+    assert decision.completion is not None
     assert decision.completion.fires is True
     assert decision.fire is False
     assert (
