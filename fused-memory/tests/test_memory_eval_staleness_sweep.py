@@ -21,14 +21,17 @@ named item_keys and exact counts on seeded fixtures.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
+import os
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_staleness_sweep.py'
 
@@ -3268,11 +3271,6 @@ class TestAttributionInReport:
 # `-m 'not integration'`, so a module-level mark would deselect every pure
 # test above and the guards they carry would guard nothing.
 # ---------------------------------------------------------------------------
-
-import contextlib  # noqa: E402
-import os  # noqa: E402
-
-from _fm_qdrant_live import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 """The ONLY prefix scripts/cleanup_test_collections.py reaps.

@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from _fm_helpers import lease_isolated_monkeypatch, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -1761,10 +1763,6 @@ class TestReplayFetchesFlag:
 # Markers PER-TEST, never a module `pytestmark`: `addopts = -m 'not
 # integration'` would otherwise deselect every pure test in this file from
 # the merge lane along with this one.
-
-import os  # noqa: E402
-
-from _fm_qdrant_live import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 class _RefusesToBeConstructed:
