@@ -3891,6 +3891,28 @@ class TestWatcherHasActionableL1:
 # task 2629 step-5: _watcher_supervisor_loop consults the empty-queue precheck
 # ---------------------------------------------------------------------------
 
+async def _run_one_drained_supervisor_iteration(h: Harness) -> tuple[AsyncMock, list[float]]:
+    """Drive one supervisor iteration that ends at the empty-queue poll sleep.
+
+    Returns the rotation spy and the recorded sleep durations; the fake sleep
+    raises CancelledError so the loop stops after its first poll.
+    """
+    sleep_durations: list[float] = []
+    rotation_spy = AsyncMock()
+
+    async def fake_sleep(duration: float) -> None:
+        sleep_durations.append(duration)
+        raise asyncio.CancelledError()
+
+    with (
+        patch.object(h, '_run_watcher_rotation', rotation_spy),
+        patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await h._watcher_supervisor_loop()
+    return rotation_spy, sleep_durations
+
+
 class TestWatcherSupervisorLoopEmptyQueueSkip:
     """_watcher_supervisor_loop skips the rotation launch when the L1 queue
     has no actionable work, and launches normally otherwise.
@@ -3902,19 +3924,8 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         the loop sleeps watcher_empty_queue_poll_secs and re-checks.
         """
         h, _queue = _make_loop_harness_with_queue(tmp_path)
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
 
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -3946,19 +3957,7 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
         l2_id = pending_before[0].id
 
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
-
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -4029,28 +4028,6 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
 # task 5315: no recovery evidence clears the outage L2 while a pause holds
 # ---------------------------------------------------------------------------
 
-async def _run_one_drained_supervisor_iteration(h: Harness) -> tuple[AsyncMock, list[float]]:
-    """Drive one supervisor iteration that ends at the empty-queue poll sleep.
-
-    Returns the rotation spy and the recorded sleep durations; the fake sleep
-    raises CancelledError so the loop stops after its first poll.
-    """
-    sleep_durations: list[float] = []
-    rotation_spy = AsyncMock()
-    h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
-
-    async def fake_sleep(duration: float) -> None:
-        sleep_durations.append(duration)
-        raise asyncio.CancelledError()
-
-    with (
-        patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-        pytest.raises(asyncio.CancelledError),
-    ):
-        await h._watcher_supervisor_loop()
-    return rotation_spy, sleep_durations
-
-
 def _pending_outage_l2_id(h: Harness, queue: EscalationQueue) -> str:
     l2_id = queue.find_pending_l2_by_root_cause(h._WATCHER_OUTAGE_ROOT_CAUSE)
     assert l2_id is not None, 'Pre-condition: an outage L2 must be pending'
@@ -4115,7 +4092,6 @@ class TestWatcherOutageL2HeldOpenWhileSchedulerPaused:
         h, queue = _make_loop_harness_with_queue(tmp_path)
         min_secs = 30.0
         h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
-        h.pause_scheduler = AsyncMock()  # type: ignore[method-assign]
         h.scheduler.pause('cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING)
         h._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
         _submit_sample_l1(queue)
