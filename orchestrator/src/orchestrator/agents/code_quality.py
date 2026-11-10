@@ -10,6 +10,11 @@ never with the operated repo, whose checkout may lack ``docs/``;
 sections verbatim. A rendered section that is missing, empty or carries a brace
 raises ``ValueError`` naming it, at import of
 ``orchestrator/src/orchestrator/agents/roles.py``.
+
+``definition()`` returns the ``## Definition`` body alone under the same
+missing, empty and brace checks, raising at call time rather than at import.
+The legibility coder (``scripts/legibility/coder.py::build_prompt``) embeds it
+as its minting test.
 """
 
 from __future__ import annotations
@@ -75,3 +80,8 @@ def render(doc_text: str) -> str:
 def guidance() -> str:
     """Return the block rendered from the packaged normative doc."""
     return render(NORMATIVE_DOC.read_text(encoding='utf-8'))
+
+
+def definition() -> str:
+    """Return the packaged doc's ``## Definition`` body alone, read on every call."""
+    return _body(NORMATIVE_DOC.read_text(encoding='utf-8'), _DEFINITION)
