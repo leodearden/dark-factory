@@ -42,6 +42,7 @@ from orchestrator.harness import (
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
+    WatcherRecoveryEvidence,
 )
 from orchestrator.pause_policy import PauseClass
 from orchestrator.scheduler import Scheduler
@@ -2833,19 +2834,20 @@ class TestResolveWatcherOutageL2:
         l2_id = l2s_before[0].id
 
         # Resolve
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
         # Must no longer be in pending
         l2s_after = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s_after) == 0, (
             f'Expected 0 pending L2s after resolve; got {l2s_after}'
         )
-        # Must be resolved in the full queue
+        # Must be resolved in the full queue, recording the caller's evidence
         resolved = queue.get(l2_id)
         assert resolved is not None, f'escalation {l2_id} not found in queue'
         assert resolved.status == 'resolved', (
             f'Expected status="resolved"; got {resolved.status!r}'
         )
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -2855,7 +2857,7 @@ class TestResolveWatcherOutageL2:
         pending_before = list(queue.get_pending())
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.DRAINED_QUEUE)
 
         # Queue unchanged
         pending_after = list(queue.get_pending())
@@ -2871,7 +2873,7 @@ class TestResolveWatcherOutageL2:
         h._escalation_queue = None
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
 
 # ---------------------------------------------------------------------------
@@ -3063,7 +3065,8 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 
         Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
         lasting >= watcher_misconfigured_min_rotation_secs (healthy-clean path),
-        then assert the L2 is no longer pending (it was resolved).
+        then assert the L2 is no longer pending and records HEALTHY_ROTATION
+        as the evidence that cleared it.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
         min_secs = 30.0
@@ -3083,6 +3086,7 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
         # Drive with one healthy-clean rotation (duration > min_secs)
         await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
@@ -3095,6 +3099,9 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             f'Expected outage L2 to be resolved after healthy-clean rotation; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
 
     @pytest.mark.asyncio
     async def test_degenerate_clean_does_NOT_resolve_outage_l2(self, tmp_path: Path) -> None:
@@ -3920,11 +3927,11 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         """Empty L1 queue with a stale outage L2 open -> the skip path both
         skips the rotation launch AND resolves the outage L2.
 
-        Reaching the empty-queue skip branch proves the supervisor loop is
-        alive and the queue is readable (the precheck fails open on a
-        None/erroring queue), which is exactly the 'watcher is up again'
-        signal the outage L2 represents -- so a stale L2 must not linger as
-        a false alarm just because the L1 queue happens to be drained.
+        With no scheduler pause holding, reaching the empty-queue skip branch
+        evidences that the supervisor loop is alive and the queue is readable
+        (the precheck fails open on a None/erroring queue), so a stale L2
+        must not linger as a false alarm just because the L1 queue happens to
+        be drained. The resolution records DRAINED_QUEUE as that evidence.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
 
@@ -3937,6 +3944,7 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
         sleep_durations: list[float] = []
         rotation_spy = AsyncMock()
@@ -3966,6 +3974,9 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             f'Expected the stale outage L2 to be resolved on the empty-queue skip path; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.DRAINED_QUEUE
 
     @pytest.mark.asyncio
     async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
