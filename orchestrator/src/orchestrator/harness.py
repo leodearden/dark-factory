@@ -16,7 +16,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
@@ -474,6 +474,14 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
+
+
+class WatcherRecoveryEvidence(StrEnum):
+    """What the supervisor observed when it clears the watcher-outage L2; the value is the recorded resolution."""
+
+    HEALTHY_ROTATION = 'watcher recovered: a watcher rotation ran its full course and exited clean'
+    DRAINED_QUEUE = 'watcher recovered: supervisor loop alive and no actionable L1 queued; no rotation ran'
+
 
 # Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
 # crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
@@ -10021,7 +10029,7 @@ class Harness:
         except Exception:
             logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
 
-    def _resolve_watcher_outage_l2(self) -> None:
+    def _resolve_watcher_outage_l2(self, evidence: WatcherRecoveryEvidence) -> None:
         """Resolve the open watcher-outage L2 escalation on healthy recovery.
 
         Called from _watcher_supervisor_loop when a healthy-clean rotation
@@ -10042,10 +10050,13 @@ class Harness:
                 return
             queue.resolve(
                 existing_id,
-                resolution='watcher recovered',
+                resolution=evidence.value,
                 resolved_by='orchestrator-watcher-supervisor',
             )
-            logger.info('Resolved watcher-outage L2 escalation %s (watcher recovered)', existing_id)
+            logger.info(
+                'Resolved watcher-outage L2 escalation %s (watcher recovered, evidence=%s)',
+                existing_id, evidence.name,
+            )
         except Exception:
             logger.warning('Failed to resolve watcher-outage L2 escalation', exc_info=True)
 
@@ -15532,7 +15543,7 @@ class Harness:
                 # watcher-outage L2 is waiting on — resolve it here so it
                 # never lingers as a false alarm just because the L1 queue
                 # happens to be drained. Best-effort/no-op when none is open.
-                self._resolve_watcher_outage_l2()
+                self._resolve_watcher_outage_l2(WatcherRecoveryEvidence.DRAINED_QUEUE)
                 try:
                     await asyncio.sleep(poll)
                 except asyncio.CancelledError:
@@ -15631,7 +15642,7 @@ class Harness:
                     # Resolve any open watcher-outage L2 — the watcher is running
                     # healthily again.  Degenerate-clean (fast exits) are NOT recovery
                     # signals; only healthy-clean (duration >= min) clears the outage.
-                    self._resolve_watcher_outage_l2()
+                    self._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
                     await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue
 
