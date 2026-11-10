@@ -516,7 +516,7 @@ def _socket_states_before(lines: list[tuple[dt.datetime, str]]) -> list[SocketSt
     reports, None until there is one, so the list is one longer than *lines*.
     """
     state: SocketState | None = None
-    states = [state]
+    states: list[SocketState | None] = [state]
     for _, line in lines:
         reported = _socket_state_reported_by(line)
         if reported is not None:
