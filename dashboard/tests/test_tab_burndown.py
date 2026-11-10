@@ -546,6 +546,27 @@ class TestBurnTabReadsServedDatums:
         assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
 
 
+class TestBurnTileReader:
+    """`_burn_tiles` reads each tile's props from its own opening tag only."""
+
+    def test_a_brace_inside_a_quoted_label_does_not_lose_the_tile(self):
+        tiles = _burn_tiles('<ST label="a } b" datum={d} />')
+
+        assert set(tiles) == {'a } b'}
+        assert _prop_expr(tiles['a } b'], 'datum') == 'd'
+
+    def test_a_childs_props_are_not_the_tiles(self):
+        tile = _burn_tiles('<ST label="x" datum={d}>\n  <Pip datum={other} />\n</ST>')['x']
+
+        assert _prop_expr(tile, 'datum') == 'd'
+        assert 'other' not in tile
+
+    def test_a_comment_between_attributes_is_stripped(self):
+        tiles = _burn_tiles("<ST\n  label=\"y\"\n  // don't\n  datum={d}\n/>")
+
+        assert _prop_expr(tiles['y'], 'datum') == 'd'
+
+
 # ---------------------------------------------------------------------------
 # OrchTab "Completed / day" — the server's per-day series, never re-derived
 # ---------------------------------------------------------------------------
