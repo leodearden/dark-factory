@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -169,3 +171,26 @@ def test_a_train_event_the_landing_rule_refuses_is_served_stale(client, tmp_path
     assert quality['state'] == 'stale'
     assert 'UnrecognisedTrainEvent' in quality['reason']
     assert len(quality['value']['axis']) == 100
+
+
+def test_an_unexpected_read_error_is_served_unknown_and_logged_as_a_bug(
+    client, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _seeded(client, tmp_path) as seeded:
+        with closing(sqlite3.connect(seeded.app.state.config.quality_db)) as conn:
+            conn.execute("UPDATE landings SET source = 'bogus' "
+                         "WHERE rowid = (SELECT MIN(rowid) FROM landings)")
+            conn.commit()
+        with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
+            body = _get(seeded, 'project=dark_factory&window=100')
+
+    assert set(body) == {'QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS', 'WINDOW', 'served_at'}
+    quality = body['QUALITY']
+    assert set(quality) == DATUM_KEYS
+    assert (quality['state'], quality['value']) == ('unknown', None)
+    assert 'unexpected error' in quality['reason']
+    assert 'ValueError' in quality['reason']
+    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+    assert 'BUG, not an outage' in record.getMessage()
