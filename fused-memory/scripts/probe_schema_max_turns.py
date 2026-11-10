@@ -256,8 +256,8 @@ for _p in (_FM_SRC, _SHARED_SRC):
 from shared.cli_invoke import (  # noqa: E402
     AgentFailureKind,
     AgentResult,
-    claude_binary_spec,
     classify_agent_failure,
+    claude_binary_spec,
     invoke_claude_agent,
     invoke_with_cap_retry,
     transcript_evidence_for_session,
