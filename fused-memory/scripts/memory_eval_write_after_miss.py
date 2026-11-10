@@ -124,6 +124,10 @@ class JournalUnavailableError(RuntimeError):
     """
 
 
+class MemoryStoreUnavailableError(RuntimeError):
+    """The live memory store could not be opened for reads."""
+
+
 class _UnparsedRowError(ValueError):
     """A journal row whose blobs do not have the shape their producer writes."""
 
@@ -762,10 +766,25 @@ def _default_journal(config: FusedMemoryConfig) -> Path:
 MemoryFactory = Callable[[FusedMemoryConfig], Awaitable[Any]]
 
 
-async def open_memory(config: FusedMemoryConfig) -> MemoryService:
-    """The live-service factory ``main`` uses by default. The caller closes what it returns."""
-    memory = MemoryService(config)
-    await memory.initialize()
+async def open_memory(
+    config: FusedMemoryConfig,
+    *,
+    service: Callable[[FusedMemoryConfig], Any] = MemoryService,
+) -> Any:
+    """The live service ``main`` uses by default, opened for reads only. The caller closes it.
+
+    ``initialize_for_reads`` starts no durable write queue and runs no Graphiti
+    startup maintenance. The full ``initialize`` would reset the live server's
+    in-flight queued writes to pending and execute them from this process.
+    """
+    memory = service(config)
+    try:
+        await memory.initialize_for_reads()
+    except (OSError, sqlite3.Error) as exc:
+        await memory.close()
+        raise MemoryStoreUnavailableError(
+            f'the memory store could not be opened ({type(exc).__name__}): {exc}'
+        ) from exc
     return memory
 
 
@@ -802,7 +821,7 @@ def main(argv: Sequence[str] | None = None, *, open_memory: MemoryFactory = open
     args = build_parser().parse_args(argv)
     try:
         return asyncio.run(_run(args, open_memory))
-    except JournalUnavailableError as exc:
+    except (JournalUnavailableError, MemoryStoreUnavailableError) as exc:
         print(f'{args.eval_id}: {exc}', file=sys.stderr)
         return 1
 

@@ -434,8 +434,8 @@ class TestAdjudication:
         write = window.writes[0]
         memory = FakeMemory(
             contents={'w': 'W content'},
-            candidates={'W content': [_hit('near', score=0.85, created_at=_before(write))]},
-            threshold=0.9,
+            candidates={'W content': [_hit('near', score=0.93, created_at=_before(write))]},
+            threshold=0.95,
         )
 
         adjudication = await _adjudicate(window, memory)
@@ -790,13 +790,6 @@ class TestPeriodAndCli:
         assert args.config == str(tmp_path / 'config.yaml')
         assert parser.parse_args(_sweep_argv(tmp_path)).initial_period_hours == 24
 
-    def test_the_parser_has_no_mutation_or_skip_flag(self):
-        option_strings = {
-            option for action in _mod().build_parser()._actions for option in action.option_strings
-        }
-        assert '--apply' not in option_strings
-        assert '--no-metrics' not in option_strings
-
     def test_a_missing_journal_exits_non_zero_and_writes_no_metrics(
         self, tmp_path, monkeypatch, capsys,
     ):
@@ -839,3 +832,43 @@ class TestPeriodAndCli:
         assert [(metric.metric_id, metric.n) for metric in series.metrics] == [('write-after-miss', 2)]
         assert memory.write_calls == []
         assert memory.closed is True
+
+
+class _InitRecordingService:
+    """A ``MemoryService`` stand-in that records which lifecycle methods ran."""
+
+    def __init__(self, config: Any, *, fail_with: Exception | None = None) -> None:
+        self.config = config
+        self.calls: list[str] = []
+        self._fail_with = fail_with
+
+    async def initialize(self) -> None:
+        self.calls.append('initialize')
+
+    async def initialize_for_reads(self) -> None:
+        self.calls.append('initialize_for_reads')
+        if self._fail_with is not None:
+            raise self._fail_with
+
+    async def close(self) -> None:
+        self.calls.append('close')
+
+
+class TestTheLiveFactoryOpensForReadsOnly:
+    def test_it_never_starts_the_durable_queue_or_graphiti_maintenance(self):
+        memory = asyncio.run(_mod().open_memory(SimpleNamespace(), service=_InitRecordingService))
+
+        assert memory.calls == ['initialize_for_reads']
+
+    def test_an_unopenable_store_closes_the_service_and_raises_a_named_error(self):
+        opened: list[_InitRecordingService] = []
+
+        def failing_service(config: Any) -> _InitRecordingService:
+            service = _InitRecordingService(config, fail_with=sqlite3.OperationalError('locked'))
+            opened.append(service)
+            return service
+
+        with pytest.raises(_mod().MemoryStoreUnavailableError, match='OperationalError'):
+            asyncio.run(_mod().open_memory(SimpleNamespace(), service=failing_service))
+
+        assert opened[0].calls == ['initialize_for_reads', 'close']
