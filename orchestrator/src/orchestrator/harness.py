@@ -16519,7 +16519,10 @@ class Harness:
         the startup path.
         """
         if self._escalation_queue is None:
-            logger.debug('scheduled-deploy settle: no escalation queue yet — pass skipped')
+            logger.warning(
+                'scheduled-deploy settle: no escalation queue — pass skipped, so every '
+                'scheduled self-deploy keeps holding its dependents',
+            )
             return
         settler = ScheduledDeploySettler(
             store=self.scheduler,

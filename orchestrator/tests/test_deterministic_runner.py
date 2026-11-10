@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import functools
+import logging
 import os
 import subprocess
 import sys
@@ -11625,7 +11626,9 @@ class TestFileIllegalDeployTransition:
         )
 
         queue = EscalationQueue(tmp_path)
-        file_illegal_deploy_transition(queue, '7238', DeployPhase.SCHEDULED, DeployPhase.DONE)
+        file_illegal_deploy_transition(
+            queue, '7238', DeployPhase.SCHEDULED, DeployPhase.DONE, actor='ScheduledDeploySettler',
+        )
 
         [record] = queue.get_by_task('7238')
         assert record.agent_role == DETERMINISTIC_AGENT_ROLE
@@ -11634,18 +11637,21 @@ class TestFileIllegalDeployTransition:
         assert record.category == 'illegal_deploy_transition'
         assert 'scheduled' in record.summary
         assert 'done' in record.summary
+        assert record.detail.startswith('ScheduledDeploySettler attempted')
+        assert 'DeterministicRunner' not in record.detail
 
 
-class TestFileDeterministicInfraIssue:
-    """The runner's born-at-L2 infra_issue filing is a module-level function, so
-    the scheduled-deploy settler files the same record the runner does."""
+class TestFileDeterministicEscalation:
+    """The runner's born-at-L2 filing is a module-level function, so the
+    scheduled-deploy settler files the same record the runner does."""
 
     @staticmethod
     def _file(queue, **kwargs):
-        from orchestrator.deterministic_runner import file_deterministic_infra_issue
+        from orchestrator.deterministic_runner import file_deterministic_escalation
 
-        return file_deterministic_infra_issue(
-            queue, '7238', summary=kwargs.pop('summary', 'restart failed'),
+        return file_deterministic_escalation(
+            queue, '7238', actor='ScheduledDeploySettler',
+            summary=kwargs.pop('summary', 'restart failed'),
             detail=kwargs.pop('detail', 'the transient read failed'), **kwargs,
         )
 
@@ -11702,3 +11708,12 @@ class TestFileDeterministicInfraIssue:
 
         [record] = queue.get_by_task('7238')
         assert record.category == 'milestone_check_failed'
+
+    def test_the_filing_is_logged_under_its_actor(self, tmp_path, caplog):
+        queue = EscalationQueue(tmp_path)
+        with caplog.at_level(logging.INFO, logger='orchestrator.deterministic_runner'):
+            self._file(queue)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith('ScheduledDeploySettler: filed L2 infra_issue') for m in messages), messages
+        assert not any('DeterministicRunner' in m for m in messages), messages

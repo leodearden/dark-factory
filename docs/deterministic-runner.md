@@ -129,17 +129,22 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   - `scheduled` → `verified` once this process started after the transient
     fired and the transient unit has finished
     (`scripts/restart-all-orchestrators.sh` restarts the dispatching unit
-    last); `scheduled` → `failed` when the transient's RP-4 wrapper filed its
-    fire-time escalation or the unit reads `failed`.
+    last); `scheduled` → `failed` when the unit reads `failed` or an own-role
+    `infra_issue` escalation was filed since scheduling.  That is the
+    transient's RP-4 fire-time filing, or the runner's own completion-failure
+    filing, which shares its role and category; the settler cannot tell them
+    apart, so it errs toward holding.
   - `failed` → `escalated`.  The settler files the born-at-L2 itself
-    (`orchestrator/src/orchestrator/deterministic_runner.py::file_deterministic_infra_issue`)
-    only when no own-role fire-failure record exists.
+    (`orchestrator/src/orchestrator/deterministic_runner.py::file_deterministic_escalation`)
+    only when no such own-role escalation exists.
   - `escalated` → `done` once no own-role escalation for the task is pending
     and the restart has landed.  This also releases a deploy that went done
     after a completion-failure escalation and sits at phase `escalated` (the
     task 2912 shape).
   - A held phase no writer advances (e.g. `ran`, or an unreadable slice) is
     reported at WARNING on every settle pass and must be repaired by hand.
+    A transient whose state cannot be read, and a restart still unobserved
+    six hours after its fire time, are reported at WARNING on every pass too.
 
   The dispatch tick keeps serving a held record from its cache when the
   re-fetch fails or is deferred past the per-tick fetch budget

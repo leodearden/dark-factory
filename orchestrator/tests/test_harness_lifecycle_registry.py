@@ -124,6 +124,24 @@ class TestLifecycleRegistrationOrder:
         assert names == [n for n in _CANONICAL_ORDER if n not in gated]
 
     @pytest.mark.asyncio
+    async def test_a_scheduled_deploy_settle_pass_without_a_queue_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness._build_lifecycle_registry()
+        assert harness._lifecycle is not None
+        [settle] = [s for s in harness._lifecycle.services if s.name == 'scheduled-deploy-settle']
+        assert isinstance(settle, BackgroundService)
+
+        with caplog.at_level('WARNING', logger='orchestrator.harness'):
+            await settle.pass_fn()
+
+        assert any(
+            'scheduled-deploy settle' in r.getMessage() and 'no escalation queue' in r.getMessage()
+            for r in caplog.records if r.levelname == 'WARNING'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_first_service_is_a_live_loop_stall_monitor(
         self, tmp_path: Path,
     ) -> None:

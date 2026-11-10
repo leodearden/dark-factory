@@ -3,8 +3,8 @@
 A self-target deploy goes done while its restart is only scheduled, and its
 dependents wait until ``deploy_state.phase`` reads verified.  The settler is
 what moves the phase: VERIFIED once this orchestrator started after the
-transient fired and the transient has finished, FAILED on the transient's
-fire-time escalation or a failed unit, otherwise left at SCHEDULED.
+transient fired and the transient has finished, FAILED on an own-role
+failure escalation or a failed unit, otherwise left at SCHEDULED.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
+from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 
 from orchestrator.scheduled_deploy_settle import (
     ScheduledDeploySettler,
@@ -70,7 +71,7 @@ class TestScheduledRestart:
 
 
 @pytest.mark.parametrize(
-    ('started_at', 'active_state', 'fire_failures', 'expected'),
+    ('started_at', 'active_state', 'failure_escalations', 'expected'),
     [
         (STARTED_AFTER_FIRE, 'active', 1, DeployPhase.FAILED),
         (STARTED_AFTER_FIRE, 'inactive', 1, DeployPhase.FAILED),
@@ -96,12 +97,12 @@ class TestScheduledRestart:
         'collected-after-fire',
     ],
 )
-def test_settled_phase(started_at, active_state, fire_failures, expected) -> None:
+def test_settled_phase(started_at, active_state, failure_escalations, expected) -> None:
     phase = settled_phase(
         _restart(),
         process_started_at=started_at,
         transient_active_state=active_state,
-        fire_failures=fire_failures,
+        failure_escalations=failure_escalations,
     )
     assert phase is expected
 
@@ -175,18 +176,29 @@ class _Lookup:
 
 
 class _Store:
-    def __init__(self, tasks: dict[str, dict], *, update_ok: bool = True, raises_for: str | None = None):
+    def __init__(
+        self,
+        tasks: dict[str, dict],
+        *,
+        update_ok: bool = True,
+        raises_for: str | None = None,
+        fails_for: str | None = None,
+    ):
         self.tasks = tasks
         self.update_ok = update_ok
         self.raises_for = raises_for
+        self.fails_for = fails_for
         self.reads: list[str] = []
         self.updates: list[tuple[str, dict, str]] = []
 
-    async def get_task(self, task_id: str) -> dict | None:
+    async def read_task(self, task_id: str) -> TaskRead:
         self.reads.append(task_id)
         if task_id == self.raises_for:
             raise RuntimeError('fused-memory down')
-        return self.tasks.get(task_id)
+        if task_id == self.fails_for:
+            return TaskReadFailed('get_task error=fused-memory down')
+        task = self.tasks.get(task_id)
+        return TaskAbsent() if task is None else TaskFound(task)
 
     async def update_task(self, task_id: str, metadata: dict, *, metadata_mode: str) -> bool:
         self.updates.append((task_id, metadata, metadata_mode))
@@ -213,14 +225,16 @@ def _inspector(states: dict[str, str]):
     return inspect
 
 
-def _settler(store, lookup, queue, *, active_state: str = 'inactive', started_at=STARTED_AFTER_FIRE):
+def _settler(
+    store, lookup, queue, *, active_state: str = 'inactive', started_at=STARTED_AFTER_FIRE, now=NOW,
+):
     return ScheduledDeploySettler(
         store,
         lookup,
         queue,
         process_started_at=started_at,
         unit_inspector=_inspector({TRANSIENT: active_state}),
-        clock=lambda: NOW,
+        clock=lambda: now,
     )
 
 
@@ -269,11 +283,12 @@ class TestSettlePass:
         task = _deploy_task()
         store = _Store({'7238': task})
         lookup = _Lookup([_row(task)])
+        before = dict(task['metadata']['deploy_state'])
 
         await _settler(store, lookup, EscalationQueue(tmp_path)).settle_pass()
 
         assert lookup.calls == [('deploy_state', None, ('done',), True)]
-        expected_state = {**task['metadata']['deploy_state'], 'phase': 'verified', 'verified_at': NOW.isoformat()}
+        expected_state = {**before, 'phase': 'verified', 'verified_at': NOW.isoformat()}
         assert store.updates == [('7238', {'deploy_state': expected_state}, 'merge')]
 
     @pytest.mark.asyncio
@@ -289,7 +304,10 @@ class TestSettlePass:
 
         [(task_id, metadata, mode)] = store.updates
         assert (task_id, metadata['deploy_state']['phase'], mode) == ('7238', 'failed', 'merge')
-        assert any(r.levelno == logging.ERROR and esc_id in r.getMessage() for r in caplog.records)
+        assert any(
+            r.levelno == logging.ERROR and esc_id in r.getMessage() and 'failure evidence' in r.getMessage()
+            for r in caplog.records
+        )
         assert len(queue.get_by_task('7238')) == before
 
     @pytest.mark.asyncio
@@ -370,6 +388,49 @@ class TestSettlePass:
         await _settler(store, lookup, EscalationQueue(tmp_path)).settle_pass()
 
         assert [task_id for task_id, _, _ in store.updates] == ['7238']
+
+    @pytest.mark.asyncio
+    async def test_a_failed_re_read_is_reported_at_warning(self, tmp_path, caplog) -> None:
+        task = _deploy_task()
+        store = _Store({'7238': task}, fails_for='7238')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduled_deploy_settle'):
+            await _settler(store, _Lookup([_row(task)]), EscalationQueue(tmp_path)).settle_pass()
+        assert store.updates == []
+        assert any(
+            r.levelno == logging.WARNING and '7238' in r.getMessage() and 'fused-memory down' in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_candidate_writes_nothing(self, tmp_path) -> None:
+        store = _Store({})
+        await _settler(store, _Lookup([_row(_deploy_task())]), EscalationQueue(tmp_path)).settle_pass()
+        assert (store.reads, store.updates) == (['7238'], [])
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_transient_is_reported_at_warning(self, tmp_path, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduled_deploy_settle'):
+            store = await _settle_one(tmp_path, _deploy_task(), active_state='')
+        assert store.updates == []
+        assert any(
+            r.levelno == logging.WARNING and '7238' in r.getMessage() and 'unreadable' in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('now', 'warned'),
+        [(FIRES_AT + timedelta(hours=7), True), (FIRES_AT + timedelta(hours=5), False)],
+        ids=['overdue', 'not-yet-overdue'],
+    )
+    async def test_a_restart_long_past_its_fire_time_is_reported_at_warning(
+        self, tmp_path, caplog, now, warned,
+    ) -> None:
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduled_deploy_settle'):
+            store = await _settle_one(tmp_path, _deploy_task(), started_at=T0, now=now)
+        assert store.updates == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and '7238' in r.getMessage()]
+        assert bool(warnings) is warned, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_a_refused_write_is_logged_and_the_pass_completes(self, tmp_path, caplog) -> None:
