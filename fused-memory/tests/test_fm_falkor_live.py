@@ -170,8 +170,9 @@ class TestFalkorHelpers:
     def test_falkor_skipif_default_reason(self):
         """falkor_skipif() returns a pytest.mark.skipif marker with a non-empty default reason.
 
-        The exact wording is deliberately not pinned — matching the Qdrant
-        sibling above. A reword is cosmetic and nothing depends on the prose.
+        The exact wording is deliberately not pinned — matching
+        test_fm_qdrant_live.py::TestQdrantHelpers::test_qdrant_skipif_default_reason.
+        A reword is cosmetic and nothing depends on the prose.
         """
         from _fm_falkor_live import falkor_skipif
 

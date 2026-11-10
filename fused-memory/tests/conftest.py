@@ -3,10 +3,8 @@
 Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
-conftests under `sys.modules['conftest']`. The live-backend probes,
-polling barriers, real-git builders and httpx-leak reaping live in their own
-`_fm_*.py` siblings (`_fm_falkor_live`, `_fm_qdrant_live`, `_fm_polling`,
-`_fm_git_repos`, `_fm_httpx_leaks`) under the same convention.
+conftests under `sys.modules['conftest']`, and in the `_fm_*.py` siblings
+that `_fm_helpers`' module docstring lists.
 
 Testing a `scripts/` script? `scripts/` is not a package and is not on
 PYTHONPATH, so import it with `from _fm_helpers import
