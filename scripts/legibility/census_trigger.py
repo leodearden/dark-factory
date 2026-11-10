@@ -188,6 +188,7 @@ class CensusConfig:
     novelty_spike_multiple: int = _CENSUS_DEFAULTS.novelty_spike.multiple
     novelty_spike_baseline_days: int = _CENSUS_DEFAULTS.novelty_spike.baseline_days
     floor_days: int = _CENSUS_DEFAULTS.floor_days
+    completion_threshold_pct: int = _CENSUS_DEFAULTS.completion_threshold_pct
 
     @classmethod
     def from_mapping(cls, mapping: dict | None) -> CensusConfig:
@@ -235,13 +236,28 @@ class CensusConfig:
             )
             novelty_spike = {}
 
-        def _threshold(label: str, source: dict, key: str, default: int) -> int:
+        def _threshold(
+            label: str,
+            source: dict,
+            key: str,
+            default: int,
+            *,
+            minimum: int = 0,
+            maximum: int | None = None,
+        ) -> int:
             if key not in source:
                 return default
             value = source[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            in_range = (
+                not isinstance(value, bool)
+                and isinstance(value, int)
+                and value >= minimum
+                and (maximum is None or value <= maximum)
+            )
+            if not in_range:
+                expected = "" if maximum is None else f", expected {minimum}..{maximum}"
                 rejected.append(
-                    f"{label}={_bounded_repr(value)} ({type(value).__name__})"
+                    f"{label}={_bounded_repr(value)} ({type(value).__name__}{expected})"
                 )
                 return default
             return value
@@ -278,6 +294,10 @@ class CensusConfig:
             floor_days=_threshold(
                 "floor_days", mapping, "floor_days", defaults.floor_days,
             ),
+            completion_threshold_pct=_threshold(
+                "completion_threshold_pct", mapping, "completion_threshold_pct",
+                defaults.completion_threshold_pct, minimum=1, maximum=100,
+            ),
         )
 
         # ONE warning for the whole block, not one per field: this is a single
@@ -287,8 +307,9 @@ class CensusConfig:
         if rejected:
             logger.warning(
                 "legibility config census: block has %d unusable value(s), each "
-                "falling back to its default -- every §7.4 threshold must be a "
-                "non-negative int (unquoted, not a float/bool): %s",
+                "falling back to its default -- every §7.4 threshold must be an "
+                "unquoted int (not a float/bool), non-negative unless a range is "
+                "named: %s",
                 len(rejected),
                 "; ".join(rejected),
             )
