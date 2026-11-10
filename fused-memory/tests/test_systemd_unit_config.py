@@ -9,6 +9,7 @@ ensures that even if the dedicated-thread heartbeat is delayed, systemd gives
 the process 120s before SIGABRT (was 30s — too tight with the old on-loop design).
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -270,30 +271,63 @@ def _wait_timeout(line: str) -> int:
     return int(argv[argv.index("--timeout") + 1])
 
 
+_EMBEDDER_ADDRESS = "127.0.0.1:8420"
+_STORE_ADDRESSES = ("127.0.0.1:6379", "127.0.0.1:6333")
+
+
+def _is_embedder_up(line: str) -> bool:
+    argv = line.split()
+    return "compose" in argv and "up" in argv and "embedder" in argv
+
+
+def _is_embedder_wait(line: str) -> bool:
+    return "wait-for-port" in line and _EMBEDDER_ADDRESS in line.split()
+
+
+def _is_store_wait(line: str) -> bool:
+    return "wait-for-port" in line and set(_STORE_ADDRESSES) <= set(line.split())
+
+
+def _index_of(lines: list[str], is_wanted: Callable[[str], bool]) -> int:
+    matches = [index for index, line in enumerate(lines) if is_wanted(line)]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
 class TestEmbedderStartHooks:
     """The embedder hooks never block fused-memory's start and fit the start timeout."""
 
-    def test_both_embedder_lines_carry_the_ignore_failure_prefix(self) -> None:
-        embedder_lines = [l for l in _exec_start_pre(_SERVICE_TEMPLATE) if "embedder" in l or ":8420" in l]
+    def test_only_the_up_and_the_wait_concern_the_embedder_and_both_ignore_failure(self) -> None:
+        embedder_lines = [
+            line for line in _exec_start_pre(_SERVICE_TEMPLATE)
+            if "embedder" in line or _EMBEDDER_ADDRESS in line
+        ]
         assert len(embedder_lines) == 2
-        assert all(l.startswith("ExecStartPre=-") for l in embedder_lines)
+        assert sum(map(_is_embedder_up, embedder_lines)) == 1
+        assert sum(map(_is_embedder_wait, embedder_lines)) == 1
+        assert all(line.startswith("ExecStartPre=-") for line in embedder_lines)
+
+    def test_embedder_up_never_pulls_and_names_only_the_embedder(self) -> None:
+        lines = _exec_start_pre(_SERVICE_TEMPLATE)
+        argv = lines[_index_of(lines, _is_embedder_up)].split()
+        assert "--pull=never" in argv
+        assert argv[-1] == "embedder"
 
     def test_embedder_is_started_before_the_store_wait_and_waited_on_after(self) -> None:
         lines = _exec_start_pre(_SERVICE_TEMPLATE)
-        up = next(i for i, l in enumerate(lines) if l.endswith("up -d embedder"))
-        store_wait = next(i for i, l in enumerate(lines) if "127.0.0.1:6379" in l)
-        embedder_wait = next(i for i, l in enumerate(lines) if "127.0.0.1:8420" in l)
+        up = _index_of(lines, _is_embedder_up)
+        store_wait = _index_of(lines, _is_store_wait)
+        embedder_wait = _index_of(lines, _is_embedder_wait)
         assert up < store_wait < embedder_wait
 
-    def test_existing_store_lines_are_unprefixed_so_store_failure_still_fails_the_start(self) -> None:
+    def test_store_wait_is_unprefixed_so_store_failure_still_fails_the_start(self) -> None:
         lines = _exec_start_pre(_SERVICE_TEMPLATE)
-        store_wait = next(l for l in lines if "127.0.0.1:6379" in l)
-        assert store_wait.startswith("ExecStartPre=/")
+        assert lines[_index_of(lines, _is_store_wait)].startswith("ExecStartPre=/")
 
     def test_serial_waits_fit_inside_the_start_timeout(self) -> None:
         service = _parse_systemd_unit(_SERVICE_TEMPLATE)["Service"]
         start_timeout = int(next(d for d in service if d.startswith("TimeoutStartSec=")).split("=", 1)[1])
-        waits = [_wait_timeout(l) for l in _exec_start_pre(_SERVICE_TEMPLATE) if "wait-for-port" in l]
+        waits = [_wait_timeout(line) for line in _exec_start_pre(_SERVICE_TEMPLATE) if "wait-for-port" in line]
         assert sum(waits) < start_timeout
 
 
