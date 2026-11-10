@@ -382,6 +382,37 @@ class TestDeterministicTaskErrorBeforeDoneCwd:
 
         assert self._submit(project_root, cwd=cwd) is None
 
+    @staticmethod
+    def _cwd_form(project_root, elsewhere, form):
+        """The cwd string to submit and the directory it names."""
+        if form == 'absolute':
+            return str(elsewhere), elsewhere
+        sub = project_root / 'sub'
+        sub.mkdir()
+        return 'sub', sub
+
+    @pytest.mark.parametrize('form', ['absolute', 'relative'])
+    def test_relative_script_with_cwd_is_validated_under_project_root(
+        self, project_root, elsewhere, form,
+    ):
+        cwd, _ = self._cwd_form(project_root, elsewhere, form)
+        _install_executable(project_root)
+
+        assert self._submit(project_root, cwd=cwd) is None
+
+    @pytest.mark.parametrize('form', ['absolute', 'relative'])
+    def test_relative_script_present_only_under_cwd_is_refused(
+        self, project_root, elsewhere, form,
+    ):
+        cwd, cwd_dir = self._cwd_form(project_root, elsewhere, form)
+        _install_executable(cwd_dir)
+
+        result = self._submit(project_root, cwd=cwd)
+
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'does not exist under project_root' in result['error']
+
 
 # ---------------------------------------------------------------------------
 # Step-5: inject_task_kind tests
