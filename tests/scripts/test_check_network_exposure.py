@@ -15,6 +15,8 @@ import pathlib
 import shlex
 import shutil
 import socket
+import subprocess
+import sys
 
 import check_network_exposure as exposure
 import pytest
@@ -25,6 +27,8 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 COMPOSE_PATH = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
 SCHEMA_PATH = REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "config" / "schema.py"
 FM_CONFIG_PATH = REPO_ROOT / "fused-memory" / "config" / "config.yaml"
+SCRIPT_PATH = REPO_ROOT / "scripts" / "check_network_exposure.py"
+REPORT_TAG = "[network_exposure]"
 
 # ---------------------------------------------------------------------------
 # socket_unit_ports: `systemctl --user list-sockets -o json`
@@ -514,3 +518,66 @@ def test_run_reports_findings_in_ascending_port_order(fake_host: FakeHost, held)
 
     assert verdict == exposure.ExposureExit.FINDING
     assert _line_index(lines, "[exposed]", f"port {low}") < _line_index(lines, "[exposed]", f"port {high}")
+
+
+# ---------------------------------------------------------------------------
+# The CLI's exit contract: 0/1 always tagged, 2 never tagged
+# ---------------------------------------------------------------------------
+
+
+def _cli(tmp_path: pathlib.Path, *args: str, script: pathlib.Path = SCRIPT_PATH) -> tuple[int, str]:
+    """Run the real script with systemctl printing no rows and ip printing garbage.
+
+    The unreadable `ip` source makes the exit 1 whatever this host's ports are.
+    """
+    host = FakeHost(tmp_path)
+    host.serve("systemctl", [])
+    host.stub("ip", "echo 'not json'\n")
+    env = {**os.environ, "PATH": f"{host.bin_dir}:{os.environ['PATH']}"}
+    result = subprocess.run(
+        [sys.executable, str(script), *args], capture_output=True, text=True, env=env, timeout=120
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def _assert_every_line_tagged(output: str) -> None:
+    lines = output.splitlines()
+    assert lines, "the CLI printed nothing"
+    untagged = [line for line in lines if not line.startswith(f"{REPORT_TAG} ")]
+    assert not untagged, f"untagged lines: {untagged}"
+
+
+def test_cli_reports_a_source_error_tagged_and_exits_1(tmp_path: pathlib.Path):
+    rc, output = _cli(tmp_path)
+
+    assert rc == exposure.ExposureExit.FINDING, output
+    _assert_every_line_tagged(output)
+    _line_index(output.splitlines(), "[source-error]", "ip -j addr")
+
+
+def test_cli_accepts_a_connect_timeout(tmp_path: pathlib.Path):
+    rc, output = _cli(tmp_path, "--connect-timeout", "0.5")
+
+    assert rc == exposure.ExposureExit.FINDING, output
+    _assert_every_line_tagged(output)
+
+
+@pytest.mark.parametrize(
+    "args", [("--connect-timeout", "soon"), ("--bogus",)], ids=["non-numeric-timeout", "unknown-flag"]
+)
+def test_cli_usage_error_exits_2_without_the_tag(tmp_path: pathlib.Path, args: tuple[str, ...]):
+    rc, output = _cli(tmp_path, *args)
+
+    assert rc == 2, output
+    assert REPORT_TAG not in output, f"an argparse usage error must not look like a report:\n{output}"
+
+
+def test_cli_missing_script_exits_2_without_the_tag(tmp_path: pathlib.Path):
+    rc, output = _cli(tmp_path, script=tmp_path / "check_network_exposure_RENAMED.py")
+
+    assert rc == 2, output
+    assert REPORT_TAG not in output, f"a missing script must not look like a report:\n{output}"
+
+
+def test_script_is_executable():
+    assert os.access(SCRIPT_PATH, os.X_OK), f"{SCRIPT_PATH} is not executable"
