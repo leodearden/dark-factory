@@ -842,6 +842,7 @@ def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
         sequential_lint_first=True,
         verify_env={'K': 'V'},
         scope_cargo=True,
+        verify_cache='never',
     )
     left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
     assert left_default == [], (
