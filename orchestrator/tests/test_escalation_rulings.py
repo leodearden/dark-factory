@@ -8,9 +8,14 @@ import pytest
 from escalation.models import Escalation, cascade_resolved_by
 
 from orchestrator.escalation_rulings import (
+    RULING_INSTRUCTIONS,
+    RULINGS_HEADING,
+    RULINGS_LIMIT,
     Ruling,
+    RulingAudience,
     is_ruling,
     plan_confirmed_at,
+    render_rulings_section,
     select_rulings,
 )
 from orchestrator.resume_resolution import select_carried_resolutions
@@ -162,3 +167,111 @@ class TestPlanConfirmedAt:
     )
     def test_is_none_without_a_parseable_finalized_stamp(self, plan):
         assert plan_confirmed_at(plan) is None
+
+
+def _ruling(
+    esc_id: str = 'esc-4764-1',
+    *,
+    level: int = 2,
+    summary: str = 'keep or drop the solver wrap?',
+    resolution: str = 'KEEP the solver wrap',
+    resolved_at: str | None = '2026-08-02T00:00:00+00:00',
+    resolved_by: str | None = 'interactive',
+    resolution_action: str | None = 'resume',
+) -> Ruling:
+    return Ruling(
+        escalation_id=esc_id, level=level, summary=summary, resolution=resolution,
+        resolved_at=resolved_at, resolved_by=resolved_by, resolution_action=resolution_action,
+    )
+
+
+def _entry_headings(section: str) -> list[str]:
+    return [line for line in section.splitlines() if line.startswith('## ')]
+
+
+class TestRenderRulingsSection:
+    @pytest.mark.parametrize('audience', list(RulingAudience))
+    def test_no_rulings_render_nothing(self, audience):
+        assert render_rulings_section((), audience) == ''
+
+    def test_opens_with_the_heading_and_has_one_entry_per_ruling(self):
+        rulings = (_ruling('esc-4764-1', level=1, summary='first'), _ruling('esc-4764-2', summary='second'))
+
+        section = render_rulings_section(rulings, RulingAudience.EXECUTE)
+
+        assert section.startswith(RULINGS_HEADING + '\n')
+        assert _entry_headings(section) == [
+            '## `esc-4764-1` (level 1): first',
+            '## `esc-4764-2` (level 2): second',
+        ]
+
+    def test_an_entry_shows_its_attribution(self):
+        section = render_rulings_section(
+            (_ruling(resolved_by='interactive', resolved_at='2026-08-02T00:00:00+00:00', resolution_action='resume'),),
+            RulingAudience.EXECUTE,
+        )
+
+        assert '- resolved by: interactive\n' in section
+        assert '- resolved at: 2026-08-02T00:00:00+00:00\n' in section
+        assert '- action: resume\n' in section
+
+    def test_missing_attribution_reads_unknown(self):
+        section = render_rulings_section(
+            (_ruling(resolved_by=None, resolved_at=None, resolution_action=None),),
+            RulingAudience.EXECUTE,
+        )
+
+        assert '- resolved by: unknown\n' in section
+        assert '- resolved at: unknown\n' in section
+        assert '- action: unknown\n' in section
+
+    def test_resolution_text_is_blockquoted_line_by_line(self):
+        resolution = 'KEEP the solver wrap.\n# Not a heading\nWiden scope if needed.'
+
+        section = render_rulings_section((_ruling(resolution=resolution),), RulingAudience.EXECUTE)
+
+        assert '> KEEP the solver wrap.\n> # Not a heading\n> Widen scope if needed.\n' in section
+        headings = [line for line in section.splitlines() if line.startswith('#')]
+        assert headings == [RULINGS_HEADING, '## `esc-4764-1` (level 2): keep or drop the solver wrap?']
+
+    def test_a_multi_line_summary_is_collapsed_into_its_heading(self):
+        section = render_rulings_section(
+            (_ruling(summary='keep or drop\n# the solver wrap?'),), RulingAudience.EXECUTE,
+        )
+
+        assert _entry_headings(section) == ['## `esc-4764-1` (level 2): keep or drop # the solver wrap?']
+
+    def test_every_audience_has_its_own_instruction(self):
+        assert set(RULING_INSTRUCTIONS) == set(RulingAudience)
+        assert len(set(RULING_INSTRUCTIONS.values())) == len(RulingAudience)
+        assert '`escalate_blocker`' in RULING_INSTRUCTIONS[RulingAudience.EXECUTE]
+        assert 'blocking issue' in RULING_INSTRUCTIONS[RulingAudience.REVIEW]
+
+    @pytest.mark.parametrize('audience', list(RulingAudience))
+    def test_the_section_carries_its_audience_instruction(self, audience):
+        section = render_rulings_section((_ruling(),), audience)
+
+        assert RULING_INSTRUCTIONS[audience] in section
+        others = set(RulingAudience) - {audience}
+        assert not any(RULING_INSTRUCTIONS[other] in section for other in others)
+
+    def test_only_the_most_recent_rulings_are_listed_and_older_ids_named(self):
+        rulings = tuple(_ruling(f'esc-4764-{n:02d}', summary=f'ruling {n}') for n in range(1, RULINGS_LIMIT + 3))
+
+        section = render_rulings_section(rulings, RulingAudience.REVIEW)
+
+        listed = rulings[-RULINGS_LIMIT:]
+        omitted = rulings[:-RULINGS_LIMIT]
+        assert _entry_headings(section) == [
+            f'## `{r.escalation_id}` (level 2): {r.summary}' for r in listed
+        ]
+        overflow = [line for line in section.splitlines() if all(f'`{r.escalation_id}`' in line for r in omitted)]
+        assert len(overflow) == 1
+        assert not overflow[0].startswith('#')
+
+    @pytest.mark.parametrize('audience', list(RulingAudience))
+    def test_the_section_ends_with_a_blank_line(self, audience):
+        section = render_rulings_section((_ruling(),), audience)
+
+        assert section.endswith('\n\n')
+        assert not section.endswith('\n\n\n')
