@@ -722,7 +722,8 @@ async def run_server():
     # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
     # multi-project mode when config.path_scope_adjudicator.enabled is True.
     # In single-project/back-compat mode the adjudicator is None and the guard
-    # behaves exactly as before (heuristic-only, not weakened).
+    # behaves exactly as before (heuristic-only, not weakened).  It borrows the
+    # curator's gate and ledger store; _graceful_shutdown keeps owning the store's close.
     path_scope_adjudicator = None
     if _multi_project_mode and config.path_scope_adjudicator.enabled:
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
@@ -730,6 +731,7 @@ async def run_server():
         path_scope_adjudicator = PathScopeAdjudicator(
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             cwd=Path(_primary_root) if _primary_root else None,
             scope_violation_escalator=scope_violation_escalator,
         )
