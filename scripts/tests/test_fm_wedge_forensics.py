@@ -219,6 +219,21 @@ UNIT_LEFT_DOWN_JOURNAL = """\
 2026-09-16T15:11:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# ASSEMBLED, not captured: the real 2026-11-08 restart job, with its Starting
+# and Started pushed out 4 minutes so the silence registers; only the
+# separation is synthetic. It is a post-deploy `restart`, which keeps
+# fused-memory.socket bound and logs nothing on it. Its service lines have the
+# same shape as UNIT_LEFT_DOWN_JOURNAL's; only the date differs. Nor can the
+# socket's own journal witness the port here: measured 2026-11-10,
+# `journalctl --user -u fused-memory.socket` = "-- No entries --".
+SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:38:18+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # ASSEMBLED, not captured: episode 2 reduced to its teardown, plus ONE added
 # line — a git error attributed to the pid systemd later SIGKILLs as `git`.
 # A spawned child inherits the unit's stderr, so its output is journaled under
@@ -405,6 +420,18 @@ def test_a_silence_that_begins_with_the_unit_already_down_reports_port_down():
     assert episodes[0].stall_seconds == 240.0
     assert episodes[0].watchdog_verdict == "port-down"
     assert episodes[0].outcome == "unit-down"
+
+
+def test_a_unit_down_silence_under_socket_activation_reports_no_watchdog_verdict():
+    """fused-memory.socket keeps 8002 bound through a restart or crash and logs
+    nothing, so this capture cannot say whether the watchdog saw 'port-down'
+    or 'wedged' (OPERATIONS.md §"fused-memory liveness revive")."""
+    episodes = analyze(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict is None
 
 
 # ---------------------------------------------------------------------------
