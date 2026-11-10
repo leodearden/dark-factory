@@ -244,6 +244,20 @@ def parse_t3_end_input(raw: str) -> T3End | None:
         raise ValueError(f'CLAUDE_SPAWN_T3_END={raw!r} is not one of none|settle|archive') from None
 
 
+def _parse_end_of_work_inputs(env: Mapping[str, str]) -> tuple[bool, T3End | None]:
+    """Parse (self_exit, t3_end) strictly; an act is set only on the T3 lane, where self-exit means exactly archive."""
+    self_exit_raw = env.get('CLAUDE_SPAWN_SELF_EXIT', '') or ''
+    t3_end_raw = env.get('CLAUDE_SPAWN_T3_END', '') or ''
+    self_exit = self_exit_raw == '1'
+    t3_end = parse_t3_end_input(t3_end_raw)
+    if t3_end is not None and self_exit != (t3_end is T3End.ARCHIVE):
+        raise ValueError(
+            f'CLAUDE_SPAWN_SELF_EXIT={self_exit_raw!r} contradicts CLAUDE_SPAWN_T3_END={t3_end_raw!r}: '
+            'a T3 spawn self-exits exactly when its act is archive'
+        )
+    return self_exit, t3_end
+
+
 @dataclass
 class Display:
     """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
@@ -5295,8 +5309,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
     launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
     launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
-    self_exit = env.get('CLAUDE_SPAWN_SELF_EXIT') == '1'
-    t3_end = parse_t3_end_input(env.get('CLAUDE_SPAWN_T3_END', '') or '')
+    self_exit, t3_end = _parse_end_of_work_inputs(env)
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
