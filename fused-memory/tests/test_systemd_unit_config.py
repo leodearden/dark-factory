@@ -283,6 +283,12 @@ def _bound_secs(exec_line: str) -> int | None:
     return None
 
 
+def _required_bound_secs(exec_line: str) -> int:
+    bound = _bound_secs(exec_line)
+    assert bound is not None, exec_line
+    return bound
+
+
 def _published_embedder_address() -> str:
     """The host side of the embedder's compose publish, e.g. 127.0.0.1:8420."""
     compose = yaml.safe_load(_COMPOSE_FILE.read_text(encoding="utf-8"))
@@ -355,8 +361,8 @@ class TestEmbedderStartHooks:
         service = _parse_systemd_unit(_SERVICE_TEMPLATE)["Service"]
         start_timeout = int(next(d for d in service if d.startswith("TimeoutStartSec=")).split("=", 1)[1])
         lines = _exec_start_pre(_SERVICE_TEMPLATE)
-        store_wait = _bound_secs(lines[_index_of(lines, _is_store_wait)])
-        embedder_bounds = [_bound_secs(line) for line in self._embedder_lines()]
+        store_wait = _required_bound_secs(lines[_index_of(lines, _is_store_wait)])
+        embedder_bounds = [_required_bound_secs(line) for line in self._embedder_lines()]
         assert store_wait + sum(embedder_bounds) < start_timeout
 
 
