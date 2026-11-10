@@ -39,10 +39,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, assert_never, overload
 
 from legibility import census_identity, census_state, codebook, layout, state_docs
-from legibility.config import Census, LegibilityConfig, load_config
+from legibility.config import Census, LegibilityConfig, load_config, project_root_mismatch
 
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
@@ -534,28 +534,29 @@ def default_status_fetcher(project_root: str | Path):
 # ---------------------------------------------------------------------------
 
 def _floor_anchor(
-    state: census_state.CensusState | None,
+    read: state_docs.Missing | state_docs.Ok[census_state.CensusState],
     *,
-    never_censused: bool,
     earliest_codebook_date: datetime | None,
 ) -> FloorAnchor | None:
     """The instant the floor is measured from: the session watermark, else
     midnight UTC of last_census_at, else, for a never-censused project, the
     earliest codebook date."""
-    if never_censused:
-        if earliest_codebook_date is None:
-            return None
-        return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
-    if state is None:
-        return None
-    if state.session_watermark is not None:
-        return FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, state.session_watermark)
-    if state.last_census_at is None:
-        return None
-    return FloorAnchor(
-        FloorAnchorKind.LAST_CENSUS_AT,
-        datetime.combine(state.last_census_at, time.min, tzinfo=UTC),
-    )
+    match read:
+        case state_docs.Missing():
+            if earliest_codebook_date is None:
+                return None
+            return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
+        case state_docs.Ok(value=state):
+            if state.session_watermark is not None:
+                return FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, state.session_watermark)
+            if state.last_census_at is None:
+                return None
+            return FloorAnchor(
+                FloorAnchorKind.LAST_CENSUS_AT,
+                datetime.combine(state.last_census_at, time.min, tzinfo=UTC),
+            )
+        case _:
+            assert_never(read)
 
 
 def decide_for_project(
@@ -610,11 +611,7 @@ def decide_for_project(
     )
     return evaluate(
         now=now,
-        floor_anchor=_floor_anchor(
-            read.value if isinstance(read, state_docs.Ok) else None,
-            never_censused=isinstance(read, state_docs.Missing),
-            earliest_codebook_date=earliest_sighting,
-        ),
+        floor_anchor=_floor_anchor(read, earliest_codebook_date=earliest_sighting),
         completion=completion,
         candidate_first_seens=candidate_first_seens,
         config=cfg.census,
@@ -622,7 +619,7 @@ def decide_for_project(
 
 
 # ---------------------------------------------------------------------------
-# CLI — `evaluate --project-root <path>`
+# CLI — `evaluate --project-root <path> [--config <path>]`
 # ---------------------------------------------------------------------------
 
 def _config_line(config_path: Path, cfg: LegibilityConfig) -> str:
@@ -640,11 +637,16 @@ def _config_line(config_path: Path, cfg: LegibilityConfig) -> str:
 
 
 def _cmd_evaluate(args: argparse.Namespace) -> int:
-    config_path = layout.config_path(Path(args.project_root))
+    project_root = Path(args.project_root).resolve()
+    config_path = Path(args.config) if args.config else layout.config_path(project_root)
     try:
         cfg = load_config(config_path)
     except Exception as exc:
         print(f"census_trigger: failed to load config at {config_path}: {exc}", file=sys.stderr)
+        return 1
+    mismatch = project_root_mismatch(project_root, cfg, config_path)
+    if mismatch is not None:
+        print(f"census_trigger: {mismatch}", file=sys.stderr)
         return 1
 
     print(_config_line(config_path, cfg))
@@ -659,9 +661,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="census_trigger",
         description="Legibility periodic-census trigger evaluator "
-        "(plans/census-incremental-prd.md C7). Exits 1 when the project's "
-        "legibility.yaml does not load, else 0; an evaluation error prints "
-        "NO-FIRE.",
+        "(plans/census-incremental-prd.md C7). Exits 1 when the legibility.yaml "
+        "does not load or names another project_root than --project-root, else "
+        "0; an evaluation error prints NO-FIRE.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -669,6 +671,11 @@ def main(argv: list[str] | None = None) -> int:
         "evaluate", help="evaluate whether the periodic census should fire"
     )
     evaluate_parser.add_argument("--project-root", default=".")
+    evaluate_parser.add_argument(
+        "--config", default=None,
+        help="Path to the project's legibility.yaml "
+        "(default: <project-root>/docs/legibility/legibility.yaml).",
+    )
     evaluate_parser.set_defaults(func=_cmd_evaluate)
 
     args = parser.parse_args(argv)

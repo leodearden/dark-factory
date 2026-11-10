@@ -1,6 +1,6 @@
 """Tests for scripts/legibility/census_state.py — the census-state.json
-document (plans/census-incremental-prd.md §4.2): its one reader and its one
-writer.
+document (plans/census-incremental-prd.md §4.2): its validated reader and its
+one writer.
 
 Driven against real tmp files, so each case is pinned by what a caller sees:
 which state_docs variant comes back, the typed values it carries, and what
@@ -98,6 +98,11 @@ class TestLoad:
         assert len(warnings) == 1
         assert field in warnings[0]
         assert repr(value) in warnings[0]
+
+    def test_a_bad_last_census_at_names_the_date_shape_it_expected(self, tmp_path, caplog):
+        read = _load_json(tmp_path, caplog, {**_SIX_KEY_STATE, 'last_census_at': 'not-a-date'})
+        assert isinstance(read, state_docs.Malformed)
+        assert 'expected an ISO date (or a legacy ISO datetime)' in read.reason
 
     @pytest.mark.parametrize(
         'document',

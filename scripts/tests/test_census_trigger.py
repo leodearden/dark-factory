@@ -1447,8 +1447,59 @@ def test_cli_evaluate_rejects_a_malformed_census_value(tmp_path, capsys):
     assert exit_code == 1
     assert str(config_path) in captured.err
     assert "floor_days" in captured.err
-    assert "-1" in captured.err
+    assert "input_value=-1" in captured.err
     assert "DECISION" not in captured.out
+
+
+def test_cli_evaluate_reads_the_config_that_config_names(tmp_path, capsys):
+    project_root = tmp_path / "project"
+    _write_codebook(project_root)
+    _write_census_state(project_root, **_real_now_state())
+    pinned = tmp_path / "pinned" / "legibility.yaml"
+    pinned.parent.mkdir()
+    pinned.write_text(_config_yaml(project_root, "census: {floor_days: 7}"), encoding="utf-8")
+
+    exit_code = ct.main(
+        ["evaluate", "--project-root", str(project_root), "--config", str(pinned)]
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    (config_line,) = [line for line in out.splitlines() if line.startswith("config: ")]
+    assert str(pinned) in config_line
+    assert "floor_days=7" in config_line
+
+
+def test_cli_evaluate_refuses_a_config_naming_another_project_root(tmp_path, capsys):
+    """A worktree's legibility.yaml names the main checkout: evaluating it
+    would read one tree's state against the other's config."""
+    worktree = tmp_path / "worktree"
+    main_checkout = tmp_path / "main"
+    main_checkout.mkdir()
+    _write_codebook(worktree)
+    config_path = worktree / "docs" / "legibility" / "legibility.yaml"
+    config_path.write_text(_config_yaml(main_checkout), encoding="utf-8")
+
+    exit_code = ct.main(["evaluate", "--project-root", str(worktree)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert str(worktree) in captured.err
+    assert str(main_checkout) in captured.err
+    assert str(config_path) in captured.err
+    assert "DECISION" not in captured.out
+
+
+def test_cli_evaluate_defaults_the_project_root_to_the_cwd(tmp_path, capsys, monkeypatch):
+    _write_config(tmp_path)
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **_real_now_state())
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = ct.main(["evaluate"])
+
+    assert exit_code == 0
+    assert "DECISION:" in capsys.readouterr().out
 
 
 def test_cli_evaluate_without_a_config_exits_1_naming_the_expected_path(tmp_path, capsys):

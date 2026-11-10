@@ -344,14 +344,16 @@ class TestRetiredCensusKeys:
               tasks_landed_threshold: 120
               tasks_landed_min_days: 7
             """)
+        path = _write(tmp_path, text)
         with caplog.at_level('WARNING'):
-            cfg = mod.load_config(_write(tmp_path, text))
+            cfg = mod.load_config(path)
         warnings = _warnings(caplog)
         assert len(warnings) == 1
         for key in RETIRED_KEYS:
             assert key in warnings[0]
         assert 'retired' in warnings[0]
         assert 'ignored' in warnings[0]
+        assert str(path) in warnings[0]
         assert cfg.census.completion_threshold_pct == 70
         extra = cfg.census.model_extra or {}
         assert not any(key in extra for key in RETIRED_KEYS)
@@ -725,8 +727,10 @@ class TestShippedDarkFactoryConfig:
         assert cfg.sampling.top_fraction == 0.12
         assert cfg.sampling.per_stratum_min == 2
 
-    def test_shipped_config_census_and_models_nonempty(self):
-        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+    def test_shipped_config_census_and_models_nonempty(self, caplog):
+        with caplog.at_level('WARNING'):
+            cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert _warnings(caplog) == [], 'the shipped config carries a retired key'
         assert cfg.census.completion_threshold_pct == 70
         assert cfg.census.floor_days > 0
         assert cfg.models.trickle

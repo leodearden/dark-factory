@@ -3,7 +3,9 @@ identity, the previous run's state, and the commit it reads
 (plans/census-incremental-prd.md §4.2)."""
 from __future__ import annotations
 
+import importlib.util
 import subprocess
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -128,3 +130,17 @@ def test_prior_census_of_a_legacy_state_carries_only_its_date():
 ], ids=["missing", "malformed"])
 def test_prior_census_without_a_usable_state_is_empty(read):
     assert census_identity.prior_census(read) == PriorCensus()
+
+
+def test_prior_census_refuses_an_ok_from_a_second_copy_of_state_docs(monkeypatch):
+    """One source file loaded as two modules has two Ok classes. Reading the
+    other copy's Ok as "no previous run" would lose the taken run id."""
+    spec = importlib.util.spec_from_file_location("state_docs_second_copy", state_docs.__file__)
+    assert spec is not None and spec.loader is not None
+    second_copy = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, second_copy)
+    spec.loader.exec_module(second_copy)
+    foreign_ok = second_copy.Ok(_census_state(last_census_run_id="census-dark_factory-20261001"))
+
+    with pytest.raises(AssertionError):
+        census_identity.prior_census(foreign_ok)

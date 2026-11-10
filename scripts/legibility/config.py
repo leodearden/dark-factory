@@ -30,6 +30,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StringConstraints,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -37,6 +38,7 @@ from pydantic import (
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
 RETIRED_CENSUS_KEYS = ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+_SOURCE_CONTEXT_KEY = 'source'
 
 logger = logging.getLogger('legibility.config')
 
@@ -154,7 +156,7 @@ class Census(BaseModel):
 
     @model_validator(mode='before')
     @classmethod
-    def _drop_retired_keys(cls, data: object) -> object:
+    def _drop_retired_keys(cls, data: object, info: ValidationInfo) -> object:
         if not isinstance(data, dict):
             return data
         present = [key for key in RETIRED_CENSUS_KEYS if key in data]
@@ -162,8 +164,9 @@ class Census(BaseModel):
             return data
         logger.warning(
             'legibility config census: %s retired (plans/census-incremental-prd.md '
-            'C7, L8b), ignored -- delete from legibility.yaml',
+            'C7, L8b), ignored -- delete from %s',
             ', '.join(present),
+            (info.context or {}).get(_SOURCE_CONTEXT_KEY, 'legibility.yaml'),
         )
         return {key: value for key, value in data.items() if key not in RETIRED_CENSUS_KEYS}
 
@@ -339,7 +342,30 @@ def load_config(path: Path | str) -> LegibilityConfig:
     """
     with open(path, encoding='utf-8') as f:
         raw = yaml.safe_load(f) or {}
-    return LegibilityConfig(**raw)
+    return LegibilityConfig.model_validate(raw, context={_SOURCE_CONTEXT_KEY: str(path)})
+
+
+def project_root_mismatch(
+    project_root: Path, cfg: LegibilityConfig, config_path: Path,
+) -> str | None:
+    """Why the resolved *project_root* a CLI was given and the
+    ``project_root`` of *cfg*, loaded from *config_path*, name different
+    trees; ``None`` when they agree.
+
+    A census CLI reads the codebook, the census state and the reports under
+    *project_root*, while ``cfg.project_root`` drives the census window and
+    ``cfg.project_id`` stamps every filing, so the two must be one tree.
+    Roots are compared resolved, so an equivalent relative spelling is no
+    mismatch (task 3269).
+    """
+    cfg_project_root = Path(cfg.project_root).resolve()
+    if cfg_project_root == project_root:
+        return None
+    return (
+        f'--project-root {project_root} disagrees with the project_root in '
+        f'{config_path} ({cfg.project_root!r} -> {cfg_project_root}); refusing '
+        f'to mix two projects (project_id={cfg.project_id!r})'
+    )
 
 
 def _resolve_level(value: str) -> int | None:

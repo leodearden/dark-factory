@@ -1,5 +1,11 @@
 """scripts/legibility/census_state.py — the census-state.json document
-(plans/census-incremental-prd.md §4.2): its one reader and its one writer.
+(plans/census-incremental-prd.md §4.2): its validated reader, :func:`load`,
+and its one writer, :func:`advance`.
+
+One other reader remains: ``trickle_state.read_last_census_at`` reads the
+raw ``last_census_at`` of the same file, quietly, for the census-fire
+streak's exact-equality check. A key renamed or retyped here must change
+there too.
 """
 from __future__ import annotations
 
@@ -21,7 +27,13 @@ def _as_census_date(name: str, raw: object) -> date:
     try:
         return state_docs.as_date(name, raw)
     except ValueError:
+        pass
+    try:
         return state_docs.as_datetime(name, raw).astimezone(UTC).date()
+    except ValueError:
+        raise ValueError(
+            f'{name}: expected an ISO date (or a legacy ISO datetime), got {raw!r}'
+        ) from None
 
 
 def _as_text(name: str, raw: object) -> str:

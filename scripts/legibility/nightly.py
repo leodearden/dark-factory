@@ -114,12 +114,15 @@ def resolve_config(
     :func:`legibility.config.load_config` -- never a directory-name guess.
     A candidate whose config fails to load (malformed YAML, schema error) is
     skipped rather than aborting the whole search. Raises
-    ``FileNotFoundError`` if no candidate matches.
+    ``FileNotFoundError`` if no candidate matches, naming every skipped
+    candidate with its load error, since *project_id*'s own config may be
+    among them.
     """
     roots = (
         [Path(r) for r in search_roots] if search_roots is not None
         else _default_search_roots()
     )
+    unloadable: list[str] = []
     for root in roots:
         if not root.is_dir():
             continue
@@ -131,13 +134,24 @@ def resolve_config(
                 continue
             try:
                 cfg = load_config(config_path)
-            except Exception:
+            except Exception as exc:
+                unloadable.append(f'{config_path}: {type(exc).__name__}: {exc}')
                 continue
             if cfg.project_id == project_id:
                 return config_path, cfg
     raise FileNotFoundError(
         f'no legibility.yaml found for project_id={project_id!r} under '
         f'search roots {[str(r) for r in roots]!r}'
+        + _unloadable_candidates_note(unloadable)
+    )
+
+
+def _unloadable_candidates_note(unloadable: Sequence[str]) -> str:
+    if not unloadable:
+        return ''
+    return (
+        f'; {len(unloadable)} candidate legibility.yaml failed to load and may '
+        'be it:\n' + '\n'.join(unloadable)
     )
 
 
@@ -1051,6 +1065,7 @@ def _report_sample_outcome(
 
 def _record_trickle_progress(
     cfg: LegibilityConfig,
+    resolved_config_path: Path,
     sample: sampling.SampleResult,
     target_date: date,
     end: _NightEnd,
@@ -1101,7 +1116,7 @@ def _record_trickle_progress(
             end.census is not None
             and trickle_state.completion_error_streak_reached(night)
             and _escalate_completion_error_streak(
-                cfg, night.state, target_date,
+                cfg, resolved_config_path, night.state, target_date,
                 census_line=end.census.line, raise_alarm=raise_alarm,
             ).landed
         )
@@ -1241,6 +1256,7 @@ def _escalate_barren_streak(
 
 def _escalate_completion_error_streak(
     cfg: LegibilityConfig,
+    config_path: Path,
     night: trickle_state.TrickleState,
     target_date: date,
     *,
@@ -1249,7 +1265,8 @@ def _escalate_completion_error_streak(
 ) -> Alarm:
     """Raise the COMPLETION_ERROR_STREAK alarm for *night*, on each night
     :func:`trickle_state.completion_error_streak_reached` owes it. WARNING
-    level, exit code 0, like the barren one."""
+    level, exit code 0, like the barren one. The reproduce command names
+    *config_path*, the config this pass decided on."""
     streak = night.completion_error_streak
     summary = (
         f'legibility census trigger: completion check failed on {streak} '
@@ -1260,7 +1277,8 @@ def _escalate_completion_error_streak(
         f'completion_error_streak={streak}. Last decision: {census_line}. '
         f'Until scripts/check_run_completion.py answers again (exit 0 or 75), '
         f'the census now fires on the novelty spike alone. Reproduce with: '
-        f'census_trigger.py evaluate --project-root {cfg.project_root}'
+        f'census_trigger.py evaluate --project-root {cfg.project_root} '
+        f'--config {config_path}'
     )
     return raise_alarm(AlarmKind.COMPLETION_ERROR_STREAK, summary, detail)
 
@@ -1453,7 +1471,7 @@ def _run_configured_nightly(
         end = _crashed(exc, raise_alarm)
     try:
         retry_due = _record_trickle_progress(
-            cfg, sample, target_date, end,
+            cfg, resolved_config_path, sample, target_date, end,
             recorder=seams.recorder, retry_recorder=seams.retry_recorder,
             raise_alarm=raise_alarm, now=now, pass_kind=pass_kind,
             max_barren_runs=max_barren_runs,

@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import assert_never
 
 from legibility import census_state, state_docs
 
@@ -37,8 +38,10 @@ def prior_census(read: state_docs.StateRead[census_state.CensusState]) -> PriorC
                 run_id=state.last_census_run_id,
                 as_of_sha=state.last_census_as_of_sha,
             )
-        case _:
+        case state_docs.Missing() | state_docs.Malformed():
             return PriorCensus()
+        case _:
+            assert_never(read)
 
 
 @dataclass(frozen=True)

@@ -1335,6 +1335,36 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     assert args == (str(project_root),)
 
 
+def test_the_completion_streak_alarm_reproduces_with_the_config_the_nights_loaded(tmp_path):
+    project_root = tmp_path / 'proj_a'
+    config_path = _write_config(project_root, project_id='proj_a')
+    _write_census_state(project_root, _OLD_CENSUS)
+    launcher, _launches = _recording_census_launcher()
+    failing_check = _scripted_completion_runner(
+        2, {'run': _PREVIOUS_RUN, 'verdict': 'error', 'error': 'store_unreachable'},
+    )
+    posted: list[dict] = []
+
+    for night in range(3):
+        nightly.run_nightly(
+            config_path=config_path,
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13) + timedelta(days=night),
+            now=datetime(2026, 7, 14 + night, 3, 0, tzinfo=UTC),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            completion_runner=failing_check,
+            poster=lambda url, arguments: posted.append(arguments),
+            census_launcher=launcher,
+            pass_kind=nightly.PassKind.MANUAL,
+        )
+
+    [streak_alarm] = [post for post in posted if 'completion check' in post['summary']]
+    assert (
+        f'evaluate --project-root {project_root} --config {config_path.resolve()}'
+        in streak_alarm['detail']
+    )
+
+
 @pytest.mark.parametrize('fire', [True, False], ids=['fire', 'no-fire'])
 def test_run_nightly_launches_the_census_once_through_the_injected_launcher(
     tmp_path, fire,
@@ -1966,6 +1996,20 @@ def test_resolve_config_path_unknown_id_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         nightly.resolve_config_path("does-not-exist", search_roots=[tmp_path])
+
+
+def test_resolve_config_path_unknown_id_names_each_candidate_that_failed_to_load(tmp_path):
+    _write_config(tmp_path / "proj-a", project_id="proj_a")
+    broken = _write_config(tmp_path / "proj-b", project_id="proj_b")
+    broken.write_text(broken.read_text() + "census: {floor_days: '5'}\n")
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        nightly.resolve_config_path("proj_b", search_roots=[tmp_path])
+
+    message = str(excinfo.value)
+    assert str(broken) in message
+    assert "floor_days" in message
+    assert "input_value='5'" in message
 
 
 def test_resolve_config_path_env_override(tmp_path, monkeypatch):

@@ -4135,27 +4135,6 @@ def _build_stage_invokes(cfg, *, project_root, runner):
     )
 
 
-def _project_identity_mismatch(project_root: Path, cfg, config_path: Path) -> str | None:
-    """Return why *project_root* and *cfg* name different projects, or
-    ``None`` when they agree.
-
-    Two identity sources must agree: *project_root* (``--project-root``,
-    already resolved) drives the codebook, state, report and payload paths
-    and the stage cwd, while ``cfg.project_root`` drives the census window
-    and archive roots and ``cfg.project_id`` stamps every filing. Roots are
-    compared RESOLVED, so an equivalent relative spelling is no mismatch.
-    A mismatch is a bad argument, never a deferral (task 3269).
-    """
-    cfg_project_root = Path(cfg.project_root).resolve()
-    if cfg_project_root == project_root:
-        return None
-    return (
-        f"--project-root {project_root} disagrees with the project_root in "
-        f"{config_path} ({cfg.project_root!r} -> {cfg_project_root}); refusing "
-        f"to run a mixed-project census (project_id={cfg.project_id!r})"
-    )
-
-
 def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -> int:
     """CLI entrypoint.
 
@@ -4353,7 +4332,7 @@ def _run_configured_census(
 ) -> int:
     """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
     ``"unlanded"`` outcome, which ``run_census`` has already escalated."""
-    mismatch = _project_identity_mismatch(project_root, cfg, config_path)
+    mismatch = config.project_root_mismatch(project_root, cfg, config_path)
     if mismatch is not None:
         raise CensusPreconditionFailed(mismatch)
 
