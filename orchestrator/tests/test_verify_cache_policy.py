@@ -60,6 +60,7 @@ class TestDecide:
         decision = _decide(_TASK_ON, 'task', _WITH_ENTRY)
 
         _assert(decision, policy.Decision.HIT)
+        assert decision.entry is not None
         assert decision.entry == _ENTRY
         assert decision.entry.evidence_event_id == 7
 
