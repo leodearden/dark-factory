@@ -4,10 +4,11 @@ identity, the previous run's state, and the commit it reads
 from __future__ import annotations
 
 import subprocess
-from datetime import date
+from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
-from legibility import census_identity
+from legibility import census_identity, census_state, state_docs
 from legibility.census_identity import PriorCensus, RunIdentity
 
 _ID_DAY = date(2026, 10, 6)
@@ -87,12 +88,26 @@ def test_resolve_as_of_sha_raises_naming_a_root_that_is_no_repo(tmp_path):
     assert str(tmp_path) in str(excinfo.value)
 
 
+def _census_state(**fields) -> census_state.CensusState:
+    values: dict = dict(
+        last_census_at=None,
+        last_census_run_id=None,
+        last_census_report=None,
+        last_census_as_of_sha=None,
+        session_watermark=None,
+    )
+    values.update(fields)
+    return census_state.CensusState(**values)
+
+
 def test_prior_census_reads_a_loaded_state():
-    prior = census_identity.prior_census("ok", {
-        "last_census_at": "2026-10-01",
-        "last_census_run_id": "census-dark_factory-20261001",
-        "last_census_as_of_sha": "b" * 40,
-    })
+    prior = census_identity.prior_census(state_docs.Ok(_census_state(
+        last_census_at=date(2026, 10, 1),
+        last_census_run_id="census-dark_factory-20261001",
+        last_census_report="plans/confusion-census-2026-10-01.md",
+        last_census_as_of_sha="b" * 40,
+        session_watermark=datetime(2026, 10, 1, tzinfo=UTC),
+    )))
 
     assert prior == PriorCensus(
         last_census_at=date(2026, 10, 1),
@@ -102,15 +117,14 @@ def test_prior_census_reads_a_loaded_state():
 
 
 def test_prior_census_of_a_legacy_state_carries_only_its_date():
-    assert census_identity.prior_census("ok", {"last_census_at": "2026-10-01"}) == PriorCensus(
-        last_census_at=date(2026, 10, 1),
-    )
+    read = state_docs.Ok(_census_state(last_census_at=date(2026, 10, 1)))
+
+    assert census_identity.prior_census(read) == PriorCensus(last_census_at=date(2026, 10, 1))
 
 
-@pytest.mark.parametrize(("status", "state"), [
-    ("missing", None),
-    ("malformed", None),
-    ("ok", None),
-])
-def test_prior_census_without_a_usable_state_is_empty(status, state):
-    assert census_identity.prior_census(status, state) == PriorCensus()
+@pytest.mark.parametrize("read", [
+    state_docs.Missing(Path("census-state.json")),
+    state_docs.Malformed(Path("census-state.json"), "x"),
+], ids=["missing", "malformed"])
+def test_prior_census_without_a_usable_state_is_empty(read):
+    assert census_identity.prior_census(read) == PriorCensus()
