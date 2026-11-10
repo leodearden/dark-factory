@@ -475,6 +475,21 @@ class StaleSummaryResult:
     edges_completeness: 'ReadCompleteness'
 
 
+@dataclass(frozen=True, kw_only=True)
+class StaleProbeResult:
+    """Structured return type for detect_stale_dry_run.
+
+    ``stale`` and ``total_count`` mean what they mean on StaleSummaryResult;
+    ``entities_completeness`` is the verdict of the node read.  There is no
+    edge verdict: the probe reads edges per node with
+    ``get_valid_edges_for_node``, never as a whole-graph read.
+    """
+
+    stale: list[dict]
+    total_count: int
+    entities_completeness: 'ReadCompleteness'
+
+
 class NodeNotFoundError(Exception):
     """Raised when a node UUID is not found in FalkorDB."""
 
@@ -5098,8 +5113,8 @@ class GraphitiBackend:
 
     @_canonicalize_group_args
     async def detect_stale_dry_run(
-        self, *, group_id: str, max_concurrency: int = 10
-    ) -> tuple[list[dict], int]:
+        self, *, group_id: str, max_concurrency: int = 10, log: logging.Logger = logger
+    ) -> StaleProbeResult:
         """Detect stale summaries using per-entity edge fetching (dry_run variant).
 
         Memory-cheaper alternative to ``detect_stale_with_edges`` for use
@@ -5119,23 +5134,34 @@ class GraphitiBackend:
           the existing empty-summary semantics, adding a Pareto improvement for graphs
           with many empty-summary entities).
 
+        The node read is a checked read (``read_entity_nodes_checked``), as in
+        ``detect_stale_with_edges``.
+
         Args:
             group_id: Project graph to query.
             max_concurrency: Maximum number of concurrent ``get_valid_edges_for_node``
                 requests in flight at once.  Defaults to 10.  Raise or lower to tune
                 the trade-off between latency and DB connection pressure.
+            log: Logger for the node read's EMPIRICAL warning, so a caller's
+                rebuild reports its short read beside its own log lines.
 
         Returns:
-            Tuple of (stale_list, total_count) where stale_list contains the same
-            per-entity dict schema as ``detect_stale_with_edges``
-            (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count) and total_count is len(all entities).  Order of entries
-            in stale_list matches the order returned by ``list_entity_nodes``.
+            StaleProbeResult.  ``stale`` carries the same per-entity dict schema
+            as ``detect_stale_with_edges`` (uuid, name, summary, duplicate_count,
+            stale_line_count, valid_fact_count, summary_line_count), in the order
+            ``enumerate_entity_nodes`` returned the entities; ``total_count`` is
+            len(all entities); ``entities_completeness`` is the node read's verdict.
+
+        Raises:
+            IncompleteEnumerationError: The node read was STRUCTURALLY
+                incomplete.  Raised before any edge is fetched.
         """
         if max_concurrency < 1:
             raise ValueError(f'max_concurrency must be >= 1, got {max_concurrency}')
 
-        entities = await self.list_entity_nodes(group_id=group_id)
+        entities, entities_completeness = await read_entity_nodes_checked(
+            self, group_id=group_id, log=log
+        )
 
         # Separate entities: empty-summary ones are cheap-skipped without any I/O.
         fetch_entities = [e for e in entities if e['summary']]
@@ -5164,7 +5190,11 @@ class GraphitiBackend:
             if entry is not None:
                 stale.append(entry)
 
-        return (stale, len(entities))
+        return StaleProbeResult(
+            stale=stale,
+            total_count=len(entities),
+            entities_completeness=entities_completeness,
+        )
 
     @_canonicalize_group_args
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:

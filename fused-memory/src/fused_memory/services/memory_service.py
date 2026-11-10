@@ -11275,9 +11275,9 @@ class MemoryService:
                     )
             else:
                 if dry_run:
-                    stale, total_entities = await self.graphiti.detect_stale_dry_run(
-                        group_id=project_id
-                    )
+                    probe = await self.graphiti.detect_stale_dry_run(group_id=project_id)
+                    stale = probe.stale
+                    total_entities = probe.total_count
                 else:
                     detect_result = await self.graphiti.detect_stale_with_edges(
                         group_id=project_id, log=logger
