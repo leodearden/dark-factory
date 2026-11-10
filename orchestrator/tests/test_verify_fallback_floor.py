@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_fallback_floor import (
@@ -241,3 +243,111 @@ class TestFallbackPlanRecordsFloor:
         assert task_run == merge_run
         assert task_run.scope_kind is ScopeKind.FILE_SCOPED
         assert task_run.scoped_targets == py_files
+
+
+def _write_files(root: Path, files: list[str]) -> None:
+    for rel in files:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# placeholder\n')
+
+
+def _passing_run_verification() -> AsyncMock:
+    return AsyncMock(return_value=verify.VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    ))
+
+
+def _executed_configs(spy: AsyncMock) -> list[ModuleConfig]:
+    return [call.args[2] for call in spy.await_args_list if len(call.args) > 2]
+
+
+def _plan_pytest_run(plan: dict | None) -> dict:
+    assert plan is not None
+    (run,) = [r for r in plan['runs'] if r['reason'].startswith('pytest:')]
+    return run
+
+
+async def _run_fallback(
+    root: Path, test_command: str, files: list[str], role: Literal['merge', 'task'],
+) -> tuple[ModuleConfig, dict]:
+    config = OrchestratorConfig(
+        project_root=root,
+        test_command=test_command,
+        lint_command='ruff check',
+        type_check_command='pyright',
+    )
+    spy = _passing_run_verification()
+    with patch.object(verify, 'run_verification', new=spy):
+        result = await verify.run_scoped_verification(
+            root, config, [], task_files=files, role=role,
+        )
+    (executed,) = _executed_configs(spy)
+    return executed, _plan_pytest_run(result.plan)
+
+
+@pytest.mark.asyncio
+class TestRunScopedVerificationFallbackFloor:
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_reify_9839_executes_configured_command(self, tmp_path, role):
+        _write_files(tmp_path, REIFY_9839_FILES)
+
+        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
+
+        assert executed.test_command == REIFY_TEST_COMMAND
+        assert run['scope_kind'] == 'full_suite'
+        assert run['module_prefix'] == executed.prefix
+        assert run['cmd']['raw'] == REIFY_TEST_COMMAND
+        assert '7041' in run['reason']
+
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_reify_9761_polyglot_executes_configured_command(self, tmp_path, role):
+        _write_files(tmp_path, REIFY_9761_FILES)
+
+        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9761_FILES, role)
+
+        assert executed.test_command == REIFY_TEST_COMMAND
+        assert run['scope_kind'] == 'full_suite'
+        assert run['cmd']['raw'] == REIFY_TEST_COMMAND
+        assert REIFY_9761_RS_FILE in run['reason']
+
+    async def test_pure_subproject_source_diff_executes_configured_command(self, tmp_path):
+        _write_files(tmp_path, ['backend/pyproject.toml', 'backend/app/x.py'])
+        test_command = 'cd backend && uv run pytest'
+
+        executed, run = await _run_fallback(tmp_path, test_command, ['backend/app/x.py'], 'task')
+
+        assert executed.prefix == 'backend'
+        assert executed.test_command == test_command
+        assert executed.lint_command is not None and 'backend' in executed.lint_command
+        assert executed.type_check_command is not None and 'backend' in executed.type_check_command
+        assert run['scope_kind'] == 'full_suite'
+        assert run['module_prefix'] == 'backend'
+
+    async def test_bare_default_source_only_runs_whole_at_merge_role(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
+
+        assert executed.test_command == 'pytest'
+        assert run['scope_kind'] == 'full_suite'
+
+    async def test_bare_default_source_only_keeps_the_task_role_skip(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
+
+        assert executed.test_command is None
+        assert run['scope_kind'] == 'skipped'
+
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_derived_configured_suite_keeps_its_verbatim_reason(self, tmp_path, role):
+        _write_files(tmp_path, ['tests/test_widget.py'])
+
+        executed, run = await _run_fallback(
+            tmp_path, REIFY_TEST_COMMAND, ['tests/test_widget.py'], role,
+        )
+
+        assert executed.test_command == REIFY_TEST_COMMAND
+        assert 'verbatim' in run['reason']
+        assert '7041' not in run['reason']
