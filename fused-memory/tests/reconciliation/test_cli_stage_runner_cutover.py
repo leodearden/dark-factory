@@ -394,11 +394,8 @@ class TestReconConfigDirHelpers:
         verified path A, written path B — the containment check says PASS while
         the kernel denies every transcript write.
 
-        A config-sourced ``reconciliation.data_dir`` is already absolute at load
-        (``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``),
-        so the relative branch engages only for a direct caller handing this
-        function a relative ``Path``. Full mechanism and deployment story:
-        ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
+        The relative case is the standalone/systemd production configuration, not
+        a hypothetical. Full mechanism and deployment story: ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
         """
         from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 
@@ -410,8 +407,9 @@ class TestReconConfigDirHelpers:
             f'name the same directory; got {base!r}'
         )
         assert base == tmp_path / 'data' / 'reconciliation' / 'recon-config', (
-            f'A relative data_dir handed directly to recon_config_base_dir '
-            f'must anchor at the process cwd; got {base!r}'
+            f'A relative data_dir must anchor at the process cwd (the same '
+            f'implicit anchor ReconciliationJournal.initialize already uses for '
+            f'reconciliation.db); got {base!r}'
         )
 
     def test_recon_config_base_dir_is_cwd_independent_for_an_absolute_data_dir(
