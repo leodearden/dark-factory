@@ -766,16 +766,24 @@ def test_evaluate_census_step_no_fire_never_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
     def fake_decide(project_root, *, now=None, completion_runner=None):
-        return census_trigger.Decision(fire=False, reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'])
+        return census_trigger.Decision(
+            fire=False,
+            reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'],
+            completion=census_trigger.Completion(
+                census_trigger.CompletionStatus.NOT_YET, 'census-proj_a-20260601', 70, share=0.5,
+            ),
+        )
 
     launcher_calls = []
-    line, fire = nightly.evaluate_census_step(
+    evaluation = nightly.evaluate_census_step(
         cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
     )
 
-    assert fire is False
-    assert 'NO-FIRE' in line
+    assert isinstance(evaluation, nightly.CensusEvaluation)
+    assert evaluation.fire is False
+    assert 'NO-FIRE' in evaluation.line
+    assert evaluation.completion is census_trigger.CompletionStatus.NOT_YET
     assert launcher_calls == []
 
 
@@ -787,7 +795,7 @@ def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_pa
 
     launcher_calls = []
     with caplog.at_level('WARNING'):
-        line, fire = nightly.evaluate_census_step(
+        line, fire, _completion = nightly.evaluate_census_step(
             cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: False, launcher=lambda: launcher_calls.append(1),
         )
@@ -805,7 +813,7 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
         return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
-    line, fire = nightly.evaluate_census_step(
+    line, fire, _completion = nightly.evaluate_census_step(
         cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True,
         launcher=lambda project_root, **kwargs: launcher_calls.append(1),
@@ -844,7 +852,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
         raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
+        line, fire, _completion = nightly.evaluate_census_step(
             cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=_dying_launcher,
         )
@@ -875,7 +883,7 @@ def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
+        line, fire, _completion = nightly.evaluate_census_step(
             cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
@@ -914,13 +922,14 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
         return True
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
+        line, fire, completion = nightly.evaluate_census_step(
             cfg, now=None, decide=fake_decide,
             entrypoint_exists=_recording_entrypoint_exists,
             launcher=lambda: launcher_calls.append(1),
         )
 
     assert fire is False
+    assert completion is None, 'a failed evaluation established no completion verdict'
     # A downstream reader of NightlyResult.census_line must still see a
     # well-formed decision line -- the one case an operator most needs to read
     # is the worst possible place to emit a novel shape.
@@ -951,7 +960,7 @@ def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
         raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
+        line, fire, _completion = nightly.evaluate_census_step(
             cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
@@ -1205,7 +1214,7 @@ def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path
     def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
-    _line, fire = nightly.evaluate_census_step(
+    _line, fire, _completion = nightly.evaluate_census_step(
         cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec,
     )
