@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
+from typing import TypeVar
 
 import aiosqlite
 from shared.project_id import project_id_for_root
@@ -107,6 +108,8 @@ __all__ = [
     'read_quality_series',
     'validate_quality_series',
 ]
+
+T = TypeVar('T')
 
 QUALITY_FRESHNESS_BOUND_SECONDS = 2 * QUALITY_SAMPLE_INTERVAL_SECONDS
 
@@ -194,15 +197,18 @@ class ComparisonState(StrEnum):
 
 @dataclass(frozen=True)
 class Provenance:
-    """What every measured headline inherits from the sample the series is read at."""
+    """What the series and every measured headline inherit from the sample it is read at, as
+    that sample reads at *served_at*."""
 
     as_of: datetime
     state: DatumState
     reason: str | None
     freshness_bound_seconds: int
+    served_at: datetime
 
-    def measured(self, headline: Headline) -> Datum[Headline]:
-        return Datum(headline, self.as_of, self.state, self.reason, self.freshness_bound_seconds)
+    def measured(self, value: T) -> Datum[T]:
+        datum = Datum(value, self.as_of, self.state, self.reason, self.freshness_bound_seconds)
+        return aged_at(datum, self.served_at)
 
     def unknown(self, reason: str) -> Datum[Headline]:
         return unknown_datum(reason, self.freshness_bound_seconds)
@@ -444,7 +450,14 @@ class QualitySeries:
 
 
 Values = Callable[[Sequence[LandingRow]], list[float | None]]
-Since = Callable[[Sequence[LandingRow]], datetime | None]
+
+
+@dataclass(frozen=True)
+class Since:
+    """When a metric's measurement starts over the stored rows, and why it has not when it has not."""
+
+    start: Callable[[Sequence[LandingRow]], datetime | None]
+    unmeasured: str
 
 
 def _per_landing(value: Callable[[LandingRow], float | None]) -> Values:
@@ -463,30 +476,35 @@ def _once_per_unit(value: Callable[[LandingRow], float | None]) -> Values:
     return values
 
 
+def _no_producer(source: MetricSource) -> str:
+    return f'{NO_PRODUCER}: {_RECORDED_IN[source]} has recorded nothing for this project'
+
+
 def _source_began(source: MetricSource) -> Since:
     """The source's first row in runs.db, as the newest row's rule vintage records it."""
-    return lambda rows: _EPOCH[source](rows[-1].rule_vintage) if rows else None
+    return Since(lambda rows: _EPOCH[source](rows[-1].rule_vintage) if rows else None,
+                 _no_producer(source))
 
 
-def _first_measured(values: Values) -> Since:
+def _first_measured(values: Values, carried: str) -> Since:
     """The first landing the value is known for: a source with no runs.db epoch of its own."""
 
-    def since(rows: Sequence[LandingRow]) -> datetime | None:
+    def start(rows: Sequence[LandingRow]) -> datetime | None:
         known = (row.landing.landed_at for row, x in zip(rows, values(rows), strict=True)
                  if x is not None)
         return next(known, None)
 
-    return since
+    return Since(start, f'no stored landing of this project carries {carried}')
 
 
-def _once_typed(rows: Sequence[LandingRow]) -> datetime | None:
+def _first_typed(rows: Sequence[LandingRow]) -> datetime | None:
     """Every landing, regex backfill included, once the typed charter_class has been written."""
     typed = any(row.cost.charter_class_source is CharterClassSource.CHARTER_CLASS for row in rows)
     return rows[0].landing.landed_at if typed else None
 
 
-def _never(rows: Sequence[LandingRow]) -> datetime | None:
-    return None
+def _never_written(source: MetricSource) -> Since:
+    return Since(lambda rows: None, _no_producer(source))
 
 
 @dataclass(frozen=True)
@@ -559,7 +577,7 @@ CATALOGUE: tuple[MetricSpec, ...] = (
           counts='landings reviewed in two or more rounds',
           excludes='landings with no review round count',
           population='landings with a review round count',
-          since=_first_measured(_per_landing(_review_rounds_ge2))),
+          since=_first_measured(_per_landing(_review_rounds_ge2), 'a review round count')),
     _rate('turns_capped', MetricSource.INVOCATION_TURNS, _turns_capped,
           counts='landings whose implementer-class invocations hit the turns cap',
           excludes='landings with no implementer-class turn count',
@@ -568,7 +586,7 @@ CATALOGUE: tuple[MetricSpec, ...] = (
           lambda row: int(row.cost.charter_class is not None),
           counts='landings whose task was blocked by its charter, regex backfill included',
           excludes='every landing until the typed charter_class is first written',
-          since=_once_typed),
+          since=Since(_first_typed, _no_producer(MetricSource.CHARTER_CLASS))),
     _metric('rejections_per_landing', MetricKind.COUNT, MetricSource.REJECTIONS,
             _once_per_unit(lambda row: row.outcomes.rejection_events),
             unit='rejections per landing',
@@ -594,11 +612,13 @@ CATALOGUE: tuple[MetricSpec, ...] = (
             counts='execute iterations summed over the dispatches that produced the landing',
             excludes='landings with no dispatch row',
             population='landings with a dispatch row',
-            since=_first_measured(_per_landing(lambda row: row.cost.execute_iterations))),
+            since=_first_measured(_per_landing(lambda row: row.cost.execute_iterations),
+                                  'an execute iteration count')),
     _metric('reverts', MetricKind.COUNT, MetricSource.LATE_EVENTS,
             lambda rows: [None] * len(rows), unit='reverts',
             counts='later first-parent commits reverting the landing',
-            excludes='every landing until late_events has a writer', since=_never),
+            excludes='every landing until late_events has a writer',
+            since=_never_written(MetricSource.LATE_EVENTS)),
     _metric(COST_METRIC, MetricKind.COST, MetricSource.INVOCATIONS,
             _per_landing(lambda row: row.cost.all_role_usd), unit='usd',
             counts='all-role invocation cost per landing',
@@ -749,12 +769,10 @@ def _rate_comparisons(
 def _unmeasured_headline(
     spec: MetricSpec, rows: Sequence[LandingRow], provenance: Provenance,
 ) -> Datum[Headline]:
-    """The headline of a metric with no measurement start: no landing stored, or no producer."""
+    """The headline of a metric with no measurement start: no landing stored, or never measured."""
     if not rows:
         return provenance.unknown('no landing is stored for this project')
-    return provenance.unknown(
-        f'{NO_PRODUCER}: {_RECORDED_IN[spec.source]} has recorded nothing for this project',
-    )
+    return provenance.unknown(spec.measured_since.unmeasured)
 
 
 def _since_note(spec: MetricSpec, since: datetime) -> str:
@@ -802,19 +820,20 @@ class _Unit:
     task_ids: tuple[str, ...]
 
 
-def _costed_units(rows: Sequence[LandingRow]) -> list[_Unit]:
+def _costed_units(rows: Sequence[LandingRow], costs: Sequence[float | None]) -> list[_Unit]:
+    """The units whose head's lines and every member's cost (*costs*, one per row) are known."""
     members: dict[str, list[int]] = {}
     for index, row in enumerate(rows):
         members.setdefault(row.landing.unit_id, []).append(index)
     units: list[_Unit] = []
     for indices in members.values():
         head = rows[indices[0]]
-        costs = [rows[i].cost.all_role_usd for i in indices]
-        if head.cost.code_lines is None or any(usd is None for usd in costs):
+        unit_costs = [costs[i] for i in indices]
+        if head.cost.code_lines is None or any(usd is None for usd in unit_costs):
             continue
         units.append(_Unit(
             indices[0], head.landing.ordinal, head.landing.landed_at, head.cost.code_lines,
-            sum(usd for usd in costs if usd is not None), module_allocation(head),
+            sum(usd for usd in unit_costs if usd is not None), module_allocation(head),
             tuple(rows[i].landing.task_id for i in indices),
         ))
     return units
@@ -847,20 +866,16 @@ class _CostAnalysis:
     comparisons: tuple[BeforeAfter, ...]
 
 
-def _cost_analysis(
-    rows: Sequence[LandingRow], events: Sequence[RegimeEvent], landings_per_day: float | None,
-) -> _CostAnalysis:
+def _cost_analysis(metric_id: str, costed: Sequence[_Unit], view: _View) -> _CostAnalysis:
     """Per unit, never per landing: a train's members share one merge's lines."""
-    units = [unit for unit in _costed_units(rows)
-             if unit.lines >= COST_MIN_LINES and unit.usd > 0]
-    regimes = regime_segments([unit.landed_at for unit in units], events, COST_METRIC)
+    units = [unit for unit in costed if unit.lines >= COST_MIN_LINES and unit.usd > 0]
+    regimes = regime_segments([unit.landed_at for unit in units], view.events, metric_id)
     segments = [
         [unit for i, unit in enumerate(units[segment.start:segment.end], segment.start)
          if i not in regimes.excluded]
         for segment in regimes.segments
     ]
-    landed_at = [row.landing.landed_at for row in rows]
-    markers = _markers(events, COST_METRIC)
+    markers = _markers(view.events, metric_id)
     model = NO_COST_MODEL
     alarms: list[Alarm] = []
     for segment in segments:
@@ -872,14 +887,14 @@ def _cost_analysis(
                                   model.a, model.b)
         signs = [int(r is not None and r > model.residual_median) for r in residuals]
         alarms.extend(_cusum(signs, SIGN_P0, [u.ordinal for u in segment],
-                             [u.head for u in segment], markers, landed_at))
+                             [u.head for u in segment], markers, view.landed_at))
     alarms.sort(key=lambda alarm: (alarm.ordinal, alarm.direction.value))
     comparisons = tuple(
-        BeforeAfter.of(after_id, COST_METRIC, before_after_cost(
+        BeforeAfter.of(after_id, metric_id, before_after_cost(
             [u.lines for u in before], [u.usd for u in before],
             [u.lines for u in after], [u.usd for u in after],
             seed=content_seed(task_id for u in (*before, *after) for task_id in u.task_ids),
-            min_lines=COST_MIN_LINES, landings_per_day=landings_per_day,
+            min_lines=COST_MIN_LINES, landings_per_day=view.landings_per_day,
         ))
         for (before, _), (after, after_id) in pairwise(
             zip(segments, (segment.event_id for segment in regimes.segments), strict=True),
@@ -909,8 +924,9 @@ class _ModuleTally:
                          100 * self.usd / self.lines if ranked else None, ranked)
 
 
-def _module_rows(rows: Sequence[LandingRow]) -> tuple[ModuleRow, ...]:
-    """The units of the RECENT window before the newest landing, allocated by src-line share.
+def _module_rows(rows: Sequence[LandingRow], costed: Sequence[_Unit]) -> tuple[ModuleRow, ...]:
+    """The *costed* units of the RECENT window before the newest landing, allocated by src-line
+    share.
 
     Ranked modules first, costliest per line first; then the unranked; the no-src bucket last.
     """
@@ -918,7 +934,7 @@ def _module_rows(rows: Sequence[LandingRow]) -> tuple[ModuleRow, ...]:
         return ()
     since = rows[-1].landing.landed_at - RECENT
     tallies: dict[str | None, _ModuleTally] = {}
-    for unit in _costed_units(rows):
+    for unit in costed:
         if unit.landed_at < since:
             continue
         for module, share in unit.modules or ((None, 1.0),):
@@ -949,7 +965,6 @@ class _View:
     events: Sequence[RegimeEvent]
     provenance: Provenance
     landings_per_day: float | None
-    cost: _CostAnalysis
 
     def served(self, values: Sequence[float | None]) -> tuple[float | None, ...]:
         return tuple(values[self.start:])
@@ -966,13 +981,24 @@ class _View:
 
 
 @dataclass(frozen=True)
+class _CostTables:
+    """The cost metric's series-wide figures: its model in force and the recent module table."""
+
+    model: CostModel
+    modules: tuple[ModuleRow, ...]
+
+
+@dataclass(frozen=True)
 class _Served:
+    """One metric as served, its marker comparisons, and the cost metric's tables (else None)."""
+
     series: MetricSeries
     comparisons: tuple[BeforeAfter, ...]
+    cost_tables: _CostTables | None = None
 
 
 def _rate_series(spec: MetricSpec, view: _View) -> _Served:
-    since = spec.measured_since(view.rows)
+    since = spec.measured_since.start(view.rows)
     flags = _flags(_gated(spec, view.rows, since))
     charted = _flags(_excluding_artefacts(flags, view.landed_at, view.events, spec.metric_id))
     chart = _control_chart(spec.metric_id, charted, view)
@@ -1000,7 +1026,7 @@ def _centred_series(
     alarms: tuple[Alarm, ...],
 ) -> MetricSeries:
     """A count or a cost: points, a rolling centre and a bootstrapped headline, no control chart."""
-    since = spec.measured_since(view.rows)
+    since = spec.measured_since.start(view.rows)
     xs = _gated(spec, view.rows, since)
     return MetricSeries(
         metric_id=spec.metric_id,
@@ -1024,9 +1050,11 @@ def _count_series(spec: MetricSpec, view: _View) -> _Served:
 
 
 def _cost_series(spec: MetricSpec, view: _View) -> _Served:
-    series = _centred_series(spec, view, HeadlineForm.MEDIAN, statistics.median,
-                             view.cost.alarms)
-    return _Served(series, view.cost.comparisons)
+    costed = _costed_units(view.rows, spec.values(view.rows))
+    analysis = _cost_analysis(spec.metric_id, costed, view)
+    series = _centred_series(spec, view, HeadlineForm.MEDIAN, statistics.median, analysis.alarms)
+    return _Served(series, analysis.comparisons,
+                   _CostTables(analysis.model, _module_rows(view.rows, costed)))
 
 
 _SERIES_BY_KIND: dict[MetricKind, Callable[[MetricSpec, _View], _Served]] = {
@@ -1034,6 +1062,16 @@ _SERIES_BY_KIND: dict[MetricKind, Callable[[MetricSpec, _View], _Served]] = {
     MetricKind.COUNT: _count_series,
     MetricKind.COST: _cost_series,
 }
+
+
+def _require_one_cost_metric() -> None:
+    """The wire has one cost_model and one module table, so the catalogue has one cost metric."""
+    costs = [spec.metric_id for spec in CATALOGUE if spec.kind is MetricKind.COST]
+    if len(costs) != 1:
+        raise RuntimeError(f'CATALOGUE must hold exactly one cost metric, not {costs}')
+
+
+_require_one_cost_metric()
 
 
 def quality_series_view(
@@ -1047,15 +1085,15 @@ def quality_series_view(
     """The served series over *rows* (ordinal order): statistics over all of them, the newest
     *window_landings* served (all when None). Pure and deterministic for equal inputs."""
     start = 0 if window_landings is None else max(0, len(rows) - window_landings)
-    landings_per_day = _landings_per_day(rows)
     view = _View(rows, tuple(row.landing.landed_at for row in rows), start, tuple(events),
-                 provenance, landings_per_day, _cost_analysis(rows, events, landings_per_day))
+                 provenance, _landings_per_day(rows))
     served = [_SERIES_BY_KIND[spec.kind](spec, view) for spec in CATALOGUE]
+    [cost] = [entry.cost_tables for entry in served if entry.cost_tables is not None]
     return QualitySeries(
         axis=tuple(AxisPoint.of(row) for row in rows[start:]),
         metrics=tuple(entry.series for entry in served),
-        cost_model=view.cost.model,
-        modules=_module_rows(rows),
+        cost_model=cost.model,
+        modules=cost.modules,
         before_after=tuple(comparison for entry in served for comparison in entry.comparisons),
         git_check=git_check,
     )
@@ -1156,8 +1194,7 @@ def _read_at(
     """A gap after the newest value names why the series stopped; else runs.db's verdict; then age."""
     reason = latest.reason if latest.state is SampleState.GAP else unsampled
     state = DatumState.FRESH if reason is None else DatumState.STALE
-    read = aged_at(Datum(None, value.ts, state, reason, QUALITY_FRESHNESS_BOUND_SECONDS), now)
-    return Provenance(value.ts, read.state, read.reason, QUALITY_FRESHNESS_BOUND_SECONDS)
+    return Provenance(value.ts, state, reason, QUALITY_FRESHNESS_BOUND_SECONDS, served_at=now)
 
 
 async def read_quality_series(
@@ -1186,8 +1223,7 @@ async def read_quality_series(
         lambda: quality_series_view(rows, window_landings=window_landings, provenance=provenance,
                                     events=events, git_check=value.git_check),
     )
-    datum = Datum(series, provenance.as_of, provenance.state, provenance.reason,
-                  QUALITY_FRESHNESS_BOUND_SECONDS)
+    datum = provenance.measured(series)
     validate_datum(datum, now)
     validate_quality_series(series, now)
     return datum

@@ -66,7 +66,8 @@ from dashboard.data.quality_store import QualitySample
 T = TypeVar('T')
 T0 = datetime(2026, 9, 1, tzinfo=UTC)
 AS_OF = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
-FRESH = Provenance(as_of=AS_OF, state=DatumState.FRESH, reason=None, freshness_bound_seconds=1200)
+FRESH = Provenance(as_of=AS_OF, state=DatumState.FRESH, reason=None, freshness_bound_seconds=1200,
+                   served_at=AS_OF)
 
 AXIS_KEYS = {
     'ordinal', 'merge_sha', 'task_id', 'landed_at', 'unit_id', 'git_first_parent', 'late_claim',
@@ -565,6 +566,31 @@ def test_a_cost_shift_raises_a_sign_of_residual_alarm() -> None:
     assert any(alarm['direction'] == 'up' for alarm in alarms)
 
 
+def _early_rate_shift() -> list[LandingRow]:
+    """1-in-10 rejected, then 1-in-2 for 60 landings from index 100, then 1-in-10 again: 360."""
+    xs = _every(10, 100) + _every(2, 60) + _every(10, 200)
+    return history(len(xs), start=T0, outcome=_rejections(xs))
+
+
+@pytest.mark.parametrize(('metric', 'build'), [
+    ('rejected', _early_rate_shift),
+    ('all_role_usd', lambda: _costed_units(330, shift_at=100)),
+])
+def test_alarms_before_the_served_window_are_dropped_and_the_window_validates(
+    metric: str, build: Callable[[], list[LandingRow]],
+) -> None:
+    rows = build()
+    every = quality_series_view(rows, window_landings=None, provenance=FRESH)
+    windowed = quality_series_view(rows, window_landings=100, provenance=FRESH)
+    first_served = windowed.axis[0].ordinal
+    [all_alarms] = [m.alarms for m in every.metrics if m.metric_id == metric]
+    [served_alarms] = [m.alarms for m in windowed.metrics if m.metric_id == metric]
+
+    assert any(alarm.ordinal < first_served for alarm in all_alarms)
+    assert served_alarms == tuple(alarm for alarm in all_alarms if alarm.ordinal >= first_served)
+    validate_quality_series(windowed, AS_OF)
+
+
 def _module_cost(i: int) -> Cost:
     return {
         0: _costed(9.0, 900),
@@ -720,6 +746,20 @@ def test_reverts_are_no_producer_until_late_events_has_a_writer() -> None:
     assert 'late_events' in served['headline']['reason']
 
 
+@pytest.mark.parametrize(('metric', 'carried'), [
+    ('review_rounds_ge2', 'a review round count'),
+    ('execute_iterations', 'an execute iteration count'),
+])
+def test_a_value_no_stored_landing_carries_is_unknown_naming_the_value_not_its_source(
+    metric: str, carried: str,
+) -> None:
+    served = _metric(history(60, start=T0), metric)
+
+    assert served['rule']['measured_since'] is None
+    assert served['headline']['state'] == 'unknown'
+    assert served['headline']['reason'] == f'no stored landing of this project carries {carried}'
+
+
 def test_the_git_cross_check_is_served_beside_the_series() -> None:
     rows = history(3, start=T0)
 
@@ -813,6 +853,19 @@ def root(tmp_path: Path) -> Path:
     project = tmp_path / 'dark_factory'
     project.mkdir()
     return project
+
+
+def test_every_measured_headline_reads_stale_once_its_sample_is_past_the_bound() -> None:
+    aged = replace(FRESH, as_of=AS_OF - timedelta(seconds=1201))
+
+    series = quality_series_view(history(60, start=T0, outcome=_rejections(_every(5, 60))),
+                                 window_landings=100, provenance=aged)
+
+    measured = [m.headline for m in series.metrics if m.headline.value is not None]
+    assert measured
+    assert {(h.state, h.as_of) for h in measured} == {(DatumState.STALE, aged.as_of)}
+    assert all('1200s freshness bound' in (h.reason or '') for h in measured)
+    validate_quality_series(series, AS_OF)
 
 
 def _quality_db(root: Path) -> Path:
