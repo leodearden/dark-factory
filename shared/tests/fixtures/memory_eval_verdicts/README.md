@@ -73,10 +73,10 @@ includes a value, a stamp or prose, so a persisting regression keeps its
 fingerprint across runs and a recovered item's `no_alarm` entry carries the
 same fingerprint as its still-open escalation.
 
-`dashboard/src/dashboard/data/memory_evals.py` currently keys entries by
-`(eval_id, metric_id)` with first-wins, so a tripwire's per-item rows collapse
-to its first item there. Adopting per-item rows is the job of the parity-gate
-consumer (task 3217).
+`dashboard/src/dashboard/data/memory_evals.py` renders one metric row per
+entry, keyed `(eval_id, metric_id, item | none)`, so each tripwire item is its
+own row. Its parity suite, `dashboard/tests/test_memory_evals_parity.py`, reads
+these exemplars.
 
 ## Fingerprints are opaque
 

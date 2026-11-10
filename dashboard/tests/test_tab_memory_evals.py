@@ -5,10 +5,9 @@ Tests parse JSX/JS/HTML source files as text and assert structural contracts
 Follows the idiom established in test_tab_escalations.py, test_tab_curator.py
 and test_index_html.py.
 
-There is no JS test runner for ``.jsx`` in this project (``dashboard/tests/js/``
-covers only plain ``.js`` modules), so JSX contracts are asserted as Python
-source-as-text tests over files fetched from ``/static/redux/`` through a
-module-scoped Starlette ``TestClient``.
+Render behaviour is covered by ``dashboard/tests/js/jsx_render.test.mjs``; this
+file keeps the wiring contracts, asserted over files fetched from
+``/static/redux/`` through a module-scoped Starlette ``TestClient``.
 """
 
 from __future__ import annotations
@@ -823,11 +822,6 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\bev\s*\.\s*metrics\b',),
     ),
     (
-        'metric row keyed on metric_id',
-        r'key=\{[^}]*\bmetric_id\b',
-        (r'key=\{\s*m\.metric_id\s*\}',),
-    ),
-    (
         'per-metric escalation guard',
         r'm\.escalation\s*&&',
         (r'm\s*\.\s*escalation\s*&&\s*\(',),
@@ -1310,8 +1304,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         'MemoryEvalsSection — not inside it.'
     )
 
-    # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, metrics on
-    #     metric_id
+    # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, and maps
+    #     metrics (row keying is a render test in jsx_render.test.mjs)
     assert re.search(
         _presence_pattern('window.DF_DATA read', code), code, re.MULTILINE
     ), (
@@ -1339,11 +1333,6 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         _presence_pattern('metrics list read', code), code, re.MULTILINE
     ), (
         "tab_memory_evals.jsx must render each eval's `metrics` list."
-    )
-    assert re.search(
-        _presence_pattern('metric row keyed on metric_id', code), code, re.MULTILINE
-    ), (
-        'each metric row must be keyed on `metric_id`.'
     )
 
     # (f) the trend renders from the PARALLEL-ARRAY shape, holes intact
