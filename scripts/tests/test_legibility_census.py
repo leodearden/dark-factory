@@ -3168,7 +3168,6 @@ def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
         "last_census_report": "confusion-census-2026-07-14.md",
         "last_census_as_of_sha": "c" * 40,
         "session_watermark": None,
-        "last_census_done_count": 5,
     }
 
 
