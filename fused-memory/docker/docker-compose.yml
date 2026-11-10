@@ -45,9 +45,10 @@ services:
 
   embedder:
     # Permanent local embedder: vLLM pooling runner serving granite-embedding-english-r2
-    # (768 dims). fused-memory's embedder.model equals the served name below; the
-    # config points at this service by its name. The image digest and the model
-    # parameters are the granite entry of scripts/local-model-serving/arms.yaml.
+    # (768 dims). Contract: fused-memory's embedder.model must equal the served name
+    # below (C3), and config-docker.yaml addresses this service by the name
+    # `embedder` (κ2, task 6810). The image digest and the model parameters are the
+    # granite entry of scripts/local-model-serving/arms.yaml.
     image: vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
     command:
       - --model

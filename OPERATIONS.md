@@ -2543,8 +2543,8 @@ counts match.
 
 ### The local embedder (`embedder` compose service)
 
-`embedder` is the fourth service in `fused-memory/docker/docker-compose.yml`
-(after `falkordb`, `qdrant`, `fused-mcp`): vLLM serving
+`embedder` is a service in `fused-memory/docker/docker-compose.yml`, beside
+`falkordb`, `qdrant` and `fused-mcp`: vLLM serving
 `ibm-granite/granite-embedding-english-r2` (768 dims) as a pooling runner under
 the served name `granite-embedding-english-r2`. The image is pinned by the digest
 that `scripts/local-model-serving/arms.yaml` carries for the granite arm, the GPU
@@ -2557,34 +2557,49 @@ eval-only; nothing here calls `lms_serve.py`.
 Check it:
 
 ```bash
-curl -s http://127.0.0.1:8420/v1/models      # lists granite-embedding-english-r2
+curl -s http://127.0.0.1:8420/v1/models      # readiness: lists granite-embedding-english-r2
 ss -ltn 'sport = :8420'                      # bound on 127.0.0.1, not 0.0.0.0
 docker compose -f fused-memory/docker/docker-compose.yml ps embedder
 ```
 
-**Start and wait.** `fused-memory.service` carries two `-`-prefixed `ExecStartPre`
-lines for it: `up -d embedder` before the store wait (so the 107-123 s cold model
-load overlaps that wait), and a 15 s `wait-for-port` on `127.0.0.1:8420` after it.
-Both carry `-`, so a failed or slow embedder never blocks the start: fused-memory
-starts degraded and its startup probe reports the embedder. The two waits run
-serially, so their budgets (280 s + 15 s) must stay below `TimeoutStartSec=300`;
-`fused-memory/tests/test_systemd_unit_config.py` pins that.
+The `curl` is the readiness check. `ss -ltn` only shows the loopback bind, and
+the port is bound before the model serves.
 
-**The cutover hold.** `scripts/fused-memory-cutover-hold.conf` is a drop-in with
-`ConditionPathExists=!%h/.local/state/dark-factory/fused-memory-cutover.lock`. It
-is installed on both `fused-memory.service` and `fused-memory.socket`. While the
-lock file exists, systemd refuses to start either; with no lock it does nothing.
-The embedder cutover writes the lock at quiesce and removes it at release, and its
-`live` profile reads the path from this file, which is its only definition. The
-path is under the state directory rather than `$XDG_RUNTIME_DIR` or `/tmp` so it
-survives a reboot: the installed `orchestrator-*.service` units carry
-`Wants=fused-memory.service` and would start a held unit at boot if the lock vanished.
+**Start and wait.** `fused-memory.service` carries two `-`-prefixed `ExecStartPre`
+lines for it. `up -d --pull=never embedder` runs before the store wait, so the
+107-123 s cold model load starts as early as possible; `--pull=never` makes a
+missing image fail fast instead of starting a multi-GB pull that would outlive
+`TimeoutStartSec`. A 15 s `wait-for-port` on `127.0.0.1:8420` runs after the store
+wait; it shows the docker-published port is up, not that the model is loaded.
+The waits run serially, and 280 s + 15 s stays under `TimeoutStartSec=300`, as
+`fused-memory/tests/test_systemd_unit_config.py::TestEmbedderStartHooks` pins.
+No wait inside that budget covers the cold load, so on a cold boot fused-memory
+starts before granite finishes loading, and β1's startup probe (task 6798)
+reports the gap. Both lines carry `-`, so a failed embedder leaves fused-memory
+starting degraded, never failing its start. A restart of fused-memory alone finds
+the embedder already serving.
+
+`scripts/check_fused_memory_unit_parity.py` accepts an `ExecStartPre` compose `up`
+that names only `embedder` (its `UNGATED_COMPOSE_SERVICES`) and still flags any
+other compose `up` beside the FalkorDB AOF gate.
+
+**The cutover hold.** `scripts/fused-memory-cutover-hold.conf` is a drop-in whose
+one `ConditionPathExists=!` directive names the cutover lock file. That file is
+the lock path's only definition: read the path there, never from a copy. `%h` in
+it is systemd's home specifier, which δ's `live` profile (task 6805) must expand
+when it reads the path. The drop-in is installed on both `fused-memory.service`
+and `fused-memory.socket`. While the lock file exists, systemd refuses to start
+either; with no lock it does nothing. The embedder cutover writes the lock at
+quiesce and removes it at release. The path is under the state directory rather
+than `$XDG_RUNTIME_DIR` or `/tmp` so it survives a reboot: the installed
+`orchestrator-*.service` units carry `Wants=fused-memory.service` and would start
+a held unit at boot if the lock vanished.
 
 Once installed, the drop-in makes `scripts/check_fused_memory_unit_parity.py`
 report an `[override]` and exit 1. That is expected while the hold is installed.
 
 Installing the compose service, the template lines and the drop-in on the host is
-a separate attended step (task 6797's α2); the tracked files alone change nothing
+a separate attended step (α2, task 6801); the tracked files alone change nothing
 on the host.
 
 ### Dashboard unit-parity check
