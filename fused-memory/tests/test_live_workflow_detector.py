@@ -1100,8 +1100,8 @@ def _awaiting_task(**overrides: object) -> dict:
     return task
 
 
-# Claimant values whose "no claimant" reading the detector must take from
-# shared.task_claimant.carries_claimant; the non-str 0 reads as carried.
+# Claimant values covering None, blank strings, a non-str value and a real id;
+# the detector must read them as shared.task_claimant.carries_claimant does.
 _CLAIMANT_SHAPES = [None, '', '   ', '\t\n', 0, 'run-x/y/pid=1']
 
 
