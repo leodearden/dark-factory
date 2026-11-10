@@ -48,7 +48,7 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_evidence, verify_plan
+from orchestrator import verify_evidence, verify_fallback_floor, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -9038,8 +9038,9 @@ def _executed_fallback_plan(
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
 
-    *pytest_reason* is the ONE exception, and it exists because the fallback
-    branch's WHY genuinely changed at the execution layer (task 3513). When
+    *pytest_reason* is the ONE exception: it carries an execution-layer
+    rewrite of the pytest slot (marker widening, task 3513; fallback test
+    floor, task 8714), where the fallback branch's WHY genuinely changed. When
     ``verify_plan.widen_fallback_for_marker_deselection`` proves the decision's
     file-scoped pytest run would collect zero items, the call site drops the
     file targets from the ModuleConfig that is about to EXECUTE; passing that
@@ -9120,9 +9121,9 @@ def _safe_derive_executed_fallback_plan(
     the idealized flat ``'__fallback__'`` decision alone.
     *fallback_pytest_reason* rides along on that same path (and only that
     path — it is meaningless without an *executed_fallback* to reconcile
-    against): it is ``widen_fallback_for_marker_deselection``'s reason, which
-    :func:`_executed_fallback_plan` needs in order to record a marker-deselection
-    widening the executed config already applied. A bug in the
+    against): it is ``widen_fallback_for_marker_deselection``'s or the fallback
+    test floor's reason, which :func:`_executed_fallback_plan` needs in order to
+    record a pytest-slot rewrite the executed config already applied. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge — must never fail an otherwise-passing verify attempt
     just because its plan couldn't be built. Catches broadly and logs a
@@ -9877,6 +9878,14 @@ async def _run_scoped_verification_body(
             # is left unwired pending a follow-up that updates the test double.
             fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
+                fallback, floor_reason = verify_fallback_floor.apply_fallback_test_floor(
+                    fallback, existing_files, config.test_command, role,
+                )
+                if floor_reason is not None:
+                    logger.info(
+                        'Fallback test floor: %s — running %r',
+                        floor_reason, fallback.test_command,
+                    )
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
@@ -9889,19 +9898,20 @@ async def _run_scoped_verification_body(
                 # rescoped result — so the command's own shape decides. One
                 # reader serves both this probe and the plan derivation below.
                 fallback_reader = _worktree_reader(worktree)
-                fallback, fallback_pytest_reason = (
+                fallback, widen_reason = (
                     verify_plan.widen_fallback_for_marker_deselection(
                         fallback, fallback_reader,
                     )
                 )
-                if fallback_pytest_reason is not None:
+                if widen_reason is not None:
                     # Loud over silent: this is DEGRADATION (the widened run
                     # applies the same addopts, so the trigger files stay
                     # deselected and unrun), not a free coverage upgrade.
                     logger.warning(
                         'Fallback pytest widened to %r — %s',
-                        fallback.test_command, fallback_pytest_reason,
+                        fallback.test_command, widen_reason,
                     )
+                fallback_pytest_reason = widen_reason if widen_reason is not None else floor_reason
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
                 # Plan-authoritative execution (task κ,
                 # verify-scope-inversion-prd.md): derive_verify_plan's
