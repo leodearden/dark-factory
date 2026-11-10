@@ -63,8 +63,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-# IMPORTED, not copied (heuristic 11): it already encodes the pid contract
-# lease_is_live needs, down to rejecting pid <= 0 before os.kill.
 from shared.proc_liveness import pid_alive
 
 if TYPE_CHECKING:
@@ -175,13 +173,8 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
     costs at most one collision — exactly pre-4755 behaviour. A backwards clock
     step is the cheap failure; a wedged fleet is not.
 
-    The pid predicate is ``shared.proc_liveness.pid_alive``, IMPORTED rather
-    than re-implemented (heuristic 11): it already encodes the required contract,
-    including rejecting ``pid <= 0`` BEFORE ``os.kill`` — ``os.kill(0, 0)``
-    signals the caller's whole process group. The type checks here gate this
-    function's WARNING for a malformed lease, which the predicate's silent
-    False would not give. The watchdog's copy of the same predicate is FORCED
-    by its stdlib-only constraint, not a second opinion.
+    The type checks here gate this function's WARNING for a malformed lease,
+    which ``pid_alive``'s silent False would not give.
     """
     if path is None:
         return False
