@@ -3571,9 +3571,22 @@ class SqliteTaskBackend:
         off the 12-method contract prevents other callers from treating it as
         sanctioned public surface.
         """
-        await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
+        # Same caller -> store metadata boundary as the three above, so the
+        # same sanitizer (task 3816 review remediation). Privileged and
+        # interceptor-only, so the stakes are lower than the public
+        # writers — applied anyway so the authority rule is UNIFORMLY
+        # enforced from one implementation rather than being a per-site
+        # judgement call. Emptiness is judged on the SANITISED dict (task
+        # 4867): fields that are all stripped write nothing, so refuse before
+        # the connection and the row, as update_task does.
+        sanitized_fields = strip_machine_authored_metadata(
+            fields, project_root=project_root, tag=tag, task_id=tid,
+        )
+        if not sanitized_fields:
+            raise NoFieldsToUpdateError('stamp_audit_metadata', task_id)
+        await self.ensure_connected()
         async with self._write_unit(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
@@ -3585,15 +3598,6 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            # Same caller -> store metadata boundary as the three above, so the
-            # same sanitizer (task 3816 review remediation). Privileged and
-            # interceptor-only, so the stakes are lower than the public
-            # writers — applied anyway so the authority rule is UNIFORMLY
-            # enforced from one implementation rather than being a per-site
-            # judgement call.
-            sanitized_fields = strip_machine_authored_metadata(
-                fields, project_root=project_root, tag=tag, task_id=tid,
-            )
             new_metadata = _merge_metadata(
                 row['metadata'], json.dumps(sanitized_fields),
                 mode='merge',
@@ -4159,7 +4163,7 @@ def _refuse_update_with_no_mutating_field(
     so the constant and the update_task signature cannot drift apart silently.
     """
     if all(arguments[name] is None for name in _MUTATING_UPDATE_FIELDS):
-        raise NoFieldsToUpdateError(task_id, _MUTATING_UPDATE_FIELDS)
+        raise NoFieldsToUpdateError('update_task', task_id, _MUTATING_UPDATE_FIELDS)
 
 
 def _reject_append_on_replace_only_fields(

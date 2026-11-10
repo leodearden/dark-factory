@@ -2525,6 +2525,9 @@ were prose.
   on any scalar collision, and never removes a key. So append to `details`
   in one call, and rotate `description` and `metadata` in a separate call
   with `append` omitted and `metadata_mode='replace'`.
+- A call that supplies none of `prompt`, `metadata`, `title`, `description`,
+  `details`, `priority` or `dependencies` is refused with
+  `NoFieldsToUpdateError` (task 4867), and nothing is written.
 - No column has a length cap of its own. The only size guidance is the
   whole-task threshold above, and no write is refused for exceeding it.
 - Re-read the task from the store afterwards and confirm the status, the

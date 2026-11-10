@@ -534,13 +534,15 @@ class AppendUnsupportedFieldError(TaskmasterError):
 
 
 class NoFieldsToUpdateError(TaskmasterError):
-    """Raised when ``update_task`` is called with none of its mutating parameters.
+    """Raised when a task-metadata write is called with nothing to write.
 
     Such a call can only bump ``updated_at``. Reporting it as a success
     hides a caller whose real argument was dropped on the way in: in
     esc-3147-7 and esc-3671-7 a misnamed ``metadata`` argument vanished, the
     call wrote nothing, and the reply still said ``updated: True``. A call
-    with no legitimate purpose is refused rather than quietly accepted.
+    with no legitimate purpose is refused rather than quietly accepted. One
+    class serves every writer that can be called empty
+    (``update_task``, ``stamp_audit_metadata``), so callers branch on one type.
 
     Keeps ``code='TASKMASTER_TOOL_ERROR'`` and, like
     :class:`AppendUnsupportedFieldError`, has no ``to_error_dict()``: it
@@ -548,21 +550,35 @@ class NoFieldsToUpdateError(TaskmasterError):
     which reports ``error_type='NoFieldsToUpdateError'``.
 
     Attributes:
+        operation: The writer that refused the call, e.g. ``'update_task'``.
         task_id: The task the refused call targeted.
         accepted_fields: The parameter names that would have made the call a
-            write, in the order the backend declares them.
+            write, in the order the backend declares them; empty when the
+            writer accepts any key (``stamp_audit_metadata``).
     """
 
-    def __init__(self, task_id: str, accepted_fields: tuple[str, ...]) -> None:
+    def __init__(
+        self, operation: str, task_id: str, accepted_fields: tuple[str, ...] = (),
+    ) -> None:
+        self.operation = operation
         self.task_id = task_id
         self.accepted_fields = accepted_fields
+        if accepted_fields:
+            supplied = (
+                f'none of {", ".join(accepted_fields)} was supplied, so there is '
+                'nothing to write and nothing was written. If you passed one of '
+                'these under another name, that argument was ignored: resend it '
+                'under the name listed here.'
+            )
+        else:
+            supplied = (
+                'no writable metadata field was supplied (machine-authored keys '
+                'are stripped), so there is nothing to write and nothing was '
+                'written.'
+            )
         super().__init__(
             'TASKMASTER_TOOL_ERROR',
-            f'Refusing update_task for task {task_id}: none of '
-            f'{", ".join(accepted_fields)} was supplied, so there is nothing to '
-            'write and nothing was written. If you passed one of these under '
-            'another name, that argument was ignored: resend it under the '
-            'name listed here.',
+            f'Refusing {operation} for task {task_id}: {supplied}',
         )
 
 
