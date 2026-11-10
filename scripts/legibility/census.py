@@ -110,6 +110,7 @@ from legibility import (  # noqa: E402
     alarm,
     census_findings,
     census_identity,
+    census_state,
     census_trigger,
     census_window,
     codebook,
@@ -4447,7 +4448,7 @@ def _run_configured_census(
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = census_trigger.census_state_path(project_root)
-    prior = census_identity.prior_census(*census_trigger.load_census_state(census_state_path))
+    prior = census_identity.prior_census(census_state.load(census_state_path))
     plans_dir = project_root / "plans"
     identity = census_identity.allocate_run_identity(
         project_id=cfg.project_id,

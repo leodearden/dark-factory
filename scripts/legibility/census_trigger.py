@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, overload
 
 import yaml
-from legibility import census_identity, codebook
+from legibility import census_identity, census_state, codebook
 from legibility.config import Census as _LegibilityCensus
 
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
@@ -893,7 +893,7 @@ def decide_for_project(
         earliest_sighting, candidate_first_seens = None, []
 
     completion = check_completion(
-        census_identity.prior_census(state_status, state).run_id,
+        census_identity.prior_census(census_state.load(census_state_path(project_root))).run_id,
         project_root=project_root,
         threshold_pct=config.completion_threshold_pct,
         runner=completion_runner,
