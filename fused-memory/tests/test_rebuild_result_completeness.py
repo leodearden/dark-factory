@@ -7,15 +7,19 @@ that only two True verdicts prove the corpus complete.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import pydantic_spec
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.rebuild_summaries import (
     RebuildResult,
     RebuildSummariesManager,
+    run_rebuild_summaries,
 )
 
 
@@ -94,3 +98,67 @@ def test_corpus_proven_complete_only_when_both_reads_are_true(
     )
 
     assert result.corpus_proven_complete is expected
+
+
+async def _cli_summary_records(
+    make_fake_maintenance_service, caplog, service_result: dict[str, Any],
+) -> list[logging.LogRecord]:
+    mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
+    service = AsyncMock()
+    service.rebuild_entity_summaries = AsyncMock(return_value=service_result)
+    fake_ctx = make_fake_maintenance_service(mock_cfg, service)
+    with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'), patch(
+        'fused_memory.maintenance.rebuild_summaries.maintenance_service',
+        side_effect=fake_ctx,
+    ):
+        await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='proj')
+    return [r for r in caplog.records if 'run_rebuild_summaries complete' in r.message]
+
+
+@pytest.mark.asyncio
+async def test_cli_summary_reports_a_proven_complete_corpus_at_info(
+    make_fake_maintenance_service, caplog,
+):
+    records = await _cli_summary_records(
+        make_fake_maintenance_service, caplog, _service_result(),
+    )
+
+    assert len(records) == 1
+    (record,) = records
+    assert record.levelno == logging.INFO
+    assert 'entities_complete=True' in record.getMessage()
+    assert 'edges_complete=True' in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_cli_summary_escalates_a_partial_corpus_to_warning(
+    make_fake_maintenance_service, caplog,
+):
+    records = await _cli_summary_records(
+        make_fake_maintenance_service, caplog,
+        _service_result(edges_complete=False, edges_incomplete_kind=INCOMPLETE_SHORT_READ),
+    )
+
+    assert len(records) == 1
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert 'edges_complete=False' in record.getMessage()
+    assert INCOMPLETE_SHORT_READ in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_cli_summary_escalates_an_unknown_verdict_to_warning(
+    make_fake_maintenance_service, caplog,
+):
+    records = await _cli_summary_records(
+        make_fake_maintenance_service, caplog,
+        _service_result(
+            entities_complete=None, entities_incomplete_kind=None,
+            edges_complete=None, edges_incomplete_kind=None,
+        ),
+    )
+
+    assert len(records) == 1
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert 'entities_complete=None' in record.getMessage()
