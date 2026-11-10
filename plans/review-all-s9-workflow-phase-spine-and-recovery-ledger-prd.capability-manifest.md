@@ -69,7 +69,7 @@ Lands C3. Closes fk-d2ba7601c130; contributes fk-b8efaa973162 (λ2 closes). Depe
 | `block-route-replaces-two-flags` | capability→producer (δ) — BlockRoute makes the contradictory pair unrepresentable | grep `class BlockRoute` `orchestrator/src/orchestrator/workflow_types.py` → present | PASS |
 | `registered-category-vocabulary` | substrate (PASS today) — escalation.categories.EscalationCategory holds every category the workflow files | grep `class EscalationCategory` `escalation/src/escalation/categories.py` → present | PASS |
 | `typed-architect-exits-upstream` | producer: S5 ν (D13; _read_model and five *Exit dataclasses) — upstream of δ; edge at decompose [Q-C2] | — | PASS |
-| `merge-phase-derivation-premise` | OPEN — δ proves (D7) every merge_phase=True path runs in WorkflowState.MERGE, else BlockReason gains a phase field | — | OPEN |
+| `merge-phase-derivation-premise` | OPEN — δ proves (D7) every merge_phase=True path runs in WorkflowState.MERGE, else BlockReason gains a phase field | manual: reviewer confirms δ's tests cover every merge_phase=True path in WorkflowState.MERGE, or the phase field | OPEN |
 
 ## ε — The steward decides every published variant; the workflow believes it; one L0 settle
 

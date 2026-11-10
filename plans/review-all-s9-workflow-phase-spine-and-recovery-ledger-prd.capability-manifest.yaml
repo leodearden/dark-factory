@@ -283,6 +283,9 @@ tasks:
   - name: merge-phase-derivation-premise
     binding: OPEN — δ proves (D7) every merge_phase=True path runs in WorkflowState.MERGE, else BlockReason gains a phase field
     verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: 'the premise is δ''s own proof obligation (D7): the reviewer confirms δ''s tests cover every merge_phase=True call path running in WorkflowState.MERGE, or that BlockReason gained a phase field instead'
 - label: ε
   task_id: 9190
   title: The steward decides every published variant; the workflow believes it; one L0 settle
