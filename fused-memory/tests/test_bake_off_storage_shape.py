@@ -9175,7 +9175,7 @@ class TestMain:
 
 import os  # noqa: E402
 
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 @pytest.mark.integration

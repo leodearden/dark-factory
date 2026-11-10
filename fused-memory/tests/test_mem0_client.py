@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory

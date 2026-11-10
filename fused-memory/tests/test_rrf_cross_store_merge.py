@@ -42,7 +42,8 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import QDRANT_URL, MockEdge, load_script_module, qdrant_skipif
+from _fm_helpers import MockEdge, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from qdrant_client import QdrantClient
 
 from fused_memory.backends.mem0_client import Mem0Backend
