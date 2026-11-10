@@ -3,7 +3,10 @@
 Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
-conftests under `sys.modules['conftest']`.
+conftests under `sys.modules['conftest']`. The live-backend probes,
+polling barriers, real-git builders and httpx-leak reaping live in their own
+`_fm_*.py` siblings (`_fm_falkor_live`, `_fm_qdrant_live`, `_fm_polling`,
+`_fm_git_repos`, `_fm_httpx_leaks`) under the same convention.
 
 Testing a `scripts/` script? `scripts/` is not a package and is not on
 PYTHONPATH, so import it with `from _fm_helpers import
@@ -703,7 +706,7 @@ def make_graph_mock():
     defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
     ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
     columns BY NAME (``GraphitiBackend.list_indices``, and
-    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``_fm_falkor_live.await_index_operational`` before it) iterates
     ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
     call would raise ``TypeError`` instead of exercising the code under test.
     The ``[]`` default is safe because no existing consumer of this fixture
@@ -926,10 +929,9 @@ def _integration_collection_lease(request):
     ``-m 'not integration'``) never writes into the machine-global lease
     directory the live cron reads.
 
-    The reaper is loaded LAZILY here rather than at conftest import time, for
-    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
-    probe: a session that never runs an integration test must not pay for
-    it.  Via ``load_script_module`` — do not add another local
+    The reaper is loaded LAZILY here rather than at conftest import time, so
+    a session that never runs an integration test does not pay for it — the
+    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.  Via ``load_script_module`` — do not add another local
     ``spec_from_file_location`` loader (tasks 3738/3895).
     """
     if request.node.get_closest_marker('integration') is None:

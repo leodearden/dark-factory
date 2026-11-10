@@ -1,4 +1,4 @@
-"""Tests for the submit_and_resolve helper in _fm_helpers.py."""
+"""Tests for the helpers in _fm_helpers.py."""
 
 import asyncio
 import concurrent.futures

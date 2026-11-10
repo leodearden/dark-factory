@@ -8,6 +8,11 @@ colliding with sibling subprojects' helpers.
 
 An opt-in fixture defined here applies only to the modules that import it
 by name (see `lease_dir_fixture`).
+
+Five siblings follow the same convention, each owning one seam: `_fm_polling`
+(wait barriers), `_fm_qdrant_live` and `_fm_falkor_live` (live-backend
+scaffolding), `_fm_git_repos` (real-git builders) and `_fm_httpx_leaks`
+(leaked httpx client reaping).
 """
 
 import asyncio

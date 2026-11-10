@@ -184,7 +184,7 @@ class TestDropVectorIndicesSettlesTheCatalogFirst:
     ):
         """An index-free graph is a production steady state, not a build in flight.
 
-        The deliberate divergence from ``_fm_helpers.await_index_operational``,
+        The deliberate divergence from ``_fm_falkor_live.await_index_operational``,
         pinned at the method level; ``unsettled_index_statuses`` says why.
         """
         graph = _graph_returning(_result([]))

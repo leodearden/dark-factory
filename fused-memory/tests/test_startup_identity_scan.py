@@ -45,7 +45,7 @@ from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantF
 # FalkorDB server -- the mock tests above can only pin the Cypher
 # string/params shape, not FalkorDB's actual grouping/count semantics.
 # The reachability probe, connection constants and per-run graph name come
-# from _fm_helpers (task 3502) — see its module docstring for why it is not
+# from _fm_falkor_live (task 3502) — see its module docstring for why it is not
 # conftest.py. Only the fixture body below is per-module; do not re-fork the
 # shared helpers back into this file.
 #

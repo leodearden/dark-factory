@@ -5401,10 +5401,8 @@ class GraphitiBackend:
         (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
         implementation instead of re-forking the build-names / check-missing /
         ``.index()`` sequence — re-forking is how the positional read survived.
-        ``tests/_fm_helpers.await_index_operational`` still carries its own copy
-        (it resolves ``status`` by name for exactly this reason); collapsing that
-        third copy onto this helper is filed as a follow-up, as ``_fm_helpers``
-        is outside task 3706's locked scope.
+        ``tests/_fm_falkor_live.await_index_operational`` resolves its
+        ``status`` column through the same helper.
 
         A missing required column — or a header entry that is not a
         ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
@@ -5525,7 +5523,7 @@ class GraphitiBackend:
         This method deliberately adds NO barrier and issues exactly one
         ``CALL db.indexes()`` (the diff read) — establishing that an index is
         serving is task ε's canary, and the wait belongs in test fixtures
-        (``tests/_fm_helpers.await_index_operational``), never here.
+        (``tests/_fm_falkor_live.await_index_operational``), never here.
 
         Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
         the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
@@ -5754,7 +5752,7 @@ class GraphitiBackend:
                 settled catalog costs one ``CALL db.indexes()`` and no wait.
             interval: Seconds between polls.  What matters is noticing the
                 window CLOSE promptly, not catching a millisecond-scale opening;
-                this matches ``tests/_fm_helpers.await_index_operational``.
+                this matches ``tests/_fm_falkor_live.await_index_operational``.
 
         Returns:
             The settled ``list_indices()`` records, every one ``OPERATIONAL``.

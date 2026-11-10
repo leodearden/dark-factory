@@ -342,7 +342,7 @@ class IndexHeaderShapeError(ValueError):
 
     Subclasses ``ValueError`` so the historical ``list_indices()`` contract
     (``raise ValueError`` on a missing column) is preserved for callers that
-    catch it.  The test-side ``_fm_helpers.IndexHeaderError`` deliberately
+    catch it.  The test-side ``_fm_falkor_live.IndexHeaderError`` deliberately
     subclasses ``AssertionError`` instead, because there a header surprise must
     read as a failed test rather than as an error the suite might swallow.
     """
@@ -629,7 +629,7 @@ class IndexCatalogUnsettledError(RuntimeError):
     ``ensure_indices`` likewise refuses for provisioning (INV-4).
 
     A DISTINCT type, mirroring the ``IndexHeaderError``-vs-timeout split
-    ``tests/_fm_helpers`` makes: "the catalog never settled" and "a DROP
+    ``tests/_fm_falkor_live`` makes: "the catalog never settled" and "a DROP
     statement was rejected" call for different operator actions.  NOT a
     :class:`TimeoutError`, which is an :class:`OSError` subclass on py3.11+ and
     would be swept up by network/driver error handlers.  NOT a
@@ -650,7 +650,7 @@ def unsettled_index_statuses(records) -> list[tuple[object, object]]:
     and safe to act on.
 
     An EMPTY catalog counts as SETTLED.  This diverges DELIBERATELY from
-    ``tests/_fm_helpers.await_index_operational``, which treats an empty
+    ``tests/_fm_falkor_live.await_index_operational``, which treats an empty
     ``result_set`` as NOT ready.  That is correct for its callers — a fixture
     that just issued CREATE and sees nothing is looking at a create that has not
     registered — and wrong here, because an index-free graph is a legitimate

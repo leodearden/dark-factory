@@ -532,7 +532,7 @@ async def _reopen_rebuild_window(graph, deadline: float | None = None) -> None:
     #
     # A barrier raising here aborts the WHOLE retry -- reopen failures
     # propagate; retry_until_observed only absorbs a falsy OBSERVATION (pinned
-    # by test_fm_helpers.py::TestRetryUntilObserved
+    # by test_fm_polling.py::TestRetryUntilObserved
     # ::test_an_exception_from_reopen_aborts_the_retry_rather_than_being
     # _retried_around). That is deliberate: continuing to observe a window
     # that was never successfully re-opened would burn the budget and then

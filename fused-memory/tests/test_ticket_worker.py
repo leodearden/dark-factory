@@ -204,7 +204,7 @@ class TestPollTicketResolvedHelper:
     stay well inside the helper's 10s poll budget, so it cannot flake
     toward failure under load. Generic ``poll_until`` machinery
     (truthy-return, timeout raise, awaitable-predicate handling) is
-    already covered by ``TestPollUntil`` in test_fm_helpers.py:787+ (task
+    already covered by ``test_fm_polling.py::TestPollUntil`` (task
     2377); these tests pin only what is new here: the ticket-row
     predicate, its re-evaluation over time, and the descriptive failure
     message.

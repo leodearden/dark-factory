@@ -2521,7 +2521,7 @@ class TestTheClientIsReleased:
     `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
     write. Neither client class defines `__del__`, but the `httpx` wrapper
     each one holds does: `openai._base_client.AsyncHttpxClientWrapper` and its
-    anthropic twin (see `tests/_fm_helpers.py::reap_leaked_async_httpx_clients`).
+    anthropic twin (see `tests/_fm_httpx_leaks.py::reap_leaked_async_httpx_clients`).
     That finaliser is no substitute for closing. It schedules `aclose()` only
     if an event loop happens to be running when the garbage collector reaches
     the client; otherwise the connection pool — sockets and TLS state — is
