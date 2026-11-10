@@ -16,7 +16,7 @@ in exactly one respect: ``dashboard.api.burndown`` passes its own
 is shared.
 
 ``dashboard.api.quality``'s ``_QUALITY_WINDOWS`` counts landings, not days,
-so :func:`_parse_landing_window` serves a :class:`ServedLandingWindow` whose
+so :func:`parse_landing_window` serves a :class:`ServedLandingWindow` whose
 echo names ``landings`` and holds ``None`` for every landing; it shares the
 decline rule and default check with :func:`_parse_window`.
 
@@ -99,7 +99,7 @@ def _parse_window(
     return ServedWindow(requested=requested, served=served, days=vocabulary[served])
 
 
-def _parse_landing_window(
+def parse_landing_window(
     query_params: Mapping[str, str],
     *,
     vocabulary: Mapping[str, int | None],

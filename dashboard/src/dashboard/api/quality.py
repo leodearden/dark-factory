@@ -1,7 +1,7 @@
 """`/api/v2/dashboard/quality` — one project's per-landing quality series.
 
 The ``?window=`` chip counts landings, not days: ``_QUALITY_WINDOWS`` is this
-route's vocabulary, parsed by ``dashboard.api.window._parse_landing_window``.
+route's vocabulary, parsed by ``dashboard.api.window.parse_landing_window``.
 ``?project=`` takes the root's label or its project id in any spelling
 ``shared.project_id.fold_project_token`` folds. The marker and snapshot datums
 are unknown until their producers land (plans/quality-dashboard-prd.md leaves δ
@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from shared.project_id import fold_project_token, project_id_for_root
 
 from dashboard.api.clock import app_clock
-from dashboard.api.window import _parse_landing_window, with_window
+from dashboard.api.window import parse_landing_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumContractError, unknown_datum, validate_datum
 from dashboard.data.db import DbPool
@@ -49,13 +49,15 @@ _NO_SNAPSHOTS = (
 
 
 def _project_root(config: DashboardConfig, token: str) -> Path | None:
-    """The configured root labelled *token*, else the one whose project id *token* folds to."""
+    """The configured root labelled *token*, else the one whose project id folds as *token* does."""
     labelled = config.project_labels.root_for(token)
     if labelled is not None:
         return labelled
     folded = fold_project_token(token)
     return next(
-        (root for root in config.all_project_roots if project_id_for_root(root) == folded), None,
+        (root for root in config.all_project_roots
+         if fold_project_token(project_id_for_root(root)) == folded),
+        None,
     )
 
 
@@ -97,7 +99,7 @@ async def api_quality(request: Request) -> JSONResponse:
     """QUALITY + QUALITY_MARKERS + QUALITY_SNAPSHOTS + WINDOW + served_at for one project."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    window = _parse_landing_window(request.query_params, vocabulary=_QUALITY_WINDOWS,
+    window = parse_landing_window(request.query_params, vocabulary=_QUALITY_WINDOWS,
                                    default='100')
     now = app_clock(request.app)()
     datums: dict[str, Datum[Any]] = {

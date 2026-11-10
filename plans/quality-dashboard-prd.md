@@ -228,7 +228,7 @@ negative, so an EWMA chart can never show improvement at these rates.
       sample. The two newest samples are read without loading the sample history
       (`dashboard/src/dashboard/data/quality_store.py::newest_samples`).
     - The window is a landing count with its own served type. The parser is
-      `dashboard/src/dashboard/api/window.py::_parse_landing_window`, which shares one decline rule
+      `dashboard/src/dashboard/api/window.py::parse_landing_window`, which shares one decline rule
       with the day parser. It echoes `WINDOW = {requested, served, landings}`
       (`::ServedLandingWindow`, `landings: null` for `all`), never a `days` field. The vocabulary is
       `dashboard/src/dashboard/api/quality.py::_QUALITY_WINDOWS`.

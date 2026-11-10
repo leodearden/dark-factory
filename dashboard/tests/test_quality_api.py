@@ -17,16 +17,18 @@ from _quality_rows import history, write_landing_events, write_quality_db
 from _runs_db_fixture import EventRow
 from shared.quality_series.landings import GitCrossCheck
 
-from dashboard.api.quality import _QUALITY_WINDOWS
 from dashboard.api.window import (
     ServedLandingWindow,
     ServedWindow,
-    _parse_landing_window,
     _parse_window,
+    parse_landing_window,
     with_window,
 )
 from dashboard.config import DashboardConfig
 from dashboard.data.quality_store import QualitySample
+
+LANDINGS: dict[str, int | None] = {'100': 100, '300': 300, 'all': None}
+"""A landing vocabulary for the parser alone; the route's own is driven through the route."""
 
 
 @pytest.mark.parametrize(
@@ -44,16 +46,16 @@ from dashboard.data.quality_store import QualitySample
 def test_the_landing_window_serves_its_vocabulary_and_declines_the_rest(
     params: dict[str, str], expected: ServedLandingWindow,
 ) -> None:
-    assert _parse_landing_window(params, vocabulary=_QUALITY_WINDOWS, default='100') == expected
+    assert parse_landing_window(params, vocabulary=LANDINGS, default='100') == expected
 
 
 def test_the_landing_window_refuses_a_default_its_vocabulary_cannot_serve() -> None:
     with pytest.raises(ValueError, match="'7d'"):
-        _parse_landing_window({'window': '100'}, vocabulary=_QUALITY_WINDOWS, default='7d')
+        parse_landing_window({'window': '100'}, vocabulary=LANDINGS, default='7d')
 
 
 def test_a_served_landing_window_names_landings_not_days() -> None:
-    window = _parse_landing_window({'window': 'all'}, vocabulary=_QUALITY_WINDOWS, default='100')
+    window = parse_landing_window({'window': 'all'}, vocabulary=LANDINGS, default='100')
 
     assert window.to_wire() == {'requested': 'all', 'served': 'all', 'landings': None}
     assert with_window({'QUALITY': {}}, window) == {'QUALITY': {}, 'WINDOW': window.to_wire()}
@@ -114,6 +116,16 @@ def test_the_route_serves_the_quality_series_with_its_window(quality_client) -> 
     assert body['WINDOW'] == {'requested': '100', 'served': '100', 'landings': 100}
 
 
+@pytest.mark.parametrize(('label', 'landings'), [('300', 300), ('all', None)])
+def test_the_route_serves_every_window_its_chip_offers(
+    quality_client, label: str, landings: int | None,
+) -> None:
+    body = _get(quality_client, f'project=dark_factory&window={label}')
+
+    assert body['WINDOW'] == {'requested': label, 'served': label, 'landings': landings}
+    assert len(body['QUALITY']['value']['axis']) == STORED
+
+
 def test_markers_and_snapshots_are_unknown_until_their_producers_land(quality_client) -> None:
     body = _get(quality_client, 'project=dark_factory&window=100')
 
@@ -137,6 +149,20 @@ def test_a_label_and_a_project_id_spelling_resolve_to_the_same_root(quality_clie
     assert other_label == other_id
     assert other_label['state'] == 'unknown'
     assert 'other_proj' in other_label['reason']
+
+
+def test_a_project_id_resolves_whatever_separator_runs_the_root_basename_holds(
+    client, tmp_path: Path,
+) -> None:
+    root = tmp_path / 'twin--dash-'
+    root.mkdir()
+    client.app.state.config = DashboardConfig(project_root=root)
+    with installed_clock(client.app, fixed_clock(NOW)):
+        by_label = _get(client, 'project=twin--dash-')['QUALITY']
+        by_id = _get(client, 'project=twin_dash')['QUALITY']
+
+    assert by_id == by_label
+    assert 'no configured project root' not in by_id['reason']
 
 
 def test_an_unconfigured_project_is_unknown_naming_the_token(quality_client) -> None:
@@ -194,3 +220,17 @@ def test_an_unexpected_read_error_is_served_unknown_and_logged_as_a_bug(
     assert record.levelno == logging.WARNING
     assert record.exc_info is not None
     assert 'BUG, not an outage' in record.getMessage()
+
+
+def test_a_quality_db_that_is_not_a_database_is_served_unknown_naming_the_error(
+    client, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _seeded(client, tmp_path) as seeded:
+        seeded.app.state.config.quality_db.write_bytes(b'not a sqlite database' * 64)
+        with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
+            quality = _get(seeded, 'project=dark_factory&window=100')['QUALITY']
+
+    assert (quality['state'], quality['value']) == ('unknown', None)
+    assert quality['reason'].startswith('quality.db unreadable: DatabaseError')
+    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert record.exc_info is not None
