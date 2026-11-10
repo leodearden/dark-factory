@@ -34,13 +34,14 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 #
 # CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
 # effects, because those legitimately differ — `absent` is `info` at the
-# orchestrator, dashboard pre-install and lms sites but `warn` at the
-# fused-memory and dashboard post-install ones; the orchestrator gate may
-# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
-# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# orchestrator, dashboard pre-install and lms sites, `warn` at the
+# fused-memory and dashboard post-install ones and `fail` at the network
+# exposure one; the orchestrator gate may `fail` and sets
+# _orch_install_blocked, while the lms gate is forbidden from ever calling
+# `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
 # A helper that also emitted messages would have to collapse those distinctions
-# or take five message parameters — either way re-creating the coupling the
-# extraction removes.
+# or take a message and a severity per verdict from every site — either way
+# re-creating the coupling the extraction removes.
 #
 # The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
 # exits the instant it matches and the tag is on line 1, so once the report
