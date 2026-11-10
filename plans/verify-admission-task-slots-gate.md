@@ -78,6 +78,11 @@ median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. "So 2
 slots is not a middle ground either." That line was later overridden by the
 2026-09-23 raise below.
 
+The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
+49-72 and non-discriminating at this load, per task 3590). The main-tip sweep
+(background role) shares this slot and was already live in the 1-slot regime
+the 2300s figure comes from.
+
 As first written, this entry also said slot time was not the constraint: "the
 whole task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE
 slot." The 2026-09-18 correction below retracts that figure.
@@ -102,10 +107,6 @@ Sources, in `plans/verify-merge-queue-policy-study-2026-09-18/`:
 
 With the slot saturated and in-flight tasks pinned at `max_concurrent_tasks`,
 mean task duration is set by WIP and leg service time, not by slot ordering.
-The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
-49-72 and non-discriminating at this load, per task 3590). The main-tip sweep
-(background role) shares this slot and was already live in the 1-slot regime
-the 2300s figure comes from.
 
 ### 2026-09-23 — 1 -> 2
 
