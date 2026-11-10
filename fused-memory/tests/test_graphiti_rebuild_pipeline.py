@@ -25,7 +25,8 @@ from fused_memory.backends.graphiti_client import (
     StaleSummaryResult,
 )
 
-#: The logger the service hands detect_stale_with_edges for the policy warning.
+#: The logger the service hands both stale probes, detect_stale_with_edges and
+#: detect_stale_dry_run, for the policy warning.
 _SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
 
 
@@ -615,7 +616,9 @@ class TestRebuildEntitySummariesDataFlow:
         result = await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
 
         # Service dispatches to detect_stale_dry_run for force=False+dry_run=True
-        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         svc.graphiti.detect_stale_with_edges.assert_not_awaited()
         # Bulk edge fetch must NOT be issued
         svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()

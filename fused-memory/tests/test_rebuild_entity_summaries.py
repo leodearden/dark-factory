@@ -44,7 +44,8 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig
 
-#: The logger the service hands detect_stale_with_edges for the policy warning.
+#: The logger the service hands both stale probes, detect_stale_with_edges and
+#: detect_stale_dry_run, for the policy warning.
 _SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
 
 
@@ -1223,7 +1224,9 @@ class TestRebuildEntitySummaries:
         assert result['skipped'] == 1
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
-        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2806,7 +2809,9 @@ class TestServiceRebuildOrchestrationDryRun:
     async def test_false_dry_run_calls_detect_stale_dry_run(self, service_dry_run):
         """force=False+dry_run=True calls detect_stale_dry_run, NOT detect_stale_with_edges."""
         await service_dry_run.rebuild_entity_summaries(project_id='proj', dry_run=True)
-        service_dry_run.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='proj')
+        service_dry_run.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='proj', log=_SERVICE_LOG
+        )
         service_dry_run.graphiti.detect_stale_with_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3421,23 +3426,55 @@ class TestRebuildReportsReadCompleteness:
         assert 'edges_incomplete_kind' not in result_summary
 
     @pytest.mark.asyncio
-    async def test_stale_dry_run_has_no_verdict(self, mock_config):
-        """Documented residual tkt_0RVHH0D37FVAWSMT1NVGSHDSZM.
+    async def test_stale_dry_run_reports_the_node_verdict_only(self, mock_config):
+        """The force=False dry_run probe reports its node read's verdict.
 
-        The force=False dry_run probe, detect_stale_dry_run, still reads through
-        the list_entity_nodes shim and surfaces no verdict.  Expected to flip
-        when that ticket lands.
+        There is no edge verdict, because the probe issues only per-node edge
+        reads, never a whole-graph one.
         """
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
-            stale=[], total_count=0, entities_completeness=COMPLETE_READ,
+            stale=[], total_count=0,
+            entities_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
         ))
         result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
 
-        assert result['entities_complete'] is None
-        assert result['entities_incomplete_kind'] is None
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
         assert result['edges_complete'] is None
         assert result['edges_incomplete_kind'] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_dry_run_reports_a_short_node_read_and_warns_under_the_service(
+        self, mock_config, make_backend, make_edge_backend, caplog
+    ):
+        """A real backend, so the probe runs the real checked node read."""
+        svc = _make_svc(mock_config)
+        svc.graphiti = make_edge_backend(
+            make_backend(mock_config),
+            nodes=self._NODES,
+            edges=self._EDGES,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+        )
+        svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=self._EDGES['u1'])
+        with caplog.at_level(logging.WARNING):
+            result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
+
+        def warned_under(logger_name):
+            return [
+                r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.WARNING
+                and 'enumerate_entity_nodes' in r.getMessage()
+            ]
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert result['edges_complete'] is None
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+        assert warned_under('fused_memory.services.memory_service')
+        assert not warned_under('fused_memory.backends.graphiti_client')
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
