@@ -72,7 +72,7 @@ from orchestrator.verify_admission_record import (
     legs_from_wire,
     plan_request,
 )
-from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -6705,7 +6705,7 @@ def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
     *,
-    role: Literal['merge', 'task', 'background'] = 'task',
+    role: VerifyRole = 'task',
 ) -> dict[str, str]:
     """Return the effective env injected into verify commands.
 

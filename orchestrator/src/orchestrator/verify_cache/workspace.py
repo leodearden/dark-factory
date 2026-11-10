@@ -65,7 +65,10 @@ class WorkspaceGraph:
         for member in WorkspacePatterns.from_root(root_text).expand(directories):
             if member not in member_texts:
                 raise ValueError(f'workspace member {member!r} has no pyproject.toml')
-            manifests[member] = tomllib.loads(member_texts[member])
+            try:
+                manifests[member] = tomllib.loads(member_texts[member])
+            except tomllib.TOMLDecodeError as exc:
+                raise ValueError(f'workspace member {member!r} has an unparseable pyproject.toml: {exc}') from exc
         names = {member: _project_name(member, manifest) for member, manifest in manifests.items()}
         member_by_name = {name: member for member, name in names.items()}
         dependencies = {

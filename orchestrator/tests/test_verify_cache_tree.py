@@ -215,6 +215,13 @@ class TestWorkspaceGraph:
         assert graph.closure({'beta'}) == {'alpha', 'beta'}
 
     @pytest.mark.asyncio
+    async def test_an_unparseable_member_pyproject_is_a_tree_read_error_naming_the_member(self, repo):
+        (repo / 'beta' / 'pyproject.toml').write_text('[project\nname = "beta"\n')
+
+        with pytest.raises(tree_objects.TreeReadError, match="member 'beta'"):
+            await workspace.read_workspace(repo, _write_tree(repo))
+
+    @pytest.mark.asyncio
     async def test_a_glob_member_expands_against_the_trees_directories(self, tmp_path):
         globbed = seed_repo(tmp_path / 'globbed', RepoSeed(
             files=(

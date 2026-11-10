@@ -54,7 +54,7 @@ from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 
 logger = logging.getLogger(__name__)
 
@@ -1431,7 +1431,7 @@ class VerifyCacheConfig(BaseModel):
     task_mode: CacheMode = CacheMode.OFF
     merge_mode: CacheMode = CacheMode.OFF
 
-    def mode_for(self, role: Literal['task', 'merge', 'background']) -> CacheMode:
+    def mode_for(self, role: VerifyRole) -> CacheMode:
         """*role*'s mode; the cache has no background role, so that is always OFF."""
         if role == 'task':
             return self.task_mode
@@ -3290,7 +3290,7 @@ _OVERRIDABLE_FIELDS = frozenset({
     'scope_cargo', 'verify_cache',
 })
 
-_MODULE_VERIFY_CACHE_VALUES = ('default', 'never')
+ModuleVerifyCache = Literal['default', 'never']
 
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
@@ -3327,13 +3327,13 @@ class ModuleConfig:
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
     # 'never' keeps every unit of this module out of the verify-result cache.
-    verify_cache: Literal['default', 'never'] = 'default'
+    verify_cache: ModuleVerifyCache = 'default'
 
     def __post_init__(self) -> None:
-        if self.verify_cache not in _MODULE_VERIFY_CACHE_VALUES:
+        if self.verify_cache not in get_args(ModuleVerifyCache):
             raise ValueError(
                 f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
-                f'expected one of {_MODULE_VERIFY_CACHE_VALUES}',
+                f'expected one of {get_args(ModuleVerifyCache)}',
             )
 
 
@@ -3450,9 +3450,22 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
             continue
         kwargs = {k: raw[k] for k in _OVERRIDABLE_FIELDS if k in raw}
         if kwargs:
-            configs[prefix] = ModuleConfig(prefix=prefix, **kwargs)
+            configs[prefix] = ModuleConfig(prefix=prefix, **_never_cache_if_unknown(prefix, kwargs))
             logger.info('Loaded module config for %r: %s', prefix, list(kwargs))
     return configs
+
+
+def _never_cache_if_unknown(prefix: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """*kwargs* with an unknown ``verify_cache`` value read as 'never': a typo in
+    one module's yaml keeps that module out of the cache, not the orchestrator down."""
+    value = kwargs.get('verify_cache', 'default')
+    if value in get_args(ModuleVerifyCache):
+        return kwargs
+    logger.error(
+        'module %r: verify_cache is %r, expected one of %s; treating it as never',
+        prefix, value, get_args(ModuleVerifyCache),
+    )
+    return {**kwargs, 'verify_cache': 'never'}
 
 
 _DEFAULT_PRICES: dict[str, dict[str, float]] = {

@@ -8,6 +8,7 @@ suite instead of a scoped subset.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -128,3 +129,17 @@ class TestModuleNeverCache:
         config = load_config(_project(tmp_path, {}))
 
         assert config.module_configs_or_empty['guards'].verify_cache == 'never'
+
+    def test_a_misspelt_module_yaml_value_loads_as_never_and_logs_the_module(self, tmp_path, caplog):
+        guards = tmp_path / 'guards'
+        guards.mkdir()
+        (guards / 'orchestrator.yaml').write_text(
+            yaml.safe_dump({'test_command': 'pytest guards', 'verify_cache': 'nevr'}),
+        )
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.config'):
+            config = load_config(_project(tmp_path, {}))
+
+        module = config.module_configs_or_empty['guards']
+        assert (module.verify_cache, module.test_command) == ('never', 'pytest guards')
+        assert any("'guards'" in record.getMessage() and "'nevr'" in record.getMessage() for record in caplog.records)

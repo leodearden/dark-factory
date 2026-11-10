@@ -21,7 +21,13 @@ from orchestrator import verify_plan
 from orchestrator.verify_cache import tree_objects
 from orchestrator.verify_cache.toolchain import ToolchainFingerprint
 from orchestrator.verify_cache.workspace import WorkspaceGraph, read_workspace
-from orchestrator.verify_cmd import render
+from orchestrator.verify_cmd import (
+    VerifyCmd,
+    parse_config_command,
+    render,
+    split_and_chain_segments,
+    strip_cwd,
+)
 from orchestrator.verify_evidence import UnitTier, module_leg_name, run_spec_hash
 from orchestrator.verify_plan import PlannedRun, VerifyPlan
 from orchestrator.verify_spec_shared import canonical_json
@@ -97,30 +103,33 @@ class CommandPath(NamedTuple):
 
 
 def command_path_candidates(run: PlannedRun) -> frozenset[CommandPath]:
-    """Every tree path *run*'s rendered command may name, root-relative and, when
-    the command has a cwd, cwd-relative too. Absolute tokens name the host, the
+    """Every tree path *run*'s command may name, each word read relative to the
+    directory its clause runs in. Absolute tokens name the host, the
     toolchain's domain; a token escaping the tree keeps its in-tree remainder."""
     if run.cmd is None:
         return frozenset()
-    bases = ('',) if run.cmd.cwd_rel is None else ('', run.cmd.cwd_rel)
     return frozenset(
         CommandPath(path, _is_path_like(token))
-        for token in _command_tokens(render(run.cmd))
-        for base in bases
-        if (path := _tree_path(base, token)) is not None
+        for clause in _clauses(run.cmd)
+        for token in _command_tokens(clause.command)
+        if (path := _tree_path(clause.cwd, token)) is not None
     )
 
 
 def unit_input_paths(run: PlannedRun, inputs: TreeInputs) -> Inputs:
-    """``('tree:<path>', oid)`` for *run*'s module, cwd, uv project, the paths its
-    command names, and the workspace members those depend on, transitively."""
-    keyed = {path: inputs.oid(path) for path in _anchor_paths(run)}
+    """``('tree:<path>', oid)`` for *run*'s module, the dirs its clauses run in,
+    their uv projects and the workspace members those depend on, transitively;
+    and for each path its command names, by that path's own oid. A module in no
+    workspace member has no derivable closure, so its key reads the whole tree."""
+    anchors = _anchor_paths(run)
+    closure = inputs.workspace.closure(inputs.workspace.members_containing(anchors))
+    keyed = {path: inputs.oid(path) for path in anchors | closure}
+    if not inputs.workspace.members_containing([run.module_prefix]):
+        keyed[WHOLE_TREE] = inputs.oid(WHOLE_TREE)
     for candidate in command_path_candidates(run):
         oid = inputs.oid(candidate.path)
         if oid is not None or candidate.path_like:
             keyed[candidate.path] = oid
-    for member in inputs.workspace.closure(inputs.workspace.members_containing(keyed)):
-        keyed[member] = inputs.oid(member)
     return tuple(sorted((f'tree:{path}', oid or ABSENT) for path, oid in keyed.items()))
 
 
@@ -218,10 +227,41 @@ def _module_unit_id(run: PlannedRun) -> str | None:
 
 
 def _anchor_paths(run: PlannedRun) -> set[str]:
-    anchors = [run.module_prefix]
-    if run.cmd is not None:
-        anchors += [run.cmd.cwd_rel or '', run.cmd.uv_project or '']
+    anchors = {run.module_prefix}
+    for clause in _clauses(run.cmd) if run.cmd is not None else ():
+        anchors.add(clause.cwd)
+        if clause.uv_project:
+            anchors.add(_subdir(clause.cwd, clause.uv_project))
     return {path for anchor in anchors if anchor and (path := _tree_path('', anchor)) is not None}
+
+
+class _Clause(NamedTuple):
+    """One clause of a command: the tree dir it runs in (``''`` at the root), its uv project and its words."""
+
+    cwd: str
+    uv_project: str | None
+    command: str
+
+
+def _clauses(cmd: VerifyCmd, cwd: str = '') -> Iterator[_Clause]:
+    """*cmd*'s clauses, following a structured command's cwd and an ``&&``
+    chain's ``cd``s; a raw command that does not segment is one clause at *cwd*."""
+    if cmd.raw is None:
+        yield _Clause(_subdir(cwd, cmd.cwd_rel), cmd.uv_project, render(strip_cwd(cmd)))
+        return
+    segments = split_and_chain_segments(cmd.raw)
+    if segments is None:
+        yield _Clause(cwd, None, render(cmd))
+        return
+    for segment in segments:
+        yield from _clauses(parse_config_command(segment.command), _subdir(cwd, segment.cwd_rel))
+
+
+def _subdir(base: str, rel: str | None) -> str:
+    if rel is None:
+        return base
+    path = _tree_path(base, rel)
+    return '' if path is None or path == WHOLE_TREE else path
 
 
 def _command_tokens(command: str) -> Iterator[str]:

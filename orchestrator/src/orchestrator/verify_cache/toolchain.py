@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.verify_cache import tree_objects
+from orchestrator.verify_cache.modes import VERIFY_ROLES, VerifyRole
 
 FINGERPRINTED_TOOLS = ('pyright', 'ruff')
 
@@ -29,19 +30,25 @@ class ToolchainFingerprint:
 
     ``tool_versions`` holds ``(tool, lockfile, version)`` and ``verify_env``
     ``(name, value)``; both are sorted at construction, so their order is not
-    identity.
+    identity. ``orchestrator_code`` identifies the orchestrator code that
+    rewrites, runs and judges the legs (its deployed code sha): that code is
+    not in a target's tree, and for this repo the running copy is not the
+    tree under verify.
     """
 
-    role: str
+    role: VerifyRole
     interpreter: str | None
     uv_lock_blob: str | None
     tool_versions: tuple[tuple[str, str, str], ...]
     verify_env: tuple[tuple[str, str], ...]
     preprovision_command: str
+    orchestrator_code: str
 
     def __post_init__(self) -> None:
-        if not self.role:
-            raise ValueError('a toolchain fingerprint needs a verify role')
+        if self.role not in VERIFY_ROLES:
+            raise ValueError(f'toolchain role {self.role!r} is not one of {VERIFY_ROLES}')
+        if not self.orchestrator_code:
+            raise ValueError('a toolchain fingerprint needs the orchestrator code identity')
         object.__setattr__(self, 'tool_versions', tuple(sorted(self.tool_versions)))
         object.__setattr__(self, 'verify_env', tuple(sorted(self.verify_env)))
         _require_unique('tool lockfile', [(tool, source) for tool, source, _v in self.tool_versions])
@@ -56,6 +63,7 @@ class ToolchainFingerprint:
             *((f'toolchain.tool.{tool}@{source}', version) for tool, source, version in self.tool_versions),
             *((f'toolchain.env.{name}', value) for name, value in self.verify_env),
             ('toolchain.preprovision', self.preprovision_command),
+            ('toolchain.orchestrator_code', self.orchestrator_code),
         )))
 
 
@@ -90,9 +98,10 @@ async def read_toolchain(
     repo: Path,
     tree: str,
     *,
-    role: str,
+    role: VerifyRole,
     verify_env: Mapping[str, str],
     preprovision_command: str,
+    orchestrator_code: str,
 ) -> ToolchainFingerprint:
     """The toolchain *tree*'s legs run under in *worktree*.
 
@@ -122,6 +131,7 @@ async def read_toolchain(
         tool_versions=tool_versions_from_lockfiles(uv_lock_text, package_lock_text),
         verify_env=tuple(verify_env.items()),
         preprovision_command=preprovision_command,
+        orchestrator_code=orchestrator_code,
     )
 
 

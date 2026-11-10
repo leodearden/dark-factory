@@ -46,6 +46,7 @@ def _fingerprint(**overrides: object) -> toolchain.ToolchainFingerprint:
         'tool_versions': (('ruff', 'uv.lock', '0.15.9'),),
         'verify_env': (('DF_VERIFY_ROLE', 'merge'), ('K', 'V')),
         'preprovision_command': 'uv sync --all-packages',
+        'orchestrator_code': 'c' * 40,
     }
     return toolchain.ToolchainFingerprint(**{**fields, **overrides})
 
@@ -108,6 +109,7 @@ class TestFingerprintInputs:
         {'verify_env': (('DF_VERIFY_ROLE', 'merge'), ('K', 'W'))},
         {'interpreter': 'CPython 3.14.0'},
         {'tool_versions': (('ruff', 'uv.lock', '0.15.10'),)},
+        {'orchestrator_code': 'd' * 40},
     ])
     def test_any_one_field_changes_the_inputs(self, override):
         assert _fingerprint(**override).as_inputs() != _fingerprint().as_inputs()
@@ -121,9 +123,18 @@ class TestFingerprintInputs:
         assert reordered == _fingerprint()
         assert reordered.as_inputs() == _fingerprint().as_inputs()
 
-    def test_a_fingerprint_needs_a_role(self):
-        with pytest.raises(ValueError, match='role'):
-            _fingerprint(role='')
+    @pytest.mark.parametrize('role', ['', 'Merge', 'merge '])
+    def test_a_role_outside_the_verify_roles_is_rejected_naming_it(self, role):
+        with pytest.raises(ValueError, match=f'role {role!r}'):
+            _fingerprint(role=role)
+
+    def test_a_fingerprint_needs_the_orchestrator_code_identity(self):
+        with pytest.raises(ValueError, match='orchestrator code'):
+            _fingerprint(orchestrator_code='')
+
+    def test_a_duplicate_verify_env_name_is_rejected_naming_it(self):
+        with pytest.raises(ValueError, match="verify_env name.*'K'"):
+            _fingerprint(verify_env=(('K', 'V'), ('K', 'W')))
 
 
 class TestReadToolchain:
@@ -137,7 +148,7 @@ class TestReadToolchain:
 
         fingerprint = await toolchain.read_toolchain(
             _worktree_with_venv(tmp_path), repo, tree,
-            role='task', verify_env={'K': 'V'}, preprovision_command='uv sync',
+            role='task', verify_env={'K': 'V'}, preprovision_command='uv sync', orchestrator_code='c' * 40,
         )
 
         assert dataclasses.astuple(fingerprint) == (
@@ -151,6 +162,7 @@ class TestReadToolchain:
             ),
             (('K', 'V'),),
             'uv sync',
+            'c' * 40,
         )
 
     @pytest.mark.asyncio
@@ -162,7 +174,7 @@ class TestReadToolchain:
         with pytest.raises(toolchain.ToolchainUnavailable, match='pyvenv.cfg'):
             await toolchain.read_toolchain(
                 worktree, repo, _git(repo, 'rev-parse', 'HEAD^{tree}'),
-                role='merge', verify_env={}, preprovision_command='',
+                role='merge', verify_env={}, preprovision_command='', orchestrator_code='c' * 40,
             )
 
     @pytest.mark.asyncio
@@ -173,7 +185,7 @@ class TestReadToolchain:
 
         fingerprint = await toolchain.read_toolchain(
             worktree, repo, _git(repo, 'rev-parse', 'HEAD^{tree}'),
-            role='merge', verify_env={}, preprovision_command='',
+            role='merge', verify_env={}, preprovision_command='', orchestrator_code='c' * 40,
         )
 
         assert fingerprint.interpreter is None

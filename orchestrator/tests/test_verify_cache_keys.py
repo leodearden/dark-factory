@@ -104,6 +104,8 @@ _KEYS_SEED = RepoSeed(
         ('alpha/tests/test_a.py', 'def test_a():\n    pass\n'),
         ('beta/pyproject.toml', '[project]\nname = "beta"\nversion = "0"\ndependencies = ["alpha>=0"]\n'),
         ('beta/src/beta/__init__.py', 'B = 1\n'),
+        ('beta/scripts/check.py', 'print("beta check")\n'),
+        ('tests/scripts/test_s.py', 'def test_s():\n    pass\n'),
         ('tools/check.py', 'print("check")\n'),
         ('docs/notes.md', '# notes\n'),
     ),
@@ -140,6 +142,7 @@ _TOOLCHAIN = toolchain.ToolchainFingerprint(
     tool_versions=(('ruff', 'uv.lock', '0.15.9'),),
     verify_env=(('DF_VERIFY_ROLE', 'merge'),),
     preprovision_command='uv sync --all-packages',
+    orchestrator_code='c' * 40,
 )
 _ALPHA = {verify_evidence.module_leg_name('alpha', leg) for leg in Leg}
 _BETA = {verify_evidence.module_leg_name('beta', leg) for leg in Leg}
@@ -233,11 +236,63 @@ class TestModuleUnitKeys:
         assert _moved(before, after) == {'module:alpha:lint'}
 
     @pytest.mark.asyncio
+    async def test_a_helper_named_inside_another_member_keys_that_file_not_its_member(self, repo, tree):
+        plan = VerifyPlan(runs=(PlannedRun(
+            'alpha', parse_config_command('uv run --project alpha ruff check alpha && python3 beta/scripts/check.py'),
+            ScopeKind.FULL_SUITE, 'lint: structural change',
+        ),))
+        before = await _keys_for(repo, tree, plan=plan)
+
+        unrelated = await _keys_for(repo, _edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n'), plan=plan)
+        helper = await _keys_for(repo, _edit(repo, 'beta/scripts/check.py', 'print("edited")\n'), plan=plan)
+
+        assert _moved(before, unrelated) == set()
+        assert _moved(before, helper) == {'module:alpha:lint'}
+
+    @pytest.mark.asyncio
+    async def test_a_clause_with_a_cwd_reads_its_words_in_that_cwd_only(self, repo, tree):
+        plan = VerifyPlan(runs=_module_runs(
+            'alpha',
+            lint='uv run --directory alpha ruff check src/ tests/ && python3 tools/check.py alpha',
+            type_check='uv run --directory alpha pyright src/ tests/',
+            test='uv run --directory alpha pytest tests/ -q',
+        ))
+        before = await _unit_keys(repo, tree, plan=plan)
+
+        after = await _keys_for(repo, _edit(repo, 'tests/scripts/test_s.py', '# edited\n'), plan=plan)
+
+        assert _moved({unit_id: unit.key for unit_id, unit in before.items()}, after) == set()
+        assert dict(before['module:alpha:test'].inputs)['tree:alpha/tests'] == (
+            _git(repo, 'rev-parse', f'{tree}:alpha/tests')
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_module_in_no_workspace_member_is_keyed_on_the_whole_tree(self, repo, tree):
+        plan = VerifyPlan(runs=(PlannedRun(
+            'tools', parse_config_command('python3 tools/check.py'), ScopeKind.FULL_SUITE, 'lint: structural change',
+        ),))
+        before = (await _unit_keys(repo, tree, plan=plan))['module:tools:lint']
+
+        after = await _keys_for(repo, _edit(repo, 'docs/notes.md', '# edited\n'), plan=plan)
+
+        assert dict(before.inputs)['tree:.'] == tree
+        assert after['module:tools:lint'] != before.key
+
+    @pytest.mark.asyncio
+    async def test_a_plan_with_two_runs_for_one_unit_is_rejected_naming_it(self, repo, tree):
+        plan = VerifyPlan(runs=(_ALPHA_TEST_RUN, _full_suite_test_run('pytest: structural change')))
+        inputs = await keys.read_tree_inputs(repo, tree, plan)
+
+        with pytest.raises(ValueError, match="'module:alpha:test'"):
+            keys.module_unit_keys(inputs, plan, _TOOLCHAIN)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('override', [
         {'role': 'task'},
         {'preprovision_command': ''},
         {'interpreter': 'CPython 3.14.0'},
         {'verify_env': (('DF_VERIFY_ROLE', 'merge'), ('EXTRA', '1'))},
+        {'orchestrator_code': 'd' * 40},
     ])
     async def test_a_toolchain_change_moves_every_key(self, repo, tree, override):
         before = await _keys_for(repo, tree)
@@ -341,7 +396,7 @@ class TestCommandPathCandidates:
 
     def test_a_payload_naming_a_path_with_non_lexer_whitespace_keeps_that_path(self):
         run = PlannedRun(
-            'alpha', parse_config_command('bash -c \'pytest "alpha/tests/a b.py" -q\''), ScopeKind.FULL_SUITE,
+            'alpha', parse_config_command('bash -c \'pytest "alpha/tests/a\xa0b.py" -q\''), ScopeKind.FULL_SUITE,
             'pytest: conftest touched',
         )
 
@@ -359,6 +414,19 @@ class TestUnitKeyInvariants:
     def test_a_unit_id_of_another_tier_is_rejected(self):
         with pytest.raises(ValueError, match="'tree'.*module"):
             keys.UnitKey.of('tree', UnitTier.MODULE, 's', (('spec', 's'),))
+
+    @pytest.mark.parametrize('inputs', [(('tree:alpha', 'a'),), (('spec', 't'), ('tree:alpha', 'a'))])
+    def test_a_spec_hash_that_is_not_its_spec_input_is_rejected(self, inputs):
+        with pytest.raises(ValueError, match="spec_hash 's'"):
+            keys.UnitKey.of('module:alpha:test', UnitTier.MODULE, 's', inputs)
+
+    @pytest.mark.parametrize('inputs', [
+        (('tree:b', 'x'), ('spec', 's'), ('tree:a', 'y')),
+        (('spec', 's'), ('tree:a', 'x'), ('tree:a', 'y')),
+    ])
+    def test_inputs_out_of_order_or_with_a_repeated_name_are_rejected(self, inputs):
+        with pytest.raises(ValueError, match="not sorted with unique names.*'tree:a'"):
+            keys.UnitKey('module:alpha:test', UnitTier.MODULE, keys.digest(inputs), 's', inputs)
 
 
 _TEST_FILE = 'alpha/tests/test_a.py'
