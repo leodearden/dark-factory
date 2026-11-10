@@ -226,17 +226,19 @@ def _anchor_paths(run: PlannedRun) -> set[str]:
 
 def _command_tokens(command: str) -> Iterator[str]:
     """The words of *command* that may name a path: shell operators and bare
-    flags dropped, ``name=value`` reduced to its value, and a quoted shell
-    payload (a ``bash -c`` argument) split again."""
+    flags dropped, ``name=value`` reduced to its value, and a token the lexer
+    could split again (a ``bash -c`` payload) re-lexed and never itself a path."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    separators = frozenset(lexer.whitespace)
     try:
         tokens = list(lexer)
     except ValueError:
         tokens = command.split()
     for token in tokens:
-        if any(char.isspace() for char in token):
+        if not separators.isdisjoint(token):
             yield from _command_tokens(token)
+            continue
         if not token or set(token) <= _SHELL_PUNCTUATION:
             continue
         _name, assigns, value = token.partition('=')
