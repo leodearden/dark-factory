@@ -10636,6 +10636,7 @@ class SpeculativeMergeWorker:
 
     def _record_dead_base(
         self, *shas: str, killer: DeadBaseKiller, doomed: Collection[str] = (),
+        notify_merger: bool = True,
     ) -> None:
         """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
 
@@ -10649,9 +10650,14 @@ class SpeculativeMergeWorker:
         Each commit is then handed to the merger's re-anchor hook,
         :meth:`SpeculationController.on_base_invalidated`
         (plans/merge-lane-policy-prd.md D2), which counts *doomed* as dead too.
+        A site about to build the commit's replacement passes
+        ``notify_merger=False`` and calls :meth:`_reanchor_merger_on` once the
+        replacement exists.
         """
         for sha in shas:
             self._dead_base_commits.record(sha, killer)
+        if not notify_merger:
+            return
         live_tip = self._merger_live_tip(doomed)
         for sha in shas:
             self._speculation_controller.on_base_invalidated(sha, live_tip)
@@ -10673,6 +10679,7 @@ class SpeculativeMergeWorker:
 
     def _record_item_commit_dead(
         self, item: SpeculativeItem, site: DeadBaseSite, *, doomed: Collection[str] = (),
+        notify_merger: bool = True,
     ) -> None:
         """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
         if isinstance(item, RealMergeItem):
@@ -10680,7 +10687,25 @@ class SpeculativeMergeWorker:
                 item.merge_result.merge_commit or '',
                 killer=DeadBaseKiller(site, item.request.task_id),
                 doomed=doomed,
+                notify_merger=notify_merger,
             )
+
+    def _reanchor_merger_on(self, dead: SpeculativeItem, replacement: SpeculativeItem) -> None:
+        """Point a merger holding *dead*'s commit at *replacement*'s (D2).
+
+        The merger then stacks after the replacement rather than beside it on
+        the tip the replacement was built on; a DecidedItem replacement built
+        no commit, so the merger lets the base go.
+        """
+        if not isinstance(dead, RealMergeItem):
+            return
+        new_tip = (
+            replacement.merge_result.merge_commit
+            if isinstance(replacement, RealMergeItem) else None
+        )
+        self._speculation_controller.on_base_invalidated(
+            dead.merge_result.merge_commit or '', new_tip,
+        )
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
         """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
@@ -20667,10 +20692,12 @@ class SpeculativeMergeWorker:
             # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
             # and the Mechanism-2 staleness discard just below), all of which
             # record the old commit dead for the identical reason.
-            self._record_item_commit_dead(item, DeadBaseSite.DISPATCH_VOID)
+            self._record_item_commit_dead(item, DeadBaseSite.DISPATCH_VOID, notify_merger=False)
             # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+            voided = item
             item = await self._remerge(req, item.started_monotonic, claim=claim)
             item_permit = item.permit
+            self._reanchor_merger_on(voided, item)
             self._note_transition(
                 req.request_id, ItemLifecycleState.MERGING,
                 ItemLifecycleState.DISPATCHING, live_obj=item,
@@ -20801,10 +20828,14 @@ class SpeculativeMergeWorker:
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
                 # by the dispatch-time dead-base re-check.
-                self._record_item_commit_dead(item, DeadBaseSite.STALE_DISCARD)
+                self._record_item_commit_dead(
+                    item, DeadBaseSite.STALE_DISCARD, notify_merger=False,
+                )
                 # Re-anchor on the live frontier tip, else main: plans/merge-lane-policy-prd.md D1.
+                discarded = item
                 item = await self._remerge(req, item.started_monotonic, claim=claim)
                 item_permit = item.permit
+                self._reanchor_merger_on(discarded, item)
                 # MQ-reliability kappa (task 2169): "then back" — regardless of
                 # whether the re-merged item now falls through to a passthrough
                 # outcome (-> TERMINAL, wired by a later step) or proceeds to a

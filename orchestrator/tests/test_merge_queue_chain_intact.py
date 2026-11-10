@@ -1274,3 +1274,49 @@ class TestDeadBaseReanchorsTheMerger:
         spec = _speculation(worker)
         assert spec['spec_base'] is None
         assert spec['held_by_merger'] == 0
+
+
+def _straggler_commit(straggler: RealMergeItem) -> str:
+    commit = straggler.merge_result.merge_commit
+    assert commit is not None
+    return commit
+
+
+@pytest.mark.asyncio
+class TestADispatchVoidHandsTheMergerTheReplacement:
+    """A merger holding a dispatch-voided item's commit stacks after that
+    item's replacement, not beside it on the tip the replacement was built
+    on (plans/merge-lane-policy-prd.md D2)."""
+
+    async def test_a_pending_merger_re_points_at_the_replacement(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
+        straggler, _ = await _dead_based_straggler(worker, git_ops, config)
+        worker._speculation_controller.on_lookahead_pending(
+            _straggler_commit(straggler), straggler.request,
+        )
+
+        replacement = _replacement(await _dispatch(worker, straggler))
+
+        spec = _speculation(worker)
+        assert replacement.base_sha == tip
+        assert spec['pending_spec_base'] == replacement.merge_result.merge_commit
+        assert spec['pending_spec_base'] != tip
+        assert spec['pending_predecessor_task_id'] == straggler.request.task_id
+
+    async def test_a_merger_in_state_a_re_points_at_the_replacement(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
+        await _live_tip(worker, git_ops, config, verifies)
+        straggler, _ = await _dead_based_straggler(worker, git_ops, config)
+        next_req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
+        worker._speculation_controller.on_lookahead_found(next_req, _straggler_commit(straggler))
+
+        replacement = _replacement(await _dispatch(worker, straggler))
+
+        assert _speculation(worker)['spec_base'] == replacement.merge_result.merge_commit

@@ -1,0 +1,36 @@
+{
+  "task_id": "8524",
+  "reason": "esc-8524-5 review fix: at the dispatch-void and stale-discard sites the merger's D2 re-anchor is deferred until the replacement exists and points the merger at the replacement's commit (notify_merger flag + _reanchor_merger_on), plus two worker-level regression tests",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1953,
+      "current": 1957
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_record_dead_base",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 84,
+      "current": 86
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5130,
+      "current": 5134
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6468,
+      "current": 6470
+    }
+  ]
+}
