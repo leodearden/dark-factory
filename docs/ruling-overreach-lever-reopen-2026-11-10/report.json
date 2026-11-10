@@ -48,6 +48,11 @@
             "other_decisions": 11.25,
             "ruling_lexeme": 8.625
           }
+        },
+        "window_counts": {
+          "holding": 1292.875,
+          "minted": 3477.125,
+          "overreach": 471.0
         }
       },
       "rates": {
@@ -301,6 +306,11 @@
             "other_decisions": 11.25,
             "ruling_lexeme": 8.625
           }
+        },
+        "window_counts": {
+          "holding": 1614.5,
+          "minted": 4287.5,
+          "overreach": 340.75
         }
       },
       "rates": {
@@ -519,9 +529,9 @@
         "retains_holdings": true,
         "upper_bound_below_control_point": true
       },
-      "holding_retention": 1.2493,
+      "holding_retention": 1.2488,
       "overreach_ratio_minted": 0.5867,
-      "overreach_ratio_per_day": 0.7244,
+      "overreach_ratio_per_day": 0.7235,
       "passes": false
     }
   },

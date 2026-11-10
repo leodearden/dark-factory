@@ -725,8 +725,8 @@ graphs. They are not trigger measurements.
 
 Task 9040 measured the re-opened choice in
 `docs/ruling-overreach-lever-reopen-2026-11-10/`, whose `design.md` is now
-authoritative over §6.1 here. O1, replayed on the same 48 episodes, cut
-overreach by 0.59× per minted edge and 0.72× per day, short of the halving
+authoritative over §6.1 here. O1, replayed on the same 48 episodes, reduced
+overreach to 0.59× per minted edge and 0.72× per day, short of the halving
 bar. The O3+O4 composite retired flagged edges at 0.937 precision [0.811–0.981].
 So **the composite, as it runs today, is the lever**: the judge stays
 record-only, Stage 1 keeps retiring its flags, the §6.1 trigger to an

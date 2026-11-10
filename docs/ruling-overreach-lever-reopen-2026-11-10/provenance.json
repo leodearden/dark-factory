@@ -10,6 +10,7 @@
     "verdicts": 644
   },
   "branch": "task/9040",
+  "code_pins": "Each run's git_sha is its commit on branch task/9040 when this file was last written, and a later rebase rewrites it. code_blobs are the git hash-object ids of the files that run executed. They survive any rebase: `git log --all --find-object=<blob>` finds the commits holding them. git_sha_before_rebase is the sha the run first recorded, from before the branch's verify-phase rebase.",
   "composite_adjudication": {
     "adjudicator": "the implementing agent for task 9040; single pass, no sub-agents",
     "blinding": "The worksheet carries neither the Stage-1 decision nor the judge rationale. Before labelling, only composite-sample.json's census and sample blocks and the count of flags were read; no per-flag decision was seen until composite-report.json was written.",
@@ -37,10 +38,15 @@
         "--out",
         "/tmp/9040-replay.jsonl"
       ],
+      "code_blobs": {
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/replay_overreach_extraction.py": "f822cce991c4f65272eacfc6df556e3889576b49"
+      },
       "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
       "exit_code": 0,
       "finished_at": "2026-11-10T14:14:45Z",
-      "git_sha": "dda9cc2c5ebfeed48c6fe94e1ee869b5296ec1a5",
+      "git_sha": "6951ad8cc090b7d26d5266d9fe3e9f3bf4630c01",
+      "git_sha_before_rebase": "dda9cc2c5ebfeed48c6fe94e1ee869b5296ec1a5",
       "graphiti_core_version": "0.28.2",
       "graphiti_core_version_via": "importlib.metadata.version(\"graphiti-core\") in this worktree's .venv",
       "graphiti_dropped_edges": {
@@ -136,9 +142,14 @@
         "--out",
         "/tmp/9040-blind-worksheet.jsonl"
       ],
+      "code_blobs": {
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/replay_overreach_extraction.py": "f822cce991c4f65272eacfc6df556e3889576b49"
+      },
       "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
       "exit_code": 0,
-      "git_sha": "8ccd703f23",
+      "git_sha": "a1ea584305fadb6550db84270d7ae03414f0b87b",
+      "git_sha_before_rebase": "8ccd703f23",
       "output": "/tmp/9040-blind-worksheet.jsonl, not committed: it carries episode bodies. 48 rows, 644 edges, no arm key.",
       "step": "worksheet"
     },
@@ -158,12 +169,18 @@
         "--out",
         "../docs/ruling-overreach-lever-reopen-2026-11-10/report.json"
       ],
+      "code_blobs": {
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/replay_overreach_extraction.py": "f822cce991c4f65272eacfc6df556e3889576b49"
+      },
       "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
       "exit_code": 0,
-      "git_sha": "8ccd703f23",
+      "git_sha": "a1ea584305fadb6550db84270d7ae03414f0b87b",
+      "git_sha_before_rebase": "8ccd703f23",
       "invocations": 1,
       "output": "report.json, written by the script (json.dumps indent=2, sort_keys=True); not hand-edited. verdicts.json passed load_verdicts on the first run.",
-      "step": "score"
+      "step": "score",
+      "superseded_by": "score-rescore"
     },
     {
       "argv": [
@@ -189,10 +206,17 @@
         "--out-worksheet",
         "/tmp/9040-composite-worksheet.jsonl"
       ],
+      "code_blobs": {
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/eval_overreach_judge.py": "752c2cbb21b1c5780b36a36774186199fdbe1485",
+        "fused-memory/scripts/score_overreach_composite.py": "d1282feb7b3848e1801be000fd43bc88a8805758",
+        "fused-memory/src/fused_memory/services/overreach_shadow.py": "ea9827eac658305d9b7267d60a0f6c12c6be7e79"
+      },
       "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
       "exit_code": 0,
       "finished_at": "2026-11-10T14:44:18Z",
-      "git_sha": "bb3bfac98e",
+      "git_sha": "a20c9ffd62f3aac92c01cbbe2d2997a015ac3866",
+      "git_sha_before_rebase": "bb3bfac98e",
       "invocations": 1,
       "output": "composite-sample.json as the script wrote it (window, graphs and cap exactly as pre-registered in design.md \u00a72.5); the worksheet (72 episodes, 80 flags, bodies) stays in /tmp and is not committed.",
       "reads": "sidecar opened with OverreachShadowStore.open_read_only; edge state and episode bodies read over GRAPH.RO_QUERY through ReadOnlyGraphReader (FALKORDB_URI unset, config default redis://localhost:6379)",
@@ -215,12 +239,77 @@
         "--out",
         "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-report.json"
       ],
+      "code_blobs": {
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/eval_overreach_judge.py": "752c2cbb21b1c5780b36a36774186199fdbe1485",
+        "fused-memory/scripts/score_overreach_composite.py": "d1282feb7b3848e1801be000fd43bc88a8805758",
+        "fused-memory/src/fused_memory/services/overreach_shadow.py": "ea9827eac658305d9b7267d60a0f6c12c6be7e79"
+      },
       "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
       "exit_code": 0,
-      "git_sha": "bb3bfac98e",
+      "git_sha": "a20c9ffd62f3aac92c01cbbe2d2997a015ac3866",
+      "git_sha_before_rebase": "bb3bfac98e",
       "invocations": 1,
       "output": "composite-report.json, written by the script; not hand-edited. composite-verdicts.json passed load_verdicts on the first run.",
       "step": "composite-score"
+    },
+    {
+      "argv": [
+        "../.venv/bin/python",
+        "scripts/replay_overreach_extraction.py",
+        "score",
+        "--replay",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/replay.jsonl",
+        "--verdicts",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/verdicts.json",
+        "--baseline-report",
+        "../docs/ruling-overreach-guard-design-2026-10-01/report.json",
+        "--out",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/report.json"
+      ],
+      "code_blobs": {
+        "fused-memory/scripts/_graph_script_cli.py": "bcaed726d9e9704fcbc710d916721f542da04ceb",
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/replay_overreach_extraction.py": "236adba5d8dcaab6bd99a5cb2f7f756638dcc392"
+      },
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "finished_at": "2026-11-10T18:35:44Z",
+      "git_sha": "de7a4fcbee2a58ac3ca041a82a0c045ea469fe92",
+      "invocations": 1,
+      "output": "report.json, rewritten by the script over the same replay.jsonl, verdicts.json and baseline; not hand-edited. Against the first score it adds arms.<arm>.population_weighted.window_counts and moves comparison.o1.overreach_ratio_per_day 0.7244 -> 0.7235 and comparison.o1.holding_retention 1.2493 -> 1.2488; overreach_ratio_minted stays 0.5867 and every check and passes is unchanged.",
+      "reason": "review amendment (reviewer_comprehensive suggestion 2): lever_decision compares unrounded weighted edge counts, not per-day rates already rounded to 0.1",
+      "step": "score-rescore"
+    },
+    {
+      "argv": [
+        "../.venv/bin/python",
+        "scripts/score_overreach_composite.py",
+        "score",
+        "--sample",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-sample.json",
+        "--verdicts",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-verdicts.json",
+        "--judge-eval",
+        "../docs/ruling-overreach-guard-design-2026-10-01/judge-eval-offline-2026-11-09.json",
+        "--out",
+        "../docs/ruling-overreach-lever-reopen-2026-11-10/composite-report.json"
+      ],
+      "code_blobs": {
+        "fused-memory/scripts/_graph_script_cli.py": "bcaed726d9e9704fcbc710d916721f542da04ceb",
+        "fused-memory/scripts/audit_ruling_overreach.py": "1512a7047dc41311616d064ddc0ba88d2c24b102",
+        "fused-memory/scripts/eval_overreach_judge.py": "752c2cbb21b1c5780b36a36774186199fdbe1485",
+        "fused-memory/scripts/score_overreach_composite.py": "3c61f9f204f1ce73dec30c7341d4ae10ad8f6c88",
+        "fused-memory/src/fused_memory/services/overreach_shadow.py": "ea9827eac658305d9b7267d60a0f6c12c6be7e79"
+      },
+      "cwd": "/home/leo/src/dark-factory/.worktrees/9040/fused-memory",
+      "exit_code": 0,
+      "finished_at": "2026-11-10T18:35:44Z",
+      "git_sha": "de7a4fcbee2a58ac3ca041a82a0c045ea469fe92",
+      "invocations": 1,
+      "output": "composite-report.json byte-identical to the composite-score run.",
+      "reason": "review amendment: re-run on the amended script to check that the Decision StrEnum and the error-handling changes leave the score unchanged",
+      "step": "composite-score-rescore"
     }
   ],
   "task_id": "9040"

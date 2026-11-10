@@ -294,9 +294,15 @@ O1 against this control, as §2.4 requires.
 | check (§2.4) | bar | measured | holds |
 |---|---|---|---|
 | overreach per minted, o1 / control | ≤ 0.5 | 0.5867 | no |
-| overreach per day, o1 / control | ≤ 0.5 | 0.7244 | no |
+| overreach per day, o1 / control | ≤ 0.5 | 0.7235 | no |
 | o1's Wilson upper bound below control's point | — | 0.1167 < 0.1355 | yes |
-| holdings/day retained | ≥ 0.8 | 1.2493 | yes |
+| holdings/day retained | ≥ 0.8 | 1.2488 | yes |
+
+Each ratio is taken over the unrounded weighted edge counts
+(`population_weighted.window_counts`). The first score took the per-day
+ratios from per-day rates already rounded to 0.1, and read 0.7244 and 1.2493.
+The review amendment re-scored the same inputs (`provenance.json`), and no
+check changed.
 
 So O1 is a real reduction, but it does not halve overreach, which is the bar
 every lever is held to. It does not dilute holdings either: it mints about 23%
@@ -501,7 +507,8 @@ None of the measured levers reaches the 2026-10-01 target, served overreach at
 least halved. The composite trims it, and O1 dents it. That target stays open,
 and O6 is the remaining measured path toward it. Two other paths were not
 measured here: a higher-recall judge, and a less conservative Stage 1 (it
-retires 0.33 of what it is handed). Each would need its own pre-registered
+retires about a third of the flagged overreach it is handed,
+`c.stage1_recall_on_flags` 0.33). Each would need its own pre-registered
 measurement before it could be a lever.
 
 ## 7. Accepted residuals
