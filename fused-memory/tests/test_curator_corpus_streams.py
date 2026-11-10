@@ -683,7 +683,7 @@ async def test_an_integer_spawned_from_submitted_through_submit_task_resolves_cr
     )
     async with (
         _open_stack(tmp_path / 'project', SqliteTaskBackend, invoke=invoke) as stack,
-        _interceptor_over(stack, tmp_path) as (interceptor, store),
+        _interceptor_over(stack, tmp_path) as (interceptor, _store),
     ):
         parent_id = await stack.seed('parent')
         submitted = await interceptor.submit_task(
@@ -700,8 +700,10 @@ async def test_an_integer_spawned_from_submitted_through_submit_task_resolves_cr
             ),
             timeout=_RESOLVE_DEADLINE_SECONDS + 5,
         )
+        created = await stack.backend.get_task(str(answer['task_id']), stack.root)
 
     assert answer['status'] == TicketStatus.CREATED
+    assert created['metadata']['spawned_from'] == int(parent_id)
     [prompt] = prompts
     assert any(
         line.startswith(f'[Task {parent_id}]') and 'source=anchor' in line
