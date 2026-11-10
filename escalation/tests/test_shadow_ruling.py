@@ -1357,17 +1357,30 @@ class TestPolicyTableLockstep:
     FIRST_TRANCHE_CLASSES equal to the table's slugs is held by
     tests/scripts/test_shadow_ruling_doc_contract.py."""
 
-    # Rows whose every act the codec refuses to stamp. Exact, so the set can
-    # neither grow silently nor outlive the ruling that empties it.
-    _UNSTAMPABLE_ROWS = frozenset({'completion_claim_true'})
+    # Rows whose deciding act no stamp may propose, so their agreement rate
+    # measures only the trailing close. Exact, so a fifth cannot appear silently.
+    _PROXY_MEASURED_ROWS = frozenset({
+        'b3_low_risk_unblock', 'dead_letter_replayed', 'red_main_recovery', 'verify_host_reprobed',
+    })
 
     def test_every_row_has_an_act_a_stamp_may_propose(self):
-        unstampable = frozenset(
+        unstampable = sorted(
             row.policy_class for row in POLICY_TABLE
-            if not {str(action) for action in row.actions} & REVERSIBLE_ACTIONS
+            if not {action.value for action in row.actions} & REVERSIBLE_ACTIONS
         )
-        assert unstampable == self._UNSTAMPABLE_ROWS, (
-            'task 8475 rules on completion_claim_true; empty _UNSTAMPABLE_ROWS when it lands'
+        assert not unstampable, (
+            f'rows with no act in REVERSIBLE_ACTIONS cannot be measured at all: {unstampable}'
+        )
+
+    def test_rows_measured_on_a_proxy_act_are_exactly_the_documented_four(self):
+        proxy_measured = frozenset(
+            row.policy_class for row in POLICY_TABLE
+            if {action.value for action in row.actions} - REVERSIBLE_ACTIONS
+        )
+        assert proxy_measured == self._PROXY_MEASURED_ROWS, (
+            'a row allowing an act outside REVERSIBLE_ACTIONS is measured on a proxy act; '
+            "change docs/escalation-standing-policy.md '## Classes measured on a proxy act' "
+            'together with _PROXY_MEASURED_ROWS'
         )
 
     def test_done_flip_is_a_reversible_action(self):

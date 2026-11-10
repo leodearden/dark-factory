@@ -827,9 +827,9 @@ class TestPolicyTableRows:
         }
         assert not not_shadow, f'every class must start shadow (decision 7): {not_shadow!r}'
 
-    def test_no_row_allows_park_or_restart(self) -> None:
+    def test_no_row_allows_park_restart_or_abandon(self) -> None:
         for row in POLICY_TABLE:
-            assert not ({'park', 'restart'} & row.actions), row.policy_class
+            assert {'park', 'restart', 'abandon'}.isdisjoint(row.actions), row.policy_class
 
     def test_unknown_slug_has_no_row(self) -> None:
         assert policy_row('nope') is None
@@ -847,6 +847,21 @@ class TestPolicyTableRows:
         assert row.reversible is False
         assert row.evidence_present(self._FOUND_ON_MAIN)
         assert not row.evidence_present(self._FOUND_ON_MAIN_NO_SHA)
+
+    def test_completion_claim_true_closes_the_gate_record(self) -> None:
+        """Sitting item 522 (Leo, 2026-11-09): the TRUE arm closes; nothing is abandoned."""
+        row = policy_row('completion_claim_true')
+        assert row is not None
+        assert row.match.matches('unverified_completion_claim', 'some-agent')
+        assert not row.match.matches('task_failure', 'some-agent')
+        assert row.actions == frozenset({PolicyAction.CLOSE_ONLY})
+        assert row.evidence_present(
+            'get_task 4321 status=done; git merge-base --is-ancestor 1a2b3c4d main rc=0'
+        )
+        assert not row.evidence_present('get_task 4321 status=done; 1a2b3c4d')
+        assert not row.evidence_present(
+            'get_task 4321 status=done; git merge-base --is-ancestor main rc=0'
+        )
 
     def test_found_on_main_matches_any_category(self) -> None:
         row = policy_row('found_on_main')
