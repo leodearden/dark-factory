@@ -15,6 +15,10 @@ import {
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
+  memoryEvalCard,
+  memoryEvalEscalation,
+  memoryEvalRow,
+  memoryEvalsPayload,
   mergeQueueBlock,
   openEscalationItem,
   orchestratorRow,
@@ -1346,4 +1350,157 @@ test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding
 
   assert.equal(expectedLocksCell(harness.window, task).placeholder, null, 'locksCellState reads this measured project as unknown');
   assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
+});
+
+// ── The memory-eval section (tab_memory_evals.jsx::MemoryEvalsSection) ──
+
+const MEMORY_EVAL_ID = 'e1-retrieval-health';
+const TRIPWIRE = 'topic-canonical-present';
+
+// The section mounted over `payload`, with every onNavigate call recorded.
+function mountMemoryEvals(t, payload) {
+  const harness = openWindow(t);
+  const { window } = harness;
+  seedDashboardData(window, {
+    MEMORY_EVALS: payload,
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['MEMORY_EVALS']),
+  });
+  const navigations = [];
+  const { container } = harness.mount(window.DF_MEMORY_EVALS.MemoryEvalsSection, {
+    onNavigate: (...args) => navigations.push(args),
+  });
+  return { window, container, navigations };
+}
+
+// The rendered table rows, one per metric row, in payload order.
+function metricRowElements(container, rows) {
+  const trs = [...container.querySelectorAll('tbody tr')];
+  assert.equal(trs.length, rows.length, 'each metric row must render as exactly one table row');
+  return trs;
+}
+
+function escalationLinks(root) {
+  return [...root.querySelectorAll('[data-testid="memory-eval-escalation-link"]')];
+}
+
+// The one span in `tr` that renders verdictBadge(row): its words, its classes,
+// and the evaluator's verdict_detail as its title.
+function renderedBadge(window, tr, row) {
+  const badge = window.DF_MEMORY_EVALS_FMT.verdictBadge(row);
+  const spans = spansDescribedBy(tr, { ...badge, title: row.verdict_detail || '' });
+  assert.equal(spans.length, 1, `${row.metric_id} ${row.item ?? ''}: expected one span reading "${badge.label}"`);
+  return spans[0];
+}
+
+function assertLinksOnly(tr, row) {
+  const links = escalationLinks(tr);
+  if (!row.escalation) {
+    assert.equal(links.length, 0, `${row.metric_id} ${row.item ?? ''} (${row.parity}) renders an escalation link`);
+    return;
+  }
+  assert.equal(links.length, 1, `${row.metric_id} ${row.item ?? ''} (${row.parity}) must render one escalation link`);
+  assert.ok(links[0].textContent.includes(row.escalation.id), links[0].textContent);
+}
+
+test("tab_memory_evals.jsx::MemoryEvalsSection renders each parity state in verdictBadge's words and links only open escalations", t => {
+  const alarmed = memoryEvalEscalation('esc-alarmed');
+  const recovered = memoryEvalEscalation('esc-recovered');
+  const rows = [
+    memoryEvalRow({
+      verdict: 'alarm', verdict_detail: '12/30 against a pooled baseline of 72/90 over 3 run(s).',
+      fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+    }),
+    memoryEvalRow({
+      metric_id: 'dangling-pointers', kind: 'count', rule_kind: 'count',
+      verdict: 'no_alarm', fingerprint: recovered.dedupe_fingerprint, escalation: recovered, parity: 'recovered_open',
+    }),
+    memoryEvalRow({
+      metric_id: 'superseded-above-successor', kind: 'count', rule_kind: 'count',
+      verdict: 'insufficient_data', fingerprint: 'fp-insufficient', parity: 'insufficient_data',
+    }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
+      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    }),
+  ];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const { window, container, navigations } = mountMemoryEvals(t, payload);
+
+  const trs = metricRowElements(container, rows);
+  rows.forEach((row, i) => {
+    const badge = renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+    if (!row.escalation) assert.ok(!badge.classList.contains('bad'), `${row.parity} renders alarm-shaped: ${badge.className}`);
+  });
+
+  click(window, escalationLinks(trs[0])[0]);
+  assert.equal(navigations.length, 1);
+  const [view, target] = navigations[0];
+  assert.equal(view, 'esc');
+  assert.deepEqual({ ...target }, { queue: payload.escalation_queue, id: alarmed.id });
+});
+
+test('tab_memory_evals.jsx::MemoryEvalsSection under a storm renders one aggregate banner and no per-metric links', t => {
+  const aggregate = memoryEvalEscalation('esc-storm-aggregate');
+  const storm = {
+    triggered: true, alarm_count: 3, aggregate_fingerprint: aggregate.dedupe_fingerprint, escalation: aggregate,
+  };
+  const collapsed = ['canonical-in-top-5', 'dangling-pointers', 'superseded-above-successor'].map(metricId =>
+    memoryEvalRow({ metric_id: metricId, verdict: 'alarm', fingerprint: `fp-${metricId}`, parity: 'storm_collapsed' }),
+  );
+  const grandfathered = memoryEvalRow({
+    metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-recon-watcher-triage',
+    verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+  });
+  const rows = [...collapsed, grandfathered];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)], storm_escape: storm });
+  const { window, container } = mountMemoryEvals(t, payload);
+
+  const banner = oneByTestId(container, 'memory-eval-storm-banner');
+  assert.ok(banner.textContent.includes(`${storm.alarm_count} alarms`), banner.textContent);
+  const bannerLinks = escalationLinks(banner);
+  assert.equal(bannerLinks.length, 1, 'the banner must link the aggregate escalation');
+  assert.ok(bannerLinks[0].textContent.includes(aggregate.id), bannerLinks[0].textContent);
+
+  const trs = metricRowElements(container, rows);
+  rows.forEach((row, i) => {
+    renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+    assert.equal(
+      trs[i].textContent.includes('link suppressed — storm aggregate'),
+      row.parity === 'storm_collapsed',
+      `${row.metric_id} (${row.parity}) and the storm-suppression note disagree`,
+    );
+  });
+  assert.equal(escalationLinks(container).length, 1, 'only the banner may link an escalation under a storm');
+});
+
+test("tab_memory_evals.jsx::MemoryEvalsSection renders a tripwire's per-item verdicts as one row per item, each naming its item", t => {
+  const alarmed = memoryEvalEscalation('esc-item-1');
+  const rows = [
+    memoryEvalRow({ verdict: 'no_alarm', fingerprint: 'fp-window', parity: 'clear' }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-alpha',
+      verdict: 'alarm', fingerprint: alarmed.dedupe_fingerprint, escalation: alarmed, parity: 'alarmed_open',
+    }),
+    memoryEvalRow({
+      metric_id: TRIPWIRE, kind: 'tripwire', rule_kind: 'tripwire', item: 't-beta',
+      verdict: 'grandfathered', fingerprint: 'fp-grandfathered', parity: 'grandfathered',
+    }),
+  ];
+  const payload = memoryEvalsPayload({ evals: [memoryEvalCard(MEMORY_EVAL_ID, rows)] });
+  const { window, container } = mountMemoryEvals(t, payload);
+
+  const trs = metricRowElements(container, rows);
+  const items = rows.map(row => row.item).filter(Boolean);
+  rows.forEach((row, i) => {
+    const firstCell = trs[i].querySelector('td').textContent;
+    assert.ok(firstCell.includes(row.metric_id), firstCell);
+    for (const item of items) {
+      assert.equal(trs[i].textContent.includes(item), item === row.item, `the ${row.item ?? 'item-less'} row and ${item} disagree`);
+    }
+    if (row.item) assert.ok(firstCell.includes(row.item), `the item is not named beside its metric: ${firstCell}`);
+    renderedBadge(window, trs[i], row);
+    assertLinksOnly(trs[i], row);
+  });
 });

@@ -61,6 +61,7 @@ from _fm_helpers import (
     unique_graph_name,
 )
 from _graphiti_fake import FakeGraphitiClient
+from _unreached_provider import skip_if_provider_unreached
 
 from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
@@ -928,8 +929,8 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
-        result = await svc._execute_graphiti_write(
-            'add_episode', _enqueued_payload(svc)
+        result = await skip_if_provider_unreached(
+            svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
         )
 
         real_uuid = result.episode.uuid

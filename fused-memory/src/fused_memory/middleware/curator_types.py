@@ -7,15 +7,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
-from shared.followup_items import FollowupItem
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FollowupBundleInvalid,
+    FollowupItem,
+    read_items,
+)
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.utils.clip_disclosure import elide_text
+
+logger = logging.getLogger(__name__)
 
 
 class CuratorFailureError(RuntimeError):
@@ -108,6 +118,19 @@ NON_CANCELLED_STATUSES: Final[tuple[str, ...]] = tuple(
 )
 
 
+def spawned_from_id(value: object) -> str | None:
+    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
+
+    The live store holds str, int and dict values; only the first two name a task.
+    This is the canonical form :attr:`CandidateTask.spawned_from` carries.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
 @dataclass
 class CandidateTask:
     """A task about to be created, fed to the curator for a drop/combine/create decision."""
@@ -117,7 +140,7 @@ class CandidateTask:
     details: str = ''
     files_to_modify: list[str] = field(default_factory=list)
     priority: str = DEFAULT_PRIORITY
-    spawned_from: str | None = None  # task id of the review-chain anchor
+    spawned_from: str | None = None  # the review-chain anchor's id, canonical per spawned_from_id
     spawn_context: str = 'manual'  # review | steward-triage | planning | agent_followup | manual
     # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
     # consulted by operational_ask_registry.match_candidate. Its routing axis
@@ -129,6 +152,16 @@ class CandidateTask:
     execution_class: str | None = None
     # metadata.followup_items (plans/follow-up-filing-shape-prd.md §4.1); part of payload_hash.
     items: tuple[FollowupItem, ...] = ()
+    # The submit stamp (§4.2). Not hashed: it is derived from fields already hashed.
+    declared_scope: DeclaredScope | None = None
+
+    def __post_init__(self) -> None:
+        if self.spawned_from != spawned_from_id(self.spawned_from):
+            raise ValueError(
+                'CandidateTask.spawned_from must be a canonical task id (a stripped, '
+                'non-empty str, as spawned_from_id returns) or None, got '
+                f'{self.spawned_from!r} (type={type(self.spawned_from).__name__})'
+            )
 
     def payload_hash(self) -> str:
         """Stable hash over the fields a curator decision depends on.
@@ -453,6 +486,8 @@ class PoolEntry:
     priority: str
     source: str  # one of POOL_SOURCES
     combine_eligible: bool
+    item_count: int = 0
+    declared_scope: DeclaredScope | None = None
 
     def render(self, desc_cap: int, details_cap: int) -> str:
         """Render this entry as a human-readable block for the LLM prompt.
@@ -465,12 +500,80 @@ class PoolEntry:
         files = ', '.join(self.files_to_modify) if self.files_to_modify else '(none)'
         return (
             f'[Task {self.task_id}] status={self.status} priority={self.priority} '
-            f'source={self.source} combine_eligible={self.combine_eligible}\n'
+            f'source={self.source} combine_eligible={self.combine_eligible} '
+            f'followup_items={self.item_count}\n'
             f'  title: {self.title}\n'
             f'  description: {desc}\n'
             f'  details: {det}\n'
-            f'  files_to_modify: {files}'
+            f'  files_to_modify: {files}\n'
+            f'  declared_scope: {render_declared_scope(self.declared_scope)}'
         )
+
+
+# How an absent stamp reads to the LLM: no information, never 'undeclared' (PRD §4.2). The pack
+# judge renders the same word, since both prompts share task_curator.py::_CURATOR_HEURISTICS.
+UNSTAMPED_BAND: Final = 'unstamped'
+
+
+def render_declared_scope(scope: DeclaredScope | None) -> str:
+    """The one rendering of a declared-scope stamp, for pool entries and candidates alike."""
+    if scope is None:
+        return UNSTAMPED_BAND
+    return f'{scope.band} (files={scope.files}, text_chars={scope.text_chars}, basis={scope.basis})'
+
+
+def _warn_discarded(key: str, error: object) -> None:
+    """The ``task_metadata.schema_warning`` census line for one unreadable stored key."""
+    logger.warning(
+        'task_metadata.schema_warning source=curator_types key=%s error=%s; value discarded',
+        key,
+        error,
+    )
+
+
+def declared_scope_of(metadata: Mapping[str, Any]) -> DeclaredScope | None:
+    """The stored stamp as its record; None when it is absent, and with a census line when invalid."""
+    stored = metadata.get(DECLARED_SCOPE_METADATA_KEY)
+    if stored is None:
+        return None
+    if not isinstance(stored, Mapping):
+        _warn_discarded(DECLARED_SCOPE_METADATA_KEY, f'not an object (type={type(stored).__name__})')
+        return None
+    try:
+        return DeclaredScope.model_validate(stored)
+    except ValueError as exc:
+        _warn_discarded(DECLARED_SCOPE_METADATA_KEY, exc)
+        return None
+
+
+def followup_items_of(metadata: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
+    """``metadata.followup_items`` as items; () when absent, and with a census line when malformed.
+
+    The curator's one reading of a stored list: ``CandidateTask.items`` and ``PoolEntry.item_count``
+    both come from here, so the candidate and pool sides read a list alike.
+    """
+    try:
+        return read_items(metadata)
+    except FollowupBundleInvalid as exc:
+        _warn_discarded(FOLLOWUP_ITEMS_METADATA_KEY, exc)
+        return ()
+
+
+_SPAWNED_FROM_METADATA_KEY: Final = 'spawned_from'
+
+
+def spawned_from_of(metadata: Mapping[str, Any]) -> str | None:
+    """``metadata.spawned_from`` as :func:`spawned_from_id` reads it, with a census line when a stored value names no task."""
+    stored = metadata.get(_SPAWNED_FROM_METADATA_KEY)
+    parent_id = spawned_from_id(stored)
+    if stored is not None and parent_id is None:
+        _warn_discarded(_SPAWNED_FROM_METADATA_KEY, f'names no task (type={type(stored).__name__})')
+    return parent_id
+
+
+def item_count_of(metadata: Mapping[str, Any]) -> int:
+    """How many items :func:`followup_items_of` reads from *metadata*."""
+    return len(followup_items_of(metadata))
 
 
 def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
@@ -508,13 +611,25 @@ def clip_for_prompt(text: str, cap: int) -> str:
     return elide_text(text, cap, field='curator_prompt').text
 
 
+def is_combine_eligible(task: Mapping[str, Any]) -> bool:
+    """The single combine-eligibility predicate over a stored task row.
+
+    Called from BOTH the curator's selection snapshot
+    (``task_curator.py::_to_pool_entry``) and the interceptor's execution-time
+    combine guard (``task_interceptor.py::TaskInterceptor._execute_combine``).
+    A follow-up holder is never a combine target (PRD §4.3, decision 10), and it
+    stays pending forever, so the status axis alone never refuses it.
+    """
+    return is_combine_eligible_status(str(task.get('status') or '')) and not is_holder(task)
+
+
 def is_combine_eligible_status(status: str) -> bool:
     """Single source of truth for combine STATUS eligibility (task 4035).
 
-    Called from BOTH the curator's selection snapshot
-    (``_to_pool_entry.combine_eligible``) and the interceptor's
-    execution-time combine guard (``_execute_combine``). Keeping one
-    definition is the point: the two sites previously hand-copied
+    Reached through :func:`is_combine_eligible` from BOTH the curator's
+    selection snapshot (``_to_pool_entry.combine_eligible``) and the
+    interceptor's execution-time combine guard (``_execute_combine``).
+    Keeping one definition is the point: the two sites previously hand-copied
     ``status == 'pending'`` and silently diverged, letting 20.2% of combines
     land on non-pending targets mid-planning.
 

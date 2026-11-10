@@ -1181,21 +1181,16 @@ def build_method(
     inputs_consumed_note: str | None,
     embedding_calls: int,
     adjudication: Mapping[str, int],
+    slug_tally: codebook.SlugTally,
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
-    (plans/census-incremental-prd.md §4.3), which carries
-    *verify_normalisations*: the verdict repairs per kind (§4.4), the
-    *reverify* counts of the outcome feedback (L5, D8), whose offered
-    re-verifies *verify_calls* includes, and the pre-screen's per-rule
-    *screened* counts (L6), and the similarity stage's *adjudication*
-    counts (L7), whose embedding requests are *embedding_calls*.
-    *inputs_consumed* are the run ids of the other
-    instruments' records the pre-screen read, and *inputs_consumed_note*
-    says why any gave it none. *selection* is ``None`` for a
-    run with no mining window, which nulls the evidence and ledger fields it
-    would have supplied; an unreadable ledger counts ``ledger_rows`` and
-    ``ledger_pruned`` as ``None``, never 0."""
+    (plans/census-incremental-prd.md §4.3). *verify_calls* includes the
+    offered re-verifies counted in *reverify*, and *inputs_consumed* are the
+    run ids of the other instruments' records the pre-screen read.
+    *selection* is ``None`` for a run with no mining window, which nulls the
+    evidence and ledger fields it would have supplied; an unreadable ledger
+    counts ``ledger_rows`` and ``ledger_pruned`` as ``None``, never 0."""
     return {
         "run_id": run_id,
         "as_of_sha": as_of_sha,
@@ -1221,6 +1216,7 @@ def build_method(
             **_ledger_extra(selection),
             "verify_normalisations": dict(verify_normalisations),
             "reverify": dict(reverify),
+            "slug_rejections": slug_tally.rejections_record(),
         },
     }
 
@@ -3511,6 +3507,7 @@ def run_census(
         inputs_consumed_note=screen_report.inputs.note,
         embedding_calls=view.requests,
         adjudication=adjudication_report.counts(),
+        slug_tally=merge.invariant_slugs,
     )
     record = build_census_record(
         method=method,

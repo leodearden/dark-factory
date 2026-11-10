@@ -172,7 +172,7 @@ def _make_mock_allocator(host_names: list[str]) -> MagicMock:
 _HOST_KEYS = {
     'name', 'is_local', 'slot_state', 'quarantined', 'quarantine_class',
     'unavailable_since', 'unavailable_secs', 'streak', 'reason',
-    'kind', 'sticky', 'identity',
+    'kind', 'sticky', 'identity', 'task_held_by',
 }
 
 

@@ -21,6 +21,7 @@ from shared.plan_deviation import DeviationRecord
 
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
+from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
@@ -416,6 +417,20 @@ class ReviewAggregation:
         if self.suggestions:
             text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
         return text
+
+
+def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> None:
+    deviations = check_issues(issues).deviations
+    if deviations:
+        logger.warning(
+            'review from %s carries %d deviation(s) from the reviewer issue contract',
+            reviewer_name, len(deviations),
+            extra={
+                'event': REVIEW_ISSUE_OFF_CONTRACT_FACT,
+                'reviewer': reviewer_name,
+                'deviations': [d.describe() for d in deviations],
+            },
+        )
 
 
 def _format_issue_section(heading: str, issues: list[dict]) -> str:
@@ -1290,7 +1305,8 @@ class TaskArtifacts:
 
         ERROR reviews are kept out of ``reviews`` and returned verbatim in
         ``errored_reviews`` (``reviewer_errors`` is its names), so the review
-        arm can read each errored reviewer's failure record.
+        arm can read each errored reviewer's failure record. Issues outside the
+        reviewer issue contract are flagged by a WARNING, never rewritten.
         """
         reviews = self.read_reviews()
         blocking = []
@@ -1302,6 +1318,8 @@ class TaskArtifacts:
             payload = normalize_review(review)
             if payload.verdict is Verdict.ERROR:
                 errored_reviews[reviewer_name] = review
+            else:
+                _warn_off_contract_issues(reviewer_name, payload.issues)
             note_dispositions.extend(payload.note_dispositions)
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues

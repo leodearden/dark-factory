@@ -60,17 +60,18 @@ negative, so an EWMA chart can never show improvement at these rates.
 ## Sketch of approach
 
 1. **One landing datum.** A landing is a `merge_finalized state=done` event or a `train_merged` member;
-   its time is main's advance (the event timestamp), its key `(project_id, merge_sha)`. A **verify unit**
-   covers the set of landings one merge verify proved (a train's `member_task_ids`, a chain's
-   `chain_items`): per-landing outcome flags are inherited by every member; verify and rejection counts
+   its time is main's advance (the event timestamp), its key `(project_id, merge_sha, task_id)` (train
+   members share one merge commit; see §Contract → Landing record, Correction). A **verify unit**
+   covers the set of landings one merge verify proved (a train's `member_task_ids`; chain units are
+   not formed, see §Contract → Landing record, Correction): per-landing outcome flags are inherited by every member; verify and rejection counts
    are per unit.
 2. **A shared producer** (`shared/src/shared/quality_series/`) computes, for landings newer than a
-   per-project cursor, one immutable per-landing row from runs.db (events, invocations, flake tables),
+   per-project cursor, one per-landing row from runs.db (events, invocations, flake tables),
    git (lines and paths of the landing vs its first parent, budgeted) and, for backfill only, the on-disk
    review counter. It also holds the pure statistics (stdlib only). The dashboard and any offline re-run
    call the same functions.
-3. **A dashboard sampler loop** (600 s, beside `dashboard/loops.py::_burndown_loop`) appends rows to a
-   new `quality.db` outside the retention policy and writes a value-or-gap `sample_state` row per
+3. **A dashboard sampler loop** (600 s, beside `dashboard/loops.py::_burndown_loop`) upserts rows into a
+   new `quality.db` (decision 14) outside the retention policy and writes a value-or-gap `sample_state` row per
    project per tick. The read side marks the datum `stale` with "N landings not yet sampled" when main
    is ahead of the cursor; nothing computes on read.
 4. **A marker stream**, derived (routing steps from `routing_decision`, cause from `config_reload`,
@@ -175,7 +176,8 @@ negative, so an EWMA chart can never show improvement at these rates.
     baseline median); artefact ranges hatched and excluded from baseline, CUSUM and comparisons.
 14. **Store and loop.** `quality.db` at `<project_root>/data/burndown/quality.db` (`config.quality_db`),
     owned by `_QualityStore` in `dashboard/loops.py` on the `_BurndownStore` pattern; tables `landings`
-    (one row per `(project_id, merge_sha)`, immutable), `late_events` (reverts, keyed to the target
+    (one row per `(project_id, merge_sha, task_id)`, upserted on that key: late claims and
+    off-first-parent landings may be re-emitted; see §Contract → Landing record, Correction), `late_events` (reverts, keyed to the target
     landing), `markers_derived` (per project, role, kind, at, ordinal), `sample_state` (per project: value
     or gap with ts, reason, cursor sha, landings sampled). **Not** registered in
     `metrics.py::_DOWNSAMPLE_TABLES`; a test pins its absence from `retention.py::apply_retention`. A
@@ -184,6 +186,24 @@ negative, so an EWMA chart can never show improvement at these rates.
     runs inside the loop, resumable through the cursor; the loop runs `git` as the dashboard's first
     subprocess over project roots and only over roots in `config.all_project_roots` that are git
     checkouts.
+
+    **Correction (β, 2026-11-09).** `sample_state.cursor_sha` is the newest stored first-claim
+    on-line landing. A tick does not resume from `LandingBatch.next_cursor`: it resumes from the newest
+    stored first claim that landed at least `DISPATCH_ROW_SETTLE_SECONDS` (1800 s) before the tick
+    (`dashboard/src/dashboard/data/quality_sampler.py::collect_quality`,
+    `::DISPATCH_ROW_SETTLE_SECONDS`). So `landings()` re-emits a row younger than the dispatch-row lag
+    and the upsert re-measures it in place (the "β must re-measure" residual of §Contract → Per-landing
+    row), and a budget-truncated cold backfill resumes exactly from what was stored. The residual it
+    shares with α's `next_cursor`: a first claim whose landed_at order inverts its first-parent order
+    could be skipped (0 such inversions measured among 3,539 df first claims, 2026-11-09). Beside the
+    cursor, a value `sample_state` row carries `landings_sampled`, `landings_deferred` (emitted but past
+    that tick's git budget) and the three `GitCrossCheck` counts over the tick's emitted range; a gap
+    row carries only its reason, the producer's error verbatim with two exceptions: a
+    `TaskDbUnreadable` refusal is rendered from its `path` and `reason` fields, because its message's
+    remedy is written for tasks.db, not runs.db; and a tick whose own write fails records a gap
+    naming that failure, so every git-checkout root still gets one row per tick. The key's `project_id` is
+    `shared/src/shared/project_id.py::project_id_for_root` of the root, passed to `landings()`
+    explicitly. `late_events` is created with no producer yet: α ships no revert detector.
 15. **Endpoint and window.** `dashboard/src/dashboard/api/quality.py` registered with one
     `app.include_router`: `GET /api/v2/dashboard/quality?project=<label>&window=<spec>` returning
     `{QUALITY: Datum[QualitySeries], QUALITY_MARKERS: Datum[list[Marker]], QUALITY_SNAPSHOTS:
@@ -266,34 +286,117 @@ negative, so an EWMA chart can never show improvement at these rates.
 ### Landing record (`shared/src/shared/quality_series/landings.py`)
 
 ```
-Landing = {project_id, merge_sha, task_id, landed_at (UTC ISO), ordinal (int, per project, by landed_at
-           then merge_sha), source ('merge_finalized' | 'train_merged'), unit_id (merge_sha of the verify
+Landing = {project_id, merge_sha, task_id, landed_at (tz-aware UTC), ordinal (int, per project, by landed_at
+           then merge_sha), source ('merge_finalized' | 'train_merged' | 'train_attributed'), unit_id (merge_sha of the verify
            unit's tip; == merge_sha for a plain landing), unit_size (int ≥ 1), git_first_parent (bool)}
-landings(runs_db, repo, since_cursor) -> list[Landing]   # ordered; never re-emits a sha ≤ cursor
+           + late_claim, prev_landed_at, lines_base, base_sha (see the Correction below)
+landings(runs_db, repo, since_cursor) -> LandingBatch(landings, git_check, next_cursor)
+    # ordered; since_cursor=None is the full history; may re-emit late claims and off-first-parent
+    # landings, so consumers upsert on (project_id, merge_sha, task_id); the next call's
+    # since_cursor is next_cursor, never main's HEAD
 ```
-Invariants: one row per `(project_id, merge_sha)`; `unit_size == len(members)` for a train or chain;
+Invariants: one row per `(project_id, merge_sha, task_id)`; `unit_size == len(members)` for a train;
 every member of a unit shares `unit_id`; `git_first_parent` is False for a landing whose sha is not on
 main's first-parent line (served as the disagreement count, never dropped).
+
+**Correction (α, 2026-11-04).** Measured on the df runs.db and git; the shipped shape is
+`shared/src/shared/quality_series/landings.py::landings`.
+- The key is `(project_id, merge_sha, task_id)`. A train lands as one merge commit and its members have
+  no `merge_finalized done` row (0 of 287), so every member carries `merge_sha == unit_id ==
+  train_merged.merge_commit_sha`; per-member lines are not separable, so members share the merge
+  commit's lines and modules (consumers pairing cost with lines aggregate per `unit_id`).
+- Chain units are not formed: `merge_verify.$.chain_items` is a count, not member ids, and 4 of the 5
+  chain-verify shas never reached main. A chain landing is a unit of one.
+- Lines are measured against a typed `lines_base`: a merge's first parent; for a single-parent
+  (fast-forward) landing, the nearest older first-parent commit that is itself a landing (its own first
+  parent is the task's previous commit); off the first-parent line, unmeasurable (None).
+- The signature is `landings(runs_db, repo, since_cursor, *, project_id=None, ...) -> LandingBatch(landings,
+  git_check)`; `project_id` defaults to the repo root's project id (its basename), and the batch carries
+  the git cross-check counts. `since_cursor` has no default; `None` means the full history (every
+  landing in the store, ordered by landed_at then merge_sha), the promise
+  `plans/instruments-honesty-prd.md` decision 2 relies on.
+- (2026-11-09) A **late claim** is a `merge_finalized done` row naming a sha that an earlier event
+  already claimed for another task. The full df history has 5: 2980@d397ce031f (first claimed by 2913),
+  5267 and 6042@100e526e15 (5963), 5149@0c8596de4c (4152), 6677@18fd0e0047 (3723). For 5149, 5267
+  and 6677, `git log -1 --format=%P` shows the task's own `Merge task/<id> into main` commit as the
+  claimed sha's first parent, and no runs.db landing names that commit. 2980's own merge
+  (95abbf6df8) is a separate landing. 6042's own merge (51fcedc570) is on main and no runs.db
+  landing names it. A late claim stays a landing, because the task left the merge queue with main
+  advanced. It forms its own unit of one (`late_claim`, with an opaque `unit_id` compared only for
+  equality) with unmeasurable lines, and `git_check.late_claims` counts it in the disagreement. See
+  `shared/src/shared/quality_series/landings.py::landings`.
+- (2026-11-09) Late claims and off-first-parent landings are emitted by `landed_at`, after the newest
+  first-claim landing at or below the cursor, so a later cursor may re-emit one. Consumers upsert on
+  `(project_id, merge_sha, task_id)`. This replaced the original sketch's "never re-emits a sha ≤ cursor".
+- (2026-11-09) **Which sha is the cursor.** A consumer resumes from `LandingBatch.next_cursor`: the
+  merge_sha of the newest first-claim landing emitted, or the call's cursor in full when none was. It
+  must never store main's HEAD. A landing's runs.db event trails main's ref update by 38 s to 3m52s
+  (measured above), so with a 600 s loop a commit at or below HEAD is routinely not yet a recorded
+  landing, and a HEAD cursor would skip it for good. Until its event is written, such a merge counts in
+  `git_check.merges_without_landing`, so that count is transient at the top of main. The Sketch's
+  "stale when main is ahead of the cursor" therefore means recorded landings above the cursor, not
+  first-parent commits. See `shared/src/shared/quality_series/landings.py::landings`.
+- (2026-11-09) A unit's members are consecutive in ordinal order, and
+  `shared/src/shared/quality_series/rows.py::rows_for` refuses input that splits, shortens or repeats
+  a unit, before any git work.
+- (2026-11-09) `train_merged` has two payload shapes. A coalesced train carries `member_task_ids` and
+  `merge_commit_sha`. A member that passes solo after the train's union verify fails
+  (`orchestrator/src/orchestrator/workflow.py::_attribute_train_failure`) carries `verdict =
+  'attributed'` and `merge_sha` under the member's own `task_id`. It advanced main alone, so it is a
+  landing with source `train_attributed` and is its own unit. Any other shape raises
+  `UnrecognisedTrainEvent`, which names the event ids; the store is never read past it. The full df
+  history had 0 attributed events on 2026-11-09.
 
 ### Per-landing row (`shared/src/shared/quality_series/rows.py`)
 
 ```
 LandingRow = Landing + {
-  outcomes: {rejected: bool|None, rejection_events: int, reviewed: bool, review_blocking: bool|None,
-             flake_confirmed: bool, flake_real_red: bool, flake_rows: int, reverify_count: int,
-             verify_failed_rows: int},
-  cost:     {all_role_usd: float|None, by_role: {role: usd}, implementer_invocations: int,
-             execute_iterations: int|None, turns: int|None, turns_capped: bool, code_lines: int,
-             src_lines: int, test_lines: int, review_rounds: int|None, review_rounds_source:
+  outcomes: {rejected: bool|None, rejection_events: int|None, reviewed: bool|None,
+             review_blocking: bool|None, flake_confirmed: bool|None, flake_real_red: bool|None,
+             flake_rows: int|None, reverify_count: int|None, verify_failed_rows: int|None},
+  cost:     {all_role_usd: float|None, by_role: ((role, usd), ...), implementer_invocations: int|None,
+             execute_iterations: int|None, turns: int|None, turns_capped: bool, code_lines: int|None,
+             src_lines: int|None, test_lines: int|None, review_rounds: int|None, review_rounds_source:
              'review_completed'|'disk_counter'|None, charter_class: str|None, charter_class_source: ...},
   modules:  [{module, src_lines}],
-  rule_vintage: {metric_id: measured_since_iso}}
+  rule_vintage: SourceEpochs   # one first-row timestamp per source, not per metric}
 rows_for(landings, runs_db, repo, git_budget_s) -> list[LandingRow]
 ```
 Invariants: `None` means "source not started or not applicable", never 0; `rejected`/`reverify_count`
 are the unit's values copied to every member; `all_role_usd is None` iff the task has no `invocations`
 row; `code_lines` follows decision 6's path classes; every window is `(prev_landing_time(task),
 landed_at]`.
+
+**Correction (α, 2026-11-09).** The block above was widened in place to the shipped shape. Every
+outcome field, `implementer_invocations` and the three line fields are Optional, because one epoch rule
+applies uniformly: a field is None when its source has not started at the landing (lines: when the
+base is unmeasurable). So quality.db columns for them are nullable. `rule_vintage` is keyed by
+source, not by metric: a consumer maps each metric to the source it reads. `by_role` is a tuple of
+(role, usd) pairs. The single homes are `shared/src/shared/quality_series/rows.py::Outcomes`,
+`::Cost` and `::SourceEpochs`, with their `__post_init__` invariants. `SourceEpochs` and the
+Landing's `landed_at`/`prev_landed_at` are timezone-aware datetimes; ISO text is rendered only where a
+row is written to quality.db or printed.
+- (2026-11-09) The `rejections` epoch is the first categorised `merge_blocked` of any category, so a
+  project that never has a post-merge rejection reads 0/n, not unknown. On df and reify that is the
+  same instant as the first `post_merge_verify` rejection (2026-07-19T17:49:40Z and
+  2026-07-20T02:18:42Z), so neither series moves. The `flake_occurrence` epoch stays the table's first
+  row, and the table records only discriminated failing tests, so it is outcome-conditioned. A
+  project that never has one serves `flake_*` = None for every landing, indefinitely, and its series
+  starts on a positive observation, which biases small projects (reify, the solar repos) upward.
+  Render that as "no producer has written here", never as 0.
+- (2026-11-09) `execute_iterations` sums the `task_results` rows of the dispatches that produced the
+  landing (`shared/src/shared/quality_series/rows.py::_landing_dispatches`): the window's rows that did
+  not report `done`, plus the landing dispatch's own row. `task_results` is written when a dispatch
+  ends, after its merge lands, so that row is the task's first row after `landed_at`, counted when it
+  reports `done`. A `done` row inside a window is the previous landing's dispatch row and is not
+  charged again. On the 151 df W44 plain landings the dispatch row trailed the landing event by 12 s
+  at the median and about 12 min at p99. The strict window alone never counted it: W44 had 73 of 234
+  landings at None against 21 with no implementer invocation; with the dispatch row, 19. Two
+  residuals. A row computed before its landing dispatch's row is written lacks it, so β must
+  re-measure a stored row whose landing is younger than that lag, or accept the loss; decision 14's
+  upsert allows the re-measure. And a landing whose own dispatch wrote no row can claim the task's
+  next landing's `done` row, because `task_results` is keyed `(run_id, task_id)` with `INSERT OR
+  REPLACE`: 7 of the 3,527 df landings in the full history (2026-11-09).
 
 ### Pure statistics (`shared/src/shared/quality_series/stats.py`)
 
@@ -306,6 +409,27 @@ landed_at]`.
 `block_rate_datum(xs, task_ids, n_block=100, n_min=30)`, `before_after_rate(...)`, `before_after_cost(...)`,
 `explain_alarm(onset_idx, onset_at, markers, k=25, days=3)`. All deterministic for equal inputs; no
 module-level state; stdlib only.
+
+**Correction (α, 2026-11-09).** The shipped signatures differ from the list above in three places
+that γ and δ build on; `shared/src/shared/quality_series/stats.py` is the single home.
+- `cusum_design(p0) -> CusumDesign(p1_up, p1_down, h)` with `p1_up = min(2·p0, (1 + p0)/2)`: the
+  doubling up to p0 = 1/3, and halfway from p0 to 1 above it, because 2·p0 reaches 1 at p0 = 1/2,
+  where the Bernoulli log-likelihood ratio is undefined. `p1_down = p0/2`, `h = CUSUM_H = 5`, and a
+  p0 outside (0, 1) is refused (`::cusum_design`).
+- Markers reach the statistics as `::RegimeEvent(event_id, at, until=None, series=None,
+  artefact=False)`. `series=None` applies to every series, and an artefact is a range `[at, until]`.
+  δ's markers are converted to it. `regime_segments(landed_at, events, series) ->
+  RegimeSegments(segments, excluded)` takes the landings' `landed_at` datetimes, not landing records.
+  An event's boundary is the first landing at or after its `at`, and an artefact's landings are
+  `excluded` (`::regime_segments`).
+- `explain_alarm(onset_idx, onset_at, events, landed_at, k=25, days=3) -> event_id | None` takes the
+  same `RegimeEvent`s plus the required `landed_at` sequence, which places each event on the landing
+  axis. Among events within ±k landings or ±days, the nearest in landings wins, then the nearest in
+  time, then the smallest `event_id` (`::explain_alarm`).
+- The other return shapes are typed, never bare tuples of strings: `baseline_rate` returns
+  `(p0, BaselineState | None)`, `block_rate_datum` returns `RateDatum`, and `before_after_rate` /
+  `before_after_cost` return `Effect` / `CostEffect` or `NotYet`. `cost_fit(lines, costs, min_lines=5)`
+  exposes the log–log fit that `reference_cost` evaluates.
 
 ### Wire shape (`dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire`)
 
@@ -476,16 +600,37 @@ apply (no load-sampler metric). No waivers.
 
 ## Open questions (tactical)
 
-1. **`train_merged.timestamp` as main's advance.** Leaf α verifies against the member sha's first reach
-   of main; if it is the train's build time, use each member's `merge_finalized done` timestamp.
-   Decide during α.
-2. **`invocation_end.$.turns` across resumed sessions** (114 `session_resume` events in October): if
-   cumulative, α sums only the last row per session. Decide during α by reading
-   `shared/src/shared/cli_invoke.py`'s resume path.
+1. **`train_merged.timestamp` as main's advance.** Resolved by α (2026-11-04): it is main's advance in
+   the same sense as `merge_finalized done`. main's reflog reached the train merges 0f0fbc44ae and
+   dd31d2ad39 2m56s and 3m37s before their `train_merged` events, and the plain landings 9f7cc8091d,
+   1ea166355e and 6c42ed815e 3m52s, 2m54s and 38s before their `done` events: both event types lag the
+   ref update by the same few minutes. The fallback named here does not exist (members have no `done`
+   row). The event timestamp anchors both sources.
+2. **`invocation_end.$.turns` across resumed sessions.** Resolved by α (2026-11-04): summed over every
+   row. `_parse_claude_output` reads `num_turns` raw, and consecutive resumed (`session_delta`)
+   processes of one task and role report non-monotone turns (task 5836 steward 13, 5, 2; task 7977
+   steward 18, 9, 16, 6), which a cumulative counter cannot do. Per-process is a strong hypothesis, not
+   proven per session: `invocation_end` carries no session id.
 3. **Per-merge git cost** (inferred ~30 ms, unmeasured): β measures it and sets the per-root budget from
    the measurement. Decide during β.
-4. **Module key for non-`<pkg>/src/<pkg>` layouts** (reify, the solar repos): first two path components
-   when depth ≥ 3; α's brief may refine per project. Decide during α.
+   **Resolved by β (2026-11-09)**, measured on the df main checkout at load ~30 on 32 cores through α's
+   public functions: `git rev-list --first-parent --parents` 0.23 s; a full-history `landings()`
+   0.57 s over 3,545 landings; `landed_lines` per unit median 13.7 ms, p90 44.8 ms, p99 137 ms, max
+   145 ms over the newest 200 units (oldest 200: median 16.8 ms, max 67 ms); a cold `rows_for` at a
+   60 s budget measured 3,112 of 3,545 rows in 62.2 s, then the remaining 433 in 7.5 s; reify's full
+   history (2,549 landings) took 40.1 s; max RSS 134 MB. Among 3,539 df first-claim on-line landings,
+   ordinal (landed_at) order and first-parent position order show 0 inversions. The choices, in
+   `dashboard/src/dashboard/data/quality_sampler.py`: `QUALITY_GIT_BUDGET_SECONDS` = 30 (at least 219
+   units even at p99, against df's ~1.6 landings per tick, so a steady-state tick is never truncated;
+   it also bounds how long a dashboard shutdown waits on an in-flight worker thread);
+   `QUALITY_REV_LIST_TIMEOUT_SECONDS` = 30; and the per-root backstop
+   `QUALITY_PER_ROOT_BUDGET_SECONDS` = 180 s, between its floor (rev-list 30 +
+   `FIRST_UNIT_GIT_FLOOR_S` 60 + runs.db reads of at most ~8 s) and its ceiling (half the 600 s tick,
+   300 s). A cold backfill takes ≈4 ticks for df and ≈3 for reify.
+4. **Module key for non-`<pkg>/src/<pkg>` layouts.** Resolved by α (2026-11-04): `<pkg>/src/<pkg2>/<rest>`
+   keys as `<pkg>/<rest[0]>`; otherwise the first two components at depth ≥ 3, else the first
+   (`crates/reify-core/src/lib.rs` → `crates/reify-core`). See
+   `shared/src/shared/quality_series/git_lines.py::module_key`.
 5. **Whether a 7-minute nightly run on the laptop is preferable** when the host is saturated: θ ships the
    workstation timer; a laptop instance is a config choice later.
 6. **CPUWeight value for the timer unit**: θ picks the lowest value with a precedent in

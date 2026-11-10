@@ -119,6 +119,17 @@ def test_stage_machinery_mutators_are_denied_in_every_stage():
             assert tool in stage_list, f'{stage_name} must deny {tool}'
 
 
+def test_dead_letter_queue_mutators_are_denied_in_every_stage():
+    """Dead-letter queues are stage machinery: no stage replays or deletes them."""
+    for tool in (
+        f'{FUSED_MEMORY_TOOL_PREFIX}replay_dead_letters',
+        f'{FUSED_MEMORY_TOOL_PREFIX}replay_event_dead_letters',
+        f'{FUSED_MEMORY_TOOL_PREFIX}delete_dead_letters',
+    ):
+        for stage_name, stage_list in _STAGE_LISTS.items():
+            assert tool in stage_list, f'{stage_name} must deny {tool}'
+
+
 def test_add_system_record_is_denied_in_stage3_only():
     """Parity with ``add_memory``: Stages 1 and 2 write memory, Stage 3 does not."""
     tool = f'{FUSED_MEMORY_TOOL_PREFIX}add_system_record'

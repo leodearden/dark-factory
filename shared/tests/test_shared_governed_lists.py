@@ -159,7 +159,10 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
     default_covers=56,
     dispositions={
         'cancel_dispositions': Policy('inv12-task-metadata-blessed-keys'),
+        'predicate_recheck': Policy('inv12-task-metadata-blessed-keys'),
+        'predicate_verdict': Policy('inv12-task-metadata-blessed-keys'),
         'superseded_by': Policy('inv12-task-metadata-blessed-keys'),
+        'trigger_chain': Policy('inv12-task-metadata-blessed-keys'),
     },
 )
 
@@ -200,7 +203,6 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::cc7999e2d4b6': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._resume_interrupted_runs::bc3672ec502c': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._record_failed_run::652fc88d57ad': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._maybe_escalate_stale_task_count_snapshot::560696057da1': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._maybe_remediate::1fbc50761be3': Debt(TaskRef(5270)),

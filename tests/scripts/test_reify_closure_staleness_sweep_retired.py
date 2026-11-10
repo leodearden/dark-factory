@@ -91,6 +91,17 @@ ALLOWED_UNCONDITIONALLY = {
         '2026-11-04 pool, consumed as a fixture by tasks 8451 and 8454; '
         'same reasoning as the pool JSON above (task 8468)'
     ),
+    'fused-memory/tests/fixtures/pack_pool_2026-11-04.json': (
+        'FROZEN fixture — task 8451\'s verbatim copy of '
+        'plans/followup-packing-sweep-prd.pack-pool-2026-11-04.json, which '
+        'test_followup_packing.py replays to reproduce the a2/c2 packs. Same '
+        'reasoning as that original above: editing it would falsify the snapshot'
+    ),
+    'fused-memory/tests/fixtures/packs-a2c2-2026-11-04.csv': (
+        'FROZEN fixture — task 8451\'s verbatim copy of '
+        'plans/followup-packing-sweep-prd.packs-a2c2.csv, the expected packs '
+        'test_followup_packing.py asserts against; same reasoning as above'
+    ),
 }
 
 # A second allowlist, merged into the same exclusion set as the dict above:

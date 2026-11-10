@@ -325,6 +325,10 @@ Four steps, in this order:
 Close with one message: the handover path, the lease result and, when the session stops in AFK
 posture, that the queue is unwatched until a successor launches.
 
+When the stop is part of a `handoff` and this watcher is T3-hosted, the session then ends with the
+archive act, gated on the confirmed successor: `skills/spawn/SKILL.md` §`handoff` step 6, and
+"Ending a T3 session" in its T3 lane section.
+
 ### Self-operations need no permission
 
 These are the session's own mechanics: do them without asking (Leo, 2026-09-25). They are item 8
@@ -2463,7 +2467,7 @@ its values may be passed to `resolve_issue`.
 | `action` | Record disposition | Live workflow | Task status effect | Intent |
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
-| `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
+| `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run it." A plain restart REUSES the branch, worktree and plan; a recent finalized plan can skip the architect entirely, which is how 5027, 3310 and 4513 no-op'd. To re-plan on current main, pass `recut=True` (C1 notes). |
 | `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` refuses it with code `park_on_info` and changes nothing; the response's `hint` and `task_id` give the deferral to use instead. An info park that is accepted means that orchestrator's escalation server predates task 6578: defer the task anyway. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
@@ -2473,6 +2477,7 @@ its values may be passed to `resolve_issue`.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
 - **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1. That cover holds only where the member L1 pins. An `info` member never pins by itself, so treat its task as unheld (see the `park` row).
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
+- **`recut=True` (restart only, task 5516)**: the next dispatch parks the branch as `task/<id>-<stamp>`, quarantines the worktree and `.task-meta` (nothing is deleted), cuts fresh from current main and plans with the architect. The archived record carries `recut: true`, and the task's `metadata.recut_executed` names where everything went. With any other action, `resolve_issue` refuses `recut=True` with code `recut_requires_restart`. A `RESTART_RECUT_UNRECORDED` `infra_issue` L1 means the ruling did not persist. Its detail says which case applies: either the task is held `blocked`, or the ruling was dropped after the re-pend and the next dispatch may reuse the stale plan. In both cases, once the task store is healthy, resolve that L1 with `action='restart', recut=True`. Mechanics: `escalation/src/escalation/server.py::resolve_issue` and `orchestrator/src/orchestrator/recut_ruling.py`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0
 steward-resolved path, where a workflow is still live and waiting (`_wait_for_resolution` →
@@ -2488,7 +2493,8 @@ steward-resolved path, where a workflow is still live and waiting (`_wait_for_re
   (task β), `action='resume'` on a memberless born-at-L2 now flips `blocked→pending` — the orphan
   flip accepts any task-attached `level >= 1`. The resolution text is recorded for audit only and
   does not reach the agent (no live workflow); write durable guidance into fused-memory / task
-  metadata instead. To re-run fresh use `action='restart'` (→ `pending` from scratch); to park for
+  metadata instead. To re-run use `action='restart'` (→ `pending`, reusing branch and plan; add
+`recut=True` to re-plan fresh on current main); to park for
   later use `action='park'` (→ `blocked`, held under an open L2); to abandon permanently use `action='abandon'`
   (→ `cancelled`); to close the record without touching the task use `action='close_only'`.
 

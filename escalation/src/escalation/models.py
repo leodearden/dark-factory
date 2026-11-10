@@ -620,6 +620,9 @@ class Escalation:
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
     resolution_action: str | None = None
+    # Set only at resolve time by EscalationQueue.resolve, and only with
+    # resolution_action='restart': the next dispatch re-cuts the task fresh off main.
+    recut: bool = False
     # Benign/actionable classification stamp (escalation-lifecycle-dashboard-prd.md
     # Seam 1).  Written ONLY at a terminal-write chokepoint — queue.resolve() or
     # queue.submit_resolved() — never author-supplied at filing time.  None means
@@ -856,6 +859,30 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+_L2_CASCADE_RESOLVER_PREFIX = 'l2-cascade:'
+
+
+def cascade_resolved_by(parent_id: str) -> str:
+    """The ``resolved_by`` an L2's cascade stamps on each member it closes."""
+    return f'{_L2_CASCADE_RESOLVER_PREFIX}{parent_id}'
+
+
+def cascade_parent_id(resolved_by: object) -> str | None:
+    """The parent L2 id a ``cascade_resolved_by`` attribution names, else None."""
+    if not isinstance(resolved_by, str):
+        return None
+    if not resolved_by.startswith(_L2_CASCADE_RESOLVER_PREFIX):
+        return None
+    return resolved_by.removeprefix(_L2_CASCADE_RESOLVER_PREFIX) or None
+
+
+def recut_action_conflict(resolution_action: str | None, recut: bool) -> str | None:
+    """Why *recut* cannot qualify *resolution_action*, else None."""
+    if not recut or resolution_action == 'restart':
+        return None
+    return f"recut=True applies only to action='restart'; got action={resolution_action!r}"
 
 
 def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:

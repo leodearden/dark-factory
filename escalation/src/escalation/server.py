@@ -88,6 +88,7 @@ from escalation.models import (
     EvidenceEntry,
     max_severity,
     note_to_file_class_conflict,
+    recut_action_conflict,
 )
 from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
@@ -2372,6 +2373,7 @@ def create_server(
         granted_files: list[str] | None = None,
         acknowledge_declared_pins: list[str] | None = None,
         escalate_model: bool = False,
+        recut: bool = False,
         terminate: Any = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
@@ -2386,7 +2388,12 @@ def create_server(
         |              |            | into agent briefing (L0    |                        |
         |              |            | path only)                 |                        |
         +--------------+------------+----------------------------+------------------------+
-        | restart      | resolved   | restart task from scratch  | reset to pending       |
+        | restart      | resolved   | workflow killed, task re-  | reset to pending       |
+        |              |            | pended; branch, worktree   |                        |
+        |              |            | and plan are REUSED, and a |                        |
+        |              |            | recent plan may skip the   |                        |
+        |              |            | architect (Lever B); pass  |                        |
+        |              |            | recut=True to re-cut       |                        |
         +--------------+------------+----------------------------+------------------------+
         | park         | kept OPEN  | workflow killed; task      | → blocked (held under  |
         |              | at L2      | blocked-on-human; no re-   | open L2 escalation)    |
@@ -2400,6 +2407,18 @@ def create_server(
 
         A ``park`` on an info-severity target is refused with code
         ``park_on_info`` and the record is not touched (see Gate precedence).
+
+        ``recut`` (task 5516) qualifies ``action='restart'`` only; any other
+        pairing (``escalation.models.recut_action_conflict``) is refused with
+        code ``recut_requires_restart`` and no record change.  With
+        ``recut=True`` the next dispatch parks the branch as
+        ``task/<id>-<stamp>``, quarantines the worktree (uncommitted files
+        survive there) and moves ``.task-meta`` aside, deleting nothing; it then
+        cuts fresh from current main and plans fresh with the architect, via
+        the task-3154 re-cut ruling gate
+        (``orchestrator/src/orchestrator/recut_ruling.py``).  Use it when the
+        plan or branch itself is in question; a plain restart keeps committed
+        branch work.  The archived record carries ``recut``.
 
         **Policy-table identities** (task 8422).  The executor
         (``authority.EXECUTOR_IDENTITY``) must pass ``resolution_class`` and
@@ -2528,7 +2547,9 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**, in order: the connection-capability gate
+        **Gate precedence**, in order: the argument-validation refusals
+        (``invalid_resolution_class``, ``recut_requires_restart``) → the
+        connection-capability gate
         (``bad_capability_header`` / ``level_forbidden``) → the policy-table
         identity gate (``resolution_class_required`` /
         ``policy_state_unreadable`` / ``level_forbidden`` /
@@ -2648,6 +2669,8 @@ def create_server(
                 ),
                 'code': 'invalid_resolution_class',
             }
+        if (conflict := recut_action_conflict(action, recut)) is not None:
+            return {'error': conflict, 'code': 'recut_requires_restart'}
 
         # Connection-capability gate (escalation-connection-capability-guard-prd.md,
         # task alpha; identity-derived ceiling extension per
@@ -2862,6 +2885,7 @@ def create_server(
             resolution_class=resolution_class,
             granted_files=granted_files,
             resolution_action=action,
+            recut=recut,
             outcome=resolve_outcome,
         )
         if esc is None:
@@ -4301,9 +4325,9 @@ def create_server(
             """The task's metadata, read AT MOST ONCE per merge_request call.
 
             ``git_authority.task_metadata`` is uncached — every call is a fresh
-            ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+            ``scheduler.read_task`` → Taskmaster MCP dispatch with an internal
             ``timeout=15`` (``orchestrator/src/orchestrator/scheduler.py::
-            Scheduler::get_task``).  It has two consumers here, the degeneracy
+            Scheduler.read_task``).  It has two consumers here, the degeneracy
             probe and the lane fallback, and this memo is what keeps the count
             per call at 0 or 1 and makes 2 unreachable
             (test_merge_request_lane.py::TestMetadataReadIsPaidAtMostOnce).
@@ -4360,10 +4384,10 @@ def create_server(
             # off that common path.
             #
             # What the metadata read costs, stated as it now is (task 4888).
-            # At most ONE `scheduler.get_task` per merge_request call — a
+            # At most ONE `scheduler.read_task` per merge_request call — a
             # Taskmaster MCP dispatch with an internal timeout=15
-            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler::
-            # get_task`) — shared via `_task_metadata_once()` between this
+            # (`orchestrator/src/orchestrator/scheduler.py::Scheduler.
+            # read_task`) — shared via `_task_metadata_once()` between this
             # probe and the lane fallback.  It is never paid twice, and never
             # paid at all when the caller supplies an explicit `lane`; it IS
             # paid on every no-explicit-lane submission, including the common

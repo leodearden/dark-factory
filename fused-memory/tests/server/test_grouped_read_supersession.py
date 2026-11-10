@@ -93,7 +93,7 @@ def _entry_for(entries: list[dict[str, Any]], memory_id: str) -> dict[str, Any]:
 
 class TestNestedEntriesKeepTheSupersessionMark:
     @pytest.mark.asyncio
-    async def test_a_digest_carries_the_mark(self) -> None:
+    async def test_an_amendment_entry_carries_the_mark(self) -> None:
         service = _service([_row(A1, 'amendment', 'old amendment', **MARK)])
 
         block = await build_grouped_document(service, PROJECT_ID, P)
@@ -135,9 +135,9 @@ class TestNestedEntriesKeepTheSupersessionMark:
         entries = await group_search_results(service, PROJECT_ID, hits)
 
         assert [entry['id'] for entry in entries] == [P]
-        digest = _entry_for(entries[0]['grouped']['amendments'], A1)
-        assert digest['matched'] is True
-        assert digest['metadata'] == MARK
+        entry = _entry_for(entries[0]['grouped']['amendments'], A1)
+        assert entry['matched'] is True
+        assert entry['metadata'] == MARK
 
     @pytest.mark.asyncio
     async def test_the_parents_point_read_carries_the_mark(self) -> None:

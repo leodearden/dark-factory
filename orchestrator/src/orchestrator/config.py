@@ -69,6 +69,13 @@ logger = logging.getLogger(__name__)
 # verify_runner.py, so there is no cycle.
 VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 
+# --- Task-verify host policy (remote task leg, task 6670) ---
+#
+# Same single-home rule as VerifyHostPolicy: task_verify_dispatch.py imports
+# this name as its HostPolicy, so the config field and the dispatcher's
+# eligibility match share one vocabulary.
+VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
+
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
@@ -1682,6 +1689,44 @@ class SccacheConfig(BaseModel):
         this model instance.
         """
         return dict(self.backend_env) if self.enabled else {}
+
+
+class VerifyCgroupMemoryConfig(BaseModel):
+    """Memory limits every verify scope is spawned with, as ``systemd-run -p``
+    properties; applied only when verify_use_cgroup_scope is on, one value for
+    every role.
+
+    Leaves are integer GiB, rendered with systemd's base-1024 ``G`` suffix. An
+    unset leaf adds no property (systemd's default applies). high may not
+    exceed max.
+    """
+
+    high_gib: int | None = Field(default=None, ge=1)
+    max_gib: int | None = Field(default=None, ge=1)
+    swap_max_gib: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def _reject_high_above_max(self) -> 'VerifyCgroupMemoryConfig':
+        if (
+            self.high_gib is not None
+            and self.max_gib is not None
+            and self.high_gib > self.max_gib
+        ):
+            raise ValueError(
+                f'VerifyCgroupMemoryConfig.high_gib={self.high_gib} exceeds '
+                f'max_gib={self.max_gib}: MemoryHigh above MemoryMax never '
+                f'throttles before the kill; lower high_gib or raise max_gib.'
+            )
+        return self
+
+    def systemd_properties(self) -> tuple[str, ...]:
+        """Return ``<Property>=<n>G`` for each set leaf, in a fixed order."""
+        pairs = (
+            ('MemoryHigh', self.high_gib),
+            ('MemoryMax', self.max_gib),
+            ('MemorySwapMax', self.swap_max_gib),
+        )
+        return tuple(f'{prop}={gib}G' for prop, gib in pairs if gib is not None)
 
 
 class JobserverConfig(BaseModel):
@@ -3386,12 +3431,11 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
-    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
-    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    # Codex sticker rates; each codex arm's cached rate is required by
+    # orchestrator/tests/test_eval_codex_pi_bundles.py::TestCodexSlatePin.
     'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
-    'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
-    'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
+    'gpt-6.1-sol': {'input_per_1m': 2.00, 'output_per_1m': 10.00, 'cached_input_per_1m': 0.10},
+    'gpt-6.1-terra': {'input_per_1m': 1.00, 'output_per_1m': 5.00, 'cached_input_per_1m': 0.05},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -4256,6 +4300,12 @@ class OrchestratorConfig(BaseSettings):
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
+    # Memory limits each verify scope is spawned with (`systemd-run -p
+    # MemoryHigh=/MemoryMax=/MemorySwapMax=`), only when verify_use_cgroup_scope
+    # is on; one value covers every role.
+    verify_cgroup_memory: VerifyCgroupMemoryConfig = Field(
+        default_factory=VerifyCgroupMemoryConfig,
+    )
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -5611,6 +5661,46 @@ class OrchestratorConfig(BaseSettings):
             'an orchestrator restart.  Must be >= 1.'
         ),
     )
+    verify_task_host_policy: VerifyTaskHostPolicy = Field(
+        default='local',
+        description=(
+            "Which task-role verifies may run on a remote verify host.  'local' "
+            '(default) short-circuits the dispatcher before it records anything, '
+            "so every task verify runs locally exactly as before.  'remote_modules' "
+            'makes a verify eligible when its executed module set intersects '
+            "verify_task_remote_modules; 'remote_all' makes every verify eligible.  "
+            'Read per dispatch, so rollback is one reload to \'local\'.  See '
+            'plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_modules: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Module prefixes eligible for a remote task verify under "
+            "verify_task_host_policy 'remote_modules' (must then be non-empty).  "
+            'See plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_cross_check_every_n: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Parity knob: every n-th task verify that returns a remote verdict, '
+            'green or red, counted per orchestrator process, is re-run locally, '
+            'the local verdict authoritative, recording the agreement in the '
+            'dispatch sidecar (the false-green direction).  0 (default) is off.  '
+            'See plans/remote-task-leg-verify-prd.md decision 9.'
+        ),
+    )
+    verify_task_remote_red_confirms_locally: bool = Field(
+        default=False,
+        description=(
+            'Parity knob: a remote red re-runs the ordinary local verify before the '
+            'verdict is returned, and the local verdict is returned (the '
+            'false-red direction).  Default false.  See '
+            'plans/remote-task-leg-verify-prd.md decision 9.'
+        ),
+    )
 
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
@@ -5873,6 +5963,17 @@ class OrchestratorConfig(BaseSettings):
                 'short inside the grace window. '
                 'Raise timeouts.steward to >= steward_completion_timeout, or lower '
                 'steward_completion_timeout in your orchestrator.yaml.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _validate_verify_task_remote_modules(self) -> 'OrchestratorConfig':
+        if self.verify_task_host_policy == 'remote_modules' and not self.verify_task_remote_modules:
+            raise ValueError(
+                "verify_task_host_policy 'remote_modules' needs a non-empty "
+                'verify_task_remote_modules; an empty list would make no task '
+                "verify eligible.  Name the module prefixes, or use 'local' or "
+                "'remote_all'."
             )
         return self
 
@@ -6537,6 +6638,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Read at each verify scope spawn (verify.py::_run_cmd via _scope_kw), so a
+    # reload applies from the next spawn, as the task-5205 CPUWeight knobs do.
+    _submodel_leaf_paths('verify_cgroup_memory', VerifyCgroupMemoryConfig),
     # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
     # green-tier hot-reloadable. apply_reload()'s existing post-apply
     # model_validate re-check already enforces
@@ -6774,6 +6878,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # dispatch prefers and cannot split an in-flight merge.  Read the
         # field's trust-anchor caveat before flipping it live.
         'verify_host_policy',
+        # Remote task-leg dispatch policy and parity knobs (task 6670) — read
+        # per dispatch and per remote grant through
+        # task_verify_dispatch.py::policy_from_config, so a reload never
+        # changes a leg already running.
+        'verify_task_host_policy',
+        'verify_task_remote_modules',
+        'verify_task_remote_cross_check_every_n',
+        'verify_task_remote_red_confirms_locally',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

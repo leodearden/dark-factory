@@ -197,13 +197,16 @@ _DECLARED_FILES_STAT_WHY = (
     'read.'
 )
 
-#: Task 5099: the curator COMBINE audit line.
+#: Task 5099: the curator COMBINE audit line; task 8415 added its item fields.
 _COMBINE_AUDIT_APPEND_WHY = (
     'ACCEPTED, bounded by an LLM decision (one cause): '
     'TaskInterceptor._execute_combine reaches _append_combine_audit, an '
     'idempotent mkdir (6-11us, task 5099 timeit) plus one open(\'a\') '
-    'append of a single JSON line under 2 KB (descriptions truncated to '
-    '500 chars), with no fsync. It runs once per curator COMBINE decision, '
+    'append of a single JSON line, with no fsync. The line is about 2 KB '
+    '(descriptions and justification truncated to 500 chars) plus, since '
+    'task 8415, the items_before/items_after lists: one 16-hex item key '
+    'per follow-up item on the target, so roughly 40 bytes per item. It '
+    'runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
     'on a hot or storm-coupled path. The one storm-coupled defect of this '
     'shape, the EventQueue dead-letter append that fires during a drop '
@@ -337,14 +340,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        '15bda1dd6b34',
+        '0a7e982628a1',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
     ),
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        'd7b1b643f3fe',
+        'ab64655040c9',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
     ),
@@ -424,13 +427,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_stale_runs',
         'cc7999e2d4b6',
-        'filed',
-        _ESCALATE_ARCHIVE_SCAN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._resume_interrupted_runs',
-        'bc3672ec502c',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),

@@ -9,6 +9,8 @@ from typing import Any, ClassVar
 
 from escalation.disposition import ReviewerDisposition
 
+from orchestrator.review_issue_contract import IssueField, IssueSeverity, parse_severity
+
 
 class Verdict(StrEnum):
     PASS = 'PASS'
@@ -21,7 +23,7 @@ class ReviewPayloadError(ValueError):
 
 
 def _is_blocking(issue: Mapping[str, Any]) -> bool:
-    return issue.get('severity') == 'blocking'
+    return parse_severity(issue.get(IssueField.SEVERITY)) is IssueSeverity.BLOCKING
 
 
 @dataclass(frozen=True)

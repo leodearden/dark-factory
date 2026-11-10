@@ -31,7 +31,7 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Awaitable, Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -41,7 +41,9 @@ import httpx
 import openai
 import pytest
 from _mock_openai_server import mock_openai_server
+from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
+from _unreached_provider import skip_if_provider_unreached
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -1537,6 +1539,17 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     return client
 
 
+def _hanging_sdk(**_constructor_kwargs: Any) -> MagicMock:
+    """An `openai.AsyncOpenAI` stand-in whose call outlasts a test-sized judge budget."""
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(5)
+
+    client = sdk_client_double()
+    client.responses.create = AsyncMock(side_effect=_hang)
+    return client
+
+
 def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespace:
     """A service double configured for the judge, with an llm section."""
     write_triage.setdefault('judge_provider', provider)
@@ -1711,7 +1724,7 @@ class TestProviderCredentials:
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
         assert ctor.call_args.kwargs == {
-            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1', 'max_retries': 0,
         }
 
     @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
@@ -2659,12 +2672,7 @@ class TestJudgeWriteFailuresRaise:
         arm, which is exactly C1's "judge error/timeout => stored + storm
         counter".
         """
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
-        with patch('openai.AsyncOpenAI', return_value=client), \
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk), \
                 pytest.raises(TimeoutError):
             await judge_write(
                 memory_service=_judge_svc(judge_timeout_seconds=0.01),
@@ -2751,6 +2759,15 @@ class TestJudgeWriteFailuresRaise:
             )
 
 
+def _mid_band_service(**write_triage) -> types.SimpleNamespace:
+    """A service whose retrieval lands squarely in the middle band."""
+    service = _judge_svc(t_high=0.95, t_low=0.50, **write_triage)
+    service.search = AsyncMock(
+        return_value=SearchResults([_result('m1', 0.80)]),
+    )
+    return service
+
+
 class TestJudgeWriteInheritsBetasFailOpenApparatus:
     """The INTEGRATION property, asserted directly rather than argued.
 
@@ -2758,15 +2775,6 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     worth pinning is not "the judge raises" but what `triage_write` DOES with
     a raising judge: exactly one counted fail-open, and an ack of `stored`.
     """
-
-    @staticmethod
-    def _mid_band_service(**write_triage) -> types.SimpleNamespace:
-        """A service whose retrieval lands squarely in the middle band."""
-        service = _judge_svc(t_high=0.95, t_low=0.50, **write_triage)
-        service.search = AsyncMock(
-            return_value=SearchResults([_result('m1', 0.80)]),
-        )
-        return service
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2783,7 +2791,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         self, body: str | None, side_effect: Exception | None, label: str,
     ) -> None:
         counter = TriageFailOpenCounter()
-        service = self._mid_band_service()
+        service = _mid_band_service()
         client = _openai_client(body)
         if side_effect is not None:
             client.responses.create = AsyncMock(side_effect=side_effect)
@@ -2800,15 +2808,10 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
     @pytest.mark.asyncio
     async def test_a_timeout_stores_and_counts_exactly_once(self) -> None:
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
         counter = TriageFailOpenCounter()
-        service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
+        service = _mid_band_service(judge_timeout_seconds=0.01)
 
-        with patch('openai.AsyncOpenAI', return_value=client):
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk):
             decision = await triage_write(
                 service, content='c', project_id='p',
                 counter=counter, judge=judge_write,
@@ -2818,9 +2821,22 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert counter.live_count() == 1
 
     @pytest.mark.asyncio
+    async def test_an_unreached_provider_stores_and_counts_exactly_once(self) -> None:
+        counter = TriageFailOpenCounter()
+
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)):
+            decision = await triage_write(
+                _mid_band_service(), content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
     async def test_an_incomplete_answer_stores_and_counts_exactly_once(self) -> None:
         counter = TriageFailOpenCounter()
-        service = self._mid_band_service()
+        service = _mid_band_service()
         client = _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens')
 
         with patch('openai.AsyncOpenAI', return_value=client):
@@ -2842,7 +2858,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         describing a failure that is not happening.
         """
         counter = TriageFailOpenCounter()
-        service = self._mid_band_service(judge_enabled=False)
+        service = _mid_band_service(judge_enabled=False)
 
         decision = await triage_write(
             service, content='c', project_id='p',
@@ -2856,7 +2872,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     async def test_a_healthy_judge_routes_and_counts_zero(self) -> None:
         """The happy path end-to-end: a verdict becomes an ack, nothing counted."""
         counter = TriageFailOpenCounter()
-        service = self._mid_band_service()
+        service = _mid_band_service()
         client = _openai_client(_payload('amends', 'm1'))
 
         with patch('openai.AsyncOpenAI', return_value=client):
@@ -2868,6 +2884,19 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert decision.outcome == OUTCOME_AMENDED
         assert decision.canonical_id == 'm1'
         assert counter.live_count() == 0
+
+
+def _frontier_arm_judge(
+    verdicts: list[TriageJudgeVerdict],
+) -> Callable[..., Awaitable[TriageJudgeVerdict]]:
+    """`judge_write`, recording each verdict into *verdicts*; it skips only when the provider was never reached."""
+
+    async def _judge(**kwargs: Any) -> TriageJudgeVerdict:
+        verdict = await skip_if_provider_unreached(judge_write(**kwargs))
+        verdicts.append(verdict)
+        return verdict
+
+    return _judge
 
 
 @pytest.mark.integration
@@ -2904,16 +2933,10 @@ class TestTheFrontierArmLive:
             config=config, search=AsyncMock(return_value=SearchResults(slate)),
         )
         verdicts: list[TriageJudgeVerdict] = []
-
-        async def recording_judge(**kwargs) -> TriageJudgeVerdict:
-            verdict = await judge_write(**kwargs)
-            verdicts.append(verdict)
-            return verdict
-
         counter = TriageFailOpenCounter()
         decision = await triage_write(
             service, content=duplicate['content'], project_id='p',
-            counter=counter, judge=recording_judge,
+            counter=counter, judge=_frontier_arm_judge(verdicts),
         )
 
         assert counter.live_count() == 0
@@ -2928,6 +2951,66 @@ class TestTheFrontierArmLive:
         assert usage.reasoning_tokens <= usage.output_tokens
 
 
+@contextlib.contextmanager
+def _failing_on_skip(instead: str) -> Iterator[None]:
+    """A skip escaping the block fails the test: a skipped guard would hide a widened skip."""
+    try:
+        yield
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f'skipped instead of {instead}: {skipped}')
+
+
+class TestTheFrontierArmSkipGuard:
+    """`_frontier_arm_judge` skips only an unreached provider; any other judge failure fails open and stays red."""
+
+    @pytest.mark.asyncio
+    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await triage_write(
+                _mid_band_service(), content='c', project_id='p',
+                counter=TriageFailOpenCounter(), judge=_frontier_arm_judge([]),
+            )
+
+        reason = str(excinfo.value)
+        assert 'api.openai.com' in reason
+        assert 'ConnectTimeout' in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('construct', 'write_triage'),
+        [
+            pytest.param(_hanging_sdk, {'judge_timeout_seconds': 0.01}, id='budget-expiry'),
+            pytest.param(real_sdk_over(connect_error), {}, id='connect-error'),
+            pytest.param(real_sdk_over(read_timeout), {}, id='read-timeout'),
+            pytest.param(
+                real_sdk_over(lambda request: httpx.Response(500, request=request)), {},
+                id='provider-5xx',
+            ),
+            pytest.param(
+                real_sdk_over(lambda request: httpx.Response(429, request=request)), {},
+                id='provider-429',
+            ),
+        ],
+    )
+    async def test_any_other_judge_failure_fails_open_and_keeps_the_live_test_red(
+        self, construct: Callable[..., object], write_triage: dict[str, Any],
+    ) -> None:
+        counter = TriageFailOpenCounter()
+        verdicts: list[TriageJudgeVerdict] = []
+
+        with patch('openai.AsyncOpenAI', side_effect=construct), \
+                _failing_on_skip('failing open'):
+            decision = await triage_write(
+                _mid_band_service(**write_triage), content='c', project_id='p',
+                counter=counter, judge=_frontier_arm_judge(verdicts),
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+        assert verdicts == []
+
+
 def _contests_exemplar() -> judge_module.JudgeExemplar:
     """The worked `contests` example, looked up through the public tuple."""
     return next(
@@ -2937,19 +3020,35 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
 
 
 async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
-    """`judge_write`'s verdict; a call past the judge budget skips, every other failure stays red.
+    """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
-    A budget expiry yields no verdict, so it says nothing about the wording. TestTheFrontierArmLive
-    keeps a timeout red: it is the live edge for the fail-open/latency dimension.
+    A budget expiry, a provider 5xx, a transient 429 and a connect timeout (the provider was
+    never reached) each yield no verdict, so they say nothing about the wording. Connection
+    errors other than a connect timeout, read or SDK timeouts with no connect-timeout cause,
+    other 4xx and unusable answers stay red, and so does a 429 whose code is
+    `insufficient_quota`: an account out of credit is a lasting fault, and skipping it would
+    silently retire every wording check on every run.
+    TestTheFrontierArmLive skips only an unreached provider and keeps a judge-budget expiry
+    red: it is the live edge for the fail-open/latency dimension.
     """
     try:
-        return await judge_write(**judge_kwargs)
+        return await skip_if_provider_unreached(judge_write(**judge_kwargs))
     except TimeoutError:
         service = judge_kwargs['memory_service']
         pytest.skip(
             f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
             f'gave no verdict within write_triage.judge_timeout_seconds='
             f'{resolve_judge_timeout(service)}; production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+    except (openai.InternalServerError, openai.RateLimitError) as exc:
+        if exc.code == 'insufficient_quota':
+            raise
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict: the provider answered {type(exc).__name__} '
+            f'(status {exc.status_code}); production stores this write and counts a '
             f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
         )
 
@@ -2962,15 +3061,12 @@ def _raises_without_skipping(
     expected: type[BaseException],
 ) -> Iterator[pytest.ExceptionInfo[BaseException]]:
     """`pytest.raises`, except a skip fails: a skipped guard test would hide a widened `except`."""
-    try:
-        with pytest.raises(expected) as excinfo:
-            yield excinfo
-    except pytest.skip.Exception as skipped:
-        pytest.fail(f'skipped instead of raising {expected.__name__}: {skipped}')
+    with _failing_on_skip(f'raising {expected.__name__}'), pytest.raises(expected) as excinfo:
+        yield excinfo
 
 
 class TestTheLiveWordingBudgetGuard:
-    """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
+    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx, a transient 429 or an unreached provider; the rest stays red."""
 
     @staticmethod
     def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
@@ -2982,18 +3078,23 @@ class TestTheLiveWordingBudgetGuard:
 
     @pytest.mark.asyncio
     async def test_a_call_past_the_judge_budget_skips_naming_the_budget(self) -> None:
-        async def _hang(*_args, **_kwargs):
-            await asyncio.sleep(5)
-
-        client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=_hang)
-        with patch('openai.AsyncOpenAI', return_value=client), \
+        with patch('openai.AsyncOpenAI', side_effect=_hanging_sdk), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs(judge_timeout_seconds=0.01))
 
         reason = str(excinfo.value)
         assert 'test-model' in reason
         assert '0.01' in reason
+
+    @pytest.mark.asyncio
+    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        reason = str(excinfo.value)
+        assert 'api.openai.com' in reason
+        assert 'ConnectTimeout' in reason
 
     @pytest.mark.asyncio
     async def test_a_verdict_is_returned_as_is(self) -> None:
@@ -3039,6 +3140,72 @@ class TestTheLiveWordingBudgetGuard:
 
         assert excinfo.value is error
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'handler',
+        [
+            pytest.param(connect_error, id='connect-error'),
+            pytest.param(read_timeout, id='read-timeout'),
+        ],
+    )
+    async def test_a_connection_failure_other_than_a_connect_timeout_stays_red(
+        self, handler: Callable[[httpx.Request], httpx.Response],
+    ) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
+                _raises_without_skipping(openai.APIConnectionError):
+            await _live_judge_verdict(**self._judge_kwargs())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.InternalServerError(
+                'boom', response=httpx.Response(500, request=_RESPONSES_REQUEST), body=None,
+            ),
+            openai.RateLimitError(
+                'slow down', response=httpx.Response(429, request=_RESPONSES_REQUEST), body=None,
+            ),
+        ],
+        ids=['provider-5xx', 'provider-429'],
+    )
+    async def test_a_retryable_provider_status_skips_naming_it(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        reason = str(excinfo.value)
+        assert type(error).__name__ in reason
+        assert str(error.status_code) in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.BadRequestError(
+                'bad', response=httpx.Response(400, request=_RESPONSES_REQUEST), body=None,
+            ),
+            openai.RateLimitError(
+                'out of credit', response=httpx.Response(429, request=_RESPONSES_REQUEST),
+                body={'code': 'insufficient_quota', 'type': 'insufficient_quota'},
+            ),
+        ],
+        ids=['provider-400', 'provider-429-insufficient-quota'],
+    )
+    async def test_a_non_retryable_provider_status_stays_red(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                _raises_without_skipping(type(error)) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
+
 
 @pytest.mark.integration
 @pytest.mark.skipif(
@@ -3050,7 +3217,8 @@ class TestTheShippedWordingLive:
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
     the old wording too, so only Sol tells the two wordings apart. A call past
-    the judge budget skips through `_live_judge_verdict`.
+    the judge budget, one the provider answers with a 5xx or a transient 429,
+    or one that never reaches the provider, skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio

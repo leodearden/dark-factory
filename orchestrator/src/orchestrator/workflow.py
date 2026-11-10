@@ -218,6 +218,7 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     WORKFLOW_PRESERVE_STATUSES,
 )
+from orchestrator.task_verify_dispatch import LOCAL_RUNNER, TaskVerifyPort, verdict_runner
 from orchestrator.unblock_types import BlockClass, classify_block_reason
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
@@ -1354,6 +1355,7 @@ class TaskWorkflow:
         run_id: str | None = None,
         prompt_store: PromptArtifactStore | None = None,
         resume_outcome_sink: ResumeOutcomeSink | None = None,
+        task_verify: TaskVerifyPort | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1379,6 +1381,10 @@ class TaskWorkflow:
         # None by default, so the eval dispatch path acquires no streak and no
         # escalation queue and stays byte-identical.
         self.resume_outcome_sink = resume_outcome_sink
+        # Task 6670: the implement-phase verify's port (the harness's
+        # TaskVerifyDispatcher); None keeps the module-level
+        # run_scoped_verification, resolved at call time.
+        self._task_verify = task_verify
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -1476,6 +1482,8 @@ class TaskWorkflow:
         self._verify_green_tip_sha: str | None = None
         # The passing VerifyResult behind _verify_green_tip_sha (task 5651); reset each VERIFY pass.
         self._verify_green_result: VerifyResult | None = None
+        # The host whose verdict that green is (task 6670), with the same lifetime.
+        self._verify_green_runner: str = LOCAL_RUNNER
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -2639,6 +2647,7 @@ class TaskWorkflow:
                     passed=True,
                     tip_sha=self._verify_green_tip_sha,
                     base_sha=self._base_commit,
+                    runner=self._verify_green_runner,
                 )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
 
@@ -2665,8 +2674,11 @@ class TaskWorkflow:
         passed: bool,
         tip_sha: str | None,
         base_sha: str | None,
+        runner: str,
     ) -> None:
         """Record one task-role verify verdict; both workflow sites emit through here.
+
+        *runner* names the host whose verdict this is (task 6670).
 
         The escalation-side merge_request(verified_green=True) row carries only
         passed/base_sha/branch, and gains these keys through task 5409's shared
@@ -2685,6 +2697,7 @@ class TaskWorkflow:
                 'duration_ms': None if result is None else round(result.duration_secs * 1000),
                 'slot_wait_secs': None if result is None else result.slot_wait_secs,
                 'site': str(site),
+                'runner': runner,
                 **verify_event_fields(result),
             },
         )
@@ -2841,9 +2854,10 @@ class TaskWorkflow:
             # NOTE: unlike a failed branch_base_sha write (_write_branch_base_sha,
             # which keeps a valid SHA in memory because only the metadata write
             # failed), this path has no SHA to record — _base_commit is left
-            # None so consumers gating on `is not None` (e.g. the plan-files-
-            # touched check in _submit_to_merge_queue) skip cleanly instead of
-            # receiving an empty SHA.
+            # None so consumers gating on `is not None` skip cleanly. The
+            # plan-files-touched check in _submit_to_merge_queue is one, but it
+            # measures from _own_work_base() (task 7668), so for it the guard
+            # only means "setup resolved HEAD", not "this is the range base".
             if proc.returncode != 0:
                 logger.warning(
                     'Task %s: git rev-parse HEAD failed in external worktree '
@@ -4111,6 +4125,7 @@ class TaskWorkflow:
                 passed=verify.passed,
                 tip_sha=tip,
                 base_sha=await self.git_ops.merge_base_with_main(tip) if tip else None,
+                runner=LOCAL_RUNNER,
             )
         if not verify.passed:
             if verify.timed_out:
@@ -8660,6 +8675,7 @@ class TaskWorkflow:
             # composing into the fast-path to merge.
             self._verify_checkpoint_hit = False
             self._verify_green_result = None
+            self._verify_green_runner = LOCAL_RUNNER
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
                 try:
@@ -10332,20 +10348,21 @@ class TaskWorkflow:
         surfaces as a VERIFY failure, never a silent green.
 
         Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
-        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
-        ``base_commit``, or any git error — a false negative here just reverts
-        to today's baseline briefing and must never sink PLAN.
+        missing collaborator (``worktree``/``git_ops``/``artifacts``) or any
+        git error — a false negative here just reverts to today's baseline
+        briefing and must never sink PLAN.
 
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
-        ``base_commit..HEAD``.
+        ``own_work_base..HEAD`` (task 7668). That range excludes everything
+        reachable from a merged-in main tip, leaving the branch's own commits
+        plus the merge commit.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
-        base = self.artifacts.read_base_commit()
-        if not base:
-            return []
         try:
-            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            commits = await self.git_ops.get_commit_subjects(
+                self.worktree, await self._own_work_base(),
+            )
             return [{'sha': sha, 'subject': subject} for sha, subject in commits]
         except Exception:
             logger.warning(
@@ -10748,11 +10765,14 @@ class TaskWorkflow:
                 # infra-retry backoff sleeps below).
                 # lane_in_use is leaf δ's IN_USE span, kept separate from the
                 # lease; its call-site spy lives in test_lane_in_use.py.
+                verify: TaskVerifyPort = (
+                    run_scoped_verification if self._task_verify is None else self._task_verify
+                )
                 async with (
                     self.git_ops.task_verify_lease(self.worktree),
                     self.git_ops.lane_in_use(self.worktree),
                 ):
-                    result = await run_scoped_verification(
+                    result = await verify(
                         self.worktree, self.config, self._module_configs,
                         task_files=self._task_files,
                         attempt_id=verify_attempt + 1,
@@ -10915,6 +10935,9 @@ class TaskWorkflow:
                 self._last_verify_result = result
             if result.passed:
                 self._verify_green_result = result
+                self._verify_green_runner = verdict_runner(
+                    self._task_verify, self.task_id, verify_attempt + 1,
+                )
                 return WorkflowOutcome.DONE
 
             verify_attempt += 1
@@ -12144,9 +12167,10 @@ class TaskWorkflow:
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             if rc == 0 and branch_head.strip():
+                own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
-                    self._base_commit,
+                    own_base,
                     branch_head.strip(),
                     self.git_ops,
                     task_id=self.task_id,
@@ -12229,7 +12253,7 @@ class TaskWorkflow:
                     from orchestrator.merge_lane import gates as _merge_gates
                     already_landed = await _merge_gates.resolve_already_landed_branch(
                         list(self._task_files),
-                        self._base_commit,
+                        own_base,
                         branch_head.strip(),
                         self.git_ops,
                         task_id=self.task_id,
@@ -12285,7 +12309,7 @@ class TaskWorkflow:
                         if rc2 == 0 and branch_head2.strip():
                             check = await _check_plan_files_touched_in_branch(
                                 list(self._task_files or []),
-                                self._base_commit,
+                                await self._own_work_base(),
                                 branch_head2.strip(),
                                 self.git_ops,
                                 task_id=self.task_id,
@@ -19447,6 +19471,7 @@ def build_workflow(
     resume_session_id: dict | None = None,
     run_id: str | None = None,
     resume_outcome_sink: ResumeOutcomeSink | None = None,
+    task_verify: TaskVerifyPort | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19482,4 +19507,5 @@ def build_workflow(
         resume_session_id=resume_session_id,
         run_id=run_id,
         resume_outcome_sink=resume_outcome_sink,
+        task_verify=task_verify,
     )

@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily timer for the scheduled memory-eval runner (task 3211)
+
+[Timer]
+# 03:15, between the 03:00 trickle and the 03:30 flag-marker drain: see the
+# OPERATIONS.md nightly ladder. runs_per_quarter in
+# fused-memory/config/memory-eval.yaml counts this cadence.
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

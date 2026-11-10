@@ -110,7 +110,7 @@ def memory_service():
     return make_memory_service()
 
 
-def _make_harness(journal, event_buffer, memory_service):
+def _make_harness(journal, event_buffer, memory_service, **harness_kwargs):
     return make_harness(
         journal=journal,
         event_buffer=event_buffer,
@@ -118,6 +118,7 @@ def _make_harness(journal, event_buffer, memory_service):
         taskmaster=AsyncMock(),
         config=make_harness_config(judge_enabled=False),
         known_projects={PROJECT_ID: PROJECT_ROOT},
+        **harness_kwargs,
     )
 
 
@@ -246,9 +247,10 @@ async def _prepare_pass(
     fresh coroutine for the pass — so a caller can hand it to
     ``_worst_loop_stall``.
     """
-    harness = _make_harness(journal, event_buffer, memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_harness(
+        journal, event_buffer, memory_service, escalation_queue=esc_queue,
+    )
 
     # Pin the two on-disk corroboration inputs to their empty forms so neither
     # of the other corroboration signals can fire against the shared,
@@ -722,11 +724,14 @@ def _fingerprint_of(finding: dict) -> str:
 
 
 @pytest.fixture
-def escalating_harness(journal, event_buffer, memory_service, tmp_path):
+def esc_queue(tmp_path):
+    return EscalationQueue(tmp_path / 'esc')
+
+
+@pytest.fixture
+def escalating_harness(journal, event_buffer, memory_service, esc_queue):
     """A harness with a real EscalationQueue, for driving `_escalate` directly."""
-    harness = _make_harness(journal, event_buffer, memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
-    return harness
+    return _make_harness(journal, event_buffer, memory_service, escalation_queue=esc_queue)
 
 
 class TestFallbackArmIsBoundedToOneScanPerRun:
@@ -805,7 +810,7 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         )
 
     def test_verdicts_are_unchanged_across_the_memo(
-        self, escalating_harness, monkeypatch, caplog,
+        self, escalating_harness, esc_queue, monkeypatch, caplog,
     ):
         """(d) An in-window resolution still suppresses; an 8-day-old one re-fires.
 
@@ -814,7 +819,6 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         """
         calls: list = []
         _count_scans(monkeypatch, calls)
-        esc_queue = escalating_harness._escalation_queue
 
         suppressed_finding = _finding_citing('901', description='recently resolved')
         refiring_finding = _finding_citing('902', description='resolved long ago')

@@ -34,6 +34,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sized
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -58,7 +59,9 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
+from shared.process_identity import Liveness, ProcessIdentity
 from shared.project_id import fold_project_token
+from shared.session_liveness import capture_for_record, judge
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -73,7 +76,9 @@ SCHEMA_VERSION = 1
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).
-SCHEMA_MINOR = 6
+# 7: SessionRecord.launcher_identity and claude_owner_identity (task 8125).
+# 8: SessionRecord.t3_end (task 8126).
+SCHEMA_MINOR = 8
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -222,6 +227,37 @@ class DisplayKind(StrEnum):
     T3 = 't3'
 
 
+class T3End(StrEnum):
+    """The end-of-work act a T3-lane spawn asked for, None meaning none; see skills/spawn/SKILL.md "Ending a T3 session"."""
+
+    SETTLE = 'settle'
+    ARCHIVE = 'archive'
+
+
+def parse_t3_end_input(raw: str) -> T3End | None:
+    """Parse the ``CLAUDE_SPAWN_T3_END`` input strictly: '' or 'none' is None, a member's value is that member."""
+    if raw in ('', 'none'):
+        return None
+    try:
+        return T3End(raw)
+    except ValueError:
+        raise ValueError(f'CLAUDE_SPAWN_T3_END={raw!r} is not one of none|settle|archive') from None
+
+
+def _parse_end_of_work_inputs(env: Mapping[str, str]) -> tuple[bool, T3End | None]:
+    """Parse (self_exit, t3_end) strictly; an act is set only on the T3 lane, where self-exit means exactly archive."""
+    self_exit_raw = env.get('CLAUDE_SPAWN_SELF_EXIT', '') or ''
+    t3_end_raw = env.get('CLAUDE_SPAWN_T3_END', '') or ''
+    self_exit = self_exit_raw == '1'
+    t3_end = parse_t3_end_input(t3_end_raw)
+    if t3_end is not None and self_exit != (t3_end is T3End.ARCHIVE):
+        raise ValueError(
+            f'CLAUDE_SPAWN_SELF_EXIT={self_exit_raw!r} contradicts CLAUDE_SPAWN_T3_END={t3_end_raw!r}: '
+            'a T3 spawn self-exits exactly when its act is archive'
+        )
+    return self_exit, t3_end
+
+
 @dataclass
 class Display:
     """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
@@ -303,6 +339,28 @@ def _coerce_owner_pid(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _coerce_identity(value: Any, pid: Any) -> ProcessIdentity | None:
+    """Read a stored ProcessIdentity naming *pid*; any other shape reads None. Never raises."""
+    if not isinstance(value, dict) or not _is_strict_int(pid):
+        return None
+    identity_pid = value.get('pid')
+    start_ticks = value.get('start_ticks')
+    boot_id = value.get('boot_id')
+    host = value.get('host')
+    if not (
+        _is_strict_int(identity_pid)
+        and identity_pid == pid
+        and _is_strict_int(start_ticks)
+        and isinstance(boot_id, str)
+        and isinstance(host, str)
+    ):
+        return None
+    try:
+        return ProcessIdentity(identity_pid, start_ticks, boot_id, host)
+    except ValueError:
+        return None
+
+
 def _coerce_session_id(value: Any) -> str | None:
     """Read a stored Claude Code session id from a record body, tolerating junk.
 
@@ -340,6 +398,20 @@ def _coerce_exit_request(value: Any) -> ExitRequest | None:
     )
 
 
+def _coerce_t3_end(value: Any) -> T3End | None:
+    """Read a stored ``t3_end``; anything but a member's exact wire string reads None. Never raises."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return T3End(value)
+    except ValueError:
+        return None
+
+
+def _identity_wire(identity: ProcessIdentity | None) -> dict[str, Any] | None:
+    return None if identity is None else dataclasses.asdict(identity)
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -359,6 +431,10 @@ class SessionRecord:
     prompt: the literal prompt passed to `claude`.
     cwd: the working directory `claude` was launched in.
     launcher_pid: spawn-claude.sh's own $$ — the reaper's liveness proxy.
+    launcher_identity: the ProcessIdentity of ``launcher_pid`` captured when
+        the record was first written, or None for a record written before
+        task 8125 or when /proc could not answer. Reads None unless it names
+        ``launcher_pid`` (see ``_coerce_identity``).
     start_ts: ISO-8601 timestamp of when this record was first written.
     status: current lifecycle status; see Status.
     exit_code: claude's exit code, populated once status is terminal.
@@ -401,12 +477,20 @@ class SessionRecord:
         ``session_hooks._env_slug_is_owned``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
+    claude_owner_identity: the ProcessIdentity of ``claude_owner_pid``,
+        stamped with it, or None for a record bound before task 8125 or when
+        /proc could not answer. Reads None unless it names
+        ``claude_owner_pid`` (see ``_coerce_identity``).
     self_exit: true when the spawn launched with self-exit on, as resolved
         per lane by ``skills/spawn/spawn-claude.sh`` (rule: the
         ``CLAUDE_SPAWN_SELF_EXIT`` entry in ``skills/spawn/SKILL.md``), which
         hands the registry 1 or empty; stamped at ``launching`` and preserved
         by every later read-modify-write. Anything but a JSON true reads back
         as False.
+    t3_end: the end-of-work act the spawn asked for, or None for none;
+        stamped at ``launching`` from the input spawn-claude.sh resolved and
+        preserved by every later read-modify-write. Anything but a member's
+        wire string reads back as None (see ``_coerce_t3_end``).
     exit_request: the Stop hook's last self-exit evaluation, or None; written
         only when the ``exit-requested`` marker is present on a proven-owner
         event. See ExitRequest and ``session_self_exit.py``.
@@ -426,6 +510,7 @@ class SessionRecord:
     prompt: str = field(default='', kw_only=True)
     cwd: str = field(default='', kw_only=True)
     launcher_pid: int = field(default=0, kw_only=True)
+    launcher_identity: ProcessIdentity | None = field(default=None, kw_only=True)
     start_ts: str = field(default='', kw_only=True)
     exit_code: int | None = field(default=None, kw_only=True)
     result_file: str | None = field(default=None, kw_only=True)
@@ -437,7 +522,9 @@ class SessionRecord:
     claude_session_id: str | None = field(default=None, kw_only=True)
     claude_launch_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
+    claude_owner_identity: ProcessIdentity | None = field(default=None, kw_only=True)
     self_exit: bool = field(default=False, kw_only=True)
+    t3_end: T3End | None = field(default=None, kw_only=True)
     exit_request: ExitRequest | None = field(default=None, kw_only=True)
     exit_requested_at: str | None = field(default=None, kw_only=True)
 
@@ -454,6 +541,7 @@ class SessionRecord:
             'prompt': self.prompt,
             'cwd': self.cwd,
             'launcher_pid': self.launcher_pid,
+            'launcher_identity': _identity_wire(self.launcher_identity),
             'start_ts': self.start_ts,
             'status': Status(self.status).value,
             'exit_code': self.exit_code,
@@ -466,7 +554,9 @@ class SessionRecord:
             'claude_session_id': self.claude_session_id,
             'claude_launch_session_id': self.claude_launch_session_id,
             'claude_owner_pid': self.claude_owner_pid,
+            'claude_owner_identity': _identity_wire(self.claude_owner_identity),
             'self_exit': self.self_exit,
+            't3_end': None if self.t3_end is None else self.t3_end.value,
             'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
             'exit_requested_at': self.exit_requested_at,
         }
@@ -476,6 +566,8 @@ class SessionRecord:
         display_data = data.get('display')
         question_data = data.get('question')
         exit_requested_at = data.get('exit_requested_at')
+        launcher_pid = data.get('launcher_pid', 0)
+        claude_owner_pid = _coerce_owner_pid(data.get('claude_owner_pid'))
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -487,7 +579,8 @@ class SessionRecord:
             escalation_id=data.get('escalation_id'),
             prompt=data.get('prompt', ''),
             cwd=data.get('cwd', ''),
-            launcher_pid=data.get('launcher_pid', 0),
+            launcher_pid=launcher_pid,
+            launcher_identity=_coerce_identity(data.get('launcher_identity'), launcher_pid),
             start_ts=data.get('start_ts', ''),
             exit_code=data.get('exit_code'),
             result_file=data.get('result_file'),
@@ -498,8 +591,12 @@ class SessionRecord:
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_launch_session_id=_coerce_session_id(data.get('claude_launch_session_id')),
-            claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
+            claude_owner_pid=claude_owner_pid,
+            claude_owner_identity=_coerce_identity(
+                data.get('claude_owner_identity'), claude_owner_pid
+            ),
             self_exit=data.get('self_exit') is True,
+            t3_end=_coerce_t3_end(data.get('t3_end')),
             exit_request=_coerce_exit_request(data.get('exit_request')),
             exit_requested_at=exit_requested_at if isinstance(exit_requested_at, str) else None,
         )
@@ -905,6 +1002,22 @@ def _read_session_pointer(path: Path) -> str | None:
         return None
 
 
+def _write_pointer_file(path: Path, slug: str) -> bool:
+    """Make the pointer file *path* hold *slug*: the shared body of every pointer writer.
+
+    True without rewriting when it already holds *slug*; False after a
+    WARNING when the write fails. Never raises.
+    """
+    if _read_session_pointer(path) == slug:
+        return True
+    try:
+        _atomic_write_text(path, slug)
+    except OSError as exc:
+        logger.warning('session pointer write failed: slug=%s path=%s: %s', slug, path, exc)
+        return False
+    return True
+
+
 def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -> bool:
     """Record *slug* as the record key of claude process *pid*'s current record.
 
@@ -919,17 +1032,7 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     """
     if pid <= 0 or not is_record_key(slug):
         return False
-    path = session_pointer_path_for_pid(pid, root=root)
-    if _read_session_pointer(path) == slug:
-        return True
-    try:
-        _atomic_write_text(path, slug)
-    except OSError as exc:
-        logger.warning(
-            'session pointer write failed: pid=%s slug=%s path=%s: %s', pid, slug, path, exc
-        )
-        return False
-    return True
+    return _write_pointer_file(session_pointer_path_for_pid(pid, root=root), slug)
 
 
 def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> str | None:
@@ -970,9 +1073,25 @@ def claude_session_pointer_path(session_id: str, root: Path | str | None = None)
     return claude_session_pointers_dir(root) / session_id
 
 
-def _is_session_id_token(session_id: str) -> bool:
-    """True iff *session_id* is safe as a pointer file name: the ``CLAUDE_CODE_SESSION_ID`` token shape."""
-    return _SESSION_ID_RE.fullmatch(session_id) is not None
+def _is_claude_session_pointer_name(name: str) -> bool:
+    """True iff *name* can name a ``sessions-by-claude-id/`` entry: the ``CLAUDE_CODE_SESSION_ID`` token shape.
+
+    The ``sessions-by-t3-thread/`` twin is ``is_t3_thread_pointer_name``.
+    """
+    return _SESSION_ID_RE.fullmatch(name) is not None
+
+
+_T3_THREAD_ID_RE = re.compile(r'[A-Za-z0-9:-]{1,128}')
+
+
+def is_t3_thread_pointer_name(thread_id: str) -> bool:
+    """True iff *thread_id* can name a ``sessions-by-t3-thread/`` entry.
+
+    T3 thread ids are a UI thread's bare UUID or an MCP-started thread's
+    ``mcp:<uuid>`` / ``mcp:launch:<hex>``; the class admits ``:`` and still
+    excludes ``/``, ``.`` and NUL.
+    """
+    return _T3_THREAD_ID_RE.fullmatch(thread_id) is not None
 
 
 def write_claude_session_pointer(
@@ -986,23 +1105,9 @@ def write_claude_session_pointer(
     is not a record key, False after a WARNING when the write fails, and
     never raises.
     """
-    if not _is_session_id_token(session_id) or not is_record_key(slug):
+    if not _is_claude_session_pointer_name(session_id) or not is_record_key(slug):
         return False
-    path = claude_session_pointer_path(session_id, root=root)
-    if _read_session_pointer(path) == slug:
-        return True
-    try:
-        _atomic_write_text(path, slug)
-    except OSError as exc:
-        logger.warning(
-            'claude session pointer write failed: session_id=%s slug=%s path=%s: %s',
-            session_id,
-            slug,
-            path,
-            exc,
-        )
-        return False
-    return True
+    return _write_pointer_file(claude_session_pointer_path(session_id, root=root), slug)
 
 
 def resolve_session_slug_for_claude_session_id(
@@ -1014,7 +1119,7 @@ def resolve_session_slug_for_claude_session_id(
     returned only when the record it names carries
     ``claude_session_id == session_id``. Read-only; never raises.
     """
-    if not _is_session_id_token(session_id):
+    if not _is_claude_session_pointer_name(session_id):
         return None
     slug = _read_session_pointer(claude_session_pointer_path(session_id, root=root))
     if slug is None or not is_record_key(slug):
@@ -1024,6 +1129,55 @@ def resolve_session_slug_for_claude_session_id(
     except (OSError, CorruptSessionRecord):
         return None
     return slug if record.claude_session_id == session_id else None
+
+
+T3_THREAD_POINTERS_DIRNAME = 'sessions-by-t3-thread'
+
+
+def t3_thread_pointers_dir(root: Path | str | None = None) -> Path:
+    """The T3 thread pointer dir, ``<fleet_root>/sessions-by-t3-thread/``; a sibling of ``sessions_dir`` like ``session_pointers_dir``.
+
+    It is the index of live T3-hosted records that ``mark_t3_sessions_exited`` iterates.
+    """
+    return fleet_root(root) / T3_THREAD_POINTERS_DIRNAME
+
+
+def t3_thread_pointer_path(thread_id: str, root: Path | str | None = None) -> Path:
+    return t3_thread_pointers_dir(root) / thread_id
+
+
+def write_t3_thread_pointer(thread_id: str, slug: str, root: Path | str | None = None) -> bool:
+    """Record *slug* as the record key of the session T3 thread *thread_id* hosts.
+
+    The thread twin of ``write_claude_session_pointer``, with the same contract.
+    """
+    if not is_t3_thread_pointer_name(thread_id) or not is_record_key(slug):
+        return False
+    return _write_pointer_file(t3_thread_pointer_path(thread_id, root=root), slug)
+
+
+def resolve_session_slug_for_t3_thread(
+    thread_id: str, root: Path | str | None = None
+) -> str | None:
+    """Return the slug of the live record T3 thread *thread_id* hosts, or None.
+
+    Vouched more strictly than the other pointers: the named record must be
+    non-terminal and ``t3_thread_of`` it must be *thread_id*. That is the one
+    definition of the index's invariant -- a terminal record has no pointer
+    -- which the reap and every terminal write enforce through
+    ``_is_stale_t3_thread_pointer``. Read-only; never raises.
+    """
+    if not is_t3_thread_pointer_name(thread_id):
+        return None
+    slug = _read_session_pointer(t3_thread_pointer_path(thread_id, root=root))
+    if slug is None or not is_record_key(slug):
+        return None
+    try:
+        record = read_record(slug, root=root)
+    except (OSError, CorruptSessionRecord):
+        return None
+    vouches = t3_thread_of(record) == thread_id and record.status not in TERMINAL_STATUSES
+    return slug if vouches else None
 
 
 def encode_cwd(cwd: str) -> str:
@@ -2731,9 +2885,9 @@ TERMINAL_TTL = timedelta(hours=24)
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
-"""How long a non-terminal record survives with a dead launcher_pid and no
-fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
-retains the record regardless of age."""
+"""How long a non-terminal record survives with its launcher judged DEAD and
+no fresh write (heartbeat) before the reaper reclaims it. A launcher not
+judged DEAD retains the record regardless of age."""
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2779,6 +2933,16 @@ def pid_alive(pid: int) -> bool:
     return _pid_alive(pid)
 
 
+def _swept_as_dead(
+    identity: ProcessIdentity | None, pid: int, *, sweep: str, subject: str
+) -> bool:
+    """Whether a liveness sweep may treat *pid* as dead: ``judge``'s DEAD, with an OTHER_HOST skip logged."""
+    verdict = judge(identity, pid, pid_alive=_pid_alive)
+    if verdict is Liveness.OTHER_HOST and identity is not None:
+        logger.info('%s: skipped %s, reason=other_host host=%s', sweep, subject, identity.host)
+    return verdict is Liveness.DEAD
+
+
 @dataclass(frozen=True)
 class ReapedSessionRecord:
     """One session-registry record directory removed by reap_stale_records.
@@ -2788,7 +2952,7 @@ class ReapedSessionRecord:
         directory name itself (never from the record body).
     reason: why it was reaped -- one of ``'terminal_ttl'`` (a terminal
         record older than TERMINAL_TTL), ``'stale_pid'`` (a non-terminal
-        record whose launcher_pid is dead and older than
+        record whose launcher is judged DEAD and older than
         NON_TERMINAL_HEARTBEAT_TTL), or ``'corrupt'`` (record.json missing
         or unparseable and older than NON_TERMINAL_HEARTBEAT_TTL).
     """
@@ -2818,10 +2982,12 @@ def reap_stale_records(
       NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='corrupt'.
     - status is terminal (EXITED/FAILED_TO_START) and age > TERMINAL_TTL ->
       reaped, reason='terminal_ttl' (independent of launcher_pid liveness).
-    - status is non-terminal, launcher_pid is dead, and age >
-      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'. A T3-hosted
-      record (``display.kind == 't3'``) is exempt: its liveness is its
-      thread, swept by ``mark_t3_sessions_exited``.
+    - status is non-terminal, age > NON_TERMINAL_HEARTBEAT_TTL, and the
+      launcher is judged DEAD by
+      ``shared/src/shared/session_liveness.py::judge`` -> reaped,
+      reason='stale_pid'. A T3-hosted
+      record (``display.kind == 't3'``) is exempt while
+      ``_t3_thread_sweep_owns`` holds, since its liveness is its thread.
     - otherwise -> kept.
 
     Directories are visited in ``sorted(iterdir())`` order (directory-name
@@ -2856,14 +3022,18 @@ def reap_stale_records(
         else:
             if record.status in TERMINAL_STATUSES:
                 reason = 'terminal_ttl' if age > TERMINAL_TTL else None
-            elif (
-                not is_t3_record(record)
-                and not _pid_alive(record.launcher_pid)
-                and age > NON_TERMINAL_HEARTBEAT_TTL
-            ):
-                reason = 'stale_pid'
             else:
-                reason = None
+                stale = (
+                    not _t3_thread_sweep_owns(record, slug, root)
+                    and age > NON_TERMINAL_HEARTBEAT_TTL
+                    and _swept_as_dead(
+                        record.launcher_identity,
+                        record.launcher_pid,
+                        sweep='reap_stale_records',
+                        subject=slug,
+                    )
+                )
+                reason = 'stale_pid' if stale else None
 
         if reason is not None:
             try:
@@ -2900,22 +3070,65 @@ def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
         pid = int(path.name)
     except ValueError:
         return True
-    if pid <= 0 or path.name != str(pid) or not _pid_alive(pid):
+    if pid <= 0 or path.name != str(pid):
         return True
     slug = _read_session_pointer(path)
-    return (
+    if (
         slug is None
         or not is_record_key(slug)
         or not record_path_for_slug(slug, root=root).is_file()
+    ):
+        return True
+    return _swept_as_dead(
+        _pointed_owner_identity(slug, pid, root),
+        pid,
+        sweep='reap_stale_session_pointers',
+        subject=path.name,
     )
+
+
+def _pointed_owner_identity(
+    slug: str, pid: int, root: Path | str | None
+) -> ProcessIdentity | None:
+    """The owner identity *slug*'s record holds for *pid*; None when unreadable or naming another pid."""
+    try:
+        identity = read_record(slug, root=root).claude_owner_identity
+    except (CorruptSessionRecord, OSError):
+        return None
+    return identity if identity is not None and identity.pid == pid else None
 
 
 def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
     if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
-    if not _is_session_id_token(path.name):
+    if not _is_claude_session_pointer_name(path.name):
         return True
     return resolve_session_slug_for_claude_session_id(path.name, root=root) is None
+
+
+def _is_stale_t3_thread_pointer(path: Path, root: Path | str | None) -> bool:
+    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+        return _is_abandoned_temp_file(path)
+    if not is_t3_thread_pointer_name(path.name):
+        return True
+    return resolve_session_slug_for_t3_thread(path.name, root=root) is None
+
+
+def _drop_t3_thread_pointer_if_stale(record: SessionRecord, root: Path | str | None) -> None:
+    """After a terminal write of *record*, unlink its thread's pointer unless a live record holds it.
+
+    A failed unlink is logged, never raised: the reap retries it.
+    """
+    thread_id = t3_thread_of(record)
+    if thread_id is None:
+        return
+    path = t3_thread_pointer_path(thread_id, root=root)
+    if not _is_stale_t3_thread_pointer(path, root):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning('t3 thread pointer drop failed: path=%s: %s', path, exc)
 
 
 def _reap_pointer_dir(
@@ -2947,8 +3160,11 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     """Remove every pointer entry that can no longer serve a reader.
 
     A ``sessions-by-pid/`` entry is stale when its name is not a canonical
-    positive pid, its pid is dead, its content is not a record key, or the
-    record it names has no ``record.json``; no record body is parsed for it.
+    positive pid, its content is not a record key, the record it names has no
+    ``record.json``, or its pid is judged DEAD by
+    ``shared/src/shared/session_liveness.py::judge`` against that record's
+    ``claude_owner_identity`` when it names the same pid, so each such entry
+    costs one record read.
     A dead pid's pointer goes even while its record still exists: its owner
     can never query it again, and a process that reuses the pid must not
     inherit it.
@@ -2958,7 +3174,11 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     unreadable, or bound to another session id), so each such entry costs one
     record read.
 
-    In both dirs a temp file of ``_atomic_write_text`` is left to its writer
+    A ``sessions-by-t3-thread/`` entry is stale when its name is not a token
+    or ``resolve_session_slug_for_t3_thread`` finds no live t3 record of that
+    thread behind it, so each such entry costs one record read.
+
+    In every dir a temp file of ``_atomic_write_text`` is left to its writer
     until ``_POINTER_TEMP_FILE_GRACE`` has passed, so a sweep never unlinks it
     out from under a concurrent ``os.replace``.
 
@@ -2972,6 +3192,7 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
         *_reap_pointer_dir(
             claude_session_pointers_dir(root), _is_stale_claude_session_pointer, root
         ),
+        *_reap_pointer_dir(t3_thread_pointers_dir(root), _is_stale_t3_thread_pointer, root),
     ]
 
 
@@ -3024,6 +3245,7 @@ def _mark_exited_if_still_non_terminal(
     record.status = Status.EXITED
     record.exit_code = exit_code
     write_record(record, root=root)
+    _drop_t3_thread_pointer_if_stale(record, root)
     return record
 
 
@@ -3044,8 +3266,9 @@ def mark_orphaned_sessions_exited(
     those records terminal.
 
     Mirrors ``reap_stale_records``'s ``stale_pid`` predicate EXACTLY --
-    status is non-terminal (not in TERMINAL_STATUSES), ``launcher_pid`` is
-    dead (``_pid_alive``), and age (record.json's mtime vs *now*) exceeds
+    status is non-terminal (not in TERMINAL_STATUSES), the launcher is judged
+    DEAD (``shared/src/shared/session_liveness.py::judge``), and age
+    (record.json's mtime vs *now*) exceeds
     ``NON_TERMINAL_HEARTBEAT_TTL`` -- the same false-positive guard that
     rule already trusts: a genuinely-live session (including a
     detached/tmux one) keeps bumping its record's mtime via its own hooks,
@@ -3054,7 +3277,7 @@ def mark_orphaned_sessions_exited(
     Known trade-off for DETACHED spawns (reviewer-flagged): spawn-claude.sh
     itself exits once it hands off (its ``launcher_pid`` dies) while claude
     keeps running standalone, so for the entire remaining life of a
-    detached session ``_pid_alive`` is already False -- the heartbeat
+    detached session the launcher is already judged DEAD -- the heartbeat
     (record.json's mtime, bumped only by that session's own
     Notification/Stop hooks after convergence) is the SOLE thing keeping it
     unswept. A detached session that goes quieter than
@@ -3095,10 +3318,11 @@ def mark_orphaned_sessions_exited(
     record) never aborts the sweep -- it is logged and skipped, exactly
     like ``reap_stale_records``'s own fault handling.
 
-    A T3-hosted record (``display.kind == 't3'``) is never swept here: its
-    ``launcher_pid`` is the spawn script, which exits in sibling mode, and its
-    hooks fall silent whenever the thread waits on a human.
-    ``mark_t3_sessions_exited`` sweeps it by thread instead.
+    A T3-hosted record (``display.kind == 't3'``) is not swept here while
+    ``_t3_thread_sweep_owns`` holds: its ``launcher_pid`` is the spawn
+    script, which exits in sibling mode, and its hooks fall silent whenever
+    the thread waits on a human. ``mark_t3_sessions_exited`` sweeps it by
+    thread instead.
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock. Returns the list of records this call marked (their post-mark,
@@ -3122,10 +3346,15 @@ def mark_orphaned_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
-        if is_t3_record(record):
-            continue  # liveness is the thread's, swept by mark_t3_sessions_exited
-        if _pid_alive(record.launcher_pid):
-            continue  # a live launcher_pid is never swept, regardless of age
+        if _t3_thread_sweep_owns(record, slug, root):
+            continue
+        if not _swept_as_dead(
+            record.launcher_identity,
+            record.launcher_pid,
+            sweep='mark_orphaned_sessions_exited',
+            subject=slug,
+        ):
+            continue  # a launcher not judged dead is never swept, regardless of age
 
         record_path = slug_dir / 'record.json'
         try:
@@ -3160,59 +3389,161 @@ def is_t3_record(record: SessionRecord) -> bool:
     return record.display is not None and record.display.kind == DisplayKind.T3
 
 
-def _same_real_path(left: str, right: str) -> bool:
-    return bool(left) and bool(right) and os.path.realpath(left) == os.path.realpath(right)
+def t3_thread_of(record: SessionRecord) -> str | None:
+    """The T3 thread *record* is a t3 record of, when that id can name a thread pointer; else None.
+
+    The one definition shared by the thread pointer's writers and by its
+    vouching check, ``resolve_session_slug_for_t3_thread``.
+    """
+    if not is_t3_record(record) or record.display is None:
+        return None
+    thread_id = record.display.t3_thread_id
+    return thread_id if thread_id and is_t3_thread_pointer_name(thread_id) else None
 
 
-def mark_t3_sessions_exited(
-    project_root: str,
-    known_threads: Mapping[str, bool],
-    root: Path | str | None = None,
-    *,
-    listed_at: datetime | None = None,
-) -> list[str]:
-    """Mark EXITED every live T3-hosted record of *project_root* whose thread has gone.
+def index_t3_record_if_unheld(
+    record: SessionRecord, slug: str, root: Path | str | None = None
+) -> bool:
+    """Write *slug* as the thread pointer of live t3 *record* when no live record holds its thread; whether it wrote.
 
-    *known_threads* is one project's thread listing, thread id -> archived.
-    A non-terminal record with ``display.kind == 't3'`` and a
-    ``t3_thread_id``, whose ``cwd`` is *project_root* by realpath, is marked
-    (exit_code ``ORPHAN_EXIT_CODE``) when its thread is absent from the
-    listing or listed as archived. Records of other projects are untouched,
-    since the listing says nothing about them. With *listed_at*, a record
-    written after that instant is skipped: the listing predates it and cannot
-    vouch for its thread's absence.
+    A held pointer is never moved: the T3 lane's bind
+    (``orchestrator/src/orchestrator/spawn_t3_lane.py::_bind_to``) is the one
+    writer that re-points one. A failed write is logged by the writer, and
+    ``index_unpointed_t3_records`` retries it.
+    """
+    thread_id = t3_thread_of(record)
+    if (
+        thread_id is None
+        or record.status in TERMINAL_STATUSES
+        or resolve_session_slug_for_t3_thread(thread_id, root=root) is not None
+    ):
+        return False
+    return write_t3_thread_pointer(thread_id, slug, root=root)
 
-    Returns the marked slugs. One unreadable or unwritable record is logged
-    and skipped, never fatal.
+
+def index_unpointed_t3_records(root: Path | str | None = None) -> list[str]:
+    """Pass every record under ``<root>/sessions/`` to ``index_t3_record_if_unheld``; returns the slugs indexed.
+
+    ``run_reap``'s first phase. A live t3 record whose thread no pointer
+    holds -- one written before the index existed, or whose pointer write
+    failed -- joins the index ``mark_t3_sessions_exited`` iterates only here.
+    Until then ``_t3_thread_sweep_owns`` keeps it out of the pid sweeps. An
+    unreadable record is skipped, never fatal.
     """
     base = sessions_dir(root)
     if not base.is_dir():
         return []
-    marked: list[str] = []
+    indexed: list[str] = []
     for slug_dir in sorted(base.iterdir()):
-        slug = slug_dir.name
-        try:
-            record = read_record(slug, root=root)
-        except (FileNotFoundError, CorruptSessionRecord):
-            continue
-        display = record.display
-        if (
-            record.status in TERMINAL_STATUSES
-            or display is None
-            or display.kind != DisplayKind.T3
-            or not display.t3_thread_id
-            or not _same_real_path(record.cwd, project_root)
-            or known_threads.get(display.t3_thread_id, True) is False
-        ):
-            continue
-        if listed_at is not None and _written_after(slug_dir / 'record.json', listed_at):
+        if not slug_dir.is_dir():
             continue
         try:
-            if _mark_exited_if_still_non_terminal(slug, root, exit_code=ORPHAN_EXIT_CODE):
-                marked.append(slug)
-        except (FileNotFoundError, CorruptSessionRecord, OSError):
-            logger.error('mark_t3_sessions_exited: failed to mark %s', slug, exc_info=True)
+            record = read_record(slug_dir.name, root=root)
+        except (OSError, CorruptSessionRecord):
+            continue
+        if index_t3_record_if_unheld(record, slug_dir.name, root=root):
+            indexed.append(slug_dir.name)
+    return indexed
+
+
+def _t3_thread_sweep_owns(record: SessionRecord, slug: str, root: Path | str | None) -> bool:
+    """Whether ``mark_t3_sessions_exited``, not a pid sweep, owns non-terminal *record*. Read-only.
+
+    True for a t3 record whose thread pointer names *slug* or no live record.
+    An unheld thread stays owned, so a record ``index_unpointed_t3_records``
+    has not indexed yet is never handed to the pid sweeps. Only displacement
+    by another live record, or a thread id that cannot name a pointer, does.
+    """
+    thread_id = t3_thread_of(record)
+    if thread_id is None:
+        return False
+    held_by = resolve_session_slug_for_t3_thread(thread_id, root=root)
+    return held_by is None or held_by == slug
+
+
+def mark_t3_sessions_exited(
+    environment_id: str,
+    listed_threads: AbstractSet[str],
+    root: Path | str | None = None,
+    *,
+    listed_at: datetime | None = None,
+    thread_ended: Callable[[str], bool],
+    routine: bool = False,
+) -> list[str]:
+    """Mark EXITED every indexed T3-hosted record of *environment_id* whose thread has gone.
+
+    *listed_threads* is one complete listing of the environment's active
+    threads. Only ``sessions-by-t3-thread/`` is read: a record behind a
+    vouched entry whose thread is unlisted and whose ``t3_environment_id`` is
+    *environment_id* or unset is marked (exit_code ``ORPHAN_EXIT_CODE``),
+    which drops its pointer, once *thread_ended* confirms that thread ended:
+    a listing omits live side chats. With *listed_at*, a record written after
+    that instant is skipped: the listing predates it and cannot vouch for its
+    thread's absence.
+
+    Returns the marked slugs. One unreadable or unwritable record is logged
+    and skipped, never fatal. One line reports the index size, at INFO
+    unless *routine* -- one pass of a wait loop -- marked nothing, then at
+    DEBUG.
+    """
+    base = t3_thread_pointers_dir(root)
+    entries = sorted(base.iterdir()) if base.is_dir() else []
+    thread_ids = [path.name for path in entries if not path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX)]
+    marked: list[str] = []
+    for thread_id in thread_ids:
+        if thread_id in listed_threads:
+            continue
+        slug = _mark_t3_session_gone(thread_id, environment_id, root, listed_at, thread_ended)
+        if slug is not None:
+            marked.append(slug)
+    logger.log(
+        logging.DEBUG if routine and not marked else logging.INFO,
+        'mark_t3_sessions_exited: marked %d of %d indexed session(s) under %s',
+        len(marked),
+        len(thread_ids),
+        base,
+    )
     return marked
+
+
+def _mark_t3_session_gone(
+    thread_id: str,
+    environment_id: str,
+    root: Path | str | None,
+    listed_at: datetime | None,
+    thread_ended: Callable[[str], bool],
+) -> str | None:
+    """Mark the live record of unlisted thread *thread_id* EXITED once *thread_ended* confirms it; its slug, or None."""
+    slug = resolve_session_slug_for_t3_thread(thread_id, root=root)
+    if slug is None:
+        return None
+    if listed_at is not None and _written_after(record_path_for_slug(slug, root=root), listed_at):
+        return None
+
+    def still_this_environments(record: SessionRecord) -> bool:
+        return (
+            t3_thread_of(record) == thread_id
+            and record.display is not None
+            and record.display.t3_environment_id in (None, environment_id)
+        )
+
+    try:
+        record = read_record(slug, root=root)
+    except (FileNotFoundError, CorruptSessionRecord, OSError):
+        logger.error('mark_t3_sessions_exited: failed to read %s', slug, exc_info=True)
+        return None
+    if record.status in TERMINAL_STATUSES or not still_this_environments(record):
+        return None
+    if not thread_ended(thread_id):
+        return None
+    try:
+        marked = _mark_exited_if_still_non_terminal(
+            slug, root, exit_code=ORPHAN_EXIT_CODE, still_applies=still_this_environments
+        )
+    except (FileNotFoundError, CorruptSessionRecord, OSError):
+        logger.error('mark_t3_sessions_exited: failed to mark %s', slug, exc_info=True)
+        return None
+    return slug if marked is not None else None
 
 
 def _written_after(path: Path, instant: datetime) -> bool:
@@ -3622,7 +3953,7 @@ def _a_reap_started_since(requested_at: datetime, root: Path | str | None) -> bo
 
 
 def run_reap(root: Path | str | None = None) -> ReapReport | None:
-    """Drain the registry: mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
+    """Drain the registry: index unpointed t3 records, mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
 
     The ``reap`` verb, for the operator and for ``_run_launching``'s detached
     child alike. Concurrent calls queue on ``reap_lock``. A call whose turn
@@ -3638,8 +3969,9 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
     terminal record does. ``mark_windowless_wm_sessions_exited`` runs here
     alongside ``mark_orphaned_sessions_exited`` because it marks exactly the
     live-pid / age<1h wm-display zombies the pid/TTL sweep is forced to keep.
-    ``reap_stale_session_pointers`` runs last so pointers to records removed
-    in this same pass go too.
+    ``index_unpointed_t3_records`` runs first; the sweeps after it only read
+    the thread index. ``reap_stale_session_pointers`` runs last so pointers
+    to records removed in this same pass go too.
 
     Each phase is timed and fail-soft on its own, so one phase's fault never
     skips the rest. The report is written atomically to
@@ -3653,6 +3985,7 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
             return None
         started_at = datetime.now(UTC)
         phases = (
+            _run_reap_phase('index_unpointed_t3_records', index_unpointed_t3_records, root),
             _run_reap_phase('mark_orphaned_sessions_exited', mark_orphaned_sessions_exited, root),
             _run_reap_phase(
                 'mark_windowless_wm_sessions_exited', mark_windowless_wm_sessions_exited, root
@@ -4976,7 +5309,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
     launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
     launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
-    self_exit = env.get('CLAUDE_SPAWN_SELF_EXIT') == '1'
+    self_exit, t3_end = _parse_end_of_work_inputs(env)
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
@@ -4993,10 +5326,12 @@ def _run_launching(env: Mapping[str, str]) -> str:
         prompt=prompt,
         cwd=cwd,
         launcher_pid=launcher_pid,
+        launcher_identity=capture_for_record(launcher_pid),
         start_ts=datetime.now(UTC).isoformat(),
         result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
         self_exit=self_exit,
+        t3_end=t3_end,
     )
     write_record(record)
     start_detached_reap()
@@ -5017,12 +5352,15 @@ def slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
 
 def _run_exit(record_dir: str, code: int) -> None:
     slug, root = slug_root_from_record_dir(record_dir)
-    update_status(slug, root=root, status=Status.EXITED, exit_code=code)
+    record = update_status(slug, root=root, status=Status.EXITED, exit_code=code)
+    _drop_t3_thread_pointer_if_stale(record, root)
 
 
 def _run_refresh(record_dir: str, status_value: str) -> None:
     slug, root = slug_root_from_record_dir(record_dir)
-    refresh_record(slug, root=root, status=Status(status_value))
+    record = refresh_record(slug, root=root, status=Status(status_value))
+    if record.status in TERMINAL_STATUSES:
+        _drop_t3_thread_pointer_if_stale(record, root)
 
 
 def _run_set_display(

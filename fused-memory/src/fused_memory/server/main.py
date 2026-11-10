@@ -14,7 +14,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from dotenv import load_dotenv
 
@@ -28,6 +28,9 @@ from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
+)
+from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
+    RebuildResult,
 )
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
@@ -59,7 +62,19 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+    from fused_memory.services.mem0_retry_backlog_alarm import Mem0RetryBacklogChecker
+    from fused_memory.services.mem0_write_retry import Mem0RetryRunner, OnMem0Landed
+
+    class _Mem0WriteDurabilityService(
+        Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
+    ):
+        """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
+
+        async def recover_mem0_intents(
+            self, *, on_landed: OnMem0Landed | None = None
+        ) -> object: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -574,10 +589,6 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.journal_retention import prune_every_table_at_startup
-    from fused_memory.services.mem0_write_retry import (
-        DEFAULT_MEM0_RETRY_POLICY,
-        run_periodic_mem0_retry,
-    )
     from fused_memory.services.write_journal import WriteJournal
     from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
@@ -591,8 +602,7 @@ async def run_server():
     # self.mem0 / self.durable_queue), so this must run here rather than inside
     # initialize(). Idempotent — no pending intents ⇒ no-op — so it is safe to
     # run on every startup; a partial dual write is thus never left SILENT.
-    _mem0_recovery = await memory_service.recover_mem0_intents()
-    logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
+    await _recover_mem0_intents_at_startup(memory_service)
 
     # Must follow mem0 intent recovery, so no still-pending intent is pruned.
     _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
@@ -757,9 +767,6 @@ async def run_server():
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
-        from fused_memory.services.orchestrator_detector import (
-            is_orchestrator_live_for,
-        )
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
@@ -819,7 +826,6 @@ async def run_server():
         backlog_policy = BacklogPolicy(
             event_buffer,
             event_queue,
-            is_orchestrator_live_for,
             hard_limit=config.reconciliation.backlog_hard_limit,
             hard_limit_overrides=config.reconciliation.backlog_hard_limit_overrides,
             rate_limit_seconds=(
@@ -1140,17 +1146,7 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
-    mem0_retry_task = asyncio.create_task(
-        run_periodic_mem0_retry(
-            memory_service.retry_due_mem0_intents,
-            interval_seconds=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
-        ),
-    )
-    logger.info(
-        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
-        DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
-        DEFAULT_MEM0_RETRY_POLICY.batch_size,
-    )
+    mem0_retry_task = _start_mem0_retry_loop(memory_service)
 
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
@@ -1617,6 +1613,60 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
+def _mark_supersedes_on_landing(memory_service: MemoryUpdater) -> OnMem0Landed:
+    """The hook every Mem0 re-issue path runs when it lands: mark the write's journaled supersedes.
+
+    Composed here because the service layer cannot import supersession_mark
+    without pulling server modules up into it.
+    """
+    from fused_memory.services.supersession_mark import mark_superseded_after_retry
+
+    return partial(mark_superseded_after_retry, memory_service)
+
+
+async def _recover_mem0_intents_at_startup(memory_service: _Mem0WriteDurabilityService) -> None:
+    summary = await memory_service.recover_mem0_intents(
+        on_landed=_mark_supersedes_on_landing(memory_service)
+    )
+    logger.info(f'mem0 intent recovery at startup: {summary}')
+
+
+def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> asyncio.Task[None]:
+    """Spawn the Mem0 write retry pass and its backlog check on the service's own policy; RETURN one handle for teardown.
+
+    Each runs in its own loop, so a failing pass never skips the check.
+    """
+    from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry
+
+    policy = memory_service.mem0_retry_policy
+
+    async def _run_both() -> None:
+        async with asyncio.TaskGroup() as loops:
+            loops.create_task(run_periodic_mem0_retry(
+                partial(
+                    memory_service.retry_due_mem0_intents,
+                    on_landed=_mark_supersedes_on_landing(memory_service),
+                ),
+                interval_seconds=policy.poll_interval_seconds,
+                what='retry pass',
+            ))
+            loops.create_task(run_periodic_mem0_retry(
+                memory_service.check_mem0_retry_backlog,
+                interval_seconds=policy.backlog_check_interval_seconds,
+                what='retry backlog check',
+            ))
+
+    task = asyncio.create_task(_run_both(), name='mem0_write_retry')
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass; '
+        'backlog age checked every %.0fs',
+        policy.poll_interval_seconds,
+        policy.batch_size,
+        policy.backlog_check_interval_seconds,
+    )
+    return task
+
+
 def _start_remint_sweep(
     task_backend: TaskBackendProtocol | None,
     remint: Callable[[str], Awaitable[object]],
@@ -1748,16 +1798,17 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     tests can exercise the fan-out without waiting for
     ``cfg.interval_seconds``.
 
-    Each project's result dict (``rebuilt``/``stale_entities``/``skipped``/
-    ``errors``) is logged so an operator can see whether the sweep is
-    actually reducing staleness — at WARNING when the project reported any
-    per-entity errors, INFO otherwise.
+    Each project's result (``rebuilt``/``stale_entities``/``skipped``/
+    ``errors`` and the four read-completeness keys) is logged so an operator
+    can see whether the sweep is actually reducing staleness — at WARNING
+    when the project reported any per-entity errors OR its corpus is not
+    proven complete (either verdict not ``is True``), INFO otherwise.
     """
     if not cfg.enabled or not cfg.projects:
         return
     for project_id in cfg.projects:
         try:
-            result = await memory_service.rebuild_entity_summaries(
+            raw = await memory_service.rebuild_entity_summaries(
                 project_id=project_id,
                 force=cfg.force,
                 _source='periodic_maintenance',
@@ -1765,16 +1816,20 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
         except Exception:
             logger.exception('rebuild_entity_summaries failed for project %s', project_id)
             continue
-        result = result or {}
-        errors = result.get('errors', 0)
-        log_fn = logger.warning if errors else logger.info
+        result = RebuildResult.from_service_result(raw or {})
+        log_fn = (
+            logger.warning
+            if result.errors or not result.corpus_proven_complete
+            else logger.info
+        )
         log_fn(
-            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s',
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s %s',
             project_id,
-            result.get('rebuilt'),
-            result.get('stale_entities'),
-            result.get('skipped'),
-            errors,
+            result.rebuilt,
+            result.stale_entities,
+            result.skipped,
+            result.errors,
+            result.completeness_summary,
         )
 
 

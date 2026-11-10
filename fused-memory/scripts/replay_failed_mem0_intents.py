@@ -9,7 +9,8 @@ itself queues for retry) is resolved failed -> completed through a
 compare-and-set, so a second run never replays it again.
 
 Dry run by default: it prints the rows it would replay and opens no MCP
-client. Pass --apply to replay.
+client, but it still passes the store-mutation preflight first, because opening
+write_journal.db applies the journal's schema migration. Pass --apply to replay.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import argparse
 import asyncio
 import collections
 import contextlib
-import json
 import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -31,9 +31,15 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import CallToolResult, Implementation
+from pydantic import ValidationError
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
-from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    WriteJournal,
+    decode_mem0_intent_metadata,
+)
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -124,7 +130,7 @@ def replay_arguments(intent: Mapping[str, Any]) -> dict[str, Any]:
         'content': intent['content'],
         'project_id': intent['project_id'],
         'category': intent['category'],
-        'metadata': json.loads(intent['metadata'] or '{}'),
+        'metadata': decode_mem0_intent_metadata(intent),
     }
     for identity in ('agent_id', 'session_id'):
         if intent.get(identity) is not None:
@@ -156,10 +162,24 @@ def _text_of(result: CallToolResult) -> str:
 def classify_ack(ack: Mapping[str, Any]) -> tuple[ReplayResult, str]:
     if 'error' in ack:
         return ReplayResult.REJECTED, f'{ack.get("error_type")}: {ack["error"]}'
-    memory_ids = ack.get('memory_ids') or []
-    if memory_ids:
-        return ReplayResult.LANDED, f'memory_ids={list(memory_ids)}'
-    if 'mem0' in (ack.get('stores_pending_retry') or []):
+    try:
+        response = AddMemoryResponse.model_validate(
+            {
+                key: ack[key]
+                for key in ('memory_ids', 'stores_pending_retry')
+                if ack.get(key) is not None
+            }
+        )
+    except ValidationError as exc:
+        return (
+            ReplayResult.NOT_LANDED,
+            f'unreadable add_memory ack, so whether it landed is unknown; check Mem0 '
+            f'before re-running this id. {exc.error_count()} validation error(s): {dict(ack)!r}',
+        )
+    state = response.mem0_write_state
+    if state is Mem0WriteState.LANDED:
+        return ReplayResult.LANDED, f'memory_ids={response.memory_ids}'
+    if state is Mem0WriteState.PENDING_RETRY:
         return (
             ReplayResult.PENDING_RETRY,
             "the replay's own Mem0 leg is pending server-side retry",
@@ -198,7 +218,12 @@ async def _replay_one(
     try:
         ack = await add_memory(replay_arguments(intent))
     except Exception as exc:
-        return _outcome(intent, ReplayResult.ERROR, f'{type(exc).__name__}: {exc}')
+        return _outcome(
+            intent,
+            ReplayResult.ERROR,
+            f'{type(exc).__name__}: {exc}; outcome unknown: the server may have landed '
+            'this write, so check Mem0 for its content before re-running this id',
+        )
     result, detail = classify_ack(ack)
     if result in (ReplayResult.LANDED, ReplayResult.PENDING_RETRY):
         resolved = await journal.resolve_mem0_intent(
@@ -256,9 +281,8 @@ async def open_mcp_add_memory(url: str) -> AsyncIterator[AddMemoryFn]:
         raise body_error
 
 
-async def _run(
-    journal_dir: Path, selection: Selection, *, apply: bool, mcp_url: str
-) -> list[ReplayOutcome]:
+def _assert_journal_may_be_opened(*, apply: bool) -> None:
+    """Refuse before write_journal.db is opened: opening it applies the journal's schema migration."""
     if apply:
         assert_store_mutation_allowed(
             operation='replay_failed_mem0_intents --apply',
@@ -270,6 +294,21 @@ async def _run(
                 'selected and nothing was replayed'
             ),
         )
+        return
+    assert_store_mutation_allowed(
+        operation='replay_failed_mem0_intents (dry run)',
+        logger=logger,
+        extra_detail=(
+            "even a dry run opens write_journal.db, which applies the journal's "
+            'schema migration. Nothing was opened and nothing was selected'
+        ),
+    )
+
+
+async def _run(
+    journal_dir: Path, selection: Selection, *, apply: bool, mcp_url: str
+) -> list[ReplayOutcome]:
+    _assert_journal_may_be_opened(apply=apply)
     journal = WriteJournal(journal_dir)
     await journal.initialize()
     try:

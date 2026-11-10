@@ -27,7 +27,7 @@ from orchestrator.verify_runner import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.config import OrchestratorConfig
+    from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,24 +67,81 @@ def build_remote_runners(
     sha from this process's own code checkout, resolved once here.
     """
     code_checkout = resolve_code_checkout()
-    runners = []
-    for r in config.enabled_verify_runners:
-        if quarantine is not None and r.name in quarantine:
-            continue
-        gate = r.gate_paths()
-        runners.append(RemoteRunner(
-            name=r.name,
-            ssh_host=r.ssh_host,
-            git_remote=r.git_remote,
-            cwd=cwd,
-            config_path=r.config_path,
-            main_branch=config.git.main_branch,
-            df_remote_checkout=gate.source,
-            gate_checkouts_path=gate.root,
-            deployed_sha=deployed_sha,
-            code_checkout=code_checkout,
-        ))
-    return runners
+    return [
+        _remote_runner(config, r, cwd, deployed_sha=deployed_sha, code_checkout=code_checkout)
+        for r in config.enabled_verify_runners
+        if quarantine is None or r.name not in quarantine
+    ]
+
+
+def task_verify_hosts(
+    config: OrchestratorConfig, *, deployed_sha: DeployedSha | None,
+) -> tuple[str, ...]:
+    """The remote hosts a task verify may queue on: every enabled runner, in config order.
+
+    With no deployed sha there are none, and every task verify stays local: a
+    remote verify never runs outside the deployed gate (task 6565 D2).
+    """
+    names = tuple(r.name for r in config.enabled_verify_runners)
+    if names and deployed_sha is None:
+        logger.warning(
+            'Remote task verifies are off: verify runners %s are enabled but this '
+            'process has no deployed sha to gate them on (task 6565)',
+            list(names),
+        )
+        return ()
+    return names
+
+
+def remote_runner_factory(
+    config: OrchestratorConfig, cwd: str | Path, *, deployed_sha: DeployedSha | None,
+) -> Callable[[str], RemoteRunner]:
+    """A builder of one fresh RemoteRunner per call, for :class:`HostPool`'s ``runner_for``.
+
+    It never filters by quarantine: the pool benches a host through its gate's
+    slots, and still builds a runner for the turn that probes it.
+    """
+    code_checkout = resolve_code_checkout()
+
+    def build(name: str) -> RemoteRunner:
+        if deployed_sha is None:
+            raise RuntimeError(
+                f'cannot build a remote verify runner for {name!r}: this process has '
+                'no deployed sha to gate it on (task 6565)'
+            )
+        runner_config = next(
+            (r for r in config.enabled_verify_runners if r.name == name), None,
+        )
+        if runner_config is None:
+            raise ValueError(f'{name!r} is not an enabled verify runner')
+        return _remote_runner(
+            config, runner_config, cwd, deployed_sha=deployed_sha, code_checkout=code_checkout,
+        )
+
+    return build
+
+
+def _remote_runner(
+    config: OrchestratorConfig,
+    runner_config: VerifyRunnerConfig,
+    cwd: str | Path,
+    *,
+    deployed_sha: DeployedSha,
+    code_checkout: str | Path | None,
+) -> RemoteRunner:
+    gate = runner_config.gate_paths()
+    return RemoteRunner(
+        name=runner_config.name,
+        ssh_host=runner_config.ssh_host,
+        git_remote=runner_config.git_remote,
+        cwd=cwd,
+        config_path=runner_config.config_path,
+        main_branch=config.git.main_branch,
+        df_remote_checkout=gate.source,
+        gate_checkouts_path=gate.root,
+        deployed_sha=deployed_sha,
+        code_checkout=code_checkout,
+    )
 
 
 class HostPool:

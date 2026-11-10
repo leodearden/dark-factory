@@ -69,7 +69,7 @@ def _random_inputs(rng: random.Random) -> OpenInputs:
     return _open_inputs(
         task_id=str(rng.randrange(10_000)),
         shape=rng.choice(shapes),
-        candidate=rng.choice(['glm-5.3-endpoint', 'minimax-m3-endpoint', 'claude-sonnet-max']),
+        candidate=rng.choice(['glm-5.3-endpoint', 'minimax-m3.1-flash-endpoint', 'claude-sonnet-max']),
         stratum=(rng.choice(['df', 'reify']), rng.choice(['feature', 'fix']), 'full'),
         base_sha=rng.choice(['a' * 40, None]),
         seed=rng.randrange(100),
@@ -96,7 +96,7 @@ class TestSamplePoint:
         for _ in range(300):
             args = (
                 str(rng.randrange(10_000)),
-                rng.choice(['glm-5.3-endpoint', 'minimax-m3-endpoint']),
+                rng.choice(['glm-5.3-endpoint', 'minimax-m3.1-flash-endpoint']),
                 rng.choice(list(ShadowShape)),
                 (rng.choice(['df', 'reify']), rng.choice(['feature', 'fix']), 'full'),
                 rng.randrange(100),
@@ -377,7 +377,7 @@ class TestCandidateFacts:
         assert config is not None
         assert cost_basis_of(config) is CostBasis.SUBSCRIPTION
 
-    @pytest.mark.parametrize('name', ['minimax-m3-endpoint', 'claude-sonnet-max'])
+    @pytest.mark.parametrize('name', ['minimax-m3.1-flash-endpoint', 'claude-sonnet-max'])
     def test_minimax_and_native_configs_are_metered(self, name):
         config = get_config_by_name(name)
         assert config is not None

@@ -84,8 +84,8 @@ class DeadLetterWriter:
 
         ``on_settled`` receives that outcome on the settling thread (the worker,
         or the caller's thread when the hand-off itself fails) BEFORE the
-        returned future resolves, so anything it schedules precedes every
-        observer of that future and of :meth:`flushed`.
+        returned future resolves, so anything it schedules is queued before
+        any done-callback of that future, or of :meth:`flushed`, runs.
         """
         written: Future[bool] = _running_future()
         try:

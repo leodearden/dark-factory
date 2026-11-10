@@ -7,6 +7,8 @@ downward only: this module must never import ``orchestrator.merge_lane`` or
 ``orchestrator.workflow``.
 """
 
+# pyright: reportIncompatibleMethodOverride=true
+
 from __future__ import annotations
 
 import asyncio
@@ -19,11 +21,21 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, assert_never, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    Protocol,
+    assert_never,
+    get_args,
+    runtime_checkable,
+)
 
 from shared.git_async import run_git
 from shared.safe_io import atomic_write_text
 
+from orchestrator.config import VerifyTaskHostPolicy
 from orchestrator.task_verify_spec import (
     CollapsedOverride,
     build_task_verify_spec,
@@ -86,7 +98,7 @@ class LocalVerifyPort(TaskVerifyPort, Protocol):
     ) -> VerifyResult: ...
 
 
-HostPolicy = Literal['local', 'remote_modules', 'remote_all']
+HostPolicy = VerifyTaskHostPolicy
 
 
 @dataclass(frozen=True)
@@ -121,6 +133,16 @@ class TaskVerifyPolicy:
             raise ValueError(
                 f'red_confirms_locally must be a bool, got {self.red_confirms_locally!r}'
             )
+
+
+def policy_from_config(config: OrchestratorConfig) -> TaskVerifyPolicy:
+    """The policy *config*'s four ``verify_task_*`` keys declare, read afresh per call."""
+    return TaskVerifyPolicy(
+        host_policy=config.verify_task_host_policy,
+        remote_modules=tuple(config.verify_task_remote_modules),
+        cross_check_every_n=config.verify_task_remote_cross_check_every_n,
+        red_confirms_locally=config.verify_task_remote_red_confirms_locally,
+    )
 
 
 @dataclass(frozen=True)
@@ -205,6 +227,24 @@ class DispatchDecision:
             ),
             'remote_wait_secs': self.remote_wait_secs,
         }
+
+
+LOCAL_RUNNER: Final = HostPool.local_name
+
+
+@runtime_checkable
+class DispatchRecords(Protocol):
+    """A task-verify port that records where each task attempt's verdict came from."""
+
+    def decision_for(self, task_id: str, attempt_id: int) -> DispatchDecision | None: ...
+
+
+def verdict_runner(port: object | None, task_id: str, attempt_id: int) -> str:
+    """The host whose verdict *port* returned for this attempt; LOCAL_RUNNER when unrecorded."""
+    if not isinstance(port, DispatchRecords):
+        return LOCAL_RUNNER
+    decision = port.decision_for(task_id, attempt_id)
+    return LOCAL_RUNNER if decision is None else decision.runner
 
 
 def eligible(
@@ -407,7 +447,7 @@ async def _reap_race(race: _Race) -> None:
     await asyncio.gather(*reaps)
 
 
-class TaskVerifyDispatcher:
+class TaskVerifyDispatcher(DispatchRecords):
     """Routes each task verify to whichever comes first: a remote host's turn or *run_local*.
 
     Shared by every workflow of one orchestrator, so decisions are keyed by
@@ -451,6 +491,7 @@ class TaskVerifyDispatcher:
         )
         policy = self._policy_of(config)
         if policy.host_policy == 'local':
+            self._decisions.pop((task_id, attempt_id), None)
             return await call.run(self._run_local)
         draft = _DecisionDraft(runner=self._pool.local_name)
         try:

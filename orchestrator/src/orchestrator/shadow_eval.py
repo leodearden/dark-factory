@@ -501,7 +501,11 @@ def runner_raised_reason(exc: BaseException) -> str:
 
 @dataclass(frozen=True)
 class CellRunOutcome:
-    """What a runner reports when a cell's run ends; a completed run has its result."""
+    """What a runner reports when a cell's run ends; a completed run has its result.
+
+    ``served_model`` is the model string the provider (or harness) reported for
+    the role under test, ``None`` when the run could not observe it.
+    """
 
     end: RunEnd
     metrics: EvalMetrics | None = None
@@ -509,6 +513,7 @@ class CellRunOutcome:
     cost_usd: float = 0.0
     cost_credits: float = 0.0
     plan: dict | None = None
+    served_model: str | None = None
 
     def __post_init__(self) -> None:
         if self.end is RunEnd.COMPLETED and (self.metrics is None or self.result_path is None):
@@ -563,6 +568,7 @@ def run_end_change(outcome: CellRunOutcome, at: datetime) -> CellChange:
             result_path=outcome.result_path,
             cost_usd=outcome.cost_usd,
             cost_credits=outcome.cost_credits,
+            served_model=outcome.served_model,
         )
     return CellChange(
         ShadowCellState.CAP_EXCLUDED,
@@ -570,6 +576,7 @@ def run_end_change(outcome: CellRunOutcome, at: datetime) -> CellChange:
         reason=_CAP_REASONS[outcome.end].value,
         cost_usd=outcome.cost_usd,
         cost_credits=outcome.cost_credits,
+        served_model=outcome.served_model,
     )
 
 
@@ -905,6 +912,7 @@ class ShadowCoordinator:
             plan_source=_PLAN_SOURCE_BY_SHAPE.get(inputs.shape),
             state=ShadowCellState.SAMPLED,
             cost_basis=cost_basis_of(candidate),
+            configured_model=candidate.model,
             run_id=self.run_id,
             opened_at=now,
             settle_deadline=now + timedelta(hours=self._config.settle_deadline_hours),

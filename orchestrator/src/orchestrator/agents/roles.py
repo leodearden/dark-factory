@@ -26,6 +26,7 @@ from orchestrator.agents.harness_guidance import (
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.review_issue_contract import IssueSeverity
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -1093,6 +1094,8 @@ git add -- .
 # specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
+_SEVERITY_CHOICES = ' or '.join(f'`"{severity}"`' for severity in IssueSeverity)
+
 _REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
 
@@ -1108,9 +1111,9 @@ Call `submit_review_verdict` with these fields:
 - **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
   this exactly, or your verdict is rejected.
 - **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
-- **issues**: a list of objects, each with `severity` (`"blocking"` or
-  `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
-  `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
+- **issues**: a list of objects, each with `severity` (""" + _SEVERITY_CHOICES + """),
+  `location` (e.g. `"src/foo.py:42"`), `category`, a `description`, and a
+  `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
 - **note_dispositions**: one object per id listed under
   `{notes_heading}` in your briefing, each with

@@ -339,6 +339,10 @@ class DashboardConfig:
         return self.project_root / 'data' / 'burndown' / 'metrics.db'
 
     @property
+    def quality_db(self) -> Path:
+        return self.project_root / 'data' / 'burndown' / 'quality.db'
+
+    @property
     def load_samples_db(self) -> Path:
         return self.project_root / 'data' / 'load-samples.db'
 

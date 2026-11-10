@@ -325,7 +325,6 @@ class MemoryConsolidator(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Run Stage 1's agent, then guard, extend and post-process its report.
 
@@ -342,7 +341,6 @@ class MemoryConsolidator(BaseStage):
         self._live_workflow_snapshot = None
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
         self._publish_always_present_stats(report)
         preservation_result = await self._apply_preservation_specimen_guard(report)

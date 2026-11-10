@@ -27,6 +27,7 @@ from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY
 _TARGET = 'shared.declared_scope'
 _TARGET_PACKAGE, _, _TARGET_NAME = _TARGET.rpartition('.')
 _DECISION_8 = 'plans/follow-up-filing-shape-prd.md §3 decision 8'
+_PACKING_PRD = 'plans/followup-packing-sweep-prd.md §3 decision 7 (task 8451)'
 
 
 class Allowed(NamedTuple):
@@ -40,6 +41,10 @@ ALLOWED_IMPORTERS: Mapping[str, Allowed] = MappingProxyType({
     'fused-memory/src/fused_memory/backends/task_backend_errors.py': Allowed('refusal', _DECISION_8),
     'fused-memory/src/fused_memory/middleware/task_curator.py': Allowed('reader (γ)', _DECISION_8),
     'scripts/followup_filing_shape_report.py': Allowed('reader (θ)', _DECISION_8),
+    'fused-memory/src/fused_memory/middleware/followup_packing.py': Allowed('reader (packing P0)', _PACKING_PRD),
+    'fused-memory/src/fused_memory/middleware/curator_types.py': Allowed(
+        'reader (γ: pool and candidate render)', _DECISION_8,
+    ),
 })
 
 _PENDING: Mapping[str, str] = MappingProxyType({

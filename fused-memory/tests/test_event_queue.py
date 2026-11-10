@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import pathlib
 import threading
 import time
 import uuid
+from concurrent.futures import Future
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -19,7 +21,9 @@ from _dead_letter_helpers import (
     hold_fifo,
     journaled_events,
     journaled_ids,
+    overflowed_queue,
     parked_queue,
+    record_dead_letter_writes,
     seed_dead_letters,
 )
 
@@ -28,6 +32,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
@@ -1648,11 +1653,8 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
     while the append is still held open, so the loop never waits on that I/O.
     """
     held = hold_fifo(tmp_path / 'dl.jsonl')
-    q = EventQueue(AsyncMock(), dead_letter_path=held.path, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2) as q:
         assert not held.reader_opened.is_set(), (
             'enqueue() only returned after the FIFO reader opened: the '
             'dead-letter append ran on the event-loop thread'
@@ -1666,8 +1668,6 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
         assert [(r['reason'], r['event']['id']) for r in records] == [('overflow_drop', e2.id)]
         assert q.stats()['dead_letters'] == 1
         assert q.stats()['dead_letters_pending'] == 0
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1676,11 +1676,8 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
     on disk, so a kill -9 while the append is pending cannot lose it."""
     held = hold_fifo(tmp_path / 'dl.jsonl')
     ej = tmp_path / 'ej.db'
-    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2, journal_path=ej) as q:
         assert e2.id in journaled_ids(ej)
 
         held.release.set()
@@ -1690,8 +1687,6 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
         journaled = journaled_ids(ej)
         assert e1.id in journaled
         assert e2.id not in journaled
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1717,22 +1712,12 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
     recover() to redeliver, rather than silently losing the event."""
     (tmp_path / 'blocker').write_text('a regular file, not a directory')
     ej = tmp_path / 'ej.db'
-    q = EventQueue(
-        AsyncMock(),
-        dead_letter_path=tmp_path / 'blocker' / 'dl.jsonl',
-        journal_path=ej,
-        maxsize=1,
-    )
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'blocker' / 'dl.jsonl', e1, e2, journal_path=ej) as q:
         await q.flush_dead_letters()
 
         assert e2.id in journaled_ids(ej)
         assert q.stats()['dead_letters'] == 0
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1858,4 +1843,96 @@ async def test_flush_dead_letters_returns_only_after_the_journal_row_release_is_
         assert e1.id in journaled
     finally:
         unpark.set()
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_releases_the_row_of_a_write_that_finished_before_the_flush(
+    monkeypatch, tmp_path,
+):
+    """A record already on disk when flush_dead_letters() is called still has
+    its journal-row release run before the flush returns.
+
+    Blocking on the write's future holds the loop thread, so the release the
+    writer thread queued on the loop has not run when the flush starts.
+    """
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej) as q:
+        [written] = writes
+        assert written.result(timeout=5) is True
+
+        await q.flush_dead_letters()
+
+        journaled = journaled_ids(ej)
+        assert e2.id not in journaled
+        assert e1.id in journaled
+
+
+@pytest.mark.asyncio
+async def test_close_releases_the_row_of_a_write_that_finished_before_close(
+    monkeypatch, tmp_path,
+):
+    """close() runs the journal-row release of a record already on disk before
+    it closes the journal, so recover() cannot redeliver a dead-lettered event."""
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej):
+        [written] = writes
+        assert written.result(timeout=5) is True
+
+    assert journaled_ids(ej) == {e1.id}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_flush_leaves_no_error_on_the_loop_when_its_write_settles(tmp_path):
+    """Cancelling flush_dead_letters() while a write is pending leaves nothing
+    for the loop's exception handler once that write settles, and a later
+    flush still releases the written record's journal row."""
+    loop = asyncio.get_running_loop()
+    contexts: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        flush = asyncio.ensure_future(q.flush_dead_letters())
+        await asyncio.sleep(0)
+        flush.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await flush
+
+        held.release.set()
+        held.records()
+        await q.flush_dead_letters()
+
+        assert contexts == []
+        assert e2.id not in journaled_ids(ej)
+    finally:
+        held.release.set()
+        await q.close()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_is_cancelled_when_the_writers_flush_future_is(
+    monkeypatch, tmp_path,
+):
+    """A cancelled writer future cancels the flush awaiting it, as
+    asyncio.wrap_future would, rather than leaving that flush to hang."""
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl')
+    try:
+        cancelled: Future[None] = Future()
+        cancelled.cancel()
+        with monkeypatch.context() as patched:
+            patched.setattr(DeadLetterWriter, 'flushed', lambda _writer: cancelled)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(q.flush_dead_letters(), timeout=5)
+    finally:
         await q.close()

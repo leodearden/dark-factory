@@ -6,7 +6,7 @@ The aggregator layer in ``dashboard.data.*`` is shared by every endpoint.
 
 This file owns app construction, lifespan wiring, the route table for the
 handlers that live in ``dashboard.api.*``, the ``/healthz`` probe apparatus
-and the endpoints not yet extracted. The two background samplers live in
+and the endpoints not yet extracted. The three background samplers live in
 ``dashboard.loops``.
 """
 
@@ -105,7 +105,14 @@ from dashboard.data.tasks import fetch_task_page
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
 from dashboard.http_pool import reaper_loop
-from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
+from dashboard.loops import (
+    _burndown_loop,
+    _BurndownStore,
+    _metrics_loop,
+    _MetricsStore,
+    _quality_loop,
+    _QualityStore,
+)
 from dashboard.project_dbs import _cost_dbs, _cost_sources
 
 _pkg_dir = Path(__file__).parent
@@ -253,7 +260,7 @@ async def _close_each(*closers: Callable[[], Awaitable[object]]) -> None:
 
     Independence is the entire point. These are the handles ``lifespan``
     opened, and one that refuses to close must not take its neighbours with
-    it: the objects at stake are two writable WAL connections and a
+    it: the objects at stake are three writable WAL connections and a
     ``DbPool``, and a stranded one's finaliser queues work onto a by-then
     closed loop — the ``RuntimeError: Event loop is closed`` class
     :func:`lifespan` documents. ``AsyncSqliteBase.close`` awaits
@@ -331,7 +338,7 @@ async def lifespan(app: FastAPI):
     closed on every exit path** — one where a teardown step above them raises,
     and equally one where an earlier CLOSE raises, which is why they go
     through :func:`_close_each` rather than standing as a flat sequence.  The
-    objects at stake are the two writable WAL connections and the ``DbPool``
+    objects at stake are the three writable WAL connections and the ``DbPool``
     above: strand one and its finaliser queues work onto a by-then-closed
     loop, the same ``RuntimeError`` this docstring already describes — so a
     failure anywhere in teardown must not be able to cause the very condition
@@ -367,11 +374,16 @@ async def lifespan(app: FastAPI):
     app.state.metrics_store = metrics_store
     app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
 
+    # Quality sampler store (third WAL writer). Bound to the LOCAL config only:
+    # its loop is its one user, so app.state gets no handle.
+    quality_store = _QualityStore(config.quality_db, busy_timeout_ms=5000)
+    await quality_store.open()
+
     # Every background task is created here, LAST, with nothing awaited between
     # here and the yield. Startup has no try/except, so a task created above an
     # `await ...store.open()` is stranded — still ticking against a client
     # nobody will close — if that open raises. One site also makes them read as
-    # the set the teardown below cancels as a set. The two samplers' gate (task
+    # the set the teardown below cancels as a set. The samplers' gate (task
     # 5826) reads the LOCAL config, never app.state.config, for the reason task
     # 3771 binds the loops themselves to it.
     #
@@ -385,6 +397,7 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(
                 _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
             ),
+            asyncio.create_task(_quality_loop(quality_store, config)),
         )
         if config.samplers_enabled
         else ()
@@ -415,6 +428,7 @@ async def lifespan(app: FastAPI):
         await _close_each(
             burndown_store.close,
             metrics_store.close,
+            quality_store.close,
             pool.close_all,
             http_client.aclose,
         )

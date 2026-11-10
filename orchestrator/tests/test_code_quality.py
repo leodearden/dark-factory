@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from _role_splice_contract import assert_brace_free, assert_nonempty, assert_opens_own_section
 
+from orchestrator.agents import code_quality
 from orchestrator.agents.code_quality import NORMATIVE_DOC, guidance, render, section
 
 # Resolved from THIS FILE, never from the process CWD, so it holds from
@@ -164,6 +165,39 @@ class TestRender:
     @pytest.mark.parametrize('heading', _EXCLUDED_HEADINGS)
     def test_a_brace_in_an_excluded_section_does_not_raise(self, heading):
         render(_with(heading, 'A literal { brace in a section that is never rendered.'))
+
+
+class TestDefinition:
+    """``definition()`` — the ``## Definition`` body alone, read from ``NORMATIVE_DOC``."""
+
+    @staticmethod
+    def _patch_doc(monkeypatch, tmp_path: Path, doc_text: str) -> None:
+        path = tmp_path / 'code_quality.md'
+        path.write_text(doc_text, encoding='utf-8')
+        monkeypatch.setattr(code_quality, 'NORMATIVE_DOC', path)
+
+    def test_is_the_definition_guidance_renders_under_the_title(self):
+        assert code_quality.definition() == section(guidance(), _TITLE).strip()
+
+    def test_reads_the_doc_on_every_call(self, monkeypatch, tmp_path):
+        self._patch_doc(monkeypatch, tmp_path, _doc(_SECTIONS))
+        assert code_quality.definition() == _SECTIONS[_DEFINITION]
+        edited = 'Definition sentence, edited between two calls.'
+        self._patch_doc(monkeypatch, tmp_path, _with(_DEFINITION, edited))
+        assert code_quality.definition() == edited
+
+    @pytest.mark.parametrize(
+        'doc_text',
+        [
+            pytest.param(_with(_DEFINITION, '   \n\t'), id='emptied'),
+            pytest.param(_without(_DEFINITION), id='missing'),
+            pytest.param(_with(_DEFINITION, 'A literal { mid-line.'), id='braced'),
+        ],
+    )
+    def test_a_broken_definition_raises_naming_it(self, monkeypatch, tmp_path, doc_text):
+        self._patch_doc(monkeypatch, tmp_path, doc_text)
+        with pytest.raises(ValueError, match=re.escape(_DEFINITION)):
+            code_quality.definition()
 
 
 class TestNormativeDocLocation:

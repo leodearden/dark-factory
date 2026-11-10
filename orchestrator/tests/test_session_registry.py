@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -30,7 +31,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _process_identity_variants import IdentityVariant, own_identity
 from _reap_report_wait import await_reap_report
+from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -80,6 +83,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'claude_launch_session_id': 'uuid-claude-launch-0',
         'claude_owner_pid': 424242,
         'self_exit': True,
+        't3_end': sr.T3End.SETTLE,
         'exit_request': sr.ExitRequest(
             state=sr.ExitRequestState.ATTEMPTED,
             reason=None,
@@ -234,6 +238,8 @@ def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
     # Task 4193's additive hook-owner binding: absent on disk -> None, no
     # migration required.
     assert record.claude_session_id is None
+    assert record.launcher_identity is None
+    assert record.claude_owner_identity is None
 
 
 def test_schema_minor_is_int_bumped() -> None:
@@ -338,6 +344,103 @@ def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
     data['claude_owner_pid'] = True
     record = sr.SessionRecord.from_dict(data)
     assert record.claude_owner_pid is None
+
+
+# ---------------------------------------------------------------------------
+# Task 8125: SessionRecord.launcher_identity and claude_owner_identity
+# ---------------------------------------------------------------------------
+
+_IDENTITY_FIELDS = ('launcher_identity', 'claude_owner_identity')
+_RECORD_PID = 1
+
+
+def _identity_wire(**overrides: object) -> dict[str, object]:
+    return {'pid': _RECORD_PID, 'start_ticks': 11, 'boot_id': 'boot-a', 'host': 'host-a', **overrides}
+
+
+def _record_dict_with_pids(pid: int) -> dict[str, Any]:
+    return _make_record(launcher_pid=pid, claude_owner_pid=pid).to_dict()
+
+
+def test_session_record_round_trip_includes_both_identities() -> None:
+    r = _make_record(
+        launcher_pid=4242,
+        launcher_identity=ProcessIdentity(4242, 11, 'boot-a', 'host-a'),
+        claude_owner_pid=424242,
+        claude_owner_identity=ProcessIdentity(424242, 12, 'boot-a', 'host-a'),
+    )
+
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+    # The wire keys are pinned by name: watchers read them back off disk.
+    assert r.to_dict()['launcher_identity'] == {
+        'pid': 4242,
+        'start_ticks': 11,
+        'boot_id': 'boot-a',
+        'host': 'host-a',
+    }
+    assert r.to_dict()['claude_owner_identity'] == {
+        'pid': 424242,
+        'start_ticks': 12,
+        'boot_id': 'boot-a',
+        'host': 'host-a',
+    }
+
+
+def test_session_record_defaults_both_identities_to_none() -> None:
+    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+
+    assert record.launcher_identity is None
+    assert record.claude_owner_identity is None
+
+
+@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
+def test_a_well_formed_identity_naming_its_pid_reads_back(identity_field: str) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    data[identity_field] = _identity_wire()
+
+    record = sr.SessionRecord.from_dict(data)
+
+    assert getattr(record, identity_field) == ProcessIdentity(_RECORD_PID, 11, 'boot-a', 'host-a')
+
+
+@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
+@pytest.mark.parametrize(
+    'junk',
+    [
+        pytest.param('host-a', id='str'),
+        pytest.param(_RECORD_PID, id='int'),
+        pytest.param(list(_identity_wire().values()), id='list'),
+        pytest.param(
+            {k: v for k, v in _identity_wire().items() if k != 'host'}, id='missing-host'
+        ),
+        pytest.param(_identity_wire(pid=True), id='bool-pid'),
+        pytest.param(_identity_wire(start_ticks='11'), id='str-start-ticks'),
+        pytest.param(_identity_wire(start_ticks=-1), id='negative-start-ticks'),
+        pytest.param(_identity_wire(boot_id=''), id='empty-boot-id'),
+        pytest.param(_identity_wire(host=''), id='empty-host'),
+        pytest.param(_identity_wire(pid=_RECORD_PID + 1), id='names-another-pid'),
+    ],
+)
+def test_a_junk_identity_reads_none(identity_field: str, junk: object) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    data[identity_field] = junk
+
+    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
+
+
+@pytest.mark.parametrize(
+    ('identity_field', 'pid_field'),
+    [('launcher_identity', 'launcher_pid'), ('claude_owner_identity', 'claude_owner_pid')],
+)
+def test_an_identity_on_a_record_without_its_pid_reads_none(
+    identity_field: str, pid_field: str
+) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    del data[pid_field]
+    data[identity_field] = _identity_wire()
+
+    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
 
 
 def test_spawn_mode_enum_values() -> None:
@@ -2079,6 +2182,79 @@ def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Task 8125: the pid sweeps judge the launcher by its identity
+# ---------------------------------------------------------------------------
+
+def _launcher_slug(variant: IdentityVariant) -> str:
+    return f'launcher-{variant}'
+
+
+_UNQUALIFIED = 'launcher-unqualified'
+_ELSEWHERE = _launcher_slug(IdentityVariant.OTHER_HOST)
+_JUDGED_DEAD = {_launcher_slug(v) for v in IdentityVariant if v.judged_dead}
+_JUDGED_KEPT = {_launcher_slug(v) for v in IdentityVariant if not v.judged_dead} | {_UNQUALIFIED}
+
+
+def _launcher_identities() -> dict[str, ProcessIdentity | None]:
+    """One record slug per identity, all naming this live test process: only the identity can make one dead."""
+    return {_launcher_slug(v): own_identity(v) for v in IdentityVariant} | {_UNQUALIFIED: None}
+
+
+def _seed_stale_launchers(root: Path) -> None:
+    for slug, identity in _launcher_identities().items():
+        record = _make_record(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=os.getpid(),
+            launcher_identity=identity,
+        )
+        sr.write_record(record, root=root)
+        _set_mtime(
+            sr.record_path_for_slug(slug, root=root),
+            _NOW,
+            sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        )
+
+
+def _logged_other_host_skip(caplog: pytest.LogCaptureFixture, sweep: str, subject: str) -> bool:
+    return any(
+        sweep in r.getMessage() and subject in r.getMessage() and 'reason=other_host' in r.getMessage()
+        for r in caplog.records
+        if r.name == sr.__name__ and r.levelno == logging.INFO
+    )
+
+
+class TestPidSweepsJudgeTheLauncherByIdentity:
+    def test_mark_orphaned_marks_exactly_the_launchers_judged_dead(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_stale_launchers(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger=sr.__name__):
+            marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+        assert {m.session_slug for m in marked} == _JUDGED_DEAD
+        for slug in _JUDGED_KEPT:
+            assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+        assert _logged_other_host_skip(caplog, 'mark_orphaned_sessions_exited', _ELSEWHERE)
+
+    def test_reap_stale_records_reaps_exactly_the_launchers_judged_dead(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_stale_launchers(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger=sr.__name__):
+            reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert {r.session_slug: r.reason for r in reaped} == dict.fromkeys(
+            _JUDGED_DEAD, 'stale_pid'
+        )
+        for slug in _JUDGED_KEPT:
+            assert sr.record_path_for_slug(slug, root=tmp_path).is_file()
+        assert _logged_other_host_skip(caplog, 'reap_stale_records', _ELSEWHERE)
+
+
+# ---------------------------------------------------------------------------
 # Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
 # ---------------------------------------------------------------------------
 
@@ -2552,6 +2728,42 @@ def test_main_launching_writes_record_and_prints_only_record_dir(
     assert record.launcher_pid == 4242
 
 
+def test_main_launching_stamps_the_launcher_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path, launcher_pid=str(os.getpid())))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', os.getpid())
+    record_file = sr.record_path_for_slug(slug, root=tmp_path)
+    assert capsys.readouterr().out.strip() == str(record_file.parent)
+    assert sr.read_record(slug, root=tmp_path).launcher_identity == own_identity()
+    on_disk = json.loads(record_file.read_text())
+    assert on_disk['launcher_identity']['host'] == socket.gethostname()
+
+
+def test_main_launching_with_a_dead_launcher_still_writes_an_unqualified_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path, launcher_pid=str(_DEAD_PID)))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', _DEAD_PID)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == _DEAD_PID
+    assert record.launcher_identity is None
+
+
 def test_main_exit_sets_status_exited_and_exit_code(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3015,6 +3227,7 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     assert report['remaining_record_dirs'] == 1
     phases = report['phases']
     assert [phase['name'] for phase in phases] == [
+        'index_unpointed_t3_records',
         'mark_orphaned_sessions_exited',
         'mark_windowless_wm_sessions_exited',
         'reap_stale_records',
@@ -3046,10 +3259,10 @@ def test_main_reap_runs_later_phases_when_one_phase_raises(
 
     assert rc == 0
     assert not (sr.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
-    first_phase = json.loads(sr.reap_report_path(tmp_path).read_text())['phases'][0]
-    assert first_phase['name'] == 'mark_orphaned_sessions_exited'
-    assert 'OSError' in first_phase['error']
-    assert first_phase['count'] is None
+    phases = json.loads(sr.reap_report_path(tmp_path).read_text())['phases']
+    [failed] = [phase for phase in phases if phase['name'] == 'mark_orphaned_sessions_exited']
+    assert 'OSError' in failed['error']
+    assert failed['count'] is None
 
 
 def _write_report_started(root: Path, started_at: datetime) -> str:
@@ -11383,6 +11596,8 @@ def _t3_record(
     cwd: str,
     status: sr.Status = sr.Status.RUNNING,
     kind: str = sr.DisplayKind.T3.value,
+    environment_id: str | None = None,
+    pointer: bool = False,
 ) -> None:
     sr.write_record(
         _make_record(
@@ -11390,52 +11605,316 @@ def _t3_record(
             status=status,
             cwd=cwd,
             exit_code=None,
-            display=sr.Display(kind=kind, t3_thread_id=thread_id),
+            display=sr.Display(
+                kind=kind, t3_thread_id=thread_id, t3_environment_id=environment_id
+            ),
         ),
         root=tmp_path,
     )
+    if pointer and thread_id is not None:
+        assert sr.write_t3_thread_pointer(thread_id, slug, root=tmp_path)
+
+
+_THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
+_OTHER_THREAD = 'mcp:launch:' + '0f9e8d7c6b5a49388271605f4e3d2c1b' * 2
+
+
+class TestT3ThreadPointers:
+    def test_pointer_dir_is_a_sibling_of_sessions(self, tmp_path: Path) -> None:
+        assert sr.t3_thread_pointers_dir(tmp_path) == tmp_path / 'sessions-by-t3-thread'
+        assert sr.t3_thread_pointer_path(_THREAD, tmp_path).parent.parent == tmp_path
+
+    def test_a_written_pointer_resolves_while_a_live_t3_record_names_the_thread(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
+
+        assert sr.write_t3_thread_pointer(_THREAD, 'session-df-8124-1', root=tmp_path)
+        assert sr.t3_thread_pointer_path(_THREAD, tmp_path).read_text() == 'session-df-8124-1'
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == (
+            'session-df-8124-1'
+        )
+
+    @pytest.mark.parametrize(
+        ('thread_id', 'status', 'kind'),
+        [
+            pytest.param(_THREAD, sr.Status.RUNNING, 'wm', id='not-t3'),
+            pytest.param(_OTHER_THREAD, sr.Status.RUNNING, 't3', id='another-thread'),
+            pytest.param(_THREAD, sr.Status.EXITED, 't3', id='terminal'),
+        ],
+    )
+    def test_a_record_that_does_not_vouch_resolves_none(
+        self, tmp_path: Path, thread_id: str, status: sr.Status, kind: str
+    ) -> None:
+        _t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
+        sr.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
+
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+
+    def test_a_missing_record_or_pointer_resolves_none(self, tmp_path: Path) -> None:
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+        sr.write_t3_thread_pointer(_THREAD, 'gone-record', root=tmp_path)
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+
+    @pytest.mark.parametrize('thread_id', ['', '../escape', 'a/b', 'x' * 129])
+    def test_an_unsafe_thread_id_is_never_written_or_read(
+        self, tmp_path: Path, thread_id: str
+    ) -> None:
+        assert not sr.write_t3_thread_pointer(thread_id, 'session-df-1', root=tmp_path)
+        assert sr.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) is None
+        assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+
+    def test_a_non_record_key_slug_is_not_written(self, tmp_path: Path) -> None:
+        assert not sr.write_t3_thread_pointer(_THREAD, '..', root=tmp_path)
+        assert not sr.write_t3_thread_pointer(_THREAD, 'a/b', root=tmp_path)
+
+    def test_reap_removes_pointers_no_live_t3_record_vouches_for(self, tmp_path: Path) -> None:
+        ended, gone, moved = (
+            '1a2b3c4d-0000-4000-8000-000000000001',
+            '1a2b3c4d-0000-4000-8000-000000000002',
+            '1a2b3c4d-0000-4000-8000-000000000003',
+        )
+        _t3_record(tmp_path, 'live', _THREAD, cwd=str(tmp_path))
+        _t3_record(tmp_path, 'ended', ended, cwd=str(tmp_path), status=sr.Status.EXITED)
+        _t3_record(tmp_path, 'moved', _OTHER_THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'live', root=tmp_path)
+        sr.write_t3_thread_pointer(ended, 'ended', root=tmp_path)
+        sr.write_t3_thread_pointer(gone, 'gone-record', root=tmp_path)
+        sr.write_t3_thread_pointer(moved, 'moved', root=tmp_path)
+        pointers = sr.t3_thread_pointers_dir(tmp_path)
+        (pointers / 'bad name').write_text('live')
+        fresh_temp = pointers / f'inflight{sr._ATOMIC_WRITE_TEMP_SUFFIX}'
+        fresh_temp.write_text('live')
+
+        removed = sr.reap_stale_session_pointers(root=tmp_path)
+
+        assert {path.name for path in removed} == {ended, gone, moved, 'bad name'}
+        assert sorted(path.name for path in pointers.iterdir()) == sorted(
+            [_THREAD, fresh_temp.name]
+        )
+
+    def test_the_exit_verb_drops_the_pointer_naming_the_exited_record(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
+
+        assert sr.main(['exit', '--record', str(sr.sessions_dir(tmp_path) / 'held'), '--code', '0']) == 0
+
+        assert sr.read_record('held', root=tmp_path).status == sr.Status.EXITED
+        assert not sr.t3_thread_pointer_path(_THREAD, tmp_path).exists()
+
+    def test_the_exit_verb_keeps_a_pointer_another_live_record_holds(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
+        _t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'holder', root=tmp_path)
+
+        sr.main(['exit', '--record', str(sr.sessions_dir(tmp_path) / 'bystander'), '--code', '0'])
+
+        assert sr.read_record('bystander', root=tmp_path).status == sr.Status.EXITED
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == 'holder'
+
+    def test_a_failed_to_start_refresh_drops_the_pointer_naming_the_record(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'held', _OTHER_THREAD, cwd=str(tmp_path), pointer=True)
+        record_dir = str(sr.sessions_dir(tmp_path) / 'held')
+
+        assert sr.main(['refresh', '--record', record_dir, '--status', 'failed-to-start']) == 0
+
+        assert sr.read_record('held', root=tmp_path).status == sr.Status.FAILED_TO_START
+        assert not sr.t3_thread_pointer_path(_OTHER_THREAD, tmp_path).exists()
+
+    def test_folding_a_record_drops_the_pointer_naming_it(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'hand', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'hand', root=tmp_path)
+
+        assert sr.mark_session_folded('hand', root=tmp_path) is not None
+
+        assert not sr.t3_thread_pointer_path(_THREAD, tmp_path).exists()
+
+
+_ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
+_GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'
+
+
+class _ThreadEnded:
+    """A ``thread_ended`` predicate answering *answer* for every thread, recording each thread asked."""
+
+    def __init__(self, answer: bool = True) -> None:
+        self.answer = answer
+        self.calls: list[str] = []
+
+    def __call__(self, thread_id: str) -> bool:
+        self.calls.append(thread_id)
+        return self.answer
 
 
 class TestMarkT3SessionsExited:
-    def test_marks_only_this_projects_records_whose_thread_is_gone_or_archived(
+    def test_marks_only_indexed_records_of_this_environment_whose_thread_is_gone(
         self, tmp_path: Path
     ) -> None:
-        project, other = tmp_path / 'proj', tmp_path / 'other'
-        project.mkdir()
-        other.mkdir()
-        _t3_record(tmp_path, 'listed', 'th-live', cwd=str(project))
-        _t3_record(tmp_path, 'archived', 'th-archived', cwd=str(project))
-        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(project))
-        _t3_record(tmp_path, 'other-project', 'th-gone', cwd=str(other))
-        _t3_record(tmp_path, 'already-exited', 'th-gone', cwd=str(project), status=sr.Status.EXITED)
-        _t3_record(tmp_path, 'not-t3', 'th-gone', cwd=str(project), kind='wm')
-        _t3_record(tmp_path, 'no-thread-yet', None, cwd=str(project))
+        foreign_thread, unindexed_thread = (
+            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
+            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
+        )
+        cwd = str(tmp_path)
+        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(
+            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
+        )
+        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
 
         marked = sr.mark_t3_sessions_exited(
-            str(project), {'th-live': False, 'th-archived': True}, root=tmp_path
+            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=_ThreadEnded()
         )
 
-        assert sorted(marked) == ['archived', 'gone']
-        for slug in ('archived', 'gone'):
-            record = sr.read_record(slug, root=tmp_path)
-            assert (record.status, record.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        for slug in ('listed', 'other-project', 'not-t3', 'no-thread-yet'):
+        assert marked == ['gone']
+        gone = sr.read_record('gone', root=tmp_path)
+        assert (gone.status, gone.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        for slug in ('listed', 'foreign', 'unindexed'):
             assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+        assert sorted(path.name for path in sr.t3_thread_pointers_dir(tmp_path).iterdir()) == (
+            sorted([_THREAD, foreign_thread])
+        )
 
-    def test_project_root_matches_by_realpath(self, tmp_path: Path) -> None:
-        project = tmp_path / 'proj'
-        project.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(project)
-        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(link))
+    def test_a_record_with_no_environment_is_this_environments(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'legacy', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
 
-        assert sr.mark_t3_sessions_exited(str(project), {}, root=tmp_path) == ['gone']
+        assert sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
+        ) == ['legacy']
 
-    def test_a_record_written_after_the_listing_is_skipped(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'just-launched', 'th-new', cwd=str(tmp_path))
+    def test_a_worktree_bound_record_is_marked_whatever_its_cwd(self, tmp_path: Path) -> None:
+        worktree = tmp_path / 'proj' / '.worktrees' / '8124'
+        _t3_record(
+            tmp_path,
+            'worktree-bound',
+            _GONE_THREAD,
+            cwd=str(worktree),
+            environment_id=_ENVIRONMENT,
+            pointer=True,
+        )
+
+        assert sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
+        ) == ['worktree-bound']
+
+    def test_a_record_written_after_the_listing_is_skipped_unasked(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'just-launched', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
         listed_at = datetime.now(UTC) - timedelta(minutes=1)
+        thread_ended = _ThreadEnded()
 
-        assert sr.mark_t3_sessions_exited(str(tmp_path), {}, root=tmp_path, listed_at=listed_at) == []
+        assert (
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT,
+                frozenset(),
+                root=tmp_path,
+                listed_at=listed_at,
+                thread_ended=thread_ended,
+            )
+            == []
+        )
+        assert thread_ended.calls == []
+
+    def test_an_unlisted_thread_not_confirmed_ended_keeps_its_record(self, tmp_path: Path) -> None:
+        _t3_record(
+            tmp_path, 'side-chat', _GONE_THREAD, cwd=str(tmp_path), environment_id=_ENVIRONMENT, pointer=True
+        )
+
+        marked = sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded(answer=False)
+        )
+
+        assert marked == []
+        assert sr.read_record('side-chat', root=tmp_path).status == sr.Status.RUNNING
+        assert sr.resolve_session_slug_for_t3_thread(_GONE_THREAD, root=tmp_path) == 'side-chat'
+
+    def test_only_this_environments_unlisted_indexed_threads_are_confirmed(
+        self, tmp_path: Path
+    ) -> None:
+        foreign_thread, unindexed_thread = (
+            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
+            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
+        )
+        cwd = str(tmp_path)
+        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(
+            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
+        )
+        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
+        thread_ended = _ThreadEnded()
+
+        sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=thread_ended
+        )
+
+        assert thread_ended.calls == [_GONE_THREAD]
+
+    def test_one_info_line_reports_the_index_entries_scanned(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for slug, thread in (
+            ('listed', _THREAD),
+            ('also-listed', _OTHER_THREAD),
+            ('gone', _GONE_THREAD),
+        ):
+            _t3_record(tmp_path, slug, thread, cwd=str(tmp_path), pointer=True)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.session_registry'):
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT,
+                frozenset({_THREAD, _OTHER_THREAD}),
+                root=tmp_path,
+                thread_ended=_ThreadEnded(),
+            )
+
+        [line] = [
+            record.getMessage().replace(str(tmp_path), '<root>')
+            for record in caplog.records
+            if record.name == 'orchestrator.session_registry'
+            and record.levelno == logging.INFO
+            and 'mark_t3_sessions_exited' in record.getMessage()
+        ]
+        assert re.search(r'\b3\b', line), line
+
+    @pytest.mark.parametrize(
+        ('routine', 'ended', 'level'),
+        [
+            pytest.param(False, False, logging.INFO, id='launch-sweep-marking-nothing'),
+            pytest.param(True, True, logging.INFO, id='routine-sweep-marking-one'),
+            pytest.param(True, False, logging.DEBUG, id='routine-sweep-marking-nothing'),
+        ],
+    )
+    def test_only_a_routine_sweep_that_marks_nothing_logs_its_line_at_debug(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        routine: bool,
+        ended: bool,
+        level: int,
+    ) -> None:
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT,
+                frozenset(),
+                root=tmp_path,
+                thread_ended=_ThreadEnded(answer=ended),
+                routine=routine,
+            )
+
+        assert [
+            record.levelno
+            for record in caplog.records
+            if record.name == 'orchestrator.session_registry'
+            and record.getMessage().startswith('mark_t3_sessions_exited: marked')
+        ] == [level]
 
 
 class TestT3RecordsAreExemptFromPidSweeps:
@@ -11461,6 +11940,63 @@ class TestT3RecordsAreExemptFromPidSweeps:
 
         assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
         assert path.is_file()
+        assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+
+    def test_the_reap_indexes_a_t3_record_whose_thread_no_pointer_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
+
+        assert sr.main(['reap']) == 0
+
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 't3-quiet'
+        assert sr.read_record('t3-quiet', root=tmp_path).status == sr.Status.RUNNING
+
+    def test_indexing_never_moves_a_held_pointer_or_indexes_a_terminal_record(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+        _t3_record(tmp_path, 'ended', 'th-2', cwd=str(tmp_path), status=sr.Status.EXITED)
+
+        assert sr.index_unpointed_t3_records(root=tmp_path) == []
+
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
+        assert not sr.t3_thread_pointer_path('th-2', tmp_path).exists()
+
+    def test_a_t3_record_displaced_from_its_thread_pointer_is_pid_swept(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+
+        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'stale_pid')]
+        assert sr.resolve_session_slug_for_t3_thread('th-1', root=tmp_path) == 'holder'
+
+    def test_mark_orphaned_marks_a_displaced_t3_record_with_a_dead_launcher(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.AWAITING_INPUT)
+        _t3_record(tmp_path, 'holder', 'th-1', cwd=str(tmp_path), pointer=True)
+
+        marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+        assert [r.session_slug for r in marked] == ['t3-quiet']
+
+    def test_a_failed_index_write_leaves_the_t3_record_exempt(self, tmp_path: Path) -> None:
+        path = self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+        sr.t3_thread_pointers_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+        sr.t3_thread_pointers_dir(tmp_path).write_text('not a dir')
+
+        assert sr.index_unpointed_t3_records(root=tmp_path) == []
+        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
+        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
+        assert path.is_file()
+        assert sr.read_record('t3-quiet', root=tmp_path).status == sr.Status.RUNNING
 
     def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
         self._stale_t3_record(tmp_path, sr.Status.EXITED)

@@ -1,0 +1,36 @@
+{
+  "task_id": "6670",
+  "reason": "net-additive host-health wiring: Harness._run_slot now hands build_workflow the harness-owned TaskVerifyDispatcher (task_verify=self._task_verify_dispatcher), so each Harness.__new__ fixture that drives _run_slot sets that one new slot beside its existing _merge_inflight_registry line (+1 private_reads in each of test_harness_claimant_clear, test_harness_merge_registry_wiring, test_harness_reblock_guard, test_workflow_cancellation)",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_claimant_clear.py",
+      "baseline": 16,
+      "current": 17
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_merge_registry_wiring.py",
+      "baseline": 22,
+      "current": 23
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_reblock_guard.py",
+      "baseline": 21,
+      "current": 22
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_cancellation.py",
+      "baseline": 42,
+      "current": 43
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6381,
+      "current": 6385
+    }
+  ]
+}

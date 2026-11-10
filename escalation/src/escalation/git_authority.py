@@ -45,6 +45,7 @@ from typing import Any
 
 from shared.branch_names import canonical_queued_branch_name
 from shared.merge_state import MergeState
+from shared.task_read import TaskAbsent, TaskFound
 
 logger = logging.getLogger(__name__)
 
@@ -171,9 +172,9 @@ class TaskMetadataResult:
     """Task metadata PLUS whether the fetch that produced it actually worked.
 
     ``metadata == {}`` alone is not proof that a task carries no metadata —
-    it is equally what a missing harness, an absent scheduler or a raising
-    ``get_task`` produces.  Read it TOGETHER with ``unavailable``, which is
-    True only when the fetch FAILED.
+    it is equally what a missing harness, an absent scheduler, a raising
+    ``read_task`` or a failed read produces.  Read it TOGETHER with
+    ``unavailable``, which is True only when the fetch FAILED.
 
     Copies the shape of
     ``orchestrator/src/orchestrator/task_ground_truth.py::TruthReport``
@@ -197,16 +198,17 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     """Best-effort task metadata for the git-authority guards (task 3103).
 
     Returns ``metadata == {}`` on EVERY failure mode — no harness, no
-    ``scheduler`` attribute, ``get_task`` raising, or a None/metadata-less
-    task — and never raises.  A scheduler fault must degrade a single guard,
-    not swallow the whole probe.
+    ``scheduler`` attribute, ``read_task`` raising, ``read_task`` reporting a
+    failed read (a fused-memory error reply, a dispatch fault, an unreadable
+    envelope), or an absent or metadata-less task — and never raises.  A
+    scheduler fault must degrade a single guard, not swallow the whole probe.
 
     The ``{}`` is qualified by :attr:`TaskMetadataResult.unavailable`, which
-    separates a FAULT from a FACT: the first three modes above set it True
+    separates a FAULT from a FACT: the first four modes above set it True
     ("we could not read"), while a healthy read that finds no metadata — or
-    finds no such task — leaves it False ("there is genuinely nothing
-    there").  "No such task" is deliberately a fact, not a fault: the
-    discriminant is READ SUCCESS, because a present-but-metadata-less record
+    finds no such task (``TaskAbsent``) — leaves it False ("there is
+    genuinely nothing there").  "No such task" is deliberately a fact, not a
+    fault: the discriminant is READ SUCCESS, because a present-but-metadata-less record
     is equally unable to answer the degeneracy question yet is plainly not a
     fault, and flagging an absent record True would make ``unavailable``
     mean a fault OR a legitimately-absent task — the very conflation it
@@ -224,7 +226,7 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
 
     Args:
         harness: The orchestrator harness, duck-typed — only
-            ``harness.scheduler.get_task`` is ever touched, and ``None`` is
+            ``harness.scheduler.read_task`` is ever touched, and ``None`` is
             a supported value.  It was a ``create_server`` capture with no
             module-level fallback, so extraction makes it an explicit
             parameter.
@@ -235,7 +237,10 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
             ``'merge_request'``), interpolated into the degradation
             warning.  Without it a scheduler fault on the SUBMIT path was
             logged as a merge_status failure, so an operator grepping for a
-            submit-path degradation would not find it (review #3).
+            submit-path degradation would not find it (review #3).  Why a
+            read failed is logged once, by its owner
+            ``orchestrator/src/orchestrator/scheduler.py::Scheduler.read_task``;
+            this warning adds only the site and what it skipped.
     """
     if harness is None:
         return TaskMetadataResult(metadata={}, unavailable=True)
@@ -243,17 +248,24 @@ async def task_metadata(harness: Any, tid: str, *, site: str) -> TaskMetadataRes
     if scheduler is None:
         return TaskMetadataResult(metadata={}, unavailable=True)
     try:
-        task = await scheduler.get_task(tid)
+        read = await scheduler.read_task(tid)
     except Exception:
         logger.warning(
-            '%s: scheduler.get_task(%s) failed — proceeding without task '
+            '%s: scheduler.read_task(%s) raised — proceeding without task '
             'metadata (degeneracy check skipped)',
             site, tid, exc_info=True,
         )
         return TaskMetadataResult(metadata={}, unavailable=True)
-    if not task:
+    if isinstance(read, TaskAbsent):
         return TaskMetadataResult(metadata={})
-    return TaskMetadataResult(metadata=task.get('metadata') or {})
+    if isinstance(read, TaskFound):
+        return TaskMetadataResult(metadata=read.task.get('metadata') or {})
+    logger.warning(
+        '%s: task %s metadata unavailable — proceeding without it '
+        '(degeneracy check skipped)',
+        site, tid,
+    )
+    return TaskMetadataResult(metadata={}, unavailable=True)
 
 
 @dataclass(frozen=True)
