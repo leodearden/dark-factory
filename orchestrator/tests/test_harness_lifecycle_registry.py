@@ -51,7 +51,7 @@ from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, g
 # MIGRATION": the loop-stall monitor first, so it watches every other
 # service's whole life and stops last (task 7366); then escalation-server and
 # merge-worker (the recovery block depends on both being live); the remaining bespoke adapter (offline-lane)
-# and the seven BackgroundService sweeps follow, then the always-on services
+# and the eight BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
 # verify-admission watch, task 5628; the flake-debt drain, task 6934).
 _CANONICAL_ORDER = [
@@ -66,6 +66,7 @@ _CANONICAL_ORDER = [
     'main-tip-sweep',
     'no-landings-breaker',
     'deterministic-recon-sweep',
+    'scheduled-deploy-settle',
     'warm-lane-gc',
     'stale-service-restart',
     'merge-heartbeat',
@@ -109,6 +110,18 @@ class TestLifecycleRegistrationOrder:
         names = [s.name for s in harness._lifecycle.services]
         assert 'warm-lane-gc' not in names
         assert names == [n for n in _CANONICAL_ORDER if n != 'warm-lane-gc']
+
+    def test_scheduled_deploy_settle_follows_the_recon_sweep_gate(self, tmp_path: Path) -> None:
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.deterministic_recon_sweep_enabled = False
+        harness = Harness(config)
+
+        harness._build_lifecycle_registry()
+
+        assert harness._lifecycle is not None
+        gated = {'deterministic-recon-sweep', 'scheduled-deploy-settle'}
+        names = [s.name for s in harness._lifecycle.services]
+        assert names == [n for n in _CANONICAL_ORDER if n not in gated]
 
     @pytest.mark.asyncio
     async def test_the_first_service_is_a_live_loop_stall_monitor(

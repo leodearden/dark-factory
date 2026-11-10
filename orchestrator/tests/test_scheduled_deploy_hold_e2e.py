@@ -4,7 +4,8 @@ A self-target deterministic deploy goes ``done`` the moment its detached restart
 is merely scheduled.  Task 3189 depended on 7238, such a deploy, and dispatched
 onto pre-restart code.  These tests drive the REAL scheduler tick through
 ``acquire_next()`` against a backend-free session double and observe dispatch
-only through its returned assignment.
+only through its returned assignment; the startup tests drive the REAL
+``Harness.run()`` and observe the phase the settler wrote into the session.
 """
 
 from __future__ import annotations
@@ -12,14 +13,19 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from escalation.models import Escalation
 from test_delivered_check_gate_e2e import (
     _build_harness,
     _LocalDepMcpSession,
     _register_dependent,
     _run_tick,
 )
+from test_harness_verify_scope_reaper import _neutralise_heavy_startup
+
+from orchestrator.harness import Harness
 
 SELF_DEPLOY_ID = '7238'
 DEPENDENT_ID = '3189'
@@ -40,7 +46,10 @@ class _DeploySession(_LocalDepMcpSession):
             return self._update_task(arguments)
         if name == 'find_tasks_by_metadata':
             return self._find_tasks_by_metadata(arguments)
-        return await super().call_tool(name, arguments, timeout)
+        try:
+            return await super().call_tool(name, arguments, timeout)
+        except NotImplementedError:
+            return self._envelope(json.dumps({}))
 
     def _update_task(self, arguments: dict) -> dict:
         task_id = str(arguments['id'])
@@ -177,3 +186,75 @@ class TestDispatchHold:
         _set_phase(session, SELF_DEPLOY_ID, 'verified')
         await _run_tick(harness)
         assert len(_anchor_writes(session, DEPENDENT_ID)) == 1
+
+
+def _deploy_state(session: _DeploySession) -> dict:
+    return session.task(SELF_DEPLOY_ID)['metadata']['deploy_state']
+
+
+async def _run_startup(
+    tmp_path: Path, session: _DeploySession, monkeypatch, *, transient_state: str,
+) -> Harness:
+    """Drive the real ``Harness.run()`` startup to a clean until-idle exit."""
+    harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
+    _neutralise_heavy_startup(harness)
+    harness.scheduler.acquire_next = AsyncMock(return_value=None)
+    harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+
+    async def fake_sleep(_secs, *args, **kwargs):
+        return
+
+    monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+    async def inspect(unit: str) -> dict:
+        states = {f'orch-redeploy-restart-{SELF_DEPLOY_ID}.service': transient_state}
+        return {'ActiveState': states.get(unit, 'active'), 'MainPID': 0}
+
+    harness._recon_unit_inspector = inspect
+    await harness.run(prd_path=None, dry_run=False, force_dirty_start=True, until_idle=True)
+    return harness
+
+
+class TestStartupSettle:
+    @pytest.mark.asyncio
+    async def test_startup_stamps_verified_after_the_self_restart(
+        self, tmp_path: Path, session: _DeploySession, monkeypatch,
+    ) -> None:
+        await _run_startup(tmp_path, session, monkeypatch, transient_state='inactive')
+
+        assert _deploy_state(session)['phase'] == 'verified'
+        assert _deploy_state(session)['verified_at'] is not None
+
+    @pytest.mark.asyncio
+    async def test_startup_leaves_scheduled_while_the_sweep_still_runs(
+        self, tmp_path: Path, session: _DeploySession, monkeypatch,
+    ) -> None:
+        await _run_startup(tmp_path, session, monkeypatch, transient_state='active')
+
+        assert _deploy_state(session)['phase'] == 'scheduled'
+        assert _deploy_state(session)['verified_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_startup_stamps_failed_on_a_fire_time_failure(
+        self, tmp_path: Path, session: _DeploySession, monkeypatch,
+    ) -> None:
+        scheduled_at = datetime.fromisoformat(
+            session.task(SELF_DEPLOY_ID)['metadata']['before_done_scheduled_at']['at'],
+        )
+        harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
+        queue = harness._escalation_queue
+        assert queue is not None
+        queue.submit(Escalation(
+            id=queue.make_id(SELF_DEPLOY_ID),
+            task_id=SELF_DEPLOY_ID,
+            agent_role='orchestrator-deterministic',
+            severity='critical',
+            category='infra_issue',
+            summary='RP-4: scheduled restart sweep exited non-zero',
+            timestamp=(scheduled_at + timedelta(seconds=90)).isoformat(),
+            level=2,
+        ))
+
+        await _run_startup(tmp_path, session, monkeypatch, transient_state='inactive')
+
+        assert _deploy_state(session)['phase'] == 'failed'
