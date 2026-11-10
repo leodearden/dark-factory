@@ -41,24 +41,26 @@ WorkingDirectory=__REPO_ROOT__
 # a stopped or absent one stays down, and Step 2's port wait then fails the unit.
 ExecStartPre=/usr/bin/python3 __REPO_ROOT__/scripts/falkordb_aof_gate.py --compose-file __REPO_ROOT__/fused-memory/docker/docker-compose.yml
 # Step 1b: start the local embedder (compose service `embedder`, loopback :8420)
-# BEFORE the store wait, so its 107-123s cold model load overlaps that wait.
-# `up -d` returns once the container is started, not once the model is loaded.
-# The `-` prefix is load-bearing: an embedder failure (NVIDIA runtime error, port
-# clash, missing image) must leave fused-memory starting degraded (the startup
-# probe reports it), never fail the start and loop Restart=on-failure.
-ExecStartPre=-/usr/bin/docker compose -f __REPO_ROOT__/fused-memory/docker/docker-compose.yml up -d embedder
+# BEFORE the store wait, so its 107-123s cold model load begins as early as
+# possible. `up -d` returns once the container is started, not once the model
+# is loaded. --pull=never makes a missing image a fast non-zero exit instead of
+# a multi-GB pull that would outlive TimeoutStartSec and loop Restart=on-failure.
+# The `-` prefix turns every embedder failure into a degraded fused-memory start,
+# which the startup probe (task 6798) reports, never a failed start.
+ExecStartPre=-/usr/bin/docker compose -f __REPO_ROOT__/fused-memory/docker/docker-compose.yml up -d --pull=never embedder
 # Step 2: poll their published ports so our FIRST start stops losing the boot
 # race — the failure mode that cancelled the dependent orchestrators (which
 # had a hard Requires= on us) on 2026-05-27. Budget 280s < TimeoutStartSec=300.
 ExecStartPre=/home/leo/bin/wait-for-port.py --timeout 280 127.0.0.1:6379 127.0.0.1:6333
 # Step 3: bounded, never-blocking wait for the embedder port (`-` as in Step 1b).
-# START-TIMEOUT BUDGET, enforced by test_systemd_unit_config.py: the waits run
-# serially, so the Step 2 wait (280s) plus this one (15s) must stay below
-# TimeoutStartSec=300 (295 < 300). That is why the wait is short and sits AFTER
-# the store wait: the embedder's cold load has already been running since Step 1b,
-# so a boot that waited on the stores is normally ready here; a restart of this
-# unit alone finds it up. A slower embedder times this wait out and fused-memory
-# starts degraded rather than blocking.
+# START-TIMEOUT BUDGET: the waits run serially, 280s + 15s = 295 <
+# TimeoutStartSec=300, enforced by
+# fused-memory/tests/test_systemd_unit_config.py::TestEmbedderStartHooks.
+# A TCP accept on the docker-published :8420 shows the port is published, not
+# that the model is loaded. No wait that fits the budget covers the cold load,
+# so on a cold boot fused-memory starts before granite serves and the probe
+# reports the gap until it does. A restart of this unit alone finds the
+# embedder already serving.
 ExecStartPre=-/home/leo/bin/wait-for-port.py --timeout 15 127.0.0.1:8420
 ExecStart=__UV_PATH__ run --no-sync --project fused-memory \
   python -m fused_memory.server.main \
