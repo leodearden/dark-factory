@@ -95,6 +95,15 @@ class TestTreeObjects:
         }
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('ch', ['\x0b', '\x0c', '\x1c', '\x85', '\u2028'])
+    async def test_an_absent_path_holding_a_non_newline_line_break_is_one_answer(self, repo, tree, ch):
+        absent = f'nope/a{ch}b.py'
+
+        ids = await tree_objects.object_ids(repo, tree, ['tools/check.py', absent])
+
+        assert ids == {'tools/check.py': _git(repo, 'rev-parse', f'{tree}:tools/check.py'), absent: None}
+
+    @pytest.mark.asyncio
     async def test_blob_text_reads_a_file_and_is_none_for_an_absent_path(self, repo, tree):
         assert await tree_objects.blob_text(repo, tree, 'tools/check.py') == 'print("check")'
         assert await tree_objects.blob_text(repo, tree, 'tools/absent.py') is None

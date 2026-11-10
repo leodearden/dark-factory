@@ -299,6 +299,21 @@ class TestModuleUnitKeys:
         assert dict(before['module:alpha:test'].inputs)['tree:missing/x.py'] == 'absent'
         assert before['module:alpha:test'].key != after['module:alpha:test'].key
 
+    @pytest.mark.asyncio
+    async def test_scoped_targets_holding_unicode_whitespace_are_keyed_present_and_absent(self, repo):
+        assert _ALPHA_TEST_RUN.cmd is not None
+        present, absent = 'alpha/tests/test\xa0a.py', 'alpha/tests/test\x0ba.py'
+        tree = _edit(repo, present, 'def test_a():\n    pass\n')
+        scoped = VerifyPlan(runs=(PlannedRun(
+            'alpha', scope_to(_ALPHA_TEST_RUN.cmd, [present, absent]), ScopeKind.FILE_SCOPED,
+            'pytest: scoped to touched tests', (present, absent),
+        ),))
+
+        inputs = dict((await _unit_keys(repo, tree, plan=scoped))['module:alpha:test'].inputs)
+
+        assert inputs[f'tree:{present}'] == _git(repo, 'rev-parse', f'{tree}:{present}')
+        assert inputs[f'tree:{absent}'] == 'absent'
+
 
 class TestCommandPathCandidates:
     def test_a_shell_payload_is_split_and_never_itself_a_path(self):
