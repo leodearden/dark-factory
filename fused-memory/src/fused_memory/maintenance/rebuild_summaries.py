@@ -109,16 +109,21 @@ async def run_rebuild_summaries(
 
     Returns:
         RebuildResult with total_entities, stale_entities, rebuilt, skipped,
-        errors, and details.
+        errors, details, entities_complete, entities_incomplete_kind,
+        edges_complete, and edges_incomplete_kind.
     """
     async with maintenance_service(config_path) as (config, service):
         manager = RebuildSummariesManager(service=service, group_id=group_id)
         result = await manager.run(force=force, dry_run=dry_run)
-        logger.info(
+        log_fn = logger.info if result.corpus_proven_complete else logger.warning
+        log_fn(
             'run_rebuild_summaries complete: total=%d stale=%d rebuilt=%d '
-            'skipped=%d errors=%d dry_run=%s',
+            'skipped=%d errors=%d dry_run=%s entities_complete=%s '
+            'entities_incomplete_kind=%s edges_complete=%s edges_incomplete_kind=%s',
             result.total_entities, result.stale_entities, result.rebuilt,
-            result.skipped, result.errors, dry_run,
+            result.skipped, result.errors, dry_run, result.entities_complete,
+            result.entities_incomplete_kind, result.edges_complete,
+            result.edges_incomplete_kind,
         )
         return result
 
