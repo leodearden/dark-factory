@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import time
-from unittest.mock import AsyncMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -591,6 +592,42 @@ class TestAdjudicateMcpScoping:
         call_kwargs = mock_invoke.await_args.kwargs
         assert call_kwargs.get('mcp_config') == {'mcpServers': {}}
         assert call_kwargs.get('strict_mcp_config') is True
+
+
+@pytest.mark.asyncio
+class TestAdjudicatorInvocationLedger:
+    """Every adjudicator CLI call carries the curator ledger keys, so it lands one row in the CostStore invocations ledger."""
+
+    async def test_passes_ledger_keys(self):
+        from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
+
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel: Any = object()
+        adj = PathScopeAdjudicator(
+            PathScopeAdjudicatorConfig(), usage_gate=gate, cost_store=store_sentinel,
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=_OK)) as mock_invoke:
+            await _do_adjudicate(adj, project_id='proj-a')
+
+        assert mock_invoke.await_args is not None
+        kwargs = mock_invoke.await_args.kwargs
+        assert kwargs['cost_store'] is store_sentinel
+        assert kwargs['role'] == 'path_scope_adjudicator'
+        assert kwargs['run_id'] == 'fm-run-1'
+        assert kwargs['project_id'] == 'proj-a'
+        assert kwargs['usage_gate'] is gate
+
+    async def test_default_construction_passes_no_store_and_empty_run_id(self, tmp_path):
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=_OK)) as mock_invoke:
+            await _do_adjudicate(adj)
+
+        assert mock_invoke.await_args is not None
+        kwargs = mock_invoke.await_args.kwargs
+        assert kwargs['cost_store'] is None
+        assert kwargs['run_id'] == ''
+        assert kwargs['role'] == 'path_scope_adjudicator'
 
 
 # ===========================================================================
