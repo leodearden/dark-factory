@@ -7,6 +7,7 @@ import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import TypeVar
 
 import pytest
 from _quality_rows import NO_COST, NO_OUTCOMES, epochs_from, history
@@ -36,9 +37,18 @@ from shared.quality_series.stats import (
     wilson_interval,
 )
 
-from dashboard.data.datum import DatumState
-from dashboard.data.quality_series import Provenance, quality_series_view
+from dashboard.data.datum import DatumContractError, DatumState
+from dashboard.data.quality_series import (
+    Alarm,
+    AlarmDirection,
+    Provenance,
+    QualitySeriesContractError,
+    QualitySeriesInvariant,
+    quality_series_view,
+    validate_quality_series,
+)
 
+T = TypeVar('T')
 T0 = datetime(2026, 9, 1, tzinfo=UTC)
 AS_OF = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 FRESH = Provenance(as_of=AS_OF, state=DatumState.FRESH, reason=None, freshness_bound_seconds=1200)
@@ -360,6 +370,11 @@ def test_nothing_is_served_as_zero_for_an_unmeasured_landing() -> None:
 INVOCATION_METRICS = ('implementer_invocations', 'turns', 'all_role_usd')
 
 
+def _known(x: T | None) -> T:
+    assert x is not None
+    return x
+
+
 def _unit_outcome(rejections: int, reverifies: int) -> Outcomes:
     return replace(
         NO_OUTCOMES, rejected=rejections > 0, rejection_events=rejections,
@@ -405,7 +420,7 @@ def test_a_unit_count_is_unmeasured_on_every_member_when_its_source_is() -> None
 def test_a_count_headline_is_the_mean_with_a_seeded_bootstrap_band() -> None:
     rows = history(130, start=T0, cost=lambda i: _costed(1.0, invocations=1 + i % 4))
     block = rows[-100:]
-    values = [float(row.cost.implementer_invocations) for row in block]
+    values = [float(_known(row.cost.implementer_invocations)) for row in block]
     lo, hi = bootstrap_interval(
         values, statistics.fmean, content_seed(row.landing.task_id for row in block),
     )
@@ -443,7 +458,7 @@ def test_invocation_sourced_metrics_cover_orchestrated_landings_only() -> None:
 def test_a_cost_headline_is_the_median_with_a_seeded_bootstrap_band() -> None:
     rows = history(130, start=T0, cost=lambda i: _costed(0.5 + (i * 7) % 11))
     block = rows[-100:]
-    values = [row.cost.all_role_usd for row in block]
+    values = [_known(row.cost.all_role_usd) for row in block]
     lo, hi = bootstrap_interval(
         values, statistics.median, content_seed(row.landing.task_id for row in block),
     )
@@ -490,8 +505,8 @@ def _unit_points(rows: Sequence[LandingRow]) -> tuple[list[int], list[float]]:
     costs: dict[str, float] = {}
     for row in rows:
         unit = row.landing.unit_id
-        lines.setdefault(unit, row.cost.code_lines)
-        costs[unit] = costs.get(unit, 0.0) + row.cost.all_role_usd
+        lines.setdefault(unit, _known(row.cost.code_lines))
+        costs[unit] = costs.get(unit, 0.0) + _known(row.cost.all_role_usd)
     return list(lines.values()), list(costs.values())
 
 
@@ -709,3 +724,64 @@ def test_counts_costs_and_comparisons_serve_byte_equal_twice() -> None:
     second = json.dumps(_wire(rows, window=100, events=events), sort_keys=True)
 
     assert first == second
+
+
+# --- validate_quality_series ---------------------------------------------------------------
+
+
+def _series(rows: list[LandingRow]):
+    return quality_series_view(rows, window_landings=100, provenance=FRESH)
+
+
+def _with_metric(series, metric_id: str, **changes):
+    metrics = tuple(
+        replace(metric, **changes) if metric.metric_id == metric_id else metric
+        for metric in series.metrics
+    )
+    return replace(series, metrics=metrics)
+
+
+def test_a_built_series_passes_its_own_validation() -> None:
+    series = _series(_costed_units(150, shift_at=120))
+
+    validate_quality_series(series, AS_OF)
+
+
+def test_a_mis_sized_points_array_is_refused_by_name() -> None:
+    series = _series(history(40, start=T0, outcome=_rejections(_every(4, 40))))
+    broken = _with_metric(series, 'rejected', points=(0,) * 39)
+
+    with pytest.raises(QualitySeriesContractError) as refused:
+        validate_quality_series(broken, AS_OF)
+
+    assert refused.value.rule is QualitySeriesInvariant.ARRAY_LENGTH
+    assert 'rejected.points' in str(refused.value)
+
+
+def test_an_alarm_off_the_served_axis_is_refused() -> None:
+    series = _series(history(40, start=T0))
+    broken = _with_metric(series, 'rejected', alarms=(Alarm(999, 0, AlarmDirection.UP, None),))
+
+    with pytest.raises(QualitySeriesContractError) as refused:
+        validate_quality_series(broken, AS_OF)
+
+    assert refused.value.rule is QualitySeriesInvariant.ALARM_ON_AXIS
+
+
+def test_an_unordered_axis_is_refused() -> None:
+    series = _series(history(3, start=T0))
+    broken = replace(series, axis=tuple(reversed(series.axis)))
+
+    with pytest.raises(QualitySeriesContractError) as refused:
+        validate_quality_series(broken, AS_OF)
+
+    assert refused.value.rule is QualitySeriesInvariant.AXIS_ORDER
+
+
+def test_a_headline_breaking_the_envelope_is_refused() -> None:
+    series = _series(history(40, start=T0, outcome=_rejections(_every(4, 40))))
+    headline = next(m.headline for m in series.metrics if m.metric_id == 'rejected')
+    broken = _with_metric(series, 'rejected', headline=replace(headline, as_of=None))
+
+    with pytest.raises(DatumContractError):
+        validate_quality_series(broken, AS_OF)

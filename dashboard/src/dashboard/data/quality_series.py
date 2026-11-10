@@ -8,56 +8,99 @@ history; the window only slices what is served.
 
 from __future__ import annotations
 
+import enum
+import statistics
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 
 from shared.quality_series.landings import GitCrossCheck
-from shared.quality_series.rows import LandingRow, SourceEpochs
+from shared.quality_series.rows import (
+    CharterClassSource,
+    LandingRow,
+    SourceEpochs,
+    module_allocation,
+    unit_heads,
+)
 from shared.quality_series.stats import (
     BaselineState,
+    CostEffect,
+    Effect,
+    NotYet,
     RateState,
     RegimeEvent,
     baseline_rate,
+    before_after_cost,
+    before_after_rate,
     block_rate_datum,
+    bootstrap_interval,
+    content_seed,
+    cost_fit,
     cusum_alarms,
     cusum_design,
     ewma_limits,
     ewma_series,
     explain_alarm,
+    log_residuals,
+    reference_cost,
     regime_segments,
     wilson_interval,
 )
 
-from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumInvariant,
+    DatumState,
+    unknown_datum,
+    validate_datum,
+)
 
 __all__ = [
     'Alarm',
     'AlarmDirection',
     'AxisPoint',
     'Baseline',
+    'BeforeAfter',
+    'ComparisonState',
+    'CostModel',
     'Ewma',
     'Headline',
     'HeadlineForm',
     'MetricKind',
     'MetricSeries',
     'MetricSource',
+    'ModuleRow',
     'Provenance',
     'QualitySeries',
+    'QualitySeriesContractError',
+    'QualitySeriesInvariant',
     'Rolling',
     'Rule',
     'quality_series_view',
+    'validate_quality_series',
 ]
 
 HEADLINE_LANDINGS = 100
 """The headline block and the rolling band: the last this-many measured landings."""
 MIN_MEASURED = 30
-"""Below this many measured landings a rate is unknown."""
+"""Below this many measured landings a headline is unknown."""
 EWMA_LAMBDA = 0.05
 EWMA_SIGMAS = 3.0
 NO_PRODUCER = 'no producer has written here'
+COST_METRIC = 'all_role_usd'
+COST_BASELINE_UNITS = 200
+COST_MIN_BASELINE_UNITS = 100
+COST_MIN_LINES = 5
+SIGN_P0 = 0.5
+"""A residual's sign against the baseline's median residual is a fair coin while cost holds."""
+RECENT = timedelta(days=28)
+"""The module table's window and the landing velocity's, ending at the newest landing."""
+MODULE_MIN_LINES = 1000
+MODULE_MIN_TASKS = 3
 
 
 def _iso(at: datetime | None) -> str | None:
@@ -71,7 +114,7 @@ class MetricKind(StrEnum):
 
 
 class MetricSource(StrEnum):
-    """The runs.db source a metric is measured from; each names a SourceEpochs field."""
+    """Where a metric is measured from: a runs.db source, or a store with no writer yet."""
 
     REJECTIONS = 'rejections'
     MERGE_VERIFY = 'merge_verify'
@@ -79,6 +122,9 @@ class MetricSource(StrEnum):
     FLAKE_OCCURRENCE = 'flake_occurrence'
     INVOCATION_TURNS = 'invocation_turns'
     INVOCATIONS = 'invocations'
+    TASK_RESULTS = 'task_results'
+    CHARTER_CLASS = 'charter_class'
+    LATE_EVENTS = 'late_events'
 
 
 _EPOCH: dict[MetricSource, Callable[[SourceEpochs], datetime | None]] = {
@@ -88,6 +134,18 @@ _EPOCH: dict[MetricSource, Callable[[SourceEpochs], datetime | None]] = {
     MetricSource.FLAKE_OCCURRENCE: lambda epochs: epochs.flake_occurrence,
     MetricSource.INVOCATION_TURNS: lambda epochs: epochs.invocation_turns,
     MetricSource.INVOCATIONS: lambda epochs: epochs.invocations,
+}
+
+_RECORDED_IN: dict[MetricSource, str] = {
+    MetricSource.REJECTIONS: 'runs.db merge_blocked',
+    MetricSource.MERGE_VERIFY: 'runs.db merge_verify',
+    MetricSource.REVIEW_COMPLETED: 'runs.db review_completed',
+    MetricSource.FLAKE_OCCURRENCE: 'runs.db flake_occurrence',
+    MetricSource.INVOCATION_TURNS: 'runs.db invocation_end turns',
+    MetricSource.INVOCATIONS: 'runs.db invocations',
+    MetricSource.TASK_RESULTS: 'runs.db task_results.execute_iterations',
+    MetricSource.CHARTER_CLASS: 'runs.db task_results.charter_class',
+    MetricSource.LATE_EVENTS: 'quality.db late_events',
 }
 
 
@@ -101,6 +159,11 @@ class HeadlineForm(StrEnum):
 class AlarmDirection(StrEnum):
     UP = 'up'
     DOWN = 'down'
+
+
+class ComparisonState(StrEnum):
+    MEASURED = 'measured'
+    NOT_YET = 'not_yet'
 
 
 @dataclass(frozen=True)
@@ -180,12 +243,18 @@ class Headline:
 
 @dataclass(frozen=True)
 class Rolling:
-    """Per axis point: the band over the last measured landings up to it, None below MIN_MEASURED."""
+    """Per axis point over the last measured landings up to it; None below MIN_MEASURED.
+
+    A rate's band is its Wilson interval; a count or a cost serves its centre alone.
+    """
 
     center: tuple[float | None, ...]
     lo: tuple[float | None, ...]
     hi: tuple[float | None, ...]
     n: tuple[int, ...]
+
+    def sliced(self, start: int) -> Rolling:
+        return Rolling(self.center[start:], self.lo[start:], self.hi[start:], self.n[start:])
 
     def to_wire(self) -> dict[str, object]:
         return {'center': list(self.center), 'lo': list(self.lo), 'hi': list(self.hi),
@@ -230,6 +299,74 @@ NO_BASELINE = Baseline(None, None, None)
 
 
 @dataclass(frozen=True)
+class CostModel:
+    """The log–log fit of unit cost on unit lines in force at the newest unit; absent: all None."""
+
+    a: float | None
+    b: float | None
+    reference_cost_100: float | None
+    residual_median: float | None
+    state: BaselineState | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'a': self.a, 'b': self.b, 'reference_cost_100': self.reference_cost_100,
+                'residual_median': self.residual_median,
+                'state': None if self.state is None else self.state.value}
+
+
+NO_COST_MODEL = CostModel(None, None, None, None, None)
+
+
+@dataclass(frozen=True)
+class ModuleRow:
+    """A module's share of the recent units' lines and cost; module None is the no-src bucket."""
+
+    module: str | None
+    landings: int
+    tasks: int
+    allocated_lines: float
+    allocated_usd: float
+    usd_per_100_lines: float | None
+    ranked: bool
+
+    def to_wire(self) -> dict[str, object]:
+        return {'module': self.module, 'landings': self.landings, 'tasks': self.tasks,
+                'allocated_lines': self.allocated_lines, 'allocated_usd': self.allocated_usd,
+                'usd_per_100_lines': self.usd_per_100_lines, 'ranked': self.ranked}
+
+
+@dataclass(frozen=True)
+class BeforeAfter:
+    """One marker's effect on one metric: a rate difference or a cost ratio, or not yet."""
+
+    marker_id: str
+    metric: str
+    n_before: int
+    n_after: int
+    effect: float | None
+    lo: float | None
+    hi: float | None
+    state: ComparisonState
+    eta_days: float | None
+    min_detectable: float | None
+
+    @classmethod
+    def of(cls, marker_id: str, metric: str, result: Effect | CostEffect | NotYet) -> BeforeAfter:
+        if isinstance(result, NotYet):
+            return cls(marker_id, metric, result.n_before, result.n_after, None, None, None,
+                       ComparisonState.NOT_YET, result.eta_days, result.min_detectable)
+        effect = result.d if isinstance(result, Effect) else result.ratio
+        return cls(marker_id, metric, result.n_before, result.n_after, effect, result.lo,
+                   result.hi, ComparisonState.MEASURED, None, None)
+
+    def to_wire(self) -> dict[str, object]:
+        return {'marker_id': self.marker_id, 'metric': self.metric, 'n_before': self.n_before,
+                'n_after': self.n_after, 'effect': self.effect, 'lo': self.lo, 'hi': self.hi,
+                'state': self.state.value, 'eta_days': self.eta_days,
+                'min_detectable': self.min_detectable}
+
+
+@dataclass(frozen=True)
 class MetricSeries:
     metric_id: str
     kind: MetricKind
@@ -264,20 +401,40 @@ def _git_check_wire(check: GitCrossCheck | None) -> dict[str, int] | None:
 class QualitySeries:
     axis: tuple[AxisPoint, ...]
     metrics: tuple[MetricSeries, ...]
+    cost_model: CostModel
+    modules: tuple[ModuleRow, ...]
+    before_after: tuple[BeforeAfter, ...]
     git_check: GitCrossCheck | None
 
     def to_wire(self) -> dict[str, object]:
         return {
             'axis': [point.to_wire() for point in self.axis],
             'metrics': {metric.metric_id: metric.to_wire() for metric in self.metrics},
-            'cost_model': None,
-            'modules': [],
-            'before_after': [],
+            'cost_model': self.cost_model.to_wire(),
+            'modules': [row.to_wire() for row in self.modules],
+            'before_after': [comparison.to_wire() for comparison in self.before_after],
             'git_check': _git_check_wire(self.git_check),
         }
 
 
+Values = Callable[[Sequence[LandingRow]], list[float | None]]
 Since = Callable[[Sequence[LandingRow]], datetime | None]
+
+
+def _per_landing(value: Callable[[LandingRow], float | None]) -> Values:
+    return lambda rows: [value(row) for row in rows]
+
+
+def _once_per_unit(value: Callable[[LandingRow], float | None]) -> Values:
+    """A unit value copied to every member, counted at the unit's head and 0 on the others."""
+
+    def values(rows: Sequence[LandingRow]) -> list[float | None]:
+        heads = {row.landing.ordinal for row in unit_heads(rows)}
+        xs = [value(row) for row in rows]
+        return [x if x is None or row.landing.ordinal in heads else 0
+                for row, x in zip(rows, xs, strict=True)]
+
+    return values
 
 
 def _source_began(source: MetricSource) -> Since:
@@ -285,16 +442,30 @@ def _source_began(source: MetricSource) -> Since:
     return lambda rows: _EPOCH[source](rows[-1].rule_vintage) if rows else None
 
 
-def _first_measured(value: Callable[[LandingRow], float | None]) -> Since:
-    """The first landing the value is known for: a source backfilled before its runs.db epoch."""
-    return lambda rows: next(
-        (row.landing.landed_at for row in rows if value(row) is not None), None,
-    )
+def _first_measured(values: Values) -> Since:
+    """The first landing the value is known for: a source with no runs.db epoch of its own."""
+
+    def since(rows: Sequence[LandingRow]) -> datetime | None:
+        known = (row.landing.landed_at for row, x in zip(rows, values(rows), strict=True)
+                 if x is not None)
+        return next(known, None)
+
+    return since
+
+
+def _once_typed(rows: Sequence[LandingRow]) -> datetime | None:
+    """Every landing, regex backfill included, once the typed charter_class has been written."""
+    typed = any(row.cost.charter_class_source is CharterClassSource.CHARTER_CLASS for row in rows)
+    return rows[0].landing.landed_at if typed else None
+
+
+def _never(rows: Sequence[LandingRow]) -> datetime | None:
+    return None
 
 
 @dataclass(frozen=True)
 class MetricSpec:
-    """One served metric: what it reads from a landing row and how its rule is labelled."""
+    """One served metric: what it reads from the landing rows and how its rule is labelled."""
 
     metric_id: str
     kind: MetricKind
@@ -303,7 +474,7 @@ class MetricSpec:
     counts: str
     excludes: str
     population: str
-    value: Callable[[LandingRow], float | None]
+    values: Values
     measured_since: Since
 
 
@@ -324,13 +495,23 @@ def _turns_capped(row: LandingRow) -> int | None:
     return None if row.cost.turns is None else int(row.cost.turns_capped)
 
 
+def _metric(
+    metric_id: str, kind: MetricKind, source: MetricSource, values: Values, *, unit: str,
+    counts: str, excludes: str, population: str = 'landings', since: Since | None = None,
+) -> MetricSpec:
+    return MetricSpec(metric_id, kind, source, unit, counts, excludes, population, values,
+                      since if since is not None else _source_began(source))
+
+
 def _rate(
     metric_id: str, source: MetricSource, value: Callable[[LandingRow], int | None], *,
     counts: str, excludes: str, population: str = 'landings', since: Since | None = None,
 ) -> MetricSpec:
-    return MetricSpec(metric_id, MetricKind.RATE, source, 'share', counts, excludes, population,
-                      value, since if since is not None else _source_began(source))
+    return _metric(metric_id, MetricKind.RATE, source, _per_landing(value), unit='share',
+                   counts=counts, excludes=excludes, population=population, since=since)
 
+
+ORCHESTRATED_ONLY = 'orchestrated landings only'
 
 CATALOGUE: tuple[MetricSpec, ...] = (
     _rate('rejected', MetricSource.REJECTIONS, lambda row: _flag(row.outcomes.rejected),
@@ -352,24 +533,68 @@ CATALOGUE: tuple[MetricSpec, ...] = (
           counts='landings reviewed in two or more rounds',
           excludes='landings with no review round count',
           population='landings with a review round count',
-          since=_first_measured(_review_rounds_ge2)),
+          since=_first_measured(_per_landing(_review_rounds_ge2))),
     _rate('turns_capped', MetricSource.INVOCATION_TURNS, _turns_capped,
           counts='landings whose implementer-class invocations hit the turns cap',
           excludes='landings with no implementer-class turn count',
           population='landings with an implementer-class turn count'),
+    _rate('charter_blocked', MetricSource.CHARTER_CLASS,
+          lambda row: int(row.cost.charter_class is not None),
+          counts='landings whose task was blocked by its charter, regex backfill included',
+          excludes='every landing until the typed charter_class is first written',
+          since=_once_typed),
+    _metric('rejections_per_landing', MetricKind.COUNT, MetricSource.REJECTIONS,
+            _once_per_unit(lambda row: row.outcomes.rejection_events),
+            unit='rejections per landing',
+            counts='post-merge verify blocks, once per verify unit at its first landing',
+            excludes='landings before the first categorised merge_blocked'),
+    _metric('reverifies_per_landing', MetricKind.COUNT, MetricSource.MERGE_VERIFY,
+            _once_per_unit(lambda row: row.outcomes.reverify_count),
+            unit='re-verifies per landing',
+            counts='merge_verify runs beyond the first, once per verify unit at its first landing',
+            excludes='landings before the first merge_verify'),
+    _metric('implementer_invocations', MetricKind.COUNT, MetricSource.INVOCATIONS,
+            _per_landing(lambda row: row.cost.implementer_invocations), unit='invocations',
+            counts='implementer-class invocations per landing',
+            excludes=f'{ORCHESTRATED_ONLY}: landings with no invocation',
+            population='orchestrated landings'),
+    _metric('turns', MetricKind.COUNT, MetricSource.INVOCATION_TURNS,
+            _per_landing(lambda row: row.cost.turns), unit='turns',
+            counts='implementer-class turns per landing',
+            excludes=f'{ORCHESTRATED_ONLY}: landings with no implementer-class turn count',
+            population='orchestrated landings'),
+    _metric('execute_iterations', MetricKind.COUNT, MetricSource.TASK_RESULTS,
+            _per_landing(lambda row: row.cost.execute_iterations), unit='iterations',
+            counts='execute iterations summed over the dispatches that produced the landing',
+            excludes='landings with no dispatch row',
+            population='landings with a dispatch row',
+            since=_first_measured(_per_landing(lambda row: row.cost.execute_iterations))),
+    _metric('reverts', MetricKind.COUNT, MetricSource.LATE_EVENTS,
+            lambda rows: [None] * len(rows), unit='reverts',
+            counts='later first-parent commits reverting the landing',
+            excludes='every landing until late_events has a writer', since=_never),
+    _metric(COST_METRIC, MetricKind.COST, MetricSource.INVOCATIONS,
+            _per_landing(lambda row: row.cost.all_role_usd), unit='usd',
+            counts='all-role invocation cost per landing',
+            excludes=f'{ORCHESTRATED_ONLY}: landings with no invocation',
+            population='orchestrated landings'),
 )
 
 
-def _measured(spec: MetricSpec, rows: Sequence[LandingRow], since: datetime | None) -> list[float | None]:
+def _gated(spec: MetricSpec, rows: Sequence[LandingRow], since: datetime | None) -> list[float | None]:
     """The metric per landing; None for a landing before its source began, never 0."""
     return [
-        None if since is None or row.landing.landed_at < since else spec.value(row)
-        for row in rows
+        None if since is None or row.landing.landed_at < since else x
+        for row, x in zip(rows, spec.values(rows), strict=True)
     ]
 
 
 def _flags(xs: Sequence[float | None]) -> list[int | None]:
     return [None if x is None else int(x) for x in xs]
+
+
+def _markers(events: Iterable[RegimeEvent], series_id: str) -> list[RegimeEvent]:
+    return [event for event in events if event.applies_to(series_id) and not event.artefact]
 
 
 def _rolling_wilson(flags: Sequence[int | None]) -> Rolling:
@@ -398,6 +623,22 @@ def _rolling_wilson(flags: Sequence[int | None]) -> Rolling:
     return Rolling(tuple(center), tuple(lo), tuple(hi), tuple(n))
 
 
+Statistic = Callable[[Sequence[float]], float]
+
+
+def _rolling_centre(xs: Sequence[float | None], stat: Statistic) -> Rolling:
+    block: deque[float] = deque(maxlen=HEADLINE_LANDINGS)
+    center: list[float | None] = []
+    n: list[int] = []
+    for x in xs:
+        if x is not None:
+            block.append(float(x))
+        n.append(len(block))
+        center.append(stat(list(block)) if len(block) >= MIN_MEASURED else None)
+    holes: tuple[float | None, ...] = (None,) * len(xs)
+    return Rolling(tuple(center), holes, holes, tuple(n))
+
+
 @dataclass(frozen=True)
 class _Chart:
     baseline: Baseline
@@ -406,24 +647,29 @@ class _Chart:
     alarms: tuple[Alarm, ...]
 
 
+def _excluding_artefacts(
+    xs: Sequence[float | None], landed_at: Sequence[datetime], events: Sequence[RegimeEvent],
+    series_id: str,
+) -> list[float | None]:
+    excluded = regime_segments(landed_at, events, series_id).excluded
+    return [None if index in excluded else x for index, x in enumerate(xs)]
+
+
 def _control_chart(
-    series_id: str, flags: Sequence[int | None], rows: Sequence[LandingRow],
-    events: Sequence[RegimeEvent],
+    series_id: str, charted: Sequence[int | None], view: _View,
 ) -> _Chart:
     """EWMA and two one-sided CUSUMs per regime segment, against the baseline in force.
 
     A segment's own baseline is in force once it has one; until then the previous segment's
     stays in force, so a shift just after a marker still alarms and the marker explains it.
     """
-    landed_at = [row.landing.landed_at for row in rows]
-    regimes = regime_segments(landed_at, events, series_id)
-    charted = [None if index in regimes.excluded else x for index, x in enumerate(flags)]
-    markers = [event for event in events if event.applies_to(series_id) and not event.artefact]
+    rows, landed_at = view.rows, view.landed_at
+    markers = _markers(view.events, series_id)
     line: list[float | None] = [None] * len(rows)
     ucl: list[float | None] = [None] * len(rows)
     alarms: list[Alarm] = []
     in_force = NO_BASELINE
-    for segment in regimes.segments:
+    for segment in regime_segments(landed_at, view.events, series_id).segments:
         p0, state = baseline_rate(charted[segment.start:segment.end])
         if p0 is not None:
             in_force = Baseline(p0, state, rows[segment.start].landing.ordinal)
@@ -435,16 +681,43 @@ def _control_chart(
         for t, (index, z) in enumerate(zip(indices, ewma_series(xs, EWMA_LAMBDA, p0), strict=True), 1):
             line[index] = z
             ucl[index] = ewma_limits(p0, EWMA_LAMBDA, EWMA_SIGMAS, t).ucl
-        design = cusum_design(p0)
-        for direction, p1 in ((AlarmDirection.UP, design.p1_up), (AlarmDirection.DOWN, design.p1_down)):
-            for alarm_at, onset_at in cusum_alarms(xs, p0, p1, design.h):
-                alarm, onset = indices[alarm_at], indices[onset_at]
-                alarms.append(Alarm(
-                    rows[alarm].landing.ordinal, rows[onset].landing.ordinal, direction,
-                    explain_alarm(onset, landed_at[onset], markers, landed_at),
-                ))
+        alarms.extend(_cusum(xs, p0, [rows[i].landing.ordinal for i in indices], indices,
+                             markers, landed_at))
     alarms.sort(key=lambda alarm: (alarm.ordinal, alarm.direction.value))
     return _Chart(in_force, tuple(line), tuple(ucl), tuple(alarms))
+
+
+def _cusum(
+    xs: Sequence[int], p0: float, ordinals: Sequence[int], indices: Sequence[int],
+    markers: Sequence[RegimeEvent], landed_at: Sequence[datetime],
+) -> list[Alarm]:
+    """Both one-sided CUSUMs over *xs*; *ordinals* and *indices* place each x on the axis."""
+    design = cusum_design(p0)
+    alarms: list[Alarm] = []
+    for direction, p1 in ((AlarmDirection.UP, design.p1_up), (AlarmDirection.DOWN, design.p1_down)):
+        for alarm_at, onset_at in cusum_alarms(xs, p0, p1, design.h):
+            onset = indices[onset_at]
+            alarms.append(Alarm(
+                ordinals[alarm_at], ordinals[onset_at], direction,
+                explain_alarm(onset, landed_at[onset], markers, landed_at),
+            ))
+    return alarms
+
+
+def _rate_comparisons(
+    metric_id: str, charted: Sequence[int | None], view: _View,
+) -> tuple[BeforeAfter, ...]:
+    """Each marker's Newcombe difference: the segment before it against the segment it opens."""
+    segments = regime_segments(view.landed_at, view.events, metric_id).segments
+    comparisons: list[BeforeAfter] = []
+    for before, after in pairwise(segments):
+        xs_before = charted[before.start:before.end]
+        if after.event_id is None or all(x is None for x in xs_before):
+            continue
+        comparisons.append(BeforeAfter.of(after.event_id, metric_id, before_after_rate(
+            xs_before, charted[after.start:after.end], landings_per_day=view.landings_per_day,
+        )))
+    return tuple(comparisons)
 
 
 def _unmeasured_headline(
@@ -454,7 +727,7 @@ def _unmeasured_headline(
     if not rows:
         return provenance.unknown('no landing is stored for this project')
     return provenance.unknown(
-        f'{NO_PRODUCER}: {spec.source.value} has recorded nothing for this project',
+        f'{NO_PRODUCER}: {_RECORDED_IN[spec.source]} has recorded nothing for this project',
     )
 
 
@@ -463,15 +736,181 @@ def _since_note(spec: MetricSpec, since: datetime) -> str:
 
 
 def _rate_headline(
-    spec: MetricSpec, flags: Sequence[int | None], rows: Sequence[LandingRow],
-    since: datetime, provenance: Provenance,
+    spec: MetricSpec, flags: Sequence[int | None], view: _View, since: datetime,
 ) -> Datum[Headline]:
-    block = block_rate_datum(flags, [row.landing.task_id for row in rows],
+    block = block_rate_datum(flags, [row.landing.task_id for row in view.rows],
                              n_block=HEADLINE_LANDINGS, n_min=MIN_MEASURED)
     if block.rate is None or block.lo is None or block.hi is None:
-        return provenance.unknown(f'{block.reason}; {_since_note(spec, since)}')
+        return view.provenance.unknown(f'{block.reason}; {_since_note(spec, since)}')
     form = HeadlineForm.RATE if block.state is RateState.RATE else HeadlineForm.K_OF_N
-    return provenance.measured(Headline(form, block.n, block.k, block.rate, block.lo, block.hi))
+    return view.provenance.measured(Headline(form, block.n, block.k, block.rate, block.lo, block.hi))
+
+
+def _bootstrap_headline(
+    spec: MetricSpec, xs: Sequence[float | None], view: _View, since: datetime,
+    form: HeadlineForm, stat: Statistic,
+) -> Datum[Headline]:
+    """*stat* over the last measured landings with a band seeded by their task ids."""
+    block = [(float(x), row.landing.task_id) for x, row in zip(xs, view.rows, strict=True)
+             if x is not None][-HEADLINE_LANDINGS:]
+    if len(block) < MIN_MEASURED:
+        return view.provenance.unknown(
+            f'n={len(block)} measured landings; a {form.value} needs >= {MIN_MEASURED}; '
+            f'{_since_note(spec, since)}',
+        )
+    values = [x for x, _ in block]
+    lo, hi = bootstrap_interval(values, stat, content_seed(task_id for _, task_id in block))
+    return view.provenance.measured(Headline(form, len(block), None, stat(values), lo, hi))
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """A verify unit whose lines and every member's cost are known: one cost-vs-lines point."""
+
+    head: int
+    ordinal: int
+    landed_at: datetime
+    lines: int
+    usd: float
+    modules: tuple[tuple[str, float], ...]
+    task_ids: tuple[str, ...]
+
+
+def _costed_units(rows: Sequence[LandingRow]) -> list[_Unit]:
+    members: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        members.setdefault(row.landing.unit_id, []).append(index)
+    units: list[_Unit] = []
+    for indices in members.values():
+        head = rows[indices[0]]
+        costs = [rows[i].cost.all_role_usd for i in indices]
+        if head.cost.code_lines is None or any(usd is None for usd in costs):
+            continue
+        units.append(_Unit(
+            indices[0], head.landing.ordinal, head.landing.landed_at, head.cost.code_lines,
+            sum(usd for usd in costs if usd is not None), module_allocation(head),
+            tuple(rows[i].landing.task_id for i in indices),
+        ))
+    return units
+
+
+def _fittable(units: Sequence[_Unit]) -> bool:
+    return len({unit.lines for unit in units}) >= 2
+
+
+def _cost_model(baseline: Sequence[_Unit]) -> CostModel:
+    """The fit over a segment's first units; absent below COST_MIN_BASELINE_UNITS."""
+    if len(baseline) < COST_MIN_BASELINE_UNITS or not _fittable(baseline):
+        return NO_COST_MODEL
+    lines = [unit.lines for unit in baseline]
+    costs = [unit.usd for unit in baseline]
+    a, b = cost_fit(lines, costs, COST_MIN_LINES)
+    residuals = [r for r in log_residuals(lines, costs, a, b) if r is not None]
+    state = (BaselineState.FROZEN if len(baseline) >= COST_BASELINE_UNITS
+             else BaselineState.PROVISIONAL)
+    return CostModel(a, b, reference_cost(lines, costs, min_lines=COST_MIN_LINES),
+                     statistics.median(residuals), state)
+
+
+@dataclass(frozen=True)
+class _CostAnalysis:
+    """The cost model in force, the sign-of-residual alarms and the cost comparisons."""
+
+    model: CostModel
+    alarms: tuple[Alarm, ...]
+    comparisons: tuple[BeforeAfter, ...]
+
+
+def _cost_analysis(
+    rows: Sequence[LandingRow], events: Sequence[RegimeEvent], landings_per_day: float | None,
+) -> _CostAnalysis:
+    """Per unit, never per landing: a train's members share one merge's lines."""
+    units = [unit for unit in _costed_units(rows)
+             if unit.lines >= COST_MIN_LINES and unit.usd > 0]
+    regimes = regime_segments([unit.landed_at for unit in units], events, COST_METRIC)
+    segments = [
+        [unit for i, unit in enumerate(units[segment.start:segment.end], segment.start)
+         if i not in regimes.excluded]
+        for segment in regimes.segments
+    ]
+    landed_at = [row.landing.landed_at for row in rows]
+    markers = _markers(events, COST_METRIC)
+    model = NO_COST_MODEL
+    alarms: list[Alarm] = []
+    for segment in segments:
+        fitted = _cost_model(segment[:COST_BASELINE_UNITS])
+        model = fitted if fitted.state is not None else model
+        if model.a is None or model.b is None or model.residual_median is None:
+            continue
+        residuals = log_residuals([u.lines for u in segment], [u.usd for u in segment],
+                                  model.a, model.b)
+        signs = [int(r is not None and r > model.residual_median) for r in residuals]
+        alarms.extend(_cusum(signs, SIGN_P0, [u.ordinal for u in segment],
+                             [u.head for u in segment], markers, landed_at))
+    alarms.sort(key=lambda alarm: (alarm.ordinal, alarm.direction.value))
+    comparisons = tuple(
+        BeforeAfter.of(after_id, COST_METRIC, before_after_cost(
+            [u.lines for u in before], [u.usd for u in before],
+            [u.lines for u in after], [u.usd for u in after],
+            seed=content_seed(task_id for u in (*before, *after) for task_id in u.task_ids),
+            min_lines=COST_MIN_LINES, landings_per_day=landings_per_day,
+        ))
+        for (before, _), (after, after_id) in pairwise(
+            zip(segments, (segment.event_id for segment in regimes.segments), strict=True),
+        )
+        if after_id is not None and _fittable(before)
+    )
+    return _CostAnalysis(model, tuple(alarms), comparisons)
+
+
+@dataclass
+class _ModuleTally:
+    landings: int = 0
+    tasks: set[str] = field(default_factory=set)
+    lines: float = 0.0
+    usd: float = 0.0
+
+    def add(self, unit: _Unit, share: float) -> None:
+        self.landings += len(unit.task_ids)
+        self.tasks.update(unit.task_ids)
+        self.lines += share * unit.lines
+        self.usd += share * unit.usd
+
+    def row(self, module: str | None) -> ModuleRow:
+        ranked = (module is not None and self.lines >= MODULE_MIN_LINES
+                  and len(self.tasks) >= MODULE_MIN_TASKS)
+        return ModuleRow(module, self.landings, len(self.tasks), self.lines, self.usd,
+                         100 * self.usd / self.lines if ranked else None, ranked)
+
+
+def _module_rows(rows: Sequence[LandingRow]) -> tuple[ModuleRow, ...]:
+    """The units of the RECENT window before the newest landing, allocated by src-line share.
+
+    Ranked modules first, costliest per line first; then the unranked; the no-src bucket last.
+    """
+    if not rows:
+        return ()
+    since = rows[-1].landing.landed_at - RECENT
+    tallies: dict[str | None, _ModuleTally] = {}
+    for unit in _costed_units(rows):
+        if unit.landed_at < since:
+            continue
+        for module, share in unit.modules or ((None, 1.0),):
+            tallies.setdefault(module, _ModuleTally()).add(unit, share)
+    served = [tally.row(module) for module, tally in tallies.items()]
+    return tuple(sorted(served, key=lambda row: (
+        not row.ranked, row.module is None, -(row.usd_per_100_lines or 0.0), row.module or '',
+    )))
+
+
+def _landings_per_day(rows: Sequence[LandingRow]) -> float | None:
+    """The landing velocity over the RECENT window before the newest landing."""
+    if len(rows) < 2:
+        return None
+    newest = rows[-1].landing.landed_at
+    recent = [row for row in rows if row.landing.landed_at >= newest - RECENT]
+    span_days = (newest - recent[0].landing.landed_at).total_seconds() / 86400
+    return (len(recent) - 1) / span_days if span_days > 0 else None
 
 
 @dataclass(frozen=True)
@@ -479,9 +918,12 @@ class _View:
     """The rows, the served slice's first index, and what every metric is computed against."""
 
     rows: Sequence[LandingRow]
+    landed_at: tuple[datetime, ...]
     start: int
     events: Sequence[RegimeEvent]
     provenance: Provenance
+    landings_per_day: float | None
+    cost: _CostAnalysis
 
     def served(self, values: Sequence[float | None]) -> tuple[float | None, ...]:
         return tuple(values[self.start:])
@@ -492,31 +934,80 @@ class _View:
         first = self.rows[self.start].landing.ordinal
         return tuple(alarm for alarm in alarms if alarm.ordinal >= first)
 
+    def rule(self, spec: MetricSpec, since: datetime | None) -> Rule:
+        return Rule(spec.counts, spec.excludes, spec.population, HEADLINE_LANDINGS, since,
+                    spec.source)
 
-def _rate_series(spec: MetricSpec, view: _View) -> MetricSeries:
+
+@dataclass(frozen=True)
+class _Served:
+    series: MetricSeries
+    comparisons: tuple[BeforeAfter, ...]
+
+
+def _rate_series(spec: MetricSpec, view: _View) -> _Served:
     since = spec.measured_since(view.rows)
-    flags = _flags(_measured(spec, view.rows, since))
-    chart = _control_chart(spec.metric_id, flags, view.rows, view.events)
-    rolling = _rolling_wilson(flags)
+    flags = _flags(_gated(spec, view.rows, since))
+    charted = _flags(_excluding_artefacts(flags, view.landed_at, view.events, spec.metric_id))
+    chart = _control_chart(spec.metric_id, charted, view)
     line = view.served(chart.line)
-    ewma = Ewma(line, view.served(chart.ucl)) if any(z is not None for z in line) else None
-    return MetricSeries(
+    series = MetricSeries(
         metric_id=spec.metric_id,
         kind=spec.kind,
-        rule=Rule(spec.counts, spec.excludes, spec.population, HEADLINE_LANDINGS, since,
-                  spec.source),
+        rule=view.rule(spec, since),
         unit=spec.unit,
         points=view.served(flags),
-        rolling=Rolling(view.served(rolling.center), view.served(rolling.lo),
-                        view.served(rolling.hi), rolling.n[view.start:]),
-        ewma=ewma,
+        rolling=_rolling_wilson(flags).sliced(view.start),
+        ewma=Ewma(line, view.served(chart.ucl)) if any(z is not None for z in line) else None,
         alarms=view.served_alarms(chart.alarms),
         baseline=chart.baseline,
         headline=(
             _unmeasured_headline(spec, view.rows, view.provenance) if since is None
-            else _rate_headline(spec, flags, view.rows, since, view.provenance)
+            else _rate_headline(spec, flags, view, since)
         ),
     )
+    return _Served(series, _rate_comparisons(spec.metric_id, charted, view))
+
+
+def _centred_series(
+    spec: MetricSpec, view: _View, form: HeadlineForm, stat: Statistic,
+    alarms: tuple[Alarm, ...],
+) -> MetricSeries:
+    """A count or a cost: points, a rolling centre and a bootstrapped headline, no control chart."""
+    since = spec.measured_since(view.rows)
+    xs = _gated(spec, view.rows, since)
+    return MetricSeries(
+        metric_id=spec.metric_id,
+        kind=spec.kind,
+        rule=view.rule(spec, since),
+        unit=spec.unit,
+        points=view.served(xs),
+        rolling=_rolling_centre(xs, stat).sliced(view.start),
+        ewma=None,
+        alarms=view.served_alarms(alarms),
+        baseline=NO_BASELINE,
+        headline=(
+            _unmeasured_headline(spec, view.rows, view.provenance) if since is None
+            else _bootstrap_headline(spec, xs, view, since, form, stat)
+        ),
+    )
+
+
+def _count_series(spec: MetricSpec, view: _View) -> _Served:
+    return _Served(_centred_series(spec, view, HeadlineForm.MEAN, statistics.fmean, ()), ())
+
+
+def _cost_series(spec: MetricSpec, view: _View) -> _Served:
+    series = _centred_series(spec, view, HeadlineForm.MEDIAN, statistics.median,
+                             view.cost.alarms)
+    return _Served(series, view.cost.comparisons)
+
+
+_SERIES_BY_KIND: dict[MetricKind, Callable[[MetricSpec, _View], _Served]] = {
+    MetricKind.RATE: _rate_series,
+    MetricKind.COUNT: _count_series,
+    MetricKind.COST: _cost_series,
+}
 
 
 def quality_series_view(
@@ -530,9 +1021,68 @@ def quality_series_view(
     """The served series over *rows* (ordinal order): statistics over all of them, the newest
     *window_landings* served (all when None). Pure and deterministic for equal inputs."""
     start = 0 if window_landings is None else max(0, len(rows) - window_landings)
-    view = _View(rows, start, tuple(events), provenance)
+    landings_per_day = _landings_per_day(rows)
+    view = _View(rows, tuple(row.landing.landed_at for row in rows), start, tuple(events),
+                 provenance, landings_per_day, _cost_analysis(rows, events, landings_per_day))
+    served = [_SERIES_BY_KIND[spec.kind](spec, view) for spec in CATALOGUE]
     return QualitySeries(
         axis=tuple(AxisPoint.of(row) for row in rows[start:]),
-        metrics=tuple(_rate_series(spec, view) for spec in CATALOGUE),
+        metrics=tuple(entry.series for entry in served),
+        cost_model=view.cost.model,
+        modules=_module_rows(rows),
+        before_after=tuple(comparison for entry in served for comparison in entry.comparisons),
         git_check=git_check,
     )
+
+
+class QualitySeriesInvariant(enum.StrEnum):
+    """The rule a :class:`QualitySeriesContractError` reports."""
+
+    AXIS_ORDER = 'axis_order'
+    ARRAY_LENGTH = 'array_length'
+    ALARM_ON_AXIS = 'alarm_on_axis'
+
+
+class QualitySeriesContractError(DatumContractError):
+    """A :class:`QualitySeries` broke one of its declared rules, named by :attr:`rule`."""
+
+    def __init__(self, rule: QualitySeriesInvariant, message: str) -> None:
+        super().__init__(DatumInvariant.VALUE_CONTRACT, f'{rule.value}: {message}')
+        self.rule = rule
+
+
+def _served_arrays(metric: MetricSeries) -> dict[str, Sequence[object]]:
+    arrays: dict[str, Sequence[object]] = {
+        'points': metric.points, 'rolling.center': metric.rolling.center,
+        'rolling.lo': metric.rolling.lo, 'rolling.hi': metric.rolling.hi,
+        'rolling.n': metric.rolling.n,
+    }
+    if metric.ewma is not None:
+        arrays.update({'ewma.line': metric.ewma.line, 'ewma.ucl': metric.ewma.ucl})
+    return arrays
+
+
+def validate_quality_series(series: QualitySeries, served_at: datetime) -> None:
+    """Raise :class:`QualitySeriesContractError` (or the envelope's own error for a headline)
+    if *series* breaks a declared rule."""
+    ordinals = [point.ordinal for point in series.axis]
+    if any(earlier >= later for earlier, later in pairwise(ordinals)):
+        raise QualitySeriesContractError(
+            QualitySeriesInvariant.AXIS_ORDER, f'axis ordinals are not strictly increasing: {ordinals}',
+        )
+    on_axis = set(ordinals)
+    for metric in series.metrics:
+        for name, array in _served_arrays(metric).items():
+            if len(array) != len(ordinals):
+                raise QualitySeriesContractError(
+                    QualitySeriesInvariant.ARRAY_LENGTH,
+                    f'{metric.metric_id}.{name} serves {len(array)} entries for '
+                    f'{len(ordinals)} axis points',
+                )
+        off_axis = [alarm.ordinal for alarm in metric.alarms if alarm.ordinal not in on_axis]
+        if off_axis:
+            raise QualitySeriesContractError(
+                QualitySeriesInvariant.ALARM_ON_AXIS,
+                f'{metric.metric_id} alarms at ordinals {off_axis} not on the served axis',
+            )
+        validate_datum(metric.headline, served_at)
