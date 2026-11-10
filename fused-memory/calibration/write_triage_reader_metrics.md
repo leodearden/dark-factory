@@ -278,8 +278,18 @@ release condition was first ratified under v2.1: M1 <= 0.15, and M3 population
 baseline (§8). v2.2 narrows LOSS, which can only lower the figures that rest on
 it (§8). So before the release condition is read, task 7812 re-rates the soak's
 LOSS-consuming pairs under v2.2 and Leo re-confirms the bounds in gate 7813, on
-which task 3131 depends. Those bounds stand until that gate rules. The v2.2
-soak figures before that gate are §8, "Under brief v2.2 (task 7812)".
+which task 3131 depends. The v2.2 soak figures before that gate are §8,
+"Under brief v2.2 (task 7812)".
+
+**Bounds re-confirmed under v2.2 (Leo, 2026-11-10, gate 7813, esc-7813-2).**
+
+- **M1 stays at 0.15.** The v2.2 soak reads 28 / 91 = 0.3077, against
+  0.3736 under v2.1. Under v2.2 the test is easier, so the bar is not relaxed.
+- **M3 population stays at 0.35.** v2.2 left every CONFLICT answer and M3
+  itself unmoved, at 0.379 on the soak.
+- **7518 stays outside 3131's dependencies.** The F3′ counterfactual does not
+  change that decision. After 7518's render, F3′ alone must contest at least
+  11 of the 24 band CONFLICT writes under both briefs.
 
 **After the embedder cutover (6807)** re-run the whole measurement: the band
 edges and every cosine-derived threshold move with the embedder.
