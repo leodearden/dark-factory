@@ -161,20 +161,21 @@ class TestLoad:
         assert watermark.tzinfo is not None
 
 
-_ADVANCE_KWARGS = dict(
-    census_at=date(2026, 7, 14),
-    run_id='census-dark_factory-20260714',
-    report_path='plans/confusion-census-2026-07-14.md',
-    as_of_sha='a' * 40,
-)
+def _advance(path, session_watermark: datetime | None) -> census_state.CensusState:
+    return census_state.advance(
+        path,
+        census_at=date(2026, 7, 14),
+        run_id='census-dark_factory-20260714',
+        report_path='plans/confusion-census-2026-07-14.md',
+        as_of_sha='a' * 40,
+        session_watermark=session_watermark,
+    )
 
 
 class TestAdvance:
     def test_writes_exactly_the_five_keys(self, tmp_path):
         path = tmp_path / 'census-state.json'
-        census_state.advance(
-            path, **_ADVANCE_KWARGS, session_watermark=datetime(2026, 7, 14, tzinfo=UTC)
-        )
+        _advance(path, datetime(2026, 7, 14, tzinfo=UTC))
         data = json.loads(path.read_text(encoding='utf-8'))
         assert set(data) == _FIVE_KEYS
         assert data == {
@@ -189,7 +190,7 @@ class TestAdvance:
         """A run with no mining window (an injected batch source) has no
         watermark; the key is still written, as null."""
         path = tmp_path / 'census-state.json'
-        census_state.advance(path, **_ADVANCE_KWARGS, session_watermark=None)
+        _advance(path, None)
         data = json.loads(path.read_text(encoding='utf-8'))
         assert set(data) == _FIVE_KEYS
         assert data['session_watermark'] is None
@@ -197,7 +198,7 @@ class TestAdvance:
     @pytest.mark.parametrize('watermark', [datetime(2026, 7, 14, tzinfo=UTC), None])
     def test_load_reads_back_the_state_advance_returned(self, tmp_path, watermark):
         path = tmp_path / 'census-state.json'
-        written = census_state.advance(path, **_ADVANCE_KWARGS, session_watermark=watermark)
+        written = _advance(path, watermark)
         assert census_state.load(path) == state_docs.Ok(written)
         assert written.last_census_at == date(2026, 7, 14)
         assert written.session_watermark == watermark
@@ -205,13 +206,13 @@ class TestAdvance:
     def test_creates_missing_parent_directories(self, tmp_path):
         path = tmp_path / 'docs' / 'legibility' / 'census-state.json'
         assert not path.parent.exists()
-        census_state.advance(path, **_ADVANCE_KWARGS, session_watermark=None)
+        _advance(path, None)
         assert set(json.loads(path.read_text(encoding='utf-8'))) == _FIVE_KEYS
 
     def test_fully_replaces_a_previous_file_and_leaves_no_temp_sibling(self, tmp_path):
         path = tmp_path / 'census-state.json'
         path.write_text(json.dumps({'stale': 'data'}), encoding='utf-8')
-        census_state.advance(path, **_ADVANCE_KWARGS, session_watermark=None)
+        _advance(path, None)
         data = json.loads(path.read_text(encoding='utf-8'))
         assert set(data) == _FIVE_KEYS
         assert [p.name for p in tmp_path.iterdir()] == ['census-state.json']
