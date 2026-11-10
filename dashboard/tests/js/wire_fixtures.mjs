@@ -278,3 +278,84 @@ export function orchestratorRow({ pid, project, running }) {
 export function projectRow(id) {
   return { id, name: id };
 }
+
+// The MEMORY_EVALS builders below are not yet checked by
+// boundary_wire_fixtures.test.mjs: no boundary payload serves MEMORY_EVALS.
+
+// One open escalation, as data/memory_evals.py::_escalation_projection projects
+// it onto a metric row, the storm banner or unmatched_escalations.
+export function memoryEvalEscalation(id, overrides = {}) {
+  return {
+    id,
+    summary: 'memory-eval regression',
+    severity: 'blocking',
+    level: 1,
+    created_at: WIRE_AS_OF,
+    dedupe_fingerprint: `fp-${id}`,
+    ...overrides,
+  };
+}
+
+// One metric row, as data/memory_evals.py::_build_eval emits it: unjudged and
+// unlinked unless overridden.
+export function memoryEvalRow(overrides = {}) {
+  return {
+    metric_id: 'canonical-in-top-5',
+    kind: 'proportion',
+    rule_kind: 'proportion',
+    current_value: 0.9,
+    n: 30,
+    denominator: 30,
+    direction: 'lower_is_worse',
+    trend: { labels: ['20260704T031500Z', '20260705T031500Z'], values: [0.9, 0.9] },
+    verdict: null,
+    verdict_detail: null,
+    value: null,
+    item: null,
+    limit_ref: null,
+    fingerprint: null,
+    run_stamp: null,
+    escalation: null,
+    parity: 'unjudged',
+    ...overrides,
+  };
+}
+
+// One eval card, as data/memory_evals.py::_build_eval emits it, over the run
+// axis of its first metric's trend: fresh, untruncated, with no limits
+// artifact. memoryEvalsPayload copies the run's storm_escape onto it.
+export function memoryEvalCard(evalId, metrics) {
+  const runStamps = metrics[0]?.trend.labels ?? [];
+  return {
+    eval_id: evalId,
+    latest_run_stamp: runStamps.at(-1) ?? null,
+    latest_run_age_seconds: 3600,
+    stale: false,
+    limits: null,
+    storm_escape: null,
+    run_stamps: runStamps,
+    run_count: runStamps.length,
+    runs_on_disk: runStamps.length,
+    truncated: false,
+    corpus: null,
+    metrics,
+  };
+}
+
+// The MEMORY_EVALS payload, as data/redux_api.py::shape_memory_evals serves it,
+// with no artifact issues. Each card carries the run-scoped storm_escape, as
+// data/memory_evals.py::_build_payload hands every card the top-level block.
+export function memoryEvalsPayload({
+  evals, storm_escape = null, unmatched_escalations = [], escalation_queue = 'reconciliation',
+}) {
+  return {
+    generated_at: WIRE_AS_OF,
+    root_present: true,
+    storm_escape,
+    evals: evals.map(card => ({ ...card, storm_escape })),
+    issues: [],
+    issue_count: 0,
+    unmatched_escalations,
+    escalation_queue,
+  };
+}
