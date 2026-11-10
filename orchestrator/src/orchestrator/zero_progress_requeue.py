@@ -50,7 +50,7 @@ Both halves are green-tier hot-tunable, so a noisy detector can be retuned live.
 
 SHAPE
 -----
-Three deliberately separate pieces, following ``merge_skew_tripwire.py`` for
+Deliberately separate pieces, following ``merge_skew_tripwire.py`` for
 the pure/injectable split and ``merge_liveness.py`` for the alarm/recovery pair:
 
 * :class:`ZeroProgressRequeueTracker` — pure per-task streak + span tracking.
