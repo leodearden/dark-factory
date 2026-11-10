@@ -384,6 +384,7 @@ class TestReviewLoopAppliesDispositions:
             assert await run.run() == WorkflowOutcome.BLOCKED
 
         assert not any('verdict absent' in record.getMessage() for record in caplog.records)
+        assert run.workflow.artifacts is not None
         (review,) = run.workflow.artifacts.read_reviews().values()
         assert review['verdict'] == 'ERROR'
 
