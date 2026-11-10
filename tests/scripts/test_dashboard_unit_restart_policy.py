@@ -345,8 +345,8 @@ def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
     exercises:
 
       (a) systemd-analyze binary absent.
-      (b) binary present, XDG_RUNTIME_DIR absent -- the regression under
-          repair.
+      (b) binary present, XDG_RUNTIME_DIR absent -- the headless case a
+          binary lookup alone cannot detect.
       (c) binary present, XDG_RUNTIME_DIR="" -- empty must count as absent.
       (d) binary present, XDG_RUNTIME_DIR set to a nonexistent path -- must
           still run.
@@ -359,8 +359,8 @@ def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
     assert reason is not None
 
     # (b) Binary present, XDG_RUNTIME_DIR absent: the predicate must still
-    # gate the test. This is the regression under repair -- the old inline
-    # decorator condition never checked this at all.
+    # gate the test. This is the headless case: shutil.which() finds the
+    # binary, yet systemd-analyze verify --user checks nothing here.
     monkeypatch.setattr(
         shutil, "which", lambda *_a, **_k: "/usr/bin/systemd-analyze"
     )
@@ -422,9 +422,8 @@ def test_backoff_canary_is_the_shape_systemd_must_warn_about(
           RestartSteps= setting. Ignoring.
 
         (exit 0).  A canary left in the first shape would make the positive
-        control below FAIL on every healthy host -- the same defect class
-        this whole task removes, a guard reporting the opposite of the
-        truth.
+        control below FAIL on every healthy host: a guard reporting the
+        opposite of the truth.
 
     (c) The written trap is detectable by the same filter the positive
         control uses below (_ignored_directive_lines), read under the
