@@ -3,9 +3,9 @@
 Contract: ``docs/task-authoring.md`` §5. Lives in ``shared`` so the run-time
 executor (``orchestrator/src/orchestrator/deterministic_runner.py``) and the
 submit-time check
-(``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``,
-which validates ``script_base / script``) can read one definition. Both choose
-``script_base`` through ``resolve_script_base``.
+(``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
+read one definition: both take the script path from
+``resolve_before_done_paths``, with the base chosen by ``resolve_script_base``.
 """
 
 from __future__ import annotations
