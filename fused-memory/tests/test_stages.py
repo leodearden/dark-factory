@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
@@ -5011,16 +5012,13 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        # The LLM must see SOMETHING about the item — not just a footer
-        assert '… [item truncated]' in text, (
-            f'Expected truncation marker in text; got first 200 chars: {text[:200]!r}'
-        )
+        assert text.startswith('- ')
+        assert_elided(text[len('- '):], json.dumps(items[0]))
         # No "... and N more" footer when there are no additional items to report
         assert '... and ' not in text, (
             f'Unexpected "... and N more" footer for single-item list; text: {text[:200]!r}'
         )
-        # Text must not exceed the budget by more than the marker length
-        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET + len('… [item truncated]') + 10, (
+        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET, (
             f'Text too long: {len(text)} chars; expected ≤ {_FLAGGED_ITEMS_CHAR_BUDGET}'
         )
         # A truncation warning must still be emitted
@@ -5046,9 +5044,8 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        assert '… [item truncated]' in text, (
-            'Expected truncation marker for oversized first item'
-        )
+        first_line = text.splitlines()[0]
+        assert_elided(first_line[len('- '):], json.dumps(items[0]))
         # The second item was not rendered; the footer should note it
         assert '... and 1 more (truncated: char budget)' in text, (
             f'Expected "... and 1 more" footer; got last 200 chars: {text[-200:]!r}'
@@ -5121,6 +5118,10 @@ class TestFormatFlaggedFirstItemEdgeCase:
         assert rec.total == rec.rendered + rec.dropped, (
             f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
         )
+
+    def test_budget_too_small_for_the_marker_raises(self):
+        with pytest.raises(ValueError):
+            _format_flagged([{'description': 'y' * 100}], budget_chars=10)
 
 
 # ---------------------------------------------------------------------------
