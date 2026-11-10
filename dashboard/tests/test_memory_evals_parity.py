@@ -25,7 +25,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import pytest
 from _dashboard_helpers import dump_artifact, write_escalation_record
@@ -462,13 +462,15 @@ def _fingerprint_string_surgery(source: str) -> list[str]:
             violations += [f'import {a.name}' for a in node.names if a.name.split('.')[0] == 're']
         elif isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] == 're':
             violations.append(f'from {node.module} import ...')
-        elif isinstance(node, ast.Attribute) and node.attr in _STRING_SURGERY_METHODS:
-            if 'fingerprint' in ast.unparse(node.value):
-                violations.append(ast.unparse(node))
-        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
-            if 'fingerprint' in ast.unparse(node.value):
-                violations.append(ast.unparse(node))
+        elif _takes_text_apart(node) and 'fingerprint' in ast.unparse(node.value):
+            violations.append(ast.unparse(node))
     return violations
+
+
+def _takes_text_apart(node: ast.AST) -> TypeGuard[ast.Attribute | ast.Subscript]:
+    if isinstance(node, ast.Attribute):
+        return node.attr in _STRING_SURGERY_METHODS
+    return isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)
 
 
 class TestFingerprintJoinIsStringEquality:
