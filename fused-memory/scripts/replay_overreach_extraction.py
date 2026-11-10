@@ -20,19 +20,24 @@ inputs are read over GRAPH.RO_QUERY only. Nothing is written to any graph.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import Any
 
 from graphiti_core.edges import EntityEdge
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.maintenance.edge_operations import extract_edges
 from graphiti_core.utils.maintenance.node_operations import extract_nodes
 
+from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.graphiti_client import build_llm_client
 from fused_memory.backends.llm_token_usage import (
     LlmTokenUsage,
@@ -185,3 +190,82 @@ async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -
         ),
         tokens=MappingProxyType({'extract_nodes': _usage(node_tokens), 'extract_edges': _usage(edge_tokens)}),
     )
+
+
+# --------------------------------------------------------------------------- #
+# The read side: each episode's production inputs, over GRAPH.RO_QUERY only
+# --------------------------------------------------------------------------- #
+
+EPISODE_CYPHER = (
+    'MATCH (e:Episodic {uuid: $uuid}) '
+    'RETURN e.valid_at, e.source, e.source_description, e.group_id'
+)
+
+PREVIOUS_EPISODES_CYPHER = (
+    'MATCH (e:Episodic) '
+    f"WHERE {exact_string_upper_bound('e.valid_at', 'reference_time', inclusive=True)} "
+    'AND e.group_id IN $group_ids AND e.source = $source AND e.uuid <> $uuid '
+    'RETURN e.content, e.valid_at ORDER BY e.valid_at DESC LIMIT $num_episodes'
+)
+"""graphiti_core 0.28.2's utils/maintenance/graph_data_operations.py::retrieve_episodes, as
+Graphiti.add_episode calls it, less the episode itself. Its bare ``e.valid_at <= $reference_time``
+is served by FalkorDB's RANGE index on Episodic.valid_at, which over-returns on a string ``<=``:
+measured 2026-11-10 it matched all 11042 dark_factory episodes for a 2026-09-17 bound. That is
+harmless at write time, when nothing newer exists, and wrong for a replay, so the bound here is
+exact_string_upper_bound's. On the 48 frozen-window episodes it selects the same 10 episodes as
+'created before this one' does."""
+
+
+class EpisodeMissing(LookupError):
+    """A worksheet episode the graph no longer holds."""
+
+
+class WorksheetMismatch(ValueError):
+    """A worksheet whose (graph, stratum) episode counts differ from the baseline report's sample."""
+
+
+def _stored_instant(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+class EpisodeContextReader:
+    """Reads one graph's episodes as production extracted them, through the read-only seam."""
+
+    def __init__(self, reader: ReadOnlyGraphReader) -> None:
+        self._reader = reader
+
+    async def read(self, row: Mapping[str, Any]) -> ReplayInput:
+        """*row* is a worksheet row (audit_ruling_overreach.py --emit-worksheet); it supplies the body."""
+        own = await self._reader.read_unpaged(EPISODE_CYPHER, {'uuid': row['uuid']})
+        if not own:
+            raise EpisodeMissing(f"{row['graph']}/{row['uuid']} is no longer in the graph")
+        valid_at, source, source_description, group_id = own[0]
+        previous_desc = await self._reader.read_unpaged(PREVIOUS_EPISODES_CYPHER, {
+            'reference_time': valid_at, 'group_ids': [group_id], 'source': source,
+            'uuid': row['uuid'], 'num_episodes': RELEVANT_SCHEMA_LIMIT,
+        })
+        return ReplayInput(
+            graph=row['graph'], uuid=row['uuid'], stratum=row['stratum'], content=row['content'],
+            source=str(source), source_description=str(source_description or ''),
+            valid_at=_stored_instant(valid_at),
+            previous=tuple(str(content) for content, _ in reversed(previous_desc)),
+        )
+
+
+def _cell_counts(rows: Iterable[Mapping[str, Any]]) -> Counter[str]:
+    return Counter(f"{row['graph']}/{row['stratum']}" for row in rows)
+
+
+def check_worksheet(rows: Iterable[Mapping[str, Any]], baseline_report: Mapping[str, Any]) -> None:
+    """Raise WorksheetMismatch unless every cell holds the episodes ``sample.sizes`` says it sampled."""
+    found = _cell_counts(rows)
+    expected = Counter({
+        f'{graph}/{stratum}': cell['episodes']
+        for graph, by_stratum in baseline_report['sample']['sizes'].items()
+        for stratum, cell in by_stratum.items()
+    })
+    differing = sorted(cell for cell in found.keys() | expected.keys() if found[cell] != expected[cell])
+    if differing:
+        raise WorksheetMismatch('worksheet episodes differ from the baseline sample in '
+                                + ', '.join(f'{c} ({found[c]} != {expected[c]})' for c in differing))
