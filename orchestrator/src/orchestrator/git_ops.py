@@ -6461,11 +6461,6 @@ class GitOps:
     async def thin_warm_lane(self, lane_dir: Path) -> int:
         """Invoke ``thin-warm-lane.sh <lane_dir>``.
 
-        The production caller is :meth:`release_warm_lane`, which invokes it
-        only after the ASSIGNED→FREE flip; the script's T3 flock and T4
-        live-reference gates, not the caller, are what keep an in-use lane's
-        ``target/`` safe.
-
         Located via :meth:`_resolve_warm_lane_script` — project override
         first, then dark-factory's own copy (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
@@ -6499,7 +6494,7 @@ class GitOps:
 
         **Flock contract (pinned — this wrapper holds no lock of its own)**:
         safety against a concurrent re-acquire racing this call rests
-        entirely on the script side. reify's ``scripts/thin-warm-lane.sh``
+        entirely on the script side, never on the caller. reify's ``scripts/thin-warm-lane.sh``
         acquires ``<lane_dir>.lock`` (a sibling lock file, non-blocking
         ``flock -n``) BEFORE touching ``target/`` and exits 75 if it cannot
         — see that script's "T3" block and PRD
@@ -6507,7 +6502,7 @@ class GitOps:
         §9.5 inv.10 (reify repo). This wrapper only spawns the script and
         interprets its exit code; if the script's flock behavior ever
         regresses, this wrapper provides no independent defense. See
-        ``TestRunThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
+        ``TestThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
         unit test that exercises this against a real held flock (not just a
         scripted exit code).  The script also refuses, with the same 75, a
         lane a live process references; see

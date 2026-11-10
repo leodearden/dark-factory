@@ -13258,7 +13258,7 @@ def _read_thin_warm_lane_call_log(repo: Path) -> list[str]:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLane:
+class TestThinWarmLane:
     """Unit tests for GitOps.thin_warm_lane (task 2442 step-4).
 
     Fail-soft, never-raise wrapper around reify δ's
@@ -13437,11 +13437,11 @@ def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-class TestRunThinWarmLaneFlockContention:
+class TestThinWarmLaneFlockContention:
     """rc=75 exercised against a REAL held flock, not a scripted exit code.
 
     Amendment requested by the task 2442 code review (git_ops.py:2323):
-    ``TestRunThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
+    ``TestThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
     proves ``thin_warm_lane`` *interprets* rc=75 correctly once told to
     return it — it says nothing about whether genuine contention on
     ``<lane_dir>.lock`` (the T3 mechanism a concurrent re-acquire actually
@@ -13560,7 +13560,7 @@ class TestSeedWarmLaneTakesLaneLock:
 
         # Simulate a concurrent release-thin holding <lane_dir>.lock for the
         # duration of its rm -rf — the exact lock thin_warm_lane's real
-        # script contends on (see TestRunThinWarmLaneFlockContention above).
+        # script contends on (see TestThinWarmLaneFlockContention above).
         lock_path = Path(f'{lane}.lock')
         lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -13797,7 +13797,7 @@ class TestSeedAndThinMutualExclusion:
     75.
 
     ``TestSeedWarmLaneTakesLaneLock`` proves ``_seed_warm_lane`` blocks
-    against an externally-held lock; ``TestRunThinWarmLaneFlockContention``
+    against an externally-held lock; ``TestThinWarmLaneFlockContention``
     proves ``thin_warm_lane``'s real script surfaces rc=75 against an
     externally-held lock. Neither, alone, proves the two sides actually
     contend with EACH OTHER on the same file. This test drives both real
@@ -13825,7 +13825,7 @@ class TestSeedAndThinMutualExclusion:
         )
         seed_script.chmod(0o755)
 
-        # Real-T3 thin stub — the SAME stub TestRunThinWarmLaneFlockContention
+        # Real-T3 thin stub — the SAME stub TestThinWarmLaneFlockContention
         # uses — so this exercises the genuine flock -n gate, not a scripted rc.
         thin_scripts_dir = git_repo / 'scripts'
         thin_scripts_dir.mkdir(parents=True, exist_ok=True)
