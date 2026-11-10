@@ -553,9 +553,9 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
 ):
     """Through the MCP tool, a 'null' metadata payload is decoded to an
     omitted metadata argument (task 6130): the call writes no metadata, so the
-    stored blob, done_provenance included, is left untouched."""
-    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
-
+    stored blob, done_provenance included, is left untouched. With no other
+    field it is a fieldless call, which task 4867 refuses instead of
+    reporting a success that wrote nothing."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
     before = await _seed_task_with_done_provenance(interceptor, root)
@@ -563,7 +563,7 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
     result = await server._tool_manager.call_tool(
         'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
     )
-    assert interceptor_write_succeeded(result), result
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
     assert (await interceptor.get_task('1', root))['metadata'] == before
 
 

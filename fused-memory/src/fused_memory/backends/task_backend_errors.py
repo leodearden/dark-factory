@@ -533,6 +533,39 @@ class AppendUnsupportedFieldError(TaskmasterError):
         )
 
 
+class NoFieldsToUpdateError(TaskmasterError):
+    """Raised when ``update_task`` is called with none of its mutating parameters.
+
+    Such a call can only bump ``updated_at``. Reporting it as a success
+    hides a caller whose real argument was dropped on the way in: in
+    esc-3147-7 and esc-3671-7 a misnamed ``metadata`` argument vanished, the
+    call wrote nothing, and the reply still said ``updated: True``. A call
+    with no legitimate purpose is refused rather than quietly accepted.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` and, like
+    :class:`AppendUnsupportedFieldError`, has no ``to_error_dict()``: it
+    reaches callers by propagating raw to ``server/tool_errors.py::mcp_tool_errors``,
+    which reports ``error_type='NoFieldsToUpdateError'``.
+
+    Attributes:
+        task_id: The task the refused call targeted.
+        accepted_fields: The parameter names that would have made the call a
+            write, in the order the backend declares them.
+    """
+
+    def __init__(self, task_id: str, accepted_fields: tuple[str, ...]) -> None:
+        self.task_id = task_id
+        self.accepted_fields = accepted_fields
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing update_task for task {task_id}: none of '
+            f'{", ".join(accepted_fields)} was supplied, so there is nothing to '
+            'write and nothing was written. If you passed one of these under '
+            'another name, that argument was ignored: resend it under the '
+            'name listed here.',
+        )
+
+
 __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
@@ -549,6 +582,7 @@ __all__ = [
     'MetadataNotAnObjectError',
     'MetadataTooDeepError',
     'AppendUnsupportedFieldError',
+    'NoFieldsToUpdateError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',
     'metadata_not_an_object_error',
