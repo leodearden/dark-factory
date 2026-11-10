@@ -43,6 +43,9 @@ from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
 )
+from fused_memory.server.unknown_argument_guard import (  # noqa: E402
+    install_unknown_argument_guard,
+)
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
@@ -2116,54 +2119,73 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 def _install_tool_dispatch_guards(
     mcp: Any, *, known_projects: dict[str, str] | None = None
 ) -> None:
-    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+    """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
-    Two independent concerns share this chokepoint, and the order they are
-    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
-    therefore what the caller sees when both fire:
+    Three independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — each call wraps whatever ``call_tool`` it
+    finds, so the order decides which one ends up OUTSIDE, and therefore what
+    the caller sees when more than one fires:
 
-    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
-       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
-       otherwise poison StreamableHTTPSessionManager's shared task group and
-       cascade into uvicorn's main loop. Re-raises CancelledError, which
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth, INNERMOST.
+       Catches BaseException escapes (SystemExit, BaseExceptionGroup, ...) that
+       would otherwise poison StreamableHTTPSessionManager's shared task group
+       and cascade into uvicorn's main loop. Re-raises CancelledError, which
        asyncio cancellation semantics require.
-    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+    2. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
+       — refuses a call naming an argument the tool does not declare, which
+       the bundled FastMCP would otherwise drop silently (task 4867).
+    3. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
        write-boundary markup guard (task 4458, PRD
-       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
-       argument absorbed MCP tool-call envelope markup and hands the caller a
-       ``repaired_call`` to resubmit verbatim.
+       ``plans/toolcall-markup-containment-prd.md``), OUTERMOST. Rejects a call
+       whose argument absorbed MCP tool-call envelope markup and hands the
+       caller a ``repaired_call`` to resubmit verbatim.
 
-    DO NOT tidy these two calls into the other order. The guard REJECTS by
-    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
-    that survives every output schema, since a returned dict is destroyed by
-    the output validation of any tool annotated ``-> str``. Installed second it
-    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
-    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
-    BaseException and flattens the rejection into its own
-    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
-    stops being a key the caller can read and survives only as text inside an
-    opaque string, so the agent cannot resubmit the repair.
+    DO NOT tidy these calls into another order. Both guards REJECT by raising
+    :class:`fastmcp.exceptions.ToolError` — measured as the only shape that
+    survives every output schema, since a returned dict is destroyed by the
+    output validation of any tool annotated ``-> str``. A guard installed
+    BEFORE ``_install_safe_tool_wrapper`` ends up inside ``_safe_call_tool``,
+    which catches BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: the structured payload
+    survives only as text inside an opaque string.
 
     Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
     the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
     such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
     pins. Order is the whole mechanism.
 
+    The unknown-argument guard sits INSIDE the markup guard because the markup
+    remedy, ``metadata={'allow_mcp_markup': True}``, is legal on every tool:
+    on a tool that declares no ``metadata`` the markup guard strips it before
+    forwarding, so the unknown-argument guard must see the post-strip call.
+
     *known_projects* is run_server's ``project_id -> project_root`` registry,
-    which the guard's storm-escalation sink uses to place a burst in the right
-    queue.
+    which the markup guard's storm-escalation sink uses to place a burst in the
+    right queue.
 
     REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
     C2), declared HERE at the interception point rather than inferred per tool
-    (INV-1). This is also the primary server only: the recon-report server
-    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    (INV-1). The recon-report server hosts no write tools and gets no markup
+    guard; it gets the other two through :func:`_install_recon_report_guards`.
     """
     _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
     install_markup_guard(
         mcp,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=known_projects,
     )
+
+
+def _install_recon_report_guards(mcp: Any) -> None:
+    """The recon-report server's wrappers: the safe wrapper inside, the unknown-argument guard outside.
+
+    Recon LLM agents call its cite_* and report tools over MCP, so a misnamed
+    argument there is dropped exactly as on the primary server. Order: see
+    :func:`_install_tool_dispatch_guards`.
+    """
+    _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
 
 
 def _build_uvicorn_config(
@@ -2276,7 +2298,7 @@ def _build_recon_report_components(
         state.known_projects = known_projects
 
     mcp = create_recon_report_server(state)
-    _install_safe_tool_wrapper(mcp)
+    _install_recon_report_guards(mcp)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.recon_report_port

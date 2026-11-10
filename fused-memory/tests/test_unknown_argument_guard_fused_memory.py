@@ -17,6 +17,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import TextContent
 from shared.mcp_unknown_arguments import UNKNOWN_ARGUMENT_CODE
 
 from fused_memory.server.main import (
@@ -110,7 +111,9 @@ async def test_the_refusal_reaches_a_client_as_structured_json_not_flattened(ser
         )
 
     assert result.isError is True
-    refusal = json.loads(result.content[0].text)
+    text = result.content[0]
+    assert isinstance(text, TextContent)
+    refusal = json.loads(text.text)
     assert refusal['code'] == UNKNOWN_ARGUMENT_CODE
     assert refusal['unknown'][0]['name'] == 'metadata_patch'
 
@@ -151,7 +154,9 @@ async def test_a_tool_with_no_usable_schema_fails_open():
         calls.append(a)
         return {'a': a}
 
-    built._tool_manager.get_tool('echo').parameters = {'type': 'object'}
+    tool = built._tool_manager.get_tool('echo')
+    assert tool is not None
+    tool.parameters = {'type': 'object'}
     _install_tool_dispatch_guards(built)
 
     result = await built._tool_manager.call_tool('echo', {'a': 1, 'extra': 2})
