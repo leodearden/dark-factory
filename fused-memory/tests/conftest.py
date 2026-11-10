@@ -75,14 +75,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from _fm_helpers import (  # noqa: E402
-    _leaked_async_httpx_clients,
-    _warn_if_drain_closed_a_foreign_client,
     complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
-    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
+)
+from _fm_httpx_leaks import (  # noqa: E402
+    _leaked_async_httpx_clients,
+    _warn_if_drain_closed_a_foreign_client,
+    reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
@@ -457,7 +459,7 @@ async def _reap_leaked_ticket_workers():
 # a real defence for a hypothetical one is the wrong way round, so the
 # constraint is enforced by DISCOVERABILITY instead: the sync arm snapshots
 # the already-leaked clients at SETUP and warns via
-# _fm_helpers._warn_if_drain_closed_a_foreign_client whenever the drain closed
+# _fm_httpx_leaks._warn_if_drain_closed_a_foreign_client whenever the drain closed
 # one that pre-dated the current test — naming the trap at the teardown that
 # sprang it, instead of leaving it to be diagnosed from the far-away symptom.
 # ---------------------------------------------------------------------------
@@ -471,7 +473,7 @@ def _reap_leaked_async_httpx_clients_sync():
     exception was never retrieved`` ERROR into some unrelated test's ``caplog``
     window, and why closing it at teardown makes that record unreachable, see
     the ONE canonical write-up of the mechanism —
-    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``. It is deliberately not
     restated here.
 
     THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
@@ -519,7 +521,7 @@ def _reap_leaked_async_httpx_clients_sync():
                 f'closes clients from a throwaway asyncio.run loop, so an '
                 f'exception type beyond the suppressed TimeoutError/'
                 f'RuntimeError reached it — widen the suppression in '
-                f'_fm_helpers.reap_leaked_async_httpx_clients or fix the '
+                f'_fm_httpx_leaks.reap_leaked_async_httpx_clients or fix the '
                 f'ordering that sent this client to the fallback (task 4412).',
                 stacklevel=2,
             )
@@ -530,7 +532,7 @@ def _reap_leaked_async_httpx_clients_sync():
 async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    Task 4412 — mechanism in ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``,
     same as the sync arm above.
 
     THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
@@ -545,7 +547,7 @@ async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync
     ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
 
     Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
-    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    ``_fm_httpx_leaks.py``: it never fails a test, and is a cheap no-op for the
     vast majority of tests that leak nothing.
     """
     yield
