@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from shared.quality_series.landings import GitCrossCheck
 from shared.quality_series.rows import FIRST_UNIT_GIT_FLOOR_S
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
+from dashboard.config import DashboardConfig
 from dashboard.data.quality_sampler import (
     QUALITY_PER_ROOT_BUDGET_SECONDS,
     QUALITY_REV_LIST_TIMEOUT_SECONDS,
@@ -29,7 +31,7 @@ from dashboard.data.quality_store import (
     read_landing_rows,
     read_samples,
 )
-from dashboard.loops import _QualityStore
+from dashboard.loops import _quality_loop, _QualityStore
 
 FIRST_LANDED_AT = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
 
@@ -222,3 +224,31 @@ def test_the_backstop_sits_between_the_producers_own_bound_and_half_the_tick() -
     floor = FIRST_UNIT_GIT_FLOOR_S + QUALITY_REV_LIST_TIMEOUT_SECONDS
 
     assert floor < QUALITY_PER_ROOT_BUDGET_SECONDS <= QUALITY_SAMPLE_INTERVAL_SECONDS / 2
+
+
+async def test_the_quality_loop_samples_a_landing_within_its_first_tick(
+    project: QualityProject, tmp_path: Path,
+) -> None:
+    """PRD sketch row 1 at loop level: the first tick runs before the loop's first aligned sleep."""
+    pid = project_id_for_root(project.root)
+    store = _QualityStore(tmp_path / 'quality.db')
+    await store.open()
+    loop = asyncio.create_task(_quality_loop(store, DashboardConfig(project_root=project.root)))
+    try:
+        async with asyncio.timeout(60):
+            while not (samples := await read_samples(store.connection, pid)):
+                await asyncio.sleep(0.05)
+        rows = await read_landing_rows(store.connection, pid)
+    finally:
+        loop.cancel()
+        with suppress(asyncio.CancelledError):
+            await loop
+        await store.close()
+
+    train = [row.landing.task_id for row in rows if row.landing.merge_sha == project.train_sha]
+    assert train == list(project.train_members)
+    first = samples[0]
+    assert first == QualitySample.value(
+        pid, first.ts, cursor_sha=project.train_sha, landings_sampled=3, landings_deferred=0,
+        git_check=GitCrossCheck(off_first_parent=0, merges_without_landing=1, late_claims=0),
+    ), f'expected a value sample naming the train merge as cursor, got {first}'
