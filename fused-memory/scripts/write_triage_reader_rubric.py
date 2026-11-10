@@ -479,7 +479,7 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
     ),
     Cell.DIGEST_CONFLICT: (
         'An amended write disputes its record (CONFLICT), and a reader of the record'
-        ' meets the dispute only as an untagged 240-character digest.'
+        ' meets the dispute only as an untagged amendment, not as a correction.'
     ),
     Cell.WRONG_HOME: (
         "An attached write is not about its record's claim (HOME=NO); a contest whose"
