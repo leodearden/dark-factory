@@ -182,6 +182,9 @@ class TestDefinition:
     def test_reads_the_doc_on_every_call(self, monkeypatch, tmp_path):
         self._patch_doc(monkeypatch, tmp_path, _doc(_SECTIONS))
         assert code_quality.definition() == _SECTIONS[_DEFINITION]
+        edited = 'Definition sentence, edited between two calls.'
+        self._patch_doc(monkeypatch, tmp_path, _with(_DEFINITION, edited))
+        assert code_quality.definition() == edited
 
     @pytest.mark.parametrize(
         'doc_text',
