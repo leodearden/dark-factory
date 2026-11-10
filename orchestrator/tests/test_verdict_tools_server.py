@@ -36,6 +36,11 @@ def artifacts(tmp_path):
     return a
 
 
+_NO_ACTION_NOTE = {
+    'escalation_id': 'esc-42-1', 'disposition': 'no_action', 'rationale': 'pure observation',
+}
+
+
 # ---------------------------------------------------------------------------
 # Standalone _impl tests (independent of the MCP tool/pydantic boundary)
 # ---------------------------------------------------------------------------
@@ -122,6 +127,62 @@ class TestSubmitReviewVerdict:
         envelope = artifacts.read_verdict('test_analyst')
         assert envelope is not None
         assert envelope['verdict']['issues'] == [contract_issue(severity='suggestion')]
+
+    def test_note_dispositions_are_written_into_the_payload(self, artifacts):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='ok',
+            note_dispositions=[dict(_NO_ACTION_NOTE)],
+        )
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['note_dispositions'] == [_NO_ACTION_NOTE]
+
+    @pytest.mark.parametrize(
+        ('note_dispositions', 'named', 'located'),
+        [
+            pytest.param(
+                [
+                    dict(_NO_ACTION_NOTE),
+                    {**_NO_ACTION_NOTE, 'escalation_id': 'esc-42-2', 'disposition': 'fixed'},
+                ],
+                "'fixed'",
+                'note_dispositions entry 1 ',
+                id='unknown-disposition',
+            ),
+            pytest.param(
+                [dict(_NO_ACTION_NOTE), {**_NO_ACTION_NOTE, 'disposition': 'work'}],
+                "'esc-42-1'",
+                'note_dispositions entries 0 and 1 ',
+                id='duplicated-id',
+            ),
+        ],
+    )
+    def test_malformed_note_dispositions_return_error_and_write_nothing(
+        self, artifacts, note_dispositions, named, located,
+    ):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='x',
+            note_dispositions=note_dispositions,
+        )
+        assert result['status'] == 'error'
+        assert named in result['message']
+        assert located in result['message']
+
+        assert artifacts.read_verdict('test_analyst') is None
 
 
 class TestSubmitCompletionVerdict:
@@ -255,6 +316,31 @@ class TestCreateServer:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
+
+    async def test_reviewer_tool_run_writes_note_dispositions(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        await tool.run({
+            'reviewer': 'test_analyst',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 's',
+            'note_dispositions': [dict(_NO_ACTION_NOTE)],
+        })
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['note_dispositions'] == [_NO_ACTION_NOTE]
+
+    async def test_reviewer_tool_note_dispositions_is_optional(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        assert 'note_dispositions' in tool.parameters['properties']
+        assert 'note_dispositions' not in tool.parameters['required']
 
 
 def _journal_lines(root: Path) -> list[dict[str, Any]]:

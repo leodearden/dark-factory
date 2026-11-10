@@ -22,7 +22,7 @@ from shared.plan_deviation import DeviationRecord
 from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
-from orchestrator.review_payload import Verdict, normalize_review
+from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +400,7 @@ class ReviewAggregation:
     reviews: dict[str, dict]
     reviewer_errors: list[str] = field(default_factory=list)
     errored_reviews: dict[str, dict] = field(default_factory=dict)
+    note_dispositions: tuple[NoteDisposition, ...] = ()
 
     @property
     def all_reviewers_errored(self) -> bool:
@@ -1311,6 +1312,7 @@ class TaskArtifacts:
         blocking = []
         suggestions = []
         errored_reviews = {}
+        note_dispositions: list[NoteDisposition] = []
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
@@ -1318,6 +1320,7 @@ class TaskArtifacts:
                 errored_reviews[reviewer_name] = review
             else:
                 _warn_off_contract_issues(reviewer_name, payload.issues)
+            note_dispositions.extend(payload.note_dispositions)
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
             )
@@ -1333,6 +1336,7 @@ class TaskArtifacts:
             reviews=clean,
             reviewer_errors=list(errored_reviews),
             errored_reviews=errored_reviews,
+            note_dispositions=tuple(note_dispositions),
         )
 
     def validate_plan_prerequisites(self) -> None:

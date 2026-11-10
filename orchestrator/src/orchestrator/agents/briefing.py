@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
@@ -56,6 +57,65 @@ def _implementer_action(variant: ImplementerBriefVariant) -> str:
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
+
+
+OPEN_INFO_NOTES_HEADING = '# Implementer notes (open info escalations)'
+"""The heading of the reviewer's notes block; the reviewer contract in roles.py names it."""
+
+OPEN_INFO_NOTES_LIMIT = 20
+"""Max notes one reviewer briefing lists, the most recent kept; the rest stay pending for the exit router."""
+
+
+def _open_info_notes_section(
+    notes: Sequence[Escalation], *, reviewer_type: str, detail_chars: int,
+) -> str:
+    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2).
+
+    It closes on the verdict call with ``note_dispositions``, so the last call
+    the reviewer is shown names the field.
+    """
+    by_age = sorted(notes, key=lambda note: note.timestamp or '')
+    listed = by_age[-OPEN_INFO_NOTES_LIMIT:]
+    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in listed)
+    unlisted = len(by_age) - len(listed)
+    overflow = (
+        f'{unlisted} older note(s) are not listed; they stay pending for the exit router.\n\n'
+        if unlisted else ''
+    )
+    return f"""\
+{OPEN_INFO_NOTES_HEADING}
+
+These info notes were filed against this task while it was worked.
+
+{entries}
+{overflow}Disposition every id above as `addressed`, `no_action` or `work`, as your
+contract defines them, in the `note_dispositions` of your verdict call:
+`submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=..., note_dispositions=[...])`
+"""
+
+
+def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
+    full_detail = note.detail or ''
+    detail = full_detail[:detail_chars]
+    quoted = '\n'.join(f'> {line}' for line in detail.splitlines()) or '> (none)'
+    if len(full_detail) > detail_chars:
+        quoted += f'\n[detail truncated at {detail_chars} characters]'
+    return f"""\
+## {note.id}
+
+- filed by: {_one_line(note.agent_role)}
+- filed at: {note.timestamp}
+- summary: {_one_line(note.summary)}
+- suggested action: {_one_line(note.suggested_action) or '(none)'}
+- detail:
+
+{quoted}
+"""
+
+
+def _one_line(text: str | None) -> str:
+    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
+    return ' '.join((text or '').split())
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -1275,6 +1335,7 @@ This task holds locks for the following modules:
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1296,6 +1357,9 @@ This task holds locks for the following modules:
 
         *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
         Production callers leave the default.
+
+        *open_info_notes* lists the task's open info notes for the reviewer to
+        disposition; none leaves the prompt byte-identical.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1321,25 +1385,40 @@ This task holds locks for the following modules:
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
-        return prompt
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build the context-complete (D2) reviewer prompt for *subject*.
 
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
+        *open_info_notes* is appended exactly as :meth:`build_reviewer_prompt`
+        appends it.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
-        return render_context_complete_review(
+        prompt = render_context_complete_review(
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
+        )
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
+
+    def _with_open_info_notes(
+        self, prompt: str, reviewer_type: str, notes: Sequence[Escalation] | None,
+    ) -> str:
+        """*prompt* with the reviewer's notes block appended; no notes leave it byte-identical."""
+        if not notes:
+            return prompt
+        return prompt + '\n' + _open_info_notes_section(
+            notes, reviewer_type=reviewer_type,
+            detail_chars=self.config.info_l0_note_detail_chars,
         )
 
     async def build_completion_judge_prompt(

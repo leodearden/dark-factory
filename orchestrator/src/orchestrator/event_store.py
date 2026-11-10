@@ -87,11 +87,13 @@ class EventType(StrEnum):
     # One info-severity L0 was dispositioned by the router or the reviewer leg
     # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
     # the fact's home; this row is telemetry naming it, keyed on the subject's
-    # REAL task_id.
+    # REAL task_id (a reviewer-leg row on the reviewing task's, which is the
+    # subject's own whenever the disposition is applied).
     # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
     #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
     #   member when the record closed); by: the dispositioning actor;
-    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   exit_kind: an escalation.disposition.ExitKind value, or null for a
+    #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
 

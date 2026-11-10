@@ -49,6 +49,11 @@ from orchestrator.review_issue_contract import (
     IssueIntake,
     check_issues,
 )
+from orchestrator.review_payload import (
+    ReviewPayloadError,
+    note_dispositions_record,
+    parse_note_dispositions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +80,10 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 # Standalone implementation functions (testable without MCP transport)
 #
 # Only _submit_review_verdict has constrained/validated fields (the
-# reviewer==role identity check, the verdict enum, and each issue checked
-# against the contract in orchestrator/review_issue_contract.py) — the other
-# three payloads (completion/triage/merge) have no enum-like fields today,
+# reviewer==role identity check, the verdict enum, the note_dispositions
+# shape below, and each issue checked against the contract in
+# orchestrator/review_issue_contract.py) — the other three payloads
+# (completion/triage/merge) have no enum-like fields today,
 # so they write whatever they receive. Booleans and lists are still
 # type-checked at the pydantic MCP tool boundary in create_server(). Add
 # parallel validation here if any of those payloads gain a constrained
@@ -104,6 +110,7 @@ def _submit_review_verdict(
     verdict: str,
     issues: list[dict],
     summary: str,
+    note_dispositions: list[dict] | None = None,
 ) -> dict[str, Any]:
     if reviewer != role:
         return {
@@ -119,6 +126,10 @@ def _submit_review_verdict(
             'status': 'error',
             'message': f'verdict must be one of PASS/ISSUES_FOUND, got {verdict!r}',
         }
+    try:
+        parsed_notes = parse_note_dispositions(note_dispositions, reviewer=reviewer)
+    except ReviewPayloadError as exc:
+        return {'status': 'error', 'message': str(exc)}
     intake = check_issues(issues)
     if intake.unusable:
         return _issue_contract_refusal(intake)
@@ -127,6 +138,7 @@ def _submit_review_verdict(
         'verdict': verdict,
         'issues': list(intake.issues),
         'summary': summary,
+        **note_dispositions_record(parsed_notes),
     }
     ack = _write_and_ack(artifacts, role, session_id, payload)
     if intake.normalised:
@@ -545,6 +557,7 @@ def create_server(
             verdict: str,
             issues: list[dict],
             summary: str,
+            note_dispositions: list[dict] | None = None,
         ) -> dict[str, Any]:
             """Submit a reviewer's verdict for this task.
 
@@ -560,9 +573,15 @@ def create_server(
                     off-contract fields are normalised and reported back
                     under issue_contract.
                 summary: One-paragraph summary of the review.
+                note_dispositions: One entry per info note your briefing lists, each
+                    {escalation_id, disposition: "addressed" | "no_action" |
+                    "work", rationale}. Omit it when the briefing lists no
+                    notes. A malformed list is rejected (status: error)
+                    rather than written.
             """
             response = _submit_review_verdict(
                 artifacts, role, session_id, reviewer, verdict, issues, summary,
+                note_dispositions,
             )
             if 'issue_contract' in response:
                 await fact_journal({
