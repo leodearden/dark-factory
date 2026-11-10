@@ -11,10 +11,9 @@ from __future__ import annotations
 import asyncio
 import random
 from pathlib import Path
-from typing import Any
 
 import pytest
-from _merge_lane_fakes import VerifyTasks, lane_scene_config
+from _merge_lane_fakes import GateTask, VerifyTask, VerifyTasks, lane_scene_config
 from _merge_lane_fakes import verifies as verifies
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -86,9 +85,9 @@ def _entry(
     *,
     base: str,
     commit: str | None,
-    verify: asyncio.Task[Any] | None,
+    verify: VerifyTask | None,
     status: InflightStatus | None = None,
-    gate_task: asyncio.Task[Any] | None = None,
+    gate_task: GateTask | None = None,
 ) -> InflightEntry:
     item = _real_item(config, task_id, base=base, commit=commit)
     return InflightEntry(
@@ -110,7 +109,7 @@ def _passthrough(config: OrchestratorConfig, task_id: str) -> InflightEntry:
     )
 
 
-def _gate(item: RealMergeItem, task: asyncio.Task[Any]) -> PendingGate:
+def _gate(item: RealMergeItem, task: GateTask) -> PendingGate:
     commit = item.merge_result.merge_commit or ''
     return PendingGate(
         task=task,
@@ -282,7 +281,7 @@ class TestChooseRemergeBase:
     ) -> None:
         owner = _entry(
             config, 'a', base=_MAIN, commit='sha-a', verify=verifies.pending(),
-            gate_task=verifies.pending(),
+            gate_task=verifies.pending_gate(),
         )
         assert _choose('sha-a', [owner]) == RemergeBase(None, RemergeReason.TIP_VERIFY_DEAD)
 
@@ -446,7 +445,7 @@ def _random_frontier(
             config, f't{cascade}-{i}', base=base, commit=commit,
             verify=None if kind == 'verify_dead' else verifies.pending(),
             status=InflightStatus.REQUEUED if kind == 'vacated' else None,
-            gate_task=verifies.pending() if kind == 'gate_parked' else None,
+            gate_task=verifies.pending_gate() if kind == 'gate_parked' else None,
         ))
         if kind == 'dead_chained':
             dead.add(commit)

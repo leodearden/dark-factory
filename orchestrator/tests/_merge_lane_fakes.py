@@ -53,6 +53,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ClockPort, VerifyPort
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import (
     DiskGuardOutcome,
     InflightVerifyResult,
@@ -542,30 +543,41 @@ def healthy_verify_clock() -> FakeClock:
     return FakeClock(content_mtime=1.0, content_tick=1.0)
 
 
+VerifyTask = asyncio.Task[InflightVerifyResult]
+GateTask = asyncio.Task[MergeOutcome | GateClearance]
+
+
 class VerifyTasks:
     """Builds verify tasks in each state a frontier owner's verify can be in,
     and cancels whichever are still pending when the test ends."""
 
     def __init__(self) -> None:
-        self._made: list[asyncio.Task[Any]] = []
+        self._made: list[VerifyTask | GateTask] = []
 
-    def pending(self) -> asyncio.Task[Any]:
-        task = asyncio.create_task(asyncio.Event().wait())
+    def pending(self) -> VerifyTask:
+        task = asyncio.create_task(_never_verifies())
         self._made.append(task)
         return task
 
-    async def settled(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    def pending_gate(self) -> GateTask:
+        task = asyncio.create_task(_never_clears())
+        self._made.append(task)
+        return task
+
+    async def settled(
+        self, coro: Coroutine[Any, Any, InflightVerifyResult],
+    ) -> VerifyTask:
         task = asyncio.create_task(coro)
         await asyncio.wait([task])
         return task
 
-    async def finished(self, result: InflightVerifyResult) -> asyncio.Task[Any]:
+    async def finished(self, result: InflightVerifyResult) -> VerifyTask:
         return await self.settled(_returns(result))
 
-    async def raised(self) -> asyncio.Task[Any]:
+    async def raised(self) -> VerifyTask:
         return await self.settled(_raises())
 
-    async def cancelled(self) -> asyncio.Task[Any]:
+    async def cancelled(self) -> VerifyTask:
         task = self.pending()
         task.cancel()
         await asyncio.wait([task])
@@ -576,6 +588,16 @@ class VerifyTasks:
             task.cancel()
         if self._made:
             await asyncio.wait(self._made)
+
+
+async def _never_verifies() -> InflightVerifyResult:
+    await asyncio.Event().wait()
+    raise AssertionError('a pending verify never completes')
+
+
+async def _never_clears() -> MergeOutcome | GateClearance:
+    await asyncio.Event().wait()
+    raise AssertionError('a pending gate never clears')
 
 
 async def _returns(result: InflightVerifyResult) -> InflightVerifyResult:
