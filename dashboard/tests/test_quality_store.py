@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import AsyncIterator
-from dataclasses import replace
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.quality_store import (
     QualitySample,
     SampleState,
+    _require_every_field_coded,
     insert_sample,
     read_landing_rows,
     read_samples,
@@ -199,6 +201,52 @@ async def test_rewriting_a_key_updates_its_one_row_in_place(
     await _store_rows(conn, [second])
 
     assert await read_landing_rows(conn, 'p') == [second]
+
+
+async def _edit_stored_rule_vintage(
+    conn: aiosqlite.Connection, edit: Callable[[dict[str, object]], object],
+) -> None:
+    """Stand in for a row an older SourceEpochs wrote, which nothing will ever re-measure."""
+    async with conn.execute('SELECT rule_vintage FROM landings') as cursor:
+        [(text,)] = await cursor.fetchall()
+    stored = json.loads(text)
+    edit(stored)
+    await conn.execute('UPDATE landings SET rule_vintage = ?', (json.dumps(stored),))
+    await conn.commit()
+
+
+async def test_a_source_added_since_a_row_was_stored_reads_as_not_started(
+    conn: aiosqlite.Connection,
+) -> None:
+    row = _train_member('102')
+    await _store_rows(conn, [row])
+
+    await _edit_stored_rule_vintage(conn, lambda stored: stored.pop('review_completed'))
+
+    assert await read_landing_rows(conn, 'p') == [
+        replace(row, rule_vintage=replace(row.rule_vintage, review_completed=None)),
+    ]
+
+
+async def test_a_stored_source_that_source_epochs_lacks_is_refused_by_name(
+    conn: aiosqlite.Connection,
+) -> None:
+    await _store_rows(conn, [_train_member('102')])
+
+    await _edit_stored_rule_vintage(conn, lambda stored: stored.update(retired_source=None))
+
+    with pytest.raises(ValueError, match=re.escape("['retired_source']")):
+        await read_landing_rows(conn, 'p')
+
+
+def test_a_codec_out_of_step_with_its_dataclass_names_both_sides() -> None:
+    @dataclass(frozen=True)
+    class Grown:
+        kept: int
+        added: int
+
+    with pytest.raises(TypeError, match=re.escape("uncoded ['added'], not fields ['dropped']")):
+        _require_every_field_coded(Grown, ('kept', 'dropped'))
 
 
 async def test_stored_cursor_names_the_newest_first_claim_on_main_by_the_cutoff(

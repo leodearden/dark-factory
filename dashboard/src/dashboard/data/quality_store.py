@@ -154,11 +154,21 @@ _MODULES = _Codec(
     lambda modules: json.dumps([[m.module, m.src_lines] for m in modules]),
     lambda text: tuple(ModuleLines(str(module), int(lines)) for module, lines in json.loads(text)),
 )
+def _decode_epochs(text: str) -> SourceEpochs:
+    """A stored rule vintage; a source added since the row was stored reads as not yet started."""
+    stored: dict[str, Any] = json.loads(text)
+    names = [f.name for f in fields(SourceEpochs)]
+    unknown = sorted(set(stored) - set(names))
+    if unknown:
+        raise ValueError(f'stored rule_vintage names sources SourceEpochs lacks: {unknown}')
+    return SourceEpochs(**{name: _UTC.decode(stored.get(name)) for name in names})
+
+
 _EPOCHS = _Codec(
     lambda epochs: json.dumps(
         {f.name: _UTC.encode(getattr(epochs, f.name)) for f in fields(SourceEpochs)}
     ),
-    lambda text: SourceEpochs(**{name: _UTC.decode(at) for name, at in json.loads(text).items()}),
+    _decode_epochs,
 )
 
 
@@ -195,6 +205,28 @@ _PARTS: tuple[_Part, ...] = (
 )
 
 _WHOLE_FIELDS: tuple[tuple[str, _Codec], ...] = (('modules', _MODULES), ('rule_vintage', _EPOCHS))
+
+
+def _require_every_field_coded(cls: Any, coded: Iterable[str]) -> None:
+    """Refuse a codec that misses or invents a field of *cls*, so a new α field fails at import."""
+    declared = {f.name for f in fields(cls)}
+    named = set(coded)
+    if named != declared:
+        raise TypeError(
+            f'the quality.db codec for {cls.__name__} is out of step with its fields: '
+            f'uncoded {sorted(declared - named)}, not fields {sorted(named - declared)}'
+        )
+
+
+def _require_the_codec_covers_landing_row() -> None:
+    for part in _PARTS:
+        _require_every_field_coded(part.cls, (name for name, _ in part.codecs))
+    _require_every_field_coded(
+        LandingRow, (*(part.attribute for part in _PARTS), *(name for name, _ in _WHOLE_FIELDS)),
+    )
+
+
+_require_the_codec_covers_landing_row()
 
 _KEY = ('project_id', 'merge_sha', 'task_id')
 
