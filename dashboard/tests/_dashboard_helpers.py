@@ -1420,7 +1420,10 @@ def extract_df_data_block(src: str, key: str) -> str:
 # JSX opening-tag walk.
 #
 # Spans one opening tag, attributes included, so a probe can confine itself to
-# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# that element.  `jsx_open_tag_end` is the walk from one known `<`;
+# `jsx_open_tags` reads every opening tag a pattern finds, comment-stripped.
+# Contracts: test_jsx_source_helpers.py::TestJsxOpenTagEnd and
+# test_jsx_source_helpers.py::TestJsxOpenTags.
 # ---------------------------------------------------------------------------
 
 
@@ -1465,6 +1468,28 @@ def jsx_open_tag_end(src: str, start: int) -> int | None:
             return None
         i += 1
     return None
+
+
+def jsx_open_tags(src: str, pattern: re.Pattern[str]) -> list[str]:
+    """Return every opening tag *pattern* finds in comment-stripped *src*, in order.
+
+    A tag with children is returned as its opening tag, which carries every
+    attribute; ``tag[-2:] == '/>'`` tells a self-closing one.  Each match must
+    start at the tag's ``<`` (else `jsx_open_tag_end`'s ``ValueError``), and a
+    tag the walk cannot close raises rather than being dropped.
+    """
+    code = strip_js_comments(src)
+    tags: list[str] = []
+    for m in pattern.finditer(code):
+        end = jsx_open_tag_end(code, m.start())
+        if end is None:
+            raise AssertionError(
+                f'jsx_open_tags: a {pattern.pattern!r} tag never closes, or a '
+                f'bare `<` or a stray `}}` comes first, so no probe over its span '
+                f'would mean anything: {code[m.start() : m.start() + 80]!r}'
+            )
+        tags.append(code[m.start() : end])
+    return tags
 
 
 # ---------------------------------------------------------------------------
