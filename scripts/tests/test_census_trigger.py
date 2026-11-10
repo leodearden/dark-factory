@@ -193,6 +193,41 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
     assert config.novelty_spike_baseline_days == 0
 
 
+def test_census_config_completion_threshold_pct_defaults_to_seventy():
+    assert ct.CensusConfig().completion_threshold_pct == 70
+
+
+@pytest.mark.parametrize("value", [1, 85, 100])
+def test_census_config_from_mapping_accepts_a_completion_threshold_in_range_silently(
+    value, caplog
+):
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"completion_threshold_pct": value})
+
+    assert config.completion_threshold_pct == value
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+@pytest.mark.parametrize("bad", [0, 101, -1, "70", 70.0, True, None, [70]])
+def test_census_config_from_mapping_rejects_a_completion_threshold_outside_1_to_100(
+    bad, caplog
+):
+    """check_run_completion rejects a threshold outside (0, 1] with a usage
+    error, so an unvalidated 0 would become a nightly completion ERROR
+    streak instead of one config WARNING naming the bound."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"completion_threshold_pct": bad})
+
+    assert config == ct.CensusConfig()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "completion_threshold_pct" in message
+    assert type(bad).__name__ in message
+    assert "1..100" in message
+
+
 # ---------------------------------------------------------------------------
 # amendment pass (review finding #3): CensusConfig defaults must not
 # silently drift from task β's legibility.config.Census model, now that β
@@ -213,6 +248,7 @@ def test_census_config_defaults_match_legibility_config_census_model():
     assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
     assert config.novelty_spike_baseline_days == beta_defaults.novelty_spike.baseline_days
     assert config.floor_days == beta_defaults.floor_days
+    assert config.completion_threshold_pct == beta_defaults.completion_threshold_pct == 70
 
 
 # ---------------------------------------------------------------------------
