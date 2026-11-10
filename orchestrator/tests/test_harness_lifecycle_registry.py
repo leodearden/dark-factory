@@ -554,7 +554,12 @@ class TestMergeWorkerLaunchedAfterStartup:
         h = make_merge_lane_harness()
         order: list[str] = []
         loop = _LoopRecorder(order)
-        h._recover_crashed_tasks = AsyncMock(side_effect=lambda: order.append('recover'))
+
+        async def recover_crashed_tasks() -> None:
+            await asyncio.sleep(0)
+            order.append('recover')
+
+        h._recover_crashed_tasks = recover_crashed_tasks
 
         async def first_acquire() -> None:
             await asyncio.wait_for(loop.entered.wait(), 5)
