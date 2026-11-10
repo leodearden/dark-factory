@@ -463,7 +463,7 @@ class TestDispatchItemComputesTruthfulChainItems:
         )
 
         entry = await worker._dispatch_item(item)
-        if entry is not None and entry.verify_task is not None:
+        if isinstance(entry, InflightEntry) and entry.verify_task is not None:
             await entry.verify_task
         return captured
 

@@ -65,7 +65,7 @@ from _recording_event_store import _RecordingEventStore
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.intake import MERGE_LANES
-from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import InflightEntry, MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -596,7 +596,7 @@ class TestOperatorHaltRequeueNoFalseAlarm:
         worker.operator_halt('test: operator halt before dispatch')
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert isinstance(entry, InflightEntry) and entry.status == InflightStatus.REQUEUED_PREDISPATCH
         assert not queue.empty(), 'req must be put back on _queue by the halt branch'
 
         # The stale T0 entry must be gone — a legitimately halted/parked
@@ -4130,8 +4130,6 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The seven surfaces from the task's REGRESSION COVERAGE list."""
-        from orchestrator.merge_lane.worker import InflightEntry
-
         worker, req, outcome, gate, fake_eq, main_sha, snap = (
             await self._drive_abort_then_land(
                 git_ops, config, 'df3082-e2e-selfheal', 'selfheal.py', caplog,
