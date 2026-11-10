@@ -22,7 +22,7 @@ import httpx
 import pytest
 from _briefing_helpers import (
     AMENDMENT_BODY_FIXTURES,
-    WORST_CASE_GROUPED_PARENT_CHARS,
+    WORST_CASE_AMENDMENT_LIST_CHARS,
     _edge,
     _entity_envelope,
     _grouped_parent,
@@ -30,6 +30,7 @@ from _briefing_helpers import (
     _node,
     _result,
     _search_arguments,
+    amendment_list_chars,
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
     recorded_search_envelope,
@@ -358,7 +359,7 @@ class TestDistilledRendering:
     async def test_grouped_children_render_as_nested_bullets(
         self, briefing: BriefingAssembler,
     ):
-        """A filtered amendment digest still renders, as a nested bullet, or
+        """A filtered amendment entry still renders, as a nested bullet, or
         the nested-drop note would announce blocking a leak nobody renders."""
         context = await self._render(briefing, [_grouped_parent()])
 
@@ -370,7 +371,7 @@ class TestDistilledRendering:
         self, briefing: BriefingAssembler,
     ):
         """The other half of ``GROUPED_CHILD_KEYS``: ``matched_children``
-        carries ``content`` where an amendment digest carries ``digest``."""
+        carries a full swallowed body where an amendment entry carries capped text."""
         parent = _grouped_parent(grouped={
             'matched_children': [
                 {'id': 's1', 'content': 'NATIVE SIGHTING BODY', 'created_at': None,
@@ -408,7 +409,6 @@ class TestDistilledRendering:
             line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
             for line in context.splitlines()
         ), context
-        assert 'digest' not in contesting
 
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,
@@ -1133,21 +1133,20 @@ class TestSearchReplyShapes:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
-_BRIEFING_OVERHEAD_CHARS = 2_000
-"""What a ``# Context`` block adds around its results: headings, caveat, notices."""
-
-
 @pytest.mark.asyncio
-class TestTheWorstCaseBriefingIsBounded:
-    """Every search answered with its limit's worth of the worst-case grouped parent.
+class TestTheBriefingsAmendmentTextIsBounded:
+    """Every search answered with its limit's worth of a parent carrying a full amendment list.
 
     The parent is a reply recorded from the real fused-memory ``search`` tool
     (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): ten
-    amendments, each cut at the amendment text cap. The ceiling is the
-    whole-briefing worst case the cap decision accepts.
+    amendments, each cut at the amendment text cap. Every result fired renders
+    its own list, even when two queries return the same parent, so the
+    amendment bullets are bounded by one list's ceiling per result. The
+    results' own bodies and matched-child bodies are uncapped and not bounded
+    here.
     """
 
-    async def test_the_context_block_stays_within_its_ceiling(
+    async def test_its_amendment_bullets_stay_within_one_list_ceiling_per_result(
         self, briefing: BriefingAssembler,
     ):
         recorded = recorded_search_text(
@@ -1164,4 +1163,4 @@ class TestTheWorstCaseBriefingIsBounded:
 
         fired = sum(spec.limit for spec, _query in queries_for(_SCOPE))
         assert context.count('DETAIL-09') == fired, context[:2_000]
-        assert len(context) <= fired * WORST_CASE_GROUPED_PARENT_CHARS + _BRIEFING_OVERHEAD_CHARS
+        assert amendment_list_chars(context) <= fired * WORST_CASE_AMENDMENT_LIST_CHARS

@@ -58,11 +58,14 @@ on the 2026-10-19 soak bundle (gitignored, main checkout):
 - The amendment text of one grouped document, taking each parent's 10 longest
   amendments: p50 899 and max 9,025 characters observed. The bound is
   10 × (4,000 + marker), about 40.2k.
-- A briefing's `# Context` block holds up to 10 results, so its worst case is
-  about 410k characters. `orchestrator/tests/test_memory_recall.py::TestAmendmentBodyRender`
-  pins one grouped parent's share, and
-  `orchestrator/tests/test_briefing_project_scope.py::TestTheWorstCaseBriefingIsBounded`
-  pins the whole block.
+- A briefing's `# Context` block holds up to 10 results, so amendment text can
+  add about 410k characters to it. That bounds the amendment text only: each
+  result's own body and its matched-child bodies are uncapped and come on top,
+  and a parent returned by both briefing queries renders its list twice.
+  `orchestrator/tests/test_memory_recall.py::TestAmendmentBodyRender` pins one
+  parent's amendment bullets, and
+  `orchestrator/tests/test_briefing_project_scope.py::TestTheBriefingsAmendmentTextIsBounded`
+  pins them across the block.
 
 ## 2. Cells
 

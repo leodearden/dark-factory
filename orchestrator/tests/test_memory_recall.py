@@ -20,13 +20,15 @@ from pathlib import Path
 import pytest
 from _briefing_helpers import (
     AMENDMENT_BODY_FIXTURES,
+    AMENDMENT_BULLET,
     SUPERSEDED_CHILD_FIXTURES,
-    WORST_CASE_GROUPED_PARENT_CHARS,
+    WORST_CASE_AMENDMENT_LIST_CHARS,
     _edge,
     _grouped_block,
     _grouped_parent,
     _node,
     _result,
+    amendment_list_chars,
     recorded_search_text,
 )
 from shared.elision import elision_marker
@@ -419,7 +421,7 @@ class TestGroupedChildrenAreFiltered:
 
     ``group_search_results`` nests child data inside a KEPT parent entry and
     every child renders into the ``# Context`` block, so reading only the
-    TOP-LEVEL tag would let a foreign digest or pinned body through.
+    TOP-LEVEL tag would let a foreign amendment entry or pinned body through.
 
     SCOPE: ``src_project`` is the task-2273 CGL-eta rehome shape — a record
     physically in this project's collection naming a different ORIGIN
@@ -460,7 +462,7 @@ class TestGroupedChildrenAreFiltered:
         """The minimal nested-only case: exactly ONE foreign child, nothing else."""
         filtered = _filter([_grouped_parent(grouped={
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'created_at': None,
                  'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
             ],
             'amendment_count': 1,
@@ -493,7 +495,7 @@ class TestGroupedChildrenAreFiltered:
         for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
             filtered = _filter([_grouped_parent(grouped={
                 'amendments': [
-                    {'id': 'a1', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+                    {'id': 'a1', 'content': 'NATIVE AMENDMENT BODY', 'created_at': None,
                      'kind': 'amendment', 'metadata': {'project_id': spelling}},
                 ],
                 'amendment_count': 1,
@@ -509,7 +511,7 @@ class TestGroupedChildrenAreFiltered:
         """The same canonicalisation must not let a FOREIGN child through either."""
         filtered = _filter([_grouped_parent(grouped={
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'created_at': None,
                  'kind': 'amendment', 'metadata': {'src_project': '  REIFY  '}},
             ],
             'amendment_count': 1,
@@ -529,9 +531,9 @@ class TestGroupedChildrenAreFiltered:
                         source_store='mem0')
         entry['grouped'] = {
             'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN CHILD ONE', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'FOREIGN CHILD ONE', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'FOREIGN CHILD TWO', 'kind': 'amendment',
+                {'id': 'a2', 'content': 'FOREIGN CHILD TWO', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
             ],
             'matched_children': [
@@ -632,9 +634,9 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
             'amendments': [
                 None,
                 'a bare string',
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
                  'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
+                {'id': 'a2', 'content': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
             ],
             'amendment_count': 4,
         }
@@ -650,7 +652,7 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         entry = _result('p1', 'Native canonical.', metadata={'project_id': PROJECT})
         entry['grouped'] = {
             'amendments': [
-                {'id': 'a1', 'digest': 'ODDLY SHAPED BODY', 'kind': 'amendment',
+                {'id': 'a1', 'content': 'ODDLY SHAPED BODY', 'kind': 'amendment',
                  'metadata': 'not a dict'},
             ],
             'amendment_count': 1,
@@ -777,7 +779,6 @@ def _line_index(lines: list[str], predicate) -> int:
     return index
 
 
-_AMENDMENT_BULLET = '  - [amendment · '
 _COUNTED_CUT = re.compile(r'…\[\+\d+ chars elided\]$')
 
 #: Where the digest that grouped reads carried before task 7518 cut every amendment.
@@ -794,7 +795,7 @@ def _amendment_body_parent() -> dict:
 
 
 class TestAmendmentBodyRender:
-    """A parent's amendments render as their text up to the cap, and the worst case is bounded.
+    """A parent's amendments render as their text up to the cap, and their bullets are bounded.
 
     The input is a reply recorded from the real fused-memory ``search`` tool
     (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): one parent
@@ -805,22 +806,45 @@ class TestAmendmentBodyRender:
     def test_each_amendment_shows_its_late_detail_and_a_counted_cut(self):
         lines = render_memory_results((_amendment_body_parent(),)).splitlines()
 
-        bullets = [line for line in lines if line.startswith(_AMENDMENT_BULLET)]
+        bullets = [line for line in lines if line.startswith(AMENDMENT_BULLET)]
         assert len(bullets) == 10, lines
         for index, bullet in enumerate(bullets):
             text = bullet.split('] ', 1)[1]
             assert text.index(f'DETAIL-{index:02d}') > _PRE_7518_DIGEST_CHARS, text
             assert _COUNTED_CUT.search(text), text[-60:]
 
-    def test_the_worst_case_parent_renders_within_its_ceiling(self):
+    def test_a_full_amendment_list_renders_within_its_ceiling(self):
         parent = _amendment_body_parent()
         amendments = parent['grouped']['amendments']
 
-        rendered = render_memory_results((parent,))
+        listed = amendment_list_chars(render_memory_results((parent,)))
 
         assert len(amendments) == 10
-        assert len(rendered) >= sum(len(child['content']) for child in amendments)
-        assert len(rendered) <= WORST_CASE_GROUPED_PARENT_CHARS, len(rendered)
+        assert listed >= sum(len(child['content']) for child in amendments)
+        assert listed <= WORST_CASE_AMENDMENT_LIST_CHARS, listed
+
+
+class TestThePre7518DigestFallback:
+    """A pre-7518 fused-memory sends an amendment's text as ``digest``, not ``content``.
+
+    ``memory_recall._entry_text`` reads it so a briefing still renders while
+    fused-memory and the orchestrator fleet are redeployed at different times.
+    Ticket tkt_0RWT7YKEWFG8K4RCHPT6ZAQTGK deletes the fallback and this class
+    once both run past task 7518.
+    """
+
+    def test_an_amendment_carrying_only_a_digest_renders_it(self):
+        parent = _grouped_parent(grouped={
+            'amendments': [
+                {'id': 'a1', 'digest': 'PRE-7518 DIGEST BODY', 'created_at': None,
+                 'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
+            ],
+            'amendment_count': 1,
+        })
+
+        rendered = render_memory_results((parent,))
+
+        assert '  - [amendment · undated · mem0] PRE-7518 DIGEST BODY' in rendered, rendered
 
 
 class TestContestingChildRender:
@@ -836,7 +860,6 @@ class TestContestingChildRender:
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         full_body = _top_level(results, contesting['id'])['content']
-        assert 'digest' not in contesting
 
         rendered = render_memory_results(results)
 
@@ -882,7 +905,7 @@ class TestContestingChildRender:
         plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["content"]}'))
         assert contests_at < plain_at, lines
         assert lines[contests_at].endswith(f'] {full_body}'), lines
-        assert 'digest' not in contesting
+        assert rendered.count(full_body) == 1, rendered
 
     def test_the_childs_own_hit_outranks_the_capped_grouped_text(self):
         results = _recorded_results('child-also-matched')

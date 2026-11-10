@@ -1,7 +1,7 @@
 # Provenance — `grouped_search_amendment_bodies` fixtures
 
-These fixtures exist so the orchestrator's briefing-size ceilings are pinned
-against the bytes fused-memory's `search` tool actually emits for the worst
+These fixtures exist so the orchestrator's ceilings on amendment text in a
+briefing are pinned against the bytes fused-memory's `search` tool actually emits for the worst
 case the amendment text cap accepts (task 7518), not against a shape written
 from its docstring. A hand-built body could pass a ceiling the producer
 exceeds.
@@ -21,7 +21,7 @@ exceeds.
 | **Grounding** | **Real producer over a stub scenario.** The real `search` MCP tool (`fused-memory/src/fused_memory/server/tools.py::create_mcp_server` → `fused-memory/src/fused_memory/server/grouped_read.py::group_search_results`) ran over a stub memory service; only the service's reads are stubbed. The service's `config.write_triage.judge_field_chars` is a mock attribute, not a positive int, so `fused-memory/src/fused_memory/server/write_triage_judge.py::resolve_judge_field_chars` falls back to the shipped `write_triage.judge_field_chars` default (4,000). |
 | **Producing code sites** | `fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry` gives each amendment entry `content` = `grouped_read.py::amendment_text` at that default: the text cut by `fused-memory/src/fused_memory/utils/clip_disclosure.py::elide_text` with the counted marker `…[+N chars elided]`. The scroll is capped at `grouped_read.py::AMENDMENT_LIST_CAP` (10). |
 | **Pinning test** | `fused-memory/tests/server/test_amendment_bodies_search_reply.py` re-produces the reply and asserts equality, printing the produced JSON on a mismatch. |
-| **Readers** | `orchestrator/tests/test_memory_recall.py::TestAmendmentBodyRender` and `orchestrator/tests/test_briefing_project_scope.py::TestTheWorstCaseBriefingIsBounded`, through `orchestrator/tests/_briefing_helpers.py::recorded_search_text` with `fixtures=AMENDMENT_BODY_FIXTURES`. |
+| **Readers** | `orchestrator/tests/test_memory_recall.py::TestAmendmentBodyRender` and `orchestrator/tests/test_briefing_project_scope.py::TestTheBriefingsAmendmentTextIsBounded`, through `orchestrator/tests/_briefing_helpers.py::recorded_search_text` with `fixtures=AMENDMENT_BODY_FIXTURES`. |
 | **Serialisation** | `pydantic_core.to_jsonable_python` of the tool result, then `json.dumps(..., indent=2, ensure_ascii=False)` plus one trailing newline. |
 
 The scenario: parent `11111111-…-111111111111`, the only hit, carries ten
