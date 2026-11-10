@@ -71,8 +71,8 @@ from pathlib import Path
 # (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
 # inside a `__main__` guard -- because the `shared.cap_markers` import it
 # enables is module-level, so it must resolve under pytest and package import
-# too. orchestrator/src is bound the same way, for the code-quality slicer
-# `orchestrator.agents.code_quality` (stdlib-only): under
+# too. orchestrator/src is bound the same way, for the code-quality
+# Definition accessor `orchestrator.agents.code_quality` (stdlib-only): under
 # `uv run --project shared` nothing else puts it on sys.path.
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
@@ -217,23 +217,6 @@ def parse_frontmatter(digest_text: str) -> dict:
 # build_prompt — instructions + codebook index + digest, embedded verbatim
 # ---------------------------------------------------------------------------
 
-_DEFINITION_HEADING = "## Definition"
-
-
-def _quality_definition() -> str:
-    """The normative code-quality doc's ``## Definition`` body, read on every
-    call. A renamed, removed or emptied section raises ValueError, so it fails
-    every digest in the batch (a coder storm) instead of the import."""
-    doc_text = code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
-    definition = code_quality.section(doc_text, _DEFINITION_HEADING).strip()
-    if not definition:
-        raise ValueError(
-            f"section {_DEFINITION_HEADING!r} of {code_quality.NORMATIVE_DOC} is "
-            "empty, so the coder has no minting test"
-        )
-    return definition
-
-
 def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
     if not invariant_slugs:
         return (
@@ -282,6 +265,8 @@ def build_prompt(
     output shape (PRD §7.3), the code-quality Definition as the test a
     confusion must meet to be minted as a candidate, and the observed
     project's *invariant_slugs* (an empty list is stated, not omitted).
+    The Definition is read on every call, so a renamed, removed, emptied or
+    braced section fails every digest in the batch rather than the import.
     The slugs are guidance only: the merger is what enforces them.
     """
     phases = ", ".join(codebook_mod.PHASES)
@@ -302,7 +287,7 @@ def build_prompt(
         "Mint a candidate only for a confusion that meets this definition, "
         "that is, one that shows a cost or risk to the next change. "
         "Otherwise do not mint one.\n"
-        + _quality_definition() + "\n\n"
+        + code_quality.definition() + "\n\n"
         "=== INVARIANT SLUGS ===\n" + _invariant_slugs_block(invariant_slugs) + "\n\n"
         "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
         "=== SESSION DIGEST ===\n" + digest_text
