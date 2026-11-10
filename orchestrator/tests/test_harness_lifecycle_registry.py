@@ -22,18 +22,22 @@ do not yet exist.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _escalation_server_capture import create_server_kwargs
+from _git_fixtures import seed_repo
+from _merge_lane_fakes import branch_merge_request, lane_scene_config
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
 from orchestrator.background_service import BackgroundService, ManagedService
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
 from orchestrator.flake_ledger import (
@@ -419,3 +423,184 @@ class TestFlakeDebtDrainPass:
         [record] = fresh.get_by_task(STALE_DUE_ESCALATION_SENTINEL, status='pending')
         assert record.level == 1
         assert record.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# task 8268 (plans/startup-hardening-prd.md §3.4): the merge worker is
+# constructed at 1b; its loop is launched only after finish_startup()
+# ---------------------------------------------------------------------------
+
+_SCENE_GIT = GitConfig(
+    main_branch='main', branch_prefix='task/', remote='origin',
+    worktree_dir='.worktrees', push_after_advance=False,
+)
+#: Every startup-table step but '1b', '1c0a' and '2f', which run for real.
+_STUBBED_STARTUP_STEPS = (
+    '_dismiss_stale_escalations', '_file_dirty_tree_escalation',
+    '_file_config_unknown_keys_escalation', '_rehydrate_merge_halt',
+    '_reap_orphaned_merge_worktrees', '_reconcile_landed_outbox',
+    '_file_restored_pause_escalation', '_run_interactive_worktree_reaper_pass',
+    '_run_leftover_verify_scope_reaper_pass', '_recover_crashed_tasks',
+    '_reconcile_lane_checkouts', '_inherit_pending_streak_alarms',
+    '_reconcile_stranded_in_progress', '_reap_orphan_worktrees',
+    '_reconcile_terminal_lanes', '_run_scheduled_deploy_settle_pass',
+)
+_SYNC_STARTUP_STEPS = frozenset({
+    '_rehydrate_merge_halt', '_file_restored_pause_escalation',
+    '_inherit_pending_streak_alarms',
+})
+_WORKER_RUN = 'orchestrator.merge_lane.worker.SpeculativeMergeWorker.run'
+
+
+class _ProcessKillingFault(BaseException):
+    """Escapes the startup-step runner, which catches only ``Exception``."""
+
+
+@pytest.fixture
+def make_merge_lane_harness(tmp_path: Path) -> Callable[[], Harness]:
+    """Build Harnesses over ONE seeded repo, each running the real 1b and 1c0a.
+
+    A later Harness sees the journal and runs.db an earlier one left.
+    """
+    repo = seed_repo(tmp_path / 'repo')
+
+    def make() -> Harness:
+        with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
+             patch('orchestrator.harness.Scheduler'), \
+             patch('orchestrator.harness.BriefingAssembler'):
+            h = Harness(lane_scene_config(repo, _SCENE_GIT))
+        mock_mcp_cls.return_value.start = AsyncMock()
+        mock_mcp_cls.return_value.stop = AsyncMock()
+
+        async def start_escalation_server() -> None:
+            h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        h._start_escalation_server = AsyncMock(side_effect=start_escalation_server)
+        h._stop_escalation_server = AsyncMock()
+        for attr in _STUBBED_STARTUP_STEPS:
+            setattr(h, attr, MagicMock() if attr in _SYNC_STARTUP_STEPS else AsyncMock())
+        h._tag_task_modules = AsyncMock()
+        h._tag_prd_metadata = AsyncMock()
+
+        h.scheduler = MagicMock()
+        h.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+        h.scheduler.set_task_status = AsyncMock()
+        return h
+
+    return make
+
+
+async def journal_merge_request(h: Harness, task_id: str) -> str:
+    """Journal a real merge of task *task_id*'s new branch, as the live enqueue does; its id."""
+    request = await branch_merge_request(h.git_ops, h.config, task_id, filename=f'{task_id}.txt')
+    h._merge_store.record(request)
+    return request.request_id
+
+
+def _drain_queued(h: Harness) -> list:
+    queued = []
+    while not h._merge_queue.empty():
+        queued.append(h._merge_queue.get_nowait())
+    return queued
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records]
+
+
+def _index_of(messages: list[str], fragment: str) -> int:
+    return next(i for i, m in enumerate(messages) if fragment in m)
+
+
+class _LoopRecorder:
+    """Stands in for the worker loop: records its entry, then waits to be cancelled."""
+
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+        self.entered = asyncio.Event()
+
+    async def __call__(self) -> None:
+        self.order.append('loop')
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+class TestMergeWorkerLaunchedAfterStartup:
+    async def test_a_crash_in_2c_resolves_no_journaled_merge(
+        self, make_merge_lane_harness,
+    ) -> None:
+        h = make_merge_lane_harness()
+        request_id = await journal_merge_request(h, '41')
+        h._recover_crashed_tasks = AsyncMock(side_effect=_ProcessKillingFault('injected 2c'))
+
+        with pytest.raises(_ProcessKillingFault):
+            await h.run(prd_path=None)
+
+        assert h.event_store is not None
+        assert h.event_store.fetch_events_by_type(EventType.merge_finalized) == []
+        [queued] = _drain_queued(h)
+        assert queued.request_id == request_id
+        assert not queued.result.done()
+
+        h2 = make_merge_lane_harness()
+        await h2.run(prd_path=None, dry_run=True)
+
+        assert [r.request_id for r in _drain_queued(h2)] == [request_id]
+
+    async def test_a_healthy_start_launches_the_loop_after_the_task_tree_is_populated(
+        self, make_merge_lane_harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = make_merge_lane_harness()
+        order: list[str] = []
+        loop = _LoopRecorder(order)
+        h._recover_crashed_tasks = AsyncMock(side_effect=lambda: order.append('recover'))
+
+        async def first_acquire() -> None:
+            await asyncio.wait_for(loop.entered.wait(), 5)
+            raise RuntimeError('__stop_sentinel__')
+
+        h.scheduler.acquire_next = AsyncMock(side_effect=first_acquire)
+
+        with patch(_WORKER_RUN, loop), \
+             caplog.at_level(logging.INFO, logger='orchestrator.harness'), \
+             pytest.raises(RuntimeError, match='__stop_sentinel__'):
+            await h.run(prd_path=None)
+
+        assert order == ['recover', 'loop']
+        messages = _messages(caplog)
+        assert _index_of(messages, 'Task tree populated') < _index_of(
+            messages, 'Speculative merge worker started',
+        )
+
+    async def test_a_dry_run_start_never_runs_the_loop(
+        self, make_merge_lane_harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = make_merge_lane_harness()
+        order: list[str] = []
+
+        with patch(_WORKER_RUN, _LoopRecorder(order)), \
+             caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await h.run(prd_path=None, dry_run=True)
+
+        assert order == []
+        assert not any('Speculative merge worker started' in m for m in _messages(caplog))
+        h.scheduler.finish_startup.assert_called_once()
+
+    async def test_stopping_a_constructed_but_unlaunched_merge_worker_resolves_nothing(
+        self, make_merge_lane_harness,
+    ) -> None:
+        h = make_merge_lane_harness()
+        h._build_lifecycle_registry()
+        assert h._lifecycle is not None
+        [service] = [s for s in h._lifecycle.services if s.name == 'merge-worker']
+        await service.start()
+        assert h._merge_worker is not None
+        assert h._merge_worker_task is None
+
+        with patch.object(h._merge_worker, 'stop', AsyncMock()) as stop, \
+             patch.object(h._drain_participant, 'on_shutdown', MagicMock()) as on_shutdown:
+            await service.stop()
+
+        stop.assert_not_called()
+        on_shutdown.assert_not_called()
