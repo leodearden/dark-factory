@@ -5428,7 +5428,7 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(t3_lane: _T3Lane) -> N
 def _named_successor(spawn: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
     """The `record=… t3_thread_id=…` line a T3 sibling spawn printed, split on its one space and percent-decoded."""
     (line,) = spawn.stdout.decode().splitlines()
-    tokens = dict(word.partition("=")[::2] for word in line.split(" "))
+    tokens = {key: value for key, _, value in (word.partition("=") for word in line.split(" "))}
     assert tokens.keys() == {"record", "t3_thread_id"}, line
     return {key: urllib.parse.unquote(value) for key, value in tokens.items()}
 
