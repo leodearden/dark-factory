@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -322,7 +323,7 @@ _RECORDED = keys.RecordedInputs(
 _CURRENT = {_TEST_FILE: 'f' * 40, 'conftest.py': 'c' * 40, _READ: 'a' * 40}
 
 
-def _test_key(current: dict[str, str | None]) -> keys.UnitKey | None:
+def _test_key(current: Mapping[str, str | None]) -> keys.UnitKey | None:
     return keys.test_unit_key(f'{_TEST_FILE}::test_a', _RECORDED, current, _ALPHA_TEST_RUN, _TOOLCHAIN)
 
 
