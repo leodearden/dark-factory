@@ -37,11 +37,14 @@ class _DeploySession(_LocalDepMcpSession):
     def __init__(self) -> None:
         super().__init__()
         self.metadata_writes: list[tuple[str, dict]] = []
+        self.failing_reads: set[str] = set()
 
     def task(self, task_id: str) -> dict:
         return next(t for t in self.tasks if str(t.get('id')) == task_id)
 
     async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        if name == 'get_task' and str(arguments['id']) in self.failing_reads:
+            return self._envelope(json.dumps({'error': 'fused-memory down', 'error_type': 'ServerError'}))
         if name == 'update_task':
             return self._update_task(arguments)
         if name == 'find_tasks_by_metadata':
@@ -186,6 +189,22 @@ class TestDispatchHold:
         _set_phase(session, SELF_DEPLOY_ID, 'verified')
         await _run_tick(harness)
         assert len(_anchor_writes(session, DEPENDENT_ID)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_refetch_of_a_held_dep_does_not_dispatch(
+        self, tmp_path: Path, session: _DeploySession,
+    ) -> None:
+        _register_dependent(session, DEPENDENT_ID, dep_id=SELF_DEPLOY_ID)
+        harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
+
+        assert await _run_tick(harness) is None
+
+        session.failing_reads.add(SELF_DEPLOY_ID)
+        assert await _run_tick(harness) is None
+
+        session.failing_reads.clear()
+        _set_phase(session, SELF_DEPLOY_ID, 'verified')
+        assert await _run_tick(harness) == DEPENDENT_ID
 
 
 def _deploy_state(session: _DeploySession) -> dict:

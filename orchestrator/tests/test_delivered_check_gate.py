@@ -1678,6 +1678,70 @@ class TestPhaseBackfillTerminalDepRecords:
         scheduler.get_task.assert_awaited_once_with('29')
         assert ctx.terminal_dep_records == {'29': still_held}
 
+    # --- (l) a held record survives a failed or deferred re-fetch ----------
+
+    def _held_ctx(self, scheduler: Scheduler) -> tuple[TickContext, dict]:
+        held = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = held
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent], status_map={'20': 'done'}, tasks_by_id={'10': dependent}
+        )
+        return ctx, held
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_returns_none(
+        self, scheduler: Scheduler, caplog
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+        assert scheduler._terminal_dep_record_cache['20'] == held
+        assert any(
+            'hold retained' in r.getMessage() and '20' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_record_is_still_served_when_its_refetch_raises(
+        self, scheduler: Scheduler
+    ):
+        ctx, held = self._held_ctx(scheduler)
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('fused-memory down'))
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.terminal_dep_records['20'] == held
+
+    @pytest.mark.asyncio
+    async def test_held_record_deferred_by_the_budget_is_still_served(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        held_21 = self._scheduled_deploy_record('21', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['21'] = held_21
+        task_a = self._dependent(task_id='10', dep_id='20')
+        task_b = self._dependent(task_id='11', dep_id='21')
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'20': 'done', '21': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},
+        )
+        still_held_20 = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler.get_task = AsyncMock(return_value=still_held_20)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records == {'20': still_held_20, '21': held_21}
+
 
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
