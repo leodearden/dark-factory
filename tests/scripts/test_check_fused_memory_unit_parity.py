@@ -18,6 +18,7 @@ import types
 
 import pytest
 import systemd_unit_parity
+import yaml
 from setup_host_sections import (
     enabled_units,
     run_section,
@@ -460,10 +461,14 @@ _GATE_LINE = (
 )
 _BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, _BARE_COMPOSE_UP_LINE)
 _GATE_PLUS_BARE_COMPOSE_UP_UNIT = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{_BARE_COMPOSE_UP_LINE}")
+_EMBEDDER_UP_ARGS = "up -d --pull=never --no-deps embedder"
 _EMBEDDER_UP_LINE = (
-    "ExecStartPre=-/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml "
-    "up -d --pull=never embedder"
+    "ExecStartPre=-/usr/bin/timeout 10 /usr/bin/docker compose "
+    f"-f /repo/fused-memory/docker/docker-compose.yml {_EMBEDDER_UP_ARGS}"
 )
+_COMPOSE_FILE = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
+# The compose keys that make `up <service>` start another service too.
+_COMPOSE_DEPENDENCY_KEYS = ("depends_on", "links", "volumes_from")
 
 
 def test_find_drift_flags_a_unit_that_brings_the_stores_up_without_the_aof_gate():
@@ -493,9 +498,9 @@ def test_find_drift_accepts_an_embedder_only_compose_up_beside_the_gate():
     "compose_up_args",
     ["up -d", "up -d embedder falkordb", "up -d qdrant", "up -d --pull never embedder"],
 )
-def test_find_drift_flags_a_compose_up_that_can_reach_falkordb(compose_up_args: str):
+def test_find_drift_flags_any_compose_up_beyond_the_ungated_services(compose_up_args: str):
     mod = _load_checker()
-    compose_up_line = _EMBEDDER_UP_LINE.replace("up -d --pull=never embedder", compose_up_args)
+    compose_up_line = _EMBEDDER_UP_LINE.replace(_EMBEDDER_UP_ARGS, compose_up_args)
     assert compose_up_line != _EMBEDDER_UP_LINE
 
     unit = _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{compose_up_line}")
@@ -509,6 +514,31 @@ def test_compose_up_bypasses_aof_gate_reads_only_ungated_services():
     assert mod.compose_up_bypasses_aof_gate(_EMBEDDER_UP_LINE) is False
     assert mod.compose_up_bypasses_aof_gate(_BARE_COMPOSE_UP_LINE) is True
     assert mod.compose_up_bypasses_aof_gate(_GATE_LINE) is False
+
+
+def test_every_ungated_compose_service_starts_alone():
+    mod = _load_checker()
+    services = yaml.safe_load(_COMPOSE_FILE.read_text(encoding="utf-8"))["services"]
+
+    for name in mod.UNGATED_COMPOSE_SERVICES:
+        service = services[name]
+        assert not set(_COMPOSE_DEPENDENCY_KEYS) & service.keys(), (name, service)
+        assert not str(service.get("network_mode", "")).startswith("service:"), (name, service)
+
+
+def test_main_names_the_flagged_compose_up_line_and_the_services_read_from_it(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    mod = _load_checker()
+    compose_up_line = _EMBEDDER_UP_LINE.replace(_EMBEDDER_UP_ARGS, "up -d --wait-timeout 30 embedder")
+    installed = _write_unit(tmp_path, _CLEAN_UNIT.replace(_GATE_LINE, f"{_GATE_LINE}\n{compose_up_line}"))
+
+    rc = mod.main(["--installed", str(installed)])
+
+    assert rc == 1
+    out = _untagged(capsys.readouterr().out)
+    assert f"  - {mod.BARE_COMPOSE_UP_DRIFT}\n      {compose_up_line}\n" in out
+    assert "      read as services: ['30', 'embedder']" in out
 
 
 def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
