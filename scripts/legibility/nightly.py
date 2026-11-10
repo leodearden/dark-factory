@@ -51,6 +51,7 @@ from legibility import (  # noqa: E402
     digest,
     invariants,
     inventory,
+    layout,
     plan_deviation_census,
     sampling,
     session_ledger,
@@ -125,7 +126,7 @@ def resolve_config(
         for candidate_root in sorted(root.iterdir()):
             if not candidate_root.is_dir():
                 continue
-            config_path = candidate_root / 'docs' / 'legibility' / 'legibility.yaml'
+            config_path = layout.config_path(candidate_root)
             if not config_path.is_file():
                 continue
             try:
@@ -469,7 +470,8 @@ def evaluate_census_step(
     run, returning a :class:`CensusEvaluation`.
 
     *decide* (default ``census_trigger.decide_for_project``) makes the
-    FIRE/NO-FIRE call. On NO-FIRE, *launcher* is never called. On FIRE: if
+    FIRE/NO-FIRE call on *cfg* itself, the config this run loaded, so the
+    thresholds are never re-read from another file (task 3269). On NO-FIRE, *launcher* is never called. On FIRE: if
     *entrypoint_exists* (default: does ``scripts/legibility/census.py`` --
     task η -- exist) is False, this logs a LOUD "FIRE-WITHOUT-LAUNCH"
     warning and returns without calling *launcher* -- η is NOT a dependency
@@ -505,7 +507,7 @@ def evaluate_census_step(
         launcher = _default_census_launcher
 
     try:
-        decision = decide(cfg.project_root, now=now, completion_runner=completion_runner)
+        decision = decide(cfg, now=now, completion_runner=completion_runner)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
@@ -578,8 +580,6 @@ def evaluate_census_step(
 # run_nightly — full pipeline assembly: inventory -> sample -> digest ->
 # code -> merge -> docs-only commit -> census (PRD §5.5).
 # ---------------------------------------------------------------------------
-
-_CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
 
 DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 
@@ -1567,7 +1567,7 @@ def _digest_stage(
 def _load_codebook(cfg: LegibilityConfig) -> dict:
     """*cfg*'s codebook, or an empty v2 document for a project onboarded
     without one."""
-    codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
+    codebook_path = layout.codebook_path(cfg.project_root)
     try:
         return codebook.load(codebook_path)
     except FileNotFoundError:
@@ -1686,14 +1686,14 @@ def _commit_stage(
     loud and never leaves its dump in the checkout
     (scripts/legibility/unlanded.py)."""
     if merge.mutated:
-        codebook.dump(merge.codebook, Path(cfg.project_root) / _CODEBOOK_RELPATH)
-        if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
+        codebook.dump(merge.codebook, layout.codebook_path(cfg.project_root))
+        if _git_status_changed(cfg.project_root, layout.CODEBOOK_RELPATH):
             message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
             refusal = _commit_refusal(committer, cfg.project_root, message)
             if refusal is None:
                 return True
             rollback = unlanded.roll_back(
-                cfg.project_root, [_CODEBOOK_RELPATH],
+                cfg.project_root, [layout.CODEBOOK_RELPATH],
                 project_id=cfg.project_id, label=f'trickle-{target_date.isoformat()}',
             )
             summary = 'legibility trickle codebook commit failed'
@@ -1715,7 +1715,7 @@ def _commit_refusal(
     """``None`` once *committer* lands the codebook dump, else why it did not:
     git's diagnostic, or the traceback of the committer's raise."""
     try:
-        result = committer(repo, [_CODEBOOK_RELPATH], message)
+        result = committer(repo, [layout.CODEBOOK_RELPATH], message)
     except Exception as exc:
         return ''.join(traceback.format_exception(exc))
     return None if result.ok else result.stderr
@@ -1751,7 +1751,7 @@ def _census_stage(
             cfg.project_id, target_date.isoformat(),
         )
         return None
-    state_path = census_trigger.census_state_path(cfg.project_root)
+    state_path = layout.census_state_path(cfg.project_root)
     anchor = _census_anchor(state_path)  # read BEFORE the synchronous launch
     evaluation = evaluate_census_step(
         cfg, now=now,

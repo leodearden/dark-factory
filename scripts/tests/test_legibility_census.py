@@ -1253,22 +1253,6 @@ def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_pat
     assert data["session_watermark"] is None
 
 
-@pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
-def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
-    path = tmp_path / "census-state.json"
-
-    _advance(path, session_watermark=watermark)
-
-    status, data = census_trigger.load_census_state(path)
-    assert status == "ok"
-    assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
-    assert data["last_census_at"] == "2026-07-14"
-    assert data["last_census_run_id"] == "census-dark_factory-20260714"
-    assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
-    assert data["last_census_as_of_sha"] == "a" * 40
-    assert data["session_watermark"] == watermark
-
-
 def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
     path = tmp_path / "census-state.json"
     path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")

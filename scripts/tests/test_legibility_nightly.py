@@ -4266,9 +4266,10 @@ class TestRunNightlyRecordsTheCensusObservation:
         with caplog.at_level('WARNING'):
             runner.night(13, 'quiet')
 
+        state_path = str(_census_state(runner.repo))
         malformed = [
             r.getMessage() for r in caplog.records
-            if 'census state at' in r.getMessage()
+            if state_path in r.getMessage()
         ]
         assert len(malformed) == 1, malformed
         assert launches == []

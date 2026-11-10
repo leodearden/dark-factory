@@ -123,6 +123,7 @@ from legibility import (  # noqa: E402
     finding_area,
     invariants,
     landing_gate,
+    layout,
     prescreen,
     session_ledger,
     session_runner,
@@ -3641,9 +3642,7 @@ inventory.enumerate_sessions scans -- distinct from a censused project's
 OWN project_root (which only ever holds that project's docs/legibility/
 state, not any transcripts)."""
 
-DEFAULT_HARNESS_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2] / "docs" / "legibility" / "legibility.yaml"
-)
+DEFAULT_HARNESS_CONFIG_PATH = layout.config_path(Path(__file__).resolve().parents[2])
 """legibility.yaml of the checkout that ships this census: the harness whose
 own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
@@ -4379,10 +4378,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
         )
         return 1
 
-    config_path = (
-        Path(args.config) if args.config
-        else project_root / "docs" / "legibility" / "legibility.yaml"
-    )
+    config_path = Path(args.config) if args.config else layout.config_path(project_root)
 
     try:
         cfg = config.load_config(config_path)
@@ -4434,7 +4430,7 @@ def _run_configured_census(
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 
     if not args.force:
-        decision = census_trigger.decide_for_project(project_root, now=now)
+        decision = census_trigger.decide_for_project(cfg, now=now)
         if not decision.fire:
             print(f"census: NO-FIRE for {cfg.project_id} -- pass --force to run anyway")
             for reason in decision.reasons:
@@ -4446,8 +4442,8 @@ def _run_configured_census(
     except RuntimeError as exc:
         raise CensusPreconditionFailed(f"cannot resolve as_of_sha -- {exc}") from exc
 
-    codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
-    census_state_path = census_trigger.census_state_path(project_root)
+    codebook_path = layout.codebook_path(project_root)
+    census_state_path = layout.census_state_path(project_root)
     prior = census_identity.prior_census(census_state.load(census_state_path))
     plans_dir = project_root / "plans"
     identity = census_identity.allocate_run_identity(
