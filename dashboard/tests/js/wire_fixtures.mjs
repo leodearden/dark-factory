@@ -359,3 +359,102 @@ export function memoryEvalsPayload({
     escalation_queue,
   };
 }
+
+// The QUALITY value and its metrics, as
+// dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire serves
+// them; that method owns the shape.
+
+const NO_GIT_DISAGREEMENT = { off_first_parent: 0, merges_without_landing: 0, late_claims: 0, disagreement: 0 };
+const NO_COST_MODEL = { a: null, b: null, reference_cost_100: null, residual_median: null, state: null };
+const NO_BASELINE = { p0: null, state: null, since_ordinal: null };
+
+// One axis point per entry of `axis`, ordinals 0, 1, ... landing an hour apart
+// and ending at WIRE_AS_OF; each entry overrides its point's fields, so `{}` is
+// a first-parent, first-claim landing. A unit is its merge sha, or for a late
+// claim its own unit of one, unless the entry names it.
+function qualityAxis(axis) {
+  const landedAt = sampleLabels(axis.length);
+  return axis.map((overrides, ordinal) => {
+    const point = {
+      ordinal,
+      merge_sha: `sha-${ordinal}`,
+      task_id: String(1000 + ordinal),
+      landed_at: landedAt[ordinal],
+      git_first_parent: true,
+      late_claim: false,
+      ...overrides,
+    };
+    const ownUnit = point.late_claim ? `${point.merge_sha}:${point.task_id}` : point.merge_sha;
+    return { ...point, unit_id: overrides.unit_id ?? ownUnit };
+  });
+}
+
+// A measured headline over the non-null `points`: a rate's k events of n, or a
+// count's or a cost's centre. The band is a placeholder around the figure.
+function qualityHeadline(kind, points, form) {
+  const measured = points.filter(x => x !== null);
+  const total = measured.reduce((sum, x) => sum + x, 0);
+  const value = measured.length === 0 ? 0 : total / measured.length;
+  return wireDatum({
+    form,
+    n: measured.length,
+    k: kind === 'rate' ? total : null,
+    value,
+    lo: Math.max(0, value - 0.1),
+    hi: kind === 'rate' ? Math.min(1, value + 0.1) : value + 0.1,
+  });
+}
+
+// One QUALITY.metrics[id] entry with one point per landing. A null
+// `measuredSince` is the no-producer state (INV-13): its rule names no start
+// and its headline is unknown, saying so. The rolling band is unmeasured
+// (null) at every point, and there is no control chart unless `ewma`,
+// `alarms` or `baseline` are given.
+export function qualityMetric({
+  kind = 'rate',
+  points,
+  headlineForm = kind === 'rate' ? 'rate' : kind === 'cost' ? 'median' : 'mean',
+  measuredSince = WIRE_AS_OF,
+  source = 'rejections',
+  unit = kind === 'rate' ? 'share' : kind === 'cost' ? 'usd' : 'per landing',
+  ewma = null,
+  alarms = [],
+  baseline = NO_BASELINE,
+}) {
+  const unmeasured = points.map(() => null);
+  return {
+    kind,
+    rule: {
+      counts: `${source} events`,
+      excludes: `landings before the first ${source}`,
+      population: 'landings',
+      window_landings: 100,
+      measured_since: measuredSince,
+      source,
+    },
+    unit,
+    points,
+    rolling: { center: unmeasured, lo: unmeasured, hi: unmeasured, n: points.map(() => 0) },
+    ewma,
+    alarms,
+    baseline,
+    headline: measuredSince === null
+      ? unreadWireDatum(`no producer has written here: runs.db ${source} has recorded nothing for this project`)
+      : qualityHeadline(kind, points, headlineForm),
+  };
+}
+
+// The QUALITY Datum's value: `axis` as qualityAxis builds it, `metrics` keyed
+// by metric id (each from qualityMetric, one point per axis entry), no cost
+// model, no module rows, no before/after comparison, and a git cross-check
+// that disagrees nowhere unless `gitCheck` is given.
+export function qualityPayload({ axis, metrics, gitCheck = NO_GIT_DISAGREEMENT }) {
+  return {
+    axis: qualityAxis(axis),
+    metrics,
+    cost_model: NO_COST_MODEL,
+    modules: [],
+    before_after: [],
+    git_check: gitCheck,
+  };
+}
