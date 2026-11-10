@@ -30,6 +30,8 @@ from escalation.authority import (
     L2_AUTO_CLOSE_DENY_CATEGORIES,
     L2_AUTO_CLOSE_DENY_ROLES,
     POLICY_TABLE,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
     PolicyAction,
 )
 from escalation.classify import classify_resolver_tier
@@ -1386,6 +1388,27 @@ class TestPolicyTableLockstep:
     def test_done_flip_is_a_reversible_action(self):
         """PRD §3 decision 7: done_flip is waived reversible (Leo, 2026-11-04)."""
         assert 'done_flip' in REVERSIBLE_ACTIONS
+
+    def test_reversible_actions_derive_from_the_policy_tables_vocabulary(self):
+        """DERIVED, not re-listed, like TestMechanicalGateSpot: the codec and
+        PolicyRow.reversible must read one list, so a hand-written literal
+        fails this even when it happens to agree today."""
+        derived = frozenset(
+            action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
+        )
+        assert derived == REVERSIBLE_ACTIONS
+
+    def test_done_flip_is_the_only_waived_action(self):
+        """Sitting item 522 (Leo, 2026-11-09) declined to waive abandon, so a
+        second waiver must arrive by ruling, not silently."""
+        assert {PolicyAction.DONE_FLIP} == REVERSIBILITY_WAIVED_ACTIONS
+
+    def test_a_reversible_row_proposes_only_stampable_acts(self):
+        for row in POLICY_TABLE:
+            if not row.reversible:
+                continue
+            assert {action.value for action in row.actions} <= REVERSIBLE_ACTIONS, row.policy_class
+            assert REVERSIBILITY_WAIVED_ACTIONS.isdisjoint(row.actions), row.policy_class
 
     def test_every_stampable_proposal_is_a_policy_table_action(self):
         assert frozenset({action.value for action in PolicyAction}) >= REVERSIBLE_ACTIONS

@@ -742,10 +742,13 @@ class TestPolicyRowInvariants:
         assert 'str_evidence' in str(excinfo.value)
         assert 'raw-string' in str(excinfo.value)
 
-    def test_reversible_is_false_iff_done_flip_is_allowed(self) -> None:
+    def test_reversible_iff_every_act_is_a_reversible_action(self) -> None:
         assert _row().reversible is True
-        flipping = _row(actions=frozenset({PolicyAction.DONE_FLIP, PolicyAction.CLOSE_ONLY}))
-        assert flipping.reversible is False
+        filing = _row(actions=frozenset({PolicyAction.FILE_TASK, PolicyAction.CLOSE_ONLY}))
+        assert filing.reversible is True
+        for irreversible in (PolicyAction.DONE_FLIP, PolicyAction.RECOVER_MAIN, PolicyAction.B3_APPLY):
+            row = _row(actions=frozenset({irreversible, PolicyAction.CLOSE_ONLY}))
+            assert row.reversible is False, irreversible
 
     def test_audit_full_until_is_20_for_file_writing_or_recover_main(self) -> None:
         assert _row().audit_full_until == 0
@@ -869,6 +872,15 @@ class TestPolicyTableRows:
         for category in ('task_failure', 'infra_issue', 'provenance_unattributed'):
             assert row.match.matches(category, 'some-agent')
         assert row.evidence_present(self._FOUND_ON_MAIN)
+
+    @pytest.mark.parametrize(
+        'slug',
+        ('red_main_recovery', 'b3_low_risk_unblock', 'dead_letter_replayed', 'verify_host_reprobed'),
+    )
+    def test_rows_with_an_irreversible_deciding_act_are_not_reversible(self, slug: str) -> None:
+        row = policy_row(slug)
+        assert row is not None
+        assert row.reversible is False
 
     @pytest.mark.parametrize('slug', ('red_main_recovery', 'b3_low_risk_unblock'))
     def test_file_writing_rows_are_fully_audited(self, slug: str) -> None:
