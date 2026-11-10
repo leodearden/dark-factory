@@ -525,6 +525,16 @@ value sits on the unit's head landing and is 0 on the other members. The cost mo
 points, at most 200 baseline units. `::validate_quality_series` refuses, with `VALUE_CONTRACT`, an
 array whose length differs from the axis, an unordered axis, or an alarm off the served axis.
 
+This amends decision 13's "absent below" for the baseline in force. A regime segment's own
+baseline (p0, or the cost model) takes force once that segment has ≥100 measured landings (≥100
+costed units for the cost model). Until then the previous segment's baseline stays in force, while
+the CUSUM still resets at the marker. That keeps a shift just after a marker alarmed and explained
+(sketch row 9). The served `baseline` and `cost_model` are the ones in force at the newest landing,
+and `baseline.since_ordinal` is the start of the segment that measured it, which can be before the
+newest marker. "Absent" means only that no segment has yet reached 100. Artefact-excluded landings
+are dropped from the EWMA and CUSUM inputs. Homes:
+`dashboard/src/dashboard/data/quality_series.py::_control_chart` and `::_cost_analysis`.
+
 ### Markers (`dashboard/src/dashboard/data/quality_markers.py`)
 
 `derived_markers(runs_db, project_id, snapshots) -> list[Marker]` (decision 11 rules, idempotent, persisted
