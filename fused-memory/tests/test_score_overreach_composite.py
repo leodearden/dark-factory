@@ -240,7 +240,8 @@ class TestTheSample:
         assert mod.run(_sample_argv(sidecar, second), reader_factory=_Graphs()) == 0
         assert first['worksheet'].read_bytes() == second['worksheet'].read_bytes()
         one, other = (json.loads(p['sample'].read_text()) for p in (first, second))
-        one.pop('sampled_at'), other.pop('sampled_at')
+        for document in (one, other):
+            document.pop('sampled_at')
         assert one == other
 
     def test_small_read_batches_give_the_same_sample(
