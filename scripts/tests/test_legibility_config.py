@@ -200,11 +200,11 @@ class TestTrickleCensusCaps:
     def test_trigger_thresholds_survive_alongside_trickle_caps(self, tmp_path):
         text = MINIMAL_YAML + textwrap.dedent("""\
             census:
-              max_interval_days: 3
+              floor_days: 3
               trickle_caps: {max_batches: 10}
             """)
         cfg = mod.load_config(_write(tmp_path, text))
-        assert cfg.census.max_interval_days == 3
+        assert cfg.census.floor_days == 3
         assert cfg.census.trickle_caps.max_batches == 10
 
     def test_caps_are_immutable_so_no_holder_can_uncap_a_shared_instance(self):
@@ -422,9 +422,7 @@ class TestFullConfigOverridesDefaults:
         budgets: {max_daily_digest_bytes: 123456}
         sampling: {top_fraction: 0.2, per_stratum_min: 3}
         census:
-          max_interval_days: 11
-          tasks_landed_threshold: 200
-          tasks_landed_min_days: 8
+          completion_threshold_pct: 85
           novelty_spike: {count: 5, window_hours: 48}
           floor_days: 6
           saturation: {dup_rate: 0.8, consecutive_batches: 3}
@@ -436,9 +434,7 @@ class TestFullConfigOverridesDefaults:
         assert cfg.budgets.max_daily_digest_bytes == 123456
         assert cfg.sampling.top_fraction == 0.2
         assert cfg.sampling.per_stratum_min == 3
-        assert cfg.census.max_interval_days == 11
-        assert cfg.census.tasks_landed_threshold == 200
-        assert cfg.census.tasks_landed_min_days == 8
+        assert cfg.census.completion_threshold_pct == 85
         assert cfg.census.novelty_spike.count == 5
         assert cfg.census.novelty_spike.window_hours == 48
         assert cfg.census.floor_days == 6
@@ -637,8 +633,8 @@ class TestShippedDarkFactoryConfig:
 
     def test_shipped_config_census_and_models_nonempty(self):
         cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
-        assert cfg.census.max_interval_days > 0
-        assert cfg.census.tasks_landed_threshold > 0
+        assert cfg.census.completion_threshold_pct == 70
+        assert cfg.census.floor_days > 0
         assert cfg.models.trickle
         assert cfg.models.census_miner
         assert cfg.models.census_verify

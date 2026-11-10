@@ -96,6 +96,19 @@ def _as_utc(value: datetime | None) -> datetime | None:
 _CENSUS_DEFAULTS = _LegibilityCensus()
 
 
+_RETIRED_CENSUS_KEYS = ("max_interval_days", "tasks_landed_threshold", "tasks_landed_min_days")
+
+
+def _warn_retired_keys(mapping: dict) -> None:
+    present = [key for key in _RETIRED_CENSUS_KEYS if key in mapping]
+    if present:
+        logger.warning(
+            "legibility config census: %s retired (plans/census-incremental-prd.md "
+            "C7, L8b), ignored -- delete from legibility.yaml",
+            ", ".join(present),
+        )
+
+
 @dataclass(frozen=True)
 class CensusConfig:
     """The census-trigger thresholds. Field defaults are sourced
@@ -108,9 +121,6 @@ class CensusConfig:
     Every field is therefore a non-negative `int` by construction, which is
     what lets `evaluate()` compare and arithmetic on them unguarded."""
 
-    max_interval_days: int = _CENSUS_DEFAULTS.max_interval_days
-    tasks_landed_threshold: int = _CENSUS_DEFAULTS.tasks_landed_threshold
-    tasks_landed_min_days: int = _CENSUS_DEFAULTS.tasks_landed_min_days
     novelty_spike_count: int = _CENSUS_DEFAULTS.novelty_spike.count
     novelty_spike_window_hours: int = _CENSUS_DEFAULTS.novelty_spike.window_hours
     novelty_spike_multiple: int = _CENSUS_DEFAULTS.novelty_spike.multiple
@@ -121,38 +131,30 @@ class CensusConfig:
     @classmethod
     def from_mapping(cls, mapping: dict | None) -> CensusConfig:
         """Build a CensusConfig by merging `mapping` (shaped like §7.4's
-        `census:` block, e.g. `{"max_interval_days": 3, "novelty_spike":
+        `census:` block, e.g. `{"floor_days": 3, "novelty_spike":
         {"count": 9}}`) over the defaults. Keys absent from `mapping`
         (including either nested `novelty_spike` key) keep their default
-        value. `mapping=None` (or `{}`) returns plain defaults.
+        value. `mapping=None` (or `{}`) returns plain defaults. This method
+        NEVER raises.
 
-        Every override is VALIDATED, never coerced, exactly as
-        `compute_tasks_landed` validates the hand-seeded
-        `last_census_done_count` baseline (task 4085) -- legibility.yaml is
-        the same operator-authored-input class, so a value that is not a
-        non-negative `int` is an expected input, not a hypothetical. A bad
-        value is REJECTED: that one field falls back to its default and the
-        whole batch is reported in exactly one WARNING. This method NEVER
-        raises.
+        Every override is VALIDATED, never coerced: legibility.yaml is
+        hand-edited, so a quoted `'5'`, a float, a `true` (an `int`
+        subclass) or an out-of-range value is an expected input. A bad value
+        falls back to its own default, alone, so one typo cannot disarm
+        another condition, and the whole batch is reported in exactly one
+        WARNING. Unvalidated, such a value would raise out of `evaluate()`
+        (a `novelty_spike.window_hours: null` reaches `timedelta(hours=None)`)
+        and break the never-raises contract of `load_census_config` and
+        `decide_for_project`.
 
-        Per-field fallback, not a whole-block reject, because the
-        thresholds are independent: one typo'd `novelty_spike.count` must not
-        also disarm the (a) max-interval backstop.
-
-        The stakes are the never-raises contract of everything above this.
-        Unvalidated, a quoted `max_interval_days: '10'` reaches `evaluate()`'s
-        `days_since >= config.max_interval_days` and raises `TypeError` out of
-        `load_census_config` (documented "never raises") and out of
-        `decide_for_project` (same) into `census.main`, which calls it
-        unguarded. A `novelty_spike.window_hours: null` reaches
-        `timedelta(hours=None)`; a non-mapping `novelty_spike:` used to raise
-        `AttributeError` from the `.get` below. `bool` is rejected explicitly
-        because it is an `int` subclass, so `max_interval_days: true` would
-        otherwise silently mean 1 -- a daily ~$100 census.
+        The retired trigger keys (`_RETIRED_CENSUS_KEYS`) are ignored
+        whatever their value, and every one present is named in one
+        deprecation WARNING per call, apart from the rejected-values one.
         """
         defaults = cls()
         mapping = mapping or {}
         rejected: list[str] = []
+        _warn_retired_keys(mapping)
 
         novelty_spike = mapping.get("novelty_spike")
         if novelty_spike is None:
@@ -191,18 +193,6 @@ class CensusConfig:
             return value
 
         config = cls(
-            max_interval_days=_threshold(
-                "max_interval_days", mapping, "max_interval_days",
-                defaults.max_interval_days,
-            ),
-            tasks_landed_threshold=_threshold(
-                "tasks_landed_threshold", mapping, "tasks_landed_threshold",
-                defaults.tasks_landed_threshold,
-            ),
-            tasks_landed_min_days=_threshold(
-                "tasks_landed_min_days", mapping, "tasks_landed_min_days",
-                defaults.tasks_landed_min_days,
-            ),
             novelty_spike_count=_threshold(
                 "novelty_spike.count", novelty_spike, "count",
                 defaults.novelty_spike_count,

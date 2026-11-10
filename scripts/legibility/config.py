@@ -131,9 +131,6 @@ class Census(BaseModel):
 
     ledger_retention_days: int = Field(default=30, ge=1, strict=True)
     completion_threshold_pct: int = Field(default=70, ge=1, le=100, strict=True)
-    max_interval_days: int = 10
-    tasks_landed_threshold: int = 120
-    tasks_landed_min_days: int = 7
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)

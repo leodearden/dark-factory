@@ -46,9 +46,7 @@ _ERRORED = ct.Completion(
 
 def test_census_config_defaults_match_prd_section_7_4():
     config = ct.CensusConfig()
-    assert config.max_interval_days == 10
-    assert config.tasks_landed_threshold == 120
-    assert config.tasks_landed_min_days == 7
+    assert config.completion_threshold_pct == 70
     assert config.novelty_spike_count == 4
     assert config.novelty_spike_window_hours == 72
     assert config.novelty_spike_multiple == 2
@@ -58,17 +56,15 @@ def test_census_config_defaults_match_prd_section_7_4():
 
 def test_census_config_from_mapping_merges_partial_overrides_over_defaults():
     config = ct.CensusConfig.from_mapping(
-        {"max_interval_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
+        {"floor_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
     )
-    assert config.max_interval_days == 3
+    assert config.floor_days == 3
     assert config.novelty_spike_count == 9
     assert config.novelty_spike_baseline_days == 14
     assert config.novelty_spike_multiple == 2
     # untouched fields keep their §7.4 defaults
-    assert config.tasks_landed_threshold == 120
-    assert config.tasks_landed_min_days == 7
+    assert config.completion_threshold_pct == 70
     assert config.novelty_spike_window_hours == 72
-    assert config.floor_days == 5
 
 
 def test_census_config_from_mapping_none_returns_defaults():
@@ -80,26 +76,15 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
 
 
 # ---------------------------------------------------------------------------
-# task 4085 (amendment pass, review finding #1): the `census:` block is
-# hand-edited -- the same operator-authored-input class as the hand-seeded
-# `last_census_done_count` baseline this task hardens -- so an unusable
-# threshold VALUE is an expected input. Unvalidated, a quoted `'10'` reaches
-# `evaluate()`'s `days_since >= config.max_interval_days` and raises
-# TypeError straight out of `load_census_config` and `decide_for_project`,
-# both of which document a never-raises contract, and into `census.main`,
-# which calls the latter unguarded.
-#
-# Same rule as the baseline guard: VALIDATE, never coerce. `int('10')` would
-# silently bless a malformed config and could arm a ~$100 census on an
-# unaudited number.
+# task 4085: the `census:` block is hand-edited, so an unusable threshold
+# VALUE is an expected input. VALIDATE, never coerce: unvalidated it raises
+# out of `evaluate()` and breaks `load_census_config`'s and
+# `decide_for_project`'s never-raises contract.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "field,key,mapping_key",
     [
-        ("max_interval_days", "max_interval_days", None),
-        ("tasks_landed_threshold", "tasks_landed_threshold", None),
-        ("tasks_landed_min_days", "tasks_landed_min_days", None),
         ("floor_days", "floor_days", None),
         ("novelty_spike_count", "count", "novelty_spike"),
         ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
@@ -111,11 +96,11 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
 def test_census_config_from_mapping_rejects_unusable_threshold_values(
     field, key, mapping_key, bad, caplog
 ):
-    """Each of the six §7.4 thresholds falls back to its OWN default, alone,
+    """Each non-negative §7.4 threshold falls back to its OWN default, alone,
     with one WARNING naming the value and its type. `True`/`False` are in the
     parameter list deliberately: `bool` is an `int` subclass, so an unquoted
-    YAML `true` would otherwise mean 1 -- a daily census -- in total silence.
-    A negative is definitionally impossible for a day/count threshold."""
+    YAML `true` would otherwise mean 1 in total silence. A negative is
+    definitionally impossible for a day/count threshold."""
     override = {key: bad} if mapping_key is None else {mapping_key: {key: bad}}
 
     with caplog.at_level(logging.WARNING):
@@ -149,22 +134,21 @@ def test_census_config_from_mapping_rejects_a_non_mapping_novelty_spike(caplog):
 
 
 def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplog):
-    """Per-FIELD fallback, per-BLOCK warning. The six thresholds are
-    independent, so one typo must not disarm the other five; but a single
+    """Per-FIELD fallback, per-BLOCK warning. The thresholds are
+    independent, so one typo must not disarm the others; but a single
     hand-edited block is a single operator fault, and this WARNING is one
     nightly journal line, so all of them are named in one message."""
     with caplog.at_level(logging.WARNING):
         config = ct.CensusConfig.from_mapping(
             {
-                "max_interval_days": "10",
+                "completion_threshold_pct": "70",
                 "floor_days": -1,
-                "tasks_landed_threshold": 200,  # the one good override
-                "novelty_spike": {"window_hours": None, "multiple": "2"},
+                "novelty_spike": {"window_hours": None, "multiple": "2", "count": 9},
             }
         )
 
-    assert config.tasks_landed_threshold == 200
-    assert config.max_interval_days == ct.CensusConfig().max_interval_days
+    assert config.novelty_spike_count == 9
+    assert config.completion_threshold_pct == ct.CensusConfig().completion_threshold_pct
     assert config.floor_days == ct.CensusConfig().floor_days
     assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
     assert config.novelty_spike_multiple == ct.CensusConfig().novelty_spike_multiple
@@ -172,9 +156,9 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
-    for named in ("max_interval_days", "floor_days", "window_hours", "multiple"):
+    for named in ("completion_threshold_pct", "floor_days", "window_hours", "multiple"):
         assert named in message
-    assert "tasks_landed_threshold" not in message
+    assert "count" not in message
 
 
 def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
@@ -183,9 +167,8 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
     with caplog.at_level(logging.WARNING):
         config = ct.CensusConfig.from_mapping(
             {
-                "max_interval_days": 0,
                 "floor_days": 0,
-                "tasks_landed_threshold": 10_000,
+                "completion_threshold_pct": 100,
                 "novelty_spike": {
                     "count": 0, "window_hours": 1, "multiple": 0, "baseline_days": 0,
                 },
@@ -194,9 +177,8 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
 
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
-    assert config.max_interval_days == 0
     assert config.floor_days == 0
-    assert config.tasks_landed_threshold == 10_000
+    assert config.completion_threshold_pct == 100
     assert config.novelty_spike_count == 0
     assert config.novelty_spike_window_hours == 1
     assert config.novelty_spike_multiple == 0
@@ -319,9 +301,6 @@ def test_census_config_defaults_match_legibility_config_census_model():
     hardcoded, so the two schemas cannot silently drift apart."""
     beta_defaults = LegibilityCensus()
     config = ct.CensusConfig()
-    assert config.max_interval_days == beta_defaults.max_interval_days
-    assert config.tasks_landed_threshold == beta_defaults.tasks_landed_threshold
-    assert config.tasks_landed_min_days == beta_defaults.tasks_landed_min_days
     assert config.novelty_spike_count == beta_defaults.novelty_spike.count
     assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
     assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
@@ -759,13 +738,13 @@ def test_load_census_config_partial_override_merges_over_defaults(tmp_path):
     legibility_dir = tmp_path / "docs" / "legibility"
     legibility_dir.mkdir(parents=True)
     (legibility_dir / "legibility.yaml").write_text(
-        "census:\n  max_interval_days: 3\n  novelty_spike:\n    count: 9\n",
+        "census:\n  floor_days: 3\n  novelty_spike:\n    count: 9\n",
         encoding="utf-8",
     )
     config = ct.load_census_config(tmp_path)
-    assert config.max_interval_days == 3
+    assert config.floor_days == 3
     assert config.novelty_spike_count == 9
-    assert config.floor_days == 5  # untouched -- still default
+    assert config.completion_threshold_pct == 70  # untouched -- still default
 
 
 def test_load_census_config_malformed_file_returns_defaults_with_one_warning(tmp_path, caplog):
@@ -1850,7 +1829,6 @@ def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_
         last_census_at=(NOW - timedelta(days=3)).isoformat(),
         last_census_report="plans/confusion-census-prior.md",
     )
-    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
 
     decision = ct.decide_for_project(tmp_path, now=NOW)
 
@@ -1878,7 +1856,6 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
             }
         ],
     )
-    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
 
     decision = ct.decide_for_project(tmp_path, now=NOW)
 
