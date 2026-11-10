@@ -2504,8 +2504,10 @@ class Harness:
         merge-heartbeat, verify-admission-watch, flake-debt-drain.
         loop-stall-monitor starts first so it watches every other service's
         whole life, and stops last (task 7366). escalation-server and
-        merge-worker start next so the recovery block (which runs immediately
-        after ``start_all()`` returns) can depend on both being live. The
+        merge-worker start next: the recovery block (which runs immediately
+        after ``start_all()`` returns) needs the escalation server live and the
+        merge worker CONSTRUCTED, not running; ``_launch_merge_worker_loop``
+        runs its loop after ``scheduler.finish_startup()``. The
         seven sweeps are conditionally registered on their own
         ``config.X_enabled`` gate — ``BackgroundService`` itself has no
         ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
@@ -3060,6 +3062,8 @@ class Harness:
             if dry_run:
                 logger.info('Dry run — stopping after task population')
                 return self.report
+
+            await self._launch_merge_worker_loop()
 
             # 3. Run workflow slots
             sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
@@ -12507,9 +12511,9 @@ class Harness:
             logger.warning('Failed to save HarnessReport: %s', e)
 
     async def _start_merge_worker(self) -> None:
-        """Start the merge queue worker as a background asyncio task.
+        """Construct the merge worker: the 'merge-worker' ManagedService start phase.
 
-        Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
+        :meth:`_launch_merge_worker_loop` runs it.  Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
         merge worker (MQ-refactor task ν retired the legacy serial
         MergeWorker).
 
@@ -12614,18 +12618,23 @@ class Harness:
         # deployed sha no remote verify runs, and the build would refuse.
         if self._deployed_sha is not None:
             self._merge_worker.ensure_host_allocator(self.config)
+        logger.info('Speculative merge worker constructed; its loop is launched after startup')
 
+    async def _launch_merge_worker_loop(self) -> None:
+        """Run the constructed merge worker's loop as a background task.
+
+        Called once by run() after ``scheduler.finish_startup()`` and never under
+        dry_run, so nothing consumes ``_merge_queue`` during the startup block
+        (plans/startup-hardening-prd.md §3.4).
+        """
+        if self._merge_worker is None:
+            logger.warning('No merge worker was constructed at startup; the merge loop is not launched')
+            return
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
         # verify subtree from a PREVIOUS run still alive under the warm
-        # _merge-verify lane BEFORE scheduling the worker loop, hence before
-        # its first reset_persistent_merge_worktree can `git reset --hard` /
-        # `git clean -xfd` that tree out from under a live build.  On restart
-        # both existing guards are blind to such a survivor: the merge_verify
-        # flock died with the process and the holder-pgid lease reads stale
-        # (dead pgid → fail-OPEN).  Fail-OPEN here (mirrors the
-        # enforce_merge_liveness_margin generic-except precedent above): the
-        # barrier is best-effort, so a failure is logged and swallowed rather
-        # than aborting merge-worker startup.
+        # _merge-verify lane before the loop's first
+        # reset_persistent_merge_worktree can `git reset --hard` it out from
+        # under a live build.  Best-effort: a failure is logged and swallowed.
         try:
             await self.git_ops.reap_merge_verify_survivors()
         except Exception as e:
@@ -12641,20 +12650,32 @@ class Harness:
     async def _stop_merge_worker(self) -> None:
         """Stop the merge worker gracefully.
 
-        First closes any honoured restart-drain request still open: what is
-        in flight now is what the stop kills (task 5371).
+        A worker whose loop was never launched is left unstopped: stop() would
+        resolve every recovered request blocked with the shutdown reason, and
+        unresolved, the journal re-recovers them next start (pinned by
+        test_harness_lifecycle_registry.py).  A launched worker's stop first
+        closes any honoured restart-drain request still open: what is in
+        flight now is what the stop kills (task 5371).
         """
-        if self._merge_worker_task is not None and self._merge_worker is not None:
-            try:
-                self._drain_participant.on_shutdown()
-            except Exception:
-                logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
-            await self._merge_worker.stop()
-            self._merge_worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._merge_worker_task
-            self._merge_worker_task = None
-            logger.info('Merge worker stopped')
+        worker, task = self._merge_worker, self._merge_worker_task
+        if worker is None:
+            return
+        if task is None:
+            logger.info(
+                'Merge loop was never launched; %d queued merge request(s) '
+                'are left to the journal', self._merge_queue.qsize(),
+            )
+            return
+        try:
+            self._drain_participant.on_shutdown()
+        except Exception:
+            logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
+        await worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._merge_worker_task = None
+        logger.info('Merge worker stopped')
 
     def _bench_verify_host(self, name: str, exc: RunnerUnavailable) -> None:
         """The task pool's bench sink: one RunnerUnavailable bench on the merge lane.
@@ -12863,7 +12884,7 @@ class Harness:
         is a clean no-op.  Default False/False → byte-identical to prior
         behaviour (trivially revertible).
 
-        Mirrors ``_start_merge_worker``'s create_task launch, but is
+        Mirrors ``_launch_merge_worker_loop``'s create_task launch, but is
         additionally gated on a lockfile acquire: a refused acquire (e.g. a
         second orchestrator instance racing to start the same lane) is
         logged and skipped (fail-open) rather than raised, leaving the

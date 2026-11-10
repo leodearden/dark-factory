@@ -13810,7 +13810,7 @@ class GitOps:
         an mmap'd path falls at-or-under the ``_merge-verify`` subtree and
         reaps them (SIGTERM → bounded wait → SIGKILL) BEFORE the worker loop
         starts, hence before that first reset can run.  The Harness invokes it
-        once from :meth:`Harness._start_merge_worker`, immediately before
+        once from :meth:`Harness._launch_merge_worker_loop`, immediately before
         creating the merge-worker task.
 
         Scope + fail-open: confined to the LOCAL in-process lane

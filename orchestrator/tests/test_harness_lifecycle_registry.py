@@ -54,7 +54,8 @@ from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, g
 # Canonical start-order registration list — task 2241 plan.json "HARNESS
 # MIGRATION": the loop-stall monitor first, so it watches every other
 # service's whole life and stops last (task 7366); then escalation-server and
-# merge-worker (the recovery block depends on both being live); the remaining bespoke adapter (offline-lane)
+# merge-worker (the recovery block needs the escalation server live and the
+# merge worker constructed, not running; task 8268); the remaining bespoke adapter (offline-lane)
 # and the eight BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
 # verify-admission watch, task 5628; the flake-debt drain, task 6934).
@@ -263,7 +264,8 @@ class TestLifecycleRegistryRunWiring:
         _dismiss_stale_escalations (task 2241 design decision: the
         startup-ritual collapse is safe because escalation-server +
         merge-worker are registered first-in-order and the seven sweeps are
-        sleep-first)."""
+        sleep-first). The recovery block needs the merge worker constructed,
+        not running: its loop launches after finish_startup() (task 8268)."""
         h, _mock_mcp = _make_run_wired_harness(tmp_path)
         h._build_lifecycle_registry()
         assert h._lifecycle is not None
