@@ -300,6 +300,39 @@ class TestModuleUnitKeys:
         assert before['module:alpha:test'].key != after['module:alpha:test'].key
 
 
+class TestCommandPathCandidates:
+    def test_a_shell_payload_is_split_and_never_itself_a_path(self):
+        run = PlannedRun(
+            'alpha', parse_config_command("bash -c 'pytest tests/x.py -q'"), ScopeKind.FULL_SUITE,
+            'pytest: conftest touched',
+        )
+
+        paths = {candidate.path for candidate in keys.command_path_candidates(run)}
+
+        assert 'tests/x.py' in paths
+        assert 'pytest tests/x.py -q' not in paths
+        assert not [path for path in paths if set(path) & set(' \t\r\n')]
+
+    @pytest.mark.parametrize('ch', ['\xa0', '\x0b', '\x0c', '\x85', '\u2028', '\u3000'])
+    def test_a_scoped_target_holding_non_lexer_whitespace_is_one_path(self, ch):
+        assert _TEST_CMD is not None
+        target = f'alpha/tests/test{ch}a.py'
+        run = PlannedRun(
+            'alpha', scope_to(_TEST_CMD, [target]), ScopeKind.FILE_SCOPED,
+            'pytest: scoped to touched tests', (target,),
+        )
+
+        assert keys.CommandPath(target, True) in keys.command_path_candidates(run)
+
+    def test_a_payload_naming_a_path_with_non_lexer_whitespace_keeps_that_path(self):
+        run = PlannedRun(
+            'alpha', parse_config_command('bash -c \'pytest "alpha/tests/a b.py" -q\''), ScopeKind.FULL_SUITE,
+            'pytest: conftest touched',
+        )
+
+        assert keys.CommandPath('alpha/tests/a\xa0b.py', True) in keys.command_path_candidates(run)
+
+
 class TestUnitKeyInvariants:
     def test_a_key_that_is_not_the_digest_of_its_inputs_is_rejected(self):
         with pytest.raises(ValueError, match='0{64}.*[0-9a-f]{64}'):
