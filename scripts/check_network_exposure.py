@@ -20,7 +20,7 @@ import subprocess
 import sys
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Final, TextIO, TypeVar
+from typing import Final, TextIO, TypeAlias, TypeVar
 
 from systemd_unit_parity import emit
 
@@ -53,6 +53,9 @@ class OwnedPort:
     owner: str
 
 
+Sockaddr: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
+
+
 @dataclasses.dataclass(frozen=True)
 class HostAddress:
     ip: str
@@ -60,7 +63,7 @@ class HostAddress:
     scope_id: int
     ifname: str
 
-    def sockaddr(self, port: int) -> tuple[str, int] | tuple[str, int, int, int]:
+    def sockaddr(self, port: int) -> Sockaddr:
         if self.family == socket.AF_INET6:
             return (self.ip, port, 0, self.scope_id)
         return (self.ip, port)
@@ -95,13 +98,13 @@ STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
 )
 
 
-def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, str]:
+def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, tuple[str, ...]]:
     """Port -> every owner of it, once each in source order, sorted by port."""
     owners: dict[int, dict[str, None]] = {}
     for source in sources:
         for owned in source:
             owners.setdefault(owned.port, {})[owned.owner] = None
-    return {port: ", ".join(owners[port]) for port in sorted(owners)}
+    return {port: tuple(owners[port]) for port in sorted(owners)}
 
 
 def _require_list(value: object, command: tuple[str, ...], what: str) -> list[object]:
@@ -217,7 +220,7 @@ def _errno_name(exc: OSError) -> str:
     return errno.errorcode.get(exc.errno, str(exc.errno))
 
 
-def probe(family: socket.AddressFamily, sockaddr: tuple, timeout: float) -> ProbeResult:
+def probe(family: socket.AddressFamily, sockaddr: Sockaddr, timeout: float) -> ProbeResult:
     """One TCP connect, classified."""
     try:
         with socket.socket(family, socket.SOCK_STREAM) as sock:
@@ -236,7 +239,12 @@ def read_json_source(argv: tuple[str, ...]) -> object:
     """Run *argv* and parse its stdout as JSON, or raise SourceUnreadable saying why not."""
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=SOURCE_TIMEOUT_SECS, check=False
+            argv,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=SOURCE_TIMEOUT_SECS,
+            check=False,
         )
     except FileNotFoundError:
         raise SourceUnreadable(argv, "command not found on PATH") from None
@@ -253,6 +261,7 @@ def read_json_source(argv: tuple[str, ...]) -> object:
 
 
 class FindingKind(enum.Enum):
+    SOURCE_ERROR = "source-error"
     EXPOSED = "exposed"
     TIMED_OUT = "timed-out"
     UNVERIFIED = "unverified"
@@ -266,31 +275,45 @@ _OFF_LOOPBACK_FINDINGS: Final = {
 }
 
 
+def _finding_line(kind: FindingKind, text: str) -> str:
+    return f"[{kind.value}] {text}"
+
+
 @dataclasses.dataclass(frozen=True)
 class Target:
     port: int
     address: HostAddress
+    loopback: bool
 
 
 @dataclasses.dataclass(frozen=True)
 class Finding:
     kind: FindingKind
     target: Target
-    owners: str
+    owners: tuple[str, ...]
     result: ProbeResult
 
     def render(self) -> str:
-        subject = f"[{self.kind.value}] port {self.target.port} ({self.owners})"
+        subject = f"port {self.target.port} ({', '.join(self.owners)})"
         label = self.target.address.label
         if self.kind is FindingKind.EXPOSED:
-            return f"{subject} accepted a connect on {label}"
-        if self.kind is FindingKind.NOT_LISTENING:
-            return f"{subject}: a connect on {label} {self.result.description}, so nothing serves it on loopback"
-        return f"{subject}: a connect on {label} {self.result.description} instead of being refused"
+            text = f"{subject} accepted a connect on {label}"
+        elif self.kind is FindingKind.NOT_LISTENING:
+            text = f"{subject}: a connect on {label} {self.result.description}, so nothing serves it on loopback"
+        else:
+            text = f"{subject}: a connect on {label} {self.result.description} instead of being refused"
+        return _finding_line(self.kind, text)
 
 
-def _finding(target: Target, owners: str, result: ProbeResult) -> Finding | None:
-    if target.address == LOOPBACK:
+def _port_targets(port: int, addresses: Sequence[HostAddress]) -> list[Target]:
+    return [
+        *(Target(port, address, loopback=False) for address in addresses),
+        Target(port, LOOPBACK, loopback=True),
+    ]
+
+
+def _finding(target: Target, owners: tuple[str, ...], result: ProbeResult) -> Finding | None:
+    if target.loopback:
         kind = None if result.outcome is Outcome.ACCEPTED else FindingKind.NOT_LISTENING
     else:
         kind = _OFF_LOOPBACK_FINDINGS.get(result.outcome)
@@ -319,7 +342,7 @@ def _read_source(
 
 
 def _source_error_line(error: SourceUnreadable) -> str:
-    return f"[source-error] {' '.join(error.command)}: {error.reason}"
+    return _finding_line(FindingKind.SOURCE_ERROR, f"{' '.join(error.command)}: {error.reason}")
 
 
 def run(
@@ -333,7 +356,7 @@ def run(
     addresses, address_error = _read_source(IP_ADDR_ARGV, host_addresses)
     errors = [error for error in (socket_error, address_error) if error is not None]
     owners = merge_owners(socket_ports, static_ports)
-    targets = [Target(port, address) for port in owners for address in (*addresses, LOOPBACK)]
+    targets = [target for port in owners for target in _port_targets(port, addresses)]
     results = _probe_all(targets, connect_timeout)
     findings = [
         finding

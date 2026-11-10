@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 
 import check_network_exposure as exposure
 import pytest
@@ -254,9 +255,9 @@ def test_merge_owners_names_every_owner_of_a_port_once_in_source_order():
         exposure.OwnedPort(port=8002, owner="compose service fused-mcp"),
     ]
     assert exposure.merge_owners(sockets, static) == {
-        6379: "compose service falkordb",
-        8002: "fused-memory.socket, compose service fused-mcp",
-        8103: "fused-memory.socket",
+        6379: ("compose service falkordb",),
+        8002: ("fused-memory.socket", "compose service fused-mcp"),
+        8103: ("fused-memory.socket",),
     }
 
 
@@ -282,8 +283,11 @@ class FakeHost:
         self.bin_dir = stub_bin_dir(root)
 
     def serve(self, command: str, payload: object) -> None:
-        data = self.root / f"{command}.json"
-        data.write_text(json.dumps(payload), encoding="utf-8")
+        self.serve_bytes(command, json.dumps(payload).encode("utf-8"))
+
+    def serve_bytes(self, command: str, output: bytes) -> None:
+        data = self.root / f"{command}.out"
+        data.write_bytes(output)
         argv_log = shlex.quote(str(self.root / f"{command}.argv"))
         write_stub(self.bin_dir, command, f'printf "%s\\n" "$*" >> {argv_log}\ncat {shlex.quote(str(data))}\n')
 
@@ -443,6 +447,10 @@ def test_run_probes_ipv6_addresses(fake_host: FakeHost, held):
         pytest.skip(f"this host cannot bind a dual-stack IPv6 socket: {exc}")
     held.append(server)
     port = server.getsockname()[1]
+    try:
+        socket.create_connection(("::1", port), timeout=1.0).close()
+    except OSError as exc:
+        pytest.skip(f"this host cannot connect to ::1: {exc}")
     fake_host.serve("ip", _fake_links(_addr("inet6", "::1", "global")))
     fake_host.serve("systemctl", [_row(port, "orchestrator-v6.socket", host="[::]")])
 
@@ -461,6 +469,17 @@ def test_run_reports_an_address_it_could_not_probe_as_unverified(fake_host: Fake
 
     assert verdict == exposure.ExposureExit.FINDING
     _line_index(lines, "[unverified]", f"port {port}", "fe80::1%ghost0")
+
+
+def test_run_reads_a_source_whose_output_is_not_utf8(fake_host: FakeHost, held):
+    port = _listen(held, "127.0.0.1")
+    fake_host.serve("systemctl", [_row(port, "orchestrator-x.socket")])
+    fake_host.serve_bytes("ip", json.dumps(_fake_links()).encode("utf-8").replace(b"fake0", b"fake\xff0"))
+
+    verdict, lines = _run()
+
+    assert verdict == exposure.ExposureExit.LOOPBACK_ONLY, lines
+    _line_index(lines, "probing 1 port(s) on 1 non-loopback address(es)")
 
 
 def _systemctl_fails(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -552,11 +571,18 @@ def test_cli_reports_a_source_error_tagged_and_exits_1(tmp_path: pathlib.Path):
     _line_index(output.splitlines(), "[source-error]", "ip -j addr")
 
 
-def test_cli_accepts_a_connect_timeout(tmp_path: pathlib.Path):
-    rc, output = _cli(tmp_path, "--connect-timeout", "0.5")
+def test_cli_connect_timeout_bounds_each_connect(fake_host: FakeHost, held, capsys: pytest.CaptureFixture[str]):
+    port = _full_backlog(held)
+    fake_host.serve("systemctl", [_row(port, "fused-memory.socket", host="0.0.0.0")])
+    longer_than_default = exposure.DEFAULT_CONNECT_TIMEOUT_SECS + 0.5
 
-    assert rc == exposure.ExposureExit.FINDING, output
-    _assert_every_line_tagged(output)
+    started = time.monotonic()
+    rc = exposure.main(["--connect-timeout", str(longer_than_default)])
+    elapsed = time.monotonic() - started
+
+    assert rc == exposure.ExposureExit.FINDING
+    _line_index(capsys.readouterr().out.splitlines(), "[timed-out]", f"port {port}", "127.0.0.2")
+    assert elapsed >= longer_than_default, f"the connect gave up after {elapsed:.2f} s"
 
 
 @pytest.mark.parametrize(
@@ -603,11 +629,6 @@ def _run_gate(
         f"fail() only printfs; the health-check section must not abort.\n{result.stdout}\n{result.stderr}"
     )
     return result
-
-
-def test_gate_slice_runs_the_checker():
-    block = slice_section(_GATE_START, _GATE_END)
-    assert "python3" in block, block
 
 
 def test_gate_reports_ok_for_a_tagged_loopback_only_report(tmp_path: pathlib.Path):
