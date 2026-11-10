@@ -3718,13 +3718,17 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
-   never starts. Its account comes from the shared pool, as a
-   lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
-   under `data/sitting/config/` holding the leased token, which is removed
-   on every exit short of a SIGKILL. With nothing leasable the night is
-   skipped (`prepare=1`, `no pool account free; skipping`): the run never
-   uses the host's own login. It stops itself after 2700s.
+   never starts. Its account comes from the shared pool, through the same
+   runner as every other session (`shared.cli_invoke.invoke_with_cap_retry`),
+   in roster order. A seat at its usage limit, or one whose credentials are
+   rejected (401/403), hands the run to the next seat, and a capped session
+   that had made progress resumes there. It never parks: after one pass
+   over the pool it gives up. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/` holding the current seat's token, which is
+   removed on every exit short of a SIGKILL. With no pool account resolved
+   the night is skipped (`prepare=1`, `no pool account resolved; skipping`):
+   the run never uses the host's own login. It stops itself after 2700s,
+   failovers and the cooldowns between them included.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3764,15 +3768,26 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run was skipped (no pool account free), failed, timed out, hit a usage limit or
-  recorded nothing; its log line carries both stream tails, or, for a run
-  that recorded nothing, the counts of what the inbox offered and could not decode. That is
-  routine, not an incident:
+- `prepare=1` means the Fable run was skipped (no pool account resolved),
+  failed, timed out, found no seat that could take it, or recorded nothing.
+  A failed run's log line carries the tail of the CLI's `result` text and
+  of its stderr. A run no seat could take logs `no pool account could take
+  the run: capped [<seats>], auth-failed [<seats>]; earliest reset <ts>`.
+  A run that recorded nothing logs the counts of what the inbox offered and
+  could not decode. That is routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
-  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
-  means the agent's entries failed validation even though some were recorded.
+  is. Two exceptions. A line listing every seat as auth-failed means those
+  tokens need operator action, and no reset clears them. A line whose
+  earliest reset is `unknown` while seats are listed as capped may be a
+  local fault rather than a quota: the shared runner reads a failure that
+  cost nothing, took at most one turn and exited within 5s as a cap, so a
+  broken sandbox wrapper or a CLI rejecting a flag caps every seat in turn.
+  Read the runner's `suspicious zero-cost instant exit` lines above it,
+  which quote the CLI's output. A run that finished
+  well logs `nightly_prepare: done (... account=<seat>, ... recorded=<n> of
+  <m>, undecodable=<u>)`; a high `undecodable` means the agent's entries
+  failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
   PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
@@ -3783,10 +3798,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` builds the child's env as
-`shared.secret_env.agent_subprocess_env` of its own (no API keys or other
-secrets, no endpoint selection, no Python-env selection), with the lease's
-`CLAUDE_CODE_OAUTH_TOKEN` on top.
+`nightly_prepare.py` runs the CLI through the shared runner, which builds
+the child's env as `shared.secret_env.agent_subprocess_env` of its own (no
+API keys or other secrets, no endpoint selection, no Python-env selection),
+with the current seat's `CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
