@@ -10,9 +10,11 @@ returns records in unsorted filesystem-glob order.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from escalation.models import cascade_parent_id
@@ -21,6 +23,39 @@ if TYPE_CHECKING:
     from escalation.models import Escalation
 
 _UNKNOWN_TIME = datetime.min.replace(tzinfo=UTC)
+
+RULINGS_HEADING = '# Escalation Rulings'
+
+RULINGS_LIMIT = 10
+"""Max rulings one briefing lists, the most recent kept; older ones are named by id."""
+
+_RULINGS_INTRO = 'Each ruling below resolved an escalation filed on this task, and binds this task.'
+
+
+class RulingAudience(StrEnum):
+    PLAN = 'plan'
+    EXECUTE = 'execute'
+    REVIEW = 'review'
+
+
+RULING_INSTRUCTIONS: Mapping[RulingAudience, str] = MappingProxyType({
+    RulingAudience.PLAN: (
+        'The plan must carry out every ruling above: add the files or steps a ruling '
+        'requires, and never plan its opposite.'
+    ),
+    RulingAudience.EXECUTE: (
+        'Work consistently with every ruling above. Never implement the opposite of a '
+        'ruling, or describe its opposite as intentional. If honouring a ruling needs work '
+        "outside the plan's files or steps, do not work around it: stop and call "
+        "`escalate_blocker` naming the ruling's escalation id."
+    ),
+    RulingAudience.REVIEW: (
+        'Check the diff against every ruling above. A change that does the opposite of a '
+        'ruling, or a comment calling its opposite intentional, is a blocking issue that '
+        "names the ruling's escalation id."
+    ),
+})
+"""What each briefed audience is told to do with the rulings it is shown."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +103,40 @@ def select_rulings(
     chosen_ids = {ruling.escalation_id for ruling in chosen}
     kept = [ruling for ruling in chosen if cascade_parent_id(ruling.resolved_by) not in chosen_ids]
     return tuple(sorted(kept, key=_chronological))
+
+
+def render_rulings_section(rulings: Sequence[Ruling], audience: RulingAudience) -> str:
+    """The briefing block for *rulings*, oldest first; empty for none, else ending in a blank line."""
+    if not rulings:
+        return ''
+    listed = rulings[-RULINGS_LIMIT:]
+    omitted = rulings[:-RULINGS_LIMIT]
+    entries = '\n\n'.join(_ruling_entry(ruling) for ruling in listed)
+    overflow = (
+        f'{len(omitted)} older ruling(s) are not listed: '
+        + ', '.join(f'`{ruling.escalation_id}`' for ruling in omitted)
+        + '.\n\n'
+        if omitted else ''
+    )
+    return (
+        f'{RULINGS_HEADING}\n\n{_RULINGS_INTRO}\n\n{entries}\n\n'
+        f'{overflow}{RULING_INSTRUCTIONS[audience]}\n\n'
+    )
+
+
+def _ruling_entry(ruling: Ruling) -> str:
+    quoted = '\n'.join(f'> {line}' for line in ruling.resolution.splitlines()) or '> (none)'
+    return (
+        f'## `{ruling.escalation_id}` (level {ruling.level}): {_one_line(ruling.summary)}\n'
+        f'- resolved by: {_one_line(ruling.resolved_by) or "unknown"}\n'
+        f'- resolved at: {_one_line(ruling.resolved_at) or "unknown"}\n'
+        f'- action: {_one_line(ruling.resolution_action) or "unknown"}\n'
+        f'\n{quoted}'
+    )
+
+
+def _one_line(text: str | None) -> str:
+    return ' '.join((text or '').split())
 
 
 def plan_confirmed_at(plan: Mapping[str, object]) -> datetime | None:
