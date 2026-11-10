@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from _dashboard_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
@@ -261,6 +262,38 @@ class TestChartLabelValuePairing:
             f'labels props found on non-chart components {unknown}; DF_CHARTS '
             f'aliases in tabs.jsx: {sorted(aliases)}'
         )
+
+
+class TestChartSitesProbe:
+    """`_chart_sites` reads each chart's props from its own opening tag, and
+    fails loudly on a tag whose props it cannot attribute."""
+
+    def test_a_chart_with_children_is_read_from_its_opening_tag(self):
+        src = '<SA labels={pb.labels} stacks={burndownStacks(pb, CP)}>\n  <Legend />\n</SA>'
+        sites = _chart_sites(src)
+
+        assert [(s['tag'], s['labels_expr'], s['values_roots']) for s in sites] == [
+            ('SA', 'pb.labels', ['pb'])
+        ]
+
+    def test_a_self_close_inside_a_quoted_attribute_does_not_end_the_tag(self):
+        src = '<LC title="a/>b" labels={d.labels} series={[{ values: d.values }]} />'
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
+    @pytest.mark.parametrize(
+        'src',
+        [
+            '<LC legend={<Leg />} labels={d.labels} series={[{ values: d.values }]} />',
+            '<LC labels={d.labels} legend={<Leg />} series={[{ values: d.values }]} />',
+            '<LC labels={d.labels} series={[{ values: d.values }]}',
+        ],
+        ids=['nested-before-labels', 'nested-after-labels', 'never-closed'],
+    )
+    def test_a_tag_whose_props_cannot_be_attributed_fails_loudly(self, src):
+        with pytest.raises(AssertionError):
+            _chart_sites(src)
 
 
 # ---------------------------------------------------------------------------
