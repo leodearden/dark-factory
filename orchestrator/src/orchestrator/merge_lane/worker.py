@@ -20520,12 +20520,11 @@ class SpeculativeMergeWorker:
         # ── Mechanism 1: release merger-ahead cap ON-DRAIN ─────────────────
         # Mirrors original _verifier_loop :6327: release BEFORE any branching so
         # every drain path (normal verify, passthrough, abandon, halt) is covered.
-        # cap release happens exactly once: here for items from _verifier_queue;
-        # items put back onto the redispatch park have cap_permit cleared.
-        # θ: release THROUGH the ledger, guarded by the threaded token rather
-        # than a bool — ledger.release(None) would AttributeError on `.released`.
+        # Released exactly once, THROUGH the ledger (θ), and cleared here so every
+        # return below — a NoHost park included — carries no cap_permit.
         if isinstance(item, RealMergeItem) and item.cap_permit is not None:
             self._merge_ahead_ledger.release(item.cap_permit)
+            item = dataclasses.replace(item, cap_permit=None)
 
         # ── Pre-dispatch abandon ────────────────────────────────────────────
         if self._request_abandoned(req):
@@ -20588,12 +20587,12 @@ class SpeculativeMergeWorker:
         # ── Real item: host acquire + verify dispatch ───────────────────────
         # Fast-path: if no host is free RIGHT NOW, return None so the caller
         # puts the item back on the redispatch park (cap_permit already released
-        # above; caller must clear it on the item before putting back).
+        # and cleared above).
         # Checked BEFORE the potentially-expensive _remerge call so no work is
         # done for an item that will be re-tried on a free host.
         allocator = self._ensure_host_allocator(req.config)
         if allocator.free_host_count() == 0:
-            return NoHost(dataclasses.replace(item, cap_permit=None))
+            return NoHost(item)
 
         # Capture the speculative flag BEFORE any _remerge reassignment so
         # the InflightEntry carries the ORIGINAL speculative state (same

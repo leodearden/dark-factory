@@ -53,6 +53,7 @@ from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSit
 from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.speculation_controller import PermitLedger, SpeculationController
 from orchestrator.merge_lane.types import (
+    CapPermit,
     InflightStatus,
     ItemLifecycleState,
     MergeRequest,
@@ -945,6 +946,29 @@ class TestDispatchSitesReanchor:
         entry = await _dispatch(worker, parked)
         assert isinstance(entry, InflightEntry) and entry.item is parked
         assert entry.permit is None and not _ledger(worker).live
+
+    async def test_losing_the_host_race_parks_an_ordinary_item_without_its_cap(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-speculative item holding a merger-ahead cap finds a free host,
+        then loses it before the acquire.  It parks with the cap released and
+        cleared, rather than raising out of NoHost."""
+        worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
+        allocator = _fake_local_allocator()
+        allocator.acquire.return_value = None
+        monkeypatch.setattr(worker, '_host_allocator', allocator)
+        cap_ledger = PermitLedger(asyncio.Semaphore(1), 1, token_factory=CapPermit)
+        monkeypatch.setattr(worker, '_merge_ahead_ledger', cap_ledger)
+        _, built = await _make_merged_item(git_ops, config, 'task/no-host', 'nh.py', 'n=1\n')
+        item = dataclasses.replace(built, cap_permit=await cap_ledger.acquire())
+
+        outcome = await _dispatch(worker, item)
+
+        assert isinstance(outcome, NoHost), outcome
+        assert outcome.item.cap_permit is None
+        assert outcome.item.request is item.request
+        assert cap_ledger.live == frozenset()
 
     async def test_a_launch_that_raises_after_a_re_anchor_frees_the_replacement(
         self, git_ops: GitOps, config: OrchestratorConfig,
