@@ -14,6 +14,7 @@ from _dashboard_helpers import (
     DF_CHARTS_EXPORT_RE,
     destructure_bindings,
     extract_function_body,
+    jsx_open_tag_end,
     strip_js_comments,
     walk_balanced,
 )
@@ -54,8 +55,8 @@ _VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
 # come off the same series object. Only where the values root is written moved.
 _STACKS_BUILDER_RE = re.compile(r'stacks=\{\s*\w+\(\s*([A-Za-z_$][\w$.]*)\s*[,)]')
 _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
-# Any tag start or end inside an element's attribute list means the element is
-# not flat self-closing, so a regex chunk cannot be attributed to it safely.
+# Any tag start or end inside an element's opening tag means a nested element
+# sits in its attribute list, so a regex chunk cannot be attributed to it safely.
 _TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
@@ -118,27 +119,30 @@ def _chart_sites(src):
     Each record is a dict with `tag`, `labels_expr`, `labels_root`,
     `values_exprs` and `values_roots`.
 
-    An element runs from its tag start to the first `/>` after it.  That is only
-    a sound bound for a FLAT SELF-CLOSING element, so it is asserted rather than
-    assumed: if a chart is ever rewritten as `<LC ...>...</LC>` (say to nest a
-    legend), or a `<` otherwise appears in its attribute list, the chunk would
-    run past the element and silently attribute a DIFFERENT element's props to
-    it — a spurious failure, or worse a spurious pass.  Failing loudly on an
-    element this probe cannot parse is the safe direction.
+    An element's props are read from its opening tag, spanned by
+    `_dashboard_helpers.py::jsx_open_tag_end`, so a chart with children
+    (`<LC ...>...</LC>`, say to nest a legend) is read correctly and a quoted
+    `/>` cannot end it.  A nested element INSIDE the attribute list still fails
+    loudly: its own props would be attributed to the chart — a spurious
+    failure, or worse a spurious pass.
     """
+    src = strip_js_comments(src)
     sites = []
     for lm in _LABELS_PROP_RE.finditer(src):
         tag, start = _element_at(src, lm.start())
-        end = src.find('/>', start)
-        boundary = _TAG_BOUNDARY_RE.search(src, start + 1)
-        limit = boundary.start() if boundary else len(src)
-        assert end != -1 and end < limit, (
-            f'<{tag}> element at line {src.count(chr(10), 0, start) + 1} is not a '
-            'flat self-closing element, so this probe cannot attribute its props '
-            '(a following element\'s labels/values would be read as its own). '
-            'Teach _chart_sites to parse it rather than deleting the assertion.'
+        end = jsx_open_tag_end(src, start)
+        assert (
+            end is not None
+            and end > lm.start()
+            and _TAG_BOUNDARY_RE.search(src, start + 1, end) is None
+        ), (
+            f'<{tag}> element at line {src.count(chr(10), 0, start) + 1} does not '
+            'close as one flat opening tag holding this labels prop, so this probe '
+            'cannot attribute its props (a nested element\'s labels/values would be '
+            'read as its own). Teach _chart_sites to parse it rather than deleting '
+            'the assertion.'
         )
-        chunk = src[start:end + 2]
+        chunk = src[start:end]
         labels_m = _LABELS_RE.search(chunk)
         labels_expr = labels_m.group(1).strip() if labels_m else None
         values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
