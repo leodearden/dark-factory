@@ -227,3 +227,313 @@ O6, a stronger extraction model, is costed here and not adjudicated:
 
 Measuring O6 later is `replay --model <name>` into its own file, then a blind
 adjudication of the same 48 episodes. It needs no new code.
+
+---
+
+*§3 onward were written after adjudication. `r.` abbreviates `report.json`
+and `c.` abbreviates `composite-report.json`, both in this directory and both
+written by the scripts, not by hand. Run provenance, including the
+adjudication record and its blinding residuals, is in `provenance.json`. The
+replay output is committed as `replay.jsonl`. §2.2 calls it `replay.json`,
+but the file is JSONL, one record per (arm, episode).*
+
+## 3. W1 results: O1 replayed
+
+The replay ran once: 96 (arm, episode) records, no failures, 192 LLM calls,
+and 10 previous episodes for every episode (`provenance.json`). 644 minted
+edges were labelled: control 292 (`r.arms.control.minted`) and o1 352
+(`r.arms.o1.minted`).
+
+### 3.1 Fidelity
+
+| | population-weighted overreach / minted |
+|---|---|
+| production, 2026-10-01 (`r.fidelity.baseline`) | 0.1238 [0.0876–0.1721] |
+| replay control (`r.fidelity.control`) | 0.1355 [0.0977–0.1849] |
+
+The intervals overlap (`r.fidelity.intervals_overlap`). So the replay frame,
+with no dedupe against the live graph and endpoints left unresolved,
+reproduces production's rate within its noise. The paired comparison below is
+O1 against this control, as §2.4 requires.
+
+### 3.2 O1 against the control
+
+| measure | control | o1 | key path (`r.arms.<arm>.`) |
+|---|---|---|---|
+| overreach / minted, weighted | 0.1355 [0.0977–0.1849] | 0.0795 [0.0534–0.1167] | `population_weighted.overreach_rate_minted` |
+| overreach / day | 12.7 | 9.2 | `population_weighted.overreach_per_day` |
+| minted / day | 94.0 | 115.9 | `population_weighted.minted_per_day` |
+| holding share, weighted | 0.3718 | 0.3766 | `population_weighted.holding_share` |
+| holdings / day | 34.9 | 43.6 | `population_weighted.holdings_per_day` |
+| episodes with ≥1 overreach | 21/48 | 19/48 | `rates.all.episode_hit_rate` |
+| misbound | 7 | 8 | `rates.all.misbound_count` |
+| entities / episode | 12.60 | 18.42 | `entities.mean_per_episode` |
+| share of control's entity names kept | 1.0 | 0.732 | `entities.mean_share_of_control` |
+
+**The pre-registered verdict: O1 FAILS** (`r.comparison.o1.passes` = false).
+
+| check (§2.4) | bar | measured | holds |
+|---|---|---|---|
+| overreach per minted, o1 / control | ≤ 0.5 | 0.5867 | no |
+| overreach per day, o1 / control | ≤ 0.5 | 0.7244 | no |
+| o1's Wilson upper bound below control's point | — | 0.1167 < 0.1355 | yes |
+| holdings/day retained | ≥ 0.8 | 1.2493 | yes |
+
+So O1 is a real reduction, but it does not halve overreach, which is the bar
+every lever is held to. It does not dilute holdings either: it mints about 23%
+more edges per day, and more of them are holdings.
+
+Three descriptive readings, not part of the pre-registered rule:
+
+* **What O1 changed.** By rubric class, from each verdict's rationale:
+  control (ii) 32, (iii) 3, (iv) 2; o1 (i) 1, (ii) 24, (iv) 4. Its
+  rejected-option clause removed every (iii) case. The garble class (ii),
+  meaning inverted relations, invented links and quantities on the wrong
+  thing, fell only from 32 to 24.
+* **The reduction is concentrated.** One episode, dark_factory `64905a27`,
+  carries 10 control overreach edges and 0 o1 ones. The control arm turned
+  its list of ten re-landed tasks into chained "re-landed along with" pairs.
+  Without that episode, o1 has 29 overreach edges against control's 27,
+  unweighted. A rule that halves overreach should not depend on one episode.
+* **O1 rewrites entity extraction.** It extracts 46% more entities per
+  episode, and keeps only 73% of the control's names. Every extra entity is a
+  node that graphiti's `dedupe_nodes` must resolve in production, and that
+  the replay does not exercise (§7).
+
+**O1's cost** (`r.arms.<arm>.tokens`, per episode): control
+`extract_nodes` + `extract_edges` take 5,177.8 input and 633.6 output tokens.
+O1 adds 588.6 input (+11.4%) and 168.7 output (+26.6%) tokens. At gpt-4o-mini
+list price that is $0.00019 per episode, about $0.13/day at 670 class
+episodes/day. It needs no extra calls. Cost is not why O1 fails.
+
+As §2.4 pre-registered, O1 is not re-tuned and replayed within this task.
+
+## 4. W2 results: the O3+O4 composite
+
+The census (`composite-sample.json` `census`) covers the window
+[2026-10-24, 2026-11-10), 17.0 days, under judge prompt
+`overreach-judge-v1-ee6466c52d67`:
+
+| graph | handed | retired | kept | superseded | gone |
+|---|---|---|---|---|---|
+| dark_factory | 751 | 109 (6.41/day) | 616 (36.24/day) | 12 | 14 |
+| reify | 340 | 63 (3.71/day) | 263 (15.47/day) | 9 | 5 |
+
+80 flags were sampled (20 per cell) and labelled blind.
+
+| measure (`c.`) | weighted | unweighted |
+|---|---|---|
+| `retire_precision` | **0.9366** [0.8110–0.9807], effective n 37.3 | 38/40 |
+| `flag_precision` | 0.4628 [0.3292–0.6019] | 52/80 |
+| `stage1_recall_on_flags` | 0.3312 [0.1811–0.5259] | |
+| `holding_retired_share` | 0.0317 [0.0063–0.1445] | |
+| `overreach_retired_per_day` | 9.48 | |
+| `holdings_retired_per_day` | 0.32 | |
+| `composite_recall` | 0.0486, range [0.0106–0.1699] | |
+
+**The pre-registered verdict: the composite PASSES** (`c.decision.passes` =
+true). Retire precision 0.9366 clears 0.80, and its Wilson lower bound 0.811
+clears 0.65. This re-measures the 2026-11-09 spot-check's unregistered "about
+0.90" at a higher n, under a frozen window and a blind worksheet.
+
+What the numbers say:
+
+* **Stage 1 is the precision filter.** The judge's live flags are overreach
+  less than half the time: 0.463, inside its offline interval [0.107–0.525]
+  (2026-10-01 §10.1).
+  Stage 1 retires almost only the true ones: 1 holding and 1 context among 40
+  retired flags. By class, the retired overreach is (ii) 30 and (iii) 8, the
+  same garble-dominated mix §10.2 of the 2026-10-01 design saw.
+* **It retires little of what it is shown.** Stage 1 retires a third of the
+  flagged overreach. The rest stays served: about 19 overreach edges/day in
+  the two graphs, against 9.48 retired/day. That figure is the kept cells'
+  overreach counts (`c.label_counts`) times their weights (`c.weights`), over
+  17 days.
+* **Its recall is low.** The composite point estimate is 0.049: the judge
+  finds about 15% of overreach (offline), and Stage 1 retires about a third of
+  that. The range is wide, and it is a product of two frames, because the
+  judge's recall was measured on the 2026-08/09 window, before the shadow
+  existed. Even its upper end, 0.17, is far from the 0.5 "at least halved"
+  target in the 2026-10-01 §6.1 revisit clause.
+* **Its cost in holdings is small.** 0.32 holdings retired per day, against
+  9.48 overreach.
+
+So the composite is safe and cheap, and it is already running. It does not
+come near halving served overreach.
+
+## 5. W3: O6, a stronger extraction model
+
+**Why it belongs in the table.** Every lever in the 2026-10-01 §6 table acts
+on the extraction model's output: O1 instructs it, O3 judges it, O4 retires
+from it. None changes the model. The measured overreach is mostly garble
+class (ii): control 32 of 37 here, and 30 of 38 retired overreach edges in
+the composite. These are extraction errors: an inverted direction, a symbol
+placed in the wrong module, a quantity put on the wrong thing. O1's
+instructions name exactly these errors (rules 4 and 5), yet class (ii) fell
+only from 32 to 24 (§3.2). The extraction model's competence, not its
+instructions, is the remaining unmeasured axis. **O6** routes the class's two
+extraction calls, `extract_nodes` and `extract_edges`, to a stronger model.
+The other graphiti calls stay on gpt-4o-mini.
+
+**Named candidate.** gpt-6.1-sol, the stronger model priced in
+`fused-memory/scripts/score_write_triage_pairs.py::LIST_PRICES` (as of
+`LIST_PRICES_AS_OF` 2026-09-30, source `LIST_PRICES_SOURCE`
+https://developers.openai.com/api/docs/pricing).
+
+**Cost**, from the control arm's measured tokens per episode (5,177.8 input,
+633.6 output; `r.arms.control.tokens`), at list price with no cached-input
+discount, at about 670 class episodes/day (2026-10-01 §10.2):
+
+| model | input / output, USD per Mtok | per episode | per day | per 30 days |
+|---|---|---|---|---|
+| gpt-4o-mini (today) | 0.15 / 0.60 | $0.00116 | $0.78 | $23 |
+| gpt-6.1-sol | 2.00 / 10.00 | $0.01669 | $11.18 | $335 |
+
+* That is 14.4× the same two calls on gpt-4o-mini, about $10.41/day more.
+* Against graphiti's whole write it moves 2 of the about 10 calls per class
+  episode (2026-10-01 §6, an estimate from call sites). The other calls'
+  tokens were not measured here, so no whole-write ratio is claimed.
+* The figure assumes gpt-6.1-sol emits about the same tokens as gpt-4o-mini.
+  Reasoning tokens are billed as output (`LIST_PRICES` docstring), so the
+  real figure may be higher. The O6 replay measures it.
+
+**How to measure it.** No new code is needed (§2.7). Run
+`replay_overreach_extraction.py replay --arm control --model gpt-6.1-sol`
+into its own file, about $0.80 at list price for 48 episodes. Emit its
+worksheet, adjudicate it blind under the 2026-10-01 §2.6 rubric, and run
+`score`. Then compare its `arms.control` against this `r.arms.control` with
+the §2.4 checks.
+
+## 6. W4: the lever
+
+### 6.1 The table, updated
+
+| option | extra cost | measured effect on overreach | holdings cost | status |
+|---|---|---|---|---|
+| **O1** `custom_extraction_instructions` | 0 calls; +11% input and +27% output tokens on the two extraction calls, about $0.13/day | ×0.59 per minted, ×0.72 per day (§3.2), concentrated in one episode | none (holdings/day ×1.25), but entity extraction rewritten (73% name overlap) | **measured, FAILS** §2.4 |
+| **O3+O4** shadow judge plus Stage-1 retirement | 1 judge call per class episode (running since 2026-10-24) plus Stage 1's existing budget | retires 9.48 overreach/day in df+reify at 0.937 precision. Composite recall about 0.05 | 0.32 holdings/day | **measured, PASSES** §2.6 |
+| **O3 enforce** the judge's own marker | as O3 | judge precision 0.267 offline (2026-10-01 §10.1) and 0.463 live (§4) | would hide at least one non-overreach edge for every overreach edge it hides | **withdrawn**: neither precision is near 0.80 |
+| **O6** stronger extraction model for the class | about +$10.41/day at list (§5) | unmeasured | unmeasured | **costed**, measurable with no new code |
+| O2 typed edges, O5 authoring lint | as 2026-10-01 §6 | 0 by construction | — | unchanged, not levers |
+
+### 6.2 Recommendation, staged, with trigger and revisit clauses
+
+**The O3+O4 composite is the lever. Ratify it as it runs today, and stage the
+next measurement on O6.** It is the only option that passed its pre-registered
+bar, and it is already deployed. O1 failed its bar. The judge's own marker
+cannot pass at the precision measured on either frame.
+
+* **Stage R (ratified, now).**
+  * The judge keeps recording every class write to the sidecar, after the
+    lock, as 2026-10-01 §6.1 Stage S specifies.
+  * Its overreach flags keep going to recon Stage 1 as the O4 list, and
+    Stage 1 keeps retiring through `update_edge(invalid_at=now)`.
+  * The judge writes nothing to the graph. The 2026-10-01 §6.1 trigger from
+    shadow to enforce is **withdrawn**: no marker is written and no read site
+    filters on one.
+  * Sidecar retention may proceed (§9).
+* **Trigger clause, from R to R+O6.** It fires when an O6 replay passes the
+  §2.4 checks against this report's control. The run is
+  `replay_overreach_extraction.py replay --arm control --model gpt-6.1-sol`
+  on the same 48 episodes, adjudicated blind under the 2026-10-01 §2.6
+  rubric, then `score`. Its `arms.control` is compared with this
+  `r.arms.control`, and all three checks must hold:
+  1. population-weighted overreach ≤ 0.5 × 0.1355 per minted AND
+     ≤ 0.5 × 12.7 per day;
+  2. its Wilson upper bound per minted < 0.1355;
+  3. holdings/day ≥ 0.8 × 34.9.
+
+  If all three hold, file one task to route the class's `extract_nodes` and
+  `extract_edges` calls to gpt-6.1-sol. That task is `always_escalates`: the
+  measured cost goes to Leo for a spend ruling before anything is routed. If
+  any check fails, O6 is closed as O1 is, and the composite stays the lever
+  alone.
+* **Revisit clause, on the composite.** Re-measure with
+  `score_overreach_composite.py sample` + `score` on a fresh frozen window:
+  at least 14 days, dark_factory + reify, cap 20, blind under §2.6, its window
+  and cells pre-registered before the sample is drawn. Run it 90 days after
+  this ruling (2027-02-08), or sooner if the judge's prompt version changes
+  (the census `prompt_versions`) or recon's Stage-1 handling of the O4 list
+  changes. **Stop Stage 1 retiring handed flags** (the judge keeps recording)
+  and re-open the lever choice if either holds:
+  * `retire_precision` < 0.80, or its Wilson lower bound < 0.65. These are
+    the same bars, so a retirement keeps hiding at most one true fact per four
+    overreach edges.
+  * `holdings_retired_per_day` > 1.0 in the two graphs. That is about 3× the
+    0.32 measured here, the volume signature of a Stage 1 that has started
+    retiring holdings while its share stays under the bar.
+
+None of the measured levers reaches the 2026-10-01 target, served overreach at
+least halved. The composite trims it, and O1 dents it. That target stays open,
+and O6 is the remaining measured path toward it. Two other paths were not
+measured here: a higher-recall judge, and a less conservative Stage 1 (it
+retires 0.33 of what it is handed). Each would need its own pre-registered
+measurement before it could be a lever.
+
+## 7. Accepted residuals
+
+* **Single adjudicator, self-blinded.** There is still no inter-rater
+  agreement. Two blinding leaks are on record (`provenance.json`
+  `adjudication.blinding_residuals`). Before labelling, the adjudicator saw
+  per-arm totals, and the first control record. That record holds episode
+  `64905a27`'s control edges, the same episode that carries O1's measured
+  reduction (§3.2). Its ten "re-landed along with" edges were labelled by the
+  same rule as every other invented link. Still, the episode the result
+  depends on is the one whose arm membership was seen. Any bias from that
+  could only have inflated the control's count, and so flattered O1, which
+  fails anyway.
+* **Replay vs production dedupe.** The replay resolves nothing against the
+  live graph. The control arm absorbs this for the paired comparison, and
+  §3.1 shows the frame reproduces production's rate. But O1's extra entities
+  would meet production's `dedupe_nodes`, which the replay never ran.
+* **The previous-episode set as read today.** Previous episodes were re-read
+  on 2026-11-10, not as they stood at write time. An episode deleted since
+  then, or written later with an earlier `valid_at`, changes the context.
+  Both arms share it.
+* **LLM run-to-run variance.** Each arm ran once, at temperature 0.0. One
+  replay cannot separate O1's effect from sampling variance within that 0.59
+  ratio. A failed result is not re-run, as pre-registered.
+* **The composite's retired cell.** A flag is "retired" when its edge has
+  `invalid_at` set and `expired_at` null. That is Stage 1's `update_edge`
+  shape, but it is not proof that Stage 1 acted because of the flag. Any
+  `update_edge(invalid_at=…)` of a flagged edge, for whatever reason, lands in
+  that cell.
+* **Two graphs.** The composite was measured on dark_factory and reify only.
+  The judge runs on 10 graphs, about 670 class episodes/day.
+* **Two frames in one product.** Composite recall multiplies an offline judge
+  recall (2026-08/09 window) by a live Stage-1 recall (2026-10/11 window). It
+  is an order of magnitude, not an estimator.
+* **O6's cost uses gpt-4o-mini's token counts.** See §5.
+
+## 8. Build leaves filed
+
+Filed through `submit_task` with `spawned_from: 9040`, one per area. Each
+id is a curator ticket, not a task id. This file is authoritative over each
+ticket's copy of §6.2.
+
+* **B1, the O6 replay measurement** (area: the replay instrument, no code
+  change expected). It runs §6.2's trigger: the gpt-6.1-sol control replay,
+  its blind adjudication and score, and the three checks against
+  `r.arms.control`. On a pass it files the `always_escalates` routing task.
+* **B2, the composite revisit gate** (area: the composite instrument). It runs
+  §6.2's revisit clause on its schedule: a pre-registered fresh composite
+  window, blind adjudication, score, and the two pull-back conditions.
+
+## 9. Sidecar retention (task 7487)
+
+The 2026-10-01 §10.3 decision held every sidecar row until this task ruled.
+That hold is released:
+
+* **The composite evidence is frozen in this directory.**
+  `composite-sample.json` carries the census, and every sampled flag's graph,
+  edge, episode, fact, decision and `handed_at`. With `composite-verdicts.json`
+  and `composite-report.json` it reproduces §4 without the sidecar. The O1
+  evidence never lived in the sidecar.
+* **What retention must keep.** The §6.2 revisit clause reads
+  `OverreachShadowStore.handed_overreach_flags`. That joins `edge_judgements`
+  (label `overreach`), `flag_handoffs` and `judged_episodes` (for
+  `prompt_version`) within a handoff window. So for the handed overreach flags
+  of the most recent window the revisit will draw, at least 30 days, those
+  three tables' rows must survive. Everything older, and every non-overreach
+  judgement once its handoff state no longer matters to Stage 1, may be pruned
+  under 7487's own design.
