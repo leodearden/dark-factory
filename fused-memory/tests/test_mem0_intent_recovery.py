@@ -22,12 +22,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _mem0_intent_fixtures import rate_limit_error
+from _mem0_intent_fixtures import rate_limit_error, seed_mem0_intent
 
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import Mem0WriteState
 from fused_memory.models.scope import Scope
+from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
+from fused_memory.services.mem0_write_retry import (
+    DEFAULT_MEM0_RETRY_POLICY,
+    Mem0RetryPolicy,
+)
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 
 @pytest_asyncio.fixture
@@ -261,6 +267,7 @@ class TestAddMemoryTransientDeferral:
         )
 
         assert result.memory_ids == []
+        assert result.mem0_write_state is Mem0WriteState.PENDING_RETRY
         assert SourceStore.mem0 not in result.stores_written
         assert result.stores_pending_retry == [SourceStore.mem0]
         assert 'mem0_pending_retry' in result.message
@@ -275,6 +282,28 @@ class TestAddMemoryTransientDeferral:
         write_op = await recovery_journal.get_write_op(intent['write_op_id'])
         assert write_op is not None
         assert json.loads(write_op['result_summary'])['stores_pending'] == ['mem0']
+
+    @pytest.mark.asyncio
+    async def test_an_opted_out_write_fails_loudly_instead_of_deferring(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+
+        result = await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            defer_transient_mem0_failure=False,
+        )
+
+        assert result.mem0_write_state is Mem0WriteState.NOT_LANDED
+        assert result.stores_pending_retry == []
+        assert '[mem0_error' in result.message
+        assert 'mem0_pending_retry' not in result.message
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'failed'
+        assert await recovery_journal.get_mem0_intents(status='retrying') == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -387,6 +416,54 @@ class TestAddMemoryTransientDeferral:
         assert [op['success'] for op in mem0_ops] == [0, 1]
 
     @pytest.mark.asyncio
+    async def test_a_landed_retry_hands_its_supersedes_to_the_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        superseded = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            metadata={'supersedes': [superseded]},
+        )
+        (intent,) = await recovery_journal.get_mem0_intents()
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-late'}]})
+        landed: list[tuple[Any, Mem0AddOutcome]] = []
+
+        async def on_landed(row, outcome):
+            landed.append((row, outcome))
+
+        summary = await svc.retry_due_mem0_intents(
+            now=datetime.datetime.fromisoformat(intent['next_attempt_at'])
+            + datetime.timedelta(seconds=1),
+            on_landed=on_landed,
+        )
+
+        assert summary.landed == 1
+        ((row, outcome),) = landed
+        assert row['id'] == intent['id']
+        assert json.loads(row['metadata'])['supersedes'] == [superseded]
+        assert outcome.memory_ids == ('mem0-late',)
+
+    @pytest.mark.asyncio
+    async def test_a_reissue_returns_a_typed_outcome(self, recovery_service, recovery_journal):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+        (intent,) = await recovery_journal.get_mem0_intents()
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-late'}]})
+
+        outcome = await svc.reissue_mem0_intent(intent)
+
+        assert outcome == Mem0AddOutcome(memory_ids=('mem0-late',), empty_result_error=None)
+
+    @pytest.mark.asyncio
     async def test_the_tool_payload_carries_the_pending_store(self, recovery_service):
         svc = recovery_service
         svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
@@ -398,6 +475,74 @@ class TestAddMemoryTransientDeferral:
         )
 
         assert result.model_dump()['stores_pending_retry'] == ['mem0']
+
+
+class TestTheServiceOwnsItsRetryPolicy:
+    def test_the_injected_policy_is_the_one_it_reports(self, mock_config):
+        custom = Mem0RetryPolicy(
+            initial_delay_seconds=5,
+            max_delay_seconds=60,
+            poll_interval_seconds=7,
+            batch_size=3,
+            backlog_alarm_age_seconds=120,
+        )
+
+        assert MemoryService(mock_config, mem0_retry_policy=custom).mem0_retry_policy is custom
+
+    def test_the_default_policy_is_reported_when_none_is_injected(self, mock_config):
+        assert MemoryService(mock_config).mem0_retry_policy is DEFAULT_MEM0_RETRY_POLICY
+
+    @pytest.mark.asyncio
+    async def test_the_backlog_check_escalates_a_backlog_older_than_the_policy_allows(
+        self, recovery_service, recovery_journal, tmp_path
+    ):
+        svc = recovery_service
+        svc.set_known_projects({'dark_factory': str(tmp_path)})
+        now = await _seed_a_stale_retrying_intent(svc, recovery_journal)
+
+        filed = await svc.check_mem0_retry_backlog(now=now)
+
+        (record,) = _escalation_records(tmp_path)
+        assert record['category'] == 'mem0_write_retry_backlog'
+        assert filed == [record['id']]
+        svc.mem0.add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_retry_pass_files_no_backlog_escalation(
+        self, recovery_service, recovery_journal, tmp_path
+    ):
+        svc = recovery_service
+        svc.set_known_projects({'dark_factory': str(tmp_path)})
+        now = await _seed_a_stale_retrying_intent(svc, recovery_journal)
+
+        await svc.retry_due_mem0_intents(now=now)
+
+        assert _escalation_records(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_the_backlog_check_without_a_journal_files_nothing(self, mock_config):
+        assert await MemoryService(mock_config).check_mem0_retry_backlog() == []
+
+
+async def _seed_a_stale_retrying_intent(svc, journal) -> datetime.datetime:
+    """Seed a retrying intent older than *svc*'s alarm age, not yet due; return the 'now' it is stale at."""
+    now = datetime.datetime(2026, 11, 3, 12, tzinfo=datetime.UTC)
+    alarm_age = svc.mem0_retry_policy.backlog_alarm_age_seconds
+    await seed_mem0_intent(
+        journal,
+        status=Mem0IntentStatus.RETRYING,
+        project_id='dark_factory',
+        created_at=now - datetime.timedelta(seconds=alarm_age + 60),
+        retry_at=now + datetime.timedelta(minutes=5),
+    )
+    return now
+
+
+def _escalation_records(project_root) -> list[dict[str, Any]]:
+    return [
+        json.loads(path.read_text())
+        for path in (project_root / 'data' / 'escalations').glob('esc-*.json')
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +575,26 @@ async def _seed_pending_intent(
         metadata=metadata if metadata is not None else {'category': 'preferences_and_norms'},
         payload_digest=payload_digest,
     )
+
+
+_SUPERSEDED = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+
+
+async def _seed_failed_only_intent(journal, *, metadata=None) -> str:
+    """A ``pending`` intent whose only mem0 backend_op failed: recovery re-issues it."""
+    write_op_id = str(uuid.uuid4())
+    intent_id = str(uuid.uuid4())
+    await _seed_pending_intent(
+        journal, write_op_id=write_op_id, intent_id=intent_id, metadata=metadata
+    )
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+        success=False,
+        error='RateLimitError: 429',
+    )
+    return intent_id
 
 
 class TestRecoverMem0Intents:
@@ -694,6 +859,59 @@ class TestRecoverMem0Intents:
         }
         completed = await recovery_journal.get_mem0_intents(status='completed')
         assert [r['id'] for r in completed] == [intent_id]
+
+    @pytest.mark.asyncio
+    async def test_a_direct_reissue_hands_the_landed_write_to_the_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        """A crash-recovered write that lands now has its supersedes marked, as a retried one does."""
+        svc = recovery_service
+        intent_id = await _seed_failed_only_intent(
+            recovery_journal, metadata={'supersedes': [_SUPERSEDED]}
+        )
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'reissued-1'}]})
+        landed: list[tuple[Any, Mem0AddOutcome]] = []
+
+        async def on_landed(row, outcome):
+            landed.append((row, outcome))
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        assert summary['reissued'] == 1
+        ((row, outcome),) = landed
+        assert row['id'] == intent_id
+        assert json.loads(row['metadata'])['supersedes'] == [_SUPERSEDED]
+        assert outcome == Mem0AddOutcome(memory_ids=('reissued-1',), empty_result_error=None)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_landing_hook_leaves_the_reissue_completed(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        intent_id = await _seed_failed_only_intent(recovery_journal)
+        on_landed = AsyncMock(side_effect=RuntimeError('mark boom'))
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        on_landed.assert_awaited_once()
+        assert summary['reissued'] == 1
+        assert summary['dead_lettered'] == 0
+        completed = await recovery_journal.get_mem0_intents(status='completed')
+        assert [r['id'] for r in completed] == [intent_id]
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_reissue_is_left_to_the_retry_pass_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        await _seed_failed_only_intent(recovery_journal)
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        on_landed = AsyncMock()
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        assert summary['deferred'] == 1
+        on_landed.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_second_recover_is_zero_work(self, recovery_service):

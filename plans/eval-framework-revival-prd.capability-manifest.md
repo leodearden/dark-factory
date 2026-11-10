@@ -201,7 +201,9 @@ said so when it shipped: earlier eval-revival tasks predate the sidecar
 convention, and their bindings live in this `.md` manifest only. That header
 was erased minutes later by its stamp commit `a238df3886`, because the stamper
 (`fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl`)
-writes the sidecar back through `yaml.safe_dump`, which keeps no comments. The
+wrote the sidecar back through `yaml.safe_dump` at the time, which keeps no
+comments (since replaced by the comment-preserving
+`fused-memory/src/fused_memory/server/manifest_sidecar_text.py::stamp_task_ids`). The
 same statement survives here, as the last sentence of the "π — architect-fable
 OFAT candidate" section above. Its "carries π only" was true when written.
 

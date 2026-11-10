@@ -1,5 +1,5 @@
 """Migration guard: the six live-FalkorDB test modules migrated by task 3502
-must apply the shared ``_fm_helpers.falkor_skipif()`` reachability gate.
+must apply the shared ``_fm_falkor_live.falkor_skipif()`` reachability gate.
 
 Task 3502 consolidated a ``_falkor_available()`` probe that had been
 copy-pasted, byte-identical modulo docstring, into six test modules, and
@@ -19,7 +19,7 @@ an unused local — collects the marker and applies it to nothing, so it does no
 satisfy this guard.
 
 Deliberately NOT asserted: that the probe is absent under some other name, or
-which identifiers the module imports from ``_fm_helpers``. Both are name-pinning
+which identifiers the module imports from ``_fm_falkor_live``. Both are name-pinning
 over sibling test source — a re-fork called ``_falkordb_up`` evades them, so
 they buy no coverage while giving false assurance that duplication cannot
 return (review esc-3502-2).

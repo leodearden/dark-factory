@@ -222,9 +222,8 @@ def _make_fake_escalate_fn():
 
 def _make_fake_status_fetcher(done_count):
     """Fake `status_fetcher() -> dict` seam, shaped like the real
-    get_statuses envelope census_trigger.compute_tasks_landed already
-    reads (`{"statuses": {id: status}}`, done count = count of "done"
-    values) so census.py's own done-count baseline logic mirrors zeta's."""
+    get_statuses envelope census_trigger.extract_statuses reads
+    (`{"statuses": {id: status}}`), with *done_count* done tasks."""
     def fake_status_fetcher():
         return {"statuses": {f"t{i}": "done" for i in range(done_count)}}
 
@@ -1201,8 +1200,8 @@ def test_retire_entry_sets_status_retained():
 
 
 # ---------------------------------------------------------------------------
-# advance_census_state() -- the six-key census-state (zeta/2579 MUST-persist
-# contract for last_census_done_count; PRD census-incremental §4.2)
+# advance_census_state() -- the five-key census-state (PRD census-incremental
+# §4.2; the done-count baseline is retired with tasks-landed, C7)
 # ---------------------------------------------------------------------------
 
 _STATE_KEYS = [
@@ -1211,7 +1210,6 @@ _STATE_KEYS = [
     "last_census_report",
     "last_census_as_of_sha",
     "session_watermark",
-    "last_census_done_count",
 ]
 
 
@@ -1222,13 +1220,12 @@ def _advance(path, **overrides):
         report_path="plans/confusion-census-2026-07-14.md",
         as_of_sha="a" * 40,
         session_watermark="2026-07-14T00:00:00+00:00",
-        done_count=42,
     )
     kwargs.update(overrides)
     mod.advance_census_state(path, **kwargs)
 
 
-def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
+def test_advance_census_state_writes_exactly_the_five_keys_in_order(tmp_path):
     path = tmp_path / "census-state.json"
 
     _advance(path)
@@ -1241,36 +1238,7 @@ def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
         "last_census_report": "plans/confusion-census-2026-07-14.md",
         "last_census_as_of_sha": "a" * 40,
         "session_watermark": "2026-07-14T00:00:00+00:00",
-        "last_census_done_count": 42,
     }
-
-
-def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_path):
-    path = tmp_path / "census-state.json"
-
-    _advance(path, done_count=0)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert "last_census_done_count" in data, "must never be dropped as falsy"
-    assert data["last_census_done_count"] == 0
-    assert isinstance(data["last_census_done_count"], int)
-
-
-def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
-    """Task 3291: when the done-count could not be OBSERVED, the honest
-    baseline is `null` -- not a fabricated 0 (that is the defect being
-    fixed), not a carried-forward stale value (a quieter guess), and not an
-    omitted key (which would violate the 2579/eta MUST-persist contract).
-    `null` honours that contract literally -- the key is still always
-    present -- while being truthful about the state being unknown."""
-    path = tmp_path / "census-state.json"
-
-    _advance(path, done_count=None)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
-    assert data["last_census_done_count"] is None
-    assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
 
 
 def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_path):
@@ -1285,62 +1253,11 @@ def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_pat
     assert data["session_watermark"] is None
 
 
-def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
-    """End-to-end proof that an UNKNOWN baseline disarms condition (b)
-    instead of arming it. A poisoned `0` baseline makes compute_tasks_landed
-    return `current_done - 0` -- every done task ever, ~24x over the 120
-    threshold -- as soon as the get_statuses fetch works (task 3291; see
-    census_trigger's module docstring for the replayed measurements). A
-    `null` baseline instead routes into the existing absent-baseline branch:
-    one WARNING, `None`, no fire."""
-    path = tmp_path / "census-state.json"
-    _advance(path, census_at="2026-07-31", done_count=None)
-
-    # A null baseline is UNKNOWN, not malformed -- the state file still loads.
-    status, data = census_trigger.load_census_state(path)
-    assert status == "ok"
-    # load_census_state returns tuple[str, dict | None] — the None is real for
-    # the "missing"/"malformed" statuses, so narrow it explicitly rather than
-    # subscripting an Optional.
-    assert data is not None
-    assert data["last_census_done_count"] is None
-
-    with caplog.at_level(logging.WARNING):
-        landed = census_trigger.compute_tasks_landed(
-            state=data,
-            # A perfectly VALID fetcher: the fail-safe here comes from the
-            # unknown baseline, not from any fetch problem.
-            status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
-        )
-
-    assert landed is None
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
-
-    # ... and with tasks_landed=None, condition (b) cannot fire even when
-    # days_since is well past tasks_landed_min_days. Condition (a)
-    # (max_interval_days) remains the unconditional backstop.
-    config = census_trigger.CensusConfig()
-    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
-    decision = census_trigger.evaluate(
-        now=now,
-        last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
-        floor_anchor=census_trigger.FloorAnchor(
-            census_trigger.FloorAnchorKind.SESSION_WATERMARK,
-            now - timedelta(days=config.tasks_landed_min_days + 1),
-        ),
-        tasks_landed=None,
-        candidate_first_seens=[],
-        config=config,
-    )
-
-    assert decision.fire is False
-
-
 @pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
     path = tmp_path / "census-state.json"
 
-    _advance(path, done_count=7, session_watermark=watermark)
+    _advance(path, session_watermark=watermark)
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
@@ -1350,17 +1267,16 @@ def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, 
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
     assert data["last_census_as_of_sha"] == "a" * 40
     assert data["session_watermark"] == watermark
-    assert data["last_census_done_count"] == 7
 
 
 def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
     path = tmp_path / "census-state.json"
     path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
 
-    _advance(path, done_count=3)
+    _advance(path)
 
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["last_census_done_count"] == 3
+    assert list(data) == _STATE_KEYS
     assert "stale" not in data, "pre-existing state must be FULLY replaced"
 
     leftovers = [p for p in tmp_path.iterdir() if p.name != "census-state.json"]
@@ -2473,6 +2389,7 @@ def _method(**overrides):
         inputs_consumed_note=_NO_INSTRUMENT_RECORDS_NOTE,
         embedding_calls=0,
         adjudication={"attached": 0, "adjudicated": 0},
+        slug_tally=codebook.SlugTally(),
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2509,6 +2426,27 @@ def test_build_method_records_a_copy_of_every_verify_normalisation_count():
     counts["tag_dropped"] = 99
 
     assert method["extra"]["verify_normalisations"] == recorded
+
+
+def test_build_method_records_the_runs_slug_rejections():
+    expected = {"count": 3, "values": ["a", "b"], "values_omitted": 0}
+
+    method = _method(slug_tally=codebook.SlugTally(valid=1, rejected=("b", "a", "b")))
+
+    assert method["extra"]["slug_rejections"] == expected
+    record = json.loads(json.dumps(_census_record(method=method)))
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
+    method_section = _section_text(mod.census_report_sections(record), mod.SECTION_METHOD)
+    block = check_census_report.method_block(method_section)
+    assert isinstance(block, dict), block
+    assert block["extra"]["slug_rejections"] == expected
+
+
+def test_build_method_without_slug_rejections_records_zero():
+    assert _method()["extra"]["slug_rejections"] == {
+        "count": 0, "values": [], "values_omitted": 0,
+    }
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -3183,10 +3121,11 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     )
     assert rejected_candidate["disposition"] == "rejected", "rejected candidate RETAINED, marked"
 
-    # --- census state advanced with status_fetcher's done-count baseline ---
+    # --- census state advanced, with no done-count baseline: the
+    # status_fetcher feeds only the outcomes ---
     assert kwargs["census_state_path"].exists()
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert state["last_census_done_count"] == 3
+    assert "last_census_done_count" not in state
 
     # --- report written to the plans/ path ---
     assert kwargs["report_path"].exists()
@@ -3229,7 +3168,6 @@ def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
         "last_census_report": "confusion-census-2026-07-14.md",
         "last_census_as_of_sha": "c" * 40,
         "session_watermark": None,
-        "last_census_done_count": 5,
     }
 
 
@@ -3248,8 +3186,9 @@ def _invariant_slugs_block(prompt):
     return prompt.split("=== INVARIANT SLUGS ===\n", 1)[1].split("\n=== ", 1)[0]
 
 
-def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
-    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+def _slug_screening_census(tmp_path):
+    """A run whose project declares `known-slug` and whose two mined sessions
+    name it (`digest-alpha`) and the free text `free-text-one` (`digest-beta`)."""
     doc = tmp_path / invariants.DOC_RELPATH
     doc.parent.mkdir(parents=True)
     doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
@@ -3266,6 +3205,12 @@ def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
         status_fetcher=_make_fake_status_fetcher(5),
         commit=_make_fake_commit(),
     )
+    return kwargs, fake_invoke
+
+
+def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
+    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+    kwargs, fake_invoke = _slug_screening_census(tmp_path)
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -3287,6 +3232,19 @@ def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
         if r.levelno == logging.WARNING and "free-text-one" in r.getMessage()
     ]
     assert len(naming_it) == 1, naming_it
+
+
+def test_run_census_records_its_slug_rejections_in_the_method_block(tmp_path):
+    expected = {"count": 1, "values": ["free-text-one"], "values_omitted": 0}
+    kwargs, _ = _slug_screening_census(tmp_path)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _run_record(kwargs)["method"]["extra"]["slug_rejections"] == expected
+    block = check_census_report.method_block(kwargs["report_path"].read_text(encoding="utf-8"))
+    assert isinstance(block, dict), block
+    assert block["extra"]["slug_rejections"] == expected
 
 
 def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
@@ -3443,7 +3401,6 @@ def _census_repo(tmp_path):
         report_path="plans/confusion-census-2026-06-01.md",
         as_of_sha="b" * 40,
         session_watermark=None,
-        done_count=0,
     )
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "initial")
@@ -4506,14 +4463,9 @@ def test_main_done_line_names_skipped_deletions_only_when_there_were_some(
 
 
 # ---------------------------------------------------------------------------
-# task 3291: run_census() must never persist a FABRICATED done-count baseline.
-#
-# This is the test that would have caught the 2026-07-24 regression on the day
-# it happened. The get_statuses call went out with a relative path (the
-# pre-task-3269 --project-root default); fused-memory rejected it with a
-# {"error", "error_type"} envelope on an isError:false response; and the old
-# `(status.get("statuses") or {})` idiom silently read that as a done-count
-# of 0 and persisted it as a real baseline.
+# A get_statuses read that fails, in either shape task 3291 met live (the
+# tool-error envelope on an isError:false response, and an unreachable
+# server), costs run_census() its outcome feed only.
 # ---------------------------------------------------------------------------
 
 def _make_error_envelope_status_fetcher():
@@ -4543,16 +4495,12 @@ def _make_raising_status_fetcher():
     [_make_error_envelope_status_fetcher, _make_raising_status_fetcher],
     ids=["tool-error-envelope", "raising-fetcher"],
 )
-def test_run_census_unobservable_done_count_persists_null_not_zero(
-    tmp_path, caplog, make_fetcher
+def test_run_census_advances_census_state_when_the_status_fetch_fails(
+    tmp_path, make_fetcher
 ):
-    """An unobservable done-count degrades the BASELINE only -- it must not
-    abandon a run whose mining has already been paid for and whose dated
-    report is already on disk.
-
-    Before task 3291 the envelope case silently persisted 0, and the raising
-    case crashed run_census AFTER the report write, leaving the codebook and
-    census state unadvanced."""
+    """An unusable get_statuses snapshot costs the outcome feed only: a run
+    whose mining is paid for and whose report is on disk still completes,
+    and the census state it advances carries no done-count baseline."""
     batch = [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
@@ -4571,35 +4519,15 @@ def test_run_census_unobservable_done_count_persists_null_not_zero(
         commit=fake_commit,
     )
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
+    outcome = mod.run_census(**kwargs)
 
-    # --- the census still COMPLETES; only the baseline degrades ---
     assert outcome.status == "done"
     assert kwargs["report_path"].exists(), "the paid-for report must survive"
-    assert kwargs["codebook_path"].exists(), "codebook must still be dumped"
     assert len(fake_commit.calls) == 1, "the run must still commit"
 
-    # --- the baseline is an honest null, NOT a fabricated 0 ---
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert "last_census_done_count" in state, "MUST-persist contract still holds"
-    assert state["last_census_done_count"] is None
-    assert state["last_census_done_count"] != 0, "a fabricated 0 is the defect being fixed"
-
-    # --- the degradation is LOUD: exactly one warning naming the failure ---
-    fetch_warnings = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and "done-count" in r.getMessage()
-    ]
-    assert len(fetch_warnings) == 1, "degrading silently is what caused the incident"
-
-    # --- round-trip: condition (b) is fail-SAFE, not always-armed ---
-    status, data = census_trigger.load_census_state(kwargs["census_state_path"])
-    assert status == "ok"
-    assert census_trigger.compute_tasks_landed(
-        state=data,
-        status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
-    ) is None
+    assert list(state) == _STATE_KEYS
+    assert "last_census_done_count" not in state
 
 
 # ---------------------------------------------------------------------------
@@ -4952,9 +4880,9 @@ def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_veri
         anchor_from_remediation=1, tag_dropped=1, severity_substituted=1, route_defaulted=1,
     )
     assert _recorded_normalisations(kwargs) == expected
-    report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    method_yaml = report_text.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
-    assert yaml.safe_load(method_yaml)["extra"]["verify_normalisations"] == expected
+    block = check_census_report.method_block(kwargs["report_path"].read_text(encoding="utf-8"))
+    assert isinstance(block, dict), block
+    assert block["extra"]["verify_normalisations"] == expected
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
@@ -5897,8 +5825,8 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 
@@ -5909,7 +5837,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     assert opened_runners == [], "a no-fire decision must open no pooled runner"
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
-    assert "max-interval: not yet due" in out
+    assert "completion: not yet due" in out
 
 
 def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
@@ -6078,8 +6006,8 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 
@@ -6104,8 +6032,8 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=["max-interval: overdue -> FIRE"])
+    def fake_decide(project_root, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=["completion: landed -> FIRE"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
 
@@ -10500,25 +10428,24 @@ def test_run_census_never_reverifies_an_entry_already_fixed(tmp_path):
     assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", "abcdef1")
 
 
-def test_run_census_reads_get_statuses_once_and_feeds_both_outcomes_and_the_done_count(tmp_path):
+def test_run_census_reads_get_statuses_once_and_feeds_the_outcomes(tmp_path):
     kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "done", "77": "done", "78": "pending"})
 
     mod.run_census(**kwargs)
 
     assert len(kwargs["status_fetcher"].calls) == 1
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert state["last_census_done_count"] == 2
+    assert "last_census_done_count" not in state
     assert _persisted_entry_a(kwargs)["status"] == "fixed"
 
 
-def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
+def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path):
     kwargs = _outcome_kwargs(tmp_path, "gone", status="accepted", accepted_by=_LINKED_TASK)
     kwargs["status_fetcher"] = _counting_status_fetcher(
         raises=census_trigger.StatusFetchUnavailable("get_statuses unreachable: fused-memory down"),
     )
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
+    outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
     assert len(kwargs["status_fetcher"].calls) == 1
@@ -10527,11 +10454,9 @@ def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
     assert _reverify_calls(kwargs["verify_fn"]) == []
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
     assert any("fused-memory down" in line and not line.startswith("|") for line in section.splitlines())
-    done_count_warnings = [
-        r for r in caplog.records if r.levelno == logging.WARNING and "done-count" in r.getMessage()
-    ]
-    assert len(done_count_warnings) == 1
-    assert json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))["last_census_done_count"] is None
+    assert "last_census_done_count" not in json.loads(
+        kwargs["census_state_path"].read_text(encoding="utf-8")
+    )
 
 
 def test_run_census_method_and_cost_note_count_the_reverify(tmp_path):

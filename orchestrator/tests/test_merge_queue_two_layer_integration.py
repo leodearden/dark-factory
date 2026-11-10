@@ -62,6 +62,7 @@ from typing import Literal
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -146,7 +147,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Request / item / entry builders ──────────────────────────────────────────
@@ -305,6 +306,11 @@ def _make_inflight_entry(
     )
 
 
+def _seed_inflight(worker: SpeculativeMergeWorker, *entries: InflightEntry) -> None:
+    """Admit *entries* to the lane's in-flight region, oldest first."""
+    worker._inflight.extend(entries)
+
+
 # ── Branch / commit helpers ───────────────────────────────────────────────────
 
 
@@ -445,7 +451,7 @@ class TestTwoLayerInvariants:
             config=config, git_repo=git_repo,
         )
         entry_a = _make_inflight_entry(item_a, verifying=True)
-        worker._inflight.append(entry_a)
+        _seed_inflight(worker, entry_a)
 
         # Suffix req — different rid, not in frozen prefix.
         req_b = _make_req('task-b', 'task/task-b', config, git_repo)
@@ -467,28 +473,54 @@ class TestTwoLayerInvariants:
         git_repo: Path,
     ) -> None:
         """(a) A broken base-chain in the frozen prefix produces a violation str
-        naming the offending request_id.
+        naming the offending SUCCESSOR's request_id.
         """
         worker = _make_worker(git_ops)
         main_sha = 'main-sha-001'
 
-        # Frozen entry whose base_sha does NOT match main_sha → chain broken.
+        # The successor's base is not its predecessor's merge commit → broken.
         _, item_a = _make_fake_item(
-            'task-a', base_sha='wrong-sha', merge_commit='merge-sha-a',
+            'task-a', base_sha=main_sha, merge_commit='merge-sha-a',
             config=config, git_repo=git_repo,
         )
-        entry_a = _make_inflight_entry(item_a, verifying=True)
-        worker._inflight.append(entry_a)
+        _, item_b = _make_fake_item(
+            'task-b', base_sha='wrong-sha', merge_commit='merge-sha-b',
+            config=config, git_repo=git_repo,
+        )
+        _seed_inflight(
+            worker, _make_inflight_entry(item_a, verifying=True), _make_inflight_entry(item_b),
+        )
 
         violations = worker.two_layer_invariants(main_sha)
 
         assert violations, 'Expected a violation for broken base-chain but got []'
-        # At least one violation must name the offending rid.
         joined = ' '.join(violations)
-        assert item_a.request.request_id in joined, (
-            f'Expected offending rid {item_a.request.request_id!r} in violations '
+        assert item_b.request.request_id in joined, (
+            f'Expected offending rid {item_b.request.request_id!r} in violations '
             f'but got: {violations!r}'
         )
+        assert item_a.request.request_id not in joined, (
+            f'the head is intact and must not be named, got: {violations!r}'
+        )
+
+    async def test_lone_head_on_a_foreign_base_is_intact(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """A lone head whose base is not current main, and not a recorded dead
+        commit, is INV-3 intact (task 5302): main moving under an in-flight
+        verify is not a violation.
+        """
+        worker = _make_worker(git_ops)
+        _, item_a = _make_fake_item(
+            'task-a', base_sha='wrong-sha', merge_commit='merge-sha-a',
+            config=config, git_repo=git_repo,
+        )
+        _seed_inflight(worker, _make_inflight_entry(item_a, verifying=True))
+
+        assert worker.two_layer_invariants('main-sha-001') == []
 
     async def test_violation_b_frozen_suffix_overlap_detected(
         self,

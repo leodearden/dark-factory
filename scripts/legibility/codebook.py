@@ -136,7 +136,7 @@ _SIGHTING_SCHEMA = {
 # are checked by finding_identity_errors, not by these schemas.
 _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
 
-FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
+FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "cancelled", "existing")
 
 FILED_TICKET_STEPS = ("key", "semantic", "curator")
 
@@ -166,12 +166,14 @@ _TASK_REF_SCHEMA = {
     "required": ["project_root", "task_id"],
 }
 
+ENTRY_SEVERITIES: tuple[str, ...] = ("high", "medium", "low")
+
 _ENTRY_SCHEMA = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
         "title": {"type": "string"},
-        "severity": {"enum": ["high", "medium", "low"]},
+        "severity": {"enum": list(ENTRY_SEVERITIES)},
         "status": {"enum": STATUSES},
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
@@ -648,6 +650,24 @@ def assert_no_deletion(before: dict, after: dict) -> None:
 
 _SIGHTING_OPS = ("matches", "candidates", "corrections")
 
+_MAX_REPORTED_REJECTED_SLUGS = 10
+_MAX_REPORTED_SLUG_CHARS = 80
+
+
+def _bounded_slug(value: str) -> str:
+    if len(value) <= _MAX_REPORTED_SLUG_CHARS:
+        return value
+    return value[:_MAX_REPORTED_SLUG_CHARS] + "..."
+
+
+def _bounded_distinct(values: Collection[str]) -> tuple[list[str], int]:
+    """The distinct bounded renderings of *values*, sorted and capped, and how
+    many distinct values none of them shows on its own: they are LLM free text,
+    so both their number and their length are capped."""
+    distinct = set(values)
+    shown = sorted({_bounded_slug(value) for value in distinct})[:_MAX_REPORTED_REJECTED_SLUGS]
+    return shown, len(distinct) - len(shown)
+
 
 @dataclass(frozen=True)
 class SlugTally:
@@ -662,6 +682,12 @@ class SlugTally:
             valid=self.valid + other.valid,
             rejected=self.rejected + other.rejected,
         )
+
+    def rejections_record(self) -> dict[str, Any]:
+        """The JSON-safe record of the rejected values, with the exact count
+        and the distinct values bounded as the run's WARNING bounds them."""
+        shown, hidden = _bounded_distinct(self.rejected)
+        return {"count": len(self.rejected), "values": shown, "values_omitted": hidden}
 
 
 @dataclass(frozen=True)
@@ -770,20 +796,9 @@ def screen_invariant_slugs(
     return screened, SlugTally(valid=valid, rejected=tuple(rejected))
 
 
-_MAX_REPORTED_REJECTED_SLUGS = 10
-_MAX_REPORTED_SLUG_CHARS = 80
-
-
 def _bounded_rejected_slugs(rejected: Collection[str]) -> str:
-    """The distinct *rejected* values, sorted, as one bounded rendering: they
-    are LLM free text, so both their number and their length are capped."""
-    distinct = sorted(set(rejected))
-    shown = [
-        value if len(value) <= _MAX_REPORTED_SLUG_CHARS
-        else value[:_MAX_REPORTED_SLUG_CHARS] + "..."
-        for value in distinct[:_MAX_REPORTED_REJECTED_SLUGS]
-    ]
-    hidden = len(distinct) - len(shown)
+    """The distinct *rejected* values, sorted, as one bounded rendering."""
+    shown, hidden = _bounded_distinct(rejected)
     return f"{shown} +{hidden} more" if hidden else f"{shown}"
 
 

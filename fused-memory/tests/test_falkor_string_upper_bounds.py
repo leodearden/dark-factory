@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from falkordb.asyncio import FalkorDB
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.nodes import EpisodeType

@@ -21,8 +21,8 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 from orchestrator.verify_admission_record import AdmissionLeg
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_evidence import (
-    CacheMode,
     UnitOutcome,
     UnitTier,
     VerifyUnit,
@@ -428,6 +428,7 @@ class TestImplementSiteWorkflowVerify:
             'duration_ms': 12500,
             'slot_wait_secs': 4.5,
             'site': 'implement',
+            'runner': 'local',
             'plan_hash': verify_evidence.plan_hash(plan),
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in passing.units or ()],
@@ -477,6 +478,7 @@ class TestPreMergeSiteWorkflowVerify:
             'duration_ms': 7000,
             'slot_wait_secs': None,
             'site': 'pre_merge',
+            'runner': 'local',
             'plan_hash': verify_evidence.plan_hash(plan),
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in verdict.units or ()],

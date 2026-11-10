@@ -16,7 +16,20 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
 from shared import process_identity
+from shared.declared_scope import (
+    DECLARED_SCOPE_METADATA_KEY,
+    derive_declared_scope,
+    stamp_violation,
+)
 from shared.defects import DeclareEvent, OutcomeEvent
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FollowupBundleInvalid,
+    FollowupItem,
+    merge_items,
+    task_items,
+    with_derived_bundle_keys,
+)
 from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
@@ -33,16 +46,21 @@ from fused_memory.backends.defect_records import (
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DeclaredScopeWriteAuthorityError,
     DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    FollowupItemsRefusedError,
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
-from fused_memory.backends.task_backend_types import AmendmentAdvisory, MetadataLookupResult
+from fused_memory.backends.task_backend_types import (
+    AmendmentAdvisory,
+    MetadataLookupResult,
+)
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.amendment_advisory import (
@@ -62,10 +80,12 @@ from fused_memory.middleware.curation_deferral import (
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
-    CuratorFailureError,
     PreparedCandidate,
+    declared_scope_of,
     exception_summary,
-    is_combine_eligible_status,
+    followup_items_of,
+    is_combine_eligible,
+    spawned_from_of,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -78,6 +98,7 @@ from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_PROVENANCE_KINDS,
     resolve_deterministic_provenance_authorization,
 )
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -104,6 +125,13 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.r4_idempotency import (
+    DroppedItem,
+    R4Lookup,
+    R4Verdict,
+    check_r4,
+    metadata_keeping,
+)
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcome,
@@ -393,10 +421,12 @@ class _PreparedTicket:
     :attr:`CuratorConfig.batch_token_threshold` accumulator before fetching
     the next ticket from the queue.
 
-    ``prepared`` is None when ``candidate`` is None (no title — curator
-    cannot judge it) or when prepare_candidate raised; the dispatch path
-    treats those tickets the same way the legacy "candidate is None" branch
-    did (skip the curator decision, go straight to ``tm.add_task``).
+    ``prepared`` is None only when ``candidate`` is None (no title — the
+    curator cannot judge it) or there was no curator at prepare time; with no
+    candidate the dispatch path skips the curator decision and goes straight to
+    ``tm.add_task``, and a missing bundle is prepared at batch time once a
+    curator exists. A ``prepare_candidate`` that raised yields
+    :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
     """
 
     ticket_id: str
@@ -407,15 +437,57 @@ class _PreparedTicket:
     candidate: CandidateTask | None
     prepared: PreparedCandidate | None
     attribution: CreationAttribution
+    r4_dropped: tuple[DroppedItem, ...] = ()
+
+    def keeping(self, verdict: R4Verdict) -> '_PreparedTicket':
+        """This ticket filing only the verdict's kept items, carrying what R4 dropped."""
+        candidate = (
+            None if self.candidate is None
+            else dataclasses.replace(self.candidate, items=verdict.kept)
+        )
+        prepared = (
+            None if self.prepared is None or candidate is None
+            else dataclasses.replace(self.prepared, candidate=candidate)
+        )
+        return dataclasses.replace(
+            self,
+            metadata=metadata_keeping(coerce_task_metadata(self.metadata) or {}, verdict),
+            candidate=candidate,
+            prepared=prepared,
+            r4_dropped=verdict.dropped,
+        )
 
     @property
     def prompt_tokens(self) -> int:
         """Estimated user-prompt token cost for this ticket's batch section.
 
-        Returns 0 when there is no prepared bundle (the ticket bypasses the
-        curator and contributes nothing to the LLM prompt).
+        Returns 0 when there is no prepared bundle: nothing is counted for a
+        bundle the batch has yet to prepare.
         """
         return self.prepared.prompt_tokens if self.prepared is not None else 0
+
+
+async def _prepare_bundle(
+    curator: TaskCurator,
+    candidate: CandidateTask,
+    *,
+    ticket_id: str,
+    project_id: str,
+    project_root: str,
+) -> PreparedCandidate:
+    """``curator.prepare_candidate``, with any raise turned into a bundle that defers.
+
+    ``prepare_candidate`` already turns a corpus-build failure into
+    :meth:`PreparedCandidate.corpus_failed`. An exception here is unexpected,
+    and gets the same bundle, so the pipeline defers it ``CORPUS_FAILED``.
+    """
+    try:
+        return await curator.prepare_candidate(candidate, project_id, project_root)
+    except Exception as exc:
+        logger.exception('curator.prepare_candidate failed for ticket %s', ticket_id)
+        return PreparedCandidate.corpus_failed(
+            candidate, f'prepare_candidate raised: {exception_summary(exc)}',
+        )
 
 
 @dataclasses.dataclass
@@ -427,9 +499,8 @@ class _TicketLifecycle:
     source of truth for a ticket's entire journey through
     :meth:`TaskInterceptor._process_add_tickets_batch_prepared`.  This
     replaces that method's historical correlated parallel arrays
-    (``decisions``, ``curator_degrade_reasons``, ``resolved_task_ids``) and
-    the ``non_none-space`` <-> ``ticket_data-space`` index remapping those
-    arrays required.
+    (``decisions``, ``resolved_task_ids``) and the ``non_none-space`` <->
+    ``ticket_data-space`` index remapping those arrays required.
 
     ``target`` is a DIRECT reference to the sibling record a within-batch
     ``drop`` decision points at (resolved once, at decision-attach time,
@@ -440,7 +511,6 @@ class _TicketLifecycle:
 
     ticket: _PreparedTicket
     decision: CuratorDecision | None = None
-    degrade_reason: str | None = None
     # Self-referential — task_interceptor.py has no
     # `from __future__ import annotations`, so this MUST stay a string
     # forward-ref: a bare `_TicketLifecycle | None` annotation would
@@ -489,37 +559,6 @@ async def _wait_for_ticket_signal(event: asyncio.Event, timeout_seconds: float |
     except TimeoutError:
         return ResolveReason.WAIT_TIMEOUT
     return ResolveReason.WAIT_INTERRUPTED
-
-
-def _decision_after_curator_failure(
-    ticket_id: str, exc: CuratorFailureError,
-) -> tuple[CuratorDecision, str | None]:
-    """Decide a ticket whose curation raised out of ``curate()``.
-
-    Returns the decision and the degrade reason a create records. A
-    zero-output hang degrades to create with the ZOT marker, so the
-    no-orchestrator path still gets swept and stamped even though no
-    escalation could be filed for it. Any other failure defers, so the ticket
-    is parked until the curator can judge it; a parked row records only its
-    defer reason, so it gets no degrade reason and the failure is logged here.
-    """
-    if not exc.zero_output_timeout:
-        logger.warning(
-            'ticket %s: curator.curate raised CuratorFailureError, deferring curation: %s',
-            ticket_id, exc,
-        )
-        return CuratorDecision.deferred(DeferReason.LLM_FAILED), None
-    logger.warning(
-        'ticket %s: curator.curate hung with zero output, degrading to create: %s',
-        ticket_id, exc,
-    )
-    decision = CuratorDecision(
-        action='create',
-        justification=f'curator-failed: {exception_summary(exc)}',
-        degraded=True,
-        degraded_by_zot=True,
-    )
-    return decision, str(exc)
 
 
 # The label a non-create decision carries when its ticket still ends in a
@@ -592,6 +631,28 @@ def _dedupe_skipped_reason(
     if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
         return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
     return None
+
+
+def _with_declared_scope_stamp(metadata: Any, kwargs: dict[str, Any]) -> Any:
+    """*metadata* plus its ``declared_scope`` stamp; an unreadable wire value is returned as is."""
+    readable = coerce_task_metadata(metadata)
+    if readable is None:
+        return metadata
+    stamp = derive_declared_scope(
+        extract_files(readable),
+        kwargs.get('description') or '',
+        kwargs.get('details') or '',
+        basis='submit',
+    )
+    return {**readable, DECLARED_SCOPE_METADATA_KEY: stamp.model_dump()}
+
+
+def _with_derived_bundle_keys(metadata: Any) -> Any:
+    """*metadata* with its follow-up bundle's R4 keys derived; any other wire value is returned as is."""
+    readable = coerce_task_metadata(metadata)
+    if readable is None or FOLLOWUP_ITEMS_METADATA_KEY not in readable:
+        return metadata
+    return with_derived_bundle_keys(readable)
 
 
 class TaskInterceptor:
@@ -1290,7 +1351,7 @@ class TaskInterceptor:
         self._closed = True
 
         # Cancel all per-project curator workers so they stop blocking on
-        # curator.curate().  Gather all tasks regardless of done-state so we
+        # curator.curate_prepared().  Gather all tasks regardless of done-state so we
         # can detect any task that raised unexpectedly.
         running_workers = [t for t in self._worker_tasks.values() if not t.done()]
         for t in running_workers:
@@ -1584,9 +1645,10 @@ class TaskInterceptor:
             # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
             # the forwarding enables at gate 2 is live_workflow_detector's
             # task_kind-scoped rules: rule 2 (blocked + deterministic, task
-            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
-            # (pending + deterministic + pure gate, task 3751). Only rule 5
-            # actually changes gate 2's verdict — rule 3 already fired there
+            # 2067), rule 3 (blocked + normal + bare, task 2409), rule 5
+            # (pending + deterministic + pure gate, task 3751) and rule 6
+            # (pending + normal + awaiting a dependency, task 8330). Only
+            # rules 5 and 6 change gate 2's verdict — rule 3 already fired there
             # on the previous implicit task_kind=None, and rule 2's extra
             # coverage is masked because gate 2 reads is_live, which ORs in
             # the per-task worktree/commit evidence. See check()'s Gate 2
@@ -1627,6 +1689,11 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
+                # Read under the same _write_lock as `before`, so no interceptor write
+                # can move a dependency before the status write; see check()'s Gate 2.
+                dependency_statuses = await recon_write_policy.read_dependency_statuses(
+                    tm, before, project_root=project_root, tag=tag,
+                )
                 verdict = await recon_write_policy.check(
                     'set_task_status',
                     task_id=task_id,
@@ -1637,6 +1704,7 @@ class TaskInterceptor:
                     snapshot_token=None,
                     task_metadata=before.get('metadata') if isinstance(before, dict) else None,
                     task_snapshot=before if isinstance(before, dict) else None,
+                    dependency_statuses=dependency_statuses,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
@@ -2457,7 +2525,7 @@ class TaskInterceptor:
             # skips both the lock and note_created. record_task is an
             # idempotent UUID5-keyed upsert (task_curator.py), so corpus
             # visibility — the goal here — is achieved regardless. The
-            # trade-off: these committed tasks never land in curate()'s
+            # trade-off: these committed tasks never land in the curator's
             # in-memory recent-created snapshot, so a concurrent add_task
             # for a near-duplicate falls back to the (now up to date)
             # corpus search instead of the in-memory pre-LLM check. A minor
@@ -2643,9 +2711,11 @@ class TaskInterceptor:
             details=str(kwargs.get('details') or ''),
             files_to_modify=files,
             priority=str(kwargs.get('priority') or 'medium'),
-            spawned_from=meta.get('spawned_from'),
+            spawned_from=spawned_from_of(meta),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
+            items=followup_items_of(meta),
+            declared_scope=declared_scope_of(meta),
         )
 
     def _files_scope_check(
@@ -3436,6 +3506,8 @@ class TaskInterceptor:
         project_root: str,
         decision: CuratorDecision,
         *,
+        candidate: CandidateTask,
+        ticket_id: str,
         candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
@@ -3443,17 +3515,26 @@ class TaskInterceptor:
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
         ``update_task``, writing the curator's rewrite as structured fields
-        and MERGING a three-key combine marker into the target's existing
-        metadata blob (``metadata_mode='merge'``) — it does not replace that
-        blob. See the comment at the write for why (task 3446).
+        and MERGING the combine's keys into the target's existing metadata
+        blob (``metadata_mode='merge'``) — it does not replace that blob. See
+        the comment at the write for why (task 3446). Those keys are the three
+        ``curator_*`` markers, the ``declared_scope`` re-stamped from the
+        rewrite (``basis='combine'``, the one sanctioned re-stamp, written
+        backend-direct), and ``followup_items``: the order-preserving union of
+        the target's and the candidate's items, written when non-empty. It
+        never writes ``metadata.files``. A malformed stored bundle on either
+        side aborts, unaudited, a combine every other guard would let
+        through; an eligibility refusal of that target is still audited, with
+        no items recorded.
 
         Before writing, verifies the decision found its target and that the
         target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
         fingerprint (curator targeted the wrong task) aborts first, so a
         misdirected decision can never be recorded as an eligibility refusal
         against a row it never meant. Eligibility is then the shared
-        ``is_combine_eligible_status`` (task_curator) — the same predicate the
-        curator's selection snapshot uses, so the two cannot drift apart —
+        ``curator_types.is_combine_eligible`` — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart, and
+        a follow-up holder refuses under its own token (``target_is_holder``) —
         conjoined with an execution-only check the snapshot cannot make: a
         target carrying a ``claimant_run_id`` stamp is refused even when its
         status is pending (task 4035). That conjunct tests only for a present,
@@ -3468,8 +3549,9 @@ class TaskInterceptor:
         token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
-        declaring an escalation gate while the live target does not. The
-        candidate's own metadata is never written anywhere by this path, so
+        declaring an escalation gate while the live target does not. Apart
+        from its follow-up items, the candidate's own metadata is never
+        written anywhere by this path, so
         such a combine would silently strip a human decision gate — the
         target-side ``'merge'`` above cannot help. Refusing degrades to
         ``create``, which files the gate as its own task (task 3446).
@@ -3530,9 +3612,21 @@ class TaskInterceptor:
             )
             return None
 
+        target_metadata = target.get('metadata')
+        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+        candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+        audit_context, items_after = _combine_fold(
+            decision,
+            ticket_id=ticket_id,
+            target_title=target_title,
+            target_meta=target_meta or {},
+            candidate=candidate,
+            candidate_meta=candidate_meta,
+        )
+
         # ── Guard: the target must still be combine-ELIGIBLE right now ──
-        # Shared with the curator's selection snapshot (task_curator's
-        # is_combine_eligible_status) so the two cannot drift apart again —
+        # Shared with the curator's selection snapshot (curator_types'
+        # is_combine_eligible) so the two cannot drift apart again —
         # the hand-copied `status == 'pending'` that used to live here as
         # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
         # that had moved on since selection (task 4035).
@@ -3553,16 +3647,16 @@ class TaskInterceptor:
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
 
-        # Single read shared by the eligibility chain and the gate guard.
-        target_metadata = target.get('metadata')
-
-        if not is_combine_eligible_status(target_status):
-            refused_reason = COMBINE_REFUSED_NOT_PENDING
+        if not is_combine_eligible(target):
+            refused_reason = (
+                COMBINE_REFUSED_HOLDER if is_holder(target) else COMBINE_REFUSED_NOT_PENDING
+            )
             logger.warning(
-                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'combine-guard: target %s is not combine-eligible (status=%r, %s) — '
                 'aborting combine to avoid silently losing candidate work',
                 decision.target_id,
                 target_status,
+                refused_reason,
             )
         elif target_is_claimed:
             # Status alone has the same TOCTOU shape one level down: a target
@@ -3604,6 +3698,7 @@ class TaskInterceptor:
                 new_title=rt.title,
                 new_description=rt.description,
                 justification=decision.justification,
+                context=audit_context,
                 refused_reason=refused_reason,
             )
             return None
@@ -3635,17 +3730,14 @@ class TaskInterceptor:
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target_metadata
         ):
-            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
             # _is_gate_metadata answers False both when the target genuinely
             # has no gate AND when its metadata blob is unparseable/corrupt
             # (permissive-on-parse-failure by design). Distinguish the two in
-            # the log text — a shape-level re-check via _parse_metadata_value
-            # (not _extract_metadata_dict, to avoid a second schema_warning
-            # emission for the same blob) is enough. The refuse-and-degrade
-            # decision itself is unchanged either way. Re-checks the SAME
-            # `target_metadata` the condition above consulted, deliberately.
-            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            # the log text: `target_meta`, parsed above from the SAME
+            # `target_metadata` this condition consulted, is None exactly for
+            # the unreadable blob. The refuse-and-degrade decision itself is
+            # unchanged either way.
             if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
@@ -3660,6 +3752,18 @@ class TaskInterceptor:
             )
             return None
 
+        # Unaudited, like the gate guard: a combine that cannot keep every
+        # item must not write, but only a combine every guard above passed
+        # reaches here, so an eligibility refusal stays counted.
+        if items_after is None:
+            logger.warning(
+                'combine-guard: target %s or its candidate carries a malformed follow-up '
+                'bundle — aborting combine, which could not keep every item. Degrading '
+                'to create.',
+                decision.target_id,
+            )
+            return None
+
         # The curator already produced the coherent rewrite — push it to the
         # backend as structured fields. No prompt, no LLM rewrite at the
         # write boundary; sqlite writes the columns directly. The
@@ -3668,13 +3772,19 @@ class TaskInterceptor:
         # kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         details_with_files = f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
-        combine_metadata = json.dumps(
-            {
-                'curator_action': 'combine',
-                'curator_justification': decision.justification[:500],
-                'combined_at': datetime.now(UTC).isoformat(),
-            }
-        )
+        combine_keys: dict[str, Any] = {
+            'curator_action': 'combine',
+            'curator_justification': decision.justification[:500],
+            'combined_at': datetime.now(UTC).isoformat(),
+            DECLARED_SCOPE_METADATA_KEY: derive_declared_scope(
+                rt.files_to_modify, rt.description, rt.details, basis='combine',
+            ).model_dump(),
+        }
+        if items_after:
+            combine_keys[FOLLOWUP_ITEMS_METADATA_KEY] = [
+                item.model_dump(mode='json') for item in items_after
+            ]
+        combine_metadata = json.dumps(combine_keys)
 
         # ── Audit: persist old-vs-new BEFORE the mutation so we can
         # recover if the write crashes mid-flight.
@@ -3687,6 +3797,7 @@ class TaskInterceptor:
             new_title=rt.title,
             new_description=rt.description,
             justification=decision.justification,
+            context=audit_context,
         )
 
         rewrite = _CombineRewrite(
@@ -3701,7 +3812,7 @@ class TaskInterceptor:
                     # Combine MERGES its marker keys into the target's blob; it
                     # does NOT overwrite the blob. Shallow last-write-wins
                     # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
-                    # the three keys above authoritative while everything else
+                    # the keys above authoritative while everything else
                     # already on the target survives: the escalation-gate stamp
                     # (execution_class / operational_mode / task_kind /
                     # always_escalates / gate_escalated_at) plus source,
@@ -3934,8 +4045,9 @@ class TaskInterceptor:
         ticket blob — so this in-place mutation is sufficient to carry the
         marker onto the task the curator creates from that ticket, when one
         is created, with no new plumbing.  It does not reach a ``combine``
-        target: :meth:`_execute_combine` merges only the ``curator_*`` keys
-        onto the existing task (task 4159).
+        target: :meth:`_execute_combine` never copies a candidate's
+        ``possible_scope_mismatch``; it writes only the ``curator_*`` markers,
+        ``declared_scope`` and ``followup_items`` (task 4159).
 
         *source* names the PROVENANCE of the finding and is the marker's only
         discriminator between them: ``'prose'`` (the default, so every
@@ -3987,71 +4099,36 @@ class TaskInterceptor:
     async def _check_escalation_idempotency(
         self,
         *,
+        lookup: R4Lookup | None,
         project_root: str,
         metadata,
-    ) -> tuple[dict | None, bool]:
-        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
-        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
-        matches a non-cancelled task, and ``check_failed`` is ``True`` when
-        ``get_tasks`` raised (so callers can fall through to CREATE rather than
-        treating a failure as a clean no-hit).
+    ) -> R4Verdict:
+        """R4 for one ticket's metadata (``r4_idempotency.py::check_r4``); no hit when it cannot run.
 
-        R4: authoritative and cheap — no LLM, no embedding lookup.
-        Works even when the curator is disabled or broken, which is
-        exactly the regime that triggered the duplicate Type::Error
-        tasks (esc-1912-179 → esc-1912-190).
+        *lookup* is the batch's, None without a backend. A lookup that raised falls through to
+        CREATE with every item, logged here.
         """
         meta = self._extract_metadata_dict(metadata)
-        if not meta:
-            return (None, False)
-        esc_id = meta.get('escalation_id')
-        sug_hash = meta.get('suggestion_hash')
-        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return (None, False)
-        if not esc_id or not sug_hash:
-            return (None, False)
-
-        if self.taskmaster is None:
-            return (None, False)
+        if not meta or lookup is None:
+            return R4Verdict()
         try:
-            tasks_result = await self.taskmaster.get_tasks(project_root)
+            verdict = await check_r4(lookup, project_root, meta)
         except Exception:
             logger.warning(
-                'r4: get_tasks failed during idempotency check',
+                'r4: metadata lookup failed during idempotency check',
                 exc_info=True,
             )
-            return (None, True)
-        for task in flatten_task_tree(tasks_result):
-            tmeta = task.get('metadata')
-            if not isinstance(tmeta, dict):
-                continue
-            if tmeta.get('escalation_id') != esc_id:
-                continue
-            if tmeta.get('suggestion_hash') != sug_hash:
-                continue
-            if str(task.get('status', '')) == 'cancelled':
-                continue
-            tid = str(task.get('id', ''))
-            if not tid:
-                continue
+            return R4Verdict()
+        if verdict.hit is not None:
             logger.warning(
-                'r4: idempotency hit — returning existing task %s for '
+                'r4: idempotency hit — returning existing task %s (%s) for '
                 'escalation_id=%s suggestion_hash=%s',
-                tid,
-                esc_id,
-                sug_hash,
+                verdict.hit.task_id,
+                verdict.match,
+                meta.get('escalation_id'),
+                meta.get('suggestion_hash'),
             )
-            return (
-                {
-                    'id': tid,
-                    'title': str(task.get('title', '')),
-                    'deduplicated': True,
-                    'action': 'idempotency_hit',
-                    'reason': 'escalation+suggestion matched',
-                },
-                False,
-            )
-        return (None, False)
+        return verdict
 
     async def submit_task(
         self, project_root: str, *, agent_id: str | None = None, **kwargs: Any
@@ -4110,6 +4187,15 @@ class TaskInterceptor:
             kwargs.pop('routing_override_reason', '') or ''
         ).strip()
 
+        # First, so no reader of this submission on either creation path, the path guard's
+        # candidate included, sees a caller-sent follow-up key (plans/follow-up-filing-shape-prd.md
+        # §3 decision 3).
+        if 'metadata' in kwargs:
+            try:
+                kwargs['metadata'] = _with_derived_bundle_keys(kwargs['metadata'])
+            except FollowupBundleInvalid as exc:
+                return FollowupItemsRefusedError(exc).to_error_dict()
+
         # Path-scope guard: reject before persisting if the candidate references
         # paths owned by another project.  The guard runs for every project
         # (including dark_factory) against the always-present prefix registry
@@ -4126,6 +4212,8 @@ class TaskInterceptor:
         incoming_metadata = coerce_task_metadata(metadata)
         if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
+        if (violation := stamp_violation({}, incoming_metadata or {}, replace=False)) is not None:
+            return DeclaredScopeWriteAuthorityError(None, violation).to_error_dict()
         # Before the planning_mode split, so both creation paths refuse
         # synchronously, before a ticket or a row is written.
         try:
@@ -4151,6 +4239,7 @@ class TaskInterceptor:
         # which is a different mechanism, not this declared-tag coercion.
         metadata = inject_operational_routing(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
+        metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
@@ -4521,7 +4610,7 @@ class TaskInterceptor:
 
         One worker per project_id so a slow LLM on project A does not delay
         add_task traffic on project B.  Within a project, tickets are still
-        serialised (one curator.curate() at a time).
+        serialised (one curator.curate_prepared() batch at a time).
 
         Workers are intentionally NOT added to ``_background_tasks``: they are
         long-running infinite-loop tasks.  Adding them would cause ``drain()``
@@ -4706,10 +4795,10 @@ class TaskInterceptor:
         ``failed`` and waiters are signalled before returning ``None``.
 
         Returns a populated :class:`_PreparedTicket` for valid tickets.
-        ``prepared`` is ``None`` when the ticket has no title (curator cannot
-        judge it) or the curator instance is not yet available — the
-        downstream dispatch path treats those the same way the legacy
-        ``candidate is None`` branch did.
+        ``prepared`` is ``None`` only when the ticket has no title (the
+        curator cannot judge it) or there is no curator yet. A
+        ``prepare_candidate`` that raises yields
+        :meth:`PreparedCandidate.corpus_failed`, which the pipeline defers.
         """
         if self._ticket_store is None:
             return None
@@ -4757,22 +4846,10 @@ class TaskInterceptor:
         if candidate is not None:
             curator = await self._get_curator()
             if curator is not None:
-                try:
-                    prepared = await curator.prepare_candidate(
-                        candidate,
-                        project_id,
-                        project_root,
-                    )
-                except Exception:
-                    # prepare_candidate already swallows corpus-build failure
-                    # to an empty pool; an exception here is unexpected.
-                    # Continue with prepared=None — dispatch falls through
-                    # to a per-ticket curate() call inside
-                    # _process_add_tickets_batch_prepared.
-                    logger.exception(
-                        '_prepare_ticket: curator.prepare_candidate failed for ticket %s',
-                        ticket_id,
-                    )
+                prepared = await _prepare_bundle(
+                    curator, candidate,
+                    ticket_id=ticket_id, project_id=project_id, project_root=project_root,
+                )
 
         return _PreparedTicket(
             ticket_id=ticket_id,
@@ -4796,11 +4873,10 @@ class TaskInterceptor:
         kwargs: dict,
         metadata: Any,
         curator: Any,  # TaskCurator | None
-        curator_degrade_reason: str | None = None,
-    ) -> tuple[str, str | None, str | None, dict | None, str | None]:
+    ) -> tuple[str, str | None, str | None, dict | None]:
         """Execute the refuse/defer/drop/combine/create dispatch for one curator decision.
 
-        Returns (status, task_id, reason, result_dict, curator_degrade_reason).
+        Returns (status, task_id, reason, result_dict).
         A ``defer`` returns ``TicketStatus.AWAITING_CURATION`` and creates nothing.
         Does NOT persist, signal, journal, or commit — the caller does, via
         :meth:`_persist_worker_outcome`.
@@ -4842,12 +4918,11 @@ class TaskInterceptor:
                 None,
                 f'refused (no task created): {decision.justification}',
                 result_dict,
-                None,
             )
 
         if decision is not None and decision.action == 'defer':
             logger.info('ticket %s: curation deferred, parking it: %s', ticket_id, decision.justification)
-            return (TicketStatus.AWAITING_CURATION, None, decision.justification, None, None)
+            return (TicketStatus.AWAITING_CURATION, None, decision.justification, None)
 
         if decision is not None and decision.action == 'drop' and decision.target_id:
             # Drop: fold candidate into the existing target task (status='combined').
@@ -4864,10 +4939,12 @@ class TaskInterceptor:
                 decision.target_id,
                 f'drop: {decision.justification}',
                 result_dict,
-                None,
             )
 
-        if decision is not None and decision.action == 'combine' and decision.target_id:
+        if (
+            decision is not None and decision.action == 'combine' and decision.target_id
+            and candidate is not None
+        ):
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
@@ -4876,7 +4953,8 @@ class TaskInterceptor:
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
-                    project_root, decision, candidate_metadata=metadata,
+                    project_root, decision,
+                    candidate=candidate, ticket_id=ticket_id, candidate_metadata=metadata,
                 )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
@@ -4907,7 +4985,6 @@ class TaskInterceptor:
                     decision.target_id,
                     f'combine: {decision.justification}',
                     result_dict,
-                    None,
                 )
             # combine failed → fall through to create
 
@@ -4976,7 +5053,6 @@ class TaskInterceptor:
                     existing_id,
                     'candidate_key_collision',
                     result_dict,
-                    curator_degrade_reason,
                 )
 
             # The task backend's add_task is contractually guaranteed to return
@@ -4991,8 +5067,6 @@ class TaskInterceptor:
             status = TicketStatus.CREATED
             reason = _create_reason(decision, curator_unavailable=curator_unavailable)
             result_dict = dict(result)
-            if curator_degrade_reason is not None:
-                result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
 
             if metadata_json and task_id_str and not atomic_metadata_written:
                 try:
@@ -5009,8 +5083,8 @@ class TaskInterceptor:
                     )
 
             # note_created + record_task under curator_lock + write_lock
-            # (R3 invariant): by holding curator_lock across curate() →
-            # note_created, concurrent curator calls cannot race on a stale
+            # (R3 invariant): by holding curator_lock across curate_prepared()
+            # → note_created, concurrent curator calls cannot race on a stale
             # in-memory snapshot.
             # Each is wrapped independently: a failure appends to
             # post_create_warnings and is logged, but does NOT flip status.
@@ -5059,7 +5133,7 @@ class TaskInterceptor:
                 result_dict=result_dict,
             )
 
-        return (status, task_id, reason, result_dict, curator_degrade_reason)
+        return (status, task_id, reason, result_dict)
 
     async def _flag_zot_duplicate(
         self,
@@ -5248,7 +5322,7 @@ class TaskInterceptor:
     ) -> None:
         """Run the full curator + write pipeline for a batch of pre-prepared tickets.
 
-        Calls :meth:`TaskCurator.curate_batch_prepared` once for all candidates
+        Calls :meth:`TaskCurator.curate_prepared` once for all candidates
         (re-using the already-built corpus pools carried on each
         :class:`_PreparedTicket`), then dispatches each per-ticket decision
         under a single ``_curator_lock`` acquisition (R3 invariant).  All
@@ -5263,13 +5337,15 @@ class TaskInterceptor:
         Per-ticket failures are isolated: one ticket failing does not prevent
         other tickets from being processed.
 
-        A submission the curator could not judge parks ``awaiting_curation``,
+        ``curate_prepared`` returns one decision per bundle and raises only a
+        pool error (``POOL_UNAVAILABLE_ERRORS``) or ``CancelledError``: every
+        other curator failure is decided inside it. A pool error from the
+        curator's LLM call is decided there too, one defer per bundle, so the
+        pool arm here serves only a pool error raised elsewhere in the
+        pipeline, deferring every curatable ticket under the pool's reason. A
+        submission the curator could not judge parks ``awaiting_curation``,
         and a within-batch drop onto a parked sibling parks with it; nothing
-        is created for them. That covers a ``defer`` decision, an account
-        pool that cannot serve raised from ``curate_batch_prepared``
-        (``POOL_UNAVAILABLE_ERRORS``), a :class:`CuratorFailureError` escaping
-        ``curate()`` other than a zero-output hang, and any other exception
-        ``curate_batch_prepared`` raises instead of deciding.
+        is created for them.
         """
         if self._ticket_store is None:
             return
@@ -5297,86 +5373,90 @@ class TaskInterceptor:
             curator = await self._get_curator()
 
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
-            # Tickets that match an existing non-cancelled task are resolved
-            # 'combined' immediately and excluded from the curate call.
+            # A ticket whose work a live task already carries resolves
+            # 'combined' onto it and is excluded from the curate call; one
+            # carrying some live items is filed with the rest. No task is
+            # written between these checks, so they share one R4Lookup and
+            # its single scan of the live follow-up items.
+            r4_lookup = None if self.taskmaster is None else R4Lookup(self.taskmaster)
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                # _idem_check_failed is intentionally unused today: both
-                # check_failed=True and check_failed=False with hit=None fall
-                # through to CREATE — retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=t.project_root,
-                        metadata=t.metadata,
-                    )
+                verdict = await self._check_escalation_idempotency(
+                    lookup=r4_lookup,
+                    project_root=t.project_root,
+                    metadata=t.metadata,
                 )
-                if idempotency_hit is not None:
-                    existing_id = str(idempotency_hit.get('id', ''))
+                if verdict.hit is not None:
                     await self._persist_worker_terminal(
                         t.ticket_id,
                         status=TicketStatus.COMBINED,
-                        task_id=existing_id or None,
+                        task_id=str(verdict.hit.task_id),
                         reason='idempotency_hit',
-                        result_dict=idempotency_hit,
+                        result_dict=verdict.hit_result(),
                         caller='add_tickets_batch_idempotency',
                         project_root=t.project_root,
                         attribution=t.attribution,
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
-                    # check_failed=True (get_tasks raised) → fall through to
-                    # CREATE; WARNING already emitted at source.
-                    active_ticket_data.append(t)
+                    active_ticket_data.append(t.keeping(verdict) if verdict.partial else t)
             ticket_data = active_ticket_data
 
             if not ticket_data:
                 return  # All tickets short-circuited by idempotency
 
             # Build one lifecycle record per active ticket — the single
-            # source of truth for that ticket's decision, degrade reason,
-            # within-batch-drop target, and resolved terminal.  Replaces the
+            # source of truth for that ticket's decision, within-batch-drop
+            # target, and resolved terminal.  Replaces the
             # historical non_none-space / ticket_data-space parallel arrays
             # entirely (see _TicketLifecycle docstring).
             records: list[_TicketLifecycle] = [
                 _TicketLifecycle(ticket=t) for t in ticket_data
             ]
 
-            # Curatable slice: records whose ticket has both a candidate and
-            # a prepared bundle.  We pass the already-prepared bundles so
-            # the curator skips the second corpus build it would otherwise
-            # do inside curate_batch.  Built as one fused loop (rather than
-            # two separately-filtered comprehensions) so curatable_records
-            # and non_none_prepared are guaranteed index-aligned — the
-            # invariant curate_batch_prepared's positional response relies
-            # on — and so prepared's None-check narrows for the type
-            # checker at the point of use.
+            # Curatable slice: every record whose ticket has a candidate, while
+            # a curator exists. A ticket prepared before the curator could be
+            # built gets its bundle now. Built as one fused loop so
+            # curatable_records and curatable_bundles stay index-aligned — the
+            # invariant curate_prepared's positional response relies on.
             curatable_records: list[_TicketLifecycle] = []
-            non_none_prepared: list[PreparedCandidate] = []
-            for r in records:
-                if r.ticket.candidate is not None and r.ticket.prepared is not None:
+            curatable_bundles: list[PreparedCandidate] = []
+            if curator is not None:
+                for r in records:
+                    candidate = r.ticket.candidate
+                    if candidate is None:
+                        continue
+                    bundle = r.ticket.prepared
+                    if bundle is None:
+                        bundle = await _prepare_bundle(
+                            curator, candidate,
+                            ticket_id=r.ticket.ticket_id, project_id=project_id,
+                            project_root=project_root,
+                        )
                     curatable_records.append(r)
-                    non_none_prepared.append(r.ticket.prepared)
-            # Records that have a candidate but no prepared bundle — usually
-            # because :meth:`_prepare_ticket` could not invoke
-            # ``prepare_candidate`` (transient error, or a mock without the
-            # method during tests).  These are dispatched via single-item
-            # ``curate()`` after the main batch so we still get the curator's
-            # decision for them instead of falling straight through to
-            # ``tm.add_task`` (the latter would silently bypass the gate).
-            unprepared_records: list[_TicketLifecycle] = [
-                r
-                for r in records
-                if r.ticket.candidate is not None and r.ticket.prepared is None
-            ]
+                    curatable_bundles.append(bundle)
 
-            # Call curate_batch_prepared — one LLM round-trip for all candidates.
-            if curator is not None and non_none_prepared:
+            # One pipeline for the whole slice. curate_prepared returns one
+            # decision per bundle and raises only a pool error or
+            # CancelledError; every other curator failure is already decided.
+            if curator is not None and curatable_bundles:
                 try:
-                    batch_decisions = await curator.curate_batch_prepared(
-                        non_none_prepared,
+                    batch_decisions = await curator.curate_prepared(
+                        curatable_bundles,
                         project_id,
                         project_root,
                     )
+                    if len(batch_decisions) != len(curatable_records):
+                        logger.error(
+                            '_process_add_tickets_batch_prepared: curate_prepared '
+                            'returned %d decision(s) for %d bundle(s) of project %s; '
+                            'deferring every one of them',
+                            len(batch_decisions), len(curatable_records), project_id,
+                        )
+                        batch_decisions = [
+                            CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
+                            for _ in curatable_records
+                        ]
                     # Attach each returned decision to its record and resolve
                     # batch_target_index — a position WITHIN curatable_records
                     # (the slice the curator actually saw) — to a DIRECT
@@ -5384,11 +5464,8 @@ class TaskInterceptor:
                     # second index space: the topological dispatch below
                     # reads rec.target.task_id / rec.target.dispatched
                     # straight off the object.
-                    for idx, rec in enumerate(curatable_records):
-                        bd = (
-                            batch_decisions[idx] if idx < len(batch_decisions) else None
-                        )
-                        if bd is not None and bd.batch_target_index is not None:
+                    for rec, bd in zip(curatable_records, batch_decisions, strict=True):
+                        if bd.batch_target_index is not None:
                             local_bti = bd.batch_target_index
                             if 0 <= local_bti < len(curatable_records):
                                 rec.decision = bd
@@ -5424,77 +5501,6 @@ class TaskInterceptor:
                     for rec in curatable_records:
                         rec.decision = CuratorDecision.deferred(pool_defer_reason(exc))
                         rec.target = None
-                except CuratorFailureError as exc:
-                    # The bisecting fallback in curate_batch_prepared no
-                    # longer surfaces CuratorFailureError to the caller for
-                    # ordinary per-batch failures (it bisects all the way to
-                    # size-1, where curate() handles its own degrade).  But
-                    # keep this catch as a defensive net for any escape — same
-                    # legacy behaviour: degrade all candidates to a per-item
-                    # curate() call so per-ticket degrade_reason is still
-                    # recorded in result_json.
-                    logger.warning(
-                        '_process_add_tickets_batch_prepared: '
-                        'curate_batch_prepared raised CuratorFailureError '
-                        'for project %s; falling back to %d individual '
-                        'curate() calls: %s',
-                        project_id,
-                        len(non_none_prepared),
-                        exc,
-                    )
-                    # Iterate curatable_records only — unprepared_records are
-                    # curated exactly once by the dedicated backfill loop
-                    # below; including them here too would curate() them
-                    # twice and the backfill's result would silently clobber
-                    # whatever this fallback just recorded.  The None-check
-                    # is defensive (curatable_records already guarantees a
-                    # candidate) and narrows the type for the curate() call.
-                    for rec in curatable_records:
-                        if rec.ticket.candidate is None:
-                            continue
-                        try:
-                            rec.decision = await curator.curate(
-                                rec.ticket.candidate,
-                                project_id,
-                                project_root,
-                            )
-                        except CuratorFailureError as e:
-                            rec.decision, rec.degrade_reason = _decision_after_curator_failure(
-                                rec.ticket.ticket_id, e,
-                            )
-                except Exception:
-                    logger.exception(
-                        '_process_add_tickets_batch_prepared: '
-                        'curate_batch_prepared failed for project %s; '
-                        'deferring %d candidates',
-                        project_id,
-                        len(curatable_records),
-                    )
-                    for rec in curatable_records:
-                        rec.decision = CuratorDecision.deferred(DeferReason.CURATOR_RAISED)
-                        rec.target = None
-
-            # Backfill any unprepared candidates via single-item curate() so
-            # we still get a curator decision instead of falling through to
-            # tm.add_task on prepare failures.  In production prepare_candidate
-            # itself swallows corpus errors to an empty pool, so this loop is
-            # rarely hit.  In tests where the curator mock omits
-            # prepare_candidate, this restores the legacy curate-then-dispatch
-            # behaviour the tests rely on.
-            if curator is not None and unprepared_records:
-                for rec in unprepared_records:
-                    if rec.ticket.candidate is None:
-                        continue
-                    try:
-                        rec.decision = await curator.curate(
-                            rec.ticket.candidate,
-                            project_id,
-                            project_root,
-                        )
-                    except CuratorFailureError as exc:
-                        rec.decision, rec.degrade_reason = _decision_after_curator_failure(
-                            rec.ticket.ticket_id, exc,
-                        )
 
             # ── Topologically-ordered dispatch ────────────────────────────────
             # Records with a target wait for that target to be dispatched
@@ -5569,7 +5575,6 @@ class TaskInterceptor:
                             task_id,
                             reason,
                             result_dict,
-                            _,
                         ) = await self._dispatch_ticket_decision(
                             ticket_id=t.ticket_id,
                             project_root=t.project_root,
@@ -5579,7 +5584,6 @@ class TaskInterceptor:
                             kwargs=t.kwargs,
                             metadata=t.metadata,
                             curator=curator,
-                            curator_degrade_reason=rec.degrade_reason,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -5592,6 +5596,17 @@ class TaskInterceptor:
                         reason = str(exc)
                         task_id = None
                         result_dict = None
+
+                    if t.r4_dropped:
+                        result_dict = {
+                            **(result_dict or {}),
+                            'idempotency_dropped_items': [d.to_record() for d in t.r4_dropped],
+                        }
+                        logger.info(
+                            'r4: ticket %s filed without %d item(s) already live: %s',
+                            t.ticket_id, len(t.r4_dropped),
+                            ', '.join(f'{d.key}->{d.owner.task_id}' for d in t.r4_dropped),
+                        )
 
                     await self._persist_worker_outcome(
                         t.ticket_id,
@@ -5709,6 +5724,11 @@ class TaskInterceptor:
            project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
            (no ``success`` key).
+        4. ``_declared_scope_refusal`` — under the write lock, refuses any add, alter or
+           removal of ``metadata.declared_scope`` (an unchanged echo passes) with
+           ``DeclaredScopeWriteAuthorityError.to_error_dict()``. It is here, not in the
+           backend floor, to leave room for the ``basis='combine'`` re-stamp that task
+           8415 adds in ``_execute_combine``, which writes through the backend directly.
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
@@ -5829,6 +5849,9 @@ class TaskInterceptor:
                 ):
                     return err
 
+            if err := await self._declared_scope_refusal(tm, task_id, project_root, kwargs, before):
+                return err
+
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
                     'update_task',
@@ -5938,6 +5961,35 @@ class TaskInterceptor:
                     )
         await self._idempotency_record(client_op_id, 'update_task', result)
         return result
+
+    async def _declared_scope_refusal(
+        self,
+        tm: TaskBackendProtocol,
+        task_id: str,
+        project_root: str,
+        kwargs: Mapping[str, Any],
+        before: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The refusal for an update that would add, alter or remove ``metadata.declared_scope``.
+
+        Called under the write lock. The stored row is read only when the payload carries the key
+        or replaces the whole blob; a recon-stage write reuses its ``before`` read.
+        """
+        raw = kwargs.get('metadata')
+        payload = None if raw is None else coerce_task_metadata(raw)
+        if payload is None:
+            return None
+        replace = kwargs.get('metadata_mode') == 'replace'
+        if not replace and DECLARED_SCOPE_METADATA_KEY not in payload:
+            return None
+        row = before if before is not None else await tm.get_task(task_id, project_root, kwargs.get('tag'))
+        stored = coerce_task_metadata(row.get('metadata')) or {}
+        violation = stamp_violation(stored, payload, replace=replace)
+        if violation is None:
+            return None
+        return DeclaredScopeWriteAuthorityError(
+            task_id, violation, stored.get(DECLARED_SCOPE_METADATA_KEY),
+        ).to_error_dict()
 
     async def _with_bounded_audit_trail(
         self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,
@@ -6176,9 +6228,10 @@ class TaskInterceptor:
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
+        fields: Sequence[str] | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        return dict(await tm.get_tasks(project_root, tag, statuses=statuses))
+        return dict(await tm.get_tasks(project_root, tag, statuses=statuses, fields=fields))
 
     async def get_statuses(
         self,
@@ -7468,15 +7521,81 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
-# Refusal-reason vocabulary for the combine audit (task 4035). Three stable
+# Refusal-reason vocabulary for the combine audit (task 4035). Four stable
 # coarse tokens, deliberately NOT one per status: an operator greps these to
 # compute the refusal rate, while the record's own old.status field supplies
 # the per-status breakdown for free. A token per status would make this
 # vocabulary track the status enum and force a consumer update every time a
-# status is added. The third marks a target already dispatched into a branch.
+# status is added. The third marks a target already dispatched into a branch;
+# the fourth a follow-up holder, which is pending forever and never a target.
 COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
 COMBINE_REFUSED_CLAIMED = 'target_claimed'
 COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
+COMBINE_REFUSED_HOLDER = 'target_is_holder'
+
+
+@dataclasses.dataclass(frozen=True)
+class _CombineAuditContext:
+    """What one combine folded and on whose behalf: the audit's candidate and item fields."""
+
+    candidate_ticket_id: str
+    candidate_source: str | None
+    candidate_spawned_from: str | None
+    batch_internal: bool
+    items_before: tuple[str, ...]
+    items_after: tuple[str, ...]
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            'candidate_ticket_id': self.candidate_ticket_id,
+            'candidate_source': self.candidate_source,
+            'candidate_spawned_from': self.candidate_spawned_from,
+            'batch_internal': self.batch_internal,
+            'items_before': list(self.items_before),
+            'items_after': list(self.items_after),
+        }
+
+
+def _combine_fold(
+    decision: CuratorDecision,
+    *,
+    ticket_id: str,
+    target_title: str,
+    target_meta: Mapping[str, Any],
+    candidate: CandidateTask,
+    candidate_meta: Mapping[str, Any],
+) -> tuple[_CombineAuditContext, tuple[FollowupItem, ...] | None]:
+    """What a combine folds: its audit context, and the union of items it leaves on the target.
+
+    The union is None when a stored bundle on either side is malformed, logged here: no combine
+    can keep every item, and the context then records no items, so a refusal is still auditable.
+    """
+    items_after: tuple[FollowupItem, ...] | None
+    try:
+        items_before = task_items(
+            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
+        )
+        extra = task_items(
+            title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta,
+        )
+        items_after = merge_items(items_before, extra)
+    except FollowupBundleInvalid as exc:
+        logger.warning(
+            'combine-guard: a follow-up bundle on target=%s or its candidate is malformed (%s)',
+            decision.target_id,
+            exc,
+        )
+        items_before, items_after = (), None
+    candidate_source = candidate_meta.get('source')
+    context = _CombineAuditContext(
+        candidate_ticket_id=ticket_id,
+        candidate_source=candidate_source if isinstance(candidate_source, str) else None,
+        candidate_spawned_from=candidate.spawned_from,
+        batch_internal=decision.batch_target_index is not None,
+        items_before=tuple(item.key for item in items_before),
+        items_after=tuple(item.key for item in items_after or ()),
+    )
+    return context, items_after
 
 
 def _append_combine_audit(
@@ -7489,14 +7608,15 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    context: _CombineAuditContext,
     refused_reason: str | None = None,
 ) -> None:
     """Append a one-line JSON record documenting a combine.
 
     Records both about-to-happen combines (``refused_reason=None``) and
     REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
-    success records alone. When *refused_reason* is None the emitted record is
-    byte-for-byte the historical shape, so existing records stay parseable and
+    success records alone. The historical keys keep their shape, so existing
+    records stay parseable; *context* adds the candidate and item fields, and
     ``rec.get('refused_reason')`` cleanly partitions refusal from success.
 
     The ``new`` block is populated on a refusal too: it records the title and
@@ -7522,6 +7642,7 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    record.update(context.to_record())
     if refused_reason is not None:
         record['refused_reason'] = refused_reason
     path = _combine_audit_path()

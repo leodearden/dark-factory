@@ -799,3 +799,20 @@ class TestTaskConfigDirCleanupAtExit:
             TaskConfigDir('probe-personal', base_dir=tmp_path, cleanup_at_exit=True)
 
         assert register.call_count == 2
+
+
+class TestRemoveCredentials:
+    def test_removes_the_token_and_keeps_the_rest(self, tmp_path):
+        config_dir = TaskConfigDir('creds', base_dir=tmp_path)
+        config_dir.write_credentials('tok')
+        transcript = config_dir.path / 'projects' / 'p' / 's.jsonl'
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{}')
+
+        config_dir.remove_credentials()
+
+        assert not (config_dir.path / '.credentials.json').exists()
+        assert transcript.exists()
+
+    def test_is_a_no_op_without_credentials(self, tmp_path):
+        TaskConfigDir('creds', base_dir=tmp_path).remove_credentials()

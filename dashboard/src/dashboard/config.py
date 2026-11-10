@@ -118,7 +118,7 @@ def _read_escalation_url(yaml_path: Path) -> str | None:
     return f'http://{host}:{port}/mcp'
 
 
-def _discover_root_escalation_url(root: Path) -> str | None:
+def discover_root_escalation_url(root: Path) -> str | None:
     """Resolve *root*'s escalation MCP URL, preferring the canonical config name.
 
     If ``_CANONICAL_CONFIG_NAME`` exists on disk, it is authoritative: its
@@ -155,7 +155,7 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     Keyed by each root's project label, unique across *roots* (see
     ``dashboard/project_labels.py::ProjectLabels``). Prefers the
     canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
-    spellings (see ``_discover_root_escalation_url``). A root that yields no
+    spellings (see ``discover_root_escalation_url``). A root that yields no
     URL at all — no config found under any spelling, or a config found with
     no ``escalation.port`` — logs a WARNING naming the root, rather than
     degrading silently.
@@ -171,7 +171,7 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     labels = ProjectLabels.of_roots(roots)
     out: dict[str, str] = {}
     for root in roots:
-        url = _discover_root_escalation_url(root)
+        url = discover_root_escalation_url(root)
         if url is None:
             logger.warning(
                 'No escalation URL discovered for project root %s '
@@ -337,6 +337,10 @@ class DashboardConfig:
     @property
     def metrics_db(self) -> Path:
         return self.project_root / 'data' / 'burndown' / 'metrics.db'
+
+    @property
+    def quality_db(self) -> Path:
+        return self.project_root / 'data' / 'burndown' / 'quality.db'
 
     @property
     def load_samples_db(self) -> Path:

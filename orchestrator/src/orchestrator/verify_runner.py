@@ -66,6 +66,7 @@ from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
     SHIM_REMEDY,
@@ -122,6 +123,10 @@ __all__ = [
     "RemoteRunner",
     "RemoteVerifySubcommand",
     "REMOTE_VERIFY_PROCESS_PATTERN",
+    "remote_verify_process_pattern",
+    "CANCEL_PROBE_ATTEMPTS",
+    "CANCEL_PROBE_INTERVAL_SECS",
+    "poll_until_clean",
     "RunnerUnavailable",
     "RunnerUnavailableKind",
     "ConcurrentDispatchError",
@@ -1112,6 +1117,9 @@ async def env_probe_local_run(
 #: reused descriptor.
 HEARTBEAT_STOP_JOIN_SECS: float = 5.0
 
+#: Pause before ``RemoteRunner.publish_sha``'s one retry of a refused publish.
+_PUBLISH_RETRY_DELAY_SECS: float = 1.0
+
 
 async def _default_ssh_heartbeat_run(
     argv: list[str],
@@ -1242,6 +1250,43 @@ async def _default_ssh_heartbeat_run(
 RemoteVerifySubcommand = Literal['verify-merge', 'verify-task']
 # The single home of the remote verify process pattern.
 REMOTE_VERIFY_PROCESS_PATTERN: str = '|'.join(get_args(RemoteVerifySubcommand))
+
+
+def remote_verify_process_pattern(request_id: str) -> str:
+    """The pgrep pattern of request *request_id*'s remote verify, of either subcommand.
+
+    The subcommand alternation keeps a ``cancel-verify --request-id <id>`` from
+    matching, and the ``)`` after it keeps the probing command line from matching
+    itself.  The id must end at a space or the line's end, so no id matches a
+    longer one it prefixes.  A dispatch puts ``--request-id`` ahead of the
+    unbounded ``--spec`` JSON, so the id lies inside the first 4096 bytes of the
+    command line that procps 3.3's ``pgrep -f`` reads.
+    """
+    return f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id {request_id}( |$)'
+
+
+CANCEL_PROBE_ATTEMPTS = 10
+CANCEL_PROBE_INTERVAL_SECS = 1.0
+
+
+async def poll_until_clean(
+    probe: Callable[[], Awaitable[bool]],
+    *,
+    attempts: int = CANCEL_PROBE_ATTEMPTS,
+    interval: float = CANCEL_PROBE_INTERVAL_SECS,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> bool:
+    """Await *probe* up to *attempts* times, *interval* apart, until it reads clean.
+
+    The one cancel-probe policy, for a failed cancel's merge PARK and its task
+    bench alike.  No sleep follows the last probe.
+    """
+    for attempt in range(attempts):
+        if await probe():
+            return True
+        if attempt < attempts - 1:
+            await sleep(interval)
+    return False
 
 
 @dataclass(frozen=True)
@@ -1494,12 +1539,26 @@ class RemoteRunner:
         the gates are cloned from whatever this runner's project remote is, and
         it delivers a sha origin has never seen.  Near-free when the remote
         already holds the objects.
+
+        ensure-gate.sh deletes ``refs/gate/<sha>`` after every ensure, so two
+        roles publishing one sha collide on ``cannot lock ref`` (classed gate).
+        A non-transport failure is retried once: the retry finds the ref present
+        or absent, and a real refusal fails twice.
         """
         sha = self.deployed_sha.sha
-        await self._push(
-            f'{self._ssh_host}:{self._df_remote_checkout}', f'{sha}:refs/gate/{sha}',
-            cwd=self._code_checkout,
-        )
+        target = f'{self._ssh_host}:{self._df_remote_checkout}'
+        refspec = f'{sha}:refs/gate/{sha}'
+        try:
+            await self._push(target, refspec, cwd=self._code_checkout)
+        except RunnerUnavailable as exc:
+            if exc.kind == 'transport':
+                raise
+            logger.info(
+                'RemoteRunner %r: publish of gate sha %s refused, retrying once: %s',
+                self.name, sha, exc,
+            )
+            await asyncio.sleep(_PUBLISH_RETRY_DELAY_SECS)
+            await self._push(target, refspec, cwd=self._code_checkout)
 
     async def reap_idle_gates(self) -> None:
         """Launch ``remote_gate/reap-gates.sh`` detached on the remote; never raises.
@@ -1523,23 +1582,25 @@ class RemoteRunner:
                 'RemoteRunner %r: gate reaper launch exited %d: %s', self.name, rc, stderr,
             )
 
-    async def _push(self, target: str, refspec: str, *, cwd: str | Path) -> None:
-        """``git push <target> <refspec>`` over the bounded ssh transport, or raise RunnerUnavailable.
+    async def _push(self, target: str, *push_args: str, cwd: str | Path) -> None:
+        """``git push <target> <push_args...>`` over the bounded ssh transport, or raise RunnerUnavailable.
 
-        A failure is classed on the push channel.  The ssh options make an
-        unreachable or lost host fail within about a minute with an ssh client
-        line ('transport'), so a push still running after
-        ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to a host whose
-        receive-pack or hook hung: 'gate', as for ensure-gate's own timeout.
+        Every RemoteRunner push goes through here.  A failure is classed on the
+        push channel.  The ssh options make an unreachable or lost host fail
+        within about a minute with an ssh client line ('transport'), so a push
+        still running after ``ENSURE_CLIENT_TIMEOUT_SECS`` has a live session to
+        a host whose receive-pack or hook hung: 'gate', as for ensure-gate's own
+        timeout.
         """
-        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, refspec]
+        argv = ['git', *GIT_PUSH_SSH_CONFIG, 'push', target, *push_args]
+        pushed = ' '.join(push_args)
         try:
             async with asyncio.timeout(ENSURE_CLIENT_TIMEOUT_SECS):
                 rc, _, stderr = await self._run(argv, cwd=cwd)
         except TimeoutError as exc:
             # BEFORE the OSError clause: TimeoutError subclasses OSError.
             raise RunnerUnavailable(
-                f'git push {target} {refspec} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
+                f'git push {target} {pushed} exceeded {ENSURE_CLIENT_TIMEOUT_SECS}s '
                 'on a reached host',
                 kind='gate',
             ) from exc
@@ -1549,7 +1610,7 @@ class RemoteRunner:
             ) from exc
         if rc != 0:
             raise RunnerUnavailable(
-                f'git push {target} {refspec} failed (rc={rc}): {stderr}',
+                f'git push {target} {pushed} failed (rc={rc}): {stderr}',
                 kind=classify_remote_exit(rc, stderr, channel='git_push'),
             )
 
@@ -1741,87 +1802,60 @@ class RemoteRunner:
     async def _push_main_mirror(self, *, task_id: str | None, event_store: Any) -> None:
         """Step 0 (best-effort): push main FIRST so the remote has a fresh view of it.
 
-        A non-zero rc or OSError is logged at WARNING and swallowed — a
-        non-fast-forward must not abort the verify.
+        Every failure is logged at WARNING and swallowed — a non-fast-forward
+        must not abort the verify.  Both pushes go through :meth:`_push`, so they
+        share its bounded ssh transport and deadline.
 
         β dedup: resolve the local main tip via `git rev-parse` (network-free).
         When the resolved sha matches _last_pushed_main_sha the push is skipped —
         the remote already has this main sha, so the push is redundant.
-        """
-        if self._main_branch:
-            # Resolve local main tip (network-free)
-            resolved_main_sha: str | None = None
-            try:
-                rev_rc, rev_stdout, _ = await self._run(
-                    ['git', 'rev-parse', self._main_branch],
-                    cwd=self._cwd,
-                )
-                if rev_rc == 0:
-                    resolved_main_sha = rev_stdout.strip() or None
-            except OSError:
-                pass  # rev-parse failed; push unconditionally below
 
-            # Skip push when sha is unchanged (dedup)
-            if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
-                try:
-                    main_rc, _, main_stderr = await self._run(
-                        ['git', 'push', self._git_remote,
-                         f'{self._main_branch}:refs/heads/{self._main_branch}'],
-                        cwd=self._cwd,
-                    )
-                    if main_rc == 0:
-                        if resolved_main_sha is not None:
-                            self._last_pushed_main_sha = resolved_main_sha
-                    else:
-                        # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
-                        # main push was rejected (typically non-fast-forward —
-                        # the remote PROJECT main diverged, e.g. the laptop
-                        # reify main since 07-20).  Retry ONCE with a force
-                        # refspec to restore mirror semantics.  The FF fast
-                        # path above is preserved — a force is attempted ONLY
-                        # on FF failure, so a healthy remote never sees one and
-                        # the divergence signal is not silently dropped.
-                        force_rc, _, force_stderr = await self._run(
-                            ['git', 'push', self._git_remote,
-                             f'+{self._main_branch}:refs/heads/{self._main_branch}'],
-                            cwd=self._cwd,
-                        )
-                        if force_rc == 0:
-                            prior_main_sha = self._last_pushed_main_sha
-                            if resolved_main_sha is not None:
-                                self._last_pushed_main_sha = resolved_main_sha
-                            if event_store is not None:
-                                from orchestrator.event_store import EventType
-                                event_store.emit(
-                                    EventType.runner_synced,
-                                    task_id=task_id,
-                                    data={
-                                        'runner': self.name,
-                                        'kind': 'project_main_mirror',
-                                        'from_head': prior_main_sha,
-                                        'to_head': resolved_main_sha,
-                                        'forced': True,
-                                    },
-                                )
-                        else:
-                            # Force ALSO failed — keep today's best-effort
-                            # WARNING+swallow (the merge-sha push stays the
-                            # load-bearing transport; a non-fatal main push
-                            # must never abort the verify).
-                            import logging as _logging
-                            _logging.getLogger(__name__).warning(
-                                'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
-                                self.name, self._main_branch, self._git_remote,
-                                main_rc, main_stderr, force_rc, force_stderr,
-                            )
-                except OSError as exc:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        'RemoteRunner %r: best-effort main push failed with OSError: %s'
-                        ' — continuing',
-                        self.name, exc,
-                    )
+        INV-2 mirror semantics (task 2884, PRD §3.1): a rejected fast-forward
+        (typically the remote PROJECT main diverged) is retried ONCE with a force
+        refspec, and a forced success emits runner_synced(kind='project_main_mirror').
+        A healthy remote never sees a force, so the divergence signal is not
+        silently dropped.
+        """
+        main_branch = self._main_branch
+        if not main_branch:
+            return
+        resolved_main_sha = await self._local_branch_sha(main_branch)
+        if resolved_main_sha is not None and resolved_main_sha == self._last_pushed_main_sha:
+            return
+        refspec = f'{main_branch}:refs/heads/{main_branch}'
+        try:
+            await self._push(self._git_remote, refspec, cwd=self._cwd)
+            forced = False
+        except RunnerUnavailable as ff_failure:
+            try:
+                await self._push(self._git_remote, f'+{refspec}', cwd=self._cwd)
+            except RunnerUnavailable as force_failure:
+                logger.warning(
+                    'RemoteRunner %r: best-effort main push of %r to %r failed '
+                    '(FF: %s; force: %s) — continuing with merge-sha push',
+                    self.name, main_branch, self._git_remote, ff_failure, force_failure,
+                )
+                return
+            forced = True
+        prior_main_sha = self._last_pushed_main_sha
+        if resolved_main_sha is not None:
+            self._last_pushed_main_sha = resolved_main_sha
+        if forced and event_store is not None:
+            event_store.emit(EventType.runner_synced, task_id=task_id, data={
+                'runner': self.name,
+                'kind': 'project_main_mirror',
+                'from_head': prior_main_sha,
+                'to_head': resolved_main_sha,
+                'forced': True,
+            })
+
+    async def _local_branch_sha(self, branch: str) -> str | None:
+        """*branch*'s local tip by a network-free ``git rev-parse``, or None when unreadable."""
+        try:
+            rc, stdout, _ = await self._run(['git', 'rev-parse', branch], cwd=self._cwd)
+        except OSError:
+            return None
+        return (stdout.strip() or None) if rc == 0 else None
 
     async def _dispatch(
         self,
@@ -1868,10 +1902,7 @@ class RemoteRunner:
             finally:
                 # Best-effort ref cleanup — never alters returned result nor masks exceptions
                 with contextlib.suppress(Exception):
-                    await self._run(
-                        ['git', 'push', self._git_remote, '--delete', ref],
-                        cwd=self._cwd,
-                    )
+                    await self._push(self._git_remote, '--delete', ref, cwd=self._cwd)
         finally:
             self._inflight_request_id = None
             self._verify_started_request_id = None
@@ -1879,10 +1910,9 @@ class RemoteRunner:
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
     ) -> _DispatchOutcome:
-        # --request-id is APPENDED, after the optional --config.
         remote_cmd = self._gate_command([
-            subcommand, '--sha', sha, '--spec', spec_json, *self._config_args(),
-            '--request-id', request_id,
+            subcommand, '--sha', sha, '--request-id', request_id,
+            '--spec', spec_json, *self._config_args(),
         ])
         if request_id == self._cancelled_request_id:
             raise RunnerUnavailable(
@@ -2166,22 +2196,21 @@ class RemoteRunner:
             return 1  # non-zero → caller treats as cancel failure
 
     async def probe_clean(self) -> bool:
-        """Probe whether any remote verify (any RemoteVerifySubcommand) is still running.
+        """Probe whether the request this runner last cancelled still runs on its host.
 
-        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f 'verify-merge|verify-task'
-        (REMOTE_VERIFY_PROCESS_PATTERN, quoted: '|' is a remote-shell metacharacter)
-
-        Returns:
-            True  — rc == 1 (pgrep found no match; host is clean)
-            False — rc == 0 (process still running) or rc >= 2 (error / ssh failure)
-                    Conservative: any non-1 rc keeps the slot PARKED.
+        Only that request is probed (``remote_verify_process_pattern``), so a
+        PARKED merge slot clears while a sibling task verify or another
+        project's verify runs there; with nothing cancelled there is nothing to
+        probe and no ssh is issued. Clean only when pgrep finds no match (rc 1):
+        any other rc, or an ssh failure, keeps the slot PARKED.
         """
+        request_id = self._cancelled_request_id
+        if request_id is None:
+            return True
+        pattern = remote_verify_process_pattern(request_id)
         try:
             rc, _, _ = await self._run(
-                [
-                    'ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                    f'pgrep -f {shlex.quote(REMOTE_VERIFY_PROCESS_PATTERN)}',
-                ]
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, f'pgrep -f {shlex.quote(pattern)}'],
             )
             return rc == 1
         except Exception:
@@ -2502,6 +2531,7 @@ class VerifyRunnerPool:
         speculative: bool | None = None,
         chain_items: int = 1,
         chain_build_ms: int | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -2556,6 +2586,12 @@ class VerifyRunnerPool:
         ``merge_verify`` doc-comment in ``event_store.py`` for the full field
         note.
 
+        ``dispatch_facts`` (task 8523) supplies ``runner_reason`` and
+        ``base_relation``; both keys are always present, None when the caller
+        reported no allocation decision.  A RunnerUnavailable fallback to
+        local reports ``remote_quarantined``.  Vocabulary:
+        ``orchestrator/merge_verify_facts.py``.
+
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch reports it to the pool's *on_unavailable*
         sink and falls back to the local runner (if distinct), logging exactly
@@ -2602,6 +2638,10 @@ class VerifyRunnerPool:
                 # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
+                dispatch_facts = dataclasses.replace(
+                    dispatch_facts or MergeVerifyDispatchFacts(),
+                    runner_reason=RunnerReason.REMOTE_QUARANTINED,
+                )
             else:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
@@ -2660,6 +2700,7 @@ class VerifyRunnerPool:
                     # dispatch()'s docstring for why the default is 1.
                     'chain_items': chain_items,
                     'chain_build_ms': chain_build_ms,
+                    **(dispatch_facts or MergeVerifyDispatchFacts()).event_fields(),
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
@@ -4096,11 +4137,18 @@ class HostLease:
     name      : host name (matches RemoteRunner.name, or 'local' for the local slot)
     runner    : the VerifyRunner instance assigned to this slot
     is_local  : True when name == 'local' (LocalRunner)
+    reason    : why :meth:`HostAllocator.acquire` granted this host; None for a
+                lease taken by ``acquire_local``/``acquire_remote`` directly
     """
 
     name: str
     runner: Any
     is_local: bool
+    reason: RunnerReason | None = None
+
+
+def _with_reason(lease: HostLease | None, reason: RunnerReason) -> HostLease | None:
+    return None if lease is None else dataclasses.replace(lease, reason=reason)
 
 
 class HostAllocator:
@@ -4223,18 +4271,32 @@ class HostAllocator:
         Eligibility is NOT re-checked here: acquire_remote() already demands a
         FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
         PARKED remote falls through to local on its own.
+
+        The returned lease's ``reason`` records the decision as a
+        :class:`~orchestrator.merge_verify_facts.RunnerReason`.
         """
         match policy:
             case 'prefer_local':
                 local = self.acquire_local(local_factory)
-                return local if local is not None else self.acquire_remote()
+                if local is not None:
+                    return _with_reason(local, RunnerReason.PREFER_LOCAL_FREE)
+                return _with_reason(self.acquire_remote(), RunnerReason.LOCAL_BUSY)
             case 'prefer_remote':
                 remote = self.acquire_remote()
                 if remote is not None:
-                    return remote
-                return self.acquire_local(local_factory)
+                    return _with_reason(remote, RunnerReason.PREFER_REMOTE_FREE)
+                fallback_reason = self._local_fallback_reason()
+                return _with_reason(self.acquire_local(local_factory), fallback_reason)
             case _:
                 assert_never(policy)
+
+    def _local_fallback_reason(self) -> RunnerReason:
+        """Why no remote was taken; read before local is, so slot state is current."""
+        if not self._remote_runners:
+            return RunnerReason.LOCAL_ONLY_RULE
+        if any(self._slots[name] == _SLOT_BUSY for name in self._remote_runners):
+            return RunnerReason.REMOTE_BUSY
+        return RunnerReason.REMOTE_QUARANTINED
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""
@@ -4505,7 +4567,7 @@ class HostAllocator:
         lease: HostLease | None,
         *,
         sleep: Any | None = None,
-        max_attempts: int = 10,
+        max_attempts: int = CANCEL_PROBE_ATTEMPTS,
     ) -> bool:
         """Cancel an in-flight verify and release the slot.
 
@@ -4587,16 +4649,12 @@ class HostAllocator:
         # Cancel failed: PARK the slot and poll until the host is clean,
         # for as long as this park episode is still the current one.
         episode = self._park(lease.name, rc)
-        for attempt in range(max_attempts):
-            if self.park_epoch(lease.name) != episode:
-                return False
-            if await lease.runner.probe_clean():
-                self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
-                return False
-            if attempt < max_attempts - 1:
-                await sleep(1.0)
 
-        # max_attempts exhausted — slot remains PARKED (non-acquirable)
+        async def clean_or_superseded() -> bool:
+            return self.park_epoch(lease.name) != episode or await lease.runner.probe_clean()
+
+        if await poll_until_clean(clean_or_superseded, attempts=max_attempts, sleep=sleep):
+            self._unpark(lease.name, expect_epoch=episode, source='inline_probe')
         return False
 
     async def reprobe_parked_slots(

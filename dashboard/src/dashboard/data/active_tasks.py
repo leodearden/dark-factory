@@ -89,6 +89,7 @@ from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.deferral_summary import UNREAD, HoldReads, deferral_row_fields
+from dashboard.data.prd_attribution import coalesce_prd
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
@@ -259,11 +260,12 @@ _TASKS_ROOT_CONCURRENCY = 4
 
 @dataclass(frozen=True, slots=True)
 class TasksBudget:
-    """The three bounds the per-root fan-out runs under.
+    """The three bounds a per-root fan-out runs under.
 
-    Both collectors take one as ``budget=``. Every bound must be able to serve
-    a root: a non-positive time bound serves nothing, and a zero-width
-    semaphore admits no root and hangs the walk.
+    Both collectors here take one as ``budget=``, and ``/prds`` ships its own
+    (``dashboard/src/dashboard/api/prds.py::PRDS_BUDGET``). Every bound must
+    be able to serve a root: a non-positive time bound serves nothing, and a
+    zero-width semaphore admits no root and hangs the walk.
     """
 
     per_project: float
@@ -388,26 +390,6 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | Non
     return max(minutes, 0)
 
 
-def _coalesce_prd(metadata: dict) -> str | None:
-    """Coalesce PRD provenance from *metadata* into a single normalized string.
-
-    Checks ``prd_path``, then ``prd``, then ``prd_ref`` (in that precedence
-    order); the first value that is a non-empty string after stripping a
-    trailing ``#anchor`` or ``§section`` suffix and surrounding whitespace
-    wins. Non-string values are skipped. A value that cleans to ``''`` (e.g.
-    it was only a suffix) falls through to the next key. Returns ``None``
-    when no key yields a non-empty result.
-    """
-    for key in ('prd_path', 'prd', 'prd_ref'):
-        raw = metadata.get(key)
-        if not isinstance(raw, str):
-            continue
-        cleaned = raw.split('#', 1)[0].split('§', 1)[0].strip()
-        if cleaned:
-            return cleaned
-    return None
-
-
 def _build_task_row(
     project: str,
     task: dict,
@@ -415,7 +397,6 @@ def _build_task_row(
     rt: dict,
     uid: str,
     *,
-    prd: str | None = None,
     now: datetime | None = None,
     hold_reads: HoldReads = UNREAD,
 ) -> dict:
@@ -443,14 +424,6 @@ def _build_task_row(
     since active rows use ``rt['started']`` while terminal rows hard-code
     ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` (used
     by direct unit tests of this function) is still valid.
-
-    *prd*, if given, is used verbatim as the row's ``prd`` value instead of
-    re-deriving it from *task*'s metadata via ``_coalesce_prd`` — callers
-    that already computed it (e.g. the terminal-bucket loop, to decide
-    live-PRD membership) can pass it through to avoid doing the same
-    split/strip work twice. Omitting it (or passing ``None``, the actual
-    no-provenance value) falls back to deriving it from metadata, which is
-    safe because re-deriving a true ``None`` is idempotent.
 
     *now* is the reference instant for the strand verdict — this function
     never reads the clock itself, so every row in one pass is judged against
@@ -498,7 +471,7 @@ def _build_task_row(
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
-        'prd': prd if prd is not None else _coalesce_prd(metadata),
+        'prd': coalesce_prd(metadata),
         **deferral_row_fields(task, now=resolve_now(now), reads=hold_reads),
     }
 

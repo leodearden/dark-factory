@@ -12,6 +12,12 @@ from __future__ import annotations
 import pytest
 from audit_delivered_checks import StalePathSweep, load_manifest_checks, stale_path_findings
 from git_checkout_root import checkout_root_or_skip
+from shared.testing_xdist_groups import single_xdist_group
+
+# Every test here consumes `sweep` or checks this pin, so one loadgroup worker
+# builds the module fixture once.
+_SWEEP_GROUP_NAME = "sidecar_delivered_check_sweep"
+pytestmark = pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
 
 _REMEDY = (
     "repath BOTH halves (this sidecar, and the task record via update_task) to "
@@ -49,3 +55,17 @@ def test_every_swept_path_was_classified(sweep):
         "the stale-path classifier could not answer for some sidecar paths; "
         "the test above would otherwise read that as nothing stale"
     )
+
+
+def test_both_sweep_consumers_share_one_xdist_worker(request):
+    consumers = {
+        test_no_sidecar_descriptor_names_a_shim_or_removed_path,
+        test_every_swept_path_was_classified,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, "function", None) in consumers
+    ]
+    if not selected:
+        pytest.skip("no sweep consumer is selected in this session")
+
+    assert single_xdist_group(selected) == _SWEEP_GROUP_NAME

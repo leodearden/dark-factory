@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import falkor_skipif, load_script_module
+from _fm_falkor_live import falkor_skipif
+from _fm_helpers import load_script_module
 from redis.exceptions import ConnectionError as RedisConnectionError
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
@@ -3551,7 +3552,6 @@ class _RecordingLiveGraph:
 
 @pytest.mark.integration
 @falkor_skipif()
-@pytest.mark.timeout(120)
 def test_live_dark_factory_population_smoke(monkeypatch):
     """One GRAPH.RO_QUERY against the live graph; nothing is written.
 

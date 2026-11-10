@@ -28,7 +28,7 @@ import contextlib
 import os
 
 import pytest
-from _fm_helpers import QDRANT_URL, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import VectorParams
@@ -117,11 +117,10 @@ async def _build_recon_backend(mock_config, scope, monkeypatch, *, real_embedder
     """Construct a real Mem0Backend and force-create its AsyncMemory instance.
 
     Stubs out everything that isn't the dedup question itself: mem0's
-    telemetry capture (offline safety), and the shared SQLite history writer
-    (xdist-contended, irrelevant to vector-store dedup). Unless
-    *real_embedder* is set, also stubs the embedder to return one constant
-    vector for every call — the strongest-possible (cosine=1.0) duplicate
-    input the infer=False path could ever see.
+    telemetry capture (offline safety). Unless *real_embedder* is set, also
+    stubs the embedder to return one constant vector for every call — the
+    strongest-possible (cosine=1.0) duplicate input the infer=False path could
+    ever see.
     """
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
 
@@ -134,7 +133,6 @@ async def _build_recon_backend(mock_config, scope, monkeypatch, *, real_embedder
 
     backend = Mem0Backend(config)
     inst = await backend._get_instance(scope)
-    inst.db.add_history = lambda *a, **kw: None
 
     if not real_embedder:
         collection = scope.mem0_collection_name(config.mem0.collection_prefix)

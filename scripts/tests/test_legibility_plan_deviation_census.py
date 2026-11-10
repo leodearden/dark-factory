@@ -1020,7 +1020,6 @@ def _run_red_night(
         target_date=date(2026, 10, 24),
         now=NOW,
         invoke=_never_invoked,
-        status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: posted.append((url, envelope)),
         pass_kind=pass_kind,
         **seams,

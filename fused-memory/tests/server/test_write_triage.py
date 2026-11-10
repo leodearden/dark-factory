@@ -30,7 +30,6 @@ from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
-    _parent_id_in_meta,
 )
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
@@ -51,7 +50,6 @@ from fused_memory.server.write_triage import (
     _stub_judge,
     attach_write_durable,
     attach_write_landed,
-    canonical_id_of,
     decide_band,
     declares_attach_keys,
     emit_triage_fail_open_storm_escalation,
@@ -633,6 +631,7 @@ class TestDecideBand:
         ('label', 'extra'),
         [
             ('no kind at all', None),
+            ('parent_id without kind', {PARENT_ID_KEY: 'm1'}),
             ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'm1'}),
             ('kind is None', {'kind': None, PARENT_ID_KEY: 'm1'}),
         ],
@@ -662,7 +661,7 @@ class TestDecideBand:
     def test_a_child_with_a_malformed_parent_id_does_not_hoist(
         self, label, extra,
     ) -> None:
-        """Matches `_parent_id_in_meta`'s exact rule, so the two cannot disagree.
+        """The rule is grouped_read's `child_parent_id`: a malformed link is no child.
 
         A child kind whose parent link is unusable is treated as an ordinary
         candidate rather than hoisted to a nonsense target: `parent_id` must
@@ -673,37 +672,6 @@ class TestDecideBand:
             [_result('c1', 0.97, extra_metadata=extra)], t_high=T_HIGH, t_low=T_LOW,
         )
         assert d.canonical_id == 'c1', label
-
-    @pytest.mark.parametrize(
-        'extra',
-        [
-            None,
-            {},
-            {'kind': 'sighting', PARENT_ID_KEY: 'm1'},
-            {'kind': 'amendment', PARENT_ID_KEY: 'm1'},
-            {'kind': 'sighting'},
-            {'kind': 'sighting', PARENT_ID_KEY: None},
-            {'kind': 'sighting', PARENT_ID_KEY: ''},
-            {'kind': 'sighting', PARENT_ID_KEY: 7},
-            {'kind': 'note', PARENT_ID_KEY: 'm1'},
-            {'kind': None, PARENT_ID_KEY: 'm1'},
-            {PARENT_ID_KEY: 'm1'},
-        ],
-    )
-    def test_the_child_rule_cannot_drift_from_grouped_reads(self, extra) -> None:
-        """DRIFT GUARD: one rule, asserted against the READ side's own function.
-
-        `write_triage` decides where a child's write attaches; `grouped_read`
-        decides where a child is displayed. If those two disagree about what
-        counts as a child, the write lands somewhere the read cannot fold it
-        from — a child that exists but never groups. Asserting equivalence
-        against the landed `_parent_id_in_meta` means a future tightening of
-        the rule in either module cannot silently re-open this hole in the
-        other.
-        """
-        result = _result('own-id', 0.97, extra_metadata=extra)
-        expected = _parent_id_in_meta(result.metadata) or 'own-id'
-        assert canonical_id_of(result) == expected
 
 
 # ---------------------------------------------------------------------------

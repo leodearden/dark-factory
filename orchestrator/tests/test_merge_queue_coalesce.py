@@ -33,7 +33,7 @@ from _live_merge_worker import (
     REAL_GIT_TRAIN_TIMEOUT,
     running_merge_worker,
 )
-from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, lane_scene_config
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
@@ -66,17 +66,9 @@ class TestConfigAndEventType:
         """
         import tempfile
 
-        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.config import OrchestratorConfig
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = OrchestratorConfig(
-                project_root=Path(tmp),
-                git=GitConfig(
-                    main_branch='main',
-                    branch_prefix='task/',
-                    remote='origin',
-                    worktree_dir='.worktrees',
-                ),
-            )
+            cfg = OrchestratorConfig(project_root=Path(tmp))
             assert cfg.merge_train_coalesce_enabled is False
 
     def test_event_type_train_coalesced(self):
@@ -88,10 +80,10 @@ class TestConfigAndEventType:
 # ─── helpers shared across steps ────────────────────────────────────────────
 
 def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> OrchestratorConfig:
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
@@ -286,8 +278,7 @@ def git_ops(git_config, git_repo: Path):
 
 @pytest.fixture
 def config(git_repo: Path, git_config) -> OrchestratorConfig:
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 @pytest.fixture
@@ -299,10 +290,10 @@ def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
     these scenes would otherwise assert trains under whatever cap the
     operational yaml (loaded via conftest's ``ORCH_CONFIG_PATH``) ships.
     """
-    from orchestrator.config import MergeDeepConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    from orchestrator.config import MergeDeepConfig
+    return lane_scene_config(
+        git_repo,
+        git_config,
         merge_train_coalesce_enabled=True,
         merge_deep=MergeDeepConfig(chain_cap=0),
     )

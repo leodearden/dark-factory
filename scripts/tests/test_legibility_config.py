@@ -94,9 +94,7 @@ class TestNestedDefaults:
 
     def test_census_defaults(self, tmp_path):
         cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
-        assert cfg.census.max_interval_days == 10
-        assert cfg.census.tasks_landed_threshold == 120
-        assert cfg.census.tasks_landed_min_days == 7
+        assert cfg.census.completion_threshold_pct == 70
         assert cfg.census.novelty_spike.count == 4
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
@@ -202,11 +200,11 @@ class TestTrickleCensusCaps:
     def test_trigger_thresholds_survive_alongside_trickle_caps(self, tmp_path):
         text = MINIMAL_YAML + textwrap.dedent("""\
             census:
-              max_interval_days: 3
+              floor_days: 3
               trickle_caps: {max_batches: 10}
             """)
         cfg = mod.load_config(_write(tmp_path, text))
-        assert cfg.census.max_interval_days == 3
+        assert cfg.census.floor_days == 3
         assert cfg.census.trickle_caps.max_batches == 10
 
     def test_caps_are_immutable_so_no_holder_can_uncap_a_shared_instance(self):
@@ -238,6 +236,47 @@ class TestLedgerRetentionDays:
         text = MINIMAL_YAML + f'census: {{ledger_retention_days: {bad_value}}}\n'
         with pytest.raises(ValidationError):
             mod.load_config(_write(tmp_path, text))
+
+
+class TestCompletionThresholdPct:
+    """``census.completion_threshold_pct`` — the completion share, as a
+    percentage, at which the previous run's filed tasks fire the census
+    (plans/census-incremental-prd.md C7 (a)), an unquoted int in 1..100."""
+
+    def test_default_is_seventy(self):
+        assert mod.Census().completion_threshold_pct == 70
+
+    def test_yaml_without_the_key_keeps_the_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {floor_days: 5}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 70
+
+    def test_yaml_value_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {completion_threshold_pct: 85}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 85
+
+    @pytest.mark.parametrize('bad_value', ['0', '101', '-5', "'70'", '70.5', 'true', 'null'])
+    def test_out_of_range_or_non_int_value_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{completion_threshold_pct: {bad_value}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_retired_trigger_keys_still_load(self, tmp_path):
+        """extra='allow' keeps a not-yet-migrated project's legibility.yaml
+        loadable; the census trigger names the retired keys instead."""
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              max_interval_days: 10
+              tasks_landed_threshold: 120
+              tasks_landed_min_days: 7
+            """)
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.completion_threshold_pct == 70
+        assert not any(
+            name in type(cfg.census).model_fields
+            for name in ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+        )
 
 
 class TestNoveltySpikeBaseline:
@@ -383,9 +422,7 @@ class TestFullConfigOverridesDefaults:
         budgets: {max_daily_digest_bytes: 123456}
         sampling: {top_fraction: 0.2, per_stratum_min: 3}
         census:
-          max_interval_days: 11
-          tasks_landed_threshold: 200
-          tasks_landed_min_days: 8
+          completion_threshold_pct: 85
           novelty_spike: {count: 5, window_hours: 48}
           floor_days: 6
           saturation: {dup_rate: 0.8, consecutive_batches: 3}
@@ -397,9 +434,7 @@ class TestFullConfigOverridesDefaults:
         assert cfg.budgets.max_daily_digest_bytes == 123456
         assert cfg.sampling.top_fraction == 0.2
         assert cfg.sampling.per_stratum_min == 3
-        assert cfg.census.max_interval_days == 11
-        assert cfg.census.tasks_landed_threshold == 200
-        assert cfg.census.tasks_landed_min_days == 8
+        assert cfg.census.completion_threshold_pct == 85
         assert cfg.census.novelty_spike.count == 5
         assert cfg.census.novelty_spike.window_hours == 48
         assert cfg.census.floor_days == 6
@@ -598,8 +633,8 @@ class TestShippedDarkFactoryConfig:
 
     def test_shipped_config_census_and_models_nonempty(self):
         cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
-        assert cfg.census.max_interval_days > 0
-        assert cfg.census.tasks_landed_threshold > 0
+        assert cfg.census.completion_threshold_pct == 70
+        assert cfg.census.floor_days > 0
         assert cfg.models.trickle
         assert cfg.models.census_miner
         assert cfg.models.census_verify

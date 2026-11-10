@@ -692,7 +692,7 @@ class TestTheForceStoreArms:
     async def test_a_declared_child_kind_alone_force_stores(self) -> None:
         """Either key alone is enough — the attach overwrites BOTH.
 
-        Deliberately wider than `grouped_read._parent_id_in_meta`, which needs
+        Deliberately wider than `grouped_read.child_parent_id`, which needs
         both keys well-formed to answer "does this record group?". The question
         here is "did the caller say anything about parentage that triage would
         overwrite?", and a half-declared link is a caller bug for
@@ -1479,12 +1479,13 @@ def _pending_retry_response() -> AddMemoryResponse:
     )
 
 
-class TestAPendingWriteClaimsNoSupersessionMark:
+class TestAPendingWriteDefersItsSupersessionMarks:
     """A write's supersedes targets are marked with its Mem0 id, which a write
-    pending server-side retry does not have yet (task 7156's seam)."""
+    pending server-side retry does not have yet; the retry pass marks them when
+    it lands, so the ack names them pending rather than unmarked."""
 
     @pytest.mark.asyncio
-    async def test_the_targets_are_reported_unmarked(self, monkeypatch) -> None:
+    async def test_the_targets_are_reported_pending_retry(self, monkeypatch) -> None:
         _install_counter(monkeypatch)
         mock_service = AsyncMock()
         configure_triage_config(mock_service, enabled=True)
@@ -1497,9 +1498,8 @@ class TestAPendingWriteClaimsNoSupersessionMark:
         assert result['stores_pending_retry'] == ['mem0'], f'{result!r}'
         supersession = result[SUPERSESSION_ACK_KEY]
         assert supersession['marked'] == [], f'{supersession!r}'
-        (unmarked,) = supersession['unmarked']
-        assert unmarked['id'] == superseded
-        assert unmarked['reason'] == 'no_superseding_mem0_record'
+        assert supersession['unmarked'] == [], f'{supersession!r}'
+        assert supersession['pending_retry'] == [superseded], f'{supersession!r}'
         mock_service.update_memory.assert_not_awaited()
 
 

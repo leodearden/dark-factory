@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from shared.merge_state import MergeState
+from shared.task_read import TaskAbsent, TaskFound, TaskReadFailed
 
 from escalation.git_authority import (
     GitAuthorityArm,
@@ -142,21 +143,28 @@ class TestGitAuthorityArm:
         assert isinstance(GitAuthorityArm.ancestor, str)
 
 
+_BACKEND_FAULT_REASON = "get_task error='boom', error_type='BackendUnavailable'"
+
+
+_NO_SUCH_TASK = TaskAbsent()
+
+
 def _harness(
-    *, task: Any = None, raises: bool = False, with_scheduler: bool = True,
+    *, read: Any = _NO_SUCH_TASK, raises: bool = False, with_scheduler: bool = True,
 ) -> types.SimpleNamespace:
     """Build the minimal duck-typed harness ``task_metadata`` reads.
 
-    The function touches nothing but ``harness.scheduler.get_task``, which is
+    The function touches nothing but ``harness.scheduler.read_task``, which is
     why it can be exercised with a two-attribute SimpleNamespace and no MCP
-    server anywhere in sight.
+    server anywhere in sight.  *read* is what ``read_task`` answers: a
+    ``shared.task_read`` outcome, by default the healthy "no such task".
     """
     harness = types.SimpleNamespace()
     if with_scheduler:
         harness.scheduler = types.SimpleNamespace(
-            get_task=(
+            read_task=(
                 AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
-                if raises else AsyncMock(return_value=task)
+                if raises else AsyncMock(return_value=read)
             ),
         )
     return harness
@@ -177,7 +185,7 @@ class TestTaskMetadata:
 
     async def test_healthy_read_with_metadata(self) -> None:
         result = await task_metadata(
-            _harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            _harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
             '4887', site='merge_status',
         )
 
@@ -198,7 +206,7 @@ class TestTaskMetadata:
         the FAULT cases — otherwise ``{}`` is exactly as uninformative as it
         was before the extraction.
         """
-        result = await task_metadata(_harness(task=task), '4887', site='merge_status')
+        result = await task_metadata(_harness(read=TaskFound(task)), '4887', site='merge_status')
 
         assert result.metadata == {}
         assert result.unavailable is False
@@ -208,18 +216,37 @@ class TestTaskMetadata:
         [
             (None, 'harness absent'),
             (_harness(with_scheduler=False), 'no .scheduler attribute'),
-            (_harness(raises=True), 'get_task raised'),
+            (_harness(raises=True), 'read_task raised'),
+            (
+                _harness(read=TaskReadFailed(_BACKEND_FAULT_REASON)),
+                'read_task reported a failed read',
+            ),
+            (_harness(read={'metadata': {}}), 'read_task answered an unexpected value'),
+            (
+                types.SimpleNamespace(
+                    scheduler=types.SimpleNamespace(
+                        get_task=AsyncMock(return_value={'metadata': {}}),
+                    ),
+                ),
+                'scheduler has no read_task',
+            ),
         ],
-        ids=['no_harness', 'no_scheduler', 'get_task_raises'],
+        ids=[
+            'no_harness', 'no_scheduler', 'read_task_raises',
+            'read_task_reports_failure', 'read_task_unexpected_value',
+            'scheduler_without_read_task',
+        ],
     )
     async def test_fault_modes_are_flagged_unavailable(
         self, harness: Any, label: str
     ) -> None:
         """The twin: ``{}`` here means "we could not read", not "nothing there".
 
-        All three must ALSO honour the never-raises guarantee — a fault in
-        the task store must degrade a single guard, not swallow the whole
-        probe.
+        ``read_task_reports_failure`` is the live fault in production: the
+        real ``Scheduler.read_task`` never raises, so a fused-memory error
+        reply arrives as a ``TaskReadFailed``, not as an exception.  Every
+        mode must ALSO honour the never-raises guarantee — a fault in the
+        task store must degrade a single guard, not swallow the whole probe.
         """
         result = await task_metadata(harness, '4887', site='merge_status')
 
@@ -227,7 +254,7 @@ class TestTaskMetadata:
         assert result.unavailable is True, f'{label}: must be flagged unavailable'
 
     async def test_absent_task_is_a_fact_not_a_fault(self) -> None:
-        """THE ONE GENUINELY ARGUABLE CELL — ``get_task`` answering None.
+        """THE ONE GENUINELY ARGUABLE CELL — ``read_task`` answering TaskAbsent.
 
         Decided as ``unavailable is False``, i.e. "no such task" is a FACT.
 
@@ -246,7 +273,7 @@ class TestTaskMetadata:
         conflation this flag exists to remove, and it would leave η unable to
         tell them apart. The module docstring states the same rule.
         """
-        result = await task_metadata(_harness(task=None), '4887', site='merge_status')
+        result = await task_metadata(_harness(read=TaskAbsent()), '4887', site='merge_status')
 
         assert result.metadata == {}
         assert result.unavailable is False
@@ -265,6 +292,22 @@ class TestTaskMetadata:
             f'the site label must be interpolated into the warning, got: {caplog.text!r}'
         )
         assert 'merge_status' not in caplog.text
+
+    async def test_failed_read_is_logged_with_the_site_label_not_the_reason(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``Scheduler.read_task`` owns the reason's WARNING; repeating it here
+        logged one fault twice.
+        """
+        with caplog.at_level(logging.WARNING):
+            await task_metadata(
+                _harness(read=TaskReadFailed(_BACKEND_FAULT_REASON)),
+                '4887', site='merge_request',
+            )
+
+        assert 'merge_request' in caplog.text
+        assert '4887' in caplog.text
+        assert 'BackendUnavailable' not in caplog.text
 
 
 class TestTaskMetadataResult:
@@ -409,7 +452,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '900',
             orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
@@ -424,7 +467,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _marker_git_ops(marker='d' * 40), '801',
             orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
@@ -456,7 +499,7 @@ class TestProbeLanding:
 
         verdict = await probe_landing(
             git_ops, '904', orch_config=_config(tmp_path, commit_citation_pattern=''),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
@@ -482,7 +525,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
             '901', orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
@@ -496,7 +539,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation=None), '3031',
             orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
@@ -510,7 +553,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _marker_git_ops(marker='d' * 40, effect_present=False), '803',
             orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {'branch_base_sha': 'b' * 40}}),
+            harness=_harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed
@@ -561,7 +604,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=False),
             '907', orch_config=_config(tmp_path),
-            harness=_harness(task=_task_declaring_checks()),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main, (
@@ -592,7 +635,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _marker_git_ops(marker='d' * 40, effect_present=False), '908',
             orch_config=_config(tmp_path),
-            harness=_harness(task=_task_declaring_checks()),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main, (
@@ -622,7 +665,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40, effect_present=True),
             '909', orch_config=_config(tmp_path),
-            harness=_harness(task=_task_declaring_checks()),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
@@ -642,7 +685,7 @@ class TestProbeLanding:
         verdict = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation=None), '910',
             orch_config=_config(tmp_path, commit_citation_pattern=''),
-            harness=_harness(task=_task_declaring_checks()),
+            harness=_harness(read=TaskFound(_task_declaring_checks())),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.found_on_main
@@ -700,7 +743,7 @@ class TestProbeLanding:
         """
         verdict = await probe_landing(
             git_ops, '800',
-            orch_config=_config(tmp_path), harness=_harness(task=task),
+            orch_config=_config(tmp_path), harness=_harness(read=TaskFound(task)),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.no_signal, label
@@ -719,7 +762,7 @@ class TestProbeLanding:
                 resolve_branch_sha=AsyncMock(side_effect=RuntimeError('git exploded')),
             ),
             '905', orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {}}),
+            harness=_harness(read=TaskFound({'metadata': {}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.probe_failed
@@ -734,7 +777,7 @@ class TestProbeLanding:
                 is_ancestor=AsyncMock(side_effect=RuntimeError('git exploded')),
             ),
             '905', orch_config=_config(tmp_path),
-            harness=_harness(task={'metadata': {}}),
+            harness=_harness(read=TaskFound({'metadata': {}})),
         )
 
         assert verdict.outcome is GitAuthorityOutcome.probe_failed
@@ -785,7 +828,7 @@ class TestProbeLanding:
             )
 
         assert verdict.metadata_unavailable is True, 'precondition: the fetch faulted'
-        assert 'scheduler.get_task' in caplog.text
+        assert 'scheduler.read_task' in caplog.text
         assert 'landed_reconciler' in caplog.text, (
             f'the metadata degradation must name the CALLER, got: {caplog.text!r}'
         )
@@ -804,7 +847,7 @@ class TestProbeLanding:
         """
         healthy = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',
-            orch_config=_config(tmp_path), harness=_harness(task={'metadata': {}}),
+            orch_config=_config(tmp_path), harness=_harness(read=TaskFound({'metadata': {}})),
         )
         faulted = await probe_landing(
             _ancestor_git_ops(tip='a' * 40, citation='c' * 40), '906',

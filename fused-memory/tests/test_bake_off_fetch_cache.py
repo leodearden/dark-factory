@@ -34,13 +34,16 @@ in-progress and claims that module.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
+import os
 import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from _fm_helpers import load_script_module
+from _fm_helpers import lease_isolated_monkeypatch, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -1241,22 +1244,13 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    def __init__(self):
-        self.db = _types.SimpleNamespace(add_history=None)
-
-
 class _FakeMem0:
     """Records every backend call, which is the whole point on the replay path."""
 
     def __init__(self):
         self.added: list[tuple[str, str]] = []
         self.searches: list[tuple[str, str, int]] = []
-        self.instances: dict[str, _FakeInstance] = {}
         self._stored: dict[str, list[dict]] = {}
-
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
 
     async def add(self, content, scope, metadata=None):
         await asyncio.sleep(0)
@@ -1343,6 +1337,95 @@ def _argv(tmp_path, name: str, *extra: str) -> list[str]:
     ]
 
 
+#: Every class that reads `cli_legs` carries this group AND
+#: `@pytest.mark.timeout(540)`.  The group puts them on one xdist worker, so
+#: the three legs, and the warm-up the process's first `main()` pays, are paid
+#: once rather than once per worker `--dist loadgroup` scatters them to.  The
+#: timeout covers whichever reader requests `cli_legs` first on that worker,
+#: which records all three legs: the first in collection order in a full-file
+#: run, but any of them under `-k` or a node-id selection; and
+#: `test_a_replay_survives_a_registry_edit_e2_does_not_read` runs two legs of
+#: its own under it.  It overrides verify's --timeout=300, sized per
+#: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_fetch_cache_recorded_legs')
+
+
+@dataclasses.dataclass(frozen=True)
+class _CliLegs:
+    """Three doubled `main()` legs over one cache: plain, live (dumping), replay."""
+
+    plain_report: str
+    live_report: str
+    replay_report: str
+    cache_text: str
+    cache_path: Path
+    replay_services_constructed: int
+    replay_drop_calls: tuple[tuple[str, ...], ...]
+    replay_cache_reads: tuple[str, ...]
+    lease_dirs: tuple[Path, ...]
+
+
+def _record_cli_legs(directory: Path) -> _CliLegs:
+    mod = _mod()
+    cache = directory / 'cache.json'
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'plain')) == 0
+
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'live', '--dump-fetches', str(cache))) == 0
+
+        # The counter goes in AFTER the live leg: only the REPLAY's parses
+        # are being measured.
+        drops = _install_driver_doubles(mp)
+        reads = _count_cache_reads(mp, mod)
+        assert mod.main(_argv(directory, 'replay', '--replay-fetches', str(cache))) == 0
+        replay_services_constructed = len(_FakeMemoryService.instances)
+        replay_drop_calls = tuple(tuple(call) for call in drops.calls)
+
+    def report(name: str) -> str:
+        return (directory / f'{name}.json').read_text(encoding='utf-8')
+
+    return _CliLegs(
+        plain_report=report('plain'),
+        live_report=report('live'),
+        replay_report=report('replay'),
+        cache_text=cache.read_text(encoding='utf-8'),
+        cache_path=cache,
+        replay_services_constructed=replay_services_constructed,
+        replay_drop_calls=replay_drop_calls,
+        replay_cache_reads=tuple(reads),
+        lease_dirs=tuple(lease_dirs),
+    )
+
+
+@pytest.fixture(scope='module')
+def cli_legs(tmp_path_factory) -> _CliLegs:
+    """The three legs, recorded once per module; every field is immutable."""
+    return _record_cli_legs(tmp_path_factory.mktemp('cli-legs'))
+
+
+@pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
+class TestTheRecordedLegs:
+    """The recorded legs the CLI tests read are safe to share."""
+
+    def test_they_held_their_leases_in_a_private_directory_never_the_machine_global_one(
+        self, cli_legs, tmp_path_factory,
+    ):
+        """`cli_legs` is set up BEFORE the autouse, function-scoped `lease_dir`
+        fixture, so a recording that did not isolate its own leases would hold
+        them in the directory the live 6-hourly cron reads."""
+        reaper = _mod().load_cleanup_script()
+        basetemp = tmp_path_factory.getbasetemp()
+
+        assert cli_legs.lease_dirs, 'the recording took no lease to locate'
+        for lease_dir in cli_legs.lease_dirs:
+            assert lease_dir != reaper.DEFAULT_LEASE_DIR
+            assert lease_dir.is_relative_to(basetemp), lease_dir
+
+
 class TestFetchCacheCliDefaults:
     """Both flags default to None, so `TestBuildParser` in the E2 module —
     which asserts defaults BY ATTRIBUTE, not flag-set exhaustiveness — keeps
@@ -1370,41 +1453,24 @@ class TestFetchCacheCliDefaults:
         assert '--replay-fetches' in message
 
 
+@pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
 class TestDumpFetchesFlag:
     """`--dump-fetches` is additive: it writes the cache and changes nothing."""
 
-    def test_a_dumping_run_writes_the_cache_and_the_identical_report(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        cache = tmp_path / 'cache.json'
+    def test_a_dumping_run_writes_the_cache_and_the_identical_report(self, cli_legs):
+        plain = json.loads(cli_legs.plain_report)
+        dumped = json.loads(cli_legs.live_report)
 
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'plain')) == 0
-        plain = json.loads((tmp_path / 'plain.json').read_text(encoding='utf-8'))
-
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'dumped', '--dump-fetches', str(cache),
-        )) == 0
-        dumped = json.loads((tmp_path / 'dumped.json').read_text(encoding='utf-8'))
-
-        assert cache.exists()
+        assert cli_legs.cache_path.exists()
         # The measurement is untouched by the act of recording it.
         assert dumped['arms'] == plain['arms']
         assert dumped['audit_recall'] == plain['audit_recall']
 
-    def test_the_dump_covers_every_shape_and_carries_its_fingerprint(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_the_dump_covers_every_shape_and_carries_its_fingerprint(self, cli_legs):
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'dumped', '--dump-fetches', str(cache),
-        )) == 0
 
-        doc = json.loads(cache.read_text(encoding='utf-8'))
+        doc = json.loads(cli_legs.cache_text)
         # A default run is probe-ON, so the dump covers the three read arms
         # PLUS one pass per regrowth mode -- each seeded over its own injected
         # corpus, so each needs its own fingerprint or a replay could silently
@@ -1441,45 +1507,30 @@ def _rekey_a_curator_gate_canonical(registry: dict) -> None:
         pair['successor_hash'] = new_hash
 
 
-# Each test runs the bake-off twice (dump, then replay); this overrides verify's
-# --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
-# 8x the worst measured wall clock, never below the pyproject default.
+def _recorded_cache_in(tmp_path: Path, cli_legs: _CliLegs) -> Path:
+    """A private copy of the recorded live leg's cache, for a test to mutate."""
+    cache = tmp_path / 'cache.json'
+    cache.write_text(cli_legs.cache_text, encoding='utf-8')
+    return cache
+
+
 @pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
 class TestReplayFetchesFlag:
     """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
 
-    def _dump_then_replay(self, mod, tmp_path, monkeypatch):
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
-        live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
-
-        drops = _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(
-            tmp_path, 'replay', '--replay-fetches', str(cache),
-        )) == 0
-        replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
-        return live, replayed, drops
-
-    def test_a_replayed_run_makes_zero_backend_calls(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        _, _, drops = self._dump_then_replay(mod, tmp_path, monkeypatch)
-
+    def test_a_replayed_run_makes_zero_backend_calls(self, cli_legs):
         # No MemoryService was even CONSTRUCTED — so no durable write queue
         # was recovered, no config was deep-copied and repointed, and no
         # embedder was resolved.
-        assert _FakeMemoryService.instances == []
+        assert cli_legs.replay_services_constructed == 0
         # And no collection was created or dropped: a replay that reaped
         # collections could destroy a concurrent live run's arms.
-        assert drops.calls == []
+        assert cli_legs.replay_drop_calls == ()
 
-    def test_the_replayed_measurement_is_identical_to_the_live_one(
-        self, tmp_path, monkeypatch,
-    ):
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+    def test_the_replayed_measurement_is_identical_to_the_live_one(self, cli_legs):
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert replayed['arms'] == live['arms']
         assert replayed['audit_recall'] == live['audit_recall']
@@ -1489,7 +1540,7 @@ class TestReplayFetchesFlag:
             assert replayed['protocol'][key] == live['protocol'][key], key
 
     def test_the_replayed_regrowth_block_and_its_descriptor_agree_with_live(
-        self, tmp_path, monkeypatch,
+        self, cli_legs,
     ):
         """`_replay_bake_off` claims the block "must come out byte-identical
         to the live one" — asserted here rather than left as a docstring.
@@ -1502,17 +1553,15 @@ class TestReplayFetchesFlag:
         probe coverage, which is the ONE thing this descriptor exists to
         state outright.
         """
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert live['regrowth'] is not None
         assert replayed['regrowth'] == live['regrowth']
         for key in ('regrowth_probed', 'regrowth_injections_measured'):
             assert replayed['protocol'][key] == live['protocol'][key], key
 
-    def test_the_replayed_report_discloses_that_it_was_replayed(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_the_replayed_report_discloses_that_it_was_replayed(self, cli_legs):
         """The ONE way a replayed report must differ from a live one.
 
         Every measured cell is identical — that is the point of the cache —
@@ -1521,24 +1570,22 @@ class TestReplayFetchesFlag:
         because a replay created none: reporting the names it *would* have
         used would be exactly the kind of unmeasured number this task forbids.
         """
-        mod = _mod()
-        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+        live = json.loads(cli_legs.live_report)
+        replayed = json.loads(cli_legs.replay_report)
 
         assert live['protocol']['replayed_from'] is None
         assert live['protocol']['collections']
 
-        assert replayed['protocol']['replayed_from'] == str(tmp_path / 'cache.json')
+        assert replayed['protocol']['replayed_from'] == str(cli_legs.cache_path)
         assert replayed['protocol']['collections'] == []
 
     def test_a_replay_against_drifted_fixtures_exits_nonzero(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, cli_legs,
     ):
         """The refusal has to survive the CLI, not just the loader: a stale
         cache that exits 0 has published a stale ranking as a measurement."""
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
         doc['provenance']['corpus_fingerprints']['c_peers'] = 'deadbeef' * 8
@@ -1552,7 +1599,7 @@ class TestReplayFetchesFlag:
         assert not (tmp_path / 'replay.json').exists()
 
     def test_a_replay_against_an_edited_query_set_exits_nonzero(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, cli_legs,
     ):
         """The digest guard, wired rather than merely available.
 
@@ -1562,9 +1609,7 @@ class TestReplayFetchesFlag:
         longer in the tree.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
         row = next(
@@ -1642,7 +1687,7 @@ class TestReplayFetchesFlag:
         return cluster_id
 
     def test_a_replay_against_a_cache_missing_a_probe_cluster_exits_three(
-        self, tmp_path, monkeypatch, capsys,
+        self, tmp_path, monkeypatch, capsys, cli_legs,
     ):
         """Exactly 3, and NAMED — not merely "something raised".
 
@@ -1653,12 +1698,9 @@ class TestReplayFetchesFlag:
         the cache nor how to re-dump it.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         cluster_id = self._delete_probe_cluster(cache, list(mod.ARM_SHAPES))
-        capsys.readouterr()
 
         _install_driver_doubles(monkeypatch)
         assert mod.main(_argv(
@@ -1671,7 +1713,7 @@ class TestReplayFetchesFlag:
         assert not (tmp_path / 'replay.json').exists()
 
     def test_a_replay_whose_regrowth_pass_is_missing_a_probe_cluster_exits_three(
-        self, tmp_path, monkeypatch, capsys,
+        self, tmp_path, monkeypatch, capsys, cli_legs,
     ):
         """The regrowth pass needs its OWN coverage.
 
@@ -1682,14 +1724,11 @@ class TestReplayFetchesFlag:
         wires only the first call site fail here instead of looking complete.
         """
         mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+        cache = _recorded_cache_in(tmp_path, cli_legs)
 
         cluster_id = self._delete_probe_cluster(
             cache, [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES],
         )
-        capsys.readouterr()
 
         _install_driver_doubles(monkeypatch)
         assert mod.main(_argv(
@@ -1700,27 +1739,14 @@ class TestReplayFetchesFlag:
         assert cluster_id in message
         assert not (tmp_path / 'replay.json').exists()
 
-    def test_a_replay_reads_the_cache_document_exactly_once(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_a_replay_reads_the_cache_document_exactly_once(self, cli_legs):
         """EXACTLY once, not "fewer than before".
 
         A `<= 2` assertion would still pass a fix that removed only one of
         the redundant reads, and the point of the item is that the 32k-line
         document is decoded once and threaded.
         """
-        mod = _mod()
-        cache = tmp_path / 'cache.json'
-        _install_driver_doubles(monkeypatch)
-        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
-
-        # The counter goes in AFTER the live leg: only the REPLAY's parses
-        # are being measured.
-        _install_driver_doubles(monkeypatch)
-        reads = _count_cache_reads(monkeypatch, mod)
-        assert mod.main(_argv(
-            tmp_path, 'replay', '--replay-fetches', str(cache),
-        )) == 0
+        reads = cli_legs.replay_cache_reads
         assert len(reads) == 1, reads
 
 
@@ -1737,10 +1763,6 @@ class TestReplayFetchesFlag:
 # Markers PER-TEST, never a module `pytestmark`: `addopts = -m 'not
 # integration'` would otherwise deselect every pure test in this file from
 # the merge lane along with this one.
-
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 class _RefusesToBeConstructed:

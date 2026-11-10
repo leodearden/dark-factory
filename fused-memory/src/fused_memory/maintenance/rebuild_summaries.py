@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from fused_memory.maintenance._utils import maintenance_service
 
@@ -20,6 +22,43 @@ class RebuildResult:
     skipped: int = 0
     errors: int = 0
     details: list[dict] = field(default_factory=list)
+    entities_complete: bool | None = None
+    entities_incomplete_kind: str | None = None
+    edges_complete: bool | None = None
+    edges_incomplete_kind: str | None = None
+
+    @classmethod
+    def from_service_result(cls, raw: Mapping[str, Any]) -> RebuildResult:
+        """Parse a MemoryService.rebuild_entity_summaries dict; a missing verdict is None."""
+        return cls(
+            total_entities=raw.get('total_entities', 0),
+            stale_entities=raw.get('stale_entities', 0),
+            rebuilt=raw.get('rebuilt', 0),
+            skipped=raw.get('skipped', 0),
+            errors=raw.get('errors', 0),
+            details=raw.get('details', []),
+            entities_complete=raw.get('entities_complete'),
+            entities_incomplete_kind=raw.get('entities_incomplete_kind'),
+            edges_complete=raw.get('edges_complete'),
+            edges_incomplete_kind=raw.get('edges_incomplete_kind'),
+        )
+
+    @property
+    def corpus_proven_complete(self) -> bool:
+        """Both reads proven complete; the tri-state contract is in
+        fused-memory/src/fused_memory/services/memory_service.py::MemoryService.rebuild_entity_summaries.
+        """
+        return self.entities_complete is True and self.edges_complete is True
+
+    @property
+    def completeness_summary(self) -> str:
+        """The four read verdicts as the key=value fragment every rebuild reporter logs."""
+        return (
+            f'entities_complete={self.entities_complete} '
+            f'entities_incomplete_kind={self.entities_incomplete_kind} '
+            f'edges_complete={self.edges_complete} '
+            f'edges_incomplete_kind={self.edges_incomplete_kind}'
+        )
 
 
 class RebuildSummariesManager:
@@ -54,14 +93,7 @@ class RebuildSummariesManager:
             force=force,
             dry_run=dry_run,
         )
-        return RebuildResult(
-            total_entities=raw.get('total_entities', 0),
-            stale_entities=raw.get('stale_entities', 0),
-            rebuilt=raw.get('rebuilt', 0),
-            skipped=raw.get('skipped', 0),
-            errors=raw.get('errors', 0),
-            details=raw.get('details', []),
-        )
+        return RebuildResult.from_service_result(raw)
 
 
 async def run_rebuild_summaries(
@@ -87,16 +119,18 @@ async def run_rebuild_summaries(
 
     Returns:
         RebuildResult with total_entities, stale_entities, rebuilt, skipped,
-        errors, and details.
+        errors, details, entities_complete, entities_incomplete_kind,
+        edges_complete, and edges_incomplete_kind.
     """
     async with maintenance_service(config_path) as (config, service):
         manager = RebuildSummariesManager(service=service, group_id=group_id)
         result = await manager.run(force=force, dry_run=dry_run)
-        logger.info(
+        log_fn = logger.info if result.corpus_proven_complete else logger.warning
+        log_fn(
             'run_rebuild_summaries complete: total=%d stale=%d rebuilt=%d '
-            'skipped=%d errors=%d dry_run=%s',
+            'skipped=%d errors=%d dry_run=%s %s',
             result.total_entities, result.stale_entities, result.rebuilt,
-            result.skipped, result.errors, dry_run,
+            result.skipped, result.errors, dry_run, result.completeness_summary,
         )
         return result
 

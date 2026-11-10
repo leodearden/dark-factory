@@ -25,6 +25,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pause_policy import (
     HaltNotPermittedError,
     PauseClass,
@@ -34,7 +35,6 @@ from orchestrator.pause_policy import (
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
     SchedulerCallbacks,
     TickContext,
@@ -3199,9 +3199,10 @@ class TestFairness:
         # H's park on m1 blocks ALL other tasks (including shadowed L).
         assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
         assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
-        # L's park on m2 remains active — H cannot acquire m2.
+        # L's park on m2 remains active: it blocks a parkless task, and H,
+        # which outranks it, passes it (task 7799, INV-8).
         assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
-        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
+        assert scheduler.lock_table.park_owners_blocking('H', ['m2']) == []
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3

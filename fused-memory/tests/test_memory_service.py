@@ -8331,7 +8331,7 @@ class TestGetStatusSurfacesDeadByOperation:
     @pytest.mark.asyncio
     async def test_queue_section_carries_dead_by_operation(self, service, tmp_path):
         """A dead `add_episode` shows up attributed, scoped to the project."""
-        from _fm_helpers import poll_until
+        from _fm_polling import poll_until
 
         from fused_memory.services.durable_queue import DurableWriteQueue
 

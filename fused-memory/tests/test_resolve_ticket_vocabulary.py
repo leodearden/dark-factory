@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from _fastmcp_tool_result import tool_result_dict
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _fused_memory_tool_surface import FUSED_MEMORY_TOOL_PREFIX, registered_fused_memory_tools
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -96,15 +96,10 @@ class _HeldCurator:
             await self.release.wait()
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         return [self.decision for _ in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return self.decision
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         return None

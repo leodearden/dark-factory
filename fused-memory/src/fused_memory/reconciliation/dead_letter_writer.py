@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,8 @@ class DeadLetterWriter:
     worker and returns a future that resolves ``True`` once the line is on
     disk, or ``False`` if the write failed (the failure is logged). The
     future cannot be cancelled, so an awaiter that is itself cancelled cannot
-    drop an accepted record.
+    drop an accepted record, and an ``on_settled`` hook runs before it
+    resolves.
     """
 
     def __init__(
@@ -73,13 +74,24 @@ class DeadLetterWriter:
             *(self._rotation_path(i) for i in range(1, self._keep_rotations + 1)),
         ]
 
-    def append(self, record: Mapping[str, Any]) -> Future[bool]:
-        """Hand ``record`` to the worker thread; resolve once it is written or has failed."""
+    def append(
+        self,
+        record: Mapping[str, Any],
+        *,
+        on_settled: Callable[[bool], None] | None = None,
+    ) -> Future[bool]:
+        """Hand ``record`` to the worker thread; resolve once it is written or has failed.
+
+        ``on_settled`` receives that outcome on the settling thread (the worker,
+        or the caller's thread when the hand-off itself fails) BEFORE the
+        returned future resolves, so anything it schedules is queued before
+        any done-callback of that future, or of :meth:`flushed`, runs.
+        """
         written: Future[bool] = _running_future()
         try:
             line = json.dumps(record) + '\n'
             with self._pending_lock:
-                self._executor.submit(self._write, line, written)
+                self._executor.submit(self._write, line, written, on_settled)
                 self._last = written
                 self._records_pending += 1
         except Exception as exc:
@@ -88,7 +100,7 @@ class DeadLetterWriter:
                 'its writer thread: %s',
                 self._path, exc,
             )
-            written.set_result(False)
+            self._settle(written, False, on_settled)
         return written
 
     def flushed(self) -> Future[None]:
@@ -102,10 +114,32 @@ class DeadLetterWriter:
             last.add_done_callback(lambda _: flushed.set_result(None))
         return flushed
 
+    def _settle(
+        self,
+        written: Future[bool],
+        ok: bool,
+        on_settled: Callable[[bool], None] | None,
+    ) -> None:
+        """Run ``on_settled(ok)``, then resolve ``written``: the hook always goes first."""
+        if on_settled is not None:
+            try:
+                on_settled(ok)
+            except Exception:
+                logger.exception(
+                    'DeadLetterWriter: on_settled hook raised for a %s write to %s',
+                    'successful' if ok else 'failed', self._path,
+                )
+        written.set_result(ok)
+
     def _rotation_path(self, index: int) -> Path:
         return Path(f'{self._path}.{index}')
 
-    def _write(self, line: str, written: Future[bool]) -> None:
+    def _write(
+        self,
+        line: str,
+        written: Future[bool],
+        on_settled: Callable[[bool], None] | None,
+    ) -> None:
         ok = False
         try:
             self._append_line(line)
@@ -118,7 +152,7 @@ class DeadLetterWriter:
         finally:
             with self._pending_lock:
                 self._records_pending -= 1
-            written.set_result(ok)
+            self._settle(written, ok, on_settled)
 
     def _append_line(self, line: str) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

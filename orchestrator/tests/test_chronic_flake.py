@@ -23,24 +23,16 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from importlib import resources as pkg_resources
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-import yaml
 from _orch_helpers import CannedMcpSession, mcp_tool_envelope, pydantic_spec
+from _packaged_defaults import load_packaged_defaults
 from shared.mcp_envelope import EnvelopeParseError
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
 from orchestrator.config import OrchestratorConfig
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
 
 # ── Step-1 / Step-2: Config default tests ─────────────────────────────────────
 
@@ -91,7 +83,7 @@ class TestChronicFlakeConfigDefaults:
         and retunable in orchestrator.yaml without guessing at Pydantic
         defaults, mirroring the git:/psi_admission: precedent."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'chronic_flake' in defaults
         block = defaults['chronic_flake']
         assert block['enabled'] is False

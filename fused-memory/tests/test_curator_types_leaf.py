@@ -39,8 +39,11 @@ FORMER_SCC_MEMBERS = (
 )
 
 ALLOWED_FIRST_PARTY = frozenset({
+    'shared.declared_scope',
+    'shared.followup_items',
     'shared.task_statuses',
     'fused_memory.middleware.curation_deferral',
+    'fused_memory.middleware.followup_hold',
     'fused_memory.utils.clip_disclosure',
 })
 

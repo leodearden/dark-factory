@@ -65,7 +65,14 @@ package's schema, and this package's fixture feed renders in the portal (two-way
     `data.merge_sha` is the landed fact; `train_merged` carries `member_task_ids`; `merge_verify` and
     `workflow_verify` carry `passed` and `duration_ms`; `phase_enter`/`phase_exit` carry the phase in
     `events.phase`; `scheduler_paused`/`scheduler_resumed`; `escalation_created`/`escalation_resolved`, whose `data`
-    carries `level` on some rows only (452 of 2,675 on 2026-10-14); `task_results.review_cycles`);
+    carries `level` on some rows only (452 of 2,675 on 2026-10-14), and which the feed no longer reads: open
+    escalations come from the escalation queue below (§12, 2026-11-02); `task_results.review_cycles`);
+  - the escalation queue at `<root>/data/escalations/` (`shared.project_layout.escalation_queue_dir`), holding
+    one `esc-*.json` per pending record at its root (`escalation/src/escalation/models.py::Escalation`).
+    Resolving or dismissing a record archives it under `archive/<date>/`
+    (`escalation/src/escalation/queue.py::EscalationQueue.resolve`); parking keeps it pending at level 2
+    (`escalation/src/escalation/queue.py::EscalationQueue.park`). Measured twice on 2026-11-02: 24, then 25,
+    pending records at the root, against 1,811, then 1,841, left open by replaying runs.db's escalation rows;
   - the verify archive at `<root>/data/verify-logs/<task_id>/` (`attempt-N[.module].junit-<ts>.xml.gz`
     for task legs on every verify — 2,294 reports under 1,885 task directories on 2026-10-14 — and for
     merge runs only under `merge_verify_breadth: full`; `summary-<ts>.json` with `category` and `rc`;
@@ -101,7 +108,8 @@ client-feed/src/client_feed/
   policy.py          the publisher's config: root, dirs, visibility globs, reveal proportion and floor, free/never globs, counting caps
   feed_io.py         append-only writer (O_APPEND, O_NOFOLLOW, monotonic seq), torn-tail truncation, rotation, atomic state (mkstemp+rename), inbox tailer, cursor file
   fold.py            state = fold(feed) up to a seq watermark; the one reducer both state.json and tests use
-  sources/tasks.py   tasks.db read-only projection (tag pinned), incremental by updated_at; waiting_on from open escalations
+  sources/tasks.py   tasks.db read-only projection (tag pinned), incremental by updated_at; waiting_on from sources/escalations.py
+  sources/escalations.py  the escalation queue root's pending records, read-only: each open escalation by task, at its current level
   sources/events.py  runs.db read-only cursor over events.id → typed events, incl. factory_state and review_completed
   sources/git.py     head, branches, merge stats, visible-tree snapshot with counted lines and kinds, blob content via cat-file
   sources/archive.py junit → test_results (ids, outcomes, durations, exception type); summary → gate legs
@@ -114,8 +122,8 @@ client-feed/src/client_feed/
 client-feed/tests/   contract fixtures, source tests over fixture stores, audit-hook isolation, canary, end-to-end on this repo
 ```
 
-The publisher never imports `orchestrator`, `fused_memory` or `dashboard`; it depends on `shared` only
-for `shared.project_layout` (`tasks_db`, `runs_db`) and `shared.task_metadata` (`done_provenance`), plus, from
+The publisher never imports `orchestrator`, `fused_memory`, `dashboard` or `escalation`; it depends on `shared` only
+for `shared.project_layout` (`tasks_db`, `runs_db`, `escalation_queue_dir`) and `shared.task_metadata` (`done_provenance`), plus, from
 §14, `shared.defects` (the ref rule, in the non-vendorable `defect_ref.py`) and `shared.mcp_session` (the filer only),
 and on `pydantic`, `pyyaml` and the standard library. It uses no helper that defaults to the factory's
 own checkout (`shared.project_layout.default_project_root` is banned in `client_feed` by a test).
@@ -141,7 +149,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    caps. Nothing the portal writes can widen what a client may see.
 5. **Direct read-only reads of the two stores, never the fused-memory MCP.** Opened with `mode=ro`
    URIs; `tasks` queried with `tag = 'master'` pinned (the only tag on the live store, checked
-   2026-10-14). The publisher has no write path to any store.
+   2026-10-14). The escalation queue's root records are read read-only too, never through the
+   escalation server and without taking its locks
+   (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`). The publisher has no
+   write path to any store.
 6. **Field allowlist, not denylist.** A task contributes `id, title, status, updated_at, depends_on,
    prd_path, prd_task_label, landed_commit, waiting_on`. `description`, `details`, `test_strategy`
    and the rest of `metadata` never leave the publisher. Titles and PRD excerpts have `/home/...` and
@@ -162,8 +173,10 @@ own checkout (`shared.project_layout.default_project_root` is banned in `client_
    reader validates as closed is not minor for that reader; §14.3 states the ordering that makes it safe.
 10. **Never hide red, from recorded sources.** A failed verify is `verify_run.passed == false`; a
     blocked task is `task_upserted` with that status and `waiting_on: leo` when an open escalation
-    whose recorded `level` is 2 exists for it, else `factory` (an open escalation with no recorded
-    level is the factory's own ladder, not Leo); `factory_state` carries `scheduler: running|paused`, `last_event_at`
+    at level 2 exists for it, else `factory`. The open escalations are the escalation queue root's pending
+    records, each at its current level. An escalation counts for its own task and for the task of each
+    member that is itself a pending record, so an L2 cluster makes every member task wait on Leo.
+    `factory_state` carries `scheduler: running|paused`, `last_event_at`
     and `idle_seconds` from the project's own `runs.db`. Where a fact is not recorded (no junit, no
     summary) the event says `not_recorded`, never pass.
 11. **The publisher reports its own health.** Every `heartbeat` carries `head`, `as_of`,
@@ -244,7 +257,7 @@ corrupt feed. Events with a natural key (`task_upserted.task_id`, `prd_upserted.
 | `heartbeat` | `head`, `as_of`, `engagement_version`, `watermark_seq`, `degraded: [{source, reason}]` | publisher | every pass (default 5 s) and on start |
 | `factory_state` | `scheduler: running\|paused`, `since`, `last_event_at`, `idle_seconds` | `scheduler_paused`/`scheduler_resumed`; newest `events.timestamp` | when any field changes |
 | `prd_upserted` | `prd_path`, `title`, `excerpt`, `task_counts: {status: n}` | `sources/prds.py`; title = first H1, excerpt = first non-heading paragraph, paths redacted | first seen or counts change |
-| `task_upserted` | `task_id`, `title`, `status`, `waiting_on: factory\|leo\|null`, `updated_at`, `depends_on`, `prd_path`, `prd_task_label`, `landed_commit` | `sources/tasks.py`; open escalation from `escalation_created`/`escalation_resolved` | `updated_at` moves past the cursor or an escalation opens/closes |
+| `task_upserted` | `task_id`, `title`, `status`, `waiting_on: factory\|leo\|null`, `updated_at`, `depends_on`, `prd_path`, `prd_task_label`, `landed_commit` | `sources/tasks.py`; open escalations from the escalation queue's pending records (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`) | `updated_at` moves past the cursor or an escalation opens/closes |
 | `task_phase` | `task_id`, `phase`, `entered: bool`, `at` | `phase_enter`/`phase_exit` | per event |
 | `verify_run` | `run_key`, `task_id`, `kind: task\|merge`, `passed`, `duration_ms`, `commit`, `legs: [{name, category, rc}] \| not_recorded` | `workflow_verify`/`merge_verify` + summary JSON | per event |
 | `test_results` | `run_key`, `counts: {passed, failed, skipped, errored, truncated}`, `duration_ms`, `cases: [{id, outcome, duration_ms, criterion, exception_type}]` | junit under the task's archive dir matching the run; the criterion map file beside it | when a junit report is found for a `verify_run` |
@@ -315,7 +328,8 @@ portal's tests also run); `client-feed criteria-results …` (§7.7).
 
 For a publisher configured with root R, output directory O and inbox directory I: every byte it writes
 under O is a function of R's git objects, R's `.taskmaster/tasks/tasks.db` rows with `tag='master'`,
-R's `data/orchestrator/runs.db`, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
+R's `data/orchestrator/runs.db`, R's `data/escalations/` queue-root records, of which only `id`,
+`task_id`, `status`, `level` and `members` are read, R's `data/verify-logs/`, R's `acceptance/criteria.yaml`, the policy,
 and I's `inbox.jsonl` and `engagement.json`, filtered by the policy's visible set. It opens no other
 path. It writes nowhere but O. The portal account reads O and nothing under R.
 
@@ -334,7 +348,7 @@ The client defect filer is a separate process under its own invariant (§14.5); 
 | B7 | Red shown | an archived red attempt summary (a leg rc ≠ 0) and a junit with one failure under the task's archive dir | `verify_run.passed == false`; `test_results.counts.failed == 1`; `exception_type` present, no message |
 | B8 | Not recorded | a `verify_run` whose task dir has no junit | `test_results` absent; `verify_run.legs == "not_recorded"` |
 | B9 | Factory state | `scheduler_paused` then nothing for 3 h | `factory_state.scheduler == paused`, `idle_seconds ≥ 10800` |
-| B10 | Waiting on Leo | task 9 blocked with an open `escalation_created` level 2 | `task_upserted.waiting_on == "leo"`; after `escalation_resolved`, `"factory"` |
+| B10 | Waiting on Leo | task 9 blocked, an L1 promoted to a pending L2 | `task_upserted.waiting_on == "leo"`; after the L2 is resolved and its members cascade, `"factory"` |
 | B11 | Visible set | tree with `dark-factory-orchestrator.yaml`, `.mcp.json`, `plans/review.md`, `src/a.py`; policy visible `src/**`, `tests/**` | `tree_snapshot.files` lists only `src/a.py`; a reveal of `.mcp.json` is `reveal_refused not_visible` |
 | B12 | Reveal within budget | 1,000 counted lines, proportion 0.25, floor 50; request a 200-line production file | `file_revealed` with content; `spent_lines == 200` |
 | B13 | Reveal over budget and floor | spent 210 of 250; request a 100-line file; then a 10-line file | both `reveal_refused over_budget` (the first costs 100: 310 > 250; the second costs the floor 50: 260 > 250) |
@@ -653,6 +667,52 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     site in setup-host. `tests/scripts/test_render_systemd_unit.py::test_setup_host_renders_each_unit_from_the_template_its_spec_names`
     pairs each registry key with that call site.
 
+- 2026-11-02, from task 7280. This supersedes the closing rule, the runs.db replay and the
+  follow-up ticket of 2026-10-20 (b), and closes tkt_0RW1F0587N3HXAH0PN8A4A5TYJ:
+  - (a) Open escalations are the pending records at the root of the escalation queue
+    (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`). runs.db's
+    `escalation_created` and `escalation_resolved` rows are no longer read. A record is open at its
+    current `level` for its own task and for the task of each member that is itself a pending root
+    record. A member's task comes from that record's `task_id`, never from its id.
+    `client-feed/src/client_feed/sources/tasks.py::waiting_on` is otherwise unchanged. No level is
+    unrecorded any more, because the producer defaults it to 0.
+  - (b) A missing or unlistable queue degrades `events`, and the reason names `data/escalations`. A
+    malformed or unreadable record is skipped and counted under `events`
+    (`skipped N records in data/escalations: malformed_record=N`). A `status` outside the producer's
+    `pending`, `resolved` and `dismissed` makes the record malformed, so it is counted rather than
+    read as closed. `client-feed dump-sources` prints the open escalations and names each skipped
+    record by file. A record that is gone between listing and reading was archived in between, so
+    it is not open.
+  - (c) The publisher reads the queue as its own unit
+    (`client-feed/src/client_feed/publisher.py::_escalations_unit`), apart from runs.db. An unreadable
+    runs.db therefore no longer blinds `waiting_on`, and an unreadable queue does not hold the stream.
+    While the queue is unreadable, each task keeps its recorded `waiting_on`, as it did while runs.db
+    was unreadable.
+  - (d) No `Source` member is added and `FEED_VERSION` is unchanged. `events` already names the
+    factory's orchestrator records to the client, and a new member of an enum the portal validates as
+    closed is not a minor change for it (§4.9). The reason string tells the two stores apart for the
+    operator.
+  - (e) `client-feed/tests/test_import_boundary.py` forbids importing `escalation`. The reader parses
+    the producer's files and never imports the producer.
+  - (f) `tests/scripts/test_client_feed_escalation_queue_boundary.py` checks the reader against the
+    real producer. It drives the escalation server's own tools (`escalate_blocker`, `promote_to_l2`,
+    `resolve_issue`) on a tmp root and checks:
+    - `level`, in every test;
+    - that every record the producer leaves parses, in every read: a `status` or a field type the
+      reader refuses would be skipped as malformed, which for a closed record reads exactly like a
+      close, so a skip fails the test;
+    - own-task attribution, and member attribution across tasks: an L1 on one task promoted under
+      another task's L2 makes the member task wait on `leo` until the cascade;
+    - the `status` filter: a resolution whose archival fails, forced by a regular file at
+      `data/escalations/archive`, leaves the closed records at the root
+      (`escalation/src/escalation/queue.py::EscalationQueue._archive_resolved`), and they are not open;
+    - archival, the L2 cascade and park.
+
+    The records that `client-feed/tests/_stores.py::EscalationQueueDir` writes by hand cannot catch
+    producer drift, any more than the copied DDL can (2026-10-21 (g)). For this seam the boundary test
+    does.
+
+
 ## 13. Open questions (tactical)
 
 1. **Tree-snapshot cost on large repos.** Suggested: snapshot only on head change; blob line counts
@@ -900,13 +960,42 @@ What an operator sees:
     - The factory side needs nothing beyond σ1b's `defect_filed` and γ's `merge_landed`. Task 7005,
       the 2026-10-15 milestone gate for this same bridge, is superseded by this section and cancelled.
 
+14. **A ruling on a report is made on the portal and reaches the filer as its kind (Leo, 2026-11-03;
+    `~/src/scoping-intake/docs/prds/declined-defect-reports.md`, design note
+    `docs/prds/defect-report-rulings.md` §Q3, shape A).**
+    - Leo declines a report on the portal's admin page with one of three kinds, `not_a_defect`, `not_covered`
+      or `change_request`, and a note to the client. The note stays on the portal. The portal appends a
+      `defect_ruled {seq, at, type, block, report, kind}` line (§14.3) when the report has a `defect_reported`
+      line; a report that never crossed crosses nothing.
+    - The filer acts on each ref's final state in the lines it has read, not line by line: a `defect_reported`
+      line with a later `defect_ruled` line for the same `(block, report)` is never filed.
+    - For a ruled ref whose carrier `lookup_defect_ref` finds, in this order: `declare_defect` with a
+      `Withdrawal(not_a_defect)` closure on the fix, then `record_defect_outcome` with
+      `Rule(accepted, ruled_by: operator)`, Leo's ruling carried by the portal (`RuledBy` gains no value);
+      `set_task_status(fix, cancelled)` if the fix is `pending`; `set_task_status(gate, cancelled)`, the gate
+      found by `x_client_defect_gate_for == ref`. Fix before gate: a cancelled gate releases the fix
+      (`orchestrator/dependency_verdict.py`, a terminal dependency satisfies).
+    - Bounded: it touches only the two tasks whose `metadata.source` is `client-defect-filer` and whose ref
+      matches. A fix that is not `pending` is withdrawn but not cancelled; the portal shows the fix task's
+      status from `task_upserted` beside the ruling, and a fix that lands anyway stands (the portal's record
+      does not change; closed is closed there too).
+    - Convergent and idempotent as decision 7's filing is: a withdrawn defect, a cancelled task and a refused
+      defect write on a terminal task are each "already done", recorded and not retried.
+    - The closed tool set grows by `declare_defect`, `record_defect_outcome` and `set_task_status` (§14.3),
+      and §14.5 names the bound. Defect-tests decision 7's drift test lists the filer as a non-dispatched
+      writer of `record_defect_outcome`.
+    - Gate σ5 shows the count of ruled refs among live reports beside the verdict count before Leo flips
+      `auto_dispatch`. Under `auto_dispatch` a ruled report's fix may be dispatched before the filer's next
+      pass; the PRD's decision 11 on the portal side names the hold that would close that window, a σ2 policy
+      knob not taken while the flag is `false`.
+
 ### 14.3 Contract
 
 All models live in `client_feed/contract.py` (§7, `extra='forbid'`, frozen), except the ref rule,
 which is in `client_feed/defect_ref.py`.
 
 **`in/inbox.jsonl` gains a second line type.** The inbox model becomes a union discriminated on
-`type`: `RevealRequested | DefectReported`. `parse_inbox_line` returns the union. δ's reveal path
+`type`: `RevealRequested | DefectReported | DefectRuled` (the third member added 2026-11-03, decision 14). `parse_inbox_line` returns the union. δ's reveal path
 handles only `RevealRequested`.
 
 ```
@@ -916,6 +1005,8 @@ DefectReported   {seq: Seq, at: UtcTimestamp, type: "defect_reported", block: in
 Restated         {kind: "restated", observed: str 1..2000, expected: str 1..2000,
                   steps: [str 1..500] (0..20 items)}
 Quarantined      {kind: "quarantined", reasons: [QuarantineReason] (≥ 1, unique)}
+DefectRuled      {seq: Seq, at: UtcTimestamp, type: "defect_ruled", block: int ≥ 1, report: int ≥ 1,
+                  kind: "not_a_defect" | "not_covered" | "change_request"}   # decision 14; no note, no text
 QuarantineReason = suspected_injection | not_restatable | restater_declined | restater_failed
 CriterionId      = ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$     # also Criterion.id in acceptance/criteria.yaml (ε)
 Token            = ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$
@@ -966,12 +1057,15 @@ must lie under none of them. `policy.py` refuses a policy that breaks this.
 **The filer's closed tool set:**
 
 - The tools: `lookup_defect_ref`, `find_tasks_by_metadata`, `get_task`, `submit_task` (always
-  `planning_mode=True`), `add_dependency` and `commit_planning`.
+  `planning_mode=True`), `add_dependency` and `commit_planning`; and, for a ruled ref only (decision 14),
+  `declare_defect` (a withdrawal closure), `record_defect_outcome` (the accepting rule) and `set_task_status`
+  (`cancelled`, on the two tasks it created).
 - The client: `shared/src/shared/mcp_session.py::SyncMcpSession`. σ2 makes its `httpx` client
   injectable, so the filer passes `trust_env=False` and no proxy setting can redirect it. Every call
   carries `project_root=R`.
-- The filer calls no other tool. In particular it never calls `update_task`, `set_task_status`,
-  `remove_task`, `declare_defect`, any memory tool or any escalation tool.
+- The filer calls no other tool. In particular it never calls `update_task`, `remove_task`, any memory tool or
+  any escalation tool, and it calls `set_task_status`, `declare_defect` and `record_defect_outcome` only on a
+  carrier it filed for a ref the portal has ruled (decision 14; amended 2026-11-03).
 
 **The tasks it files:**
 
@@ -1028,7 +1122,8 @@ For a filer configured with policy P (root R, inbox directory I, state directory
   with `planning_mode=True`.
 - It writes nothing under O, I or R.
 - Everything it submits is a function of the `defect_reported` lines in I and of P. No other text
-  reaches a task.
+  reaches a task. It withdraws and cancels only the two tasks it created for a ref a `defect_ruled` line in
+  I rules, and only a `pending` fix is cancelled (decision 14; amended 2026-11-03).
 
 §8 is unchanged. The publisher still opens nothing beyond R, O and I. Its new reads, the
 `defect_reported` lines and the two allowlisted fields, are inside them.
@@ -1051,6 +1146,10 @@ For a filer configured with policy P (root R, inbox directory I, state directory
 | B34 | Reveals unaffected | an inbox interleaving both line types | reveal answers as in B12–B16; the filer ignores `reveal_requested`; no valid `defect_reported` line is counted under `inbox` |
 | B35 | Validation fallback | a restatement whose `observed` contains `</description>`; the fake returns the guard's real shape (an `isError` reply), and B36 repeats it against the real guard | the restated fix is refused; the filer files the quarantined shape with `filer_fallback` and a gate, even with `auto_dispatch: true` |
 | B36 | Real tool layer end to end | the server built as the fixture in `fused-memory/tests/test_defect_write_tools.py` builds it (`SqliteTaskBackend`, `TaskInterceptor`, `create_mcp_server`), plus `fused_memory.server.main._install_tool_dispatch_guards`, its HTTP app served by uvicorn in a background thread on a free 127.0.0.1 port; the filer pointed at that URL; the vendored `in-v2` inbox | B25, B29 and B35 hold on the rows that store wrote and against the real guard; the publisher, run over that same `tasks.db`, emits `defect_filed` for each filed ref |
+| B37 | Inbox contract, third member | the portal's committed `tests/fixtures/in-v3/` (a `defect_reported` line followed by its `defect_ruled` line; a `defect_ruled` line for a report whose `defect_reported` line came earlier; between `reveal_requested` lines), vendored byte for byte | each line validates under `client_feed.contract`; `parse_inbox_line` returns `DefectRuled`; a `defect_ruled` line carrying a note field, a fourth kind or `report: 0` is rejected; δ's reveal path still takes `RevealRequested` only |
+| B38 | Ruled before filing | a `defect_reported` line and its `defect_ruled` line read in one pass; the same two lines read in two passes with the filer restarted between | nothing is filed for the ref in the first case; in the second the fix and gate the first pass filed are withdrawn and cancelled by the second, fix before gate; one `defect_filed` was emitted and `task_upserted` shows both cancelled |
+| B39 | Bounded, idempotent, convergent | the ruled ref's fix `pending` with its gate; the same inbox run twice; the filer killed after the withdrawal, after the fix's cancel, and before the gate's cancel; a ruled ref whose fix is `in-progress`, and one whose fix is `done` | the end state (withdrawn, fix cancelled, gate cancelled) is reached from each crash point; the recording fake sees writes only on the two tasks whose `metadata.source` is `client-defect-filer` and whose ref matches; the `in-progress` and `done` fixes are withdrawn but not cancelled; B30's tool-name set is the amended closed set, and `set_task_status` is seen with `cancelled` only |
+| B40 | Decision 7's order on a terminal fix | a ruled ref whose fix is `done` | no defect write is attempted on it (none is allowed on a terminal task); the refusal is recorded as converged and not retried; the gate, if still pending, is cancelled |
 
 B3 is extended with a task carrying a `review:` ref and a foreign project's `portal:` ref: neither
 reaches O.
@@ -1099,6 +1198,7 @@ Pre-conditions:
 | Label | Task | Modules | Observable signal | Prereqs |
 |---|---|---|---|---|
 | σ1a | Inbox union with `defect_reported`, `CriterionId`, and the ref rule | `client_feed/contract.py` (`DefectReported`, `Restated`, `Quarantined`, `CriterionId`, the union, `parse_inbox_line`), `client_feed/inbox.py` (`InboxRead` over the union; δ's reveal path takes `RevealRequested` only), `client_feed/defect_ref.py` (new), `client_feed/policy.py` (`filer_grace_seconds` and the `filer:` block's model with its O/I/R checks), `client-feed/tests/test_import_boundary.py` (`shared.defects` allowed), a factory fixture `client-feed/tests/fixtures/in-v2-factory/`, tests | Intermediate: unlocks σ1b, σ2 and ε's adoption of `CriterionId`. B24; B23's rejection cases over the factory fixture; a policy naming its `state_dir` under O is refused; δ's reveal tests stay green | — |
+| σ1c | `DefectRuled` in the inbox contract (decision 14; added 2026-11-03) | `client_feed/contract.py` (`DefectRuled`, `RulingKind`, the three-member union, `parse_inbox_line`), `client_feed/inbox.py` (`InboxRead` over the union; the reveal path unchanged) | Intermediate: unlocks σ2's decision-14 duty and the portal's δ (the writer). B37 passes against a hand-written line; the vendored fixture arrives with σ3 | σ1a |
 | σ1b | The acknowledgement: `defect_filed`, `defects_filed`, `Source.filer`, the ref reader, the unfiled check, feed 1.1 | `client_feed/contract.py` (`DefectFiled`, `Source.filer`, `FEED_VERSION`), `client_feed/sources/tasks.py` (the ref reader), `client_feed/feed_io.py` (`Cursor.defect_scan_offset`, `pending_reports`), `client_feed/publisher.py`, `client_feed/value_events.py` or `stream_events.py`, `client_feed/fold.py`, the committed 1.1 feed fixture, tests | `client-feed snapshot` over a fixture root whose inbox holds a `defect_reported` line and whose `tasks.db` holds its carrier writes one `defect_filed` and folds it into `state.json`. Without a carrier, and past the grace, the heartbeat names `filer`, with reveals disabled too (B32, B33, B34, B3 extended). `validate-feed` passes on the 1.1 fixture | σ1a, ε (6972) (shares `publisher.py` and `contract.py`) |
 | σ2 | The filer: `client-feed file-defects` (`--once`, `--check`), the closed MCP client, convergent gated filing with the validation fallback, the lock, the unit template and operator docs | `client_feed/filer.py` (new), `client_feed/cli.py` (`file-defects`), `shared/src/shared/mcp_session.py` (an injectable `httpx` client), `client-feed/tests/test_import_boundary.py` (`shared.mcp_session` allowed, for the filer only), `client-feed/tests/_audit_hook.py` (new; ζ imports it), `client-feed/tests/test_filer*.py`, `scripts/client-feed-filer.service.template`, `scripts/setup-host.sh` (render only), `OPERATIONS.md` ("Client feed": the filer, `--check`, σ4's preconditions) | Intermediate: unlocks σ3, σ4 and ζ's import. B25–B30 and B35 pass in the client-feed suite | σ1a, ε (6972) (shares `cli.py`), η (6974) |
 | σ3 | Integration gate: the real tool layer and the portal's fixture, end to end | `client-feed/tests/fixtures/in-v2/` (vendored, with its source sha), B36's test and its home: where both the filer and `fused_memory.server` import, e.g. `fused-memory/tests/` with `client-feed` as a fused-memory dev dependency (src unchanged). σ3 decides | B23 against the portal's real fixture; B36 against the real fused-memory tool layer and its markup guard, ending with `defect_filed` in the feed | σ1b, σ2, `scoping_intake:<P1a>` |
@@ -1114,6 +1214,10 @@ Amendments at decompose to tasks already filed:
 - ι (7057) builds on σ1b's ref reader and depends on σ1b.
 - 7005, the 2026-10-15 milestone gate for this same bridge, is cancelled as superseded (decision 13).
   It has no dependents.
+- Added 2026-11-03 (decision 14): σ2 (7404) gains the ruled-ref duty, the three tools, B38 to B40 and the
+  defect-tests drift-test line, and depends on σ1c; σ3 (7407) vendors the portal's `in-v3` fixture and depends
+  on the portal's δ (`scoping_intake`, filed from `docs/prds/declined-defect-reports.md`); σ5 shows the count
+  of ruled refs among live reports beside the verdict count.
 
 Portal tasks, filed in scoping-intake's tree, are the portal PRD's ξ1, ξ2, π and ρ:
 
@@ -1155,6 +1259,7 @@ Edges:
 
 - Within this PRD: σ1a → σ1b, σ2; ε (6972) → σ1b, σ2; η (6974) → σ2; σ1b, σ2, P1a → σ3; σ3, P1b, P2
   → σ4; σ4 → σ5.
+- Added 2026-11-03: σ1a → σ1c; σ1c → σ2; σ1c → the portal's δ; the portal's δ → σ3.
 - Amendments to filed tasks: σ1a → ε (6972); σ2 → ζ (6973); σ1b → ι (7057).
 - Into the portal: σ1a, σ1b → P1a; P1a, μ (61) → P3; P1a, P3, 6972 → P1b; ι (53) → P2.
 
@@ -1191,8 +1296,9 @@ G7, design-time notes:
 ### 14.9 Out of scope
 
 - Raw client text anywhere on the factory side.
-- Disputed reports, such as a change request presented as a defect. These are Leo's call at the gate;
-  defect-tests' withdrawal and exemption rules apply to the declared defect.
+- ~~Disputed reports~~ (amended 2026-11-03): a report Leo declines is ruled on the portal and reaches the
+  filer as decision 14's `defect_ruled` line; defect-tests' withdrawal rules apply to the declared defect.
+  What stays out: Leo's note to the client (portal only) and a hold before a client-defect fix is dispatchable.
 - Authentication on the factory's MCP servers. The residual is recorded in decision 9, and the
   portal's default-deny is the chosen control.
 - Read containment for agents.

@@ -30,6 +30,8 @@ _HOME_CLAUDE = Path.home() / '.claude'
 # Do NOT include projects/, sessions/, telemetry/ — those must be per-task.
 _SYMLINK_FILES = ['settings.json', 'settings.local.json']
 
+_CREDENTIALS_FILE = '.credentials.json'
+
 # Single source of truth for the config-dir naming template. Both
 # TaskConfigDir.__init__ (which constructs the names) and
 # sweep_stale_pid_dirs (which reclaims them) key off this, so the
@@ -354,10 +356,14 @@ class TaskConfigDir:
                 'accessToken': oauth_token,
             },
         }
-        creds_path = self._dir / '.credentials.json'
+        creds_path = self._dir / _CREDENTIALS_FILE
         creds_path.write_text(json.dumps(creds))
         # Restrict permissions (token is sensitive)
         creds_path.chmod(0o600)
+
+    def remove_credentials(self) -> None:
+        """Delete the written OAuth token, keeping the session transcripts."""
+        (self._dir / _CREDENTIALS_FILE).unlink(missing_ok=True)
 
     @property
     def path(self) -> Path:

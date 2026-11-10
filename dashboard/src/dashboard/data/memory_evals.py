@@ -48,8 +48,8 @@ is a list); semantic M1 rules such as a proportion outside [0,1] still pass
 through verbatim with no issue.
 
 The same rule governs the reader's INDEXES.  Every ``{key: record}`` build here
-(metrics by ``metric_id``, verdicts by ``(eval_id, metric_id)``, escalations by
-``dedupe_fingerprint``) would silently keep whichever record came last on a key
+(metrics by ``metric_id``, verdicts by ``(eval_id, metric_id, item)``,
+escalations by ``dedupe_fingerprint``) would silently keep whichever record came last on a key
 collision, so each one instead keeps the FIRST and names the drop
 (``duplicate_*``).  A dropped escalation is the sharpest case: last-wins would
 make the loser invisible everywhere in the payload — no row link and no
@@ -68,12 +68,10 @@ escalation with no usable ``dedupe_fingerprint`` is named
 and a live alarm must never be absent from both.  The openness test is positive
 (``status`` is ``pending``) rather than a blocklist of closed states, so a
 status vocabulary that grows a new terminal state fails toward "not shown as
-open" rather than toward a closed alarm rendered as live.  A record that is not
-even an object — the parsed queue file's top level was a list, string, number
-or other non-dict JSON value — is neither classifiable nor keyable, so it takes
-neither filter path above; it is instead the ``malformed_*`` case from the
-three disposal paths described earlier (``malformed_escalation_record``), since
-the file parsed but not into the expected shape.
+open" rather than toward a closed alarm rendered as live.  A queue file the
+escalation corpus could not read as an escalation is neither classifiable nor
+keyable, so it takes neither filter path above; it is named at its own path
+(``unreadable_escalation_file``), exactly as the Escalations tab lists it.
 
 The derived ``parity`` badge answers to the same rule.  A verdict outside the
 closed M2 set has no badge, so it is NAMED (``unknown_verdict``) instead of
@@ -98,7 +96,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from dashboard.data.escalations import load_queue_escalations
+from escalation.models import Escalation
+
+from dashboard.data.datum import Datum
+from dashboard.data.escalation_corpus import EscalationCorpus, Location, QueueScan
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 _KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
 
 # The closed parity vocabulary — every value ``_parity`` can emit, plus the
-# ``storm_collapsed`` state ``_build_eval`` short-circuits to.  PUBLIC on
+# ``storm_collapsed`` state ``_verdict_row_fields`` short-circuits to.  PUBLIC on
 # purpose: it is the single source of truth the dashboard tab (task 3216) and
 # the parity gate (task 3217) should assert against, rather than each
 # hardcoding a subset that rots silently the moment a state is added here.
@@ -227,11 +228,11 @@ _LIMITS_PROVENANCE_KEYS = (
 )
 
 # Every value this module interpolates into an `_issue` detail is read out
-# of unvalidated JSON off disk — an escalation queue record, a metrics run,
+# of unvalidated data off disk — an escalation queue record, a metrics run,
 # a per-eval limits artifact, or the root verdicts artifact — and may be
 # arbitrarily large.  Two shapes reach here, and the second is the
 # non-obvious one a future reader would otherwise re-litigate: a value with
-# no type guard at all (`record.get("id")`, `run_kind`, `verdict`,
+# no type guard at all (`escalation.id`, `run_kind`, `verdict`,
 # `status`) is arbitrary JSON and may be a dict, a list, or a
 # multi-megabyte string; a value already `isinstance`-guarded to a
 # non-empty `str` (`metric_id`, `eval_id`, `latest_run_stamp`) is
@@ -243,17 +244,16 @@ _LIMITS_PROVENANCE_KEYS = (
 # the naming of the discard its own degradation.
 #
 # A THIRD shape reaches a detail without ever going through `_short_repr`:
-# `str(exc)` on the `unreadable_*` sites, and `entry["error"]` (itself a
-# `str(exc)`, built by
-# dashboard/src/dashboard/data/escalations.py::load_queue_escalations) on
+# `str(exc)` on the `unreadable_*` sites, and
+# dashboard/src/dashboard/data/escalation_corpus.py::Unreadable.error on
 # `unreadable_escalation_file`.  These stay raw because they are bounded
-# BY the exception types each site's `try` actually narrows to
-# (`_ARTIFACT_ERRORS = (OSError, ValueError)`, at a read/parse boundary
-# BEFORE the artifact exists as Python data): a `json.JSONDecodeError`
-# message is one of a handful of fixed internal literals plus a
-# line/column/char offset, never the document's own bytes; `OSError`
-# carries the path (OS-length-bounded) and a fixed errno string;
-# `UnicodeDecodeError` carries one byte value and a position — none of
+# BY the exceptions a read/parse boundary raises BEFORE the artifact exists
+# as Python data (`_ARTIFACT_ERRORS` here; the corpus' read, `json.loads`
+# and `Escalation.from_dict`): a `json.JSONDecodeError` message is one of a
+# handful of fixed internal literals plus a line/column/char offset, never
+# the document's own bytes; `OSError` carries the path (OS-length-bounded)
+# and a fixed errno string; `UnicodeDecodeError` carries one byte value and
+# a position; a `from_dict` rejection names a type or a field — none of
 # those can embed an artifact-derived string of attacker-chosen length.
 # The two `internal_error` sites are the exception: they catch bare
 # `Exception` as the last-resort bug boundary (see `build_memory_evals`'s
@@ -270,10 +270,9 @@ _LIMITS_PROVENANCE_KEYS = (
 # of it either.
 #
 # The invariant this enforces: no raw `!r` on an artifact-derived value in
-# an `_issue` detail, at any of the fifteen interpolations this task swept
-# — held by the closure test
+# an `_issue` detail — held by the closure test
 # `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded` for the
-# fourteen issue kinds its hostile tree exercises (see `required_kinds`
+# thirteen issue kinds its hostile tree exercises (see `required_kinds`
 # there), so an edit that reintroduces a raw `!r` at one of THOSE sites
 # fails loudly instead of silently reopening this exposure.  That test
 # does not enumerate the module's full issue-kind vocabulary: a brand-new
@@ -289,10 +288,9 @@ _LIMITS_PROVENANCE_KEYS = (
 #
 # `_issue`'s structured `path=` kwarg needs no cap at all: every `path=`
 # argument in this module is filesystem-derived — a `Path` built from the
-# artifact-tree walk, or the `str(Path)` that
-# dashboard/src/dashboard/data/escalations.py::load_queue_escalations
-# returns at its skips projection — never artifact-derived, hence bounded
-# by construction rather than by any knob here.
+# artifact-tree walk, or the corpus walk's `Unreadable.path` — never
+# artifact-derived, hence bounded by construction rather than by any knob
+# here.
 _MAX_DISCARDED_VALUE_REPR = 120
 
 # `_issue`'s structured `eval_id=` kwarg is an IDENTITY field — the
@@ -319,6 +317,10 @@ _MAX_DISCARDED_VALUE_REPR = 120
 # Held by `tests/test_memory_evals_data.py::TestVerdictEvalIdLengthIsBounded`
 # and `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded`.
 _MAX_EVAL_ID_LENGTH = 255
+
+# ``(eval_id, metric_id) -> {item -> entry}``; a window metric's entry has no
+# ``item`` and is keyed ``None``.
+_VerdictIndex = dict[tuple[str, str], dict[str | None, dict[str, Any]]]
 
 
 def _load_json(path: Path) -> Any:
@@ -359,6 +361,12 @@ def _short_repr(value: Any) -> str:
     if len(text) <= _MAX_DISCARDED_VALUE_REPR:
         return text
     return text[:_MAX_DISCARDED_VALUE_REPR] + '…'
+
+
+def _verdict_identity(metric_id: Any, item: Any) -> str:
+    """How an issue detail names one verdict entry: its metric, then its item when it has one."""
+    named = f'metric {_short_repr(metric_id)}'
+    return named if item is None else f'{named} item {_short_repr(item)}'
 
 
 def _read_limits(
@@ -550,8 +558,12 @@ def _read_verdicts(
     root: Path,
     eval_dirs: list[Path],
     issues: list[dict[str, Any]],
-) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any] | None]:
-    """Index the ROOT verdicts artifact by ``(eval_id, metric_id)``.
+) -> tuple[_VerdictIndex, dict[str, Any] | None]:
+    """Index the ROOT verdicts artifact by ``(eval_id, metric_id, item)``.
+
+    That triple is the fingerprint identity, so a tripwire contributes one
+    entry per item; see ``shared/tests/fixtures/memory_eval_verdicts/README.md``
+    §"Entry granularity".
 
     Root-scoped, not per-eval: ``docs/prds/memory-eval-program.md`` pins
     ``fused-memory/data/memory-evals/verdicts-<STAMP>.json``, and the
@@ -568,8 +580,9 @@ def _read_verdicts(
     body that parses but is not an object — or is an object whose ``entries``
     is absent or not a list — is ``malformed_verdicts``, an individual
     non-object element is ``malformed_verdict_entry``, and elements that ARE
-    objects but carry no usable ``(eval_id, metric_id)`` pair are counted into
-    one ``unidentified_verdicts``.  The ``entries`` paths matter most: a
+    objects but carry no usable ``(eval_id, metric_id)`` pair, or an ``item``
+    that is present but not a non-empty string, are counted into one
+    ``unidentified_verdicts``.  The ``entries`` paths matter most: a
     discarded verdicts body leaves every row's verdict absent, which is
     indistinguishable from a healthy no-alarm tree unless the discard is
     recorded — and the record-level form is the same confusion one row at a
@@ -655,7 +668,7 @@ def _read_verdicts(
         )
         entries = []
 
-    index: dict[tuple[str, str], dict[str, Any]] = {}
+    index: _VerdictIndex = {}
     unkeyable = 0
     overlong_eval_id = 0
     for entry in entries:
@@ -670,10 +683,12 @@ def _read_verdicts(
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
+        item = entry.get('item')
         eval_id_overlong = isinstance(eval_id, str) and len(eval_id) > _MAX_EVAL_ID_LENGTH
         if (
             not isinstance(eval_id, str) or not isinstance(metric_id, str)
             or not eval_id or not metric_id
+            or not (item is None or (isinstance(item, str) and item))
             or eval_id_overlong
         ):
             # An object, but one that can never be keyed onto a row.  Dropping
@@ -690,17 +705,21 @@ def _read_verdicts(
             else:
                 unkeyable += 1
         else:
-            key = (eval_id, metric_id)
-            if key in index:
-                # Two judgements of one metric in one run: last-wins would pick
-                # the row's verdict AND its fingerprint (hence its escalation
-                # link) by array order alone.  First wins, and the drop is named.
+            items = index.setdefault((eval_id, metric_id), {})
+            if item in items:
+                # Two judgements of one fingerprint identity in one run:
+                # last-wins would pick the row's verdict AND its fingerprint
+                # (hence its escalation link) by array order alone.  First
+                # wins, and the drop is named.
                 _issue(
                     issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
-                    detail=f'metric {_short_repr(metric_id)} has more than one verdict entry; the first is used',
+                    detail=(
+                        f'{_verdict_identity(metric_id, item)} has more than one verdict '
+                        'entry; the first is used'
+                    ),
                 )
                 continue
-            index[key] = entry
+            items[item] = entry
     if unkeyable or overlong_eval_id:
         # Counted once per file rather than one issue apiece, mirroring
         # `_by_metric_id`: a systematically broken artifact should cost one row
@@ -709,10 +728,12 @@ def _read_verdicts(
             issues, 'unidentified_verdicts', path=path,
             detail=(
                 f'{unkeyable} verdict entr(ies) carry no usable "eval_id"/"metric_id" pair '
-                f'(absent, empty, or not a string) and {overlong_eval_id} carry an "eval_id" '
-                f'longer than {_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
+                '(absent, empty, or not a string) or carry an "item" that is not a non-empty '
+                f'string, and {overlong_eval_id} carry an "eval_id" longer than '
+                f'{_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
             ),
         )
+    _name_shared_fingerprints(index, path, issues)
 
     # Run-scoped, which is why it lives beside the entries rather than inside
     # them.  Surfaced only while TRIGGERED — an untriggered block is the
@@ -723,25 +744,53 @@ def _read_verdicts(
     return index, storm
 
 
-def _escalation_projection(record: dict[str, Any]) -> dict[str, Any]:
+def _name_shared_fingerprints(index: _VerdictIndex, path: Path, issues: list[dict[str, Any]]) -> None:
+    """Name every indexed verdict entry whose fingerprint an earlier one already carries.
+
+    A fingerprint names one ``(eval_id, metric_id, item)`` identity and the
+    escalation join is whole-string equality on it, so two entries sharing one
+    would both claim the same escalation.  ``_verdict_row_fields`` links it to
+    the first row that claims it; this makes the sharing itself visible.
+    """
+    holders: dict[str, tuple[str, str, str | None]] = {}
+    for (eval_id, metric_id), items in index.items():
+        for item, entry in items.items():
+            fingerprint = entry.get('fingerprint')
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            holder = holders.setdefault(fingerprint, (eval_id, metric_id, item))
+            if holder == (eval_id, metric_id, item):
+                continue
+            held_eval_id, held_metric_id, held_item = holder
+            _issue(
+                issues, 'duplicate_verdict_fingerprint', eval_id=eval_id, path=path,
+                detail=(
+                    f'{_verdict_identity(metric_id, item)} carries fingerprint {_short_repr(fingerprint)}, '
+                    f'as does {_verdict_identity(held_metric_id, held_item)} in eval '
+                    f'{_short_repr(held_eval_id)}; an escalation carrying it links only whichever '
+                    'of their rows comes first in the payload'
+                ),
+            )
+
+
+def _escalation_projection(escalation: Escalation) -> dict[str, Any]:
     """The fields a metric row (or ``unmatched_escalations``) carries.
 
-    ``created_at`` is sourced from the queue record's ``timestamp`` — that is
-    the field ``escalation.models.Escalation`` serialises.  The fingerprint is
-    echoed so an operator can see WHY a row linked, without the UI having to
-    cross-reference two fields.
+    ``created_at`` is sourced from the queue record's ``timestamp``.  The
+    fingerprint is echoed so an operator can see WHY a row linked, without the
+    UI having to cross-reference two fields.
     """
     return {
-        'id': record.get('id'),
-        'summary': record.get('summary'),
-        'severity': record.get('severity'),
-        'level': record.get('level'),
-        'created_at': record.get('timestamp'),
-        'dedupe_fingerprint': record.get('dedupe_fingerprint'),
+        'id': escalation.id,
+        'summary': escalation.summary,
+        'severity': escalation.severity,
+        'level': escalation.level,
+        'created_at': escalation.timestamp,
+        'dedupe_fingerprint': escalation.dedupe_fingerprint,
     }
 
 
-def _unmatched_projection(record: dict[str, Any], reason: str) -> dict[str, Any]:
+def _unmatched_projection(escalation: Escalation, reason: str) -> dict[str, Any]:
     """An open escalation that no metric row links, plus WHY it carries no link.
 
     ``no_matching_verdict`` — nothing in the verdicts artifact claims this
@@ -765,215 +814,128 @@ def _unmatched_projection(record: dict[str, Any], reason: str) -> dict[str, Any]
     escalations that are in fact fully explained, and train operators to ignore
     the one signal that catches a real parity orphan.
     """
-    return {**_escalation_projection(record), 'reason': reason}
+    return {**_escalation_projection(escalation), 'reason': reason}
+
+
+def _name_unreadable_queue_files(scan: QueueScan, issues: list[dict[str, Any]]) -> None:
+    """One ``unreadable_escalation_file`` per live-queue file the corpus could not read.
+
+    The ``detail`` is deliberately CONDITIONAL ("if it held an open
+    ``eval_regression`` escalation…"): the queue is shared across every
+    category and status, and an unreadable file's category and status are
+    exactly what is not known.  Its ``path`` is the FILE, unlike the
+    record-level issues, which name the queue dir.  The singular kind stays
+    separable from ``unreadable_escalations``, which means no walk was read.
+    """
+    for entry in scan.unreadable:
+        if entry.location is not Location.ROOT:
+            continue
+        _issue(
+            issues, 'unreadable_escalation_file', path=entry.path,
+            detail=(
+                f'escalation queue file could not be read ({entry.error}); '
+                'if it held an open eval_regression escalation it is missing '
+                'from this payload, so unmatched_escalations cannot be read '
+                'as exhaustive'
+            ),
+        )
 
 
 def _index_escalations(
-    escalations_dir: Path,
+    corpus: Datum[EscalationCorpus],
+    escalation_queue: str,
     issues: list[dict[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, Escalation], list[Escalation]]:
     """Index open ``eval_regression`` escalations by ``dedupe_fingerprint``.
 
-    Returns ``(fingerprint -> record, open records that carry no usable
+    Returns ``(fingerprint -> escalation, open escalations that carry no usable
     fingerprint)``.  The second list exists because the fingerprint is the
     index KEY: a record without one cannot be represented in the index at all,
     yet it is still an open alarm the payload owes the operator.
 
-    Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
-    a call site, never a second reader).  Its existing contracts carry most of
-    this join: a missing dir returns ``[]`` so the no-queue case needs no
-    guard, and unparseable files are skipped so a corrupt escalation cannot
-    crash the join.  Those skips are also NAMED here
-    (``unreadable_escalation_file``, one issue per file) via the reader's
-    opt-in ``skipped`` accumulator.  That is the one discard this function
-    makes that it cannot see directly — it happens a frame down — and it is
-    the one that matters most: a corrupt file holding an open alarm is
-    precisely what makes ``unmatched_escalations`` non-exhaustive, and left
-    unnamed the parity view reports "nothing unexplained" in exactly the case
-    it exists to catch.
+    The source is the escalation corpus' ROOT records of *escalation_queue* —
+    the live queue, the same population the Escalations tab lists — and its
+    root unreadable files are named (:func:`_name_unreadable_queue_files`),
+    because a corrupt file holding an open alarm is precisely what makes
+    ``unmatched_escalations`` non-exhaustive.  An unknown corpus is one
+    ``unreadable_escalations`` issue carrying the corpus' own reason, never
+    read as "nothing is escalated".
 
-    The issue's ``detail`` is deliberately CONDITIONAL ("if it held an open
-    ``eval_regression`` escalation…").  The queue is shared across every
-    escalation category and both open and closed statuses, and this join keeps
-    only open ``eval_regression`` records — so the likeliest corrupt file is
-    one this function would have filtered out anyway.  The file is unreadable,
-    which means its category and status are exactly what is NOT known; stating
-    the loss as fact would make the payload assert something it cannot see, and
-    "degrade loudly, never lie" is the whole point of the parity view.  The
-    uncertainty is the reason to name it, not a reason to overstate it.  The
-    corollary is that ``issue_count`` here can be non-zero for corruption with
-    no bearing on memory evals; a named maybe-loss beats an unnamed one.
+    Openness is filtered EXPLICITLY on ``status``, not inferred from a record
+    lying at the queue root: ``escalation.queue._archive_resolved`` is
+    best-effort, and on ``OSError`` leaves the RESOLVED record in the root.
+    The test is POSITIVE (``status`` is ``pending``), so a status vocabulary
+    that grows a new terminal state does not silently start rendering as open;
+    ``park()`` keeps a genuinely-open L2 at ``pending``.  An UNRECOGNISED
+    status, a null one included, is skipped and NAMED, unlike the
+    resolved/dismissed skip, which is the filter doing its job.
+    ``Escalation.from_dict`` validates no field types, so ``status`` and
+    ``dedupe_fingerprint`` are type-guarded before use.
 
-    The issue's ``path`` is the FILE, unlike the
-    record-level issues below which name the queue dir: those describe records
-    inside a file that DID parse, so the dir is the most specific location
-    available, whereas here the reader knows exactly which file to go repair.
-    The kind is singular to stay separable from ``unreadable_escalations``
-    (plural), which means the whole join blew up.
+    Matching is ``==`` over the WHOLE fingerprint string; nothing here parses
+    the producer's private construction of it.
 
-    A record that DOES parse but is not an object takes a related, narrower
-    path one frame down: ``load_queue_escalations`` validates only that a file
-    PARSES, not that its top level is a dict, so a queue file whose JSON is a
-    bare list, string or number arrives here as a non-dict entry in
-    ``records``.  It is named ``malformed_escalation_record`` with the queue
-    DIR as its path, like the other record-level issues below — by this point
-    the loop has only the parsed value, not the file it came from, so the dir
-    is the most specific location available.  It is named but, unlike
-    ``unfingerprinted_escalation`` below, it is NOT carried into
-    ``unmatched_escalations``: a non-dict value has no ``category`` or
-    ``status`` to read, so the reader never established it was an open
-    ``eval_regression`` escalation at all, and asserting it into that list
-    would claim a classification that was never made.
-
-    Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
-    that ``load_queue_escalations`` skips the archive subtree.  That inference
-    does not hold: ``escalation.queue._archive_resolved`` is best-effort — on
-    ``OSError`` it logs a warning and leaves the RESOLVED record in the queue
-    root — and ``dashboard.data.escalations._bucket`` counts ``resolved`` /
-    ``dismissed`` among the very records this same reader returns.  Without the
-    filter a closed alarm renders as ``alarmed_open``, and a closed orphan
-    renders as a still-open ``unmatched_escalations`` entry — the parity view
-    reporting the exact falsehood it exists to catch.
-
-    The test is POSITIVE (``status`` is ``pending``) rather than a blocklist of
-    closed values, so a status vocabulary that grows a new terminal state does
-    not silently start rendering as open.  ``park()`` deliberately keeps
-    ``status='pending'`` for a genuinely-open L2, so a parked escalation still
-    joins.  A record with no ``status`` at all is treated as pending, matching
-    the ``Escalation.status`` model default.  An UNRECOGNISED status is skipped
-    and NAMED — that skip is a real discard, unlike the resolved/dismissed case
-    which is the filter doing its job.  A status that is not a string at all
-    (the artifact is unvalidated JSON) is unrecognised in exactly that sense
-    and takes the same path.
-
-    Matching is ``==`` over the WHOLE fingerprint string.  The fingerprint is
-    the producer's private construction; nothing here parses its substructure,
-    so the producer can change how it is built without breaking the dashboard.
-
-    Two open escalations may share a fingerprint (a dedupe that did not take).
-    Indexing them last-wins would make the loser invisible EVERYWHERE in the
-    payload — no row link, no ``unmatched_escalations`` entry — which is
-    precisely the silent degradation the parity view exists to catch, so the
-    collision is named.  The survivor is whichever record the queue scan reached
-    first, and that is ``Path.glob`` order rather than a meaningful ranking —
-    which is exactly why the issue names BOTH ids: the operator can see the
-    colliding pair without depending on which one won.
-
-    The loser is deliberately NOT carried into ``unmatched_escalations``,
-    unlike the unfingerprinted case below — this is intentional, not an
-    oversight.  It is not unreachable from the payload the way an unnamed drop
-    would be: the issue above already names BOTH ids, so the operator can see
-    the colliding pair without a second list.  And carrying it could assert a
-    FALSEHOOD — the loser shares the winner's fingerprint, so if a metric row
-    claims that fingerprint the loser IS explained, and listing it under
-    ``no_matching_verdict`` would fire the parity signal on a fully-explained
-    escalation, exactly the failure :func:`_unmatched_projection`'s reason
-    vocabulary exists to prevent.  If no row claims the fingerprint, the winner
-    already lands in ``unmatched_escalations`` under it, so the fact is
-    surfaced either way.  The unfingerprinted case below is genuinely
-    different: it can never join ANY row and has no sibling record carrying
-    its signal, which is why it alone is both named and carried.
-
-    An OPEN record whose ``dedupe_fingerprint`` is absent or not a string is
-    the last place a live alarm could leave this payload: it cannot key the
-    index, and ``unmatched_escalations`` is derived FROM the index, so a bare
-    skip would erase it from the metric rows and from the reverse-direction
-    list in one move — the exact blind spot the parity view exists to close.
-    It is therefore both NAMED and returned for surfacing.  That is the
-    opposite standing from ``resolved``/``dismissed``, which are dropped with
-    no issue precisely because dropping them is the filter doing its job.
+    Two open escalations sharing a fingerprint (a dedupe that did not take) is
+    named with BOTH ids; the first in walk order is used.  The loser is not
+    carried into ``unmatched_escalations``: it shares the winner's fingerprint,
+    so listing it could fire the parity signal on an escalation a metric row
+    fully explains.  An OPEN record with no usable fingerprint can never join
+    any row and has no sibling carrying its signal, so it alone is both named
+    and returned for surfacing.
     """
-    index: dict[str, dict[str, Any]] = {}
-    unfingerprinted: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    # Drained in ``finally`` and BEFORE the join loop, for two distinct reasons.
-    # ``finally``: the reader can raise mid-scan (``is_dir`` or the ``glob``
-    # iterator hitting a mode change or an NFS hiccup — the very case
-    # ``build_memory_evals``'s ``_ARTIFACT_ERRORS`` wrapper exists for) AFTER it
-    # has already recorded some skips, and dropping those on the way out would
-    # be this change's own silent discard reappearing one frame up.  The
-    # exception still propagates untouched — this is a drain, not a catch — so
-    # the coarse ``unreadable_escalations`` issue is added on top, and the two
-    # kinds read together as "the scan died, and here is what it had found".
-    # BEFORE the loop: ``issues`` is the caller's list object, so entries
-    # appended here also survive a failure inside the join loop below.
-    try:
-        records = load_queue_escalations(escalations_dir, skipped=skipped)
-    finally:
-        for entry in skipped:
-            _issue(
-                issues, 'unreadable_escalation_file', path=entry['path'],
-                detail=(
-                    f'escalation queue file could not be read ({entry["error"]}); '
-                    'if it held an open eval_regression escalation it is missing '
-                    'from this payload, so unmatched_escalations cannot be read '
-                    'as exhaustive'
-                ),
-            )
-    for record in records:
-        if not isinstance(record, dict):
-            _issue(
-                issues, 'malformed_escalation_record', path=escalations_dir,
-                detail=(
-                    f'escalation queue record is {type(record).__name__}, not an object '
-                    f'({_short_repr(record)}); if it held an open eval_regression escalation '
-                    'it is missing from this payload, so unmatched_escalations cannot be read '
-                    'as exhaustive'
-                ),
-            )
+    if corpus.value is None:
+        _issue(
+            issues, 'unreadable_escalations',
+            detail=f'escalation queue {escalation_queue!r} was not read: {corpus.reason}',
+        )
+        return {}, []
+    scan = corpus.value.scan(escalation_queue)
+    _name_unreadable_queue_files(scan, issues)
+    queue_dir = scan.queue.directory
+    index: dict[str, Escalation] = {}
+    unfingerprinted: list[Escalation] = []
+    for record in scan.records:
+        escalation = record.escalation
+        if record.location is not Location.ROOT or escalation.category != _EVAL_REGRESSION_CATEGORY:
             continue
-        if record.get('category') != _EVAL_REGRESSION_CATEGORY:
-            continue
-        status = record.get('status')
-        if status is not None and status != _OPEN_ESCALATION_STATUS:
-            # ``isinstance`` FIRST for the same reason the metric-kind loop
-            # tests it: ``status`` is an unvalidated JSON value, so an
-            # unhashable one (``[]``, ``{}``) would make ``in
-            # _CLOSED_ESCALATION_STATUSES`` raise ``TypeError``.  A non-string
-            # status is not a status this reader can classify, so it takes the
-            # unrecognised path — named and not joined — rather than the
-            # closed-filter path, which is reserved for values that ARE known
-            # to be terminal.
+        status = escalation.status
+        if status != _OPEN_ESCALATION_STATUS:
+            # ``isinstance`` FIRST: an unhashable status (``[]``, ``{}``) would
+            # make the set membership test raise ``TypeError``.
             if isinstance(status, str) and status in _CLOSED_ESCALATION_STATUSES:
-                # The filter doing its job, not a discard: a closed escalation
-                # is precisely what must NOT render as open.
                 continue
             _issue(
-                issues, 'unknown_escalation_status', path=escalations_dir,
+                issues, 'unknown_escalation_status', path=queue_dir,
                 detail=(
-                    f'escalation {_short_repr(record.get("id"))} has unrecognised status '
+                    f'escalation {_short_repr(escalation.id)} has unrecognised status '
                     f'{_short_repr(status)}; not joined (only pending escalations are '
                     'treated as open)'
                 ),
             )
             continue
-        fingerprint = record.get('dedupe_fingerprint')
+        fingerprint = escalation.dedupe_fingerprint
         if not (isinstance(fingerprint, str) and fingerprint):
-            # Open, but unjoinable: no fingerprint means no index key, and the
-            # index is what ``unmatched_escalations`` is built from.  Named AND
-            # carried out, so the open alarm stays visible even though no
-            # metric row can ever claim it.
             _issue(
-                issues, 'unfingerprinted_escalation', path=escalations_dir,
+                issues, 'unfingerprinted_escalation', path=queue_dir,
                 detail=(
-                    f'escalation {_short_repr(record.get("id"))} is open but carries no usable '
+                    f'escalation {_short_repr(escalation.id)} is open but carries no usable '
                     f'dedupe_fingerprint ({_short_repr(fingerprint)}); it can never join '
                     'a metric row'
                 ),
             )
-            unfingerprinted.append(record)
+            unfingerprinted.append(escalation)
             continue
         if fingerprint in index:
             _issue(
-                issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
+                issues, 'duplicate_escalation_fingerprint', path=queue_dir,
                 detail=(
-                    f'escalation {_short_repr(record.get("id"))} shares dedupe_fingerprint '
-                    f'{_short_repr(fingerprint)} with {_short_repr(index[fingerprint].get("id"))}; '
+                    f'escalation {_short_repr(escalation.id)} shares dedupe_fingerprint '
+                    f'{_short_repr(fingerprint)} with {_short_repr(index[fingerprint].id)}; '
                     'the first is used'
                 ),
             )
             continue
-        index[fingerprint] = record
+        index[fingerprint] = escalation
     return index, unfingerprinted
 
 
@@ -1033,7 +995,8 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
 
     Reachability of ``unjudged_open``, which is not obvious: the row-level join
     only runs when the verdict ENTRY carries a fingerprint (see
-    ``_build_eval``), so a metric with NO entry at all can never link.  The
+    ``_verdict_row_fields``), so a row no ``(eval_id, metric_id, item)`` entry
+    names can never link.  The
     linked variant is reached only by an entry that has a ``fingerprint`` and
     no ``verdict`` field — exactly the case that used to claim a recovery that
     never happened.  The function stays total over both axes anyway, so no
@@ -1046,12 +1009,114 @@ def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
     return f'{verdict_class}_open' if escalation else verdict_class
 
 
+def _item_order(item: str | None) -> tuple[bool, str]:
+    """Row order within one metric: the item-less (window) entry, then items lexically."""
+    return item is not None, item or ''
+
+
+def _verdict_row_fields(
+    entry: dict[str, Any] | None,
+    metric_id: str,
+    eval_dir: Path,
+    issues: list[dict[str, Any]],
+    escalation_index: dict[str, Escalation],
+    linked_fingerprints: set[str],
+    storm_suppressed: set[str],
+    storm: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The verdict half of one metric row: *entry*'s fields, its escalation link and its parity.
+
+    The fields are passed through UNMAPPED from the sole verdict source.  Their
+    ``value`` is what the evaluator judged, while the row's ``current_value``
+    is what the metrics artifact says: two sources, two fields, never
+    conflated.
+    """
+    # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
+    # dict makes every verdict field read as None below without a second
+    # code path.
+    judged: dict[str, Any] = entry or {}
+
+    # The join, in full: whole-string equality on the fingerprint.  It is
+    # NOT gated on the verdict — a metric that has recovered while its
+    # escalation is still open is a real transient state (the watcher has
+    # not closed it yet), and hiding the link there would make the
+    # escalation look orphaned in exactly the window an operator is most
+    # likely to be looking at it.
+    #
+    # While a storm is triggered the runner files ONE aggregate escalation
+    # instead of N per-metric ones, so per-metric links are suppressed
+    # here.  Showing them would invent links that were never filed.
+    #
+    # Suppressed is NOT unexplained: a per-metric escalation from an
+    # earlier run stays open while this run's storm collapses, and it must
+    # not then be reported as an escalation nothing accounts for.  The row
+    # renders no link; the fingerprint is recorded so
+    # ``unmatched_escalations`` can say WHY.
+    #
+    # A fingerprint links at most one row, the first to claim it, so an
+    # escalation keeps exactly one home even when two entries share its
+    # fingerprint (named by ``_name_shared_fingerprints``).
+    fingerprint = judged.get('fingerprint')
+    matched: Escalation | None = None
+    if isinstance(fingerprint, str) and fingerprint:
+        if storm is None:
+            matched = None if fingerprint in linked_fingerprints else escalation_index.get(fingerprint)
+            if matched is not None:
+                linked_fingerprints.add(fingerprint)
+        elif fingerprint in escalation_index:
+            storm_suppressed.add(fingerprint)
+    escalation = _escalation_projection(matched) if matched is not None else None
+
+    # Classified ONCE and reused for both the parity badge and the
+    # unrenderable-value check below, so the membership rule lives in
+    # exactly one place.
+    verdict = judged.get('verdict')
+    verdict_class = _verdict_class(verdict)
+    if verdict_class == 'unknown_verdict':
+        # A verdict outside the closed M2 set has no badge, so it is named
+        # rather than folded into the healthy label — the same standing as
+        # ``unknown_kind`` (no chart primitive) and
+        # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
+        # verdict is deliberately NOT named: "nothing judged this metric"
+        # is a legitimate state the payload already models as ``unjudged``
+        # parity, and at the artifact level as
+        # ``missing_verdicts``/``orphan_verdict``.
+        #
+        # ``eval_dir.parent`` IS the memory-evals root, which is where
+        # ``_read_verdicts`` locates the sole verdicts artifact — this
+        # value came out of that file, not out of the eval's own dir.
+        _issue(
+            issues, 'unknown_verdict', eval_id=eval_dir.name,
+            path=eval_dir.parent / 'verdicts-current.json',
+            detail=(
+                f'{_verdict_identity(metric_id, judged.get("item"))} has verdict '
+                f'{_short_repr(verdict)}, which is outside the M2 vocabulary and has no parity badge'
+            ),
+        )
+
+    return {
+        'verdict': verdict,
+        'verdict_detail': judged.get('detail'),
+        'value': judged.get('value'),
+        'item': judged.get('item'),
+        'limit_ref': judged.get('limit_ref'),
+        'fingerprint': fingerprint,
+        'run_stamp': judged.get('run_stamp'),
+        'escalation': escalation,
+        'parity': (
+            'storm_collapsed'
+            if storm is not None and verdict == 'alarm'
+            else _parity(verdict_class, escalation)
+        ),
+    }
+
+
 def _build_eval(
     eval_dir: Path,
     issues: list[dict[str, Any]],
-    verdict_index: dict[tuple[str, str], dict[str, Any]],
+    verdict_index: _VerdictIndex,
     consumed: set[tuple[str, str]],
-    escalation_index: dict[str, dict[str, Any]],
+    escalation_index: dict[str, Escalation],
     linked_fingerprints: set[str],
     storm_suppressed: set[str],
     storm: dict[str, Any] | None,
@@ -1064,6 +1129,9 @@ def _build_eval(
     because the stamp is a zero-padded UTC string) — so the dashboard never
     invents a second ordering rule.  The x-axis label for each run is the
     artifact's in-body ``run_stamp``.
+
+    Each verdict entry gets its own row, so a tripwire's items are rows that
+    repeat the metric-level fields, each with its own ``trend`` object.
     """
     eval_id = eval_dir.name
     all_paths = sorted(eval_dir.glob('metrics-*.json'))
@@ -1229,97 +1297,28 @@ def _build_eval(
                     ),
                 )
 
-        # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
-        # dict makes every verdict field read as None below without a second
-        # code path.
-        entry = verdict_index.get((eval_id, metric_id))
-        if entry is not None:
+        entries = verdict_index.get((eval_id, metric_id), {})
+        if entries:
             consumed.add((eval_id, metric_id))
-        judged: dict[str, Any] = entry or {}
-
-        # The join, in full: whole-string equality on the fingerprint.  It is
-        # NOT gated on the verdict — a metric that has recovered while its
-        # escalation is still open is a real transient state (the watcher has
-        # not closed it yet), and hiding the link there would make the
-        # escalation look orphaned in exactly the window an operator is most
-        # likely to be looking at it.
-        #
-        # While a storm is triggered the runner files ONE aggregate escalation
-        # instead of N per-metric ones, so per-metric links are suppressed
-        # here.  Showing them would invent links that were never filed.
-        #
-        # Suppressed is NOT unexplained: a per-metric escalation from an
-        # earlier run stays open while this run's storm collapses, and it must
-        # not then be reported as an escalation nothing accounts for.  The row
-        # renders no link; the fingerprint is recorded so
-        # ``unmatched_escalations`` can say WHY.
-        fingerprint = judged.get('fingerprint')
-        matched: dict[str, Any] | None = None
-        if isinstance(fingerprint, str) and fingerprint:
-            if storm is None:
-                matched = escalation_index.get(fingerprint)
-                if matched is not None:
-                    linked_fingerprints.add(fingerprint)
-            elif fingerprint in escalation_index:
-                storm_suppressed.add(fingerprint)
-        escalation = _escalation_projection(matched) if matched is not None else None
-
-        # Classified ONCE and reused for both the parity badge and the
-        # unrenderable-value check below, so the membership rule lives in
-        # exactly one place.
-        verdict = judged.get('verdict')
-        verdict_class = _verdict_class(verdict)
-        if verdict_class == 'unknown_verdict':
-            # A verdict outside the closed M2 set has no badge, so it is named
-            # rather than folded into the healthy label — the same standing as
-            # ``unknown_kind`` (no chart primitive) and
-            # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
-            # verdict is deliberately NOT named: "nothing judged this metric"
-            # is a legitimate state the payload already models as ``unjudged``
-            # parity, and at the artifact level as
-            # ``missing_verdicts``/``orphan_verdict``.
-            #
-            # ``eval_dir.parent`` IS the memory-evals root, which is where
-            # ``_read_verdicts`` locates the sole verdicts artifact — this
-            # value came out of that file, not out of the eval's own dir.
-            _issue(
-                issues, 'unknown_verdict', eval_id=eval_id,
-                path=eval_dir.parent / 'verdicts-current.json',
-                detail=(
-                    f'metric {_short_repr(metric_id)} has verdict {_short_repr(verdict)}, '
-                    'which is outside the M2 vocabulary and has no parity badge'
+        # A metric no entry judges still gets its one (unjudged) row.
+        row_entries = [entries[item] for item in sorted(entries, key=_item_order)]
+        for entry in row_entries or [None]:
+            metrics.append({
+                'metric_id': metric_id,
+                'kind': kind,
+                # Looked up by metric_id, never zipped positionally: the two lists
+                # are ordered independently and a metric may be absent from either.
+                'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
+                'current_value': current.get('value'),
+                'n': current.get('n'),
+                'denominator': current.get('denominator'),
+                'direction': current.get('direction'),
+                'trend': {'labels': list(run_stamps), 'values': list(values)},
+                **_verdict_row_fields(
+                    entry, metric_id, eval_dir, issues,
+                    escalation_index, linked_fingerprints, storm_suppressed, storm,
                 ),
-            )
-
-        metrics.append({
-            'metric_id': metric_id,
-            'kind': kind,
-            # Looked up by metric_id, never zipped positionally: the two lists
-            # are ordered independently and a metric may be absent from either.
-            'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
-            'current_value': current.get('value'),
-            'n': current.get('n'),
-            'denominator': current.get('denominator'),
-            'direction': current.get('direction'),
-            'trend': {'labels': list(run_stamps), 'values': values},
-            # Verdict fields, passed through UNMAPPED from the sole verdict
-            # source.  `value` is what the evaluator judged; `current_value`
-            # above is what the metrics artifact says — two sources, two
-            # fields, never conflated.
-            'verdict': judged.get('verdict'),
-            'verdict_detail': judged.get('detail'),
-            'value': judged.get('value'),
-            'item': judged.get('item'),
-            'limit_ref': judged.get('limit_ref'),
-            'fingerprint': judged.get('fingerprint'),
-            'run_stamp': judged.get('run_stamp'),
-            'escalation': escalation,
-            'parity': (
-                'storm_collapsed'
-                if storm is not None and verdict == 'alarm'
-                else _parity(verdict_class, escalation)
-            ),
-        })
+            })
 
     return {
         'eval_id': eval_id,
@@ -1343,7 +1342,8 @@ def _build_eval(
 
 def build_memory_evals(
     memory_evals_dir: Path,
-    escalations_dir: Path,
+    corpus: Datum[EscalationCorpus],
+    escalation_queue: str,
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -1353,7 +1353,10 @@ def build_memory_evals(
         memory_evals_dir: The memory-eval artifact root
             (``<project_root>/fused-memory/data/memory-evals``); enumerated
             generically — one entry per subdirectory, no per-eval code (DD5).
-        escalations_dir: The recon escalation queue dir, joined by fingerprint.
+        corpus: The escalation corpus walk; its *escalation_queue* root
+            records are joined by fingerprint.
+        escalation_queue: The id of the corpus queue memory-eval
+            regressions are filed onto.
         now: Request-scoped reference timestamp, resolved ONCE via
             :func:`~dashboard.data.utils.resolve_now` and threaded through
             every derived time field.  Injectable so staleness is testable
@@ -1376,7 +1379,9 @@ def build_memory_evals(
     payload = _empty_payload(resolved_now, issues)
 
     try:
-        _build_payload(payload, memory_evals_dir, escalations_dir, issues, resolved_now)
+        _build_payload(
+            payload, memory_evals_dir, corpus, escalation_queue, issues, resolved_now,
+        )
     except Exception as exc:  # noqa: BLE001 - the never-500 boundary; named, not swallowed
         # Logged with the traceback: the payload names the bug for the
         # operator, the log carries what whoever fixes it actually needs.
@@ -1500,7 +1505,8 @@ def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict
 def _build_payload(
     payload: dict[str, Any],
     memory_evals_dir: Path,
-    escalations_dir: Path,
+    corpus: Datum[EscalationCorpus],
+    escalation_queue: str,
     issues: list[dict[str, Any]],
     resolved_now: datetime,
 ) -> None:
@@ -1540,30 +1546,7 @@ def _build_payload(
     # in place, so there is nothing for this caller to catch.
     verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
 
-    try:
-        escalation_index, unfingerprinted = _index_escalations(escalations_dir, issues)
-    except _ARTIFACT_ERRORS as exc:
-        # The join reads a second unvalidated artifact tree, so it is a
-        # boundary like the verdicts read, the limits read and the root walk —
-        # and it is the LAST one here that was not wrapped.  Unwrapped, the
-        # "never raises" contract held only as long as every field access
-        # inside the index happened to tolerate every JSON type it could be
-        # handed, which is not a property a reader can keep by inspection.
-        # Losing the join is a real degradation — rows render unlinked — so it
-        # is named rather than read as "nothing is escalated".
-        #
-        # Narrowed to ``_ARTIFACT_ERRORS`` alongside the others.  This site was
-        # made deliberately broad to stop an unhashable ``status`` 500ing, but
-        # that value is now handled at source by the ``isinstance(status, str)``
-        # guard in ``_index_escalations``, so the broad tuple is no longer what
-        # protects it.  Anything else of that shape now reaches the outermost
-        # guard and is named ``internal_error`` — strictly better than being
-        # mislabelled as an unreadable escalation queue.
-        _issue(
-            issues, 'unreadable_escalations',
-            path=escalations_dir, detail=str(exc),
-        )
-        escalation_index, unfingerprinted = {}, []
+    escalation_index, unfingerprinted = _index_escalations(corpus, escalation_queue, issues)
 
     consumed: set[tuple[str, str]] = set()
     linked_fingerprints: set[str] = set()
@@ -1578,7 +1561,7 @@ def _build_payload(
     storm_block: dict[str, Any] | None = None
     if storm is not None:
         aggregate_fingerprint = storm.get('aggregate_fingerprint')
-        aggregate: dict[str, Any] | None = None
+        aggregate: Escalation | None = None
         if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
             aggregate = escalation_index.get(aggregate_fingerprint)
             if aggregate is not None:

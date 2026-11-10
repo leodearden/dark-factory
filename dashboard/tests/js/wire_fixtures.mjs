@@ -199,17 +199,35 @@ export function escalationsPayload(subsections) {
   };
 }
 
+// The unknown triad data/datum.py::unknown_datum emits, for a runs.db that
+// could not be read.
+function unreadWireDatum(reason) {
+  return wireDatum(null, { as_of: null, state: 'unknown', reason });
+}
+
 // One MERGE_QUEUE[project] block, as data/redux_api.py::shape_merge_queue
 // serves it: a measured, empty queue whose depth series holds `buckets` labels
 // ending at WIRE_AS_OF, `bucketMinutes` apart, every count zero but the newest.
 // A null `bucketMinutes` is a series that names no width; its labels are then
-// hourly.
-export function mergeQueueBlock({ bucketMinutes = null, buckets = 3 } = {}) {
+// hourly. `outcomes` counts the window's untimed attempts by outcome. With
+// `unread`, the project's runs.db could not be read, so its depth and attempts
+// are unknown.
+export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false } = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
+  const outcomeLabels = Object.keys(outcomes);
+  const outcomeValues = outcomeLabels.map(label => outcomes[label]);
+  const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
+  const unreadReason = 'the merge_attempt events could not be read from runs.db';
   return {
-    depth: { labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes },
-    outcomes: { labels: [], values: [], colors: [] },
-    latency: { p50: 0, p95: 0, p99: 0, mean_ms: 0, with_duration: 0, without_duration: 0 },
+    depth: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({ labels, values: labels.map((_, i) => (i === buckets - 1 ? 1 : 0)), bucket_minutes: bucketMinutes }),
+    attempts: unread
+      ? unreadWireDatum(unreadReason)
+      : wireDatum({
+        outcomes: { labels: outcomeLabels, values: outcomeValues, colors: outcomeLabels.map(() => '#888888') },
+        latency: { p50: null, p95: null, p99: null, mean_ms: null, with_duration: 0, without_duration: attempts },
+      }),
     recent: [],
     active: [],
     recent_total: wireDatum(0),
@@ -219,8 +237,36 @@ export function mergeQueueBlock({ bucketMinutes = null, buckets = 3 } = {}) {
     active_spark: { labels: [], values: [] },
     halt: { offline: true },
     train_events: [],
+    train_throughput: wireDatum({}),
     metrics: {},
   };
+}
+
+// The SCHEDULER payload, as /scheduler serves it: the keys data.js seeds it
+// with, every project in `offlineProjects` listed offline, nothing paused.
+export function schedulerSnapshot({ offlineProjects = [], rows = [], modules = [] } = {}) {
+  return {
+    rows,
+    modules,
+    pin_queue: [],
+    events_by_task: {},
+    snapshot_at: WIRE_AS_OF,
+    offline: offlineProjects.length > 0,
+    offline_projects: offlineProjects,
+    paused: false,
+    paused_projects: [],
+  };
+}
+
+// One SCHEDULER row: the modules task `taskId` of `project` declares it locks.
+export function schedulerLockRow({ project, taskId, lockSet }) {
+  return { project, task_id: taskId, lock_set: lockSet };
+}
+
+// One SCHEDULER.modules entry: who holds `path` in `project`, and who has it
+// parked. Every lock field is null unless given, which reads as a free module.
+export function schedulerModule({ project, path, holder = null, holderProject = null, parkedBy = null, parkedOwnerLive = null }) {
+  return { project, path, holder, holder_project: holderProject, parked_by: parkedBy, parked_owner_live: parkedOwnerLive };
 }
 
 // One ORCHESTRATORS row, as /orchestrators serves it.
@@ -231,4 +277,85 @@ export function orchestratorRow({ pid, project, running }) {
 // One PROJECTS row, as /orchestrators serves it.
 export function projectRow(id) {
   return { id, name: id };
+}
+
+// The MEMORY_EVALS builders below are not yet checked by
+// boundary_wire_fixtures.test.mjs: no boundary payload serves MEMORY_EVALS.
+
+// One open escalation, as data/memory_evals.py::_escalation_projection projects
+// it onto a metric row, the storm banner or unmatched_escalations.
+export function memoryEvalEscalation(id, overrides = {}) {
+  return {
+    id,
+    summary: 'memory-eval regression',
+    severity: 'blocking',
+    level: 1,
+    created_at: WIRE_AS_OF,
+    dedupe_fingerprint: `fp-${id}`,
+    ...overrides,
+  };
+}
+
+// One metric row, as data/memory_evals.py::_build_eval emits it: unjudged and
+// unlinked unless overridden.
+export function memoryEvalRow(overrides = {}) {
+  return {
+    metric_id: 'canonical-in-top-5',
+    kind: 'proportion',
+    rule_kind: 'proportion',
+    current_value: 0.9,
+    n: 30,
+    denominator: 30,
+    direction: 'lower_is_worse',
+    trend: { labels: ['20260704T031500Z', '20260705T031500Z'], values: [0.9, 0.9] },
+    verdict: null,
+    verdict_detail: null,
+    value: null,
+    item: null,
+    limit_ref: null,
+    fingerprint: null,
+    run_stamp: null,
+    escalation: null,
+    parity: 'unjudged',
+    ...overrides,
+  };
+}
+
+// One eval card, as data/memory_evals.py::_build_eval emits it, over the run
+// axis of its first metric's trend: fresh, untruncated, with no limits
+// artifact. memoryEvalsPayload copies the run's storm_escape onto it.
+export function memoryEvalCard(evalId, metrics) {
+  const runStamps = metrics[0]?.trend.labels ?? [];
+  return {
+    eval_id: evalId,
+    latest_run_stamp: runStamps.at(-1) ?? null,
+    latest_run_age_seconds: 3600,
+    stale: false,
+    limits: null,
+    storm_escape: null,
+    run_stamps: runStamps,
+    run_count: runStamps.length,
+    runs_on_disk: runStamps.length,
+    truncated: false,
+    corpus: null,
+    metrics,
+  };
+}
+
+// The MEMORY_EVALS payload, as data/redux_api.py::shape_memory_evals serves it,
+// with no artifact issues. Each card carries the run-scoped storm_escape, as
+// data/memory_evals.py::_build_payload hands every card the top-level block.
+export function memoryEvalsPayload({
+  evals, storm_escape = null, unmatched_escalations = [], escalation_queue = 'reconciliation',
+}) {
+  return {
+    generated_at: WIRE_AS_OF,
+    root_present: true,
+    storm_escape,
+    evals: evals.map(card => ({ ...card, storm_escape })),
+    issues: [],
+    issue_count: 0,
+    unmatched_escalations,
+    escalation_queue,
+  };
 }

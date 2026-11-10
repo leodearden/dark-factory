@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo, make_db_without_claimant_columns
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import make_db_without_claimant_columns
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig

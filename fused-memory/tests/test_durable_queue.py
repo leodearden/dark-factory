@@ -13,7 +13,8 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 from _fm_held_writes import HeldWrites
-from _fm_helpers import poll_until
+from _fm_helpers import make_retry_budget_queue
+from _fm_polling import poll_until, poll_until_dead
 from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
@@ -225,10 +226,9 @@ class TestDeadLetter:
         # wall-clock sleep.  The dead-letter path (attempt1→retry→attempt2→dead)
         # involves several real SQLite fsync commits; under full-suite xdist load
         # the fixed 1.0s budget was regularly exceeded, causing flaky failures.
-        # 20s is generous under any load while staying well under the 60s
-        # pytest-timeout.  The accounting itself (attempts counter, 'dead'
-        # status) is deterministic given a single worker + max_attempts=2.
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        # The accounting itself (attempts counter, 'dead' status) is
+        # deterministic given a single worker + max_attempts=2.
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         dead = await q.get_dead_items()
         assert len(dead) == 1
@@ -257,7 +257,7 @@ class TestDeadLetter:
                 group_id='proj1', operation='add_episode',
                 payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
             )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=4, timeout=20.0)
+        await poll_until_dead(q, group_id='proj1', expected_dead=4)
 
         # All 4 should be dead.
         all_dead = await q.get_dead_items()
@@ -309,7 +309,7 @@ class TestReplayDead:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         # Should be dead-lettered
         dead = await q.get_dead_items()
@@ -616,7 +616,7 @@ class TestCallbackFailure:
         )
 
         # Wait for all retries to exhaust (max_attempts=3 in fixture)
-        await _poll_until_dead(queue, group_id='proj1', expected_dead=1, timeout=20.0)
+        await poll_until_dead(queue, group_id='proj1', expected_dead=1)
 
         stats = await queue.get_stats()
         # Item should be dead-lettered, not completed — callback kept failing
@@ -1264,7 +1264,7 @@ class TestStats:
         # Poll until both successful items complete and the failing item
         # dead-letters. A fixed sleep raced under full-suite CPU load: the two
         # 'good' writes had not both drained yet, yielding completed==1 (see
-        # _poll_until_dead's rationale — same fix, both terminal counts).
+        # poll_until_dead's rationale — same fix, both terminal counts).
         # Delegates to the shared poll_until (task 2377); last_counts is a
         # side-channel capture so the timeout message can still report the
         # latest observed counts, since poll_until's message is static.
@@ -1288,38 +1288,6 @@ class TestStats:
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
         await q.close()
-
-
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 5.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items have status='dead'.
-
-    Thin wrapper over the shared poll_until (task 2377): replaces fixed
-    ``asyncio.sleep`` calls in tests that wait for items to dead-letter,
-    avoiding the 1.5 s floor on fast machines while still handling slow CI
-    runners via the *timeout* guard. last_counts is a side-channel capture
-    so the timeout message can still report the latest observed counts,
-    since poll_until's message is static.
-    """
-    last_counts: dict = {}
-
-    async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
-
-    try:
-        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
-    except AssertionError as exc:
-        raise AssertionError(
-            f'Timed out waiting for {expected_dead} dead item(s) '
-            f'(group_id={group_id!r}); last counts={last_counts}'
-        ) from exc
 
 
 class TestGetStatsScopedByGroup:
@@ -1356,7 +1324,7 @@ class TestGetStatsScopedByGroup:
                 )
             # Wait for all 5 items to dead-letter (2 proj_a + 3 proj_b).
             # Polling is faster than a fixed sleep and reliable on slow CI.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -1402,7 +1370,7 @@ class TestGetStatsScopedByGroup:
                     payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
                 )
             # Wait for all 5 items to dead-letter; polling avoids fixed-sleep flakiness.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats = await q.get_stats()  # no group_id → unscoped
             # Should see the total across both groups
@@ -1522,7 +1490,7 @@ class TestTransientErrorRetryPolicy:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1552,10 +1520,7 @@ class TestTransientErrorRetryPolicy:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            # Generous timeout: 5 attempts at a 0.01s backoff base is fast in
-            # practice, but slow CI runners need headroom (see other dead-letter
-            # tests in this file using the same 20s budget).
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1653,23 +1618,6 @@ class TestNotFoundFamilyIsNotTransient:
     governs. TestTransientErrorRetryPolicy covers the mechanism.
     """
 
-    @staticmethod
-    def _queue(tmp_path, execute):
-        """The shared config: plain budget 5, extended budget 12, and no
-        transient_error_names= override so DEFAULT_TRANSIENT_ERROR_NAMES
-        decides which one applies."""
-        return DurableWriteQueue(
-            data_dir=tmp_path / 'queue',
-            execute_write=execute,
-            workers_per_group=1,
-            semaphore_limit=5,
-            max_attempts=5,
-            retry_base_seconds=0.01,
-            retry_max_delay_seconds=0.05,
-            write_timeout_seconds=2.0,
-            transient_max_attempts=12,
-        )
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'exc_cls',
@@ -1686,17 +1634,16 @@ class TestNotFoundFamilyIsNotTransient:
         this never did at any budget.
         """
         execute = AsyncMock(side_effect=exc_cls('uuid abc-123 not found'))
-        q = self._queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            # 20s budget for slow CI runners, matching the rest of this file;
             # 12 attempts at a 0.05s delay ceiling costs well under a second,
             # so the pre-3585 behaviour fails on the COUNT, not by timing out.
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1717,14 +1664,14 @@ class TestNotFoundFamilyIsNotTransient:
         This is what fails if a later edit prunes the set too broadly.
         """
         execute = AsyncMock(side_effect=ConnectionResetError('connection reset by peer'))
-        q = self._queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1802,7 +1749,7 @@ class TestTerminalHook:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'x', '_write_op_id': 'W2'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1847,7 +1794,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W8'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1903,7 +1850,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W9'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1955,11 +1902,11 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W10'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
 
             assert await q.replay_dead(group_id='proj1') == 1
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 2, timeout=20.0, interval=0.05)
 
             assert len(calls) == 2
@@ -2018,8 +1965,8 @@ class TestTerminalHook:
                 payload={'content': 'never', '_write_op_id': 'W12'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='landed-grp', expected_dead=1, timeout=20.0)
-            await _poll_until_dead(q, group_id='never-grp', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='landed-grp', expected_dead=1)
+            await poll_until_dead(q, group_id='never-grp', expected_dead=1)
 
             landed = (await q.get_dead_items(group_id='landed-grp'))[0]
             never = (await q.get_dead_items(group_id='never-grp'))[0]
@@ -2142,7 +2089,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W14'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
 
             dead = await q.get_dead_items(group_id='proj1')
@@ -2578,7 +2525,7 @@ class TestExecutedColumnSchema:
                 {'group_id': 'batch-grp', 'operation': 'add_episode',
                  'payload': {'content': 'via enqueue_batch'}},
             ])
-            await _poll_until_dead(q, group_id='batch-grp', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='batch-grp', expected_dead=1)
 
             dead = await q.get_dead_items(group_id='batch-grp')
             assert dead[0]['executed'] is False, (
@@ -2641,7 +2588,7 @@ class TestDeadLetterHook:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'never lands', '_write_op_id': 'W1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1, f'exactly one alarm per death, got {events}'
@@ -2753,9 +2700,7 @@ class TestDeadLetterHook:
                 group_id='mem0_proj1', operation='mem0_classify_and_add',
                 payload={'fact_text': 'no join key here', 'project_id': 'proj1'},
             )
-            await _poll_until_dead(
-                q, group_id='mem0_proj1', expected_dead=1, timeout=20.0
-            )
+            await poll_until_dead(q, group_id='mem0_proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1
@@ -2797,7 +2742,7 @@ class TestDeadLetterHook:
                 payload={'content': 'the write landed', '_write_op_id': 'W4'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1
@@ -2841,9 +2786,7 @@ class TestDeadLetterHook:
                     payload={'content': 'b', '_write_op_id': 'W6'},
                 )
                 # The worker keeps draining despite the hook raising on item 1.
-                await _poll_until_dead(
-                    q, group_id='proj1', expected_dead=2, timeout=20.0
-                )
+                await poll_until_dead(q, group_id='proj1', expected_dead=2)
                 await poll_until(
                     lambda: len(seen) >= 2, timeout=20.0, interval=0.05
                 )
@@ -2908,7 +2851,7 @@ class TestDeadByOperation:
                 group_id='proj_a', operation='add_memory_graphiti',
                 payload={'content': 'mem', 'group_id': 'proj_a'},
             )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             stats = await q.get_stats()
 
@@ -2954,7 +2897,7 @@ class TestDeadByOperation:
                 group_id='proj_a', operation='add_memory_graphiti',
                 payload={'content': 'bad', 'group_id': 'proj_a', 'fail': True},
             )
-            await _poll_until_dead(q, expected_dead=1)
+            await poll_until_dead(q, expected_dead=1)
 
             stats = await q.get_stats()
 
@@ -3009,7 +2952,7 @@ class TestDeadByOperation:
                     group_id='proj_b', operation='add_memory_graphiti',
                     payload={'content': f'b{i}', 'group_id': 'proj_b'},
                 )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -3053,7 +2996,7 @@ class TestDeadByOperation:
                 group_id='mem0_proj_a', operation='mem0_classify_and_add',
                 payload={'fact_text': 'a derived fact', 'project_id': 'proj_a'},
             )
-            await _poll_until_dead(q, expected_dead=2)
+            await poll_until_dead(q, expected_dead=2)
 
             scoped = await q.get_stats(group_id='proj_a')
             mem0_scoped = await q.get_stats(group_id='mem0_proj_a')
@@ -3162,7 +3105,7 @@ class TestEarliestExecutingStart:
             assert queue.earliest_executing_start('proj1') is not None
 
             held.release('A')
-            await _poll_until_dead(queue, expected_dead=1)
+            await poll_until_dead(queue, expected_dead=1)
             assert queue.earliest_executing_start('proj1') is None
         finally:
             held.release_all()

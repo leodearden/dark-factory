@@ -21,13 +21,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
     extract_cypher,
     extract_params,
-    falkor_skipif,
-    unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
 from graphiti_core.errors import EdgeNotFoundError
@@ -393,7 +390,7 @@ class TestReassignEdgePostMove:
 # when FalkorDB is unreachable (the mock tests guarantee coverage then) and
 # deselected by the default `-m 'not integration'`; runs only under an explicit
 # `-m integration` with FalkorDB reachable. The reachability probe, connection
-# constants and per-run graph name come from _fm_helpers (task 3502) — see its
+# constants and per-run graph name come from _fm_falkor_live (task 3502) — see its
 # module docstring for why it is not conftest.py. Only the fixture body below
 # is per-module; do not re-fork the shared helpers back into this file.
 # ---------------------------------------------------------------------------

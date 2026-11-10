@@ -14,8 +14,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
+from fused_memory.backends.llm_token_usage import measure_llm_tokens
 from fused_memory.middleware.dead_letter_escalator import (
     _REPORTED_TO_CALLER,
     _REPORTED_TO_CALLER_DEFAULT,
@@ -36,12 +37,16 @@ def _mock_backends(svc: MemoryService) -> MemoryService:
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.close = AsyncMock()
     svc.graphiti._require_client = MagicMock()
+    # A bare MagicMock probe yields an AsyncMock usage that the real WriteJournal
+    # rejects, dropping the graphiti backend_ops row; this one measures nothing.
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    svc.mem0.close = AsyncMock()
     return svc
 
 
@@ -170,11 +175,14 @@ class TestIntegrationFlow:
         """add_episode -> enqueued with dual_write_episode callback -> graphiti called -> facts enqueued for mem0."""
         svc = integrated_service
 
-        # graphiti.add_episode returns result with entity_edges for dual-write
+        # graphiti.add_episode returns a result with edges for dual-write. `edges`
+        # must be set explicitly: _dual_write_callback reads it first, and a
+        # MagicMock would auto-create a truthy, empty-iterating one.
+        fact = 'Always format code with black'  # preferences -> mem0 primary
         mock_result = MagicMock()
-        edge = MagicMock()
-        edge.fact = 'Always format code with black'  # preferences -> mem0 primary
-        mock_result.entity_edges = [edge]
+        mock_result.edges = [
+            MagicMock(fact=fact, source_node_uuid='', target_node_uuid='')
+        ]
         svc.graphiti.add_episode.return_value = mock_result
 
         result = await svc.add_episode(
@@ -183,20 +191,21 @@ class TestIntegrationFlow:
         )
         assert result.status == 'queued'
 
-        # Poll until at least the episode item has completed (worker +
-        # callback + mem0 classify_and_add may enqueue further items),
-        # instead of a fixed sleep that can race under full-suite CPU load.
-        async def _completed():
+        # Poll until both the episode item and the mem0_classify_and_add item
+        # its callback enqueued have completed, instead of a fixed sleep that
+        # can race under full-suite CPU load.
+        async def _both_completed():
             s = await svc.durable_queue.get_stats()
-            return s if s['counts'].get('completed', 0) >= 1 else None
+            return s if s['counts'].get('completed', 0) >= 2 else None
 
-        stats = await poll_until(_completed, message='timed out waiting for the episode item to complete')
+        stats = await poll_until(
+            _both_completed,
+            message='timed out waiting for the episode and mem0 fact items to complete',
+        )
         svc.graphiti.add_episode.assert_called_once()
-        # The callback enqueues mem0_classify_and_add items which the queue processes.
-        # The fact "Always format code with black" should classify as preferences_and_norms
-        # (mem0 primary) and trigger a mem0.add call.
-        # At minimum the episode item completed; mem0 items may also be completed
-        assert stats['counts'].get('completed', 0) >= 1
+        assert stats['counts'] == {'completed': 2}
+        svc.mem0.add.assert_awaited_once()
+        assert svc.mem0.add.await_args.kwargs['content'] == fact
 
     @pytest.mark.asyncio
     async def test_dual_write_both_paths(self, integrated_service):
@@ -371,14 +380,7 @@ class TestFailureRecovery:
     async def test_crash_recovery(self, mock_config):
         """Enqueue item, close before processing, new service recovers and processes it."""
         # Service 1: enqueue but close quickly
-        svc1 = MemoryService(mock_config)
-        svc1.graphiti = MagicMock()
-        svc1.graphiti.initialize = AsyncMock()
-        svc1.graphiti.add_episode = AsyncMock(return_value=None)
-        svc1.graphiti.close = AsyncMock()
-        svc1.graphiti._require_client = MagicMock()
-        svc1.mem0 = MagicMock()
-        svc1.mem0.add = AsyncMock(return_value={'results': []})
+        svc1 = _mock_backends(MemoryService(mock_config))
 
         await svc1.initialize()
 
@@ -392,14 +394,8 @@ class TestFailureRecovery:
         await svc1.close()
 
         # Service 2: same data_dir -> should recover the item
-        svc2 = MemoryService(mock_config)
-        svc2.graphiti = MagicMock()
-        svc2.graphiti.initialize = AsyncMock()
+        svc2 = _mock_backends(MemoryService(mock_config))
         svc2.graphiti.add_episode = AsyncMock(return_value={'ok': True})
-        svc2.graphiti.close = AsyncMock()
-        svc2.graphiti._require_client = MagicMock()
-        svc2.mem0 = MagicMock()
-        svc2.mem0.add = AsyncMock(return_value={'results': []})
 
         await svc2.initialize()
         assert svc2.durable_queue is not None
@@ -880,6 +876,11 @@ class TestTerminalOutcomeWrittenBack:
         row = await journal.get_write_op(write_op_id)
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [(op['backend'], op['success']) for op in backend_ops] == [
+            ('graphiti', 1)
+        ], 'expected exactly one successful graphiti backend_ops row for this write'
+        assert journal.journal_drop_stats()['dropped_total'] == 0
 
     @pytest.mark.asyncio
     async def test_terminal_state_survives_dead_letter_deletion(

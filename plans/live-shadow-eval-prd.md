@@ -326,6 +326,53 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     cell as `no_credentials` rather than letting it 401. Pay-as-you-go `sk-` keys use
     `https://api.xiaomimimo.com/anthropic` and are not interchangeable with `tp-` keys. The
     literal slate pin covers both ids and prices.
+
+    **Amended 2026-11-01 (Leo, task 8086). Frontier refresh.** The Sol line moves from
+    `gpt-5.6-sol` to `gpt-6.1-sol` (released 2026-09-29; $2 / $0.10 cached / $10 per 1M
+    in / cached-in / out; `https://developers.openai.com/api/docs/models/gpt-6.1-sol`), candidate
+    `codex-gpt6.1-sol`. The Terra line moves from `gpt-5.6-terra` to `gpt-6.1-terra` (released
+    2026-10-26; $1 / $0.05 / $5; `https://developers.openai.com/api/docs/models/gpt-6.1-terra`),
+    candidate `codex-gpt6.1-terra`. The MiniMax line moves from `MiniMax-M3` to
+    `MiniMax-M3.1-Flash` (released 2026-10-19; $0.15 / $0.015 / $0.60, metered, no long-context
+    surcharge; `https://platform.minimax.io/docs/pricing/overview`), candidate
+    `minimax-m3.1-flash-endpoint`. MiniMax calls it M3's next-generation update, and it is the
+    only M3.1 model. Its $0.015 cached rate is recorded here but not modelled:
+    `CandidateEndpointPrice` carries input and output rates only. Astra stays `gpt-6-astra`
+    ($10 / $1 / $50). GLM stays `glm-5.3` / `glm-5.3-flash`; GLM-5.3-FlashX is priced outside the
+    Coding Plan and is not added. MiMo stays `mimo-v2.6-pro` / `mimo-v2.6-flash`. The OpenAI
+    prices apply at up to 272K input. The sources were retrieved 2026-11-01 and re-checked
+    2026-11-09 by task 8086: ids and prices are unchanged, and each OpenAI page lists only the
+    bare id as its single default snapshot. Codex CLI: measured 2026-11-09 on this host,
+    codex-cli 0.164.0 runs `codex exec -m gpt-6.1-terra` and `codex exec -m gpt-6.1-sol` (rc 0,
+    answered), so 0.164.0 suffices and no upgrade is needed (recorded on esc-7992-1). The literal
+    slate pin covers the new ids and prices, and the retired names resolve to `None`.
+
+    **Standing rule (Leo, 2026-11-01): keep the slate on the frontier.** In Leo's words: "keep
+    the slate on the frontier: always use the newest model in each line, frozen at the start of
+    that model's trial." The mechanics:
+    - A candidate's name embeds its model id. An existing name is never re-pointed at another
+      model.
+    - A newer model in a line is a new candidate. Its trial starts with its first cell.
+    - A running trial finishes on its frozen model, and the newer model enters at the next
+      campaign gate. Both arms run at once only if Leo rules it at that gate. This mechanic is
+      the reading recorded with the rule, not Leo's words.
+    - No slate vendor publishes a dated snapshot id. The OpenAI pages list only the bare id as
+      default snapshot, and the Z.ai, MiniMax and MiMo ids are bare aliases, so a vendor can
+      change the model behind an id mid-trial.
+    - The frontier check is repeated at every campaign gate (task 5393 and later), so the slate
+      entering a trial is the frontier on the day it starts.
+
+    Where it is recorded: every cell's `shadow_cells` row (C1) carries `configured_model`, the
+    candidate's `EvalConfig.model` stamped at open, and `served_model`, the model string
+    reported for the role under test when its run ends. For the Claude harness that is the last
+    assistant transcript record's `model`, which an Anthropic-format endpoint fills from its
+    response (`shared/src/shared/cli_invoke.py::AgentResult.model_id`). `NULL` means not
+    observable, and it is never copied from `configured_model`. For the Codex arms it is not
+    observable: `codex exec --json` carries no model field, and the rollout's
+    `turn_context.model` echoes the `-m` argument (measured 2026-11-09, codex-cli 0.164.0). So a
+    change behind a Codex id is detectable only by OpenAI's announcement. A vendor-announced
+    change to an id during a trial ends that trial; the report splits that candidate's cells at
+    the change date on `running_at` and by `served_model`.
 13. **No production config change** is applied by anything in this PRD (as every eval
     PRD in this lineage).
 14. **(Leo) The one-step implementer harness variant is an eval axis, with a control.**
@@ -387,7 +434,8 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
   dispatching leaf and everything after it depend on both.
 - Provider credentials present in the orchestrator's environment for any endpoint bundle to be
   sampled — a **GLM Coding Plan** key for the GLM arms (paired with the coding endpoint, not the
-  general one), `MINIMAX_API_KEY`, a Codex CLI ≥ 0.153.0 for `gpt-6-astra`, … A missing
+  general one), `MINIMAX_API_KEY`, a Codex CLI ≥ 0.153.0 for `gpt-6-astra` (0.164.0 is measured
+  to serve `gpt-6.1-sol` and `gpt-6.1-terra`), … A missing
   credential is a per-candidate `shadow_cell_skipped reason=no_credentials`, never a run that
   401s; a Coding Plan whose allowance is spent settles the cell `cap_excluded` with reason
   `credits_exhausted`.
@@ -433,6 +481,8 @@ shadow_cells(
   cost_credits REAL NOT NULL DEFAULT 0, -- the REAL figure for a Coding Plan arm
   cost_basis TEXT NOT NULL,            -- 'metered' | 'subscription'. A typed discriminator,
                                        -- never inferred from the candidate name (heuristic 12)
+  configured_model TEXT NOT NULL,      -- EvalConfig.model at open (decision 12, task 8086)
+  served_model TEXT,                   -- the model reported when the run ended; NULL = not observable
   run_id TEXT,                         -- the orchestrator run that opened it; startup
                                        -- reconciliation reads this to find orphans
   opened_at TEXT NOT NULL, running_at TEXT, settled_at TEXT,
@@ -700,6 +750,29 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   Modules: `orchestrator/evals`, `orchestrator/agents`. Prereqs: α, ν. Depends
   (out-of-batch): **4757**, **3096**.
 
+  > **As built (task 5386).** Where this bullet and the code differ, the code is authoritative.
+  >
+  > - **The S6 gate** was `orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config`'s
+  >   `sandbox: SandboxConfig(enabled=False)`, not a missing kwarg. `TaskWorkflow._invoke`
+  >   already forwards `sandbox_modules`/`sandbox_extras` once the sandbox is enabled, through
+  >   `orchestrator/src/orchestrator/agents/invocation_scope.py::invocation_scope`, so
+  >   `agents/invoke.py` is unchanged.
+  > - **The profile** is `orchestrator/src/orchestrator/evals/shadow_invocation.py::build_shadow_orch_config`.
+  >   Strict MCP and the null memory endpoint are inherited from `EVAL_PROFILE`, not re-set.
+  >   `run_eval` and `run_end_to_end` take it as `orch_config_builder`.
+  > - **ε2 (task 5388) runs a shadow cell only through**
+  >   `orchestrator/src/orchestrator/evals/shadow_invocation.py::run_shadow_eval` or `::run_shadow_end_to_end`.
+  >   Both fix that builder, so the profile the probe checks is the profile the cell runs under.
+  > - **The coordinator's isolation dep** is
+  >   `orchestrator/src/orchestrator/evals/shadow_isolation.py::shadow_isolation_available`. Its
+  >   findings come from `probe_isolation` over the legs `shadow_leg_invocations` builds, and a
+  >   probe that cannot build its legs fails closed. Beyond strict MCP, memory and containment, it
+  >   also refuses a sandboxed leg whose backend resolves to `none` (`sandbox_unwrapped`). It refuses
+  >   any leg carrying an MCP server that is not spawned per invocation (`live_mcp_server`). A
+  >   workflow leg's servers come from
+  >   `orchestrator/src/orchestrator/workflow.py::compose_invocation_mcp_config`, the composition
+  >   `TaskWorkflow._invoke` dispatches with.
+
 - **ω — ZCode harness arm** *(leaf, probe-gated, task **5399**)*. **Stage 1 is a gate:** probe
   whether ZCode can be driven by the eval runner at all — a headless/non-interactive invocation,
   MCP server config (the implementer leg calls `mark_step_done`), an argument targeting the
@@ -739,7 +812,9 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   coexist — the event itself has no in-process consumer outside the merge worker. Create the
   detached eval worktree via `snapshots.py::create_eval_worktree`, run the `implementer` shape
   through `run_eval`, apply the PSI gate and `max_concurrent` checks, and set `cap_excluded` on
-  a `detect_cap_hit` boolean. **[S5]** Row 13 is re-bound: no reaper exclusion is added
+  a `detect_cap_hit` boolean. Its runner fills `CellRunOutcome.served_model` from the
+  role-under-test invocation's `AgentResult.model_id` (also the `invocations.model_id` ledger
+  column), leaving it `None` when absent (decision 12). **[S5]** Row 13 is re-bound: no reaper exclusion is added
   (structurally unnecessary), and the "never reaches the lane" claim is proved by the absence of
   any ref plus the coordinator's lack of a merge client — G6 branch 4, executed rather than
   asserted. **Signal: boundary rows 1, 3, 4, 7, 8, 13, 14, 15 executed against a real
@@ -774,7 +849,8 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
 - **θ2 — full report and the η-gate view** *(leaf, task **5392**)*. All shapes;
   `terminal_kind` split; per-stratum breakdown; observed pair variance and iterations-per-step;
   the `architect-consequence` view for `architect-fable-max` vs `architect-opus-max` that
-  esc-3637-1 consumes. **Signal:** the report over a seeded multi-shape store matches a
+  esc-3637-1 consumes. The report can split a candidate's cells by `served_model` and at a
+  change date on `running_at` (decision 12). **Signal:** the report over a seeded multi-shape store matches a
   committed golden output rendered from that store (INV-10 tier 1: it executes the renderer);
   `--json` validates against a committed schema. Prereqs: ζ, η.
 

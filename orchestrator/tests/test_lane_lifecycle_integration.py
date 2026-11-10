@@ -44,15 +44,22 @@ import shutil
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
+from _lane_test_helpers import (
+    acquire_lane,
+    add_warm_lane_scripts,
+    build_harness,
+    get_head,
+    make_orch_config,
+    make_plan,
+    wire_recovery_scheduler,
+)
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run
-from orchestrator.harness import Harness
+from orchestrator.git_ops import WorktreeInfo, _run
 from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     IllegalLaneTransition,
@@ -94,90 +101,6 @@ def ig_git_repo(tmp_path: Path) -> Path:
     return repo
 
 
-async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
-    """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo.
-
-    No real ssh/reify — the seed stub only needs to mkdir target/ and drop a
-    marker file so acquire_warm_lane's seed step exits 0.
-    """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    seed_script = scripts_dir / 'seed-warm-lane.sh'
-    seed_script.write_text(
-        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
-    )
-    seed_script.chmod(0o755)
-    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
-    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
-    debug_script.chmod(0o755)
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
-
-
-def _make_orch_config(repo: Path, *, max_concurrent_tasks: int = 1) -> OrchestratorConfig:
-    """Build a minimal real OrchestratorConfig with the warm-lane pool on."""
-    return OrchestratorConfig(
-        project_root=repo,
-        max_concurrent_tasks=max_concurrent_tasks,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-            push_after_advance=False,
-            warm_lane_pool=True,
-        ),
-    )
-
-
-def _build_harness(config: OrchestratorConfig) -> Harness:
-    """Construct a Harness with heavy constructors patched out.
-
-    GitOps is deliberately left REAL (not patched) — this gate drives the
-    real writer/reader seam. Mirrors test_warm_lane_integration_gate.py /
-    test_harness_warm_lane_wiring.py's _build_harness.
-    """
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        return Harness(config)
-
-
-async def _get_head(repo: Path) -> str:
-    """Return the HEAD commit SHA of the repo."""
-    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
-    assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
-    return out.strip()
-
-
-def _make_plan(done: int, total: int, task_id: str = 'test') -> dict:
-    """Build a plan dict with the given step-completion counts."""
-    steps = []
-    for i in range(total):
-        steps.append({
-            'id': f'step-{i + 1}',
-            'description': f'Step {i + 1}',
-            'status': 'done' if i < done else 'pending',
-            'commit': f'abc{i}' if i < done else None,
-        })
-    return {'task_id': task_id, 'title': 'Test Task', 'steps': steps}
-
-
-async def _acquire_lane(
-    git_ops: GitOps,
-    task_id: str,
-    start_ref: str,
-    *,
-    expected_title: str | None = None,
-) -> Path:
-    """Acquire a warm lane for *task_id*, asserting success, and return its path."""
-    wt = await git_ops.acquire_warm_lane(task_id, start_ref, expected_title=expected_title)
-    assert isinstance(wt, WorktreeInfo), f'acquire_warm_lane failed: {wt!r}'
-    return wt.path
-
-
 def _backdate_record(lifecycle: LaneLifecycle, lane: Path, *, days: int) -> str:
     """Rewrite *lane*'s on-disk updated_at to *days* ago; return that stamp."""
     path = lifecycle.state_dir / f'{lane.name}.json'
@@ -185,20 +108,6 @@ def _backdate_record(lifecycle: LaneLifecycle, lane: Path, *, days: int) -> str:
     stamp = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     path.write_text(replace(record, updated_at=stamp).to_json(), encoding='utf-8')
     return stamp
-
-
-def _wire_recovery_scheduler(harness: Harness) -> None:
-    """Stub the scheduler + event_store surface _recover_crashed_tasks reads.
-
-    get_task returns a title-less (but non-None) dict so the identity guard
-    (config.worktree_identity_guard_enabled defaults True) fails OPEN
-    (identities_match treats an empty title as a match) instead of deferring.
-    """
-    harness.scheduler.get_status = AsyncMock(return_value=None)
-    harness.scheduler.get_task = AsyncMock(return_value={})
-    harness.scheduler.get_tasks = AsyncMock(return_value=[])
-    harness.scheduler.is_deterministic = MagicMock(return_value=False)
-    harness.event_store = MagicMock()
 
 
 # ── B1 — writer->reader round-trip (adopt) ──────────────────────────────
@@ -213,27 +122,27 @@ class TestB1WriterReaderRoundTrip:
 
     async def test_acquire_then_recover_adopts_lane(self, ig_git_repo: Path):
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
         # Strengthen the round-trip claim: exercise the identity guard's
         # genuine BOTH-present, equal branch (harness.py:2151-2190) rather
-        # than the fail-open default `_wire_recovery_scheduler` sets up —
+        # than the fail-open default `wire_recovery_scheduler` sets up —
         # return the SAME title the writer stores below via `ta.init`, so
         # `identities_match` actually compares 'B1 task' == 'B1 task'
         # instead of short-circuiting on a title-less dict.
         harness.scheduler.get_task = AsyncMock(return_value={'title': 'B1 task'})
 
         # WRITER: real acquire_warm_lane — real `git worktree add`.
-        head = await _get_head(repo)
-        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
+        head = await get_head(repo)
+        lane = await acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
         assert lane.name.startswith('_lane-')
 
-        # Write crashed progress under the sibling .task-meta root.
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        # Write crashed progress under the sibling .task-meta roots, as a
+        # dispatch of '42' into this lane leaves them.
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B1 task', 'd')
-        ta.write_plan(_make_plan(3, 5, '42'))
+        ta.write_plan(make_plan(3, 5, '42'))
 
         # Simulate restart: fresh in-memory pool cache; durable record +
         # git worktree persist on disk.
@@ -291,12 +200,12 @@ class TestB2CrashQuarantine:
         import logging
 
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
 
-        head = await _get_head(repo)
-        lane = await _acquire_lane(harness.git_ops, '42', head)
+        head = await get_head(repo)
+        lane = await acquire_lane(harness.git_ops, '42', head)
         assert (repo / '.git' / 'worktrees' / lane.name).exists()
 
         old_pool = harness.git_ops.warm_lane_pool
@@ -364,9 +273,9 @@ class TestB2CrashQuarantine:
         import logging
 
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
         # Diverging live title — the guard must catch this even though the
         # admin-entry + branch checks that gate it (harness.py:2140) both
         # pass below.
@@ -374,12 +283,11 @@ class TestB2CrashQuarantine:
             return_value={'title': 'Unrelated live task'},
         )
 
-        head = await _get_head(repo)
-        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B2 identity')
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        head = await get_head(repo)
+        lane = await acquire_lane(harness.git_ops, '42', head, expected_title='B2 identity')
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B2 identity', 'd')
-        ta.write_plan(_make_plan(1, 2, '42'))
+        ta.write_plan(make_plan(1, 2, '42'))
 
         # Admin entry + branch stay intact — the divergence here is
         # identity, not registration (contrast with the orphan case above).
@@ -491,23 +399,22 @@ class TestB4Contamination:
 
     async def test_hostile_add_all_stages_zero_task_meta(self, ig_git_repo: Path):
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
 
-        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        lane = await acquire_lane(harness.git_ops, '42', await get_head(repo))
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B4', 'd')
-        ta.write_plan(_make_plan(1, 2, '42'))
+        ta.write_plan(make_plan(1, 2, '42'))
         ta.append_iteration_log({'k': 1})
 
         # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
-        # the sibling `meta` root, never at `<lane>/.task`.  Nothing writes
-        # `<lane>/.task` any more, either — acquire's _ensure_task_gitignore
-        # defense-in-depth guard, the last thing that unconditionally
-        # created it, is gone.
-        assert (meta / 'plan.json').exists()
+        # the sibling `.task-meta` roots, never at `<lane>/.task`.  Nothing
+        # writes `<lane>/.task` any more, either — acquire's
+        # _ensure_task_gitignore defense-in-depth guard, the last thing that
+        # unconditionally created it, is gone.
+        assert ta.artifact_path('plan.json').exists()
         assert not (lane / '.task' / 'plan.json').exists()
         assert not (lane / '.task-meta').exists()
 
@@ -524,7 +431,7 @@ class TestB4Contamination:
             assert forbidden not in out, f'{forbidden!r} leaked into the hostile commit tree'
 
         # The sidecar is untouched by the commit.
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
 
 
 # ── B5 — survives cleaning ──────────────────────────────────────────────
@@ -541,16 +448,15 @@ class TestB5SurvivesCleaning:
         self, ig_git_repo: Path,
     ):
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
 
         base = harness.git_ops.worktree_base
-        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        lane = await acquire_lane(harness.git_ops, '42', await get_head(repo))
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B5', 'd')
-        ta.write_plan(_make_plan(1, 2, '42'))
+        ta.write_plan(make_plan(1, 2, '42'))
 
         record_path = base / '.lane-state' / f'{lane.name}.json'
         assert record_path.exists()
@@ -566,7 +472,7 @@ class TestB5SurvivesCleaning:
         assert rec.state == DurableLaneState.ASSIGNED
         assert rec.task_id == '42'
 
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
 
 
 # ── B7 — REUSE dispatch refreshes the record's age (task 7863) ─────────
@@ -585,17 +491,16 @@ class TestB7ReuseDispatchRefreshesRecordAge:
         self, ig_git_repo: Path, caplog,
     ):
         repo = ig_git_repo
-        await _add_warm_lane_scripts(repo)
-        harness = _build_harness(_make_orch_config(repo))
-        _wire_recovery_scheduler(harness)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
         harness.scheduler.get_task = AsyncMock(return_value={'title': 'B7 task'})
 
-        head = await _get_head(repo)
-        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B7 task')
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        head = await get_head(repo)
+        lane = await acquire_lane(harness.git_ops, '42', head, expected_title='B7 task')
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B7 task', 'd')
-        ta.write_plan(_make_plan(1, 3, '42'))
+        ta.write_plan(make_plan(1, 3, '42'))
 
         lifecycle = LaneLifecycle(harness.git_ops.worktree_base)
         old = _backdate_record(lifecycle, lane, days=30)

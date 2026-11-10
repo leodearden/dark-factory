@@ -419,7 +419,7 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     key; dropping done_provenance is refused with the same canonical dict the
     interceptor returns. Metadata is sent as a dict, so the tool's own
     json.dumps coercion is on the path."""
-    from _fm_helpers import _init_git_repo
+    from _fm_git_repos import _init_git_repo
 
     from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
     from fused_memory.middleware.task_interceptor import interceptor_write_succeeded

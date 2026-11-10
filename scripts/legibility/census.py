@@ -24,7 +24,7 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``task_store``, ``escalate_fn``, ``status_fetcher``, ``gate``, ``commit``,
 ``roll_back``, ``batch_source``, ``selection_of``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
-``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
+``census_trigger.decide_for_project(completion_runner=)``. The scripts/ test env (``uv run
 --project shared``) has no live models. Every seam is ALWAYS faked in this
 module's own test suite for DETERMINISM -- to keep the suite off the
 network and make both the request shape and the failure path assertable
@@ -913,23 +913,15 @@ def advance_census_state(
     report_path: str,
     as_of_sha: str,
     session_watermark: str | None,
-    done_count: int | None,
 ) -> None:
-    """Write census-state.json to *path*, atomically, as exactly
-    ``{last_census_at, last_census_run_id, last_census_report,
-    last_census_as_of_sha, session_watermark, last_census_done_count}`` in
-    that order (``plans/census-incremental-prd.md`` §4.2). *census_at* is
-    the run's ``YYYY-MM-DD``, *report_path* is repo-relative, and
-    *session_watermark* is the exclusive end of the mined window (``None``
-    when the run had no window).
-
-    Every key is always written. ``done_count`` is three-valued: a positive
-    int or ``0`` is a real observed baseline (``0`` is never dropped as
-    falsy), and ``None`` -- serialised as ``null`` -- means the count could
-    not be observed. ``census_trigger.compute_tasks_landed`` treats ``null``
-    like an absent key, so its condition (b) fails safe; never pass a
-    fabricated ``0`` or a carried-forward value for an unknown (task 3291;
-    ``census_trigger``'s module docstring has the measurements).
+    """Write census-state.json to *path*, atomically, as exactly the five
+    keys ``{last_census_at, last_census_run_id, last_census_report,
+    last_census_as_of_sha, session_watermark}`` in that order
+    (``plans/census-incremental-prd.md`` §4.2). *census_at* is the run's
+    ``YYYY-MM-DD``, *report_path* is repo-relative, and *session_watermark*
+    is the exclusive end of the mined window (``None`` when the run had no
+    window). Every key is always written; the next trigger's completion arm
+    reads ``last_census_run_id``.
 
     ``tempfile.mkstemp`` in *path*'s directory plus ``os.replace``: a crash
     mid-write never leaves a partial file, and an existing one is fully
@@ -941,7 +933,6 @@ def advance_census_state(
         "last_census_report": report_path,
         "last_census_as_of_sha": as_of_sha,
         "session_watermark": session_watermark,
-        "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
     # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
@@ -1181,21 +1172,16 @@ def build_method(
     inputs_consumed_note: str | None,
     embedding_calls: int,
     adjudication: Mapping[str, int],
+    slug_tally: codebook.SlugTally,
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
-    (plans/census-incremental-prd.md §4.3), which carries
-    *verify_normalisations*: the verdict repairs per kind (§4.4), the
-    *reverify* counts of the outcome feedback (L5, D8), whose offered
-    re-verifies *verify_calls* includes, and the pre-screen's per-rule
-    *screened* counts (L6), and the similarity stage's *adjudication*
-    counts (L7), whose embedding requests are *embedding_calls*.
-    *inputs_consumed* are the run ids of the other
-    instruments' records the pre-screen read, and *inputs_consumed_note*
-    says why any gave it none. *selection* is ``None`` for a
-    run with no mining window, which nulls the evidence and ledger fields it
-    would have supplied; an unreadable ledger counts ``ledger_rows`` and
-    ``ledger_pruned`` as ``None``, never 0."""
+    (plans/census-incremental-prd.md §4.3). *verify_calls* includes the
+    offered re-verifies counted in *reverify*, and *inputs_consumed* are the
+    run ids of the other instruments' records the pre-screen read.
+    *selection* is ``None`` for a run with no mining window, which nulls the
+    evidence and ledger fields it would have supplied; an unreadable ledger
+    counts ``ledger_rows`` and ``ledger_pruned`` as ``None``, never 0."""
     return {
         "run_id": run_id,
         "as_of_sha": as_of_sha,
@@ -1221,6 +1207,7 @@ def build_method(
             **_ledger_extra(selection),
             "verify_normalisations": dict(verify_normalisations),
             "reverify": dict(reverify),
+            "slug_rejections": slug_tally.rejections_record(),
         },
     }
 
@@ -1813,7 +1800,7 @@ def _with_refilings(
 def _read_statuses(status_fetcher) -> tuple[Mapping[str, Any] | None, str | None]:
     """The run's one get_statuses snapshot (``census_trigger.extract_statuses``),
     or None and why it could not be read: an unread snapshot leaves every
-    outcome unobserved and the done-count null, and never fails the run."""
+    outcome unobserved, and never fails the run."""
     try:
         return census_trigger.extract_statuses(status_fetcher()), None
     except Exception as exc:
@@ -2816,8 +2803,7 @@ def run_census(
     written) -> write the JSON record beside *report_path*
     (``build_census_record``) and the
     report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
-    (done-count from the same *status_fetcher* snapshot, watermark from the
-    mining window) -> *gate*, the project's landing gate
+    (watermark from the mining window) -> *gate*, the project's landing gate
     (``landing_gate.run_gate``) over the checkout now holding those outputs,
     at a HEAD that held still while it ran (it re-runs a bounded number of
     times while the merge worker moves HEAD, then refuses):
@@ -3511,6 +3497,7 @@ def run_census(
         inputs_consumed_note=screen_report.inputs.note,
         embedding_calls=view.requests,
         adjudication=adjudication_report.counts(),
+        slug_tally=merge.invariant_slugs,
     )
     record = build_census_record(
         method=method,
@@ -3555,33 +3542,6 @@ def run_census(
     record_path.write_text(record_text, encoding="utf-8")
     Path(report_path).write_text(render_report(json.loads(record_text)), encoding="utf-8")
 
-    # An unobservable done-count degrades ONLY the next window's condition-(b)
-    # baseline -- it must never abandon a run whose mining has already been
-    # paid for and whose dated report is already on disk above. Aborting would
-    # also leave last_census_at unadvanced, so condition (a) would re-fire the
-    # census every single night -- a strictly more over-eager loop than any
-    # this task set out to fix.
-    #
-    # The count comes from the run's one get_statuses snapshot, read above for
-    # the outcome feed (_read_statuses guards both the fetch and the
-    # extraction). census_trigger.extract_statuses is what stops
-    # fused-memory's {"error", "error_type"} envelope -- which rides an
-    # isError:false JSON-RPC response and so arrives here looking like a
-    # perfectly good dict -- from being counted as a done-count of 0 and
-    # persisted as a REAL baseline. Such a fabricated 0 arms condition (b)
-    # with a delta of every-done-task-ever the moment the fetch works again
-    # (task 3291; see census_trigger's module docstring for the replayed
-    # measurements). See advance_census_state's docstring for why null, not 0
-    # and not a carried-forward value, is the honest degradation.
-    done_count = None if statuses is None else census_trigger.count_done(statuses)
-    if statuses is None:
-        logger.warning(
-            "census: done-count unobservable (%s) -- persisting a null "
-            "last_census_done_count; the tasks-landed trigger condition will "
-            "fail safe until the next successful census",
-            statuses_error,
-        )
-
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
     # between them, so the ONLY way census-state.json can end up lagging
@@ -3596,7 +3556,6 @@ def run_census(
         report_path=report_relpath,
         as_of_sha=as_of_sha,
         session_watermark=selection.window.end.isoformat() if selection is not None else None,
-        done_count=done_count,
     )
 
     verdict = gate()
@@ -4265,7 +4224,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
     mining/verify/synthesis, the fused-memory poster for ``submit_fn``,
     :func:`alarm.raise_alarm` (through *poster*) for ``escalate_fn``,
-    ``census_trigger.default_status_fetcher`` for the done-count baseline,
+    ``census_trigger.default_status_fetcher`` for the outcome feed's get_statuses snapshot,
     a :class:`census_window.WindowBatchSource` over the mining window,
     ``unlanded.commit_only`` for the scoped commit, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
@@ -4474,9 +4433,7 @@ def _run_configured_census(
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 
     if not args.force:
-        decision = census_trigger.decide_for_project(
-            project_root, now=now, status_fetcher=status_fetcher,
-        )
+        decision = census_trigger.decide_for_project(project_root, now=now)
         if not decision.fire:
             print(f"census: NO-FIRE for {cfg.project_id} -- pass --force to run anyway")
             for reason in decision.reasons:

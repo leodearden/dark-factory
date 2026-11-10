@@ -58,6 +58,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _meta_root_for_worktree,
 )
+from orchestrator.workflow_types import PublishedStewardOutcome
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
@@ -2674,12 +2675,12 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2693,12 +2694,12 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -2715,7 +2716,7 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf._worktree_has_wip_commits = AsyncMock(return_value=wip)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=wip)
 
@@ -2752,17 +2753,17 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
-        wf._steward_outcome_channel.put_nowait(
-            StewardReescalatedL1(esc_id='L1'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2', StewardReescalatedL1(esc_id='L1'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         assert wf._steward_outcome_channel.empty(), (
@@ -2777,9 +2778,9 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
@@ -2787,7 +2788,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.get_by_task.assert_called_once_with(
@@ -2802,14 +2803,14 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2822,9 +2823,9 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
@@ -2832,7 +2833,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
 
@@ -2844,14 +2845,14 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='done')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus.DONE)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -10,7 +11,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
+from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
+from _reap_report_wait import await_reap_report
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -30,12 +34,14 @@ def _record(
     *,
     owner_pid: int | None,
     status: sr.Status = sr.Status.RUNNING,
+    owner_identity: ProcessIdentity | None = None,
 ) -> sr.SessionRecord:
     return sr.SessionRecord(
         session_slug=slug,
         status=status,
         claude_session_id='claude-session-uuid',
         claude_owner_pid=owner_pid,
+        claude_owner_identity=owner_identity,
     )
 
 
@@ -318,7 +324,42 @@ class TestReapStaleSessionPointers:
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
 
-    def test_a_corrupt_record_is_never_parsed_so_its_pointer_is_kept(
+    @pytest.mark.parametrize('variant', list(IdentityVariant))
+    def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
+        self, tmp_path: Path, variant: IdentityVariant
+    ) -> None:
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity(variant))
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+        removed = variant.judged_dead
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
+        assert pointer.exists() is not removed
+
+    def test_a_dead_pids_pointer_to_a_record_reclaimed_by_a_live_owner_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity())
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    def test_a_live_pids_pointer_to_a_record_owned_by_another_pid_is_judged_by_its_own_pid(
+        self, tmp_path: Path
+    ) -> None:
+        elsewhere = dataclasses.replace(own_identity(), pid=_DEAD_PID)
+        owner = _record(self._SLUG, owner_pid=_DEAD_PID, owner_identity=elsewhere)
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+
+    def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
         self, tmp_path: Path
     ) -> None:
         record_path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
@@ -384,6 +425,7 @@ class TestPointerSweepDrivers:
         slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
         expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
+        await_reap_report(tmp_path)
         assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
 

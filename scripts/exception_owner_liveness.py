@@ -26,10 +26,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 import _checkout as _checkout
-from _task_db_scan import connect_ro, decode_metadata
+from _task_db_scan import decode_metadata
 from shared.governed_exceptions import TaskRef, TicketRef
 from shared.task_deferral import CarriedByDeferral, parse_record
 from shared.task_statuses import OwnerLiveness, owner_liveness
+from shared.tasks_db_readonly import connect_ro
 
 _SELECT_ROWS = "SELECT id, status, title, metadata FROM tasks WHERE tag = 'master'"
 

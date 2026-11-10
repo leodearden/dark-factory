@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import install_identity_mocks, poll_until
+from _fm_helpers import install_identity_mocks
+from _fm_polling import poll_until
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.server.main import _MEMORY_CLOSE_STEP_TIMEOUT

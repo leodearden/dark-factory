@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.services.consolidation_ops import (
     TOPIC_MEMBER_LIMIT,
@@ -283,6 +284,32 @@ class TestTheCanonicalIsMinted:
         assert result['error_type'] == 'CanonicalWriteFailed'
         assert result['topic'] == TOPIC
         svc.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_mint_opts_out_of_mem0_retry_deferral(self):
+        """A canonical deferred for retry would land after this op refused,
+        and a re-run would then mint a second canonical for the topic."""
+        svc = make_service()
+
+        await call_execute(svc)
+
+        assert svc.add_memory.await_args.kwargs['defer_transient_mem0_failure'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_mint_left_pending_retry_refuses_and_patches_nothing(self):
+        svc = make_service()
+        svc.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(
+                memory_ids=[], stores_pending_retry=[SourceStore.mem0]
+            )
+        )
+
+        result = await call_execute(svc)
+
+        assert result['error_type'] == 'CanonicalWriteFailed'
+        assert result['topic'] == TOPIC
+        svc.update_memory.assert_not_awaited()
+        svc.delete_memory.assert_not_awaited()
 
 
 class TestThePeersAreTaggedInPlace:

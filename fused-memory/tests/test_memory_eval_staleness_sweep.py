@@ -21,14 +21,17 @@ named item_keys and exact counts on seeded fixtures.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
+import os
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_staleness_sweep.py'
 
@@ -3269,11 +3272,6 @@ class TestAttributionInReport:
 # test above and the guards they carry would guard nothing.
 # ---------------------------------------------------------------------------
 
-import contextlib  # noqa: E402
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
-
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 """The ONLY prefix scripts/cleanup_test_collections.py reaps.
 
@@ -3378,19 +3376,12 @@ class TestSeededStalenessSweep:
     ):
         from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
 
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         m = _mod()
         memory = MemoryService(sweep_config)
         await memory.initialize()
         try:
-            # mem0's SQLite history writer is process-shared and xdist-
-            # contended; it is not the question under test, and its failure
-            # would mask the one that is.
-            instance = await memory.mem0._get_instance(Scope(project_id=sweep_project_id))
-            instance.db.add_history = lambda *a, **kw: None
-
             predecessor = await memory.add_memory(
                 SEED_PREDECESSOR, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',

@@ -22,11 +22,11 @@ from .judge import _strip_metadata, parse_confidence, parse_winner
 from .measurement import (
     MeasurementStage,
     Unmeasured,
+    format_invocation_errors,
     json_answer,
     measured_call,
     require_answer_iff_measured,
 )
-from .report import format_invocation_errors
 from .results import EvalResult
 from .scoring import quality_from_reviews
 from .snapshots import get_diff
@@ -178,7 +178,7 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Revi
     Returns ``{reviewer_name: ReviewPayload}``. Returns an empty dict if the
     verdicts dir doesn't exist or has no reviewer files.
     """
-    verdicts_dir = artifacts.root / 'verdicts'
+    verdicts_dir = artifacts.artifact_path('verdicts')
     if not verdicts_dir.is_dir():
         return {}
 
@@ -220,7 +220,7 @@ def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, ReviewPayload]:
     Returns ``{reviewer_name: ReviewPayload}``. Returns an empty dict if the
     reviews dir doesn't exist.
     """
-    reviews_dir = artifacts.root / 'reviews'
+    reviews_dir = artifacts.artifact_path('reviews')
     if not reviews_dir.is_dir():
         return {}
 

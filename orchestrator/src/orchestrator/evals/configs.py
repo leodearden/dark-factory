@@ -14,9 +14,10 @@ always loses to an existing ``config.prices`` entry).
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from orchestrator.config import default_price_table
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
 from .metrics import CANDIDATE_ROLES, RoleUnderTest
@@ -41,6 +42,9 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    # The implementer brief variant this candidate runs under; becomes the
+    # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
+    harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
     # vLLM-only pod fields (None / 0 for non-vllm or workstation configs)
     image: str | None = None              # Docker image tag
     gpu_type: str | None = None           # RunPod GPU type id
@@ -53,6 +57,10 @@ class EvalConfig:
                 f'EvalConfig {self.name!r}: role {self.role.value!r} is not a candidate '
                 f'role; expected one of {sorted(r.value for r in CANDIDATE_ROLES)}',
             )
+
+
+class UnknownHarnessVariant(ValueError):
+    """A ``<name>@<variant>`` lookup named a variant outside ImplementerBriefVariant."""
 
 
 def _vllm_config(
@@ -487,7 +495,36 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     judge candidate is intentionally unsupported: a lookup returns ``None``
     ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
     than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
+
+    A name may carry a harness variant, ``<name>@<variant>`` (task 5385): it
+    resolves to a copy of the registered ``<name>`` relabelled with the full
+    requested name and carrying that ``harness_variant``. Two refusals keep a
+    variant from silently not applying: an unknown or empty variant raises
+    ``UnknownHarnessVariant`` before any scan, and a non-whole-plan variant on
+    a non-implementer candidate raises ``ValueError`` naming its role.
     """
+    base_name, separator, raw_variant = name.partition('@')
+    if not separator:
+        return _find_registered(name)
+    try:
+        variant = ImplementerBriefVariant(raw_variant)
+    except ValueError:
+        known = ', '.join(repr(member.value) for member in ImplementerBriefVariant)
+        raise UnknownHarnessVariant(
+            f'{name!r}: unknown harness variant {raw_variant!r}; known: {known}',
+        ) from None
+    base = _find_registered(base_name)
+    if base is None:
+        return None
+    if variant is not ImplementerBriefVariant.WHOLE_PLAN and base.role is not RoleUnderTest.IMPLEMENTER:
+        raise ValueError(
+            f'{name!r}: harness variant {variant.value!r} changes only the '
+            f'implementer brief, but {base_name!r} is a {base.role.value!r}-role candidate',
+        )
+    return replace(base, name=name, harness_variant=variant)
+
+
+def _find_registered(name: str) -> EvalConfig | None:
     families: tuple[Callable[[], list[EvalConfig]], ...] = (
         lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
         claude_endpoint_candidates,
@@ -656,7 +693,7 @@ MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
 # stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
-MINIMAX_MODEL = 'MiniMax-M3'
+MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
@@ -718,7 +755,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
     MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
     endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
@@ -736,7 +773,7 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
-            'minimax-m3-endpoint', MINIMAX_MODEL,
+            'minimax-m3.1-flash-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
         _claude_endpoint_config(
@@ -786,9 +823,9 @@ class CandidateEndpointPrice:
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
 # GLM access is a GLM Coding Plan, so both GLM rows are SUBSCRIPTION: imputed.
 CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
-    # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
-    # deliberately not used.
-    MINIMAX_MODEL: CandidateEndpointPrice(0.30, 1.20, CostBasis.METERED),
+    # MiniMax's native list rate from the 2026-11-01 frontier check (task
+    # 8086), no long-context surcharge.
+    MINIMAX_MODEL: CandidateEndpointPrice(0.15, 0.60, CostBasis.METERED),
     GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
@@ -839,17 +876,19 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Codex model ids from the 2026-09-10 live market check (task 5384); list
-# prices live in config.py::_DEFAULT_PRICES.
+# Codex model ids from the 2026-11-01 frontier check (task 8086); list prices
+# live in config.py::_DEFAULT_PRICES.
 #   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
 #   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
 #     14 — Claude leads the only Rust-bearing public benchmarks and open-model
 #     Rust evidence is thin, so no architect-role variant and no production
-#     wiring). Its rate is promotional through at least 2026-11-21.
+#     wiring).
 #   - Terra is the mid-price control.
+# A candidate name embeds its model id and is never re-pointed:
+# plans/live-shadow-eval-prd.md decision 12.
 CODEX_ASTRA_MODEL = 'gpt-6-astra'
-CODEX_SOL_MODEL = 'gpt-5.6-sol'
-CODEX_TERRA_MODEL = 'gpt-5.6-terra'
+CODEX_SOL_MODEL = 'gpt-6.1-sol'
+CODEX_TERRA_MODEL = 'gpt-6.1-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
 # vs claude delta attributes cleanly to harness effect rather than a model
@@ -870,10 +909,10 @@ def codex_pi_candidates() -> list[EvalConfig]:
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend

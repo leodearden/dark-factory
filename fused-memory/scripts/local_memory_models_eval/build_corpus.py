@@ -388,7 +388,7 @@ def payload_kind(source_description: object) -> str:
 def content_hash(content: str, *, uuid: str | None = None) -> str:
     """Return the full 64-char SHA-256 hex digest of *content*'s UTF-8 bytes.
 
-    Deliberately NOT ``memory_eval_retrieval_probe.content_key()``, which is
+    Deliberately NOT ``fused_memory.eval.retrieval_probe.content_key()``, which is
     ``sha256(whitespace-normalized)[:16]``. That digest's job is stable
     *identity matching* of memory text across re-indentation and rewrapping;
     this one's job is the opposite — **drift detection** on replay inputs. For
@@ -819,7 +819,7 @@ class EpisodeReader:
 def _falkor_host_from_env() -> str:
     """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
 
-    Same env vars and defaults as ``fused-memory/tests/_fm_helpers.py``, so an
+    Same env vars and defaults as ``fused-memory/tests/_fm_falkor_live.py``, so an
     operator who has pointed the test suite at a FalkorDB has pointed this
     script at the same one.
     """

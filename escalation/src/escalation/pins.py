@@ -438,6 +438,8 @@ def classify_pins(
 def pinned_only_by_human_parked(
     report: PinReport,
     records: Sequence[ClusterPinRecord] | None,
+    *,
+    holder_candidates: Sequence[ClusterPinRecord] = (),
 ) -> bool:
     """Is everything that PINS this task already in front of a human?
 
@@ -446,11 +448,16 @@ def pinned_only_by_human_parked(
     every record in the ``queue_handoff`` bucket — the bucket
     :attr:`PinReport.pins` reads — is either itself at
     ``level >= HUMAN_PARKED_MIN_LEVEL``, or a level-1 record that such a
-    human-level handoff in the SAME *records* names in its ``members``.  The
-    L1 an L2 was promoted from stays open, and still pins, until the L2's
-    cascade closes it, yet a human already holds it.  The holder must be among
-    *records* — the caller's read scope — so a cluster L2 filed under another
-    task id holds nothing here.
+    human-level handoff names in its ``members``.  The L1 an L2 was promoted
+    from stays open, and still pins, until the L2's cascade closes it, yet a
+    human already holds it.  The holder may be among *records* — the caller's
+    read scope — or among *holder_candidates*, OPEN records from outside that
+    read: ``escalation/src/escalation/server.py::promote_to_l2`` mints a
+    cluster L2 under ONE task id, so the L2 holding this task's L1 may be
+    filed under another (task 7716).  A candidate only holds members: it never
+    pins this task, and it counts only as a human-level queue handoff
+    (:func:`is_queue_handoff`).  Candidates are never classified into
+    *report*, so passing the whole pending queue is safe.
 
     *report* is what :func:`classify_pins` returned for these same *records*,
     taken rather than recomputed so a caller that already classified them does
@@ -461,7 +468,7 @@ def pinned_only_by_human_parked(
     be read never counts as parked.
 
     Every uncertain input answers False — no records, an unreadable store, an
-    L1 no human-level handoff in *records* holds, a level that is missing or
+    L1 no human-level handoff holds, a level that is missing or
     not an int (never coerced: ``'3'``, ``2.9`` and ``True`` are not levels,
     and a held member must be a genuine int ``1``), ``members`` that are not a
     list or tuple of str (never coerced, and a bare string is never
@@ -474,21 +481,30 @@ def pinned_only_by_human_parked(
     level 0 is the contradictory state link 3b fails safe to pinning, not proof
     that anyone human holds the task.
 
-    Pure: no I/O, and neither argument is mutated.
+    Pure: no I/O, and no argument is mutated.
     """
     if report.store_unavailable or records is None or not report.queue_handoff:
         return False
-    return set(report.queue_handoff) <= _human_parked_ids(report.queue_handoff, records)
+    parked = _human_parked_ids(report.queue_handoff, records, holder_candidates)
+    return set(report.queue_handoff) <= parked
 
 
 def _human_parked_ids(
     handoff_ids: Sequence[str],
     records: Sequence[ClusterPinRecord],
+    holder_candidates: Sequence[ClusterPinRecord],
 ) -> frozenset[str]:
     by_id = {record.id: record for record in records}
     handoffs = [by_id[esc_id] for esc_id in handoff_ids if esc_id in by_id]
     holders = [record for record in handoffs if _is_human_level(record.level)]
-    held = frozenset(member for holder in holders for member in _member_ids(holder))
+    outside_holders = [
+        candidate
+        for candidate in holder_candidates
+        if _is_human_level(candidate.level) and is_queue_handoff(candidate)
+    ]
+    held = frozenset(
+        member for holder in holders + outside_holders for member in _member_ids(holder)
+    )
     held_l1s = [record for record in handoffs if record.id in held and _is_l1(record.level)]
     return frozenset(record.id for record in holders + held_l1s)
 

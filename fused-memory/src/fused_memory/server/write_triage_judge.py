@@ -830,6 +830,12 @@ _JUDGE_MAX_TOKENS = 128
 #: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
+#: Every arm's SDK client makes ONE attempt, so nothing retries inside
+#: ``write_triage.judge_timeout_seconds``; the SDK's per-attempt timeouts still
+#: apply within it. Why: that field's description in
+#: ``config/schema.py::WriteTriageConfig``.
+_JUDGE_SDK_MAX_RETRIES = 0
+
 
 class _ProviderCredentials(NamedTuple):
     """How to reach *provider*'s endpoint, and what that endpoint speaks."""
@@ -1002,7 +1008,9 @@ async def _call_openai_responses(
         if reasoning_effort is None
         else {'reasoning': {'effort': reasoning_effort}}
     )
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.responses.create(
                 model=model,
@@ -1042,7 +1050,9 @@ async def _call_openai_chat(
     """
     import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=model,
@@ -1077,7 +1087,9 @@ async def _call_anthropic(
     """
     import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
+    async with anthropic.AsyncAnthropic(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.messages.create(
                 model=model,

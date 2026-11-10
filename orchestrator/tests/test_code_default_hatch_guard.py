@@ -1123,6 +1123,8 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestLayeredConfig.test_load_config_raises_when_no_config_and_no_env'),
     ('test_flake_report.py',
      'TestFlakeLedgerCommand.test_no_config_and_no_env_exits_one_with_an_error'),
+    ('test_verify_cache_status_cli.py',
+     'TestVerifyCacheStatus.test_no_config_and_no_env_exits_one_with_an_error'),
     ('test_eval_task_sampler.py',
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
     ('test_code_default_hatch_guard.py',

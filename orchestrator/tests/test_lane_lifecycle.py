@@ -74,6 +74,11 @@ class TestStaticContract:
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
 
+    def test_in_use_returns_to_assigned_when_last_child_exits(self):
+        # Leaf δ (task 3076): IN_USE is a liveness marker over an ASSIGNED
+        # lane, so the last live child exiting must be able to step it back.
+        assert (LaneState.IN_USE, LaneState.ASSIGNED) in LEGAL_TRANSITIONS
+
     def test_quarantined_has_exactly_one_sanctioned_recycle_edge(self):
         # The ONE sanctioned exit from QUARANTINED: recycle a quarantined slot
         # back into service (QUARANTINED -> RELEASED) once its bad worktree was
@@ -141,6 +146,31 @@ class TestLegalRoundtrip:
         assert record.title is None
         assert record.branch == 'task/foo'  # branch is NOT cleared
         assert lifecycle.read(lane) == record
+
+    def test_in_use_round_trips_back_to_assigned_keeping_the_assignment(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/2254')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='2254', title='demo')
+        in_use = lifecycle.transition(lane, LaneState.IN_USE)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED)
+
+        assert record.state == LaneState.ASSIGNED
+        assert lifecycle.read(lane) == record
+        assert (record.task_id, record.title, record.branch) == (
+            in_use.task_id, in_use.title, in_use.branch,
+        ) == ('2254', 'demo', 'task/2254')
+        assert datetime.fromisoformat(record.updated_at) > datetime.fromisoformat(
+            in_use.updated_at,
+        )
+
+        released = lifecycle.transition(lane, LaneState.RELEASED)
+        assert released.state == LaneState.RELEASED
+        assert released.task_id is None
 
     def test_record_file_path_and_json_shape(self, tmp_path: Path):
         lifecycle = _lifecycle(tmp_path)
@@ -238,6 +268,52 @@ class TestIllegalEscalate:
 
         with pytest.raises(IllegalLaneTransition):
             lifecycle.transition(lane, LaneState.IN_USE)
+
+
+def _in_use_lane(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    """Drive a lane to IN_USE for task 42 and return its path."""
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
+    lifecycle.transition(lane, LaneState.IN_USE)
+    return lane
+
+
+class TestInUseReturnEdgeKeepsTheAssignment:
+    """Leaf δ (task 3076) legalised IN_USE -> ASSIGNED for the last live child
+    exiting. transition() is the one mutator, so it is where that edge is
+    refused when it would hand the lane to another task."""
+
+    @pytest.mark.parametrize('other_task_id', ['99', None])
+    def test_a_task_id_change_raises_escalates_and_writes_nothing(
+        self, tmp_path: Path, other_task_id: str | None,
+    ):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition, match='IN_USE for task'):
+            lifecycle.transition(lane, LaneState.ASSIGNED, task_id=other_task_id)
+
+        assert record_path.read_bytes() == before_bytes
+        escalations = queue.get_by_task(f'lane-lifecycle-{lane.name}')
+        assert len(escalations) == 1
+        assert (escalations[0].agent_role, escalations[0].level) == (
+            ESCALATION_SENTINEL_ROLE, 2,
+        )
+
+    def test_naming_the_task_it_already_holds_is_legal(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _in_use_lane(tmp_path, lifecycle)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42')
+
+        assert (record.state, record.task_id, record.title) == (
+            LaneState.ASSIGNED, '42', 'demo',
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +587,41 @@ class TestNoteAssigned:
             lifecycle.note_assigned(lane, task_id='99', branch='task/99')
 
         # Never silent-steal: the record is untouched on conflict.
+        assert record_path.read_bytes() == before_bytes
+
+    def test_in_use_different_task_raises_escalates_and_leaves_record_unchanged(
+        self, tmp_path: Path,
+    ):
+        # Leaf δ made IN_USE -> ASSIGNED legal, so without transition()'s
+        # re-key guard task 99 could silently take a lane task 42 has a live
+        # child in.
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.note_assigned(lane, task_id='99', branch='task/99')
+
+        assert record_path.read_bytes() == before_bytes
+        escalations = queue.get_by_task(f'lane-lifecycle-{lane.name}')
+        assert len(escalations) == 1
+        assert escalations[0].agent_role == ESCALATION_SENTINEL_ROLE
+        assert escalations[0].level == 2
+
+    def test_in_use_same_task_is_idempotent_noop_and_stays_in_use(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        record = lifecycle.note_assigned(lane, task_id='42')
+
+        assert record.state == LaneState.IN_USE
+        assert record.task_id == '42'
         assert record_path.read_bytes() == before_bytes
 
 

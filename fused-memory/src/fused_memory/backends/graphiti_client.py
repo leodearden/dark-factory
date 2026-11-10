@@ -2058,19 +2058,8 @@ class GraphitiBackend:
             # Translate only a not-found provably about the caller's own uuid —
             # graphiti_core raises the same class from entity/edge resolution
             # after the episode loaded fine. The proof CONSTRUCTS the genuine
-            # upstream exception instead of parsing its text (the regex in
-            # durable_queue.py::_parse_not_found_uuid exists only because that
-            # module refuses to import graphiti_core; this one already does), so
-            # an upstream reword fails open rather than mislabelling.
-            #
-            # The replacement message deliberately does not match
-            # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
-            # it would fall open to ordinary retry rather than task 3586's
-            # ('permanent', 1) rule — moot today, since post-3561 an add_episode
-            # payload cannot carry a uuid at all. Enforced, not merely claimed:
-            # tests/test_graphiti_add_episode_uuid_param.py::
-            # test_the_translated_message_stays_retryable_for_the_durable_queue
-            # feeds this message through durable_queue's real parser.
+            # upstream exception instead of parsing its text, so an upstream
+            # reword fails open rather than mislabelling.
             if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
                 raise
             raise NodeNotFoundError(
@@ -3637,6 +3626,11 @@ class GraphitiBackend:
         `old_uuid` lost the race, which is acceptable for an audit-only
         property.
 
+        Deleted-graph note: detection is read over GRAPH.RO_QUERY, so a graph
+        deleted after the startup scan listed it is refused rather than
+        recreated empty. Pinned by
+        fused-memory/tests/test_startup_identity_scan.py::TestRepairDuplicateEdgeUuidsLiveFalkorDB::test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted.
+
         Args:
             group_id: Project graph to repair.
 
@@ -3651,7 +3645,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher)
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:
@@ -5407,10 +5401,8 @@ class GraphitiBackend:
         (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
         implementation instead of re-forking the build-names / check-missing /
         ``.index()`` sequence — re-forking is how the positional read survived.
-        ``tests/_fm_helpers.await_index_operational`` still carries its own copy
-        (it resolves ``status`` by name for exactly this reason); collapsing that
-        third copy onto this helper is filed as a follow-up, as ``_fm_helpers``
-        is outside task 3706's locked scope.
+        ``tests/_fm_falkor_live.await_index_operational`` resolves its
+        ``status`` column through the same helper.
 
         A missing required column — or a header entry that is not a
         ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
@@ -5531,7 +5523,7 @@ class GraphitiBackend:
         This method deliberately adds NO barrier and issues exactly one
         ``CALL db.indexes()`` (the diff read) — establishing that an index is
         serving is task ε's canary, and the wait belongs in test fixtures
-        (``tests/_fm_helpers.await_index_operational``), never here.
+        (``tests/_fm_falkor_live.await_index_operational``), never here.
 
         Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
         the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
@@ -5760,7 +5752,7 @@ class GraphitiBackend:
                 settled catalog costs one ``CALL db.indexes()`` and no wait.
             interval: Seconds between polls.  What matters is noticing the
                 window CLOSE promptly, not catching a millisecond-scale opening;
-                this matches ``tests/_fm_helpers.await_index_operational``.
+                this matches ``tests/_fm_falkor_live.await_index_operational``.
 
         Returns:
             The settled ``list_indices()`` records, every one ``OPERATIONAL``.

@@ -7,7 +7,7 @@ import shutil
 from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 
 from fused_memory.server.tools import create_mcp_server
 

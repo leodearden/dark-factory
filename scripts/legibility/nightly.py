@@ -9,7 +9,7 @@ boundary test §8.8.
 
 Every stage is injected through :func:`run_nightly` (``selector``,
 ``digest_builder``, ``invoke`` for the LLM, ``committer`` for git,
-``census_launcher`` and ``status_fetcher`` for the census, ``poster`` for
+``census_launcher`` and ``completion_runner`` for the census, ``poster`` for
 the alarm (:func:`alarm.raise_alarm`), ``recorder``/``retry_recorder`` for
 run state). Each seam
 resolves ``None`` to its real implementation, so a production entrypoint
@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple, assert_never
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -445,18 +445,28 @@ def _default_census_launcher(
         )
 
 
+class CensusEvaluation(NamedTuple):
+    """One census-trigger evaluation: its one-line decision, whether it
+    FIREd, and the completion arm's verdict (``None`` when the evaluation
+    established none)."""
+
+    line: str
+    fire: bool
+    completion: census_trigger.CompletionStatus | None
+
+
 def evaluate_census_step(
     cfg: LegibilityConfig,
     *,
     now=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner = census_trigger.run_completion_check,
     decide=census_trigger.decide_for_project,
     entrypoint_exists=None,
     launcher=None,
     config_path: Path | str | None = None,
-) -> tuple[str, bool]:
+) -> CensusEvaluation:
     """Evaluate the periodic-census trigger (ζ) at the end of a nightly
-    run, returning ``(one_line_decision, fire)``.
+    run, returning a :class:`CensusEvaluation`.
 
     *decide* (default ``census_trigger.decide_for_project``) makes the
     FIRE/NO-FIRE call. On NO-FIRE, *launcher* is never called. On FIRE: if
@@ -495,14 +505,13 @@ def evaluate_census_step(
         launcher = _default_census_launcher
 
     try:
-        decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+        decision = decide(cfg.project_root, now=now, completion_runner=completion_runner)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
         # and `census_line` is a one-line field on `NightlyResult`. An escaping
-        # exception's message is arbitrary -- a `StatusFetchUnavailable`
-        # chained from a large get_statuses payload, or a multi-line YAML /
-        # pydantic error -- so it is truncated (and its newlines escaped) by
+        # exception's message is arbitrary -- a large payload, or a multi-line
+        # YAML / pydantic error -- so it is truncated (and its newlines escaped) by
         # census_trigger's own log-hygiene helper rather than a second copy of
         # that logic here. Formatted once, so the two sinks cannot drift.
         detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
@@ -536,13 +545,18 @@ def evaluate_census_step(
     # config.configure_logging() is what makes INFO visible in the journal at
     # all (gap (b) of the trickle-legibility incident).
     logger.info('legibility trickle: %s', line)
+    completion = (
+        decision.completion.status
+        if decision is not None and decision.completion is not None
+        else None
+    )
 
     # A failed evaluation has established NOTHING, so it must never be able to
     # start a census -- hence `decision is None` returns here, BEFORE
     # `entrypoint_exists` is even consulted. That ordering is a safety
     # property rather than a style choice.
     if decision is None or not decision.fire:
-        return line, False
+        return CensusEvaluation(line, False, completion)
 
     if not entrypoint_exists():
         logger.warning(
@@ -550,14 +564,14 @@ def evaluate_census_step(
             '(scripts/legibility/census.py, task η) is not on main -- '
             'FIRE-WITHOUT-LAUNCH; no census started'
         )
-        return line, True
+        return CensusEvaluation(line, True, completion)
 
     try:
         launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
-    return line, True
+    return CensusEvaluation(line, True, completion)
 
 
 # ---------------------------------------------------------------------------
@@ -597,8 +611,8 @@ CensusLauncher = Callable[..., None]
 :func:`_default_census_launcher`."""
 
 _Recorder = Callable[..., trickle_state.TrickleState]
-"""``recorder(night_fold, *, barren_escalated)``, shaped like
-:func:`trickle_state.write_night`."""
+"""``recorder(night_fold, *, barren_escalated, completion_alarm_landed)``,
+shaped like :func:`trickle_state.write_night`."""
 
 _RetryRecorder = Callable[..., trickle_state.TrickleState | None]
 """Shaped like :func:`trickle_state.record_retry`."""
@@ -607,11 +621,11 @@ _RetryRecorder = Callable[..., trickle_state.TrickleState | None]
 @dataclass(frozen=True, kw_only=True)
 class _NightSeams:
     """:func:`run_nightly`'s injected stages with every ``None`` resolved to
-    the real one, except *invoke* and *status_fetcher*: the stage that owns
-    each builds its real one only when it runs."""
+    the real one, except *invoke*: the code stage builds its real one only
+    when it runs."""
 
     invoke: Callable[[str, str], str] | None
-    status_fetcher: Callable[[], Any] | None
+    completion_runner: census_trigger.CompletionRunner
     poster: alarm.Poster | None
     committer: Callable[..., unlanded.CommitResult]
     recorder: _Recorder
@@ -622,12 +636,15 @@ class _NightSeams:
 
     @classmethod
     def resolve(
-        cls, *, invoke, status_fetcher, poster, committer, recorder, retry_recorder,
+        cls, *, invoke, completion_runner, poster, committer, recorder, retry_recorder,
         selector, digest_builder, census_launcher,
     ) -> _NightSeams:
         return cls(
             invoke=invoke,
-            status_fetcher=status_fetcher,
+            completion_runner=(
+                completion_runner if completion_runner is not None
+                else census_trigger.run_completion_check
+            ),
             poster=poster,
             committer=committer if committer is not None else unlanded.commit_only,
             recorder=recorder if recorder is not None else trickle_state.write_night,
@@ -654,6 +671,7 @@ class AlarmKind(StrEnum):
     CODER_DEFERRED = 'coder_deferred'
     DELETION_DIRECTIVE = 'deletion_directive'
     BARREN_STREAK = 'barren_streak'
+    COMPLETION_ERROR_STREAK = 'completion_error_streak'
 
     @property
     def level(self) -> int:
@@ -1049,9 +1067,10 @@ def _record_trickle_progress(
 
     A ``PassKind.RETRY`` pass folds only its date into the retry backlog.
     Any other pass is folded once over the recorded predecessor; the
-    barren-streak alarm is decided on that fold and raised BEFORE the same
-    fold is written, and the record carries whether it landed. Only a
-    finished pass owes retries, taken from the state it recorded.
+    barren-streak and completion-error-streak alarms are decided on that fold
+    and raised BEFORE the same fold is written, and the record carries
+    whether each landed. Only a finished pass owes retries, taken from the
+    state it recorded.
     """
     recorded_at = now if now is not None else datetime.now(UTC)
     retry_due: tuple[date, ...] = ()
@@ -1072,13 +1091,23 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = _barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
             ).landed
         )
-        recorded = recorder(night, barren_escalated=streak_landed)
+        completion_landed = (
+            end.census is not None
+            and trickle_state.completion_error_streak_reached(night)
+            and _escalate_completion_error_streak(
+                cfg, night.state, target_date,
+                census_line=end.census.line, raise_alarm=raise_alarm,
+            ).landed
+        )
+        recorded = recorder(
+            night, barren_escalated=streak_landed, completion_alarm_landed=completion_landed,
+        )
         if _finished_of(end.outcome):
             retry_due = trickle_state.due_retries(recorded, today=recorded_at.date())
     return retry_due
@@ -1113,6 +1142,7 @@ def _record_unloaded_night(
         recorder(
             trickle_state.fold_night(trickle_state.read_prior(project_id), project_id, run),
             barren_escalated=False,
+            completion_alarm_landed=False,
         )
 
 
@@ -1175,24 +1205,6 @@ def _night_run(
     )
 
 
-def _barren_streak_reached(night: trickle_state.NightFold, max_runs: int) -> bool:
-    """Whether *night* is the barren night on which its streak first reaches
-    *max_runs*: the nightly's re-arm policy, and the one place it lives.
-
-    Once per streak, re-armed only when a productive or quiet night resets
-    the streak. Re-firing every night past the threshold would revive task
-    3270's alarm fatigue; a one-shot latch would leave whoever missed the
-    single escalation in silence, which 3270 rejected as worse."""
-    already_due = (
-        night.prior is not None and trickle_state.barren_streak_due(night.prior, max_runs)
-    )
-    return (
-        night.state.outcome == trickle_state.RunOutcome.BARREN
-        and trickle_state.barren_streak_due(night.state, max_runs)
-        and not already_due
-    )
-
-
 def _escalate_barren_streak(
     cfg: LegibilityConfig,
     night: trickle_state.TrickleState,
@@ -1227,6 +1239,32 @@ def _escalate_barren_streak(
     return raise_alarm(AlarmKind.BARREN_STREAK, summary, detail)
 
 
+def _escalate_completion_error_streak(
+    cfg: LegibilityConfig,
+    night: trickle_state.TrickleState,
+    target_date: date,
+    *,
+    census_line: str,
+    raise_alarm: _RaiseAlarm,
+) -> Alarm:
+    """Raise the COMPLETION_ERROR_STREAK alarm for *night*, on each night
+    :func:`trickle_state.completion_error_streak_reached` owes it. WARNING
+    level, exit code 0, like the barren one."""
+    streak = night.completion_error_streak
+    summary = (
+        f'legibility census trigger: completion check failed on {streak} '
+        f'consecutive evaluations'
+    )
+    detail = (
+        f'project={cfg.project_id} date={target_date.isoformat()} '
+        f'completion_error_streak={streak}. Last decision: {census_line}. '
+        f'Until scripts/check_run_completion.py answers again (exit 0 or 75), '
+        f'the census now fires on the novelty spike alone. Reproduce with: '
+        f'census_trigger.py evaluate --project-root {cfg.project_root}'
+    )
+    return raise_alarm(AlarmKind.COMPLETION_ERROR_STREAK, summary, detail)
+
+
 def run_nightly(
     *,
     config_path: Path | str | None = None,
@@ -1235,7 +1273,7 @@ def run_nightly(
     target_date: date | None = None,
     now: datetime | None = None,
     invoke=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner | None = None,
     poster=None,
     committer=None,
     recorder=None,
@@ -1263,13 +1301,10 @@ def run_nightly(
     ``--project-id %i``), and left unrecorded under *config_path*, which
     names no project to record against.
 
-    *status_fetcher* defaults to the real MCP-backed ``get_statuses``
-    fetcher for ``cfg.project_root``
-    (:func:`census_trigger.default_status_fetcher`) -- inject to override.
-    ``None`` means "build the real one", NOT "no fetcher": that asymmetry
-    with every other seam here is what kept the census's tasks-landed
-    condition dead on the production path (task 4148). A test wanting the
-    fail-safe path injects a raising/empty fake instead.
+    *completion_runner* defaults to
+    :func:`census_trigger.run_completion_check`, the real
+    ``scripts/check_run_completion.py`` run the census trigger's completion
+    arm reads -- inject to override.
 
     *invoke* reads the same way (task 5488): ``None`` means "open ONE
     pooled session runner for the code stage and code every digest through
@@ -1282,9 +1317,9 @@ def run_nightly(
     census the trigger FIREd.
 
     *recorder* (default :func:`trickle_state.write_night`) is the run-state
-    seam: ``recorder(night_fold, *, barren_escalated)`` writes the
-    :class:`trickle_state.NightFold` the barren escalation was decided on and
-    returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
+    seam: ``recorder(night_fold, *, barren_escalated, completion_alarm_landed)``
+    writes the :class:`trickle_state.NightFold` the streak escalations were
+    decided on and returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
     once per pass but a retry, whatever the stages did,
     so the progress probe (``check_trickle_progress.py``) can tell every
     outcome apart, a barren night from a quiet one included — the
@@ -1303,7 +1338,7 @@ def run_nightly(
     The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
     seams = _NightSeams.resolve(
-        invoke=invoke, status_fetcher=status_fetcher, poster=poster, committer=committer,
+        invoke=invoke, completion_runner=completion_runner, poster=poster, committer=committer,
         recorder=recorder, retry_recorder=retry_recorder, selector=selector,
         digest_builder=digest_builder, census_launcher=census_launcher,
     )
@@ -1496,7 +1531,7 @@ def _code_and_land(
     ledger = _ledger_coded_sessions(cfg, merge.merged_records, target_date, now)
     census = _census_stage(
         cfg, resolved_config_path, target_date,
-        status_fetcher=seams.status_fetcher, census_launcher=seams.census_launcher,
+        completion_runner=seams.completion_runner, census_launcher=seams.census_launcher,
         now=now, pass_kind=pass_kind,
     )
     return _NightEnd(
@@ -1700,7 +1735,7 @@ def _census_stage(
     resolved_config_path: Path,
     target_date: date,
     *,
-    status_fetcher: Callable[[], Any] | None,
+    completion_runner: census_trigger.CompletionRunner,
     census_launcher: CensusLauncher,
     now: datetime | None,
     pass_kind: PassKind,
@@ -1708,7 +1743,7 @@ def _census_stage(
     """Evaluate the census trigger against the config THIS pass loaded (task
     3269); ``None`` on a retry pass, which never evaluates it: the scheduled
     pass already did, and a second evaluation could launch a second paid
-    census. The default status fetcher is built only here."""
+    census."""
     if pass_kind is PassKind.RETRY:
         logger.info(
             'legibility trickle: census trigger not evaluated on a retry pass '
@@ -1718,21 +1753,41 @@ def _census_stage(
         return None
     state_path = census_trigger.census_state_path(cfg.project_root)
     anchor = _census_anchor(state_path)  # read BEFORE the synchronous launch
-    line, fire = evaluate_census_step(
+    evaluation = evaluate_census_step(
         cfg, now=now,
-        status_fetcher=(
-            status_fetcher if status_fetcher is not None
-            else census_trigger.default_status_fetcher(cfg.project_root)
-        ),
+        completion_runner=completion_runner,
         launcher=census_launcher,
         config_path=resolved_config_path,
     )
     return _CensusStep(
-        line=line, fire=fire,
+        line=evaluation.line, fire=evaluation.fire,
         observation=trickle_state.CensusObservation(
-            fired=fire, last_census_at=anchor, census_state_path=str(state_path),
+            fired=evaluation.fire, last_census_at=anchor, census_state_path=str(state_path),
+            completion=_completion_arm(evaluation.completion),
         ),
     )
+
+
+def _completion_arm(
+    status: census_trigger.CompletionStatus | None,
+) -> trickle_state.CompletionArm | None:
+    """What one evaluation's completion verdict does to the recorded
+    completion error streak: a check that answered resets it, one that
+    could not counts, and a night with nothing to check carries it."""
+    match status:
+        case None:
+            return None
+        case census_trigger.CompletionStatus.FIRE | census_trigger.CompletionStatus.NOT_YET:
+            return trickle_state.CompletionArm.CONCLUDED
+        case census_trigger.CompletionStatus.ERROR:
+            return trickle_state.CompletionArm.ERRORED
+        case (
+            census_trigger.CompletionStatus.NO_PREVIOUS_RUN
+            | census_trigger.CompletionStatus.FILED_NOTHING
+        ):
+            return trickle_state.CompletionArm.STANDING
+        case _:
+            assert_never(status)
 
 
 def _parse_date(value: str) -> date:
@@ -1747,7 +1802,7 @@ def run_scheduled_night(
     target_date: date | None = None,
     now: datetime | None = None,
     invoke=None,
-    status_fetcher=None,
+    completion_runner: census_trigger.CompletionRunner | None = None,
     poster=None,
     committer=None,
     recorder=None,
@@ -1766,7 +1821,7 @@ def run_scheduled_night(
     def run_pass(pass_date: date | None, pass_kind: PassKind) -> NightlyResult:
         return run_nightly(
             config_path=config_path, project_id=project_id, projects_root=projects_root,
-            target_date=pass_date, now=now, invoke=invoke, status_fetcher=status_fetcher,
+            target_date=pass_date, now=now, invoke=invoke, completion_runner=completion_runner,
             poster=poster, committer=committer, recorder=recorder,
             retry_recorder=retry_recorder, selector=selector,
             digest_builder=digest_builder, census_launcher=census_launcher,
