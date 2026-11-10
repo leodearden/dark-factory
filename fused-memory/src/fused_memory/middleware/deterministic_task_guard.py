@@ -81,7 +81,9 @@ from typing import Any, assert_never, get_args
 
 from pydantic import ValidationError
 from shared.before_done_paths import (
+    CwdRefused,
     ScriptRootRefused,
+    before_done_cwd,
     resolve_before_done_paths,
     resolve_script_base,
 )
@@ -638,10 +640,11 @@ def _validate_before_done(
             hint="Set 'script' to a relative path of an executable file under project_root.",
         )
 
-    cwd = before_done.get('cwd')
-    if cwd is not None and not isinstance(cwd, str):
+    try:
+        before_done_cwd(before_done)
+    except CwdRefused as exc:
         return _validation_error(
-            f"before_done.cwd must be a string path when present (got {type(cwd).__name__!r}).",
+            str(exc),
             hint=(
                 "Omit 'cwd' to run the script from project_root, or set it to a "
                 'directory path; a relative cwd joins project_root.'
