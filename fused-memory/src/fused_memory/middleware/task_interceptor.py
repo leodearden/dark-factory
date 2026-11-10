@@ -85,7 +85,7 @@ from fused_memory.middleware.curator_types import (
     exception_summary,
     followup_items_of,
     is_combine_eligible,
-    spawned_from_id,
+    spawned_from_of,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -2711,7 +2711,7 @@ class TaskInterceptor:
             details=str(kwargs.get('details') or ''),
             files_to_modify=files,
             priority=str(kwargs.get('priority') or 'medium'),
-            spawned_from=spawned_from_id(meta.get('spawned_from')),
+            spawned_from=spawned_from_of(meta),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
             items=followup_items_of(meta),

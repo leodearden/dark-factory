@@ -559,6 +559,18 @@ def followup_items_of(metadata: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
         return ()
 
 
+_SPAWNED_FROM_METADATA_KEY: Final = 'spawned_from'
+
+
+def spawned_from_of(metadata: Mapping[str, Any]) -> str | None:
+    """``metadata.spawned_from`` as :func:`spawned_from_id` reads it, with a census line when a stored value names no task."""
+    stored = metadata.get(_SPAWNED_FROM_METADATA_KEY)
+    parent_id = spawned_from_id(stored)
+    if stored is not None and parent_id is None:
+        _warn_discarded(_SPAWNED_FROM_METADATA_KEY, f'names no task (type={type(stored).__name__})')
+    return parent_id
+
+
 def item_count_of(metadata: Mapping[str, Any]) -> int:
     """How many items :func:`followup_items_of` reads from *metadata*."""
     return len(followup_items_of(metadata))
