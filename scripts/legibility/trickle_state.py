@@ -74,10 +74,10 @@ OTHER value as malformed rather than guessing at unknown fields.
 
 Fields added after the first writer are ADDITIVE and do not bump it:
 ``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
-``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``
-and ``barren_escalated``. :meth:`TrickleState.from_json` reads an absent one
-as its default, and an absent ``barren_escalated`` as ``None``
-(unrecorded). Bumping for such a field would make every live state file
+``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``,
+``barren_escalated`` and ``completion_error_streak``.
+:meth:`TrickleState.from_json` reads an absent one as its default, and an
+absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a field would make every live state file
 read malformed on the first post-deploy probe.
 
 THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
@@ -469,8 +469,25 @@ def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
 
 # ---------------------------------------------------------------------------
 # The census-fire streak — did the census each FIRE launched advance
-# census-state?
+# census-state? — and the completion error streak
 # ---------------------------------------------------------------------------
+
+class CompletionArm(StrEnum):
+    """What one evaluation's completion check means for
+    ``completion_error_streak``: the nightly's translation of
+    ``census_trigger.CompletionStatus``, which this stdlib-only module cannot
+    import."""
+
+    CONCLUDED = 'concluded'
+    """The check answered (exit 0 or 75): resets the streak."""
+
+    ERRORED = 'errored'
+    """The check could not answer: counts one toward the streak."""
+
+    STANDING = 'standing'
+    """There was nothing to check (no previous run, or it filed nothing):
+    carries the streak."""
+
 
 @dataclasses.dataclass(frozen=True)
 class CensusObservation:
@@ -479,11 +496,14 @@ class CensusObservation:
     ``last_census_at`` is the census-state value the trigger was evaluated
     against, read BEFORE any launch: the launch is synchronous, so a census
     that lands has already rewritten census-state by the time the night is
-    recorded. ``None`` means census-state had no value (never censused)."""
+    recorded. ``None`` means census-state had no value (never censused).
+    ``completion`` is ``None`` when the trigger established no completion
+    verdict, which carries the completion error streak."""
 
     fired: bool
     last_census_at: str | None
     census_state_path: str
+    completion: CompletionArm | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -563,6 +583,18 @@ def _fold_census_fire_streak(
     )
 
 
+def _fold_completion_error_streak(
+    prior_streak: int, census: CensusObservation | None
+) -> int:
+    match None if census is None else census.completion:
+        case CompletionArm.ERRORED:
+            return prior_streak + 1
+        case CompletionArm.CONCLUDED:
+            return 0
+        case _:
+            return prior_streak
+
+
 # ---------------------------------------------------------------------------
 # The recorded document
 # ---------------------------------------------------------------------------
@@ -593,6 +625,7 @@ class TrickleState:
     counters: RunCounters
     retry_backlog: Mapping[date, int]
     barren_escalated: bool | None
+    completion_error_streak: int
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -643,6 +676,9 @@ class TrickleState:
             barren_escalated=defaulted(
                 doc, 'barren_escalated', state_docs.as_bool, None
             ),
+            completion_error_streak=defaulted(
+                doc, 'completion_error_streak', state_docs.as_count, 0
+            ),
         )
 
     def to_json(self) -> dict[str, object]:
@@ -671,6 +707,7 @@ class TrickleState:
             'counters': self.counters.to_json(),
             'retry_backlog': _serialize_retry_backlog(self.retry_backlog),
             'barren_escalated': self.barren_escalated,
+            'completion_error_streak': self.completion_error_streak,
         }
 
 
@@ -825,7 +862,10 @@ def fold_night(
 
     A census FIRE against the streak's anchor and path increments
     ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
-    clears it and ``census=None`` carries it. A scheduled pass advances
+    clears it and ``census=None`` carries it. ``completion_error_streak``
+    folds the night's :class:`CompletionArm`: ERRORED adds 1, CONCLUDED
+    resets it, and STANDING, no verdict or ``census=None`` carry it. A
+    scheduled pass advances
     ``last_scheduled_target_date`` (never backwards) and owes, with 0
     attempts, the :func:`never_run_dates` since the previous scheduled pass;
     a manual pass moves neither. A pass that :func:`owes_retry` enters or
@@ -875,6 +915,9 @@ def fold_night(
         counters=run.counters,
         retry_backlog=retry.backlog,
         barren_escalated=False,
+        completion_error_streak=_fold_completion_error_streak(
+            0 if prior is None else prior.completion_error_streak, run.census
+        ),
     )
     return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
 
@@ -914,6 +957,18 @@ def _schedule_cursor(
         max(prior_cursor, target_date),
         never_run_dates(prior_cursor, target_date=target_date, today=today),
     )
+
+
+def completion_error_streak_reached(
+    night: NightFold, max_errors: int | None = None
+) -> bool:
+    """Whether *night* is the fold on which the completion error streak
+    first reaches *max_errors* (:data:`DEFAULT_MAX_COMPLETION_ERRORS` by
+    default): the once-per-streak policy, so a streak escalates once and
+    re-arms only after a concluded check resets it."""
+    threshold = DEFAULT_MAX_COMPLETION_ERRORS if max_errors is None else max_errors
+    prior = 0 if night.prior is None else night.prior.completion_error_streak
+    return night.state.completion_error_streak >= threshold > prior
 
 
 def write_night(night: NightFold, *, barren_escalated: bool) -> TrickleState:
@@ -1076,4 +1131,12 @@ COUNTS toward the streak: nothing the pipeline records tells it apart.
 
 A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
 as its siblings above.
+"""
+
+DEFAULT_MAX_COMPLETION_ERRORS = 3
+"""Consecutive census evaluations whose completion check ERRORED before
+``nightly.py`` escalates once. The PRD fixes 3
+(plans/census-incremental-prd.md C7 (a)): until a check concludes again,
+the census can fire on the novelty spike alone. A MODULE CONSTANT, NOT A
+``legibility.yaml`` FIELD, for the same reason as its siblings above.
 """
