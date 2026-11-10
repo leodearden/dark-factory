@@ -10,7 +10,7 @@ schema_version: 1
 signal_leaves: ["π"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9255
     title: "run_git is the factory-wide runner; git_run leaf; the 9 orchestrator importers of git_ops._run repointed; GitQueryFailed becomes GitQueryError"
     capabilities:
       - name: "git-runner-protocol-published"
@@ -62,7 +62,7 @@ tasks:
           paths: ["shared/src/shared/git_async.py"]
           expect: present
   - label: "λ0"
-    task_id: null
+    task_id: 9256
     title: "Codemod (complexity simple): QueuedBranch moves to shared.branch_names; every importer repointed, no re-export"
     capabilities:
       - name: "queued-branch-shared-home"
@@ -82,7 +82,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
           expect: absent
   - label: "β0"
-    task_id: null
+    task_id: 9257
     title: "Codemod (complexity simple): the 135 test files that import git_ops._run move onto orchestrator/tests/_git.py::run"
     capabilities:
       - name: "test-git-helper-exists"
@@ -102,7 +102,7 @@ tasks:
           paths: ["orchestrator/tests/", "escalation/tests/"]
           expect: absent
   - label: "β"
-    task_id: null
+    task_id: 9258
     title: "GitOps takes its runner through the constructor; module-level _run deleted; patch-form tests move onto the port"
     capabilities:
       - name: "module-run-deleted"
@@ -137,7 +137,7 @@ tasks:
           paths: ["orchestrator/tests/_git_fault_shim.py"]
           expect: absent
   - label: "γ"
-    task_id: null
+    task_id: 9259
     title: "Constructor ports: WarmLaneScripts, WarmBaseProbe, GitOpsLimits, GitOpsCallbacks"
     capabilities:
       - name: "warm-lane-scripts-port"
@@ -189,7 +189,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/", "escalation/src/escalation/"]
           expect: absent
   - label: "δ"
-    task_id: null
+    task_id: 9260
     title: "WarmLaneUnavailable members carry requeue class, disposition, steal retryability and seed rcs (R5 option 1)"
     capabilities:
       - name: "disposition-leaf-exists"
@@ -233,7 +233,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/workflow_types.py"]
           expect: absent
   - label: "ι"
-    task_id: null
+    task_id: 9261
     title: "LaneLifecycle as the single public owner of durable lane records; Harness passes it; adopt_lane owns pool assignment"
     capabilities:
       - name: "lifecycle-release-method"
@@ -285,7 +285,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/lane_lifecycle.py"]
           expect: present
   - label: "κ"
-    task_id: null
+    task_id: 9262
     title: "Acquire routes as one method each behind a classifier; one pool-storage bootstrap guard"
     capabilities:
       - name: "pool-storage-guard"
@@ -313,7 +313,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/lane_lifecycle.py"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 9263
     title: "One GitQueryError contract for GitOps read queries (GitCommandFailed for a failed command); enumerators unified; worktree_work and branch_work replace nine predicates"
     capabilities:
       - name: "git-command-failed-exists"
@@ -365,7 +365,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/"]
           expect: absent
   - label: "ζ"
-    task_id: null
+    task_id: 9264
     title: "Typed diff, worktree-list and commit-count readers behind the hand parsers"
     capabilities:
       - name: "typed-diff-reader"
@@ -401,7 +401,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/"]
           expect: present
   - label: "η"
-    task_id: null
+    task_id: 9265
     title: "_move_main under advance_main and recover_red_main; AdvanceOutcome.detail (frozen union) replaces the _last_* side channel, writes and reads"
     capabilities:
       - name: "advance-detail-type"
@@ -437,7 +437,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/"]
           expect: present
   - label: "θ"
-    task_id: null
+    task_id: 9266
     title: "One lane_lease context manager for the local lease and the remote verify-merge CLI; compat co-lock becomes the span lock"
     capabilities:
       - name: "lane-lease-exists"
@@ -473,7 +473,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/cli.py", "orchestrator/src/orchestrator/git_ops.py"]
           expect: absent
   - label: "λ"
-    task_id: null
+    task_id: 9267
     title: "TaskBranchRefs owns writes and deletions of refs/heads/task/*; the rebase target is a closed OntoRef sum"
     capabilities:
       - name: "task-branch-owner"
@@ -501,7 +501,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/"]
           expect: absent
   - label: "ξ0"
-    task_id: null
+    task_id: 9268
     title: "Codemod (complexity simple): worktrees.py with the moved types and a one-step WorktreeOps surface; callers and tests repointed"
     capabilities:
       - name: "worktree-ops-module"
@@ -521,7 +521,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/worktrees.py"]
           expect: present
   - label: "ξ"
-    task_id: null
+    task_id: 9269
     title: "h14 split I: worktree primitive bodies (cluster b) move below the pool cluster into worktrees.py"
     capabilities:
       - name: "registration-probe-moved"
@@ -549,7 +549,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/git_ops.py"]
           expect: absent
   - label: "ο0"
-    task_id: null
+    task_id: 9270
     title: "Codemod (complexity simple): main_landing.py with the moved types and a one-step MainLanding surface; callers and tests repointed"
     capabilities:
       - name: "main-landing-module"
@@ -569,7 +569,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/main_landing.py"]
           expect: present
   - label: "ο"
-    task_id: null
+    task_id: 9271
     title: "h14 split II: merge worktrees and main landing bodies (cluster e) move into main_landing.py"
     capabilities:
       - name: "advance-main-moved"
@@ -581,7 +581,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/git_ops.py"]
           expect: absent
   - label: "ρ0"
-    task_id: null
+    task_id: 9272
     title: "Codemod (complexity simple): git_queries.py with the query types and a one-step GitQueries surface; callers repointed"
     capabilities:
       - name: "git-queries-module"
@@ -593,7 +593,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/git_queries.py"]
           expect: present
   - label: "ρ"
-    task_id: null
+    task_id: 9273
     title: "h14 split III: the diff/query read bodies (cluster f) move into git_queries.py"
     capabilities:
       - name: "diff-query-moved"
@@ -605,7 +605,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/git_ops.py"]
           expect: absent
   - label: "μ"
-    task_id: null
+    task_id: 9276
     title: "fused-memory done-provenance probes rebuilt on shared.git_async.run_git; the runner threaded from TaskInterceptor.__init__"
     capabilities:
       - name: "probes-on-run-git"
@@ -633,7 +633,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/"]
           expect: present
   - label: "ν"
-    task_id: null
+    task_id: 9274
     title: "TaskArtifacts non-plan readers through _read_json_object; typed architect exits"
     capabilities:
       - name: "typed-read-seam"
@@ -661,7 +661,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/artifacts.py"]
           expect: absent
   - label: "π"
-    task_id: null
+    task_id: 9275
     title: "Integration gate: boundary tests B1-B28, private GitOps patch targets measured and zero, heuristic-13 import tripwire"
     capabilities:
       - name: "private-patch-measure-script"
@@ -693,7 +693,7 @@ tasks:
           kind: manual
           reason: "a line count is not a grep the gate can run; the measurement is recorded in the commit message per docs/code-quality.md heuristic 14"
   - label: "σ"
-    task_id: null
+    task_id: 9277
     title: "Follow-up (low): the re-entrant lane lease — a lease token lets reset_persistent_merge_worktree skip its own acquire; the span lock and .merge_verify.lock go"
     capabilities:
       - name: "lane-lease-token"

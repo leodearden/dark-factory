@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["π"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9143
     title: "Typed queued-write values and a QueueOperation enum beside durable_queue"
     note: "Closes fk-1215aacfa626, fk-bdc0427c8971. No out-of-batch deps: 6362, 6369 (a555a1ecac deleted the self-identity seam) and 7650 are done."
     capabilities:
@@ -40,7 +40,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
           expect: absent
   - label: "β"
-    task_id: null
+    task_id: 9147
     title: "add_memory reports Graphiti as queued, not written"
     note: "Closes fk-b30cc4fa2899. Depends on α. Task 7650 (done) shipped the Mem0-only mem0_write_state; β adds stores_queued and no second predicate (D3)."
     capabilities:
@@ -69,7 +69,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/models/memory.py"]
           expect: present
   - label: "γ0"
-    task_id: null
+    task_id: 9151
     title: "Every operator entry point constructs MemoryService through maintenance/_utils.py::maintenance_service"
     note: "Carries fk-017442f273d2 (operator half). S26-4 ruled A. Depends on β and θ2. Absorbs task 6835 (task_family_census CLI opens ServiceOpen.READS)."
     capabilities:
@@ -112,7 +112,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/maintenance/_utils.py"]
           expect: present
   - label: "γ"
-    task_id: null
+    task_id: 9158
     title: "MemoryService constructed with its collaborators; an explicit start() after wiring"
     note: "Closes fk-017442f273d2. Depends on γ0 and θ. Absorbs task 8660 (planned_registry= keyword replaces set_planned_registry)."
     capabilities:
@@ -155,7 +155,7 @@ tasks:
           kind: manual
           reason: "behaviour asserted by boundary rows 5 and 5b, not a tree property"
   - label: "δ"
-    task_id: null
+    task_id: 9161
     title: "One journaled_op context manager for every Layer-1 write"
     note: "Closes fk-d37d63bf0d11. Depends on γ. S26-5 ruled B; S26-2 set its home: services/journaled_ops.py, never write_journal.py. Edges requested: 6636 depends on δ; 6293 reaches δ through ν (last in-batch editor of durable_queue.py)."
     capabilities:
@@ -192,7 +192,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/services/write_journal.py"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 9168
     title: "EpisodeIdentityReconciler owns the nine identity passes behind run()"
     note: "Closes fk-abc3487a3528 and fk-ec3de5b6cf2b (task 6601, cancelled into ε); carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb with ρ, τ, υ. Depends on λ. High: dependency of gate 6698."
     capabilities:
@@ -245,7 +245,7 @@ tasks:
           paths: ["shared/src/shared/streak.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 9172
     title: "The verify pass as four methods; its narration rehomed"
     note: "Closes fk-41eaf65cc4d0. Depends on ε. The memory_service.py leaf-narration deletions are η's."
     capabilities:
@@ -270,7 +270,7 @@ tasks:
           kind: manual
           reason: "episode_identity.py does not exist at authoring, so an absent-grep on it passes vacuously; judged in review"
   - label: "η"
-    task_id: null
+    task_id: 9174
     title: "search as fan-out / fuse-and-filter / pin / journal; the pin a pure function in topic_anchor"
     note: "Closes fk-eb0d5fea9a52. Depends on ε. Also deletes the leaf-iota narration left in memory_service.py."
     capabilities:
@@ -305,7 +305,7 @@ tasks:
           kind: manual
           reason: "a complexipy measurement recorded in the task record"
   - label: "θ"
-    task_id: null
+    task_id: 9179
     title: "GraphAccess protocol with bounded egress; GraphitiBackend takes it at construction"
     note: "Closes fk-90f6fbb5daa0 and the backend half of fk-9430031679c4. Depends on 6631 and 6823 (out of batch; S26-6 ruled B); 6233 landed; 6369 done. High: dependency of gate 6698."
     capabilities:
@@ -364,7 +364,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/backends/falkor_read_only.py"]
           expect: absent
   - label: "θ2"
-    task_id: null
+    task_id: 9183
     title: "Operator scripts and their tests onto GraphitiBackend.graph_access"
     note: "Carries fk-9430031679c4 (scripts half). Depends on θ. γ0 and ι depend on θ2. Also moves test_reindex.py's 4 patch.object(backend, '_graph_for') sites, which cannot outlive the shim it deletes."
     capabilities:
@@ -393,7 +393,7 @@ tasks:
           paths: ["fused-memory/tests/"]
           expect: absent
   - label: "ι"
-    task_id: null
+    task_id: 9185
     title: "Tests on the public graph seam, cluster 1 (the heavy files)"
     note: "Carries fk-9430031679c4 (test half). Depends on θ2 and ε. Task 7781 cancelled into ι/κ."
     capabilities:
@@ -414,7 +414,7 @@ tasks:
           paths: ["fused-memory/tests/conftest.py"]
           expect: present
   - label: "κ"
-    task_id: null
+    task_id: 9189
     title: "Tests on the public graph seam, cluster 2 (the long tail)"
     note: "Carries fk-9430031679c4 (test half). Depends on ι and η. Rewrites conftest::make_graph_driver's docstring."
     capabilities:
@@ -433,7 +433,7 @@ tasks:
           kind: manual
           reason: "judged by scripts/inline_suppressions.py --check on the merged tree"
   - label: "λ"
-    task_id: null
+    task_id: 9194
     title: "The identity lock as a public context manager held by every in-process identity mutator"
     note: "Closes fk-9804ecc4567d (in-process half; the out-of-process half is gate σ). S26-7 ruled C. Depends on θ and δ. High: dependency of gate 6698. σ depends on λ only."
     capabilities:
@@ -478,7 +478,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/backends/graphiti_client.py"]
           expect: present
   - label: "σ"
-    task_id: null
+    task_id: 9198
     title: "Human design session: cross-process identity exclusion between the fused-memory server and operator scripts"
     note: "S26-3 ruled D as an interactive /spawn /team --fable session; deterministic pure gate (task_kind=deterministic, always_escalates=true, no before_done); carries fk-9804ecc4567d (out-of-process half). Depends on λ only (lead ruling); absorbs 6293's design question (6293 depends on σ); 6730 must not depend on σ. High: dependency of gate 6698. Brief: plans/fm-cross-process-identity-exclusion-session-brief.md (PRD Appendix A; the lead commits it in the wave-2 commit, before filing — lead ruling 2026-11-10)."
     capabilities:
@@ -492,7 +492,7 @@ tasks:
           kind: manual
           reason: "a human design sitting; closed by resume with done_provenance deterministic-gate citing the escalation"
   - label: "μ"
-    task_id: null
+    task_id: 9203
     title: "Backends private; the sweeps' read surface; every graph mutation through the service"
     note: "Closes fk-6e50b22357f2 (src half). Depends on ξ."
     capabilities:
@@ -527,7 +527,7 @@ tasks:
           kind: manual
           reason: "guard quality is judged by its own fixture test"
   - label: "ν"
-    task_id: null
+    task_id: 9208
     title: "Scripts stop reaching through MemoryService's backends"
     note: "Closes fk-6e50b22357f2 (scripts half). S26-1 ruled A. Depends on μ. 6293 depends on ν and σ; 6950 depends on υ (ρ/τ/υ edit five of its files after ν)."
     capabilities:
@@ -546,7 +546,7 @@ tasks:
           kind: manual
           reason: "guard quality is judged by its own fixture test"
   - label: "ξ"
-    task_id: null
+    task_id: 9215
     title: "One home for a RELATES_TO edge's stored meaning: the active predicate and the relocation rule"
     note: "Closes fk-265caf7191a5, fk-62af616b8470. Depends on ζ, η, κ. Tasks 6680 and 5612 cancelled into ξ (S26-6 ruled B). High: dependency of gate 6698."
     capabilities:
@@ -597,7 +597,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/maintenance/cross_graph_move.py"]
           expect: present
   - label: "ο"
-    task_id: null
+    task_id: 9238
     title: "canonical_labels' five patterns from one grammar"
     note: "Closes fk-352d7b3fcad4. No deps. Edge requested: 6826 depends on ο; 4235 and 4479 cancelled as landed by 4850."
     capabilities:
@@ -624,7 +624,7 @@ tasks:
           kind: manual
           reason: "behavioural suite outcome, not a tree grep"
   - label: "ρ"
-    task_id: null
+    task_id: 9243
     title: "Move the write-metadata policy and store-codec helpers out of memory_service.py"
     note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ν. Module names confirmed by the lead 2026-11-10 (t7)."
     capabilities:
@@ -661,7 +661,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/grouped_read.py"]
           expect: absent
   - label: "τ"
-    task_id: null
+    task_id: 9245
     title: "Extract GraphMutations over a shared journaled-operations module"
     note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ρ. MemoryService keeps one-line public delegates. 6730's ensure_entity_node code lands here."
     capabilities:
@@ -704,7 +704,7 @@ tasks:
           kind: manual
           reason: "behaviour asserted by boundary row 22, not a tree property"
   - label: "υ"
-    task_id: null
+    task_id: 9247
     title: "Extract MemoryMutations"
     note: "S26-2 (Leo). Carries fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb. Depends on ρ (ruled) and τ (same file). Out of batch: 6730 and 6950 depend on υ."
     capabilities:
@@ -733,7 +733,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/services/store_records.py"]
           expect: present
   - label: "π"
-    task_id: null
+    task_id: 9250
     title: "Integration gate: the write path end to end, and the re-measurement"
     note: "Signal leaf; closes no key. Depends on υ and ο (υ is the tail of the merged service, graph and test chains)."
     capabilities:
@@ -757,7 +757,7 @@ tasks:
           kind: manual
           reason: "a measurement, recorded, not a grep"
   - label: "φ"
-    task_id: null
+    task_id: 9252
     title: "Follow-up: the read-path split and a prose pass over memory_service.py"
     note: "S26-2 (Leo) follow-up. Carries fk-da5b47d0493a. Low. Depends on π; re-measures first and may close with the measurement recorded."
     capabilities:

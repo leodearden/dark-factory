@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ω", "ι", "ρ"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9180
     title: "Two typed write axes on the wire; the backend resolves once"
     note: "Closes fk-ff5234ac1013 (backend half) and fk-116481623cfb. Chain head: waits on 4867 (hand-carried; ruled by Leo 2026-11-10, never inverted), 6621, 5281, 6719, 6720, 6721, 8143 and S5 μ (6708 is done). Produces C1."
     capabilities:
@@ -38,7 +38,7 @@ tasks:
           kind: manual
           reason: "live server call (metadata without metadata_mode, and append=True) returns metadata_mode_required / append_retired; not a tree property"
   - label: "β1"
-    task_id: null
+    task_id: 9187
     title: "Client signature: metadata_mode required, append gone, facade and fakes in parity"
     note: "Closes the client half of fk-ff5234ac1013 and the carried fk-5c98cc0bb7e0 (from cancelled 3150). Waits on α, 6766, 6724. Keeps -> bool; mechanical. Includes scheduled_deploy_settle.TaskStore and workflow._write_branch_base_sha's append=not overwrite."
     capabilities:
@@ -59,7 +59,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/workflow.py"]
           expect: absent
   - label: "β2"
-    task_id: null
+    task_id: 9191
     title: "Scheduler.update_task raises MetadataWriteFailed; nothing reads its result"
     note: "Closes fk-de964b86bdd8. Produces C2 (S9 λ1 depends on β2; S9 μ1 depends on β1 and follows β2 through λ1). The 14 workflow except arms are kept and made live (R3); the result-never-read guard (OQ-13 ruled (a); bool reads and gather/create_task consumption) replaces the pyright assumption. 12 readers and 14 outside-try sites at e634cfe658, scheduled_deploy_settle and _write_branch_base_sha included."
     capabilities:
@@ -93,7 +93,7 @@ tasks:
           kind: manual
           reason: "behavioural: the arm firing is judged by β2's boundary test (and ω end to end), not a grep"
   - label: "γ"
-    task_id: null
+    task_id: 9195
     title: "One parse per request, every rejection a dict through one renderer, invariants on update"
     note: "Closes fk-f6224c565a9b, fk-1f8a4c69798f, fk-cc04e61d23ec. Renderer: exc.to_error_dict() else S14 ξ's error_envelope, homed in shared.mcp_envelope (OQ-12 ruled; 6719 amended)."
     capabilities:
@@ -130,7 +130,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
           expect: present
   - label: "π"
-    task_id: null
+    task_id: 9199
     title: "Prose callers of update_task state the two axes"
     note: "Companion of α and γ; closes no key of its own. complexity='simple'. Head of the docs/task-authoring.md chain: waits on γ (task 6392 is done). Also removes the reference's three files_to_modify mentions (OQ-9 ruled)."
     capabilities:
@@ -151,7 +151,7 @@ tasks:
           paths: ["docs/task-authoring.md"]
           expect: absent
   - label: "δ"
-    task_id: null
+    task_id: 9204
     title: "shared.declared_files: one key, one reader; files_to_modify refused and unread; lock_charter_guard imports shared.locking"
     note: "Closes fk-fa3e3d765f50 (with ε) and fk-fa355c2c0498. OQ-9 ruled: files only; the refusal checks incoming keys only; a guard test pins absence of readers; the lead backfills the rows that differ after the deploy. Absorbs task 6653 (cancelled into δ). Produces C4. Task 7748 waits on it."
     capabilities:
@@ -222,7 +222,7 @@ tasks:
         binding: "measured 2026-11-10 across all 11 stores: 4 rows carry metadata.files_to_modify, all done, 0 non-terminal — no live candidate key or lock changes; δ re-measures with the _migrate_v3_to_v4 audit query before landing"
         verdict: PASS
   - label: "ε"
-    task_id: null
+    task_id: 9209
     title: "Orchestrator reads declared files through shared.declared_files; one sanitizer"
     note: "Contributes to fk-fa3e3d765f50. Waits on δ and β2 (same orchestrator files). Callers call shared.locking.strip_directory_locks (D5)."
     capabilities:
@@ -242,7 +242,7 @@ tasks:
           paths: ["orchestrator/tests/test_lock_derivation_declared_files.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 9214
     title: "The combine writes a union it computes into metadata.files; a collision is a counted refusal"
     note: "Closes fk-de3df95984a5. Waits on λ (same file) and task 8453 (extracts the write half ζ edits); consumes C4 and C5; produces C7 (combine_audit.py). Collision → refused_reason candidate_key_collision with survivor_id (OQ-14 ruled); legacy rows left (OQ-15 ruled (a))."
     capabilities:
@@ -269,7 +269,7 @@ tasks:
           kind: manual
           reason: "live store read after a real combine; not a tree property"
   - label: "ρ"
-    task_id: null
+    task_id: 9237
     title: "Combine-collision census script"
     note: "OQ-14 ruled. Reads combine_audit_path() and CombineRefusal through C7; exit 0 below, 1 at or above (>= 5 collisions or >= 1% of combine rows in the window); trailing JSON verdict. Waits on ζ. Its landing is the lead's trigger to file σ. A signal leaf: no in-batch leaf depends on it."
     capabilities:
@@ -300,7 +300,7 @@ tasks:
           kind: manual
           reason: "a time-delayed predicate over live audit rows; judged by the deterministic runner at its milestone, not a tree property"
   - label: "η"
-    task_id: null
+    task_id: 9240
     title: "The slice table: static, downward, one home"
     note: "Closes fk-f528087f44c7 (θ promotes the invariant). Waits on γ (shared test file; α and 5281 upstream). 14 slices at e634cfe658, five registered by import side effect (followup_items.py new). Produces C3 (S9 ξ consumes)."
     capabilities:
@@ -335,7 +335,7 @@ tasks:
           paths: ["fused-memory/tests/test_deploy_state_registration.py"]
           expect: absent
   - label: "θ"
-    task_id: null
+    task_id: 9242
     title: "INV-16 metadata-slices-one-table: lockstep edit and fixture"
     note: "Lands R22 item 4 (owned by S10). OQ-5 revised by the lead 2026-11-10: S6 α (INV-15) → S10 θ (INV-16) → S7 ζ (INV-17); θ depends on S6 α; checks anchor on the slug."
     capabilities:
@@ -367,7 +367,7 @@ tasks:
           kind: manual
           reason: "rejection quality is judged by the fixture's own test, not a grep"
   - label: "ι"
-    task_id: null
+    task_id: 9244
     title: "The blessed-key table in docs §8; the code keeps the frozenset"
     note: "Closes fk-941b5369a3d7 (333 comment lines around 58 keys at e634cfe658). Waits on η and π. Task 7173 waits on it. A signal leaf: no in-batch leaf depends on it."
     capabilities:
@@ -394,7 +394,7 @@ tasks:
           kind: manual
           reason: "a comment-density ratio over one block; measured by the leaf in its commit message"
   - label: "κ1"
-    task_id: null
+    task_id: 9248
     title: "One transition verdict, enforced in the backend only"
     note: "Closes fk-d80c1c44bca1. OQ-6 ruled by Leo (amends R3's 'as well as the interceptor'): one call site in SqliteTaskBackend._write_status_and_verify, actor required, reopen reason passed; the interceptor's gate 2a refusal and gate 2e are deleted and the backend's refusal is rendered with today's tokens. Waits on δ and S26 γ (server/main.py). task_status defaults to TaskStatusConfig(); production constructors pass the loaded config."
     capabilities:
@@ -439,7 +439,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/"]
           expect: absent
   - label: "κ2"
-    task_id: null
+    task_id: 9251
     title: "Privileged-writer protocol, census failure, candidate-key scope"
     note: "Closes fk-260352fa900a, fk-c41aa02e0779, fk-d4d61005457b. Migrations keep frozen literal DDL; a check pins the live index WHERE to the constant (D9a)."
     capabilities:
@@ -484,7 +484,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
           expect: present
   - label: "λ"
-    task_id: null
+    task_id: 9254
     title: "One gate rule: deterministic and always_escalates"
     note: "Closes fk-06ab2d3e9148. OQ-10 ruled by Leo: is_human_gate (stored shape; a submission after inject_operational_routing) with named refinements; the blocked-gate audit and the curator sweep keep honestly named selectors; the combine guard, recon duplicate-gate guard, phrasing selector, live-workflow detector, closure readers and the dashboard's copy move onto it. Produces C6, which owns CONSOLIDATION_GATE_METADATA_KEY."
     capabilities:
@@ -535,7 +535,7 @@ tasks:
           kind: manual
           reason: "a live journal count over a week; recorded by λ's verifier, not a tree property"
   - label: "μ1"
-    task_id: null
+    task_id: 9278
     title: "One interceptor test factory"
     note: "Contributes to fk-85e1293e0aa4. Waits on task 6332 (which waits on ζ; if 6332 is already in progress or done at decompose, ζ and μ1 depend on it instead, PRD D15). Tests only; 49 constructing test files at e634cfe658, the two shared stacks included."
     capabilities:
@@ -547,7 +547,7 @@ tasks:
           paths: ["fused-memory/tests/_interceptor_helpers.py"]
           expect: present
   - label: "μ2"
-    task_id: null
+    task_id: 9280
     title: "Collaborators at construction; the setters go"
     note: "Closes fk-85e1293e0aa4. Waits on μ1 and S26 γ. The lifecycle-reset filer is the one provider member (OQ-3 ruled)."
     capabilities:
@@ -568,7 +568,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/"]
           expect: present
   - label: "ν"
-    task_id: null
+    task_id: 9282
     title: "task_interceptor.py partitioned: status transition and path-scope routing as composed objects"
     note: "Closes fk-1eb04ceac9e8 and fk-e3e99447e11e. Waits on μ2 (6332 and S5 μ upstream). StatusTransitionGate holds only the context gates; Table A is the backend's (κ1)."
     capabilities:
@@ -595,7 +595,7 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
           expect: absent
   - label: "ξ"
-    task_id: null
+    task_id: 9283
     title: "Orchestrator task-status comparisons use TaskStatus members; the literal guard lands"
     note: "Contributes to fk-1695d6b02400 (ο closes). The guard lands here scoped to orchestrator/src (D13, OQ-4 ruled), so ξ's signal is its own."
     capabilities:
@@ -615,7 +615,7 @@ tasks:
           paths: ["orchestrator/src/"]
           expect: absent
   - label: "ο"
-    task_id: null
+    task_id: 9285
     title: "fused-memory and dashboard task-status comparisons use TaskStatus members"
     note: "Closes fk-1695d6b02400. Appends fused-memory/src and dashboard/src to the guard's SCAN_ROOTS; no exemption list (INV-12)."
     capabilities:
@@ -642,7 +642,7 @@ tasks:
           kind: manual
           reason: "rejection quality is judged by the guard's own fixture test"
   - label: "ω"
-    task_id: null
+    task_id: 9286
     title: "Integration gate: the task-write contract end to end"
     note: "The B+H integration gate (gates.md §What B + H adds item 3). Waits on β2, γ, ζ, κ2, θ, ο. Priority high (gate 6698 dependency). Swaps the rig's dispatch_tool→interceptor bridge for the registered tools (create_mcp_server). Replays rows 1, 2, 5, 7, 12, 14, 19, 21, 27."
     capabilities:

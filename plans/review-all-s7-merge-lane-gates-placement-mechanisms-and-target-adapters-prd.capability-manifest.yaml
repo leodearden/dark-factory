@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ζ", "δ"]
 tasks:
   - label: "δ"
-    task_id: null
+    task_id: 9127
     title: "Delete reify retry narrowing end to end"
     note: "Closes fk-dd411ada7c29 by deletion (S7-3 = B, an amendment to R11). Deps: S6 α only (same-file order: S6 α lands first on worker.py, shadow.py, types.py, test_merge_shadow.py, test_merge_queue.py and the ratchet baseline, lead 2026-11-10 late; S6 α waits on no S7 leaf). First in S7's chain by the lead sequencing ruling of 2026-11-10 (β depends on δ), so δ does not wait on 7720 (rebase-only on worker.py and the ratchet baseline). S3 ε2 (merge_request move) depends on δ. The fixture run_all-failed-marker.txt moves to fixtures/verify_classify_run_all/ (test_verify_event_channel.py reads it). No edge to 5040 either way (S6-2 = B); the absent checks scan all of orchestrator/src, so they hold wherever 5040 moved the section. Subsumes task 6575; replaces task 6576."
     capabilities:
@@ -66,7 +66,7 @@ tasks:
         binding: "substrate — passes today and must keep passing: merge_lane/shadow.py::parse_per_test_results, used by the warm and cold shadow on every verify"
         verdict: PASS
   - label: "β"
-    task_id: null
+    task_id: 9133
     title: "Delete the variable-depth probe and γ2 auto-chain; adjacent placement plus deep chain"
     note: "Closes fk-7d1580bb3f03 (probe and auto-chain deleted; the deep-chain third dropped under G6 because deep chain is live and kept by S7-1 = A, an amendment to R11). Subsumes task 7384. Deps: δ (chain; lead sequencing ruling 2026-11-10), task 7720 (OQ-CQ7), S6 α (same-file order, S6 α first, lead 2026-11-10 late); reify yaml block via external_deps (OQ-CQ2). S6's remaining worker.py leaves depend on β (OQ-CQ5). No edge to 5040 either way (S6-2 = B). Same-file neighbours without an edge: 8527, 8528, 7721, 7824, 7922."
     capabilities:
@@ -112,7 +112,7 @@ tasks:
           kind: manual
           reason: "cross-repo yaml state, checked with orchestrator check-config --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
   - label: "α1"
-    task_id: null
+    task_id: 9136
     title: "GateMeasurement, ProbeId, UNMEASURED_POLICY, StormEscalationSink and GateUnmeasuredReporter"
     note: "Carries fk-88e3c228b649. Deps: β (chain δ → β → α1). Produces C1 and C2 (S6 consumes)."
     capabilities:
@@ -152,7 +152,7 @@ tasks:
         binding: "substrate — passes today: shared/src/shared/storm_counter.py::StormCounter; escalation/queue.py::EscalationQueue.make_id(key), has_open_l1(task_id, *, category) and submit(escalation) (the three-method StormEscalationSink, OQ-CQ4 ruled by the lead); house pattern merge_lane/landing_evidence.py::file_landing_git_error_storm_escalation"
         verdict: PASS
   - label: "α2"
-    task_id: null
+    task_id: 9139
     title: "Convert the 12 fail-open returns and the sub-probes they own; gates_unmeasured on merge_attempt"
     note: "Carries fk-88e3c228b649. Deps: α1."
     capabilities:
@@ -179,7 +179,7 @@ tasks:
           kind: manual
           reason: "a runtime event under a real git fault; judged by the boundary test, not a tree grep"
   - label: "γ"
-    task_id: null
+    task_id: 9145
     title: "Remaining encodings onto GateMeasurement: overlap, rename pair, already-landed, plan-files"
     note: "Closes fk-689227abfab1; carries fk-88e3c228b649. Deps: α2, S5/C4 (S5 leaf ε, the typed query failure), task 3918. Held on S5/C4 if S5 has not filed at S7 decompose."
     capabilities:
@@ -209,7 +209,7 @@ tasks:
         binding: "substrate — passes today: workflow.py::TaskWorkflow holds merge_worker; γ reads merge_worker.gate_reporter (α1)"
         verdict: PASS
   - label: "ε"
-    task_id: null
+    task_id: 9149
     title: "Resource-audit violations as records fingerprinted on identity, not regex"
     note: "Closes fk-5d4406afeade (weakened, re-verified under R23). Deps: γ (chain), task 7720 (OQ-CQ7), S6 α (the resource-audit file test_merge_queue_resource_audit.py; S6 α first, lead 2026-11-10 late). Fingerprint fields per OQ-CQ6 (lead; a clarification of R11)."
     capabilities:
@@ -233,7 +233,7 @@ tasks:
         binding: "substrate — passes today: snapshot()['resource_audit'] pinned by exact dict equality in orchestrator/tests/test_merge_queue_invariant_integration_gate.py; ε must keep it green"
         verdict: PASS
   - label: "ζ"
-    task_id: null
+    task_id: 9154
     title: "The merge-gate-unmeasured-typed invariant (INV-17), its guard, and the PRD's integration gate"
     note: "Enforces fk-88e3c228b649's rule (R11, R22 item 6). Deps: γ, ε, and S10 θ (cross-stream). INV-17 under the lead's revised order (S6 α INV-15, S10 θ INV-16; S10 θ depends on S6 α, ζ on S10 θ); checks anchor on the slug, never the number."
     capabilities:

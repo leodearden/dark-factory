@@ -3,7 +3,7 @@ schema_version: 1
 signal_leaves: ["ι"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 9140
     title: "Lane timing budgets derived from the merge-verify budget; the load-time validator; INV-15 lane-budgets-exceed-verify-timeouts"
     note: "Closes fk-4b76c9695674 (high). Subsumes tasks 4581 and 7396 (cancelled at decompose naming α; S6-1). One cascade in orchestrator/verify_budget.py; four constants replaced; merge_verify_progress is red-tier. Performs the INV-15 four-site lockstep edit (lead order revised 2026-11-10: S6 α lane-budgets-exceed-verify-timeouts INV-15 first, then S10 θ metadata-slices-one-table INV-16, then S7 ζ merge-gate-unmeasured-typed INV-17; S10 θ depends on α); the former docs leaf ν is folded in. No cross-stream dependency (lead 2026-11-10, after the fold-verifiers): α lands first on every file it shares; S5 α, S5 λ0, S7 δ and S7 β depend on α there, S7 ε on the resource-audit file, S3 β on harness.py; never held behind S3 or task 4833. The verify_budget resolver's keyword is merge_cold, no default."
     capabilities:
@@ -53,7 +53,7 @@ tasks:
           paths: ["docs/legibility/design-invariants.md"]
           expect: present
   - label: "β1"
-    task_id: null
+    task_id: 9144
     title: "MergeOutcome.kind and GroupMergeRequest.train_kind; consumers route on kind, reason strings frozen"
     note: "Closes fk-e61eed486dbc, fk-fd91b14b3ead, fk-80a790e6f793. Subsumes task 5046 (cancelled naming β1; 5047 and 6416 repointed first; S6-4). Produces C1. Depends on α, S3 κ (harness.py order, lead 2026-11-10: S6 α, then S3 β, δ, κ, then S6 β1 … μ), S5 λ0 (types.py/worker.py/harness.py imports; every later S6 leaf follows it through the chain) and S7 β (S6's remaining worker.py leaves follow it through the chain)."
     capabilities:
@@ -88,7 +88,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
           expect: absent
   - label: "β2"
-    task_id: null
+    task_id: 9155
     title: "MergeOutcome test constructions on one builder; kind mandatory for blocked/error"
     note: "Completes C1 (no keys of its own). 51 test files, mechanical."
     capabilities:
@@ -107,7 +107,7 @@ tasks:
           kind: manual
           reason: "construction-time refusal judged by the outcome-kind boundary test, not a grep"
   - label: "γ1"
-    task_id: null
+    task_id: 9159
     title: "LandedOutbox injected by the harness into worker, build_workflow and TaskGroundTruth; MergeProvenance deleted"
     note: "Closes fk-2c9b6486d554 and the journal half of fk-e501862ffe2c (detector consolidation is S9 ι). Subsumes task 8164. Produces C4 (S6-3: one construction edit at the existing site)."
     capabilities:
@@ -140,7 +140,7 @@ tasks:
           kind: manual
           reason: "observed on the running orchestrator after merge (startup reconcile_landed_outbox report); not a tree property"
   - label: "γ2"
-    task_id: null
+    task_id: 9165
     title: "TaskWorkflow test constructions through the helper; landed_outbox a required keyword"
     note: "Completes C4 (no keys of its own). 95 test files, mechanical."
     capabilities:
@@ -151,7 +151,7 @@ tasks:
           kind: manual
           reason: "construction-time refusal judged by the journal boundary test; the keyword's default is not grep-distinguishable from γ1's"
   - label: "δ"
-    task_id: null
+    task_id: 9171
     title: "One MainHealthAutoHeal collaborator, grown from 5040's responder, for the workflow sync arm and the deferred arm; fingerprint and eligibility move into the lane"
     note: "Closes fk-7f2bce2d482c, fk-75fc1b96098d (the scheduler import residue is S17's). Depends on task 5040 (S6-2 = B: its part 2 moves the deferred arm into main_health_probe.py::MainHealthResponder). Produces C3."
     capabilities:
@@ -180,7 +180,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/"]
           expect: absent
   - label: "θ"
-    task_id: null
+    task_id: 9176
     title: "A lane's halt is its holder set (operator, WIP, auto-heal, train advance, lifecycle refused); train advance failures hold with an owner"
     note: "Closes fk-83625b943aa5, fk-ba531799522b (high; coalesce arm dormant, named in the acceptance task; declared-train arm live on reify). Depends on tasks 4838 and 3876 (S6-8). Declares the lifecycle_refused kind φ places (S6-5). Produces C7."
     capabilities:
@@ -215,7 +215,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
           expect: absent
   - label: "ζ"
-    task_id: null
+    task_id: 9182
     title: "ItemLifecycle as the operative state in merge_lane/item_lifecycle.py; one synchronous retire(item, outcome) with drained hooks; snapshot derived from the registry; refusals typed"
     note: "Closes fk-313f404f3cc6, fk-a2984bf98f85 (both high). Depends on θ, task 5040 (S6-2 = B; ζ follows the terminal edges into 5040's extracted modules), S3 α and task 4833 (lands first in today's files, lead 2026-11-10). Produces C2, consumed by φ, 5042, 5306, κ, μ."
     capabilities:
@@ -256,7 +256,7 @@ tasks:
           kind: manual
           reason: "rejection quality is judged by the lifecycle boundary tests, not a grep"
   - label: "φ"
-    task_id: null
+    task_id: 9186
     title: "The lifecycle-refusal policy: escalate | hold_lane (restart-only, default escalate), the lifecycle_refused hold arm with its storm guard, the refusal census script and the decision-4 amendment"
     note: "Leo's ruling S6-5 = B staged (2026-11-10); no finding key. Depends on ζ. Amends decision 4 of plans/merge-queue-modularization-invariants-prd.md. Ships scripts/lifecycle_refusal_census.py, which ξ runs; the lead files ξ and υ once φ is on main."
     capabilities:
@@ -290,7 +290,7 @@ tasks:
           kind: manual
           reason: "behaviour judged by the refusal-policy boundary tests, not a grep"
   - label: "κ"
-    task_id: null
+    task_id: 9192
     title: "LaneLimits and RetryBudget replace the class constants and per-task dicts; pipeline functions take a narrow host; test pins move onto LaneLimits"
     note: "Closes fk-769c3bb58ce1, fk-201d70aaf409, fk-e7deb8bcfa95 (high). Depends on φ (same files), task 5040 (S6-2 = B), 5446, 5777, S4 β (VerifyContext), S5 θ (same files) and task 4833 (lands first in today's files, lead 2026-11-10). Moves the 19 constants α leaves (18 if S7 δ deleted the narrowed-retry cap). Subsumes task 6162 (cancelled naming κ)."
     capabilities:
@@ -325,7 +325,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
           expect: present
   - label: "λ"
-    task_id: null
+    task_id: 9197
     title: "Drift and shadow satellites own their state objects; no worker-private reach"
     note: "Closes fk-a0f6af37f0d6. Depends on κ (worker.py edge)."
     capabilities:
@@ -346,7 +346,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/shadow.py"]
           expect: absent
   - label: "μ"
-    task_id: null
+    task_id: 9201
     title: "S3's MergeLaneQueries built natively over the lifecycle registry with the total LIVE_STATE_OF table; landing-evidence verdict API exported"
     note: "Closes fk-d9e6c03dc259. Depends on λ (chain κ → λ → μ, so S4 μ0 → S6 μ follows S6's last worker.py/shadow.py leaf) and S3 α only (S3-1 = A: no adapter; S3 ε1 and ε2 depend on μ, never the reverse). Priority low, raised by the scheduler's priority inheritance once S3's moves are filed."
     capabilities:
@@ -373,7 +373,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
           expect: present
   - label: "ι"
-    task_id: null
+    task_id: 9206
     title: "S6 lane integration gate: boundary rows through the facade after the decomposition chain"
     note: "Closes fk-1432a52e4753, fk-153195971a14, fk-e521254a5b71, fk-e768d50f8363 via dependencies on tasks 5045, 5047, 5048, S7 β, θ, φ, κ, λ and μ. Signal leaf."
     capabilities:

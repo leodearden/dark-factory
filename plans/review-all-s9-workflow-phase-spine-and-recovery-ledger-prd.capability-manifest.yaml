@@ -4,7 +4,7 @@ signal_leaves:
 - ω
 tasks:
 - label: π
-  task_id: null
+  task_id: 9164
   title: 'The L0 settle check script: stranded and wrongly dismissed blocking L0s from the escalation archive'
   note: 'Lands C10. Contributes fk-bab6058b23c8, fk-e39550272df9 (measures ε; closes neither). No dependencies; ε depends on π. Ruled: OQ-5 plus Leo''s check (sitting key S9-7). The lead files the 14-day
     check task once π is on main (lead action).'
@@ -59,7 +59,7 @@ tasks:
       kind: manual
       reason: a task-store fact, not a tree property; the lead files it
 - label: α
-  task_id: null
+  task_id: 9170
   title: Typed Plan model; every plan.json writer through it; structural edits clear confirmation; the replan prompt confirms
   note: 'Lands C1. Contributes fk-37190b541196 (β closes). No dependencies (task 3155, the draft''s gate, landed ef96d32603). Ruled: OQ-1, Q-C1 (a).'
   capabilities:
@@ -149,7 +149,7 @@ tasks:
       kind: manual
       reason: live plan.json read after merge; not a tree property
 - label: β
-  task_id: null
+  task_id: 9175
   title: Every plan reader on PlanState; finalization a precondition at every stamp site; recovered plans keep their lifecycle
   note: 'Closes fk-37190b541196. Depends on α. Tasks 5645 and 7345 depend on β. Ruled: OQ-2.'
   capabilities:
@@ -205,7 +205,7 @@ tasks:
       kind: manual
       reason: 'behavioural: boundary rows 3c, 4, 4b, 4c, 5b, 5c, 5d'
 - label: γ
-  task_id: null
+  task_id: 9178
   title: IterationEntry union with writer-decided is_work; the completion judge reads typed entries
   note: Closes fk-9973521f4f59. Depends on β; lands before S5 ν on read_iteration_log. Subsumes task 7391.
   capabilities:
@@ -246,7 +246,7 @@ tasks:
     binding: substrate (PASS today) — append_iteration_log refuses a source outside ORCHESTRATOR_ITERATION_SOURCES (task 5726)
     verdict: PASS
 - label: δ
-  task_id: null
+  task_id: 9184
   title: BlockReason and the one-argument _mark_blocked; report-handler and recovery families converted
   note: Lands C3. Closes fk-d2ba7601c130; contributes fk-b8efaa973162 (λ2 closes). Depends on γ and S5 ν (typed exits) [Q-C2].
   capabilities:
@@ -284,7 +284,7 @@ tasks:
     binding: OPEN — δ proves (D7) every merge_phase=True path runs in WorkflowState.MERGE, else BlockReason gains a phase field
     verdict: OPEN
 - label: ε
-  task_id: null
+  task_id: 9190
   title: The steward decides every published variant; the workflow believes it; one L0 settle
   note: 'Lands C4. Closes fk-e39550272df9, fk-bab6058b23c8. Depends on δ and π (task 5563, the draft''s other dependency, landed 3fd6ccb3dd). Ruled: OQ-5 (S9-7).'
   capabilities:
@@ -337,7 +337,7 @@ tasks:
       kind: manual
       reason: a deterministic milestone task's outcome 14 days after landing; not a tree property
 - label: ζ1
-  task_id: null
+  task_id: 9196
   title: '_invoke in three parts: ResumeArm, invocation, accounting'
   note: Lands C7. Closes fk-2c0594928a18; contributes fk-7d410939a337 and fk-f37f7e253cd5 (branch 5). Depends on ε.
   capabilities:
@@ -393,7 +393,7 @@ tasks:
       kind: manual
       reason: 'behavioural: python -c import orchestrator.storm_window_bound; its sampler carve-out equals the by-design members'
 - label: ζ2
-  task_id: null
+  task_id: 9202
   title: One route resolver with one scope-capacity read; MCP-injection helpers leave workflow.py
   note: 'Closes fk-5ea52a0f89ad; contributes fk-a503ccb37b4b. Depends on ζ1 and task 6766 (S25 C4). Ruled: OQ-7 (lead).'
   capabilities:
@@ -452,7 +452,7 @@ tasks:
       - orchestrator/src/orchestrator/routing_dispatch.py
       expect: present
 - label: η
-  task_id: null
+  task_id: 9207
   title: Merge-side blocks from OutcomeKind; the merge stash goes
   note: Contributes fk-d2ba7601c130, fk-44bc973b1cc4, fk-7d410939a337, fk-b8efaa973162. Depends on ζ2, S6 C1 (β1), S6 C3 (δ), S6 C7 (θ), task 4838.
   capabilities:
@@ -481,7 +481,7 @@ tasks:
     binding: 'producer: S6 C7 (HaltState owner semantics, S6 θ) — upstream of η; edge at decompose'
     verdict: PASS
 - label: θ
-  task_id: null
+  task_id: 9213
   title: Merge-done classification and the stranded_merge_failed filer in stranded_verified_green.py
   note: Lands C5. Closes fk-108cdd00d122 (pairs 1–2). Depends on η, S6 C1 (β1), task 7277. 3354 and S8 ε2b depend on θ (ε2b then moves the re-pointed Harness._on_stranded_merge_done into stranded_reconcile.py).
     Subsumes 7985.
@@ -532,7 +532,7 @@ tasks:
       - orchestrator/src/orchestrator/stranded_verified_green.py
       expect: present
 - label: ι
-  task_id: null
+  task_id: 9239
   title: One corroborated landing reader for the recovery guards and the ground-truth journal rung
   note: Lands C6. Closes fk-a152341e38ed. Depends on θ, S6 C4 (γ1), task 7277. Subsumes 7769.
   capabilities:
@@ -576,7 +576,7 @@ tasks:
     binding: 'producer: S6 C4 (LandedOutbox injected; MergeProvenance deleted, S6 γ1) — upstream of ι; edge at decompose'
     verdict: PASS
 - label: κ
-  task_id: null
+  task_id: 9241
   title: Execute, verify and planning legs return BlockReason; the stash dicts go
   note: Closes fk-44bc973b1cc4, fk-7d410939a337. Depends on ι, S4 C2 (α) and S4 C1 (β); keeps S4 α's bare-crash rule (S4-5 ruling).
   capabilities:
@@ -602,7 +602,7 @@ tasks:
     binding: 'producer: S4 C2 (α: infra_transient property, VerifyInfraError retired) and S4 C1 (β: VerifyContext at the two call sites) — upstream of κ; edges at decompose'
     verdict: PASS
 - label: λ1
-  task_id: null
+  task_id: 9246
   title: The _drive ladder onto disposition rows; MetadataWriteFailed blocks; two dead columns go
   note: Closes fk-4f7a933c0dd4, fk-67b5971ed72d; contributes fk-b8efaa973162. Depends on κ, S5 C3 (δ), S10 C2 (β2), S4 C2 (α).
   capabilities:
@@ -645,7 +645,7 @@ tasks:
     binding: 'producer: S4 C2 (α: VerifyInfraError arm and row removed; is_infra_oserror public) — upstream of λ1; edge at decompose'
     verdict: PASS
 - label: λ2
-  task_id: null
+  task_id: 9249
   title: The keyword form is deleted; the remaining keyword-form tests migrate
   note: Closes fk-b8efaa973162. Depends on λ1.
   capabilities:
@@ -666,7 +666,7 @@ tasks:
       kind: manual
       reason: read _workflow_helpers.py after λ2; the suite asserts on TerminalReport/the filed record
 - label: μ1
-  task_id: null
+  task_id: 9253
   title: Protocol-typed seams, hand-written fakes, conformance; fixture-tolerance branches deleted
   note: Lands C8 ports. Contributes fk-f37f7e253cd5 (branches 3, 6, 7). Depends on λ2, S10 β1 (SchedulerFacade/FakeScheduler parity).
   capabilities:
@@ -716,7 +716,7 @@ tasks:
       - orchestrator/src/orchestrator/scheduler.py
       expect: present
 - label: μ2
-  task_id: null
+  task_id: 9279
   title: A spec'd scheduler double replaces the bare mocks; the double-tolerance branches go
   note: 'Contributes fk-f37f7e253cd5 (branches 4, 9, the dry-run trims, the is-True check; μ3 closes). Depends on μ1. Subsumes 6962. Ruled: Q-C4 (a).'
   capabilities:
@@ -754,7 +754,7 @@ tasks:
       kind: manual
       reason: 'behavioural: boundary row 23b'
 - label: μ3
-  task_id: null
+  task_id: 9281
   title: A spec'd config double replaces the bare config mocks; branch 1 goes
   note: 'Closes fk-f37f7e253cd5 (branch 1, after μ1/μ2/ζ1 delete the rest). Depends on μ2 (same files). Ruled: Q-C4 (a).'
   capabilities:
@@ -783,7 +783,7 @@ tasks:
       kind: manual
       reason: 'behavioural: boundary row 23c'
 - label: ν
-  task_id: null
+  task_id: 9284
   title: WorkflowStateMachine is the single writer of phase and row
   note: 'Lands C9. Closes fk-ee708be4436f; contributes fk-f37f7e253cd5 (branch 8). Depends on μ3. Ruled: OQ-3, Q-C5 (b).'
   capabilities:
@@ -836,7 +836,7 @@ tasks:
       kind: manual
       reason: 'behavioural: boundary row 24d'
 - label: ξ
-  task_id: null
+  task_id: 9287
   title: 'Retry budgets: one run-length rule on shared.streak, one steward guard clear, a typed first-enqueue time'
   note: 'Closes fk-9eb149f0706d (narrow). Depends on ν, S10 C3 (η), task 6724. Ruled: OQ-4.'
   capabilities:
@@ -877,7 +877,7 @@ tasks:
       - shared/src/shared/streak.py
       expect: present
 - label: ο
-  task_id: null
+  task_id: 9288
   title: 'DryRunProposal: one typed entry for metadata.dry_run_proposals'
   note: Closes fk-e43472e7d5d7. Depends on μ2 (same file dry_run_unblock.py).
   capabilities:
@@ -915,7 +915,7 @@ tasks:
       kind: manual
       reason: live metadata read after a real block; not a tree property
 - label: ω
-  task_id: null
+  task_id: 9289
   title: 'Integration gate: the boundary matrix on real fixtures; heuristic-14 re-measure of workflow.py'
   note: Signal leaf. Closes fk-a503ccb37b4b, fk-a71254176a81. Depends on π and α–ο.
   capabilities:

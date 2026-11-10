@@ -4,7 +4,7 @@ signal_leaves:
 - π
 tasks:
 - label: α
-  task_id: null
+  task_id: 9128
   title: Failure vocabulary and infra-transient as data; the bare-crash re-run rule; every entry point branches; retire VerifyInfraError
   note: 'Closes fk-5037fafc755c and fk-09ad1a19f587 (R4 option 1). Lands C2, D16, D17. Ruling S4-5 (a clarification of R4): XDIST_WORKER_CRASH is not infra-transient; both gates re-run a bare crash once
     (BARE_CRASH_RERUNS) and send a second crash to the fix loop with repeated_crash_report. Subsumes tasks 5506 and 7001. Until γ, failing_legs is read from failing_leg_categories; the bare-crash test leg
@@ -103,7 +103,7 @@ tasks:
       kind: manual
       reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
 - label: β
-  task_id: null
+  task_id: 9129
   title: VerifyContext and ModuleRegistry replace the context kwargs and the private registry channel
   note: 'Closes fk-0bb03714372a and fk-0c5e73f13485. Lands C1 (S6/S7/S8/S9 consume). C1 site table pins today''s cold rule, timeout track, attempts and warm mark per call site, run_node_ids and TaskVerifyDispatcher''s
     local leg included. ResourceClass also replaces verify_cache/modes.py::VerifyRole (task 5652). S6 α names verify_budget.resolve_verify_timeout''s keyword merge_cold from the start (lead ruling 2026-11-10); β passes it from the context. Depends on S6
@@ -194,7 +194,7 @@ tasks:
       kind: manual
       reason: cross-stream same-file ordering prerequisite; its delivered checks belong to S6
 - label: γ
-  task_id: null
+  task_id: 9130
   title: Per-leg typed outcome on VerifyResult; report, aggregate, cause hint and remote no-verdict read legs
   note: 'Closes fk-caa8f680e1c2, fk-3b67e8761674, fk-a2fb58789c14. Lands C3 (CheckRun gains leg and tool; LegOutcome.of). One leg vocabulary: verify_evidence.Leg replaces verify.py::LegSlot. Subsumes task
     5892. High: gate 6698 dependency at decompose. CheckRun.leg replaces label; to_dict() keeps the label key (census bytes unchanged).'
@@ -259,7 +259,7 @@ tasks:
       reason: 'substrate, green by design at e634cfe658: git grep ''def wire_classes'' matches remote_gate.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays out of
         the dispatch gate'
 - label: δ
-  task_id: null
+  task_id: 9131
   title: One no-source-diff resolver and a typed plan leg
   note: Closes fk-0f9cace0cd00 and fk-c88f7d3ae54a. PlannedRun.leg replaces the reason-prefix decoding task 5652 moved into verify_plan.py::_LEG_BY_REASON_PREFIX; verify_cache/keys.py reads the field. Moves
     _emit_trivial_pass_escalated beside the resolver (ruled pre-split move).
@@ -292,7 +292,7 @@ tasks:
       - orchestrator/src/
       expect: absent
 - label: ε
-  task_id: null
+  task_id: 9160
   title: The plan executes the fallback branch; delete the second scope engine; final h14 measurement
   note: 'Closes fk-fac2cb6af858, fk-d99f146ff901, fk-cb29fac47dba, fk-a635d54da4ab. Runs last on verify.py (ruling S4-7); depends on ξ and on task 7041 (out of batch). High: gate 6698 dependency at decompose.'
   capabilities:
@@ -344,7 +344,7 @@ tasks:
       kind: manual
       reason: a measurement recorded at landing, not a tree pattern
 - label: ζ
-  task_id: null
+  task_id: 9132
   title: One isolated-rerun policy table; sweep confirm on the ephemeral worktree helper
   note: Closes the policy half of fk-3756ad2f3357 (task 7918 merged the three command builders into _node_id_test_config at fca89bd55b) and fk-f994995001e5. Subsumes task 6249. Depends on δ (ruling S4-7).
   capabilities:
@@ -392,7 +392,7 @@ tasks:
       reason: 'substrate, green by design at e634cfe658: git grep ''async def ephemeral_worktree'' matches git_ops.py; a present-today grep is vacuous under shared/delivered_check_polarity.py, so it stays
         out of the dispatch gate'
 - label: η
-  task_id: null
+  task_id: 9135
   title: One merge-verify profile drives both legs
   note: 'Closes fk-8dbae7d39adc. Lands C7 (spec half); ruling S4-4. Depends on ι1 (same LocalRunner and worker runner construction) and on task 7465 (out of batch). High: gate 6698 dependency at decompose.'
   capabilities:
@@ -437,7 +437,7 @@ tasks:
       kind: manual
       reason: out-of-batch same-file prerequisite
 - label: θ
-  task_id: null
+  task_id: 9137
   title: Host selection and quarantine live only in HostAllocator
   note: Closes fk-baa454b81f6f. Lands C7 (dispatch half). The harness-built quarantine set (task 6670) stays one object; HostAllocator becomes its only writer and the merge lane's only reader (the
     worker sites task 5040 moves go through it); HostPool keeps reading it by reference. Deletes build_remote_runners' dead quarantine filter (task 8734 cancelled into θ). Does not widen the quarantine-class
@@ -508,7 +508,7 @@ tasks:
       kind: manual
       reason: cross-stream same-file ordering prerequisite
 - label: ι1
-  task_id: null
+  task_id: 9134
   title: The VerifyHost seam in place; host required on every verify function
   note: 'Prepares fk-3e806baf4c6e (carried by ι2 and ξ). Lands C5 in verify.py under ruling S4-1: host required on the entry points, run_node_ids, the six public probes, LocalRunner and every internal helper;
     no default inside the verify modules; TaskWorkflow, SpeculativeMergeWorker and ReviewCheckpoint resolve VerifyHost.process() once at construction; Harness, verify-merge and verify-task resolve it once;
@@ -548,7 +548,7 @@ tasks:
       kind: manual
       reason: object identity across the composition root; judged by row 14c
 - label: ι2
-  task_id: null
+  task_id: 9138
   title: Retire every _run_cmd patch site
   note: Carries fk-3e806baf4c6e (patch half; closes at ξ); priority high by explicit choice. 215 dotted patches in 21 files at e634cfe658, test_verify.py included. Keeps the module-level _run_cmd name until
     ι3. Same-file edges with tasks 6765 and 7666 on tests/scripts/test_verify_budget_census.py.
@@ -574,7 +574,7 @@ tasks:
       - tests/
       expect: absent
 - label: ι3
-  task_id: null
+  task_id: 9141
   title: Move the exec region and the host to verify_exec.py and verify_host.py
   note: Prepares fk-3e806baf4c6e (carried by ι2 and ξ). Subsumes task 7913. harness.py reaches reap_leftover_verify_scopes in its new home. ι3 repoints review_pre_test.py and test_shutdown.py's child-script
     import.
@@ -607,7 +607,7 @@ tasks:
       - orchestrator/src/orchestrator/review_pre_test.py
       expect: absent
 - label: κ
-  task_id: null
+  task_id: 9142
   title: Owned stores on VerifyHost; the 12 module-level caches and the admission gates go
   note: Closes fk-126a75a57ca5. Depends on task 5292 (out of batch). Admission waiters reach gates through the host they were given; Harness builds AdmissionWatch with its one process host, so the heartbeat
     sees the same queue (row 15b).
@@ -678,7 +678,7 @@ tasks:
       kind: manual
       reason: watcher/waiter agreement is behaviour; judged by row 15b
 - label: λ
-  task_id: null
+  task_id: 9146
   title: verify_archive.py and the one attempt-* grammar; the census parses through it
   note: Closes fk-37d63bf83608. Lands C6 (S25 consumes). Depends on task 6765 (S25 κ). Subsumes task 5673.
   capabilities:
@@ -746,7 +746,7 @@ tasks:
       kind: manual
       reason: out-of-batch same-file prerequisite
 - label: μ
-  task_id: null
+  task_id: 9148
   title: 'Split I: verify_pytest_output.py and verify_commands.py'
   note: Prepares fk-73b03674a8e4 (carried by ξ). Moves _worktree_reader first (ruled pre-split move); subsumes task 5895; leaves the fallback-only rescoper for ε.
   capabilities:
@@ -770,7 +770,7 @@ tasks:
       - orchestrator/src/orchestrator/task_verify_dispatch.py
       expect: absent
 - label: μ0
-  task_id: null
+  task_id: 9150
   title: Move the result types to verify_result.py and repoint every importer
   note: 'complexity=simple; ruling S4-6. One import-line shape over 16 production and 114 test files (AST at e634cfe658). Depends on S6 ζ and S6 μ (lead rulings: the last S6 leaf on worker.py, types.py,
     gates.py, shadow.py).'
@@ -816,7 +816,7 @@ tasks:
       kind: manual
       reason: cross-stream same-file ordering prerequisite
 - label: ν
-  task_id: null
+  task_id: 9153
   title: 'Split II: verify_leg.py'
   note: Prepares fk-73b03674a8e4. Moves _load_sample and _xdist_workers down from the discriminator region; merge_verify_command_budget_secs stays in verify.py; resolve_verify_timeout is imported from S6's
     verify_budget.py, not moved.
@@ -840,7 +840,7 @@ tasks:
       - orchestrator/src/orchestrator/verify.py
       expect: absent
 - label: ξ
-  task_id: null
+  task_id: 9156
   title: 'Split III: verify_main_probe.py and verify_discriminator.py'
   note: 'Closes fk-73b03674a8e4 and fk-3e806baf4c6e (the last private-name imports become module publics). Priority high: gate 6698 dependency at decompose. Subsumes task 6435. harness.py repointed.'
   capabilities:
@@ -872,7 +872,7 @@ tasks:
       - orchestrator/src/orchestrator/verify.py
       expect: absent
 - label: ο
-  task_id: null
+  task_id: 9163
   title: 'verify_runner: dead code, reach-backs, HostAllocator and DriftDetector out'
   note: Carries fk-e906c4e914c2 (closes at ρ). Keeps run_verdict_parity and its report types for ρ (D15, ruling S4-8). run_unscoped becomes a required keyword; cli.py passes merge_lane/worker.py::PRODUCTION_VERIFIER.run_unscoped_typechecks.
   capabilities:
@@ -913,7 +913,7 @@ tasks:
       - orchestrator/src/orchestrator/verify_drift.py
       expect: present
 - label: ρ
-  task_id: null
+  task_id: 9166
   title: The orchestrator verdict-parity command; both escalation actions name it
   note: New by ruling S4-8 (D15). Closes fk-e906c4e914c2 (the parity code ο kept gets its caller). Defaults to the single divergent SHA; mints and cleans one merge worktree per SHA under merge_verify_lease;
     exits non-zero on disagreement; both action texts name the command and clear_verify_host_quarantine; OPERATIONS.md documents the procedure. Depends on ο; same-file edges with 5291 and with S6 worker
@@ -959,7 +959,7 @@ tasks:
       kind: manual
       reason: prose in the runbook, judged at review
 - label: π
-  task_id: null
+  task_id: 9169
   title: 'Integration gate: two-way boundary rows for C1–C7 and D15'
   note: Signal leaf. Carries no finding key; lands the starred boundary rows and re-runs the rest, row 21 included.
   capabilities:
