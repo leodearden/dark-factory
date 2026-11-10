@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, assert_never
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -611,8 +611,8 @@ CensusLauncher = Callable[..., None]
 :func:`_default_census_launcher`."""
 
 _Recorder = Callable[..., trickle_state.TrickleState]
-"""``recorder(night_fold, *, barren_escalated)``, shaped like
-:func:`trickle_state.write_night`."""
+"""``recorder(night_fold, *, barren_escalated, completion_alarm_landed)``,
+shaped like :func:`trickle_state.write_night`."""
 
 _RetryRecorder = Callable[..., trickle_state.TrickleState | None]
 """Shaped like :func:`trickle_state.record_retry`."""
@@ -1069,8 +1069,8 @@ def _record_trickle_progress(
     Any other pass is folded once over the recorded predecessor; the
     barren-streak and completion-error-streak alarms are decided on that fold
     and raised BEFORE the same fold is written, and the record carries
-    whether the barren one landed. Only a finished pass owes retries, taken
-    from the state it recorded.
+    whether each landed. Only a finished pass owes retries, taken from the
+    state it recorded.
     """
     recorded_at = now if now is not None else datetime.now(UTC)
     retry_due: tuple[date, ...] = ()
@@ -1091,18 +1091,23 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = _barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
             ).landed
         )
-        if end.census is not None and trickle_state.completion_error_streak_reached(night):
-            _escalate_completion_error_streak(
+        completion_landed = (
+            end.census is not None
+            and trickle_state.completion_error_streak_reached(night)
+            and _escalate_completion_error_streak(
                 cfg, night.state, target_date,
                 census_line=end.census.line, raise_alarm=raise_alarm,
-            )
-        recorded = recorder(night, barren_escalated=streak_landed)
+            ).landed
+        )
+        recorded = recorder(
+            night, barren_escalated=streak_landed, completion_alarm_landed=completion_landed,
+        )
         if _finished_of(end.outcome):
             retry_due = trickle_state.due_retries(recorded, today=recorded_at.date())
     return retry_due
@@ -1137,6 +1142,7 @@ def _record_unloaded_night(
         recorder(
             trickle_state.fold_night(trickle_state.read_prior(project_id), project_id, run),
             barren_escalated=False,
+            completion_alarm_landed=False,
         )
 
 
@@ -1199,24 +1205,6 @@ def _night_run(
     )
 
 
-def _barren_streak_reached(night: trickle_state.NightFold, max_runs: int) -> bool:
-    """Whether *night* is the barren night on which its streak first reaches
-    *max_runs*: the nightly's re-arm policy, and the one place it lives.
-
-    Once per streak, re-armed only when a productive or quiet night resets
-    the streak. Re-firing every night past the threshold would revive task
-    3270's alarm fatigue; a one-shot latch would leave whoever missed the
-    single escalation in silence, which 3270 rejected as worse."""
-    already_due = (
-        night.prior is not None and trickle_state.barren_streak_due(night.prior, max_runs)
-    )
-    return (
-        night.state.outcome == trickle_state.RunOutcome.BARREN
-        and trickle_state.barren_streak_due(night.state, max_runs)
-        and not already_due
-    )
-
-
 def _escalate_barren_streak(
     cfg: LegibilityConfig,
     night: trickle_state.TrickleState,
@@ -1259,9 +1247,9 @@ def _escalate_completion_error_streak(
     census_line: str,
     raise_alarm: _RaiseAlarm,
 ) -> Alarm:
-    """Raise the COMPLETION_ERROR_STREAK alarm for *night*, once per streak
-    (:func:`trickle_state.completion_error_streak_reached`). WARNING level,
-    exit code 0, like the barren one."""
+    """Raise the COMPLETION_ERROR_STREAK alarm for *night*, on each night
+    :func:`trickle_state.completion_error_streak_reached` owes it. WARNING
+    level, exit code 0, like the barren one."""
     streak = night.completion_error_streak
     summary = (
         f'legibility census trigger: completion check failed on {streak} '
@@ -1329,9 +1317,9 @@ def run_nightly(
     census the trigger FIREd.
 
     *recorder* (default :func:`trickle_state.write_night`) is the run-state
-    seam: ``recorder(night_fold, *, barren_escalated)`` writes the
-    :class:`trickle_state.NightFold` the barren escalation was decided on and
-    returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
+    seam: ``recorder(night_fold, *, barren_escalated, completion_alarm_landed)``
+    writes the :class:`trickle_state.NightFold` the streak escalations were
+    decided on and returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
     once per pass but a retry, whatever the stages did,
     so the progress probe (``check_trickle_progress.py``) can tell every
     outcome apart, a barren night from a quiet one included — the
@@ -1787,6 +1775,8 @@ def _completion_arm(
     completion error streak: a check that answered resets it, one that
     could not counts, and a night with nothing to check carries it."""
     match status:
+        case None:
+            return None
         case census_trigger.CompletionStatus.FIRE | census_trigger.CompletionStatus.NOT_YET:
             return trickle_state.CompletionArm.CONCLUDED
         case census_trigger.CompletionStatus.ERROR:
@@ -1797,7 +1787,7 @@ def _completion_arm(
         ):
             return trickle_state.CompletionArm.STANDING
         case _:
-            return None
+            assert_never(status)
 
 
 def _parse_date(value: str) -> date:

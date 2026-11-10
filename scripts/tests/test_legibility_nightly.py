@@ -3598,8 +3598,11 @@ def _recorder_spy():
     ``barren_escalated``, and *returned_doc* is the JSON document written."""
     calls = []
 
-    def _record(night, *, barren_escalated):
-        state = trickle_state.write_night(night, barren_escalated=barren_escalated)
+    def _record(night, *, barren_escalated, completion_alarm_landed):
+        state = trickle_state.write_night(
+            night, barren_escalated=barren_escalated,
+            completion_alarm_landed=completion_alarm_landed,
+        )
         facts = {
             field.name: getattr(night.run, field.name)
             for field in dataclasses.fields(night.run)
@@ -4080,7 +4083,7 @@ class TestRunNightlyRecordsTrickleState:
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
         the alarm's best-effort contract."""
-        def _raising_recorder(night, *, barren_escalated):
+        def _raising_recorder(night, *, barren_escalated, completion_alarm_landed):
             raise OSError('synthetic state-write failure')
 
         with caplog.at_level('WARNING', logger='legibility.nightly'):
@@ -4095,24 +4098,31 @@ class TestRunNightlyRecordsTrickleState:
     def test_the_recorder_receives_the_night_and_the_escalation_fact(self, tmp_path):
         received = []
 
-        def _record(night, *, barren_escalated):
-            received.append((night, barren_escalated))
-            return trickle_state.write_night(night, barren_escalated=barren_escalated)
+        def _record(night, *, barren_escalated, completion_alarm_landed):
+            received.append((night, barren_escalated, completion_alarm_landed))
+            return trickle_state.write_night(
+                night, barren_escalated=barren_escalated,
+                completion_alarm_landed=completion_alarm_landed,
+            )
 
         _run_e2e_nightly(tmp_path, recorder=_record)
 
-        [(night, barren_escalated)] = received
+        [(night, barren_escalated, completion_alarm_landed)] = received
         assert isinstance(night, trickle_state.NightFold)
         assert night.state.project_id == 'testproj'
         assert night.run.outcome == trickle_state.RunOutcome.PRODUCTIVE
         assert night.state.outcome == trickle_state.RunOutcome.PRODUCTIVE
         assert barren_escalated is False
+        assert completion_alarm_landed is False
 
     def test_the_state_the_recorder_returns_schedules_the_retries(self, tmp_path):
         owed = date(2026, 7, 12)
 
-        def _record_owing(night, *, barren_escalated):
-            state = trickle_state.write_night(night, barren_escalated=barren_escalated)
+        def _record_owing(night, *, barren_escalated, completion_alarm_landed):
+            state = trickle_state.write_night(
+                night, barren_escalated=barren_escalated,
+                completion_alarm_landed=completion_alarm_landed,
+            )
             return dataclasses.replace(state, retry_backlog={owed: 1})
 
         result, _repo = _run_e2e_nightly(tmp_path, recorder=_record_owing)

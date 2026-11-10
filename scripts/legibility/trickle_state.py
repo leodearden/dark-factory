@@ -53,7 +53,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import NamedTuple, assert_never
 
 # Import state_docs by the same spelling this module was imported by, so a
 # caller matching on Missing / Malformed / Ok sees the classes this module
@@ -75,7 +75,8 @@ OTHER value as malformed rather than guessing at unknown fields.
 Fields added after the first writer are ADDITIVE and do not bump it:
 ``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
 ``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``,
-``barren_escalated`` and ``completion_error_streak``.
+``barren_escalated``, ``completion_error_streak`` and
+``completion_escalated``.
 :meth:`TrickleState.from_json` reads an absent one as its default, and an
 absent ``barren_escalated`` as ``None`` (unrecorded). Bumping for such a
 field would make every live state file read malformed on the first
@@ -587,13 +588,16 @@ def _fold_census_fire_streak(
 def _fold_completion_error_streak(
     prior_streak: int, census: CensusObservation | None
 ) -> int:
-    match None if census is None else census.completion:
+    arm = None if census is None else census.completion
+    match arm:
         case CompletionArm.ERRORED:
             return prior_streak + 1
         case CompletionArm.CONCLUDED:
             return 0
-        case _:
+        case CompletionArm.STANDING | None:
             return prior_streak
+        case _:
+            assert_never(arm)
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +610,9 @@ class TrickleState:
 
     :meth:`from_json` and :meth:`to_json` are the document's only codec.
     ``barren_escalated`` is ``None`` for a document written before the
-    field existed: UNRECORDED, which a reader must not take for False."""
+    field existed: UNRECORDED, which a reader must not take for False.
+    ``completion_escalated`` is whether an escalation of the current
+    completion error streak has landed; it clears with the streak."""
 
     project_id: str
     target_date: date
@@ -627,6 +633,7 @@ class TrickleState:
     retry_backlog: Mapping[date, int]
     barren_escalated: bool | None
     completion_error_streak: int
+    completion_escalated: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -680,6 +687,9 @@ class TrickleState:
             completion_error_streak=defaulted(
                 doc, 'completion_error_streak', state_docs.as_count, 0
             ),
+            completion_escalated=defaulted(
+                doc, 'completion_escalated', state_docs.as_bool, False
+            ),
         )
 
     def to_json(self) -> dict[str, object]:
@@ -709,6 +719,7 @@ class TrickleState:
             'retry_backlog': _serialize_retry_backlog(self.retry_backlog),
             'barren_escalated': self.barren_escalated,
             'completion_error_streak': self.completion_error_streak,
+            'completion_escalated': self.completion_escalated,
         }
 
 
@@ -865,7 +876,9 @@ def fold_night(
     ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
     clears it and ``census=None`` carries it. ``completion_error_streak``
     folds the night's :class:`CompletionArm`: ERRORED adds 1, CONCLUDED
-    resets it, and STANDING, no verdict or ``census=None`` carry it. A
+    resets it, and STANDING, no verdict or ``census=None`` carry it.
+    ``completion_escalated`` carries while that streak stands and clears
+    when it resets; :func:`write_night` latches it. A
     scheduled pass advances
     ``last_scheduled_target_date`` (never backwards) and owes, with 0
     attempts, the :func:`never_run_dates` since the previous scheduled pass;
@@ -874,6 +887,9 @@ def fold_night(
     outcome = run.outcome
     today = run.recorded_at.date()
     barren_streak, failed_streak = _fold_streaks(prior, outcome)
+    completion_streak = _fold_completion_error_streak(
+        0 if prior is None else prior.completion_error_streak, run.census
+    )
     cursor, never_run = _schedule_cursor(
         None if prior is None else prior.last_scheduled_target_date,
         target_date=run.target_date,
@@ -916,8 +932,9 @@ def fold_night(
         counters=run.counters,
         retry_backlog=retry.backlog,
         barren_escalated=False,
-        completion_error_streak=_fold_completion_error_streak(
-            0 if prior is None else prior.completion_error_streak, run.census
+        completion_error_streak=completion_streak,
+        completion_escalated=(
+            completion_streak > 0 and prior is not None and prior.completion_escalated
         ),
     )
     return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
@@ -960,28 +977,68 @@ def _schedule_cursor(
     )
 
 
+# ---------------------------------------------------------------------------
+# Escalation re-arm policies — decided on a night's fold, before it is written
+# ---------------------------------------------------------------------------
+
+def barren_streak_reached(night: NightFold, max_runs: int) -> bool:
+    """Whether *night* is the barren night on which its streak first reaches
+    *max_runs*: once per streak, re-armed only when a productive or quiet
+    night resets the streak.
+
+    Re-firing every night past the threshold would revive task 3270's alarm
+    fatigue; a one-shot latch would leave whoever missed the single
+    escalation in silence, which 3270 rejected as worse. A post that does
+    not land is not retried: ``check_trickle_progress.py`` fails on the same
+    streak independently and prints the recorded ``barren_escalated``."""
+    already_due = night.prior is not None and barren_streak_due(night.prior, max_runs)
+    return (
+        night.state.outcome == RunOutcome.BARREN
+        and barren_streak_due(night.state, max_runs)
+        and not already_due
+    )
+
+
 def completion_error_streak_reached(
     night: NightFold, max_errors: int | None = None
 ) -> bool:
-    """Whether *night* is the fold on which the completion error streak
-    first reaches *max_errors* (:data:`DEFAULT_MAX_COMPLETION_ERRORS` by
-    default): the once-per-streak policy, so a streak escalates once and
-    re-arms only after a concluded check resets it."""
+    """Whether *night* owes the completion error streak's escalation: the
+    streak stands at or past *max_errors*
+    (:data:`DEFAULT_MAX_COMPLETION_ERRORS` by default) and no escalation of
+    it has landed yet.
+
+    Unlike the barren streak, no probe re-reads this one, so a post that
+    does not land is retried on each later night until one does; after that
+    the streak stays silent until a concluded check resets it, which
+    re-arms the policy."""
     threshold = DEFAULT_MAX_COMPLETION_ERRORS if max_errors is None else max_errors
-    prior = 0 if night.prior is None else night.prior.completion_error_streak
-    return night.state.completion_error_streak >= threshold > prior
+    state = night.state
+    return state.completion_error_streak >= threshold and not state.completion_escalated
 
 
-def write_night(night: NightFold, *, barren_escalated: bool) -> TrickleState:
+# ---------------------------------------------------------------------------
+# Recording a night
+# ---------------------------------------------------------------------------
+
+def write_night(
+    night: NightFold, *, barren_escalated: bool, completion_alarm_landed: bool
+) -> TrickleState:
     """Record *night* with *barren_escalated* — whether the nightly
-    escalated its barren streak — write the document atomically and return
-    it.
+    escalated its barren streak — and *completion_alarm_landed* — whether
+    its completion error streak escalation landed this night, which latches
+    ``completion_escalated`` — write the document atomically and return it.
 
-    *barren_escalated* has no default: it is the fact the health probe reads
-    instead of re-deriving the nightly's threshold. The WARNINGs for owed
+    Neither flag has a default: *barren_escalated* is the fact the health
+    probe reads instead of re-deriving the nightly's threshold, and
+    *completion_alarm_landed* is what stops
+    :func:`completion_error_streak_reached` retrying. The WARNINGs for owed
     dates the fold abandoned are logged here, once per write. An ``OSError``
     from the write propagates."""
-    state = dataclasses.replace(night.state, barren_escalated=barren_escalated)
+    state = dataclasses.replace(
+        night.state,
+        barren_escalated=barren_escalated,
+        completion_escalated=night.state.completion_escalated or completion_alarm_landed,
+    )
     prior_cursor = None if night.prior is None else night.prior.last_scheduled_target_date
     if prior_cursor is not None and night.never_run.expired:
         _warn_expired_never_run(state.project_id, prior_cursor, night.never_run.expired)
@@ -996,10 +1053,12 @@ def record_run(
     project_id: str, run: NightRun, *, barren_escalated: bool
 ) -> TrickleState:
     """Fold *run* over the recorded predecessor and write it: :func:`write_night`
-    of :func:`fold_night`, for a writer with nothing to decide in between."""
+    of :func:`fold_night`, for a writer with nothing to decide in between,
+    which raised no completion error streak escalation."""
     return write_night(
         fold_night(read_prior(project_id), project_id, run),
         barren_escalated=barren_escalated,
+        completion_alarm_landed=False,
     )
 
 

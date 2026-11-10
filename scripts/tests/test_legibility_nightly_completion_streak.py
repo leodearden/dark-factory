@@ -101,13 +101,34 @@ def _no_census_launch(project_root, **kwargs):
     """A FIRE must never spawn the real census.py from a test."""
 
 
-def _run_nights(tmp_path, outcomes, *, run_id: str | None = _RUN_ID):
+def _refusing_first_streak_post(posted: list[dict]):
+    """A poster whose first completion-streak post is refused, as
+    escalate_info's error reply; every other post lands."""
+    refused: list[dict] = []
+
+    def _post(url, arguments):
+        posted.append(arguments)
+        if 'completion check' in arguments['summary'] and not refused:
+            refused.append(arguments)
+            return {'error': 'synthetic refusal'}
+        return {}
+
+    return _post
+
+
+def _run_nights(
+    tmp_path, outcomes, *, run_id: str | None = _RUN_ID, refuse_first_streak_post=False,
+):
     """Run one manual night per entry of *outcomes*, on successive target
     dates. Returns ``(results, posted)``: each night's NightlyResult and the
     arguments of every escalation posted."""
     config_path = _write_project(tmp_path, run_id=run_id)
     runner = _scripted_runner(outcomes)
     posted: list[dict] = []
+    poster = (
+        _refusing_first_streak_post(posted) if refuse_first_streak_post
+        else lambda url, arguments: posted.append(arguments)
+    )
     results = []
     for night in range(len(outcomes)):
         target_date = _FIRST_NIGHT + timedelta(days=night)
@@ -118,7 +139,7 @@ def _run_nights(tmp_path, outcomes, *, run_id: str | None = _RUN_ID):
             now=_now_after(target_date),
             invoke=_never_invoked,
             completion_runner=runner,
-            poster=lambda url, arguments: posted.append(arguments),
+            poster=poster,
             census_launcher=_no_census_launch,
             pass_kind=nightly.PassKind.MANUAL,
         ))
@@ -206,3 +227,26 @@ def test_the_policy_re_arms_after_a_reset(tmp_path):
     _results, posted = _run_nights(tmp_path, [_ERROR] * 3 + [_PASS] + [_ERROR] * 3)
 
     assert len(_streak_escalations(posted)) == 2
+
+
+def test_an_escalation_that_did_not_land_is_retried_until_one_does(tmp_path):
+    results, posted = _run_nights(tmp_path, [_ERROR] * 5, refuse_first_streak_post=True)
+
+    landed = [
+        [alarm.landed for alarm in result.alarms
+         if alarm.kind is nightly.AlarmKind.COMPLETION_ERROR_STREAK]
+        for result in results
+    ]
+    assert landed == [[], [], [False], [True], []]
+    assert len(_streak_escalations(posted)) == 2
+    prior = trickle_state.read_prior(_PROJECT_ID)
+    assert prior is not None
+    assert prior.completion_escalated is True
+
+
+def test_a_refused_post_is_retried_on_a_standing_night(tmp_path):
+    results, _posted = _run_nights(
+        tmp_path, [_ERROR, _ERROR, _ERROR, _FILED_NOTHING], refuse_first_streak_post=True,
+    )
+
+    assert [alarm.landed for alarm in results[-1].alarms] == [True]
