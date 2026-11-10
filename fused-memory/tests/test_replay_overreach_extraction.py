@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,8 +18,11 @@ from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.prompts.models import Message
+from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from pydantic import BaseModel
 
+from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_token_usage import AttributingTokenUsageTracker, LlmTokenUsage
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -203,3 +207,120 @@ class TestBuildArmLlm:
     def test_the_client_attributes_its_tokens(self, mock_config: FusedMemoryConfig) -> None:
         client = mod.build_arm_llm(mock_config, model=None)
         assert client is not None and isinstance(client.token_tracker, AttributingTokenUsageTracker)
+
+
+# --------------------------------------------------------------------------- #
+# The read side: an episode's production inputs, read-only
+# --------------------------------------------------------------------------- #
+
+STORED_VALID_AT = '2026-09-17T20:31:43.521296+00:00'
+
+
+class _Graph:
+    """A graph double answering each Cypher constant with canned rows; records what it was sent."""
+
+    name = 'dark_factory'
+
+    def __init__(self, answers: dict[str, list[list[Any]]]) -> None:
+        self.answers = answers
+        self.sent: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+        self.sent.append((cypher, params))
+        return SimpleNamespace(result_set=self.answers[cypher])
+
+
+def _episode_graph(previous_desc: list[list[Any]] | None = None, *, own: list[list[Any]] | None = None) -> _Graph:
+    return _Graph({
+        mod.EPISODE_CYPHER: own if own is not None else [
+            [STORED_VALID_AT, 'text', 'add_memory:decisions_and_rationale', 'dark_factory'],
+        ],
+        mod.PREVIOUS_EPISODES_CYPHER: previous_desc if previous_desc is not None else [
+            ['third', '2026-09-17T19:00:00+00:00'], ['second', '2026-09-17T18:00:00+00:00'],
+            ['first', '2026-09-17T17:00:00+00:00'],
+        ],
+    })
+
+
+def _worksheet_row(uuid: str = 'ep-1', **overrides: Any) -> dict[str, Any]:
+    return {'graph': 'dark_factory', 'uuid': uuid, 'stratum': 'ruling_lexeme',
+            'content': f'the body of {uuid}', 'minted': []} | overrides
+
+
+async def _read(graph: _Graph, row: dict[str, Any] | None = None) -> Any:
+    reader = mod.EpisodeContextReader(ReadOnlyGraphReader(graph_name='dark_factory', graph=graph))
+    return await reader.read(row or _worksheet_row())
+
+
+class TestEpisodeContextReader:
+    @pytest.mark.asyncio
+    async def test_the_episodes_own_fields_come_from_its_own_row(self) -> None:
+        replay_input = await _read(_episode_graph())
+        assert (replay_input.graph, replay_input.uuid, replay_input.stratum) == ('dark_factory', 'ep-1', 'ruling_lexeme')
+        assert replay_input.content == 'the body of ep-1'
+        assert (replay_input.source, replay_input.source_description) == ('text', 'add_memory:decisions_and_rationale')
+        assert replay_input.valid_at == datetime(2026, 9, 17, 20, 31, 43, 521296, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_previous_episodes_are_put_back_in_chronological_order(self) -> None:
+        replay_input = await _read(_episode_graph())
+        assert replay_input.previous == ('first', 'second', 'third')
+
+    @pytest.mark.asyncio
+    async def test_the_previous_episode_query_is_graphitis_retrieve_episodes_rule(self) -> None:
+        graph = _episode_graph()
+        await _read(graph)
+        (own_params,) = [params for cypher, params in graph.sent if cypher == mod.EPISODE_CYPHER]
+        (previous_params,) = [params for cypher, params in graph.sent if cypher == mod.PREVIOUS_EPISODES_CYPHER]
+        assert own_params == {'uuid': 'ep-1'}
+        assert previous_params == {
+            'reference_time': STORED_VALID_AT, 'group_ids': ['dark_factory'], 'source': 'text',
+            'uuid': 'ep-1', 'num_episodes': RELEVANT_SCHEMA_LIMIT,
+        }
+        assert mod.RELEVANT_SCHEMA_LIMIT is RELEVANT_SCHEMA_LIMIT and RELEVANT_SCHEMA_LIMIT == 10
+
+    def test_the_valid_at_bound_is_one_no_range_index_can_serve(self) -> None:
+        assert exact_string_upper_bound('e.valid_at', 'reference_time', inclusive=True) in mod.PREVIOUS_EPISODES_CYPHER
+
+    @pytest.mark.asyncio
+    async def test_an_episode_the_graph_no_longer_holds_is_a_named_error(self) -> None:
+        with pytest.raises(mod.EpisodeMissing, match='ep-gone'):
+            await _read(_episode_graph(own=[]), _worksheet_row('ep-gone'))
+
+    @pytest.mark.asyncio
+    async def test_only_the_read_primitive_reaches_the_graph(self) -> None:
+        graph = _episode_graph()
+        await _read(graph)
+        assert {cypher for cypher, _ in graph.sent} == {mod.EPISODE_CYPHER, mod.PREVIOUS_EPISODES_CYPHER}
+
+
+def _sizes(**episodes: int) -> dict[str, Any]:
+    sizes: dict[str, dict[str, dict[str, int]]] = {}
+    for cell, count in episodes.items():
+        graph, stratum = cell.split('__')
+        sizes.setdefault(graph, {})[stratum] = {'episodes': count, 'minted': 0, 'corroborated': 0}
+    return {'sample': {'sizes': sizes}}
+
+
+class TestCheckWorksheet:
+    ROWS = [
+        _worksheet_row('a1'), _worksheet_row('a2'),
+        _worksheet_row('b1', graph='reify', stratum='other_decisions'),
+    ]
+
+    def test_matching_cell_counts_pass(self) -> None:
+        mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=2, reify__other_decisions=1))
+
+    def test_a_short_cell_is_named(self) -> None:
+        with pytest.raises(mod.WorksheetMismatch, match='dark_factory/ruling_lexeme'):
+            mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=3, reify__other_decisions=1))
+
+    def test_a_cell_the_baseline_lacks_is_named(self) -> None:
+        with pytest.raises(mod.WorksheetMismatch, match='reify/other_decisions'):
+            mod.check_worksheet(self.ROWS, _sizes(dark_factory__ruling_lexeme=2))
+
+    def test_a_baseline_cell_the_worksheet_lacks_is_named(self) -> None:
+        with pytest.raises(mod.WorksheetMismatch, match='reify/decision_anchor'):
+            mod.check_worksheet(self.ROWS, _sizes(
+                dark_factory__ruling_lexeme=2, reify__other_decisions=1, reify__decision_anchor=8,
+            ))
