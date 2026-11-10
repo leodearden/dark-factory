@@ -865,10 +865,6 @@ class TestCensusCategoriesAreImportedNotRestated:
             c.value for c in census.CENSUS_CATEGORIES
         ]
 
-    def test_the_census_module_is_loaded_once(self):
-        """``sys.modules``-first — re-executing would hand back new classes."""
-        assert _mod.load_census_module() is _mod.load_census_module()
-
     def test_the_census_module_is_whatever_its_key_holds(self, monkeypatch):
         """Every loader of ``census_memory_metadata`` shares one module object."""
         _mod.load_census_module()

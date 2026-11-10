@@ -291,10 +291,7 @@ DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
 # ---------------------------------------------------------------------------
 
 def load_census_module() -> Any:
-    """Load ``census_memory_metadata`` by path through
-    ``fused_memory/utils/script_loader.py::load_script``, so it shares one
-    module object with every other loader of that key.
-    """
+    """Load ``census_memory_metadata`` by path via ``load_script``, sharing its key's module."""
     return load_script(_CENSUS_SCRIPT_PATH, 'census_memory_metadata')
 
 
