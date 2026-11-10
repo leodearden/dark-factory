@@ -543,8 +543,7 @@ def format_report(episodes: list[StallEpisode]) -> str:
         lines = [
             f"stall {number}: {episode.stall_seconds:.0f}s silent "
             f"({episode.stall_started_at:%H:%M:%S} -> {episode.stall_ended_at:%H:%M:%S})",
-            f"  outcome          {episode.outcome} (watchdog would report "
-            f"{episode.watchdog_verdict})",
+            f"  outcome          {episode.outcome} ({_show_verdict(episode.watchdog_verdict)})",
             f"  teardown         {_show_seconds(costs.teardown_seconds)}",
             f"  startup          {_show_seconds(costs.startup_seconds)}",
             f"  total            {_show_seconds(costs.total_seconds)}",
@@ -578,6 +577,15 @@ def _show_seconds(seconds: float | None) -> str:
 
 def _show_gigabytes(byte_count: float | None) -> str:
     return "not measured" if byte_count is None else f"{byte_count / 1024**3:.1f}G"
+
+
+def _show_verdict(verdict: str | None) -> str:
+    if verdict is None:
+        return (
+            "watchdog verdict not witnessed: port 8002 may have stayed bound in "
+            "fused-memory.socket; add -u fused-memory.socket to the capture"
+        )
+    return f"watchdog would report {verdict}"
 
 
 def main(argv: list[str] | None = None) -> int:
