@@ -206,6 +206,24 @@ class TestDispatchHold:
         _set_phase(session, SELF_DEPLOY_ID, 'verified')
         assert await _run_tick(harness) == DEPENDENT_ID
 
+    @pytest.mark.asyncio
+    async def test_a_cold_held_dep_deferred_by_the_fetch_budget_does_not_dispatch(
+        self, tmp_path: Path, session: _DeploySession,
+    ) -> None:
+        """The restart shape: an empty record cache, more terminal deps than the
+        per-tick budget, and the held self-deploy sorting after the others."""
+        session.tasks.append({'id': '1000', 'title': 'Plain done dep', 'status': 'done', 'dependencies': []})
+        dependent = _register_dependent(session, DEPENDENT_ID, dep_id='1000')
+        dependent['dependencies'].append({'id': SELF_DEPLOY_ID})
+        harness = _build_harness(tmp_path, session, tmp_path / 'escalations')
+        harness.scheduler.config.delivered_checks.max_checks_per_tick = 1
+
+        assert await _run_tick(harness) is None
+        assert await _run_tick(harness) is None
+
+        _set_phase(session, SELF_DEPLOY_ID, 'verified')
+        assert await _run_tick(harness) == DEPENDENT_ID
+
 
 def _deploy_state(session: _DeploySession) -> dict:
     return session.task(SELF_DEPLOY_ID)['metadata']['deploy_state']

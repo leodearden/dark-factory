@@ -14,7 +14,7 @@ scheduler's logger.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
@@ -117,6 +117,7 @@ def deps_verdict(
     external_resolver_failed: bool = False,
     delivered_check_cache: dict[str, bool] | None = None,
     terminal_dep_records: dict[str, dict] | None = None,
+    deferred_terminal_deps: Collection[str] = frozenset(),
 ) -> DepsVerdict:
     """THE dependency predicate: are *task*'s dependencies satisfied?
 
@@ -149,8 +150,11 @@ def deps_verdict(
     ``verified`` or ``done`` — see
     ``orchestrator/src/orchestrator/deploy_state.py::awaits_scheduled_restart``;
     the phase writer is ``orchestrator/src/orchestrator/scheduled_deploy_settle.py``.
-    The record is read from *tasks_by_id*, else *terminal_dep_records*; a
-    missing record does not hold.
+    The record is read from *tasks_by_id*, else *terminal_dep_records*.  A
+    missing record does not hold, unless the dep is in
+    *deferred_terminal_deps*: the per-tick record fetch budget deferred it
+    before it was ever cached, so it may be held, and the arm answers UNKNOWN
+    until a later tick fetches it.
 
     **Cross-project external deps**: consulted only when
     *external_status_cache* is not ``None``.  An external dep in
@@ -202,6 +206,7 @@ def deps_verdict(
         partial(
             _scheduled_deploy_verdict,
             task, dep_ids, status_map, tasks_by_id, terminal_dep_records,
+            deferred_terminal_deps,
         ),
         partial(_external_verdict, task, external_status_cache, external_resolver_failed),
         partial(
@@ -287,14 +292,23 @@ def _scheduled_deploy_verdict(
     status_map: dict[str, str],
     tasks_by_id: dict[str, dict] | None,
     terminal_dep_records: dict[str, dict] | None,
+    deferred_terminal_deps: Collection[str],
 ) -> DepsVerdict:
-    """The scheduled-deploy arm of :func:`deps_verdict`: SATISFIED or UNSATISFIED."""
+    """The scheduled-deploy arm of :func:`deps_verdict`."""
+    verdict = DEPS_SATISFIED
     for dep_id in dep_ids:
         if status_map.get(dep_id, 'unknown') not in TERMINAL_STATUSES:
             continue
         dep_task = _dep_record(dep_id, tasks_by_id, terminal_dep_records)
         if dep_task is None:
-            # Fail-open, as in the delivered-check arm below.
+            if dep_id in deferred_terminal_deps:
+                logger.debug(
+                    'Task %s waits: dep %s record not fetched yet (deferred by the '
+                    'per-tick fetch budget), so its scheduled-deploy hold is unknown',
+                    task.get('id', '?'), dep_id,
+                )
+                verdict = DepsVerdict.unknown(DepKind.SCHEDULED_DEPLOY)
+            # Otherwise fail-open, as in the delivered-check arm below.
             continue
         metadata = dep_task.get('metadata')
         if not isinstance(metadata, dict) or not awaits_scheduled_restart(metadata):
@@ -308,7 +322,7 @@ def _scheduled_deploy_verdict(
             deploy_slice.get('phase') if isinstance(deploy_slice, dict) else deploy_slice,
         )
         return DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)
-    return DEPS_SATISFIED
+    return verdict
 
 
 def _external_verdict(

@@ -1741,6 +1741,38 @@ class TestPhaseBackfillTerminalDepRecords:
 
         scheduler.get_task.assert_awaited_once_with('20')
         assert ctx.terminal_dep_records == {'20': still_held_20, '21': held_21}
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    # --- (m) a never-cached dep deferred by the budget is named on ctx -----
+
+    @pytest.mark.asyncio
+    async def test_only_a_never_cached_dep_deferred_by_the_budget_is_named_on_ctx(
+        self, scheduler: Scheduler
+    ):
+        """A deferred dep with no record would fail open; the scheduled-deploy
+        arm waits on it instead.  A deferred re-validation keeps its cached,
+        known-unheld record, so it is not named."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        scheduler._terminal_dep_record_cache['22'] = {
+            'id': '22',
+            'status': 'done',
+            'metadata': {'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'P'}]},
+        }
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '21'), ('12', '22'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '21': 'done', '22': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'status': 'done', 'metadata': {}})
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.deferred_terminal_deps == frozenset({'21'})
 
 
 # ---------------------------------------------------------------------------

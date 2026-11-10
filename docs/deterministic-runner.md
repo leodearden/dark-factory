@@ -143,9 +143,13 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
 
   The dispatch tick keeps serving a held record from its cache when the
   re-fetch fails or is deferred past the per-tick fetch budget
-  (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`);
-  only a not-yet-cached dep fails open, for that tick.  Accepted residual: an
-  RP-4 submit that itself failed reads as `verified`.
+  (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`).
+  A dep never yet cached that the budget defers makes its dependents wait
+  (verdict `unknown`) until a later tick fetches it: after a restart the
+  cold cache takes ceil(terminal deps / `delivered_checks.max_checks_per_tick`)
+  ticks to warm.  Only a never-cached dep whose fetch fails outright fails
+  open, for that tick.  Accepted residual: an RP-4 submit that itself failed
+  reads as `verified`.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT
   running the blocking cross-unit deploy.  The detached restart is already

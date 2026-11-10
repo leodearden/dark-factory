@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -1111,12 +1111,15 @@ class TickContext:
     a just-completed dep carrying ``metadata.delivered_checks`` would
     otherwise be invisible to the delivered-check gate. Populated by
     ``_phase_backfill_terminal_dep_records`` (via the lean per-id
-    ``get_task`` primitive) and consulted ONLY by the two delivered-check
-    consumers (``_deps_satisfied``, ``_compute_delivered_check_cache``) as
-    a purely additive fallback when ``tasks_by_id.get(dep_id)`` is
-    ``None`` — NEVER merged into ``tasks_by_id`` itself, since ~20 other
-    phases (``_phase_stale_sweep``, ``_phase_park_gc``, ...) assume
-    ``tasks_by_id`` holds only active tasks.
+    ``get_task`` primitive) and consulted ONLY by the delivered-check and
+    scheduled-deploy arms of ``dependency_verdict.py::deps_verdict`` and by
+    ``_compute_delivered_check_cache``, as a purely additive fallback when
+    ``tasks_by_id.get(dep_id)`` is ``None`` — NEVER merged into
+    ``tasks_by_id`` itself, since ~20 other phases (``_phase_stale_sweep``,
+    ``_phase_park_gc``, ...) assume ``tasks_by_id`` holds only active tasks.
+    ``deferred_terminal_deps`` names the deps that phase's fetch budget
+    deferred before their record was ever cached, so the scheduled-deploy
+    arm waits on them rather than failing open.
     """
 
     tasks: list[dict]
@@ -1127,6 +1130,7 @@ class TickContext:
     external_resolver_failed: bool = False
     delivered_check_cache: dict[str, bool] | None = field(default_factory=dict)
     terminal_dep_records: dict[str, dict] = field(default_factory=dict)
+    deferred_terminal_deps: frozenset[str] = frozenset()
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
@@ -4320,6 +4324,7 @@ class Scheduler:
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> bool:
         """The boolean view of ``dependency_verdict.py::deps_verdict``: True iff SATISFIED.
 
@@ -4332,6 +4337,7 @@ class Scheduler:
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=deferred_terminal_deps,
         ).satisfied
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
@@ -4615,6 +4621,7 @@ class Scheduler:
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
         terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> None:
         """Per-tick sweep: stamp the frozen-once ``milestone_deps_satisfied_at``
         wall-clock anchor for pending 'delayed' milestone tasks (task 2335 β).
@@ -4675,6 +4682,7 @@ class Scheduler:
                     external_status_cache=external_status_cache,
                     external_resolver_failed=external_resolver_failed,
                     terminal_dep_records=terminal_dep_records,
+                    deferred_terminal_deps=deferred_terminal_deps,
                 ):
                     continue
                 await self.update_task(
@@ -4700,6 +4708,7 @@ class Scheduler:
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -4783,6 +4792,7 @@ class Scheduler:
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=deferred_terminal_deps,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -5812,7 +5822,12 @@ class Scheduler:
         deferred ids are simply "needed" again next tick (they're never
         negatively cached, and any id fetched this tick is cached and so
         never recompetes for a future tick's budget), so this is fail-safe
-        deferral, not silent dropping.
+        deferral, not silent dropping. A deferred dep with no cached record
+        is named in ``ctx.deferred_terminal_deps``, and its dependents wait
+        (UNKNOWN on the scheduled-deploy arm) rather than fail open: after a
+        restart the cold cache needs ceil(terminal deps / budget) ticks to
+        warm, and a held self-deploy sorting late would otherwise release
+        its dependents on every one of them.
 
         Budget priority: a held scheduled-deploy re-validation goes first
         of all, since only a fresh read can release its hold (a deferred
@@ -5918,6 +5933,7 @@ class Scheduler:
                 _total = len(_ordered)
                 _deferred = set(_ordered[_budget:])
                 _ordered = _ordered[:_budget]
+                ctx.deferred_terminal_deps = frozenset(_deferred.intersection(_new_to_fetch))
                 logger.warning(
                     'acquire_next: terminal dep record backfill has %d '
                     'dep(s) to fetch this tick (%d held, %d new, %d '
@@ -6036,6 +6052,7 @@ class Scheduler:
             external_resolver_failed=ctx.external_resolver_failed,
             delivered_check_cache=ctx.delivered_check_cache,
             terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         if verdict.state is not DepState.UNSATISFIED:
             return None
@@ -6713,6 +6730,7 @@ class Scheduler:
             external_status_cache=ctx.external_cache,
             external_resolver_failed=ctx.external_resolver_failed,
             terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         return _CONTINUE
 
@@ -6914,6 +6932,7 @@ class Scheduler:
                 external_resolver_failed=ctx.external_resolver_failed,
                 delivered_check_cache=ctx.delivered_check_cache,
                 terminal_dep_records=ctx.terminal_dep_records,
+                deferred_terminal_deps=ctx.deferred_terminal_deps,
             )
             if not eligible:
                 continue
@@ -7289,6 +7308,7 @@ class Scheduler:
             external_resolver_failed=ctx.external_resolver_failed,
             delivered_check_cache=ctx.delivered_check_cache,
             terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         if not eligible:
             return False, None

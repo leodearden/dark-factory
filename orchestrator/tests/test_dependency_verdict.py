@@ -235,6 +235,31 @@ def test_a_done_dependency_without_a_record_does_not_hold(terminal_dep_records):
     assert verdict == SATISFIED
 
 
+def test_a_done_dependency_the_backfill_deferred_before_caching_is_unknown():
+    verdict = deps_verdict(
+        _dependent('D'), {'D': 'done'}, {}, terminal_dep_records={}, deferred_terminal_deps={'D'}
+    )
+    assert verdict == DepsVerdict.unknown(DepKind.SCHEDULED_DEPLOY)
+
+
+@pytest.mark.parametrize(
+    ('phase', 'expected'),
+    [
+        ('scheduled', DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)),
+        ('verified', SATISFIED),
+    ],
+)
+def test_a_deferred_dependency_with_a_record_follows_its_record(phase, expected):
+    verdict = deps_verdict(
+        _dependent('D'),
+        {'D': 'done'},
+        {},
+        terminal_dep_records={'D': _scheduled_dep(phase)},
+        deferred_terminal_deps={'D'},
+    )
+    assert verdict == expected
+
+
 def test_a_done_deploy_that_was_not_scheduled_does_not_hold():
     record = _scheduled_dep('scheduled', provenance_kind='deterministic-deploy')
     verdict = deps_verdict(_dependent('D'), {'D': 'done'}, {}, terminal_dep_records={'D': record})
