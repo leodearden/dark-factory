@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _merged_branch_repo import INCIDENT_BRIEFING, INCIDENT_GUARD, incident_merge
 
 from fused_memory.models.reconciliation import (

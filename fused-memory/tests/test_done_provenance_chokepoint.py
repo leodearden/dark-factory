@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from pydantic import ValidationError
 from shared.task_metadata import DoneProvenance
 

@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 
 from fused_memory.models.reconciliation import Watermark
 from fused_memory.models.scope import ProjectRoot

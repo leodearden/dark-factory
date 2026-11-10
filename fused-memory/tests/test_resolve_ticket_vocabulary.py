@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from _fastmcp_tool_result import tool_result_dict
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _fused_memory_tool_surface import FUSED_MEMORY_TOOL_PREFIX, registered_fused_memory_tools
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend

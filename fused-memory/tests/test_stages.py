@@ -12,13 +12,12 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
+from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
     LoopFreedomProbe,
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
-    init_ab_commit_repo,
-    init_merge_history_repo,
     make_8df8_scenario,
 )
 from _fused_memory_tool_surface import (
