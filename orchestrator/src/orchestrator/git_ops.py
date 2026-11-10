@@ -1019,12 +1019,12 @@ def classify_worktree_entry(name: str) -> WorktreeClass:
         * everything else                => ``'task'`` — the task-id-shaped
           namespace the sweep/reaper may act on.
 
-    WARNING — adoptable warm/spec lanes (``_lane-`` / ``_spec-``) are
-    ``_``-prefixed, so this classifier labels them ``'infra'``.  They are
-    NOT infra: they carry recoverable task work and have their own
-    adopt/release/quarantine handling.  Every caller MUST therefore check
-    ``pool.is_lane()`` (warm AND spec pools) FIRST and only consult this
-    classifier for non-lane entries.
+    WARNING — only ``_lane-`` warm lanes carry recoverable task work, yet
+    they are labelled ``'infra'``: a caller that adopts warm lanes MUST check
+    ``warm_lane_pool.is_lane()`` first.  ``_spec-`` lanes carry none, so
+    ``'infra'`` is right for them (owner: the merge worker's spec pool,
+    PROTECTED_PREFIXES ``'_spec-'``); a caller may still skip them earlier
+    through ``spec_warm_lane_pool.is_lane()``.
 
     Fail-safe direction: a mis-shaped task name is left alone / leaked
     (recoverable by an operator), never destroyed.

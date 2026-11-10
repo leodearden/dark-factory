@@ -4435,22 +4435,15 @@ class Harness:
     async def _recover_worktree_entry(self, entry: Path) -> _WorktreeRecovery:
         """Recover, clean up or skip one surviving worktree directory."""
         pool = self.git_ops.warm_lane_pool
-        spec_pool = self.git_ops.spec_warm_lane_pool
-        # '_spec-' merge-speculation lanes are a SEPARATE pool: they have
-        # no '.task/plan.json' and their dir name is not a live task id,
-        # so without this they would hit the mid-crash cold cleanup branch
-        # and be removed.  Treat them as lanes too — they take the no-plan
-        # branch (no recoverable task identity) and route through
-        # cleanup_worktree, which now releases '_spec-' lanes back to the
-        # spec pool instead of removing them.
-        is_lane = (pool is not None and pool.is_lane(entry)) or (
-            spec_pool is not None and spec_pool.is_lane(entry)
-        )
+        # '_spec-' lanes belong to the merge worker's spec pool, so they fall
+        # to the C2 'infra' skip below and are left to their owner
+        # (orchestrator/tests/test_recovery_spec_lane_hold.py).
+        is_lane = pool is not None and pool.is_lane(entry)
         task_id = entry.name
 
         # ── C2 namespace invariant (task 2925, merge-worktree-lifecycle
         # -integrity PRD §4) ───────────────────────────────────────────
-        # is_lane is checked FIRST above: adoptable warm/spec lanes are
+        # is_lane is checked FIRST above: adoptable warm lanes are
         # `_`-prefixed, so they MUST bypass the classifier (which would
         # label them 'infra') and keep their adopt/release/quarantine
         # handling below.  For every NON-lane entry, the positive-match
@@ -5276,10 +5269,9 @@ class Harness:
         # members of warm_lane_pool, and their names are not live task
         # ids, so they would otherwise fall through to the orphan branch
         # and get moved/removed mid-verify.  Protect them identically.
-        # Checked FIRST — before the C2 classifier below: adoptable
-        # '_lane-'/'_spec-' lanes are '_'-prefixed, so the classifier
-        # would mislabel them 'infra'; is_lane (actual pool registration)
-        # must win.
+        # Checked FIRST — before the C2 classifier below: '_lane-' lanes
+        # are adoptable and '_'-prefixed, so the classifier would mislabel
+        # them 'infra'; '_spec-' lanes are skipped here by their pool too.
         if (
             self.git_ops.warm_lane_pool is not None
             and self.git_ops.warm_lane_pool.is_lane(entry)
