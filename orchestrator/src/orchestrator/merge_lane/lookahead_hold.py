@@ -1,0 +1,46 @@
+"""The merger waits here, before its look-ahead pop, for the verifier's chain decision on the speculative item it just queued.
+
+The decision is the chain tip the item's dispatch built, or None when it built
+no chain. The contract is ``plans/deep-merge-ahead-prd.md`` (dispatch contract).
+"""
+from __future__ import annotations
+
+import asyncio
+
+
+class LookaheadHold:
+    """Pending chain decisions, keyed by the held item's request id."""
+
+    def __init__(self) -> None:
+        self._decisions: dict[str, asyncio.Future[str | None]] = {}
+
+    def hold(self, request_id: str) -> None:
+        """Register a pending decision for *request_id*."""
+        if request_id in self._decisions:
+            raise ValueError(f'look-ahead hold already registered for {request_id}')
+        self._decisions[request_id] = asyncio.get_running_loop().create_future()
+
+    def decide(self, request_id: str, tip: str | None) -> None:
+        """Publish *request_id*'s chain decision; a no-op when nothing holds it."""
+        decision = self._decisions.get(request_id)
+        if decision is not None and not decision.done():
+            decision.set_result(tip)
+
+    def is_held(self, request_id: str) -> bool:
+        return request_id in self._decisions
+
+    def release_all(self) -> None:
+        """Decide None for every pending hold (lane stop)."""
+        for request_id in list(self._decisions):
+            self.decide(request_id, None)
+
+    async def wait(self, request_id: str, *, alive: asyncio.Future) -> str | None:
+        """The decision for *request_id*, or None once *alive* (the verifier) has finished."""
+        decision = self._decisions.get(request_id)
+        if decision is None:
+            return None
+        try:
+            await asyncio.wait({decision, alive}, return_when=asyncio.FIRST_COMPLETED)
+            return decision.result() if decision.done() else None
+        finally:
+            self._decisions.pop(request_id, None)
