@@ -24,10 +24,9 @@ _HINT = (
     'The call was rejected BEFORE the tool ran: nothing was executed, enqueued '
     'or written, so resubmitting is safe. Each argument under `unknown` is not '
     'declared by this tool and would otherwise have been silently ignored. '
-    'Rename it to a name under `declared` (`closest_declared` is the likeliest) '
-    'or remove it. `repaired_call`, when not null, is your complete argument map '
-    'with each unknown argument renamed to its closest declared name: confirm '
-    'each rename is what you meant, then resubmit it.'
+    'Rename it to the declared name you meant, or remove it. `closest_declared` '
+    'is only a spelling guess and can name a parameter with a different meaning, '
+    'so check it against the tool\'s documentation before resubmitting.'
 )
 
 
@@ -51,7 +50,6 @@ def unknown_argument_refusal(
         'unknown': [{'name': name, 'closest_declared': closest[name]} for name in unknown],
         'declared': list(declared),
         'provided': list(arguments),
-        'repaired_call': _repaired_call(arguments, closest),
         'hint': _HINT,
     }
 
@@ -77,17 +75,3 @@ def _closest(name: str, declared: Sequence[str]) -> str | None:
     matches = difflib.get_close_matches(name, declared, n=1)
     return matches[0] if matches else None
 
-
-def _repaired_call(
-    arguments: Mapping[str, Any], closest: Mapping[str, str | None]
-) -> dict[str, Any] | None:
-    """*arguments* with every unknown name renamed, or ``None`` if any rename would lose a value.
-
-    A rename loses a value when there is no close declared name, when the
-    caller already sent that name, or when two unknown names would land on it.
-    """
-    targets = list(closest.values())
-    for target in targets:
-        if target is None or target in arguments or targets.count(target) > 1:
-            return None
-    return {closest.get(name) or name: value for name, value in arguments.items()}

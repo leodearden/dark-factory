@@ -22,18 +22,10 @@ stand-in context. Two further substrate deltas, both measured:
   (``fn_metadata.call_fn_with_arg_validation``), strictly AFTER this
   chokepoint, so a middleware here sees the arguments exactly as sent.
 
-## Why a middleware's verdict RAISES, and why installation order matters
-
-A middleware rejects by raising :class:`fastmcp.exceptions.ToolError`.
-Measured: a rejection returned as a bare dict from this chokepoint is destroyed
-by the output validation of a tool annotated ``-> str`` ("Output validation
-error: 'result' is a required property"); a raised ToolError reaches the caller
-as its text, byte-intact, for every output schema.
-
-So a middleware must be installed AFTER — and therefore OUTSIDE —
-``main._install_safe_tool_wrapper``. That wrapper catches ``BaseException`` and
-would flatten the ToolError into its own ``{'error', 'error_type'}`` dict.
-``main._install_tool_dispatch_guards`` owns the order.
+A middleware rejects by raising :class:`fastmcp.exceptions.ToolError`, and must
+be installed outside ``main._install_safe_tool_wrapper``;
+``fused_memory/server/main.py::_install_tool_dispatch_guards`` owns that order
+and says why.
 
 Being outside that wrapper also puts the middleware's OWN defects beyond its
 containment, so :func:`install_tool_middleware` carries its own: anything but

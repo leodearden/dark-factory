@@ -45,6 +45,10 @@ class UnknownArgumentMiddleware(Middleware):
             return await call_next(context)
         refusal = unknown_argument_refusal(name, list(properties), context.message.arguments or {})
         if refusal is not None:
+            logger.warning(
+                'refused %s: undeclared argument(s) %s',
+                name, {entry['name']: entry['closest_declared'] for entry in refusal['unknown']},
+            )
             raise ToolError(json.dumps(refusal, default=repr))
         return await call_next(context)
 

@@ -66,10 +66,26 @@ async def test_a_misnamed_metadata_is_refused_and_nothing_is_written(server, tas
     assert refusal['code'] == UNKNOWN_ARGUMENT_CODE
     assert refusal['tool'] == 'update_task'
     assert refusal['unknown'] == [{'name': 'metadata_patch', 'closest_declared': 'metadata'}]
-    assert refusal['repaired_call'] == {
-        'id': '7', 'project_root': _PROJECT_ROOT, 'metadata': {'owner': 'x'},
-    }
+    assert 'repaired_call' not in refusal
     task_interceptor.update_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_logged_on_the_server_naming_tool_and_argument(server, caplog):
+    with (
+        caplog.at_level('WARNING', logger='fused_memory.server.unknown_argument_guard'),
+        pytest.raises(ToolError),
+    ):
+        await server._tool_manager.call_tool(
+            'update_task',
+            {'id': '7', 'project_root': _PROJECT_ROOT, 'metadata_patch': {'owner': 'secret-value'}},
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'fused_memory.server.unknown_argument_guard']
+    message = record.getMessage()
+    assert 'update_task' in message
+    assert 'metadata_patch' in message
+    assert 'secret-value' not in message
 
 
 @pytest.mark.asyncio

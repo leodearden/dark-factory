@@ -28,38 +28,17 @@ def test_a_misnamed_argument_is_refused_naming_it_and_its_closest_declared_name(
     assert refusal['unknown'] == [{'name': 'metadata_patch', 'closest_declared': 'metadata'}]
     assert refusal['declared'] == list(_DECLARED)
     assert refusal['provided'] == ['id', 'project_root', 'metadata_patch']
-    assert refusal['repaired_call'] == {'id': '7', 'project_root': '/p', 'metadata': {'k': 'v'}}
+    assert 'repaired_call' not in refusal
     assert 'metadata_patch' in refusal['error']
     assert 'nothing was executed' in refusal['hint']
     json.dumps(refusal)
 
 
-def test_a_name_with_no_close_declared_name_gets_no_repaired_call() -> None:
+def test_a_name_with_no_close_declared_name_has_no_closest_declared() -> None:
     refusal = unknown_argument_refusal('update_task', _DECLARED, {'id': '7', 'zzzzzz': 1})
 
     assert refusal is not None
     assert refusal['unknown'] == [{'name': 'zzzzzz', 'closest_declared': None}]
-    assert refusal['repaired_call'] is None
-
-
-def test_a_rename_onto_a_name_already_sent_gets_no_repaired_call() -> None:
-    arguments = {'id': '7', 'metadata': {'a': 1}, 'metadata_patch': {'b': 2}}
-
-    refusal = unknown_argument_refusal('update_task', _DECLARED, arguments)
-
-    assert refusal is not None
-    assert refusal['unknown'][0]['closest_declared'] == 'metadata'
-    assert refusal['repaired_call'] is None
-
-
-def test_two_unknown_names_landing_on_one_declared_name_get_no_repaired_call() -> None:
-    refusal = unknown_argument_refusal(
-        'update_task', _DECLARED, {'id': '7', 'metadata_patch': 1, 'metadatas': 2},
-    )
-
-    assert refusal is not None
-    assert [entry['closest_declared'] for entry in refusal['unknown']] == ['metadata', 'metadata']
-    assert refusal['repaired_call'] is None
 
 
 def test_the_reader_recovers_the_refused_names_from_the_wire_text() -> None:

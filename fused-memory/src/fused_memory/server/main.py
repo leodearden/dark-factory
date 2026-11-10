@@ -43,9 +43,6 @@ from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
 )
-from fused_memory.server.unknown_argument_guard import (  # noqa: E402
-    install_unknown_argument_guard,
-)
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
@@ -2168,6 +2165,8 @@ def _install_tool_dispatch_guards(
     (INV-1). The recon-report server hosts no write tools and gets no markup
     guard; it gets the other two through :func:`_install_recon_report_guards`.
     """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
     _install_safe_tool_wrapper(mcp)
     install_unknown_argument_guard(mcp)
     install_markup_guard(
@@ -2184,6 +2183,8 @@ def _install_recon_report_guards(mcp: Any) -> None:
     argument there is dropped exactly as on the primary server. Order: see
     :func:`_install_tool_dispatch_guards`.
     """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
     _install_safe_tool_wrapper(mcp)
     install_unknown_argument_guard(mcp)
 
