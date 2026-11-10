@@ -1201,8 +1201,8 @@ def test_retire_entry_sets_status_retained():
 
 
 # ---------------------------------------------------------------------------
-# advance_census_state() -- the six-key census-state (zeta/2579 MUST-persist
-# contract for last_census_done_count; PRD census-incremental §4.2)
+# advance_census_state() -- the five-key census-state (PRD census-incremental
+# §4.2; the done-count baseline is retired with tasks-landed, C7)
 # ---------------------------------------------------------------------------
 
 _STATE_KEYS = [
@@ -1211,7 +1211,6 @@ _STATE_KEYS = [
     "last_census_report",
     "last_census_as_of_sha",
     "session_watermark",
-    "last_census_done_count",
 ]
 
 
@@ -1222,13 +1221,12 @@ def _advance(path, **overrides):
         report_path="plans/confusion-census-2026-07-14.md",
         as_of_sha="a" * 40,
         session_watermark="2026-07-14T00:00:00+00:00",
-        done_count=42,
     )
     kwargs.update(overrides)
     mod.advance_census_state(path, **kwargs)
 
 
-def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
+def test_advance_census_state_writes_exactly_the_five_keys_in_order(tmp_path):
     path = tmp_path / "census-state.json"
 
     _advance(path)
@@ -1241,7 +1239,6 @@ def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
         "last_census_report": "plans/confusion-census-2026-07-14.md",
         "last_census_as_of_sha": "a" * 40,
         "session_watermark": "2026-07-14T00:00:00+00:00",
-        "last_census_done_count": 42,
     }
 
 
@@ -3154,10 +3151,11 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     )
     assert rejected_candidate["disposition"] == "rejected", "rejected candidate RETAINED, marked"
 
-    # --- census state advanced with status_fetcher's done-count baseline ---
+    # --- census state advanced, with no done-count baseline: the
+    # status_fetcher feeds only the outcomes ---
     assert kwargs["census_state_path"].exists()
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert state["last_census_done_count"] == 3
+    assert "last_census_done_count" not in state
 
     # --- report written to the plans/ path ---
     assert kwargs["report_path"].exists()
@@ -4497,14 +4495,9 @@ def test_main_done_line_names_skipped_deletions_only_when_there_were_some(
 
 
 # ---------------------------------------------------------------------------
-# task 3291: run_census() must never persist a FABRICATED done-count baseline.
-#
-# This is the test that would have caught the 2026-07-24 regression on the day
-# it happened. The get_statuses call went out with a relative path (the
-# pre-task-3269 --project-root default); fused-memory rejected it with a
-# {"error", "error_type"} envelope on an isError:false response; and the old
-# `(status.get("statuses") or {})` idiom silently read that as a done-count
-# of 0 and persisted it as a real baseline.
+# A get_statuses read that fails, in either shape task 3291 met live (the
+# tool-error envelope on an isError:false response, and an unreachable
+# server), costs run_census() its outcome feed only.
 # ---------------------------------------------------------------------------
 
 def _make_error_envelope_status_fetcher():
@@ -4534,16 +4527,12 @@ def _make_raising_status_fetcher():
     [_make_error_envelope_status_fetcher, _make_raising_status_fetcher],
     ids=["tool-error-envelope", "raising-fetcher"],
 )
-def test_run_census_unobservable_done_count_persists_null_not_zero(
+def test_run_census_advances_census_state_when_the_status_fetch_fails(
     tmp_path, caplog, make_fetcher
 ):
-    """An unobservable done-count degrades the BASELINE only -- it must not
-    abandon a run whose mining has already been paid for and whose dated
-    report is already on disk.
-
-    Before task 3291 the envelope case silently persisted 0, and the raising
-    case crashed run_census AFTER the report write, leaving the codebook and
-    census state unadvanced."""
+    """An unusable get_statuses snapshot costs the outcome feed only: a run
+    whose mining is paid for and whose report is on disk still completes,
+    and the census state it advances carries no done-count baseline."""
     batch = [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
@@ -4565,32 +4554,17 @@ def test_run_census_unobservable_done_count_persists_null_not_zero(
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
 
-    # --- the census still COMPLETES; only the baseline degrades ---
     assert outcome.status == "done"
     assert kwargs["report_path"].exists(), "the paid-for report must survive"
-    assert kwargs["codebook_path"].exists(), "codebook must still be dumped"
     assert len(fake_commit.calls) == 1, "the run must still commit"
 
-    # --- the baseline is an honest null, NOT a fabricated 0 ---
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert "last_census_done_count" in state, "MUST-persist contract still holds"
-    assert state["last_census_done_count"] is None
-    assert state["last_census_done_count"] != 0, "a fabricated 0 is the defect being fixed"
-
-    # --- the degradation is LOUD: exactly one warning naming the failure ---
-    fetch_warnings = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and "done-count" in r.getMessage()
-    ]
-    assert len(fetch_warnings) == 1, "degrading silently is what caused the incident"
-
-    # --- round-trip: condition (b) is fail-SAFE, not always-armed ---
-    status, data = census_trigger.load_census_state(kwargs["census_state_path"])
-    assert status == "ok"
-    assert census_trigger.compute_tasks_landed(
-        state=data,
-        status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
-    ) is None
+    assert list(state) == _STATE_KEYS
+    assert "last_census_done_count" not in state
+    assert not any(
+        r.levelno == logging.WARNING and "done-count unobservable" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10491,14 +10465,14 @@ def test_run_census_never_reverifies_an_entry_already_fixed(tmp_path):
     assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", "abcdef1")
 
 
-def test_run_census_reads_get_statuses_once_and_feeds_both_outcomes_and_the_done_count(tmp_path):
+def test_run_census_reads_get_statuses_once_and_feeds_the_outcomes(tmp_path):
     kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "done", "77": "done", "78": "pending"})
 
     mod.run_census(**kwargs)
 
     assert len(kwargs["status_fetcher"].calls) == 1
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert state["last_census_done_count"] == 2
+    assert "last_census_done_count" not in state
     assert _persisted_entry_a(kwargs)["status"] == "fixed"
 
 
@@ -10518,11 +10492,12 @@ def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
     assert _reverify_calls(kwargs["verify_fn"]) == []
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
     assert any("fused-memory down" in line and not line.startswith("|") for line in section.splitlines())
-    done_count_warnings = [
-        r for r in caplog.records if r.levelno == logging.WARNING and "done-count" in r.getMessage()
-    ]
-    assert len(done_count_warnings) == 1
-    assert json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))["last_census_done_count"] is None
+    assert not any(
+        r.levelno == logging.WARNING and "done-count" in r.getMessage() for r in caplog.records
+    )
+    assert "last_census_done_count" not in json.loads(
+        kwargs["census_state_path"].read_text(encoding="utf-8")
+    )
 
 
 def test_run_census_method_and_cost_note_count_the_reverify(tmp_path):

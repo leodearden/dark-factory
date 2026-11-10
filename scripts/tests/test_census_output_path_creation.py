@@ -236,7 +236,6 @@ def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
         report_path="plans/confusion-census-2026-08-03.md",
         as_of_sha="a" * 40,
         session_watermark=None,
-        done_count=7,
     )
 
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
@@ -245,5 +244,4 @@ def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
         "last_census_report": "plans/confusion-census-2026-08-03.md",
         "last_census_as_of_sha": "a" * 40,
         "session_watermark": None,
-        "last_census_done_count": 7,
     }
