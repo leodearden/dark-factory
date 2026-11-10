@@ -182,12 +182,14 @@ def _worker_constants() -> tuple[int, str]:
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
-    Constructed with five narrow accessor callables — ``git_ops``,
+    Constructed with six narrow accessor callables — ``git_ops``,
     ``lane_buffers``, ``frozen_requests``, ``frozen_prefix_tip``,
-    ``retire_item`` — instead of a worker reference, so the tracker is fully
-    unit-testable without a :class:`SpeculativeMergeWorker`.  ``retire_item``
-    is required: a request diverted out of its lane must leave the caller's
-    lifecycle registry too.  All five are captured as callables (not
+    ``retire_item``, ``is_reserved`` — instead of a worker reference, so the
+    tracker is fully unit-testable without a :class:`SpeculativeMergeWorker`.
+    ``retire_item`` is required: a request diverted out of its lane must leave
+    the caller's lifecycle registry too. ``is_reserved`` names the requests a
+    deep chain holds for its tip verify, which the bounce leaves alone.  All
+    six are captured as callables (not
     their values, and not a bound-method snapshot) so the tracker always
     re-reads the caller's live state at call time, including a
     :class:`~orchestrator.git_ops.GitOps` reassigned on the caller *after*
@@ -213,8 +215,10 @@ class SuffixConflictTracker:
         frozen_requests: Callable[[], tuple[MergeRequest, ...]],
         frozen_prefix_tip: Callable[[str], str],
         retire_item: Callable[[str], None],
+        is_reserved: Callable[[str], bool],
     ) -> None:
         self._git_ops = git_ops
+        self._is_reserved = is_reserved
         self._lane_buffers = lane_buffers
         self._frozen_requests = frozen_requests
         self._frozen_prefix_tip = frozen_prefix_tip
@@ -538,7 +542,7 @@ class SuffixConflictTracker:
         For each request_id in ``graph.conflicts_with_main``:
 
         1. Skip :class:`GroupMergeRequest` items (trains keep their existing
-           TRAIN_REBASE_CONFLICT path).
+           TRAIN_REBASE_CONFLICT path), and requests a deep chain reserves.
         2. Emit a structured ``needs_rebase`` log line.
         3. Bump the bounce registry; if the count exceeds :data:`MERGE_BOUNCE_CAP`
            → escalate via :meth:`_escalate` (ordinal-bearing reason) WITHOUT
@@ -607,6 +611,10 @@ class SuffixConflictTracker:
             lane, req = found
             if isinstance(req, GroupMergeRequest):
                 continue  # trains keep their own TRAIN_REBASE_CONFLICT path
+            if self._is_reserved(rid):
+                # A deep chain's link (task 7720): its tree is under a tip
+                # verify, and the walk lands its built merge commit, not its branch.
+                continue
 
             branch = req.branch.bare_id
             logger.info(

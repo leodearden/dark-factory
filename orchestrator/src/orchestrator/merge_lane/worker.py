@@ -78,6 +78,7 @@ from orchestrator.main_health_fix_owner import (
     build_main_fix_task_arguments,
     ensure_main_fix_owner,
 )
+from orchestrator.merge_lane.chain_reservation import ChainReservations
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
 from orchestrator.merge_lane.dead_base_ledger import (
     DeadBaseKiller,
@@ -8556,6 +8557,11 @@ class SpeculativeMergeWorker:
         # Cleared by the merger before each wait; never cancelled.
         self._resume_signal = asyncio.Event()
         self._halt_state = HaltState(MERGE_LANES, on_resume=self._resume_signal.set)
+        # The lane-buffered requests each deep chain holds for its tip verify
+        # (task 7720); a release wakes the merger, since links became pickable.
+        self._chain_reservations = ChainReservations(
+            monotonic=lambda: self._clock.monotonic(), on_release=self._resume_signal.set,
+        )
         # The lane buffers, the redispatch park and the suffix-conflict state.
         # Every port re-reads the live worker attribute on each call.
         self._intake = MergeIntake(
@@ -8584,6 +8590,7 @@ class SpeculativeMergeWorker:
             assert_merger_owns=lambda structure: self._assert_single_writer(
                 self._merger_task, structure,
             ),
+            is_reserved=self._chain_reservations.holds,
         )
         # Persistent queue.get() future — kept alive across iterations to
         # avoid the lost-item hazard of cancelling an in-flight get().
