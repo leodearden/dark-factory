@@ -931,7 +931,8 @@ def _integration_collection_lease(request):
 
     The reaper is loaded LAZILY here rather than at conftest import time, so
     a session that never runs an integration test does not pay for it — the
-    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.  Via ``load_script_module`` — do not add another local
+    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.
+    Via ``load_script_module`` — do not add another local
     ``spec_from_file_location`` loader (tasks 3738/3895).
     """
     if request.node.get_closest_marker('integration') is None:
