@@ -950,6 +950,7 @@ def _store_quality(
         project_id_for_root(root), sampled_at, cursor_sha=rows[-1].landing.merge_sha,
         landings_sampled=len(rows), landings_deferred=0, git_check=git_check,
     )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
     client.portal.call(write_quality_db, app.state.config.quality_db, rows, [sample])
 
 
