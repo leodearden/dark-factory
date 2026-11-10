@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2339,7 +2340,7 @@ async def _sample_one_minute_ticket(
     config,
     *,
     now: datetime,
-    cap_events: list[tuple[str, str, datetime, dict | None]],
+    cap_events: Sequence[tuple[str, str, datetime, dict | None]],
     account_count: int,
 ) -> dict:
     """Run _sample_curator over real runs.db/tickets.db files.
