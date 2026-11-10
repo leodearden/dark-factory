@@ -445,6 +445,10 @@ class StallEpisode:
         return tuple(killed)
 
 
+class OffsetlessTimestampError(ValueError):
+    """A capture line leads with a timestamp that carries no UTC offset."""
+
+
 def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
     """Pair every journal line with the timestamp it leads with, in order.
 
@@ -456,14 +460,22 @@ def timestamped_lines(journal_text: str) -> list[tuple[dt.datetime, str]]:
     safe only because the caller can still tell a capture that parsed from
     one that did not: an all-unparseable input yields an empty list, which
     the CLI reports as a loud failure rather than as "no episodes".
+
+    A timestamp WITHOUT an offset raises :class:`OffsetlessTimestampError`
+    instead. No short-iso capture prints one, and it cannot be ordered against
+    an offset-bearing time such as FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT.
     """
     parsed = []
-    for line in journal_text.splitlines():
+    for number, line in enumerate(journal_text.splitlines(), start=1):
         leading, _, _ = line.partition(" ")
         try:
             timestamp = dt.datetime.fromisoformat(leading)
         except ValueError:
             continue
+        if timestamp.utcoffset() is None:
+            raise OffsetlessTimestampError(
+                f"line {number} leads with a timestamp that carries no UTC offset: {line!r}"
+            )
         parsed.append((timestamp, line))
     return parsed
 
@@ -689,7 +701,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     journal_text = sys.stdin.read()
-    if not timestamped_lines(journal_text):
+    try:
+        parsed = timestamped_lines(journal_text)
+    except OffsetlessTimestampError as error:
+        print(f"{error}. Capture with `{CAPTURE_COMMAND}`.", file=sys.stderr)
+        return 2
+    if not parsed:
         print(
             "no journal lines parsed: every line lacked a leading short-iso timestamp. "
             f"Capture with `{CAPTURE_COMMAND}` — "

@@ -37,6 +37,9 @@ SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL changes only the separation.
 DELIBERATE_STOP_WITH_SOCKET_JOURNAL and REOPENED_SOCKET_THEN_RESTART_JOURNAL
 also carry INVENTED fused-memory.socket lines, because the retained journal
 holds no entry for that unit.
+
+OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL is UNIT_LEFT_DOWN_JOURNAL with its UTC
+offsets stripped, a form no `-o short-iso` capture prints.
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from fm_wedge_forensics import (
     DEFAULT_STALL_THRESHOLD_SECONDS,
     analyze,
@@ -225,6 +229,10 @@ UNIT_LEFT_DOWN_JOURNAL = """\
 2026-09-16T15:11:06+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T15:11:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
+
+# A hand-edited capture: nothing orders these timestamps against the
+# socket-activation cutover or against an offset-bearing line.
+OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL = UNIT_LEFT_DOWN_JOURNAL.replace("+01:00 ", " ")
 
 # ASSEMBLED, not captured: the real 2026-11-08 restart job, with its Starting
 # and Started pushed out 4 minutes so the silence registers; only the
@@ -499,6 +507,13 @@ def test_a_reopened_socket_supersedes_an_earlier_close():
     assert episodes[0].stall_seconds == 240.0
     assert episodes[0].outcome == "unit-down"
     assert episodes[0].watchdog_verdict is None
+
+
+def test_a_timestamp_without_a_utc_offset_is_rejected_where_it_is_parsed():
+    """Rejected by analyze() itself, rather than surfacing later as a TypeError
+    from whichever property first compares it with an offset-bearing time."""
+    with pytest.raises(ValueError, match="UTC offset"):
+        analyze(OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL)
 
 
 # ---------------------------------------------------------------------------
@@ -875,3 +890,12 @@ def test_cli_empty_stdin_also_fails_loudly():
     result = _run_cli("")
 
     assert result.returncode != 0
+
+
+def test_cli_rejects_timestamps_without_a_utc_offset_with_the_capture_to_take():
+    result = _run_cli(OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "UTC offset" in result.stderr
+    assert "-o short-iso" in result.stderr
+    assert "Traceback" not in result.stderr
