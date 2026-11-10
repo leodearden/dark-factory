@@ -24,6 +24,7 @@ __all__ = [
     'UnrecognisedTrainEvent',
     'landings',
     'parse_utc',
+    'recorded_landing_keys',
 ]
 
 
@@ -233,6 +234,17 @@ def _recorded_history(conn: sqlite3.Connection) -> list[_Recorded]:
     for recorded in sorted(found, key=lambda r: (r.landed, r.event_id)):
         earliest.setdefault((recorded.merge_sha, recorded.task_id), recorded)
     return sorted(_mark_late_claims(list(earliest.values())), key=lambda r: r.order)
+
+
+def recorded_landing_keys(
+    runs_db: sqlite3.Connection, *, recorded_after: datetime | None,
+) -> frozenset[tuple[str, str]]:
+    """(merge_sha, task_id) of each landing recorded after *recorded_after*; reads runs.db, never git."""
+    return frozenset(
+        (recorded.merge_sha, recorded.task_id)
+        for recorded in _recorded_history(runs_db)
+        if recorded_after is None or recorded.landed > recorded_after
+    )
 
 
 def _mark_late_claims(records: list[_Recorded]) -> list[_Recorded]:

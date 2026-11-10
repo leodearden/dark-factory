@@ -15,6 +15,8 @@ import {
   escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  qualityMetric,
+  qualityPayload,
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
@@ -137,4 +139,33 @@ test("an /escalations payload's counts and views agree with the served ones for 
     assert.deepEqual(builtPart.summary, servedPart.summary, `${where}.summary`);
     assert.deepEqual(viewValues(builtPart.views), viewValues(servedPart.views), `${where}.views`);
   }
+});
+
+test('a QUALITY series, a measured and a no-producer metric included, is built only with keys /quality serves', () => {
+  const served = payload('quality_fresh').QUALITY;
+  const measured = qualityMetric({
+    kind: 'rate',
+    points: [0, 1, 0],
+    headlineForm: 'rate',
+    ewma: { line: [0.2, 0.25, 0.22], ucl: [0.4, 0.4, 0.4] },
+  });
+  const unproduced = qualityMetric({ kind: 'count', points: [null, null, null], measuredSince: null });
+  const built = qualityPayload({
+    axis: [{}, { git_first_parent: false }, { late_claim: true }],
+    metrics: { rejected: measured, reverts: unproduced },
+  });
+  const servedMetrics = served.value.metrics;
+
+  assertSameKeys(wireDatum(null), served, 'the QUALITY Datum');
+  assertBuiltKeysServed(built, served.value, 'QUALITY.value');
+  assertSameKeys(built, served.value, 'QUALITY.value');
+  assertSameKeys(built.axis[0], served.value.axis[0], 'QUALITY.value.axis[0]');
+  for (const [id, metric] of Object.entries(built.metrics)) {
+    assertSameKeys(metric, servedMetrics[id], `QUALITY.value.metrics.${id}`);
+    assertSameKeys(metric.rule, servedMetrics[id].rule, `QUALITY.value.metrics.${id}.rule`);
+    assertSameKeys(metric.headline, servedMetrics[id].headline, `QUALITY.value.metrics.${id}.headline`);
+  }
+  assertSameKeys(measured.headline.value, servedMetrics.rejected.headline.value, 'a measured headline value');
+  assert.equal(servedMetrics.reverts.rule.measured_since, null, 'this check expects reverts to have no producer');
+  assert.equal(unproduced.headline.state, servedMetrics.reverts.headline.state);
 });

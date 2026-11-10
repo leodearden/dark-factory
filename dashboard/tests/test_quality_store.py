@@ -25,10 +25,12 @@ from shared.quality_series.rows import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.quality_store import (
+    NewestSamples,
     QualitySample,
     SampleState,
     _require_every_field_coded,
     insert_sample,
+    newest_samples,
     read_landing_rows,
     read_samples,
     stored_cursor,
@@ -339,3 +341,66 @@ def test_a_sample_whose_state_disagrees_with_its_fields_is_refused() -> None:
 def test_a_sample_time_without_an_offset_is_refused() -> None:
     with pytest.raises(ValueError, match=r'ts=datetime\.datetime\(2026, 11, 2, 9, 0\)'):
         QualitySample.gap('p', T0.replace(tzinfo=None), 'boom')
+
+
+def _value_sample(project_id: str, ts: datetime, cursor_sha: str = 'sha') -> QualitySample:
+    return QualitySample.value(
+        project_id, ts, cursor_sha=cursor_sha, landings_sampled=1, landings_deferred=0,
+        git_check=GitCrossCheck(off_first_parent=0, merges_without_landing=0, late_claims=0),
+    )
+
+
+async def _insert_samples(conn: aiosqlite.Connection, samples: list[QualitySample]) -> None:
+    for sample in samples:
+        await insert_sample(conn, sample)
+    await conn.commit()
+
+
+async def test_newest_samples_of_an_empty_store_are_none(conn: aiosqlite.Connection) -> None:
+    assert await newest_samples(conn, 'p') == NewestSamples(latest=None, latest_value=None)
+
+
+async def test_newest_samples_name_the_newest_sample_and_the_newest_value(
+    conn: aiosqlite.Connection,
+) -> None:
+    older_value = _value_sample('p', T0, 'older')
+    value = _value_sample('p', T0 + timedelta(minutes=10), 'newer')
+    gap = QualitySample.gap('p', T0 + timedelta(minutes=20), 'OperationalError: database is locked')
+    await _insert_samples(conn, [gap, older_value, value])
+
+    assert await newest_samples(conn, 'p') == NewestSamples(latest=gap, latest_value=value)
+
+
+async def test_newest_samples_with_only_gaps_have_no_value(conn: aiosqlite.Connection) -> None:
+    first = QualitySample.gap('p', T0, 'GitUnavailable: not a git repository')
+    second = QualitySample.gap('p', T0 + timedelta(minutes=10), 'GitTimeout: rev-list')
+    await _insert_samples(conn, [first, second])
+
+    assert await newest_samples(conn, 'p') == NewestSamples(latest=second, latest_value=None)
+
+
+async def test_newest_samples_never_read_another_projects_samples(
+    conn: aiosqlite.Connection,
+) -> None:
+    own = _value_sample('p', T0)
+    await _insert_samples(conn, [
+        own,
+        _value_sample('q', T0 + timedelta(hours=1)),
+        QualitySample.gap('q', T0 + timedelta(hours=2), 'not this project'),
+    ])
+
+    assert await newest_samples(conn, 'p') == NewestSamples(latest=own, latest_value=own)
+    assert await newest_samples(conn, 'r') == NewestSamples(latest=None, latest_value=None)
+
+
+async def test_newest_samples_break_a_tie_on_ts_by_insertion_like_read_samples(
+    conn: aiosqlite.Connection,
+) -> None:
+    first = _value_sample('p', T0, 'first')
+    second = _value_sample('p', T0, 'second')
+    await _insert_samples(conn, [first, second])
+
+    newest = await newest_samples(conn, 'p')
+
+    assert newest == NewestSamples(latest=second, latest_value=second)
+    assert (await read_samples(conn, 'p'))[-1] == newest.latest
