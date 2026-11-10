@@ -1,9 +1,6 @@
 """Contract of the ``allow_mcp_markup`` override lifecycle in shared.toolcall_markup (task 3689).
 
-Contract C2 of ``plans/toolcall-markup-containment-prd.md``. The lifecycle was
-promoted from ``fused_memory.server.markup_tripwire`` so the middleware's
-boundary row B6 preserves its semantics by REUSING the code that defines them
-rather than re-implementing it (INV-5).
+Contract C2 of ``plans/toolcall-markup-containment-prd.md``.
 """
 from __future__ import annotations
 
