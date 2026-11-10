@@ -465,7 +465,7 @@ class TestCompositeScore:
         assert composite['point'] == round(judge['rate'] * stage1['rate'], 4)
         assert composite['range'] == [round(judge['ci'][0] * stage1['ci'][0], 4),
                                       round(judge['ci'][1] * stage1['ci'][1], 4)]
-        assert 'product of two frames' in composite['label']
+        assert composite['label'] == mod.COMPOSITE_RECALL_LABEL
         assert composite['judge_recall'] == {'rate': judge['rate'], 'ci': judge['ci']}
 
     def test_without_a_judge_eval_there_is_no_composite_recall(self, tmp_path: Path) -> None:
