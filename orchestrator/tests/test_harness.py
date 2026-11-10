@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wait_responsive
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
@@ -528,7 +529,10 @@ class TestHarnessMergeVerifySurvivorBarrierWiring:
                 await harness._start_merge_worker()
                 # Must NOT raise despite the barrier raising.
                 await harness._launch_merge_worker_loop()
-                await asyncio.wait_for(worker_started.wait(), timeout=5)
+                await wait_responsive(
+                    worker_started.wait(),
+                    label='the merge-worker loop launches despite a failing barrier',
+                )
 
             reap_mock.assert_awaited_once()
         finally:

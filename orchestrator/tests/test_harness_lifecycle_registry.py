@@ -33,6 +33,7 @@ import pytest
 from _escalation_server_capture import create_server_kwargs
 from _git_fixtures import seed_repo
 from _merge_lane_fakes import branch_merge_request, lane_scene_config
+from _orch_helpers import wait_responsive
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -564,7 +565,9 @@ class TestMergeWorkerLaunchedAfterStartup:
         h._recover_crashed_tasks = recover_crashed_tasks
 
         async def first_acquire() -> None:
-            await asyncio.wait_for(loop.entered.wait(), 5)
+            await wait_responsive(
+                loop.entered.wait(), label='the merge-worker loop is entered before the first acquire',
+            )
             raise RuntimeError('__stop_sentinel__')
 
         h.scheduler.acquire_next = AsyncMock(side_effect=first_acquire)
