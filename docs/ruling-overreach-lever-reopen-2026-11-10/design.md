@@ -228,6 +228,25 @@ O6, a stronger extraction model, is costed here and not adjudicated:
 Measuring O6 later is `replay --model <name>` into its own file, then a blind
 adjudication of the same 48 episodes. It needs no new code.
 
+**Post-registration correction (2026-11-10, after review).** This paragraph
+was added after §1–§2 were committed and after the W1 replay ran. The
+registered text of §2.1 and §2.7 above is left as it was. Three things were
+wrong with it:
+
+1. The `--model` flag that §2.1 and §2.7 describe recorded a model on each
+   replay record, but the arm's own model field was never read.
+2. A model replayed into its own file could not be blinded together with the
+   control, and `lever_decision` could not judge it against the control,
+   because the decision compares arms within one replay.
+3. The model is now part of the arm. `ARMS['o6']` is the control's
+   instructions on `replay_overreach_extraction.py::O6_MODEL`, and the
+   `--model` flag is gone. O6 is measured as `replay --arm control --arm o6`
+   into one file (§5).
+
+W1 is unaffected. Control and o1 both ran with no model override, on the
+configured gpt-4o-mini: `provenance.json` `runs[0].argv` has no `--model`, and
+`r.arms.control.model` and `r.arms.o1.model` are both gpt-4o-mini.
+
 ---
 
 *§3 onward were written after adjudication. `r.` abbreviates `report.json`
@@ -397,12 +416,17 @@ discount, at about 670 class episodes/day (2026-10-01 §10.2):
   Reasoning tokens are billed as output (`LIST_PRICES` docstring), so the
   real figure may be higher. The O6 replay measures it.
 
-**How to measure it.** No new code is needed (§2.7). Run
-`replay_overreach_extraction.py replay --arm control --model gpt-6.1-sol`
-into its own file, about $0.80 at list price for 48 episodes. Emit its
-worksheet, adjudicate it blind under the 2026-10-01 §2.6 rubric, and run
-`score`. Then compare its `arms.control` against this `r.arms.control` with
-the §2.4 checks.
+**How to measure it.** One run on the same 48 episodes. It needs no new
+code, because O6 is an arm: `ARMS['o6']`, the control's instructions on
+`replay_overreach_extraction.py::O6_MODEL` (§2.7's correction).
+
+1. `replay_overreach_extraction.py replay --arm control --arm o6 --out <new file>`.
+   The control is a fresh gpt-4o-mini replay, about $0.06 at list price from
+   the per-episode cost above. The o6 replay is about $0.80.
+2. `worksheet`, which interleaves both arms' edges blind.
+3. Adjudicate every edge in ONE sitting under the 2026-10-01 §2.6 rubric.
+4. `score`. Its `comparison.o6` is the §2.4 decision against the control
+   from that same run and sitting.
 
 ## 6. W4: the lever
 
@@ -413,7 +437,7 @@ the §2.4 checks.
 | **O1** `custom_extraction_instructions` | 0 calls; +11% input and +27% output tokens on the two extraction calls, about $0.13/day | ×0.59 per minted, ×0.72 per day (§3.2), concentrated in one episode | none (holdings/day ×1.25), but entity extraction rewritten (73% name overlap) | **measured, FAILS** §2.4 |
 | **O3+O4** shadow judge plus Stage-1 retirement | 1 judge call per class episode (running since 2026-10-24) plus Stage 1's existing budget | retires 9.48 overreach/day in df+reify at 0.937 precision. Composite recall about 0.05 | 0.32 holdings/day | **measured, PASSES** §2.6 |
 | **O3 enforce** the judge's own marker | as O3 | judge precision 0.267 offline (2026-10-01 §10.1) and 0.463 live (§4) | would hide at least one non-overreach edge for every overreach edge it hides | **withdrawn**: neither precision is near 0.80 |
-| **O6** stronger extraction model for the class | about +$10.41/day at list (§5) | unmeasured | unmeasured | **costed**, measurable with no new code |
+| **O6** stronger extraction model for the class | about +$10.41/day at list (§5) | unmeasured | unmeasured | **costed**, measurable as arm `o6`, no new code |
 | O2 typed edges, O5 authoring lint | as 2026-10-01 §6 | 0 by construction | — | unchanged, not levers |
 
 ### 6.2 Recommendation, staged, with trigger and revisit clauses
@@ -432,16 +456,26 @@ cannot pass at the precision measured on either frame.
     shadow to enforce is **withdrawn**: no marker is written and no read site
     filters on one.
   * Sidecar retention may proceed (§9).
-* **Trigger clause, from R to R+O6.** It fires when an O6 replay passes the
-  §2.4 checks against this report's control. The run is
-  `replay_overreach_extraction.py replay --arm control --model gpt-6.1-sol`
-  on the same 48 episodes, adjudicated blind under the 2026-10-01 §2.6
-  rubric, then `score`. Its `arms.control` is compared with this
-  `r.arms.control`, and all three checks must hold:
-  1. population-weighted overreach ≤ 0.5 × 0.1355 per minted AND
-     ≤ 0.5 × 12.7 per day;
-  2. its Wilson upper bound per minted < 0.1355;
-  3. holdings/day ≥ 0.8 × 34.9.
+* **Trigger clause, from R to R+O6.** It fires when the O6 measurement's
+  `comparison.o6.passes` is true. The run is
+  `replay_overreach_extraction.py replay --arm control --arm o6` on the same
+  48 episodes, into one file. One `worksheet` interleaves both arms blind,
+  every edge is adjudicated in one sitting under the 2026-10-01 §2.6 rubric,
+  and then `score` runs (§5). `comparison.o6.passes` is §2.4's three checks,
+  computed by `lever_decision` with `OVERREACH_RATIO_MAX` and
+  `HOLDING_RETENTION_MIN`. The comparison is against the control replayed in
+  the same run and labelled in the same blind sitting, and all three must
+  hold:
+  1. population-weighted overreach ≤ 0.5 × the control's, per minted AND per
+     day;
+  2. its Wilson upper bound per minted < the control's point estimate;
+  3. holdings/day ≥ 0.8 × the control's.
+
+  The clause does not use fixed numbers from this report's control, because a
+  cross-sitting comparison would give up the pairing and blinding that §2.2
+  and §2.4 rely on. That run's `arms.control` is reported beside this
+  `r.arms.control` (0.1355 per minted, 12.7 overreach/day, 34.9
+  holdings/day), as a stability reading only.
 
   If all three hold, file one task to route the class's `extract_nodes` and
   `extract_edges` calls to gpt-6.1-sol. That task is `always_escalates`: the
@@ -504,23 +538,35 @@ measurement before it could be a lever.
   recall (2026-08/09 window) by a live Stage-1 recall (2026-10/11 window). It
   is an order of magnitude, not an estimator.
 * **O6's cost uses gpt-4o-mini's token counts.** See §5.
+* **O6 is sent temperature 0.0.** graphiti_core 0.28.2's
+  `llm_client/openai_client.py` treats only model names starting with
+  `gpt-5`, `o1` or `o3` as reasoning models, and drops `temperature` only for
+  those. The default `llm.client_class: openai` builds that client, so
+  gpt-6.1-sol is sent temperature 0.0 (`cfg.llm.temperature or 0.0`). This
+  was read from source, not run. If the API refuses it, the o6 replay records
+  failure lines and exits 1, and the measuring task escalates rather than
+  patching graphiti.
 
 ## 8. Build leaves filed
 
-Filed through `submit_task` with `spawned_from: 9040`, one per area. Each
-id is a curator ticket, not a task id. This file is authoritative over each
-ticket's copy of §6.2.
+Filed through `submit_task` with `spawned_from: 9040`, one per area. The
+curator turned ticket `tkt_0RWTVN4F9A2APEFBN010V3RTVG` into task 9065 (B1)
+and ticket `tkt_0RWTVNXGVV14Q5XZ58CCKFH24X` into task 9066 (B2). Both tasks
+depend on 9040. The architect wired that on 2026-11-10, because both scripts
+exist only on this branch until it merges. This file is authoritative over
+each task's copy of §6.2.
 
-* **B1, the O6 replay measurement** (area: the replay instrument, no code
-  change expected). It runs §6.2's trigger: the gpt-6.1-sol control replay,
-  its blind adjudication and score, and the three checks against
-  `r.arms.control`. On a pass it files the `always_escalates` routing task.
-  Priority medium: `tkt_0RWTVN4F9A2APEFBN010V3RTVG`.
-* **B2, the composite revisit gate** (area: the composite instrument). It runs
-  §6.2's revisit clause on its schedule: a pre-registered fresh composite
-  window, blind adjudication, score, and the two pull-back conditions.
-  Priority low, with a `dated` milestone at 2027-02-08T00:00:00+00:00:
-  `tkt_0RWTVNXGVV14Q5XZ58CCKFH24X`.
+* **B1, task 9065, the O6 replay measurement** (area: the replay instrument,
+  no code change expected). It runs §6.2's trigger:
+  `replay --arm control --arm o6` into one file, one blind worksheet over both
+  arms adjudicated in one sitting, then `score`. The decision is that
+  report's `comparison.o6`. On a pass it files the `always_escalates` routing
+  task. Priority medium.
+* **B2, task 9066, the composite revisit gate** (area: the composite
+  instrument). It runs §6.2's revisit clause on its schedule: a
+  pre-registered fresh composite window, blind adjudication, score, and the
+  two pull-back conditions. Priority low, with a `dated` milestone at
+  2027-02-08T00:00:00+00:00.
 
 ## 9. Sidecar retention (task 7487)
 
