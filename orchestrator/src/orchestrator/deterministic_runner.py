@@ -50,6 +50,7 @@ from orchestrator.before_done_script import (
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
+    SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
     DeployState,
     IllegalDeployTransition,
@@ -552,10 +553,46 @@ def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
     provenance = metadata.get('done_provenance')
     if (
         isinstance(provenance, dict)
-        and provenance.get('kind') == 'deterministic-deploy-scheduled'
+        and provenance.get('kind') == SCHEDULED_DEPLOY_PROVENANCE_KIND
     ):
         return True
     return bool(metadata.get('before_done_scheduled_at'))
+
+
+def file_illegal_deploy_transition(
+    escalation_queue: EscalationQueue, task_id: str, old: DeployPhase, new: DeployPhase,
+) -> None:
+    """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
+
+    Wired into ``enforce_transition``'s ``escalation_sink`` — files BEFORE
+    ``enforce_transition`` raises ``IllegalDeployTransition``, so an illegal
+    edge is never silently swallowed (D2).  Mirrors the other
+    escalation-filing helpers' construction (sentinel role keeps level=2 past
+    the server downgrade gate) but is unconditional — no dedup guard — since
+    an illegal transition is itself a bug signal that must never be
+    suppressed by an unrelated pending escalation.
+    """
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category='illegal_deploy_transition',
+        summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
+        detail=(
+            f'DeterministicRunner attempted an illegal deploy-phase '
+            f'transition {old!r} -> {new!r} for task {task_id}. This '
+            'indicates a runner bug or corrupted deploy_state metadata — '
+            'investigate before resuming.'
+        ),
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.error(
+        'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
+        '%s for task %s (%s -> %s)',
+        esc.id, task_id, old, new,
+    )
 
 
 def build_milestone_gate_escalation_fields(
@@ -1406,38 +1443,8 @@ class DeterministicRunner:
     def _deploy_transition_escalation_sink(
         self, task_id: str, old: DeployPhase, new: DeployPhase,
     ) -> None:
-        """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
-
-        Wired into every ``_advance_deploy_phase`` call via
-        ``enforce_transition``'s ``escalation_sink`` — files BEFORE
-        ``enforce_transition`` raises ``IllegalDeployTransition``, so an
-        illegal edge is never silently swallowed (D2).  Mirrors the other
-        escalation-filing helpers' construction (sentinel role keeps level=2
-        past the server downgrade gate) but is unconditional — no dedup
-        guard — since an illegal transition is itself a bug signal that must
-        never be suppressed by an unrelated pending escalation.
-        """
-        esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=DETERMINISTIC_AGENT_ROLE,
-            severity='critical',
-            category='illegal_deploy_transition',
-            summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
-            detail=(
-                f'DeterministicRunner attempted an illegal deploy-phase '
-                f'transition {old!r} -> {new!r} for task {task_id}. This '
-                'indicates a runner bug or corrupted deploy_state metadata — '
-                'investigate before resuming.'
-            ),
-            level=2,
-        )
-        self.escalation_queue.submit(esc)
-        logger.error(
-            'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
-            '%s for task %s (%s -> %s)',
-            esc.id, task_id, old, new,
-        )
+        """DS-2 sink for every ``_advance_deploy_phase``: see :func:`file_illegal_deploy_transition`."""
+        file_illegal_deploy_transition(self.escalation_queue, task_id, old, new)
 
     def _compute_deploy_phase_advance(
         self,
@@ -3141,7 +3148,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=_sched.get('transient_unit', ''),
                                 fire_delay_secs=_sched.get('fire_delay_secs', 0),
@@ -3525,7 +3532,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=transient_unit,
                                 fire_delay_secs=on_active_secs,
