@@ -497,8 +497,7 @@ def create_server(
                 verdict: One of "PASS" or "ISSUES_FOUND".
                 issues: Structured list of issues found (empty if PASS).
                 summary: One-paragraph summary of the review.
-                note_dispositions: One entry per id listed in the briefing's
-                    "Implementer notes (open info escalations)" block, each
+                note_dispositions: One entry per info note your briefing lists, each
                     {escalation_id, disposition: "addressed" | "no_action" |
                     "work", rationale}. Omit it when the briefing lists no
                     notes. A malformed list is rejected (status: error)

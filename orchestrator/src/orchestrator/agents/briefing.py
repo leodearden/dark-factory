@@ -58,23 +58,46 @@ DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
 
 
-def _open_info_notes_section(notes: Sequence[Escalation], detail_chars: int) -> str:
-    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2)."""
-    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in notes)
+OPEN_INFO_NOTES_HEADING = '# Implementer notes (open info escalations)'
+"""The heading of the reviewer's notes block; the reviewer contract in roles.py names it."""
+
+OPEN_INFO_NOTES_LIMIT = 20
+"""Max notes one reviewer briefing lists, the most recent kept; the rest stay pending for the exit router."""
+
+
+def _open_info_notes_section(
+    notes: Sequence[Escalation], *, reviewer_type: str, detail_chars: int,
+) -> str:
+    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2).
+
+    It closes on the verdict call with ``note_dispositions``, so the last call
+    the reviewer is shown names the field.
+    """
+    by_age = sorted(notes, key=lambda note: note.timestamp or '')
+    listed = by_age[-OPEN_INFO_NOTES_LIMIT:]
+    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in listed)
+    unlisted = len(by_age) - len(listed)
+    overflow = (
+        f'{unlisted} older note(s) are not listed; they stay pending for the exit router.\n\n'
+        if unlisted else ''
+    )
     return f"""\
-# Implementer notes (open info escalations)
+{OPEN_INFO_NOTES_HEADING}
 
-These info notes were filed against this task while it was worked. Disposition
-every id below in `submit_review_verdict`'s `note_dispositions`, each as
-`addressed`, `no_action` or `work` as your contract defines them.
+These info notes were filed against this task while it was worked.
 
-{entries}"""
+{entries}
+{overflow}Disposition every id above as `addressed`, `no_action` or `work`, as your
+contract defines them, in the `note_dispositions` of your verdict call:
+`submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=..., note_dispositions=[...])`
+"""
 
 
 def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
-    detail = note.detail[:detail_chars]
+    full_detail = note.detail or ''
+    detail = full_detail[:detail_chars]
     quoted = '\n'.join(f'> {line}' for line in detail.splitlines()) or '> (none)'
-    if len(note.detail) > detail_chars:
+    if len(full_detail) > detail_chars:
         quoted += f'\n[detail truncated at {detail_chars} characters]'
     return f"""\
 ## {note.id}
@@ -89,9 +112,9 @@ def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
 """
 
 
-def _one_line(text: str) -> str:
-    """*text* with its line breaks collapsed, so a field cannot start a heading of its own."""
-    return ' '.join(text.split())
+def _one_line(text: str | None) -> str:
+    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
+    return ' '.join((text or '').split())
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -1360,12 +1383,8 @@ This task holds locks for the following modules:
 
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
-        if open_info_notes:
-            prompt += '\n' + _open_info_notes_section(
-                open_info_notes, self.config.info_l0_note_detail_chars,
-            )
 
-        return prompt
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
@@ -1388,11 +1407,18 @@ This task holds locks for the following modules:
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
         )
-        if open_info_notes:
-            prompt += '\n' + _open_info_notes_section(
-                open_info_notes, self.config.info_l0_note_detail_chars,
-            )
-        return prompt
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
+
+    def _with_open_info_notes(
+        self, prompt: str, reviewer_type: str, notes: Sequence[Escalation] | None,
+    ) -> str:
+        """*prompt* with the reviewer's notes block appended; no notes leave it byte-identical."""
+        if not notes:
+            return prompt
+        return prompt + '\n' + _open_info_notes_section(
+            notes, reviewer_type=reviewer_type,
+            detail_chars=self.config.info_l0_note_detail_chars,
+        )
 
     async def build_completion_judge_prompt(
         self,

@@ -13,6 +13,7 @@ from shared.followup_items import (
 from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
@@ -1112,7 +1113,7 @@ Call `submit_review_verdict` with these fields:
   `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
 - **note_dispositions**: one object per id listed under
-  `# Implementer notes (open info escalations)` in your briefing, each with
+  `{notes_heading}` in your briefing, each with
   `escalation_id`, `disposition` and a one-sentence `rationale`. The
   `disposition` is `"addressed"` (the change on this branch fixes what the
   note describes, and you verified it), `"no_action"` (a pure observation,
@@ -1227,7 +1228,9 @@ def build_reviewer_prompt_spec(
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
         contract=(
-            _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
+            _REVIEWER_CONTRACT_TEMPLATE.format(
+                name=name, specialization=specialization, notes_heading=OPEN_INFO_NOTES_HEADING,
+            )
             + REVIEWER_INV12_BLOCKERS
         ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(

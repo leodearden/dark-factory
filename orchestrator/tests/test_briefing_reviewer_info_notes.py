@@ -14,8 +14,14 @@ from _briefing_helpers import briefing as briefing
 from escalation.disposition import ReviewerDisposition
 from escalation.models import Escalation
 
-from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.review_briefing import ChangedFile, ReviewChange, ReviewSubject
+from orchestrator.agents.briefing import OPEN_INFO_NOTES_LIMIT, BriefingAssembler
+from orchestrator.agents.review_briefing import (
+    ChangedFile,
+    ReviewBriefing,
+    ReviewChange,
+    ReviewSubject,
+)
+from orchestrator.agents.roles import build_reviewer_prompt_spec
 
 REVIEWER = 'reviewer_comprehensive'
 NOTES_HEADING = '# Implementer notes (open info escalations)'
@@ -147,6 +153,37 @@ class TestNotesBlock:
         _assert_lists_every_note(prompt)
         assert prompt.index(AMENDMENT_HEADING) < prompt.index(NOTES_HEADING)
 
+    async def test_the_last_verdict_call_the_reviewer_is_shown_names_note_dispositions(
+        self, briefing, build,
+    ):
+        prompt = await build(briefing, amendment_suggestions=SUGGESTIONS, open_info_notes=NOTES)
+
+        last_call = prompt[prompt.rindex('submit_review_verdict('):].splitlines()[0]
+        assert last_call.startswith(f'submit_review_verdict(reviewer="{REVIEWER}"')
+        assert 'note_dispositions=' in last_call
+
+    async def test_a_legacy_null_field_renders_as_empty(self, briefing, build):
+        legacy = Escalation.from_dict({
+            'id': 'esc-42-1', 'task_id': '42', 'agent_role': None, 'severity': 'info',
+            'category': 'design_concern', 'summary': None, 'detail': None,
+            'suggested_action': None,
+        })
+
+        entry = _entry(_notes_block(await build(briefing, open_info_notes=[legacy])), 'esc-42-1')
+
+        for line in ('- filed by: ', '- summary: ', '- suggested action: (none)', '> (none)'):
+            assert line in entry, line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('generation', list(ReviewBriefing))
+async def test_the_reviewer_contract_names_the_heading_the_block_opens_with(briefing, generation):
+    heading = _notes_block(await _diff_only(briefing, open_info_notes=NOTES)).splitlines()[0]
+
+    contract = build_reviewer_prompt_spec('comprehensive', 'everything', generation).contract
+
+    assert f'`{heading}`' in contract
+
 
 @pytest.mark.asyncio
 class TestNoteDetailCap:
@@ -168,3 +205,30 @@ class TestNoteDetailCap:
 
         assert detail in prompt
         assert '[detail truncated' not in prompt
+
+
+def _listed_ids(block: str) -> list[str]:
+    return [line.removeprefix('## ') for line in block.splitlines() if line.startswith('## ')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('build', BUILDERS)
+class TestNoteCountCap:
+    async def test_only_the_most_recent_notes_are_listed_and_the_rest_are_counted(
+        self, briefing, build,
+    ):
+        notes = [
+            _note(f'esc-42-{n}', timestamp=f'2026-10-29T12:{n:02d}:00+00:00')
+            for n in range(OPEN_INFO_NOTES_LIMIT + 3)
+        ]
+
+        block = _notes_block(await build(briefing, open_info_notes=list(reversed(notes))))
+
+        assert _listed_ids(block) == [note.id for note in notes[3:]]
+        assert '3 older note(s) are not listed' in block
+
+    async def test_notes_within_the_cap_are_all_listed_and_none_counted(self, briefing, build):
+        block = _notes_block(await build(briefing, open_info_notes=NOTES))
+
+        assert sorted(_listed_ids(block)) == sorted(note.id for note in NOTES)
+        assert 'not listed' not in block
