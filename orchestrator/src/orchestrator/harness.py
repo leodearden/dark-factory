@@ -184,6 +184,7 @@ from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
+from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
     Scheduler,
     SchedulerCallbacks,
@@ -2251,6 +2252,9 @@ class Harness:
         # constructor-injected unit_inspector); None uses the module-level
         # default _recon_inspect_unit.  Injected in tests to avoid real systemd.
         self._recon_unit_inspector: Callable[[str], Awaitable[dict]] | None = None
+        # One Harness is built per orchestrator process, so this is this
+        # incarnation's start: the scheduled-deploy settler's restart evidence.
+        self._process_started_at = datetime.now(UTC)
 
         # No-landings circuit-breaker — θ=1893, PRD §5.5.
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
@@ -2600,6 +2604,14 @@ class Harness:
                 stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
                 max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
             ))
+            registry.register(BackgroundService(
+                name='scheduled-deploy-settle',
+                pass_fn=self._run_scheduled_deploy_settle_pass,
+                interval_secs=self.config.deterministic_recon_sweep_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
         if self.config.warm_lane_gc_enabled:
             registry.register(BackgroundService(
                 name='warm-lane-gc',
@@ -2943,6 +2955,7 @@ class Harness:
                 StartupStep('2e', self._reap_orphan_worktrees),
                 StartupStep('diff7', self._reconcile_terminal_lanes),
                 StartupStep('2f', self._prewarm_warm_lane_pool),
+                StartupStep('2g', self._run_scheduled_deploy_settle_pass),
             )
             outcomes = await self._run_startup_steps(service_steps, journal)
 
@@ -16539,6 +16552,32 @@ class Harness:
             esc.id, esc.task_id, subject_status,
         )
         return True
+
+    async def _run_scheduled_deploy_settle_pass(self) -> None:
+        """Advance every scheduled self-deploy whose restart can now be judged.
+
+        All logic lives in ``orchestrator/src/orchestrator/scheduled_deploy_settle.py``.
+        Without an escalation queue the fire-time failure evidence is
+        unreadable, so the pass never verifies blind.  Never raises: it runs on
+        the startup path.
+        """
+        if self._escalation_queue is None:
+            logger.warning(
+                'scheduled-deploy settle: no escalation queue — pass skipped, so every '
+                'scheduled self-deploy keeps holding its dependents',
+            )
+            return
+        settler = ScheduledDeploySettler(
+            store=self.scheduler,
+            lookup=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
+            escalation_queue=self._escalation_queue,
+            process_started_at=self._process_started_at,
+            unit_inspector=self._recon_unit_inspector or _recon_inspect_unit,
+        )
+        try:
+            await settler.settle_pass()
+        except Exception:
+            logger.error('scheduled-deploy settle: pass failed', exc_info=True)
 
     async def _run_deterministic_recon_sweep(self) -> None:
         """Single testable pass of the deterministic-strand reconciliation sweep.

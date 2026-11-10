@@ -151,7 +151,7 @@ marked `done` on the strength of an unverified claim.
 | `merged` | Landed via the normal merge queue | `commit` required |
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
-| `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
+| `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run`; dependents wait until the restart is verified (see `docs/deterministic-runner.md` §2) | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
@@ -806,7 +806,7 @@ from it.
 | `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
 | `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
 | `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
-| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps |
+| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps. It also bounds the scheduler's per-tick fetch of terminal dep records, which the scheduled self-deploy hold reads too (`docs/deterministic-runner.md` §2), so lowering it slows that hold's cold-cache warm-up |
 
 **Manual re-pend recipe:** exactly like the external-dep gate, a dependent
 blocked by this escalation is **not auto-re-pended**. Once the underlying

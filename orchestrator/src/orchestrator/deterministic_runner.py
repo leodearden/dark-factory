@@ -50,6 +50,7 @@ from orchestrator.before_done_script import (
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
+    SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
     DeployState,
     IllegalDeployTransition,
@@ -194,6 +195,14 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # same task_id (e.g. a starvation-watchdog filing) must never alias as this
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
+# The category the scheduled self-restart transient's RP-4 wrapper files a
+# fire-time failure under; the scheduled-deploy settler reads it as failure
+# evidence (orchestrator/src/orchestrator/scheduled_deploy_settle.py).
+SELF_RESTART_FAILURE_CATEGORY: str = 'infra_issue'
+
+# The actor named in this runner's own filings and their log lines.
+_RUNNER_ACTOR = 'DeterministicRunner'
 
 # Task 2803 (γ, PRD plans/operational-ask-routing-prd.md): stable, fixed
 # token emitted on a pure-gate born-at-L2 escalation's summary/detail when
@@ -552,10 +561,93 @@ def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
     provenance = metadata.get('done_provenance')
     if (
         isinstance(provenance, dict)
-        and provenance.get('kind') == 'deterministic-deploy-scheduled'
+        and provenance.get('kind') == SCHEDULED_DEPLOY_PROVENANCE_KIND
     ):
         return True
     return bool(metadata.get('before_done_scheduled_at'))
+
+
+def file_illegal_deploy_transition(
+    escalation_queue: EscalationQueue,
+    task_id: str,
+    old: DeployPhase,
+    new: DeployPhase,
+    *,
+    actor: str,
+) -> None:
+    """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge *actor* attempted.
+
+    Wired into ``enforce_transition``'s ``escalation_sink`` — files BEFORE
+    ``enforce_transition`` raises ``IllegalDeployTransition``, so an illegal
+    edge is never silently swallowed (D2).  Mirrors the other
+    escalation-filing helpers' construction (sentinel role keeps level=2 past
+    the server downgrade gate) but is unconditional — no dedup guard — since
+    an illegal transition is itself a bug signal that must never be
+    suppressed by an unrelated pending escalation.
+    """
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category='illegal_deploy_transition',
+        summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
+        detail=(
+            f'{actor} attempted an illegal deploy-phase '
+            f'transition {old!r} -> {new!r} for task {task_id}. This '
+            f'indicates a bug in {actor} or corrupted deploy_state metadata — '
+            'investigate before resuming.'
+        ),
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.error(
+        '%s: filed L2 illegal_deploy_transition escalation '
+        '%s for task %s (%s -> %s)',
+        actor, esc.id, task_id, old, new,
+    )
+
+
+def file_deterministic_escalation(
+    escalation_queue: EscalationQueue,
+    task_id: str,
+    *,
+    actor: str,
+    summary: str,
+    detail: str,
+    category: str = 'infra_issue',
+) -> str | None:
+    """File a born-at-L2 escalation unless one of ours is pending; its id, or None when skipped.
+
+    *actor* names the filer in the log lines.  Dedup rationale:
+    ``DeterministicRunner._file_infra_issue_and_block``.
+    """
+    existing_pending = escalation_queue.get_by_task(
+        task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+    )
+    if existing_pending:
+        logger.info(
+            '%s: task %s already has %d pending escalation(s) — '
+            'skipping re-file (%s dedup guard)',
+            actor, task_id, len(existing_pending), category,
+        )
+        return None
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category=category,
+        summary=summary[:200],
+        detail=detail,
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.info(
+        '%s: filed L2 %s escalation %s for task %s',
+        actor, category, esc.id, task_id,
+    )
+    return esc.id
 
 
 def build_milestone_gate_escalation_fields(
@@ -881,7 +973,7 @@ class DeterministicRunner:
                 f'journalctl --user -u {transient_unit}'
             ),
             severity='critical',
-            category='infra_issue',
+            category=SELF_RESTART_FAILURE_CATEGORY,
             agent_role=DETERMINISTIC_AGENT_ROLE,
         )
 
@@ -1111,31 +1203,10 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        file_deterministic_escalation(
+            self.escalation_queue, task_id,
+            actor=_RUNNER_ACTOR, summary=summary, detail=detail, category=category,
         )
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (%s dedup guard)',
-                task_id, len(existing_pending), category,
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=DETERMINISTIC_AGENT_ROLE,
-                severity='critical',
-                category=category,
-                summary=summary[:200],
-                detail=detail,
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 %s escalation %s for task %s',
-                category, esc.id, task_id,
-            )
 
         if metadata is not None and metadata.get('before_done') is not None:
             _current_deploy_state = DeployState.from_metadata(metadata)
@@ -1406,38 +1477,8 @@ class DeterministicRunner:
     def _deploy_transition_escalation_sink(
         self, task_id: str, old: DeployPhase, new: DeployPhase,
     ) -> None:
-        """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
-
-        Wired into every ``_advance_deploy_phase`` call via
-        ``enforce_transition``'s ``escalation_sink`` — files BEFORE
-        ``enforce_transition`` raises ``IllegalDeployTransition``, so an
-        illegal edge is never silently swallowed (D2).  Mirrors the other
-        escalation-filing helpers' construction (sentinel role keeps level=2
-        past the server downgrade gate) but is unconditional — no dedup
-        guard — since an illegal transition is itself a bug signal that must
-        never be suppressed by an unrelated pending escalation.
-        """
-        esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=DETERMINISTIC_AGENT_ROLE,
-            severity='critical',
-            category='illegal_deploy_transition',
-            summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
-            detail=(
-                f'DeterministicRunner attempted an illegal deploy-phase '
-                f'transition {old!r} -> {new!r} for task {task_id}. This '
-                'indicates a runner bug or corrupted deploy_state metadata — '
-                'investigate before resuming.'
-            ),
-            level=2,
-        )
-        self.escalation_queue.submit(esc)
-        logger.error(
-            'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
-            '%s for task %s (%s -> %s)',
-            esc.id, task_id, old, new,
-        )
+        """DS-2 sink for every ``_advance_deploy_phase``: see :func:`file_illegal_deploy_transition`."""
+        file_illegal_deploy_transition(self.escalation_queue, task_id, old, new, actor=_RUNNER_ACTOR)
 
     def _compute_deploy_phase_advance(
         self,
@@ -1990,31 +2031,10 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        file_deterministic_escalation(
+            self.escalation_queue, task_id,
+            actor=_RUNNER_ACTOR, summary=summary, detail=detail, category=category,
         )
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (%s dedup guard)',
-                task_id, len(existing_pending), category,
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=DETERMINISTIC_AGENT_ROLE,
-                severity='critical',
-                category=category,
-                summary=summary[:200],
-                detail=detail,
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 %s escalation %s for task %s',
-                category, esc.id, task_id,
-            )
 
         # Stamp gate_escalated_at AFTER successful escalation submit (file-before-stamp
         # ordering, same as _file_milestone_gate_and_block) so a stamp failure re-files
@@ -3141,7 +3161,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=_sched.get('transient_unit', ''),
                                 fire_delay_secs=_sched.get('fire_delay_secs', 0),
@@ -3525,7 +3545,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=transient_unit,
                                 fire_delay_secs=on_active_secs,
