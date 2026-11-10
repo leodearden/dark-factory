@@ -21,10 +21,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
-    falkor_skipif,
     lease_dir_fixture,  # noqa: F401  # debt: task 6997
     load_script_module,
 )

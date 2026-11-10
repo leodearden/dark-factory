@@ -24,7 +24,7 @@ from _falkor_index_live import (
     missing_production_indices,
     scratch_graphs,
 )
-from _fm_helpers import await_index_operational, falkor_skipif
+from _fm_falkor_live import await_index_operational, falkor_skipif
 from _graphiti_fake import FakeGraphitiClient
 
 from fused_memory.backends.graphiti_client import GraphitiBackend

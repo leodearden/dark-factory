@@ -6,7 +6,7 @@ tests/arm_harness/test_live_fork_slot_integration.py``.
 """
 
 import pytest
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.arm_harness.fork_slot import ForkHolder, read_fork_holders

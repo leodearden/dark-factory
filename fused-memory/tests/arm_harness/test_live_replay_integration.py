@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import (
+from _fm_falkor_live import (
     FALKOR_HOST,
     FALKOR_PORT,
     await_index_operational,

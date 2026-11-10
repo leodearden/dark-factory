@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 import pytest
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 from graphiti_core.embedder import EmbedderClient
