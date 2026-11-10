@@ -2859,7 +2859,7 @@ class TestPlanFinalizeMarker:
                 self.completion_called = False
 
             async def build_plan_completion_prompt(
-                self, task, partial_plan, worktree=None, context=None,
+                self, task, partial_plan, worktree=None, context=None, *, rulings=(),
             ) -> str:
                 self.completion_called = True
                 return 'Complete the partial plan'
