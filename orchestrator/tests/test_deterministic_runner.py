@@ -11611,3 +11611,26 @@ class TestCrossUnitDeployCarriesBeforeDoneEnv:
         )
         assert 'A=B' in pending[0].detail
         assert 'environment variable name' in pending[0].detail
+
+
+class TestFileIllegalDeployTransition:
+    """The DS-2 sink is a module-level function, so the scheduled-deploy settler
+    files the same born-at-L2 record as the runner does."""
+
+    def test_files_one_born_at_l2_record_naming_both_phases(self, tmp_path):
+        from orchestrator.deploy_state import DeployPhase
+        from orchestrator.deterministic_runner import (
+            DETERMINISTIC_AGENT_ROLE,
+            file_illegal_deploy_transition,
+        )
+
+        queue = EscalationQueue(tmp_path)
+        file_illegal_deploy_transition(queue, '7238', DeployPhase.SCHEDULED, DeployPhase.DONE)
+
+        [record] = queue.get_by_task('7238')
+        assert record.agent_role == DETERMINISTIC_AGENT_ROLE
+        assert record.level == 2
+        assert record.severity == 'critical'
+        assert record.category == 'illegal_deploy_transition'
+        assert 'scheduled' in record.summary
+        assert 'done' in record.summary
