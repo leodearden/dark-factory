@@ -145,7 +145,7 @@ _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 _KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
 
 # The closed parity vocabulary — every value ``_parity`` can emit, plus the
-# ``storm_collapsed`` state ``_build_eval`` short-circuits to.  PUBLIC on
+# ``storm_collapsed`` state ``_verdict_row_fields`` short-circuits to.  PUBLIC on
 # purpose: it is the single source of truth the dashboard tab (task 3216) and
 # the parity gate (task 3217) should assert against, rather than each
 # hardcoding a subset that rots silently the moment a state is added here.
@@ -361,6 +361,12 @@ def _short_repr(value: Any) -> str:
     if len(text) <= _MAX_DISCARDED_VALUE_REPR:
         return text
     return text[:_MAX_DISCARDED_VALUE_REPR] + '…'
+
+
+def _verdict_identity(metric_id: Any, item: Any) -> str:
+    """How an issue detail names one verdict entry: its metric, then its item when it has one."""
+    named = f'metric {_short_repr(metric_id)}'
+    return named if item is None else f'{named} item {_short_repr(item)}'
 
 
 def _read_limits(
@@ -708,8 +714,8 @@ def _read_verdicts(
                 _issue(
                     issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
                     detail=(
-                        f'metric {_short_repr(metric_id)} item {_short_repr(item)} has more '
-                        'than one verdict entry; the first is used'
+                        f'{_verdict_identity(metric_id, item)} has more than one verdict '
+                        'entry; the first is used'
                     ),
                 )
                 continue
@@ -727,6 +733,7 @@ def _read_verdicts(
                 f'{_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
             ),
         )
+    _name_shared_fingerprints(index, path, issues)
 
     # Run-scoped, which is why it lives beside the entries rather than inside
     # them.  Surfaced only while TRIGGERED — an untriggered block is the
@@ -735,6 +742,35 @@ def _read_verdicts(
     if not isinstance(storm, dict) or not storm.get('triggered'):
         storm = None
     return index, storm
+
+
+def _name_shared_fingerprints(index: _VerdictIndex, path: Path, issues: list[dict[str, Any]]) -> None:
+    """Name every indexed verdict entry whose fingerprint an earlier one already carries.
+
+    A fingerprint names one ``(eval_id, metric_id, item)`` identity and the
+    escalation join is whole-string equality on it, so two entries sharing one
+    would both claim the same escalation.  ``_verdict_row_fields`` links it to
+    the first row that claims it; this makes the sharing itself visible.
+    """
+    holders: dict[str, tuple[str, str, str | None]] = {}
+    for (eval_id, metric_id), items in index.items():
+        for item, entry in items.items():
+            fingerprint = entry.get('fingerprint')
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            holder = holders.setdefault(fingerprint, (eval_id, metric_id, item))
+            if holder == (eval_id, metric_id, item):
+                continue
+            held_eval_id, held_metric_id, held_item = holder
+            _issue(
+                issues, 'duplicate_verdict_fingerprint', eval_id=eval_id, path=path,
+                detail=(
+                    f'{_verdict_identity(metric_id, item)} carries fingerprint {_short_repr(fingerprint)}, '
+                    f'as does {_verdict_identity(held_metric_id, held_item)} in eval '
+                    f'{_short_repr(held_eval_id)}; an escalation carrying it links only whichever '
+                    'of their rows comes first in the payload'
+                ),
+            )
 
 
 def _escalation_projection(escalation: Escalation) -> dict[str, Any]:
@@ -1016,11 +1052,15 @@ def _verdict_row_fields(
     # not then be reported as an escalation nothing accounts for.  The row
     # renders no link; the fingerprint is recorded so
     # ``unmatched_escalations`` can say WHY.
+    #
+    # A fingerprint links at most one row, the first to claim it, so an
+    # escalation keeps exactly one home even when two entries share its
+    # fingerprint (named by ``_name_shared_fingerprints``).
     fingerprint = judged.get('fingerprint')
     matched: Escalation | None = None
     if isinstance(fingerprint, str) and fingerprint:
         if storm is None:
-            matched = escalation_index.get(fingerprint)
+            matched = None if fingerprint in linked_fingerprints else escalation_index.get(fingerprint)
             if matched is not None:
                 linked_fingerprints.add(fingerprint)
         elif fingerprint in escalation_index:
@@ -1049,8 +1089,8 @@ def _verdict_row_fields(
             issues, 'unknown_verdict', eval_id=eval_dir.name,
             path=eval_dir.parent / 'verdicts-current.json',
             detail=(
-                f'metric {_short_repr(metric_id)} has verdict {_short_repr(verdict)}, '
-                'which is outside the M2 vocabulary and has no parity badge'
+                f'{_verdict_identity(metric_id, judged.get("item"))} has verdict '
+                f'{_short_repr(verdict)}, which is outside the M2 vocabulary and has no parity badge'
             ),
         )
 

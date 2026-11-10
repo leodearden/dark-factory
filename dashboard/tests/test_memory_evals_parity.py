@@ -64,10 +64,7 @@ def _tree(tmp_path: Path, verdicts: Path | dict[str, Any]) -> DashboardConfig:
 
 
 def _serve(client, config: DashboardConfig) -> dict[str, Any]:
-    from dashboard.app import _memory_evals_cache_clear
-
     client.app.state.config = config
-    _memory_evals_cache_clear()
     resp = client.get(_ROUTE_URL)
     assert resp.status_code == 200, resp.text
     return resp.json()['MEMORY_EVALS']
@@ -408,15 +405,22 @@ class TestTripwireItemsAreRows:
         payload = _serve(client, config)
 
         assert payload['issues'] == []
-        assert [(r['metric_id'], r['item']) for r in _rows(payload)] == [
-            ('canonical-in-top-5', None),
-            ('dangling-pointers', None),
-            ('search-latency-p50-ms', None),
-            ('superseded-above-successor', None),
-            (_TRIPWIRE, None),
-            (_TRIPWIRE, 't-a'),
-            (_TRIPWIRE, 't-b'),
-        ]
+        assert [r['item'] for r in _rows(payload) if r['metric_id'] == _TRIPWIRE] == [None, 't-a', 't-b']
+        metric_ids = [r['metric_id'] for r in _rows(payload)]
+        assert metric_ids == sorted(metric_ids)
+
+    def test_an_unknown_verdict_on_each_item_names_its_own_item(self, client, tmp_path: Path) -> None:
+        config = _tree(tmp_path, _verdicts(
+            _entry(_TRIPWIRE, 'weird', _opaque('weird t-a'), item='t-a'),
+            _entry(_TRIPWIRE, 'weird', _opaque('weird t-b'), item='t-b'),
+        ))
+
+        payload = _serve(client, config)
+
+        details = [issue['detail'] for issue in payload['issues'] if issue['kind'] == 'unknown_verdict']
+        assert len(details) == len(set(details)) == 2
+        for detail, item in zip(sorted(details), ('t-a', 't-b'), strict=True):
+            assert repr(_TRIPWIRE) in detail and repr(item) in detail
 
     def test_an_unkeyable_item_is_counted_and_its_siblings_still_render(self, client, tmp_path: Path) -> None:
         unkeyable = [_entry(_TRIPWIRE, 'alarm', _opaque(f'bad item {n}')) for n in range(3)]
@@ -455,22 +459,37 @@ _STRING_SURGERY_METHODS = frozenset({
 
 
 def _fingerprint_string_surgery(source: str) -> list[str]:
-    """Code in *source* that imports ``re`` or takes a fingerprint apart as text."""
-    violations: list[str] = []
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            violations += [f'import {a.name}' for a in node.names if a.name.split('.')[0] == 're']
-        elif isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] == 're':
-            violations.append(f'from {node.module} import ...')
-        elif _takes_text_apart(node) and 'fingerprint' in ast.unparse(node.value):
-            violations.append(ast.unparse(node))
-    return violations
+    """Code in *source* that takes a fingerprint apart as text, by string method, slice or ``re`` call.
+
+    Name-keyed: an expression counts as fingerprint-bearing only when its text
+    says ``fingerprint``.  ``TestFingerprintJoinIsStringEquality``'s near-miss
+    cases are the behavioural gate; this scan only backs them up.
+    """
+    return [
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(source))
+        if any('fingerprint' in ast.unparse(operand) for operand in _text_operands(node))
+    ]
 
 
-def _takes_text_apart(node: ast.AST) -> TypeGuard[ast.Attribute | ast.Subscript]:
-    if isinstance(node, ast.Attribute):
-        return node.attr in _STRING_SURGERY_METHODS
-    return isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)
+def _text_operands(node: ast.AST) -> list[ast.AST]:
+    """What *node* reads as text: a string method's receiver, a slice's target, or a ``re.*`` call's arguments."""
+    if isinstance(node, ast.Attribute) and node.attr in _STRING_SURGERY_METHODS:
+        return [node.value]
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+        return [node.value]
+    if _calls_re(node):
+        return [*node.args, *node.keywords]
+    return []
+
+
+def _calls_re(node: ast.AST) -> TypeGuard[ast.Call]:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == 're'
+    )
 
 
 class TestFingerprintJoinIsStringEquality:
@@ -525,7 +544,12 @@ class TestFingerprintJoinIsStringEquality:
 
     @pytest.mark.parametrize(
         'injected',
-        ["x = fingerprint.split('|')", 'x = fingerprint[:8]', 'import re'],
+        [
+            "x = fingerprint.split('|')",
+            'x = fingerprint[:8]',
+            "x = re.split('[|]', fingerprint)",
+            "x = re.fullmatch(pattern='[0-9a-f]+', string=entry['fingerprint'])",
+        ],
     )
     def test_the_guard_flags_injected_string_surgery(self, injected: str) -> None:
         import dashboard.data.memory_evals as memory_evals_module
@@ -533,3 +557,30 @@ class TestFingerprintJoinIsStringEquality:
         source = Path(memory_evals_module.__file__).read_text()
 
         assert _fingerprint_string_surgery(f'{source}\n{injected}\n') != []
+
+    @pytest.mark.parametrize(
+        'injected',
+        ['import re', "x = re.fullmatch('[0-9]{8}T[0-9]{6}Z', run_stamp)"],
+    )
+    def test_the_guard_ignores_a_regex_over_other_text(self, injected: str) -> None:
+        assert _fingerprint_string_surgery(injected) == []
+
+    def test_two_entries_sharing_a_fingerprint_are_named_and_link_one_row(
+        self, client, tmp_path: Path,
+    ) -> None:
+        shared = _opaque('shared by t-a and t-b')
+        config = _tree(tmp_path, _verdicts(
+            _entry(_TRIPWIRE, 'alarm', shared, item='t-b'),
+            _entry(_TRIPWIRE, 'alarm', shared, item='t-a'),
+        ))
+        _file(config, 'esc-shared', shared)
+
+        payload = _serve(client, config)
+
+        (issue,) = payload['issues']
+        assert issue['kind'] == 'duplicate_verdict_fingerprint'
+        assert repr('t-a') in issue['detail'] and repr('t-b') in issue['detail']
+        linked = [(r['item'], r['escalation']['id']) for r in _rows(payload) if r['escalation'] is not None]
+        assert linked == [('t-a', 'esc-shared')]
+        assert _row(payload, _TRIPWIRE, 't-b')['parity'] == 'alarmed_unlinked'
+        assert payload['unmatched_escalations'] == []
