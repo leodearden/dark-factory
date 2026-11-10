@@ -989,6 +989,7 @@ def _committed_pairs() -> tuple[bytes, tuple[dict, ...]]:
 def _assert_each_arm_names_the_prompt_it_measured(wording: types.ModuleType) -> None:
     measured = wording.PROMPTS_WHILE_PSI_SHIPPED  # π2 ran while ψ shipped (task 6530)
     for row in _committed()['arms']:
+        assert row['wording'] in measured, (row['arm'], row['wording'], sorted(measured))
         assert row['system_prompt_sha256'] == _sha(measured[row['wording']]), row['arm']
 
 
