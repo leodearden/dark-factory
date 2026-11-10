@@ -1223,10 +1223,11 @@ class TestMemoryServiceRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_journal_result_summary_is_condensed(self, mock_config):
-        """Journal result_summary must contain only aggregate fields, not 'details'.
+        """Journal result_summary holds the aggregate counts and the two completeness booleans.
 
         The service builds the result internally. This test verifies the journal
-        only receives the condensed aggregate fields (not the full details list).
+        only receives the condensed aggregate counts plus entities_complete and
+        edges_complete, without the details list or the incomplete kinds.
         """
         svc = _make_svc(mock_config)
         # 4 stale entities out of 10 total: 3 rebuilt, 1 skipped_dry_run (force=False)
@@ -1263,7 +1264,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         result_summary = call_kwargs.get('result_summary')
         assert result_summary is not None, 'result_summary must be set on success'
-        # Must contain the five aggregate fields
+        # Must contain the aggregate counts
         assert 'total_entities' in result_summary
         assert 'stale_entities' in result_summary
         assert 'rebuilt' in result_summary
@@ -1281,9 +1282,14 @@ class TestMemoryServiceRebuildEntitySummaries:
         # Must contain 'skipped' aggregate field
         assert 'skipped' in result_summary
         assert result_summary['skipped'] == 0
-        # Key set must be exactly these five aggregate fields — no more, no less
+        # Both reads were COMPLETE_READ, so both verdicts are recorded as True
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is True
+        # Key set must be exactly the aggregate counts plus the two completeness
+        # booleans, without the incomplete kinds — no more, no less
         assert set(result_summary.keys()) == {
-            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors'
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors',
+            'entities_complete', 'edges_complete',
         }
 
 
@@ -3309,6 +3315,28 @@ class TestRebuildReportsReadCompleteness:
         assert result['entities_incomplete_kind'] is None
         assert result['edges_complete'] is False
         assert result['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+
+    @pytest.mark.asyncio
+    async def test_journal_records_both_read_verdicts(self, mock_config):
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        journal = MagicMock()
+        journal.log_write_op = AsyncMock()
+        svc.set_write_journal(journal)
+
+        await svc.rebuild_entity_summaries(project_id='test')
+
+        result_summary = journal.log_write_op.call_args.kwargs['result_summary']
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is False
+        assert 'entities_incomplete_kind' not in result_summary
+        assert 'edges_incomplete_kind' not in result_summary
 
     @pytest.mark.asyncio
     async def test_stale_dry_run_has_no_verdict(self, mock_config):
