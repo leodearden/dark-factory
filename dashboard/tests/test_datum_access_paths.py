@@ -408,14 +408,59 @@ _QUALITY_SOURCE_WORD = re.compile(r'\b(' + '|'.join(sorted(GUARDED_QUALITY_SOURC
 _PRODUCER_PACKAGE = 'shared.quality_series'
 
 
-class _QualityUseFinder(_UseFinder):
-    """Collects each quality source a non-docstring string names, and Loads of imported reads."""
+_PRODUCER_DIR = Path(__file__).resolve().parents[2] / 'shared' / 'src' / 'shared' / 'quality_series'
 
-    def __init__(self, aliases: Mapping[str, str], docstrings: frozenset[int]) -> None:
+
+def _producer_modules() -> frozenset[str]:
+    """The producer package and every module in it, as an import statement names them."""
+    stems = {path.stem for path in _PRODUCER_DIR.glob('*.py')} - {'__init__'}
+    assert {'landings', 'rows'} <= stems, f'the producer modules are not under {_PRODUCER_DIR}'
+    return frozenset({_PRODUCER_PACKAGE, *(f'{_PRODUCER_PACKAGE}.{stem}' for stem in stems)})
+
+
+_PRODUCER_MODULES = _producer_modules()
+
+
+def _in_producer_package(module: str) -> bool:
+    return module == _PRODUCER_PACKAGE or module.startswith(f'{_PRODUCER_PACKAGE}.')
+
+
+def _dotted(node: ast.expr) -> str | None:
+    """``a.b.c`` for a chain of attributes on a name; None for anything else."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return None if base is None else f'{base}.{node.attr}'
+    return None
+
+
+class _QualityUseFinder(_UseFinder):
+    """Collects each quality source a non-docstring string names, and Loads of imported reads,
+    whether imported by name or reached as an attribute of a producer module an import binds."""
+
+    def __init__(
+        self, aliases: Mapping[str, str], bindings: Mapping[str, str], docstrings: frozenset[int],
+    ) -> None:
         super().__init__(aliases)
+        self._bindings = bindings
         self._docstrings = docstrings
 
+    def _module_of(self, node: ast.expr) -> str | None:
+        dotted = _dotted(node)
+        if dotted is None:
+            return None
+        head, _, rest = dotted.partition('.')
+        bound = self._bindings.get(head)
+        if bound is None:
+            return None
+        return f'{bound}.{rest}' if rest else bound
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if (isinstance(node.ctx, ast.Load) and node.attr in GUARDED_QUALITY_READS
+                and self._module_of(node.value) in _PRODUCER_MODULES):
+            self._record(node, node.attr)
+            return
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
@@ -436,20 +481,38 @@ def _docstring_ids(tree: ast.Module) -> frozenset[int]:
     )
 
 
+def _import_bindings(tree: ast.Module) -> dict[str, str]:
+    """Each name an import binds, mapped to the dotted path it names (``import a.b`` binds ``a``)."""
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is None:
+                    head = alias.name.partition('.')[0]
+                    bindings[head] = head
+                else:
+                    bindings[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module is not None and not node.level:
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = f'{node.module}.{alias.name}'
+    return bindings
+
+
 def find_quality_source_uses(source: str) -> list[AccessUse]:
     """Every quality source named in a string constant that is not a docstring (one use per
-    source per constant, whole words only), and every Load of a read imported from the shared
-    producer, under its imported name."""
+    source per constant, whole words only), and every Load of a read the shared producer
+    exports: imported by name (reported under its imported name) or reached as an attribute of
+    a module of the producer package that an import binds."""
     tree = ast.parse(source)
     aliases = {
         alias.asname or alias.name: alias.name
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module is not None
-        and (node.module == _PRODUCER_PACKAGE or node.module.startswith(f'{_PRODUCER_PACKAGE}.'))
+        and _in_producer_package(node.module)
         for alias in node.names
         if alias.name in GUARDED_QUALITY_READS
     }
-    finder = _QualityUseFinder(aliases, _docstring_ids(tree))
+    finder = _QualityUseFinder(aliases, _import_bindings(tree), _docstring_ids(tree))
     finder.visit(tree)
     return finder.uses
 
@@ -536,6 +599,44 @@ def test_a_read_imported_from_the_shared_producer_is_a_use_under_its_name():
         AccessUse(4, 'tick', 'rows_for'),
         AccessUse(4, 'tick', 'landings'),
     ]
+
+
+def test_a_read_reached_through_an_aliased_producer_module_is_a_use():
+    source = (
+        'import shared.quality_series.landings as ql\n'
+        'from shared.quality_series import rows as qr\n'
+        'def tick(c, root):\n'
+        '    keys = ql.recorded_landing_keys(c, recorded_after=None)\n'
+        '    return qr.rows_for(keys, c, root, 1.0)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'recorded_landing_keys'),
+        AccessUse(5, 'tick', 'rows_for'),
+    ]
+
+
+def test_a_read_reached_through_a_dotted_producer_module_path_is_one_use():
+    source = (
+        'import shared.quality_series.landings\n'
+        'from shared import quality_series\n'
+        'def tick(c, root):\n'
+        '    shared.quality_series.landings.recorded_landing_keys(c, recorded_after=None)\n'
+        '    return quality_series.landings.landings(c, root, None)\n'
+    )
+    assert find_quality_source_uses(source) == [
+        AccessUse(4, 'tick', 'recorded_landing_keys'),
+        AccessUse(5, 'tick', 'landings'),
+    ]
+
+
+def test_a_read_named_attribute_of_another_module_is_not_a_use():
+    source = (
+        'import elsewhere.landings as el\n'
+        'from shared.quality_series.landings import GitCrossCheck\n'
+        'def f(c):\n'
+        '    return el.recorded_landing_keys(c), GitCrossCheck.landings\n'
+    )
+    assert find_quality_source_uses(source) == []
 
 
 def test_a_local_or_attribute_named_like_a_read_is_not_a_use():
