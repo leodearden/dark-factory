@@ -115,7 +115,7 @@ DEFAULT_BUDGET_USD = 10.0
 DEFAULT_TIMEOUT_SECS = 2700.0
 DEFAULT_MAX_TURNS = 200
 PERMISSION_MODE = 'dontAsk'
-STREAM_TAIL_CHARS = 2000
+TAIL_CHARS = 2000
 
 DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
 NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
@@ -233,9 +233,10 @@ class TimedOut:
 
 @dataclass(frozen=True)
 class PoolExhausted:
-    """No seat could take the run: every one capped or rejecting its credentials."""
+    """No seat could take the run: every one capped or rejecting its credentials, as the gate held them at the end."""
 
-    reason: str
+    capped: tuple[str, ...]
+    auth_failed: tuple[str, ...]
     earliest_reset: datetime | None
 
 
@@ -322,16 +323,19 @@ async def _invoke_on_pool(gate: UsageGate, *, timeout_secs: float, **invoke_kwar
     process group. ``max_cap_retries`` is one pass over the pool, and a frozen pool raises rather
     than parks. Every gate read happens here, and the gate is shut down on this loop, before it closes.
     """
+    deadline = asyncio.timeout(timeout_secs)
     try:
-        async with asyncio.timeout(timeout_secs):
+        async with deadline:
             return await invoke_with_cap_retry(
                 gate, 'nightly_prepare', max_cap_retries=gate.account_count, park_on_frozen_pool=False,
                 **invoke_kwargs,
             )
     except TimeoutError:
+        if not deadline.expired():
+            raise
         return TimedOut(timeout_secs)
-    except (AllAccountsCappedException, PoolFrozen) as exc:
-        return PoolExhausted(str(exc), gate.soonest_resets_at)
+    except (AllAccountsCappedException, PoolFrozen):
+        return PoolExhausted(gate.capped_account_names, gate.auth_failed_account_names, gate.soonest_resets_at)
     finally:
         await gate.shutdown()
 
@@ -430,7 +434,8 @@ def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
         return EXIT_FAILED
     if isinstance(ending, PoolExhausted):
         reset = ending.earliest_reset.isoformat() if ending.earliest_reset else 'unknown'
-        _log(f'no pool account could take the run: {ending.reason}; earliest reset {reset} ({run_label})')
+        _log(f'no pool account could take the run: capped [{", ".join(ending.capped)}], '
+             f'auth-failed [{", ".join(ending.auth_failed)}]; earliest reset {reset} ({run_label})')
         return EXIT_FAILED
     if not ending.success:
         _log(f'claude failed (subtype={ending.subtype!r}, api_error_status={ending.api_error_status!r}, '
@@ -447,8 +452,8 @@ def _judge(ending: Ending, settings: Settings, outcome: Outcome) -> int:
 
 
 def _tails(result: AgentResult) -> str:
-    return (f'stdout={result.output[-STREAM_TAIL_CHARS:]!r} '
-            f'stderr={result.stderr[-STREAM_TAIL_CHARS:]!r}')
+    return (f'result={result.output[-TAIL_CHARS:]!r} '
+            f'stderr={result.stderr[-TAIL_CHARS:]!r}')
 
 
 def _log(message: str) -> None:

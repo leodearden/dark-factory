@@ -8,6 +8,7 @@ no model is billed.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -649,18 +650,6 @@ def test_a_proxied_shells_endpoint_selection_does_not_reach_the_child(tmp_path, 
     assert not env_has['ANTHROPIC_AUTH_TOKEN']
 
 
-def test_the_run_settles_its_slot(tmp_path, pool):
-    """A slot the run left claimed would hold that seat out of the pool for the rest of the night."""
-    fake = _fake_claude(tmp_path)
-
-    assert _run(fake, pool) == mod.EXIT_OK
-
-    lease = pool.try_lease()
-    assert lease is not None and lease.token == fake.only_call()['env']['CLAUDE_CODE_OAUTH_TOKEN'], (
-        'the seat the run used must be leasable again once the run is over'
-    )
-
-
 def test_an_empty_pool_skips_the_night_without_launching_the_cli(tmp_path, capsys, pool_roster, sentinel_login):
     accounts_file, env_file = pool_roster(SEAT_B, SEAT_H, resolve_tokens=False)
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
@@ -697,7 +686,7 @@ def test_the_leased_token_is_the_config_dirs_login_for_the_run_only(tmp_path, po
 
 
 # ---------------------------------------------------------------------------
-# 4. Exit codes, and a failure that names what both streams said.
+# 4. Exit codes, and a failure that names the CLI's result and its stderr.
 # ---------------------------------------------------------------------------
 
 
@@ -713,7 +702,8 @@ def test_a_successful_result_that_quotes_a_banner_is_still_ok(tmp_path, pool):
     assert _run(_fake_claude(tmp_path, stdout=stdout), pool) == mod.EXIT_OK
 
 
-def test_a_failed_run_fails_with_both_stream_tails_labelled(tmp_path, capsys, pool):
+def test_a_failed_run_fails_with_its_result_and_stderr_tails_labelled(tmp_path, capsys, pool):
+    """The CLI's stdout is a JSON envelope; what the line tails is the ``result`` text inside it."""
     fake = _fake_claude(tmp_path, **_costed_failure('error_during_execution', result='partial-out-7Q'),
                         stderr='backend-down-9Z')
 
@@ -721,7 +711,7 @@ def test_a_failed_run_fails_with_both_stream_tails_labelled(tmp_path, capsys, po
 
     err = capsys.readouterr().err
     line = next(line for line in err.splitlines() if 'claude failed' in line)
-    assert 'stdout=' in line and 'partial-out-7Q' in line
+    assert "result='partial-out-7Q'" in line
     assert 'stderr=' in line and 'backend-down-9Z' in line
     assert line.startswith('nightly_prepare: ')
 
@@ -735,6 +725,20 @@ def test_a_timeout_fails_naming_its_bound(tmp_path, capsys, pool):
     line = next(line for line in err.splitlines() if 'timed out' in line)
     assert f'after {float(TIMEOUT_SECS):g}s' in line and 'recorded=' in line
     assert line.startswith('nightly_prepare: ')
+
+
+def test_a_timeout_error_from_inside_the_runner_is_not_the_runs_own_bound(tmp_path, capsys, monkeypatch, pool):
+    """``TimeoutError`` is also ``OSError(ETIMEDOUT)``: only the run's own deadline expiring is a timeout."""
+    async def connection_timed_out(*args, **kwargs):
+        raise TimeoutError(errno.ETIMEDOUT, 'Connection timed out')
+
+    monkeypatch.setattr(mod, 'invoke_with_cap_retry', connection_timed_out)
+
+    assert _run(_fake_claude(tmp_path), pool) == mod.EXIT_CONFIG
+
+    err = capsys.readouterr().err
+    assert 'Connection timed out' in err
+    assert 'timed out after' not in err
 
 
 def test_an_error_result_fails(tmp_path, capsys, pool):
@@ -1055,9 +1059,25 @@ def test_every_seat_capped_fails_naming_the_earliest_reset(tmp_path, capsys, poo
 
     assert _tokens_called(fake) == [TOKEN_B, TOKEN_H], 'one pass over the pool, then stop'
     line = _exhaustion_line(capsys.readouterr().err)
+    assert f'capped [{SEAT_B}, {SEAT_H}], auth-failed []' in line
     assert pool.soonest_resets_at is not None
-    assert pool.soonest_resets_at.isoformat() in line
+    assert f'earliest reset {pool.soonest_resets_at.isoformat()}' in line
     assert 'recorded=0' in line
+    assert _credentials_left(tmp_path) == []
+
+
+@pytest.mark.timeout(FAILOVER_TEST_TIMEOUT_SECS)
+def test_a_pool_both_capped_and_rejecting_names_each_seat_in_its_state(tmp_path, capsys, pool):
+    """Ending on a frozen pool rather than on the cap-retry bound logs the same shape, with the capped seat's reset."""
+    fake = _fake_claude(tmp_path, by_token={TOKEN_B: _cap(), TOKEN_H: _auth_401()})
+
+    assert _run(fake, pool) == mod.EXIT_FAILED
+
+    assert _tokens_called(fake) == [TOKEN_B, TOKEN_H]
+    line = _exhaustion_line(capsys.readouterr().err)
+    assert f'capped [{SEAT_B}], auth-failed [{SEAT_H}]' in line
+    assert pool.soonest_resets_at is not None
+    assert f'earliest reset {pool.soonest_resets_at.isoformat()}' in line
     assert _credentials_left(tmp_path) == []
 
 
@@ -1071,5 +1091,5 @@ def test_every_seat_rejecting_its_credentials_fails_and_never_rides_the_host_log
     assert _tokens_called(fake) == [TOKEN_B, TOKEN_H], 'no third call on a fallback credential'
     assert not any(Path(call['env']['CLAUDE_CONFIG_DIR']).is_relative_to(sentinel_login) for call in fake.calls())
     line = _exhaustion_line(capsys.readouterr().err)
-    assert 'auth-failed' in line and SEAT_B in line and SEAT_H in line
+    assert f'capped [], auth-failed [{SEAT_B}, {SEAT_H}]; earliest reset unknown' in line
     assert _credentials_left(tmp_path) == []

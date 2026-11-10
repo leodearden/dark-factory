@@ -3770,15 +3770,21 @@ systemctl --user list-timers return-brief.timer
 
 - `prepare=1` means the Fable run was skipped (no pool account resolved),
   failed, timed out, found no seat that could take it, or recorded nothing.
-  A failed run's log line carries both stream tails. A run no seat could
-  take logs `no pool account could take the run: <reason>; earliest reset
-  <ts>`, where the reason names the capped and the auth-failed seats. A run
-  that recorded nothing logs the counts of what the inbox offered and could
-  not decode. That is routine, not an incident:
+  A failed run's log line carries the tail of the CLI's `result` text and
+  of its stderr. A run no seat could take logs `no pool account could take
+  the run: capped [<seats>], auth-failed [<seats>]; earliest reset <ts>`.
+  A run that recorded nothing logs the counts of what the inbox offered and
+  could not decode. That is routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is. The exception is a reason that lists every seat as auth-failed: those
-  tokens need operator action, and no reset clears them. A run that finished
+  is. Two exceptions. A line listing every seat as auth-failed means those
+  tokens need operator action, and no reset clears them. A line whose
+  earliest reset is `unknown` while seats are listed as capped may be a
+  local fault rather than a quota: the shared runner reads a failure that
+  cost nothing, took at most one turn and exited within 5s as a cap, so a
+  broken sandbox wrapper or a CLI rejecting a flag caps every seat in turn.
+  Read the runner's `suspicious zero-cost instant exit` lines above it,
+  which quote the CLI's output. A run that finished
   well logs `nightly_prepare: done (... account=<seat>, ... recorded=<n> of
   <m>, undecodable=<u>)`; a high `undecodable` means the agent's entries
   failed validation even though some were recorded.
