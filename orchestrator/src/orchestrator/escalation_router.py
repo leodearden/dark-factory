@@ -16,10 +16,11 @@ import hashlib
 import json
 import logging
 from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal, Protocol, assert_never
+from typing import Literal, Protocol, TypeVar, assert_never
 
 from escalation.amendments import amendment_room
 from escalation.categories import EscalationCategory
@@ -96,6 +97,48 @@ def exit_kind_for(
     return _EXIT_KIND_BY_OUTCOME[outcome]
 
 
+_Stamped = TypeVar('_Stamped')
+
+
+def _stamp_note(prefix: str, fields: Mapping[str, str]) -> str:
+    return prefix + json.dumps(dict(fields))
+
+
+def _read_stamp(
+    record: Escalation, *, owner: str, prefix: str, kind: str,
+    parse: Callable[[Mapping[str, object]], _Stamped],
+) -> _Stamped | None:
+    """What *owner* stamped into *record*'s triage note under *prefix*, or None.
+
+    The one parser of ``_stamp_note``: a note *owner* stamped that does not
+    parse logs a WARNING and reads as unstamped.
+    """
+    if record.triaged_by != owner:
+        return None
+    note = record.triage_note or ''
+    try:
+        if not note.startswith(prefix):
+            raise ValueError(f'note does not carry the {kind} prefix')
+        fields = json.loads(note.removeprefix(prefix))
+        if not isinstance(fields, dict):
+            raise ValueError(f'{kind} fields are not an object')
+        return parse(fields)
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning(
+            'info-l0-router: %s is stamped by %s but its triage note is not a %s (%s); '
+            'it is routed as if unstamped. note=%r',
+            record.id, owner, kind, exc, note[:200],
+        )
+        return None
+
+
+def _string_field(fields: Mapping[str, object], name: str) -> str:
+    value = fields[name]
+    if not isinstance(value, str):
+        raise ValueError(f'{name} is not a string')
+    return value
+
+
 @dataclass(frozen=True)
 class RouterHold:
     """A curator ticket filed for a record that stays pending until the ticket resolves (D9)."""
@@ -108,59 +151,64 @@ _HOLD_PREFIX = 'info-l0-router hold: '
 
 
 def hold_note(ticket: str, filed_at: datetime) -> str:
-    return _HOLD_PREFIX + json.dumps({'ticket': ticket, 'filed_at': filed_at.isoformat()})
+    return _stamp_note(_HOLD_PREFIX, {'ticket': ticket, 'filed_at': filed_at.isoformat()})
 
 
 def read_hold(record: Escalation) -> RouterHold | None:
-    """The router's hold on *record*, or None; the only parser of ``hold_note``."""
-    if record.triaged_by != ROUTER_ID:
-        return None
-    note = record.triage_note or ''
-    try:
-        if not note.startswith(_HOLD_PREFIX):
-            raise ValueError('note does not carry the hold prefix')
-        fields = json.loads(note.removeprefix(_HOLD_PREFIX))
-        ticket, filed_at = fields['ticket'], fields['filed_at']
-        if not isinstance(ticket, str) or not isinstance(filed_at, str):
-            raise ValueError('hold fields are not strings')
-        filed = datetime.fromisoformat(filed_at)
-        if filed.tzinfo is None:
-            raise ValueError('hold filed_at carries no timezone')
-        return RouterHold(ticket, filed)
-    except (ValueError, TypeError, KeyError) as exc:
-        logger.warning(
-            'info-l0-router: %s is stamped by the router but its triage note is not a '
-            'router hold (%s); it will be routed afresh. note=%r',
-            record.id, exc, note[:200],
-        )
-        return None
+    """The router's hold on *record*, or None; the only reader of ``hold_note``."""
+    return _read_stamp(
+        record, owner=ROUTER_ID, prefix=_HOLD_PREFIX, kind='router hold', parse=_hold_from,
+    )
+
+
+def _hold_from(fields: Mapping[str, object]) -> RouterHold:
+    filed = datetime.fromisoformat(_string_field(fields, 'filed_at'))
+    if filed.tzinfo is None:
+        raise ValueError('hold filed_at carries no timezone')
+    return RouterHold(_string_field(fields, 'ticket'), filed)
+
+
+@dataclass(frozen=True)
+class ReviewerMark:
+    """The reviewer's standing verdict on a note it left pending, and its reason (D2)."""
+
+    disposition: ReviewerDisposition
+    rationale: str
 
 
 _REVIEWER_MARK_PREFIX = 'reviewer verdict: '
 
 
-def reviewer_mark_note(disposition: ReviewerDisposition, rationale: str) -> str:
-    return _REVIEWER_MARK_PREFIX + json.dumps(
-        {'disposition': str(disposition), 'rationale': rationale},
+def reviewer_mark_note(mark: ReviewerMark) -> str:
+    return _stamp_note(
+        _REVIEWER_MARK_PREFIX, {'disposition': str(mark.disposition), 'rationale': mark.rationale},
     )
 
 
-def read_reviewer_mark(record: Escalation) -> ReviewerDisposition | None:
-    """The reviewer's standing verdict on *record*, or None; the only parser of ``reviewer_mark_note``."""
-    if record.triaged_by != REVIEWER_LEG_ID:
-        return None
-    note = record.triage_note or ''
-    try:
-        if not note.startswith(_REVIEWER_MARK_PREFIX):
-            raise ValueError('note does not carry the reviewer-mark prefix')
-        return ReviewerDisposition(json.loads(note.removeprefix(_REVIEWER_MARK_PREFIX))['disposition'])
-    except (ValueError, TypeError, KeyError) as exc:
-        logger.warning(
-            'info-l0-router: %s is stamped by the reviewer but its triage note is not a '
-            'reviewer mark (%s); it will be routed without it. note=%r',
-            record.id, exc, note[:200],
-        )
-        return None
+def read_reviewer_mark(record: Escalation) -> ReviewerMark | None:
+    """The reviewer's mark on *record*, or None; the only reader of ``reviewer_mark_note``."""
+    return _read_stamp(
+        record, owner=REVIEWER_LEG_ID, prefix=_REVIEWER_MARK_PREFIX, kind='reviewer mark',
+        parse=_reviewer_mark_from,
+    )
+
+
+def _reviewer_mark_from(fields: Mapping[str, object]) -> ReviewerMark:
+    return ReviewerMark(
+        ReviewerDisposition(_string_field(fields, 'disposition')),
+        _string_field(fields, 'rationale'),
+    )
+
+
+def _carrying_rationale(decided: Disposition, mark: ReviewerMark | None) -> Disposition:
+    """*decided*, with the reviewer's reason for a marked note handed to the curator too."""
+    if mark is None or not isinstance(decided, ConvertViaCurator):
+        return decided
+    candidate = decided.payload
+    return ConvertViaCurator(replace(
+        candidate,
+        description=f'{candidate.description}\n\nReviewer rationale ({REVIEWER_LEG_ID}): {mark.rationale}',
+    ))
 
 
 @dataclass(frozen=True)
@@ -672,7 +720,7 @@ def _apply_reviewer(
         case ReviewerDisposition.WORK:
             marked = ports.queue.stamp_triage(
                 note.escalation_id, triaged_by=REVIEWER_LEG_ID,
-                triage_note=reviewer_mark_note(note.disposition, note.rationale),
+                triage_note=reviewer_mark_note(ReviewerMark(note.disposition, note.rationale)),
             )
             if marked is None:
                 return Applied(note.escalation_id, Outcome.ALREADY_TERMINAL)
@@ -711,12 +759,13 @@ class InfoL0Sweep:
         current = self._ports.queue.get(record.id)
         if current is None or current.status != 'pending' or read_hold(current) is not None:
             return None
+        mark = read_reviewer_mark(current)
         try:
-            decided = route_info_l0(
+            decided = _carrying_rationale(route_info_l0(
                 current, task_status=task_status, exit_kind=exit_kind,
                 mechanical_roles=INFO_L0_MECHANICAL_ROLES,
-                reviewer_disposition=read_reviewer_mark(current),
-            )
+                reviewer_disposition=None if mark is None else mark.disposition,
+            ), mark)
         except Exception:
             logger.exception('info-l0-router: deciding %s failed (by=%s)', current.id, self._by)
             decided = PromoteWithHint(PromoteReason.ROUTER_ERROR)

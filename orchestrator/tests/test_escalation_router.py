@@ -40,6 +40,7 @@ from orchestrator.escalation_router import (
     InfoL0Sweep,
     Outcome,
     Refused,
+    ReviewerMark,
     RouteContext,
     RouterHold,
     RouterPorts,
@@ -51,6 +52,7 @@ from orchestrator.escalation_router import (
     hold_note,
     read_hold,
     read_reviewer_mark,
+    reviewer_mark_note,
     reviewer_note_refusal,
     reviewer_notes,
     router_owns,
@@ -174,6 +176,40 @@ class TestRouterHold:
         with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
             assert read_hold(record) is None
         assert any(record.id in r.getMessage() for r in caplog.records)
+
+
+class TestReviewerMark:
+    MARK = ReviewerMark(ReviewerDisposition.WORK, 'needs its own task')
+
+    def test_reviewer_mark_note_round_trips_through_read_reviewer_mark(self):
+        record = _record(triaged_by=REVIEWER_LEG_ID, triage_note=reviewer_mark_note(self.MARK))
+        assert read_reviewer_mark(record) == self.MARK
+
+    def test_unstamped_record_has_no_mark(self):
+        assert read_reviewer_mark(_record()) is None
+
+    def test_record_triaged_by_someone_else_has_no_mark(self):
+        record = _record(triaged_by=ROUTER_ID, triage_note=reviewer_mark_note(self.MARK))
+        assert read_reviewer_mark(record) is None
+
+    @pytest.mark.parametrize('note', [
+        '',
+        'verified: still relevant',
+        'reviewer verdict: not json',
+        'reviewer verdict: ["work"]',
+        'reviewer verdict: {"rationale": "r"}',
+        'reviewer verdict: {"disposition": "work"}',
+        'reviewer verdict: {"disposition": "later", "rationale": "r"}',
+        'reviewer verdict: {"disposition": "work", "rationale": 7}',
+    ])
+    def test_reviewer_stamp_with_a_foreign_note_reads_as_no_mark_and_warns(self, note, caplog):
+        record = _record(triaged_by=REVIEWER_LEG_ID, triage_note=note)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
+            assert read_reviewer_mark(record) is None
+        assert any(
+            record.id in r.getMessage() and 'reviewer mark' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 class TestClassifyTicket:
@@ -628,6 +664,14 @@ def _hold(queue: EscalationQueue, record: Escalation, ticket: str, filed_at: dat
     return _current(queue, record.id)
 
 
+def _mark(queue: EscalationQueue, record: Escalation, rationale: str) -> Escalation:
+    queue.stamp_triage(
+        record.id, triaged_by=REVIEWER_LEG_ID,
+        triage_note=reviewer_mark_note(ReviewerMark(ReviewerDisposition.WORK, rationale)),
+    )
+    return _current(queue, record.id)
+
+
 class TestSweepRoute:
     @pytest.mark.asyncio
     async def test_a_work_note_is_decided_by_route_info_l0_and_converted(self, queue, ports, curator):
@@ -680,6 +724,20 @@ class TestSweepRoute:
         reasons = [row['data']['reason'] for row in _dispositions(events)]
         assert reasons == ['ticket_failed'] * 3
         assert all(_current(queue, r.id).status == 'dismissed' for r in records)
+
+    @pytest.mark.asyncio
+    async def test_a_reviewer_work_mark_converts_an_authors_no_action_note_with_its_rationale(
+        self, queue, ports, curator,
+    ):
+        record = _mark(queue, _seed(queue, suggested_action='no action needed'), 'split helper X out')
+        sweep = _sweep(ports)
+
+        await sweep.route(record, exit_kind=ExitKind.DONE, task_status='done')
+
+        (arguments,) = curator.calls_named('submit_task')
+        assert arguments['metadata']['escalation_id'] == record.id
+        assert f'Reviewer rationale ({REVIEWER_LEG_ID}): split helper X out' in arguments['description']
+        assert read_hold(_current(queue, record.id)) is not None
 
 
 class TestSweepStatusInfoAggregates:
@@ -1053,12 +1111,14 @@ class TestApplyReviewerDisposition:
     ):
         record = _seed(queue)
 
-        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.WORK))
+        applied = _apply_review(
+            ports, _review_note(record.id, ReviewerDisposition.WORK, 'needs its own task'),
+        )
 
         assert (applied.outcome, applied.reason) == (Outcome.DEFERRED, 'work')
         after = _current(queue, record.id)
         assert (after.status, after.resolution) == ('pending', None)
-        assert read_reviewer_mark(after) is ReviewerDisposition.WORK
+        assert read_reviewer_mark(after) == ReviewerMark(ReviewerDisposition.WORK, 'needs its own task')
         assert read_hold(after) is None
         (row,) = _dispositions(events)
         assert (row['data']['class'], row['data']['reason']) == ('defer', 'work')
@@ -1098,6 +1158,23 @@ class TestApplyReviewerDisposition:
         assert row['task_id'] == '42'
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(esc_id in message and str(applied.reason) in message for message in warnings)
+        assert curator.calls == []
+
+    def test_a_later_round_still_lists_a_work_marked_note_and_may_close_it(
+        self, queue, events, ports, curator,
+    ):
+        record = _seed(queue)
+        _apply_review(ports, _review_note(record.id, ReviewerDisposition.WORK, 'needs a task'))
+
+        assert [note.id for note in reviewer_notes(queue, task_id='42', enabled=True)] == [record.id]
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.CLOSED
+        closed = _current(queue, record.id)
+        assert (closed.status, closed.resolved_by, closed.resolution_class) == (
+            'dismissed', REVIEWER_LEG_ID, 'addressed',
+        )
+        assert [row['data']['class'] for row in _dispositions(events)] == ['defer', 'addressed']
         assert curator.calls == []
 
     def test_a_failed_close_leaves_the_note_pending_and_never_raises(
