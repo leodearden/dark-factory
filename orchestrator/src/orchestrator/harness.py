@@ -10030,14 +10030,19 @@ class Harness:
             logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
 
     def _resolve_watcher_outage_l2(self, evidence: WatcherRecoveryEvidence) -> None:
-        """Resolve the open watcher-outage L2 escalation on healthy recovery.
+        """Resolve the open watcher-outage L2, recording *evidence* as its resolution.
 
-        Called from _watcher_supervisor_loop when a healthy-clean rotation
-        completes (duration >= watcher_misconfigured_min_rotation_secs) to
-        signal to the human that the watcher is running again.
+        Never resolves while any scheduler pause holds: the trips that file
+        this shared L2 (cost ceiling, watcher guard) install holds only a
+        human resume ends, and _enforce_cost_ceilings returns early while
+        paused, so a false resolve would never be re-filed.  The in-memory
+        pause class is first-wins, so it cannot attribute which trip filed
+        the L2.  After a resume, the next drained poll or healthy rotation
+        clears it.
 
-        No-op when no pending L2 with root_cause='watcher_supervisor_down' exists.
-        Best-effort: failures are swallowed so the supervisor loop never breaks.
+        No-op when no outage L2 is pending.  Best-effort: failures are
+        swallowed (a missing scheduler fails closed) so the supervisor loop
+        never breaks.
         """
         queue = getattr(self, '_escalation_queue', None)
         if not queue:
@@ -10047,6 +10052,14 @@ class Harness:
                 self._WATCHER_OUTAGE_ROOT_CAUSE
             )
             if existing_id is None:
+                return
+            if self.scheduler.is_paused:
+                logger.debug(
+                    'Watcher-outage L2 %s stays open: scheduler is paused (%s: %s) '
+                    'and %s does not clear a held pause',
+                    existing_id, self.scheduler.pause_class,
+                    self.scheduler.pause_reason, evidence.name,
+                )
                 return
             queue.resolve(
                 existing_id,
@@ -15234,9 +15247,9 @@ class Harness:
             #
             # Intentional-disable note: when the supervisor is deliberately
             # disabled via config, this L2 will remain open indefinitely because
-            # the only auto-resolver (_resolve_watcher_outage_l2) runs from the
-            # healthy-clean branch of _watcher_supervisor_loop, which never
-            # executes while the supervisor is disabled.  This is expected
+            # the only auto-resolver (_resolve_watcher_outage_l2) runs only
+            # from _watcher_supervisor_loop, which never executes while the
+            # supervisor is disabled.  This is expected
             # behaviour — the operator should manually resolve/dismiss the L2
             # once they have verified the disable is intentional.  The 'urgent'
             # severity is intentional: no autonomous L1 triage is occurring.
@@ -15536,13 +15549,9 @@ class Harness:
                     'Escalation-watcher-auto: L1 queue has no actionable work; '
                     'skipping rotation launch (poll=%.1fs)', poll,
                 )
-                # task 2629 review fix: reaching this branch proves the
-                # supervisor loop is alive and the queue was readable (the
-                # precheck fails open on a None/erroring queue), which is
-                # exactly the "watcher is up again" signal a stale
-                # watcher-outage L2 is waiting on — resolve it here so it
-                # never lingers as a false alarm just because the L1 queue
-                # happens to be drained. Best-effort/no-op when none is open.
+                # task 2629: a drained precheck evidences a live loop and a
+                # readable queue (it fails open otherwise); the helper decides
+                # whether that clears a stale watcher-outage L2.
                 self._resolve_watcher_outage_l2(WatcherRecoveryEvidence.DRAINED_QUEUE)
                 try:
                     await asyncio.sleep(poll)
@@ -15639,9 +15648,9 @@ class Harness:
                     # counter so the next degenerate burst starts fresh from base.
                     consecutive_degenerate_clean = 0
                     logger.info('Escalation-watcher-auto rotation completed cleanly; restarting')
-                    # Resolve any open watcher-outage L2 — the watcher is running
-                    # healthily again.  Degenerate-clean (fast exits) are NOT recovery
-                    # signals; only healthy-clean (duration >= min) clears the outage.
+                    # Only a healthy-clean rotation (not a degenerate fast exit) is
+                    # offered as recovery evidence; the helper decides whether it
+                    # clears the watcher-outage L2.
                     self._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
                     await asyncio.sleep(self.config.watcher_subprocess_restart_backoff_secs)
                 continue

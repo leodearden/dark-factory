@@ -4078,9 +4078,11 @@ class TestWatcherOutageL2HeldOpenWhileSchedulerPaused:
         h, queue = _make_loop_harness_with_queue(tmp_path)
         h._run_store = None
         h.event_store = None
-        h.cost_store.cost_totals_in_window = AsyncMock(
+        cost_store = MagicMock()
+        cost_store.cost_totals_in_window = AsyncMock(
             return_value=(0.0, h.config.watcher_daily_cost_ceiling_usd + 1.0),
         )
+        h.cost_store = cost_store
 
         await h._enforce_cost_ceilings()
 
