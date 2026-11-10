@@ -30,6 +30,13 @@ changed.
 The two APPLICATION_SAYS_CONSUMED_* inputs are assembled too, and carry one
 INVENTED application line: an application log line containing the word that
 begins systemd's stop-time accounting, which none of the captures above holds.
+
+Three inputs come from after socket activation, from a later restart job on
+2026-11-08 (task 6568), and are assembled too.
+SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL changes only the separation.
+DELIBERATE_STOP_WITH_SOCKET_JOURNAL and REOPENED_SOCKET_THEN_RESTART_JOURNAL
+also carry INVENTED fused-memory.socket lines, because the retained journal
+holds no entry for that unit.
 """
 from __future__ import annotations
 
@@ -234,6 +241,45 @@ SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL = """\
 2026-11-08T00:38:18+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# ASSEMBLED, not captured: the service lines are the real 2026-11-08 lines
+# above; the fused-memory.socket lines are INVENTED. They are written in
+# systemd's `<verb> <unit> - <Description>.` form, the same form as this host's
+# real `Stopped fused-memory.service - ...` lines, with the Description from
+# scripts/fused-memory.socket.template. They have to be invented because the
+# retained journal holds no fused-memory.socket entry at all (measured
+# 2026-11-10). The `Closed` line comes after the service's `Consumed` because
+# the service is After=fused-memory.socket: on a deliberate stop the socket's
+# stop job (queued by scripts/stop-socket-unless-restarting.sh) runs after the
+# service's.
+DELIBERATE_STOP_WITH_SOCKET_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Closed fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Listening on fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:38:18+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED the same way, from the same real service lines and invented socket
+# lines. A deliberate stop whose socket reopens 10s later is followed by a
+# `restart` job, which logs no socket line, and the unit is then left down for
+# 4 minutes. Every gap except that last silence is under the 90s default.
+REOPENED_SOCKET_THEN_RESTART_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Closed fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:33:51+00:00 leo-MS-7C35 systemd[2626]: Listening on fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:33:51+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:34:28+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:35:00+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:35:08+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:35:08+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:39:08+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:39:45+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # ASSEMBLED, not captured: episode 2 reduced to its teardown, plus ONE added
 # line — a git error attributed to the pid systemd later SIGKILLs as `git`.
 # A spawned child inherits the unit's stderr, so its output is journaled under
@@ -427,6 +473,27 @@ def test_a_unit_down_silence_under_socket_activation_reports_no_watchdog_verdict
     nothing, so this capture cannot say whether the watchdog saw 'port-down'
     or 'wedged' (OPERATIONS.md §"fused-memory liveness revive")."""
     episodes = analyze(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict is None
+
+
+def test_a_socket_closed_before_the_silence_witnesses_port_down():
+    episodes = analyze(DELIBERATE_STOP_WITH_SOCKET_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict == "port-down"
+
+
+def test_a_reopened_socket_supersedes_an_earlier_close():
+    """The witness is the socket's LATEST state, not any `Closed` line in the
+    capture. Reading an earlier close would bring back the false 'port-down'
+    this guard exists to keep out."""
+    episodes = analyze(REOPENED_SOCKET_THEN_RESTART_JOURNAL)
 
     assert len(episodes) == 1
     assert episodes[0].stall_seconds == 240.0
