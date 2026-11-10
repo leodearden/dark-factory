@@ -1138,6 +1138,46 @@ def test_check_completion_without_a_previous_run_id_never_runs_the_check(tmp_pat
     assert len(_warnings(caplog)) == 1
 
 
+@pytest.mark.parametrize(
+    "status, run_id, extra",
+    [
+        (ct.CompletionStatus.FIRE, None, {"share": 0.8}),
+        (ct.CompletionStatus.NO_PREVIOUS_RUN, RUN_ID, {}),
+        (ct.CompletionStatus.FILED_NOTHING, RUN_ID, {"share": 0.5}),
+        (ct.CompletionStatus.ERROR, RUN_ID, {"vacuous": True, "detail": "exit 2, tool_error"}),
+        (ct.CompletionStatus.ERROR, RUN_ID, {}),
+        (ct.CompletionStatus.NOT_YET, RUN_ID, {"share": 0.5, "detail": "exit 75"}),
+    ],
+    ids=[
+        "fire-without-run-id",
+        "no-previous-run-with-run-id",
+        "filed-nothing-with-share",
+        "error-with-vacuous",
+        "error-without-detail",
+        "not-yet-with-detail",
+    ],
+)
+def test_a_completion_refuses_a_field_its_status_does_not_use(status, run_id, extra):
+    with pytest.raises(ValueError, match=str(status)):
+        ct.Completion(status, run_id, 70, **extra)
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        _FIRING,
+        _NOT_YET,
+        _ERRORED,
+        ct.Completion(ct.CompletionStatus.FIRE, RUN_ID, 70, vacuous=True),
+        ct.Completion(ct.CompletionStatus.NO_PREVIOUS_RUN, None, 70),
+        ct.Completion(ct.CompletionStatus.FILED_NOTHING, RUN_ID, 70),
+    ],
+    ids=lambda completion: completion.status,
+)
+def test_a_well_formed_completion_states_its_reason(completion):
+    assert completion.reason.startswith("completion: ")
+
+
 def _closed_port_url():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -1204,6 +1244,21 @@ def test_run_completion_check_against_a_closed_port_is_a_store_unreachable_error
 
     assert completion.status is ct.CompletionStatus.ERROR
     assert "store_unreachable" in completion.reason
+
+
+def test_run_completion_check_on_a_run_that_filed_nothing_is_filed_nothing(
+    tmp_path, monkeypatch,
+):
+    """Pins the cross-process contract FILED_NOTHING hangs on: the real
+    script's error code for a run no task carries, not a copy of it."""
+    store = _RunStore([])
+
+    with StubMcpServer(stateful=False, tools=store) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        completion = _check(ct.run_completion_check, tmp_path)
+
+    assert completion.status is ct.CompletionStatus.FILED_NOTHING, completion.reason
+    assert store.lookups
 
 
 # ---------------------------------------------------------------------------

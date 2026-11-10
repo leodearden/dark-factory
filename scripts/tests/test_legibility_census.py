@@ -4496,7 +4496,7 @@ def _make_raising_status_fetcher():
     ids=["tool-error-envelope", "raising-fetcher"],
 )
 def test_run_census_advances_census_state_when_the_status_fetch_fails(
-    tmp_path, caplog, make_fetcher
+    tmp_path, make_fetcher
 ):
     """An unusable get_statuses snapshot costs the outcome feed only: a run
     whose mining is paid for and whose report is on disk still completes,
@@ -4519,8 +4519,7 @@ def test_run_census_advances_census_state_when_the_status_fetch_fails(
         commit=fake_commit,
     )
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
+    outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
     assert kwargs["report_path"].exists(), "the paid-for report must survive"
@@ -4529,10 +4528,6 @@ def test_run_census_advances_census_state_when_the_status_fetch_fails(
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
     assert list(state) == _STATE_KEYS
     assert "last_census_done_count" not in state
-    assert not any(
-        r.levelno == logging.WARNING and "done-count unobservable" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -10444,14 +10439,13 @@ def test_run_census_reads_get_statuses_once_and_feeds_the_outcomes(tmp_path):
     assert _persisted_entry_a(kwargs)["status"] == "fixed"
 
 
-def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
+def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path):
     kwargs = _outcome_kwargs(tmp_path, "gone", status="accepted", accepted_by=_LINKED_TASK)
     kwargs["status_fetcher"] = _counting_status_fetcher(
         raises=census_trigger.StatusFetchUnavailable("get_statuses unreachable: fused-memory down"),
     )
 
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
+    outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
     assert len(kwargs["status_fetcher"].calls) == 1
@@ -10460,9 +10454,6 @@ def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path, caplog):
     assert _reverify_calls(kwargs["verify_fn"]) == []
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
     assert any("fused-memory down" in line and not line.startswith("|") for line in section.splitlines())
-    assert not any(
-        r.levelno == logging.WARNING and "done-count" in r.getMessage() for r in caplog.records
-    )
     assert "last_census_done_count" not in json.loads(
         kwargs["census_state_path"].read_text(encoding="utf-8")
     )

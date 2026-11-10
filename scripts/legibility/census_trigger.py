@@ -248,10 +248,17 @@ class CompletionStatus(StrEnum):
     ERROR = "error"
 
 
+_MEASURED = frozenset({CompletionStatus.FIRE, CompletionStatus.NOT_YET})
+
+
 @dataclass(frozen=True)
 class Completion:
     """What scripts/check_run_completion.py said about the previous census
-    run's filed tasks, parsed once at the subprocess boundary."""
+    run's filed tasks, parsed once at the subprocess boundary.
+
+    Each field belongs to the statuses that use it: ``run_id`` is None
+    exactly for NO_PREVIOUS_RUN, ``share`` and ``vacuous`` are set only on a
+    measured FIRE or NOT_YET, and ``detail`` is set exactly for ERROR."""
 
     status: CompletionStatus
     run_id: str | None
@@ -259,6 +266,14 @@ class Completion:
     share: float | None = None
     vacuous: bool = False
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        if (self.run_id is None) != (self.status is CompletionStatus.NO_PREVIOUS_RUN):
+            raise ValueError(f"Completion {self.status}: run_id {self.run_id!r} does not fit")
+        if self.status not in _MEASURED and (self.share is not None or self.vacuous):
+            raise ValueError(f"Completion {self.status}: carries a share, but measured nothing")
+        if bool(self.detail) != (self.status is CompletionStatus.ERROR):
+            raise ValueError(f"Completion {self.status}: detail {self.detail!r} does not fit")
 
     @property
     def fires(self) -> bool:
@@ -796,7 +811,7 @@ def default_status_fetcher(project_root: str | Path):
     def _fetch() -> dict:
         try:
             with SyncMcpSession(
-                base_url, client_name="legibility-census-trigger", timeout=10.0,
+                base_url, client_name="legibility-census-outcome-feed", timeout=10.0,
             ) as session:
                 return session.call_tool("get_statuses", {"project_root": project_root_str})
         except McpCallError as exc:
