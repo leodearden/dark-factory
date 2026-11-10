@@ -23,10 +23,22 @@ from pathlib import Path
 from typing import Annotated
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+RETIRED_CENSUS_KEYS = ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+
+logger = logging.getLogger('legibility.config')
 
 
 class Budgets(BaseModel):
@@ -52,21 +64,21 @@ class NoveltySpike(BaseModel):
     minimum, and ``multiple`` x the median of the daily window counts over
     the trailing ``baseline_days`` is the relative bar."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    count: int = Field(default=4, ge=0, strict=True)
-    window_hours: int = Field(default=72, ge=0, strict=True)
-    multiple: int = Field(default=2, ge=0, strict=True)
-    baseline_days: int = Field(default=30, ge=0, strict=True)
+    count: StrictInt = Field(default=4, ge=0)
+    window_hours: StrictInt = Field(default=72, ge=0)
+    multiple: StrictInt = Field(default=2, ge=0)
+    baseline_days: StrictInt = Field(default=30, ge=0)
 
 
 class Saturation(BaseModel):
     """``census.saturation`` — the mining-stop condition (PRD §5.2 point 7)."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    dup_rate: float = 0.9
-    consecutive_batches: int = 2
+    dup_rate: StrictFloat = Field(default=0.9, ge=0.0, le=1.0)
+    consecutive_batches: StrictInt = Field(default=2, ge=1)
 
 
 class TrickleCensusCaps(BaseModel):
@@ -84,8 +96,8 @@ class TrickleCensusCaps(BaseModel):
 
     model_config = ConfigDict(extra='allow', frozen=True)
 
-    max_batches: int | None = Field(default=50, ge=1, strict=True)
-    max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
+    max_batches: StrictInt | None = Field(default=50, ge=1)
+    max_verify_clusters: StrictInt | None = Field(default=150, ge=1)
 
 
 class Adjudication(BaseModel):
@@ -101,9 +113,9 @@ class Adjudication(BaseModel):
 
     model_config = ConfigDict(extra='allow', frozen=True)
 
-    attach_min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
-    cluster_min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
-    max_clusters_per_run: int = Field(default=10, ge=0, strict=True)
+    attach_min_similarity: StrictFloat = Field(default=0.90, ge=0.0, le=1.0)
+    cluster_min_similarity: StrictFloat = Field(default=0.85, ge=0.0, le=1.0)
+    max_clusters_per_run: StrictInt = Field(default=10, ge=0)
     embedding_model: str = 'text-embedding-3-small'
 
 
@@ -115,7 +127,7 @@ class LandingGate(BaseModel):
     model_config = ConfigDict(extra='allow', frozen=True)
 
     argv: tuple[Annotated[str, StringConstraints(min_length=1)], ...] = Field(min_length=1)
-    timeout_secs: int = Field(default=900, ge=1, strict=True)
+    timeout_secs: StrictInt = Field(default=900, ge=1)
 
 
 class Census(BaseModel):
@@ -125,18 +137,35 @@ class Census(BaseModel):
     session ledger's retention), the landing gate a census output must
     pass before it lands, and the completion share (as a percentage) at
     which the previous run's filed tasks fire the census
-    (plans/census-incremental-prd.md C7 (a))."""
+    (plans/census-incremental-prd.md C7 (a)). The census block is validated
+    strictly here, once, at ``load_config``, and this model is its only
+    reader."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
-    completion_threshold_pct: int = Field(default=70, ge=1, le=100, strict=True)
+    ledger_retention_days: StrictInt = Field(default=30, ge=1)
+    completion_threshold_pct: StrictInt = Field(default=70, ge=1, le=100)
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
-    floor_days: int = 5
+    floor_days: StrictInt = Field(default=5, ge=0)
     saturation: Saturation = Field(default_factory=Saturation)
     trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
     adjudication: Adjudication = Field(default_factory=Adjudication)
     landing_gate: LandingGate | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        present = [key for key in RETIRED_CENSUS_KEYS if key in data]
+        if not present:
+            return data
+        logger.warning(
+            'legibility config census: %s retired (plans/census-incremental-prd.md '
+            'C7, L8b), ignored -- delete from legibility.yaml',
+            ', '.join(present),
+        )
+        return {key: value for key, value in data.items() if key not in RETIRED_CENSUS_KEYS}
 
 
 class Models(BaseModel):
