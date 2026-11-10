@@ -44,6 +44,7 @@ from orchestrator.harness import (
     Harness,
 )
 from orchestrator.pause_policy import PauseClass
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -2714,6 +2715,7 @@ def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     h._watcher_supervisor_task = None
     h._watcher_unclean_exits = deque()
     h._watcher_degenerate_clean_exits = deque()
+    h.scheduler = Scheduler(config)
 
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
@@ -3046,6 +3048,7 @@ class TestEnforceCostCeilingsFilesL2:
 def _make_loop_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
     h = _make_loop_harness(tmp_path)
+    h.scheduler = Scheduler(h.config)
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
     return h, queue
