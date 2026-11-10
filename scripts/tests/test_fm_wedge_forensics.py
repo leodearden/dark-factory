@@ -753,6 +753,24 @@ def test_cli_human_report_marks_absent_terms_as_not_measured():
     assert "self-recovered" in result.stdout
 
 
+def test_cli_reports_an_unwitnessed_watchdog_verdict_as_such():
+    """An operator mid-incident reads this line, and "None" or a guessed
+    verdict would both mislead. The remedy is the socket unit's own journal,
+    so the line names the capture that would witness the port."""
+    result = _run_cli(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "unit-down" in result.stdout
+    assert "port-down" not in result.stdout
+    assert "would report None" not in result.stdout
+    assert "-u fused-memory.socket" in result.stdout
+
+    json_result = _run_cli(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL, "--json")
+
+    assert json_result.returncode == 0, f"stderr={json_result.stderr!r}"
+    assert json.loads(json_result.stdout)["episodes"][0]["watchdog_verdict"] is None
+
+
 def test_cli_fails_loudly_when_nothing_in_the_input_parses():
     """The trap this exists to catch: system-scope `journalctl -u
     fused-memory.service` prints "-- No entries --" because the unit is a
