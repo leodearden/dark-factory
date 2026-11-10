@@ -273,6 +273,7 @@ def _make_tracker(
     lane_buffers: dict[str, collections.deque],
     frozen_tip: str,
     retired: list[tuple[str, bool]] | None = None,
+    reserved: frozenset[str] = frozenset(),
 ) -> SuffixConflictTracker:
     """A tracker over the TEST's lane buffers and a fixed frozen-prefix tip.
 
@@ -294,6 +295,7 @@ def _make_tracker(
         frozen_requests=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
         retire_item=_record,
+        is_reserved=lambda rid: rid in reserved,
     )
 
 
@@ -678,6 +680,40 @@ class TestBounceBookkeeping:
             'no needs_rebase log line was emitted; records='
             f'{[r.message for r in caplog.records]}'
         )
+
+    async def test_a_reserved_request_records_no_bounce(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A deep chain's reserved link (task 7720) is skipped before any bounce
+        is recorded: no rebase of its worktree, no escalation, no count. The
+        unreserved peer is bounced as usual."""
+        held = _make_req('591', '591', config, git_repo)
+        held.worktree = git_repo / 'held-wt'
+        peer = _make_req('592', '592', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([held, peer])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3333',
+            retired=retired, reserved=frozenset({held.request_id}),
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(held.request_id, peer.request_id),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({held.request_id, peer.request_id}),
+        )
+        tracker.signature = ((held.request_id, peer.request_id), 'abc123')
+        rebase_spy = AsyncMock(return_value=True)
+        git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert [call.args[0] for call in rebase_spy.await_args_list] == [peer.worktree]
+        assert list(buffers['normal']) == [held, peer]
+        assert not held.result.done()
+        assert retired == []
+        assert tracker.bounce_registry.count('591') == 0
+        assert tracker.bounce_registry.count('592') == 1
 
     async def test_escalation_clears_the_bounce_count(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
