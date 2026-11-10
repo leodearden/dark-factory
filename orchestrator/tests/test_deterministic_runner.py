@@ -11634,3 +11634,71 @@ class TestFileIllegalDeployTransition:
         assert record.category == 'illegal_deploy_transition'
         assert 'scheduled' in record.summary
         assert 'done' in record.summary
+
+
+class TestFileDeterministicInfraIssue:
+    """The runner's born-at-L2 infra_issue filing is a module-level function, so
+    the scheduled-deploy settler files the same record the runner does."""
+
+    @staticmethod
+    def _file(queue, **kwargs):
+        from orchestrator.deterministic_runner import file_deterministic_infra_issue
+
+        return file_deterministic_infra_issue(
+            queue, '7238', summary=kwargs.pop('summary', 'restart failed'),
+            detail=kwargs.pop('detail', 'the transient read failed'), **kwargs,
+        )
+
+    @staticmethod
+    def _own_role_record(queue) -> str:
+        from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE
+
+        esc = Escalation(
+            id=queue.make_id('7238'),
+            task_id='7238',
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='infra_issue',
+            summary='an earlier filing',
+            level=2,
+        )
+        queue.submit(esc)
+        return esc.id
+
+    def test_files_one_born_at_l2_record_and_returns_its_id(self, tmp_path):
+        from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE
+
+        queue = EscalationQueue(tmp_path)
+        esc_id = self._file(queue, summary='x' * 300, detail='the transient read failed')
+
+        [record] = queue.get_by_task('7238')
+        assert esc_id == record.id
+        assert record.agent_role == DETERMINISTIC_AGENT_ROLE
+        assert record.level == 2
+        assert record.severity == 'critical'
+        assert record.category == 'infra_issue'
+        assert record.summary == 'x' * 200
+        assert record.detail == 'the transient read failed'
+
+    def test_a_pending_own_role_escalation_skips_the_filing(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        self._own_role_record(queue)
+
+        assert self._file(queue) is None
+        assert len(queue.get_by_task('7238')) == 1
+
+    def test_a_resolved_own_role_escalation_does_not_skip_the_filing(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        queue.resolve(self._own_role_record(queue), 'fixed')
+
+        esc_id = self._file(queue)
+
+        assert esc_id is not None
+        assert len(queue.get_by_task('7238')) == 2
+
+    def test_the_category_is_honoured(self, tmp_path):
+        queue = EscalationQueue(tmp_path)
+        self._file(queue, category='milestone_check_failed')
+
+        [record] = queue.get_by_task('7238')
+        assert record.category == 'milestone_check_failed'
