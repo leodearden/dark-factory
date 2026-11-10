@@ -50,7 +50,8 @@
 #     names one explicitly; a disabled one is refused, exit 145). Child mode
 #     joins on the thread's result.md or archive, records spawn_t3_lane.py
 #     `wait`'s code as the session's exit and exits with it; a sibling spawn
-#     prints `record=<dir> t3_thread_id=<id>` on stdout. The started-grace
+#     prints `record=<dir> t3_thread_id=<id>` on stdout, both values
+#     percent-encoded as the lane's verdicts are. The started-grace
 #     defaults to 300s.
 #   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -172,6 +173,24 @@ verdict_text() {
   local v
   v=$(verdict_field "$1" "$2") || return 1
   printf '%b' "${v//%/\\x}"
+}
+
+# $1 in the lane's token spelling (spawn_t3_lane.py::_token): percent-encoded
+# outside the same safe set, so it holds no space; `none` when empty.
+lane_token() {
+  local LC_ALL=C text="$1" encoded="" char i
+  if [ -z "$text" ]; then
+    printf 'none'
+    return 0
+  fi
+  for (( i = 0; i < ${#text}; i++ )); do
+    char="${text:i:1}"
+    case "$char" in
+      [A-Za-z0-9/_.~:@+,-]) encoded+="$char" ;;
+      *) printf -v char '%%%02X' "'$char"; encoded+="$char" ;;
+    esac
+  done
+  printf '%s' "$encoded"
 }
 
 t3_host_detected() {
@@ -1346,9 +1365,10 @@ join_t3_thread() {
 
 # A sibling spawn's only stdout line names the record `launch` stamped (display
 # t3, running) before it answered `started`, so the caller reads that record
-# instead of looking one up by title. `none` is the lane's spelling for absent.
+# instead of looking one up by title. Both values are lane tokens:
+# $t3_thread_id is already one, as `started` printed it.
 name_t3_sibling_on_stdout() {
-  printf 'record=%s t3_thread_id=%s\n' "${SESSION_RECORD_DIR:-none}" "$t3_thread_id"
+  printf 'record=%s t3_thread_id=%s\n' "$(lane_token "$SESSION_RECORD_DIR")" "$t3_thread_id"
 }
 
 # --- emulator selection ----------------------------------------------------

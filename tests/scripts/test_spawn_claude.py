@@ -19,7 +19,8 @@ import sys
 import textwrap
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+import urllib.parse
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -5424,13 +5425,25 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(t3_lane: _T3Lane) -> N
     assert launch["title"] == "worker:df#7489 t3-lane-test"
 
 
-def test_t3_sibling_spawn_names_its_stamped_record_on_stdout(t3_lane: _T3Lane) -> None:
+def _named_successor(spawn: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
+    """The `record=… t3_thread_id=…` line a T3 sibling spawn printed, split on its one space and percent-decoded."""
+    (line,) = spawn.stdout.decode().splitlines()
+    tokens = dict(word.partition("=")[::2] for word in line.split(" "))
+    assert tokens.keys() == {"record", "t3_thread_id"}, line
+    return {key: urllib.parse.unquote(value) for key, value in tokens.items()}
+
+
+@pytest.mark.parametrize("fleet_dir", [None, "fleet root é"], ids=["default-root", "spaced-root"])
+def test_t3_sibling_spawn_names_its_stamped_record_on_stdout(t3_lane: _T3Lane, fleet_dir: str | None) -> None:
     t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    if fleet_dir is not None:
+        t3_lane.env["CLAUDE_FLEET_ROOT"] = str(t3_lane.tmp_path / fleet_dir)
+        t3_lane.credential = t3_lane.server.write_paired_credential(t3_lane.env["CLAUDE_FLEET_ROOT"])
 
     result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert result.stdout.decode() == f"record={t3_lane.record_dir()} t3_thread_id={_T3_THREAD_ID}\n"
+    assert _named_successor(result) == {"record": t3_lane.record_dir(), "t3_thread_id": _T3_THREAD_ID}
     record = t3_lane.record()
     assert record.status == session_registry.Status.RUNNING
     assert record.display is not None and record.display.t3_thread_id == _T3_THREAD_ID
@@ -5575,6 +5588,7 @@ def test_t3_lane_resolves_the_end_of_work_act_into_the_record_and_the_trailer(
     assert f'"{expected_end.value}"' in prompt and f'"{other_act}"' not in prompt
     assert "Ending a T3 session" in prompt
     assert str(_SPAWN_SKILL_DOC) in prompt
+    assert "### Ending a T3 session" in _SPAWN_SKILL_DOC.read_text().splitlines(), "the trailer points at no heading"
 
 
 @pytest.mark.parametrize(("t3_end", "self_exit", "named"), [
@@ -5663,122 +5677,38 @@ def _seed_predecessor(lane: _T3Lane) -> pathlib.Path:
     )
 
 
-def _named_successor(spawn: subprocess.CompletedProcess[bytes]) -> dict[str, str] | None:
-    """The `record=… t3_thread_id=…` tokens a T3 sibling spawn printed, or None when it printed none."""
-    lines = [line for line in spawn.stdout.decode().splitlines() if line.startswith("record=")]
-    if len(lines) != 1:
-        return None
-    return dict(token.split("=", 1) for token in lines[0].split(" "))
-
-
-def _unconfirmed_because(spawn: subprocess.CompletedProcess[bytes]) -> str | None:
-    """Why the successor is not confirmed, or None when the record the spawn named runs on its thread."""
-    named = _named_successor(spawn)
-    if spawn.returncode != 0 or named is None:
-        return f"spawn exit {spawn.returncode}, no record line"
-    if named.get("record", "none") == "none" or not named.get("t3_thread_id"):
-        return f"spawn named record={named.get('record')} t3_thread_id={named.get('t3_thread_id')}"
-    successor = session_registry.SessionRecord.from_json((pathlib.Path(named["record"]) / "record.json").read_text())
-    display = successor.display
-    if display is None or display.t3_thread_id != named["t3_thread_id"]:
-        return f"the named record is not on thread {named['t3_thread_id']}"
-    if successor.status != session_registry.Status.RUNNING:
-        return f"the named record is {successor.status}"
-    return None
-
-
-def _rehearse_t3_handoff(
-    lane: _T3Lane, own_record_dir: pathlib.Path, spawn: subprocess.CompletedProcess[bytes],
-) -> list[tuple[str, dict[str, Any]]]:
-    """Play skills/spawn/SKILL.md §handoff steps 4-6 as a T3-hosted predecessor; return its acts in order."""
-    result_file = own_record_dir / session_registry.RESULT_FILENAME
-    reason = _unconfirmed_because(spawn)
-    if reason is not None:
-        result_file.write_text(
-            "---\noutcome: blocked\nchanged: none\n"
-            f"action_needed: queue unwatched; successor spawn failed ({reason})\n---\n"
-            "The successor could not be confirmed, so this watcher stopped without archiving.\n"
-        )
-        return [("result", {"outcome": "blocked"})]
-    named = _named_successor(spawn)
-    assert named is not None
-    result_file.write_text(
-        f"---\noutcome: handed-off\nchanged: none\naction_needed: none\n---\nHanded off to {named['record']}.\n"
-    )
-    exit_verb = subprocess.run(
-        ["python3", str(_ORCH_MODULE_DIR / "session_registry.py"), "exit", "--record", str(own_record_dir), "--code", "0"],
-        env=lane.env, capture_output=True, timeout=60,
-    )
-    assert exit_verb.returncode == 0, exit_verb.stderr.decode()
-    return [
-        ("result", {"outcome": "handed-off"}),
-        ("exit-verb", {"record": str(own_record_dir), "code": 0}),
-        ("t3_thread_organize", {"action": "archive"}),
-    ]
-
-
-def _refuse_the_cwd(lane: _T3Lane) -> pathlib.Path | None:
-    lane.scenario["workspace_root"] = str(lane.tmp_path / "elsewhere")
-    return None
-
-
-def _seed_older_namesake(lane: _T3Lane) -> pathlib.Path | None:
+def _seed_older_namesake(lane: _T3Lane) -> pathlib.Path:
     return _seed_watcher_record(
         lane, os.getppid(), status=session_registry.Status.LAUNCHING, start_ts="2026-11-01T00:00:00+00:00",
     )
 
 
-def _unstamp_named_record(spawn: subprocess.CompletedProcess[bytes]) -> None:
-    """Null the display of the record the spawn named, as a stamp `_stamp_launched_record` swallowed leaves it."""
-    named = _named_successor(spawn)
-    assert named is not None
-    record_dir = pathlib.Path(named["record"])
-    root = record_dir.parent.parent
-    record = session_registry.read_record(record_dir.name, root=root)
-    record.display = None
-    session_registry.write_record(record, root=root)
-
-
-@pytest.mark.parametrize(("before_spawn", "unstamp_named_record", "confirmed"), [
-    pytest.param(None, False, True, id="confirmed"),
-    pytest.param(None, True, False, id="named-record-unstamped"),
-    pytest.param(_refuse_the_cwd, False, False, id="spawn-refused"),
-    pytest.param(_seed_older_namesake, False, True, id="older-namesake"),
-])
-def test_handoff_archives_the_predecessor_only_once_the_named_successor_is_confirmed(
-    t3_lane: _T3Lane,
-    before_spawn: Callable[[_T3Lane], pathlib.Path | None] | None,
-    unstamp_named_record: bool,
-    confirmed: bool,
+@pytest.mark.parametrize("older_namesake", [False, True], ids=["alone", "older-namesake"])
+def test_t3_handoff_confirms_the_successor_the_spawn_named_and_exits_the_predecessor(
+    t3_lane: _T3Lane, older_namesake: bool,
 ) -> None:
+    """An executable mirror of skills/spawn/SKILL.md §handoff steps 4-6 on their production surfaces; it does not guard that prose."""
     t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
     own_dir = _seed_predecessor(t3_lane)
-    decoy_dir = before_spawn(t3_lane) if before_spawn is not None else None
+    decoy_dir = _seed_older_namesake(t3_lane) if older_namesake else None
 
     spawn = t3_lane.run(title=_HANDOFF_TITLE)
-    if unstamp_named_record:
-        _unstamp_named_record(spawn)
-    acts = _rehearse_t3_handoff(t3_lane, own_dir, spawn)
 
-    root = t3_lane.env["CLAUDE_FLEET_ROOT"]
-    own = session_registry.read_record(own_dir.name, root=root)
-    result_md = (own_dir / session_registry.RESULT_FILENAME).read_text()
-    if not confirmed:
-        assert acts == [("result", {"outcome": "blocked"})]
-        assert own.status == session_registry.Status.RUNNING
-        assert session_registry.parse_result_outcome(result_md) == "blocked"
-        assert "queue unwatched" in result_md
-        return
     assert spawn.returncode == 0, f"stderr: {spawn.stderr.decode()}"
-    assert [act for act, _ in acts] == ["result", "exit-verb", "t3_thread_organize"]
-    assert acts[0] == ("result", {"outcome": "handed-off"})
-    assert acts[-1] == ("t3_thread_organize", {"action": "archive"})
-    assert (own.status, own.exit_code) == (session_registry.Status.EXITED, 0)
-    assert session_registry.parse_result_outcome(result_md) == "handed-off"
     named = _named_successor(spawn)
-    assert named is not None
     named_dir = pathlib.Path(named["record"])
-    successor = session_registry.read_record(named_dir.name, root=root)
-    assert successor.status == session_registry.Status.RUNNING
-    assert successor.display is not None and successor.display.t3_thread_id == _T3_THREAD_ID
     assert named_dir not in (own_dir, decoy_dir)
+    root = t3_lane.env["CLAUDE_FLEET_ROOT"]
+    successor = session_registry.read_record(named_dir.name, root=root)
+    assert successor.title == _HANDOFF_TITLE
+    assert successor.status == session_registry.Status.RUNNING
+    assert successor.display is not None and successor.display.t3_thread_id == named["t3_thread_id"] == _T3_THREAD_ID
+
+    exit_verb = subprocess.run(
+        ["python3", str(_ORCH_MODULE_DIR / "session_registry.py"), "exit", "--record", str(own_dir), "--code", "0"],
+        env=t3_lane.env, capture_output=True, timeout=60,
+    )
+
+    assert exit_verb.returncode == 0, exit_verb.stderr.decode()
+    own = session_registry.read_record(own_dir.name, root=root)
+    assert (own.status, own.exit_code) == (session_registry.Status.EXITED, 0)
