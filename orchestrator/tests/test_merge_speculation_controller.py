@@ -31,7 +31,11 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_lane.speculation_controller import PermitLedger, SpeculationController
+from orchestrator.merge_lane.speculation_controller import (
+    LiveTip,
+    PermitLedger,
+    SpeculationController,
+)
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
@@ -958,16 +962,29 @@ async def _pending_state() -> SpeculationController:
 _State = Callable[[], Awaitable[SpeculationController]]
 
 
+def _tip() -> LiveTip:
+    """The live frontier tip 't', owned by the in-flight request 'tip-owner'."""
+    return LiveTip('t', _make_pending_request('tip-owner'))
+
+
 @pytest.mark.asyncio
 class TestOnBaseInvalidated:
     """``on_base_invalidated(dead_sha, live_tip)`` re-points or lets go; it
     never acquires (task 8524)."""
 
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    async def test_holds_base_names_only_the_held_commit(self, state: _State) -> None:
+        controller = await state()
+
+        assert controller.holds_base(' sha-dead ')
+        assert not controller.holds_base('sha-other')
+        assert not controller.holds_base('')
+
     async def test_state_a_re_points_onto_the_live_tip(self) -> None:
         controller = await _state_a()
         before = controller.snapshot()
 
-        controller.on_base_invalidated('sha-dead', 't')
+        controller.on_base_invalidated('sha-dead', _tip())
 
         after = controller.snapshot()
         assert after['spec_base'] == 't'
@@ -999,20 +1016,20 @@ class TestOnBaseInvalidated:
     async def test_mid_iteration_re_points_onto_the_live_tip(self) -> None:
         controller = await _state_b()
 
-        controller.on_base_invalidated('sha-dead', 't')
+        controller.on_base_invalidated('sha-dead', _tip())
 
         assert controller.snapshot()['spec_base'] == 't'
         assert controller.snapshot()['held_by_merger'] == 1
 
-    async def test_pending_attach_re_points_onto_the_live_tip(self) -> None:
+    async def test_pending_attach_re_points_onto_the_live_tip_and_its_owner(self) -> None:
         controller = await _pending_state()
         before = controller.snapshot()
 
-        controller.on_base_invalidated('sha-dead', 't')
+        controller.on_base_invalidated('sha-dead', _tip())
 
         after = controller.snapshot()
         assert after['pending_spec_base'] == 't'
-        assert after['pending_predecessor_task_id'] == 'pred'
+        assert after['pending_predecessor_task_id'] == 'tip-owner'
         assert after['held_by_merger'] == 1
         assert after['slot_available'] == before['slot_available']
 
@@ -1044,7 +1061,7 @@ class TestOnBaseInvalidated:
         before = controller.snapshot()
 
         controller.on_base_invalidated('sha-other', None)
-        controller.on_base_invalidated('sha-other', 't')
+        controller.on_base_invalidated('sha-other', _tip())
 
         assert controller.snapshot() == before
 
@@ -1059,10 +1076,11 @@ class TestOnBaseInvalidated:
         assert controller.snapshot() == once
 
     @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
-    @pytest.mark.parametrize('live_tip', ['t', None])
-    async def test_never_acquires(self, state: _State, live_tip: str | None) -> None:
+    @pytest.mark.parametrize('has_tip', [True, False])
+    async def test_never_acquires(self, state: _State, has_tip: bool) -> None:
         controller = await state()
         before = controller.snapshot()['slot_available']
+        live_tip = _tip() if has_tip else None
 
         controller.on_base_invalidated('sha-dead', live_tip)
         controller.on_base_invalidated('sha-dead', live_tip)

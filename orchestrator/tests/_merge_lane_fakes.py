@@ -53,16 +53,29 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.merge_lane.ports import ClockPort, VerifyPort
+from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.types import (
     DiskGuardOutcome,
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
+    RemergeBase,
+    RemergeReason,
+    SpeculativeItem,
 )
-from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
+from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE, SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import RunnerUnavailable
+
+
+async def remerge_on_main(
+    worker: SpeculativeMergeWorker, req: MergeRequest, started_monotonic: float | None = None,
+) -> SpeculativeItem:
+    """Re-merge *req* under the claim a site makes with no frontier tip:
+    onto main, holding no permit."""
+    claim = RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None)
+    return await worker._remerge(req, started_monotonic, claim=claim)
 
 
 def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:

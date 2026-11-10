@@ -2064,6 +2064,25 @@ class InflightEntry:
             )
 
 
+@dataclass(frozen=True)
+class NoHost:
+    """``_dispatch_item`` found no free verify host: park ``item``.
+
+    ``item`` is what the dispatch produced, so a dispatch-time re-merge's
+    replacement rather than the item it superseded, and its merger-ahead cap
+    is already released.
+    """
+
+    item: RealMergeItem
+
+    def __post_init__(self) -> None:
+        if self.item.cap_permit is not None:
+            raise ValueError(
+                'NoHost.item must hold no cap_permit: dispatch released it; got '
+                f'task={self.item.request.task_id!r} cap_permit={self.item.cap_permit!r}',
+            )
+
+
 @dataclass
 class InflightEntrySlot:
     """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).

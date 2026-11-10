@@ -52,9 +52,9 @@ currently holds (or ``None``) rather than a bare boolean:
 * ``on_shutdown`` — releases any held permit and clears all five fields
   (covers the shutdown-after-lookahead branch and the outer ``finally``).
 * ``on_base_invalidated`` — a base the merger holds was recorded dead: it is
-  re-pointed at the live tip, or cleared with the retained permit released;
-  mid-iteration with no live tip the dispatch-time re-anchor handles it.
-  Never acquires (task 8524, plans/merge-lane-policy-prd.md D2).
+  re-pointed at the live tip and its owner, or cleared with the retained
+  permit released; mid-iteration with no live tip the dispatch-time re-anchor
+  handles it.  Never acquires (task 8524, plans/merge-lane-policy-prd.md D2).
 
 The verifier-side releases (``_resolve_and_release``'s ``was_speculative``/
 ``speculative`` release, ``_finalize_inflight``'s finally release, and the
@@ -87,6 +87,7 @@ before.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
@@ -271,8 +272,18 @@ class PermitLedger(Generic[_PermitT]):
             self._slot.release()
 
 
-def _same_commit(base: str | None, dead: str) -> bool:
-    return base is not None and base.strip() == dead
+def _same_commit(base: str | None, sha: str) -> bool:
+    return bool(sha) and base is not None and base.strip() == sha
+
+
+@dataclasses.dataclass(frozen=True)
+class LiveTip:
+    """A frontier merge commit the merger may stack on, and the request
+    whose in-flight verify owns it: a late arrival attaches only while that
+    owner is still in flight."""
+
+    sha: str
+    owner: MergeRequest
 
 
 class SpeculationController:
@@ -573,30 +584,38 @@ class SpeculationController:
         self.pending_spec_base = None
         self.pending_predecessor = None
 
-    def on_base_invalidated(self, dead_sha: str, live_tip: str | None) -> None:
+    def holds_base(self, sha: str) -> bool:
+        """True when the merger holds *sha* as ``spec_base`` or ``pending_spec_base``."""
+        held = sha.strip()
+        return _same_commit(self.spec_base, held) or _same_commit(self.pending_spec_base, held)
+
+    def on_base_invalidated(self, dead_sha: str, live_tip: LiveTip | None) -> None:
         """Re-point a held base that died at *live_tip*, or let it go.
 
         With no live tip a prefetched request falls back to main and its
         retained permit is released.  Mid-iteration the merger may already
         have read ``spec_base``, so base and permit stay and the dispatch
-        re-anchor rebuilds that item.  Idempotent; never acquires.
+        re-anchor rebuilds that item.  A pending late-arrival base moves
+        together with its predecessor, so ATTACH gates on the tip's owner.
+        Idempotent; never acquires.
         """
         dead = dead_sha.strip()
-        if dead and _same_commit(self.spec_base, dead):
+        if _same_commit(self.spec_base, dead):
             self._reanchor_spec_base(live_tip)
-        if dead and _same_commit(self.pending_spec_base, dead):
+        if _same_commit(self.pending_spec_base, dead):
             self._reanchor_pending(live_tip)
 
-    def _reanchor_spec_base(self, live_tip: str | None) -> None:
+    def _reanchor_spec_base(self, live_tip: LiveTip | None) -> None:
         if live_tip is not None:
-            self.spec_base = live_tip
+            self.spec_base = live_tip.sha
         elif self.prefetched is not None:
             self.spec_base = None
             self._release_held()
 
-    def _reanchor_pending(self, live_tip: str | None) -> None:
+    def _reanchor_pending(self, live_tip: LiveTip | None) -> None:
         if live_tip is not None:
-            self.pending_spec_base = live_tip
+            self.pending_spec_base = live_tip.sha
+            self.pending_predecessor = live_tip.owner
             return
         self.pending_spec_base = None
         self.pending_predecessor = None

@@ -10,9 +10,10 @@ Covers:
                  recompute excludes frozen rids (exclusion filter)
   step-11 RED  — the dispatch-time verify-base guard (task 5302: now
                  _verify_base_divergence_at_dispatch, the §5.3 detector)
-  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard:
-                 `_remerge` recovery items are exempt; the carve-out is
-                 narrow (an ordinary mismatch still warns exactly once).
+  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard: a
+                 recovery re-merge that fell to main is exempt (task 8524,
+                 plans/merge-lane-policy-prd.md D1); the carve-out is narrow
+                 (an ordinary mismatch still warns exactly once).
   3206 step-5  — the surviving WARNING keeps its CALL-TIME CONTEXT (task_id,
                  request_id, both shas, verify_depth), which task 1999 records
                  as available on no other §5.3 surface.  Data only: the
@@ -66,6 +67,7 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.types import (
     InflightStatus,
+    NoHost,
     QueuedBranch,
     RemergeBase,
     RemergeReason,
@@ -286,7 +288,7 @@ async def _dispatch(
     git_ops: GitOps,
     item: SpeculativeItem,
     get_main_sha: Callable[..., Awaitable[str]],
-) -> InflightEntry | None:
+) -> InflightEntry | NoHost:
     """Drive *item* through the lane's dispatch step while git's main read is
     *get_main_sha*.  The verify the dispatch launches is a no-op, so a row
     observes only what dispatch itself decided."""
@@ -940,50 +942,17 @@ class TestWarnIfVerifyBaseNotFrozenTip:
 
 
 def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
-    """Stamp the §5.3 re-merge recovery marker (task 3206) on *item*.
-
-    Deliberately uses ``dataclasses.replace`` rather than a new
-    ``_make_fake_item`` keyword so this is RED (TypeError: unexpected keyword
-    argument) ONLY inside the tests that opt in, leaving every other suite in
-    this module green until step-2 adds the field.
-
-    Mirrors what ``_remerge`` does in production: it is the single producer of
-    recovery items for all five consumer paths — ``_verifier_loop``'s
-    head-failure cascade, ``_void_and_remerge`` (INV-3 adoption-time void),
-    ``_finalize_inflight``'s RUNNER_UNAVAILABLE re-dispatch, and
-    ``_dispatch_item``'s dead-base-straggler and Mechanism-2 sites — so the
-    marker is set once at the producer rather than threaded through each
-    consumer.  (Named, not line-numbered: line numbers in this ~17k-line
-    module rot within a release; PRD §5.3 carries the numbered list and is
-    reconciled at close-out.)
-
-    Task 8524 narrowed the marker to a recovery re-merge that FELL TO MAIN
-    (plans/merge-lane-policy-prd.md D1): that is the only recovery item the
-    carve-out still exempts.
-    """
+    """Stamp *item* as a recovery re-merge that fell to main, the anchor
+    ``_remerge`` gives it (plans/merge-lane-policy-prd.md D1)."""
     return dataclasses.replace(item, remerge_base=RemergeBase(None, RemergeReason.NO_TIP))
 
 
 @pytest.mark.asyncio
 class TestRemergeCarveOutAtDispatchGuard:
-    """§5.3 carves out `_remerge` recovery items from the dispatch-time guard.
+    """A recovery re-merge that fell to main is exempt from the dispatch-time
+    guard, and nothing else is (plans/merge-lane-policy-prd.md D1)."""
 
-    ADJUDICATION (task 3206, PRD §5.3): items produced by ``_remerge`` are
-    RECOVERY re-merges that legitimately target real main rather than
-    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this reproduces
-    the measured class-(b) shape: a dead-base straggler re-merged onto real
-    main while another item was frozen.  Under hard enforcement both measured
-    instances of it would have been REFUSED, and the tip they'd have been
-    forced onto can itself be the dead commit they exist to escape.  PRD §5.3
-    holds the dated instances; they are not duplicated here to rot.
-
-    The carve-out must be NARROW: it suppresses recovery items only, never a
-    genuine class-(d) violation.
-
-    RED until step-2 GREEN adds ``remerge_recovery`` and honours it here.
-    """
-
-    async def test_remerge_recovery_item_suppresses_warning(
+    async def test_a_fell_to_main_item_suppresses_warning(
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
@@ -1003,9 +972,8 @@ class TestRemergeCarveOutAtDispatchGuard:
         )
         _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
-        # Recovery re-merge: _remerge always sets base_sha=actual_main (here
-        # 'main0'), which is NOT the frozen tip 'sha-Dc'.  That is correct by
-        # construction, not a violation.
+        # A recovery re-merge that fell to main (here 'main0'), not onto the
+        # frozen tip 'sha-Dc'.
         _, item_r = _make_fake_item(
             't-recovery', base_sha='main0', merge_commit='sha-Rc',
             config=config, git_repo=git_repo,
@@ -1449,12 +1417,11 @@ class TestDispatchItemGuardWiring:
 
         result = await _dispatch(worker, git_ops, item, _raise_on_get_main)
 
-        # Fail-open: dispatch must return a verifying InflightEntry, not None.
-        assert result is not None, (
-            '_dispatch_item returned None; expected a verifying InflightEntry '
+        # Fail-open: dispatch must return a verifying InflightEntry.
+        assert isinstance(result, InflightEntry), (
+            f'_dispatch_item returned {result!r}; expected a verifying InflightEntry '
             'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
         )
-        assert isinstance(result, InflightEntry)
         assert result.verify_task is not None, (
             'dispatch returned an entry with no verify task: the guard refused '
             'the dispatch instead of failing open'
@@ -1526,7 +1493,7 @@ class TestDispatchItemGuardWiring:
         )
 
         # Dispatch must still succeed — the guard is purely observational.
-        assert result is not None, 'dispatch must succeed even when guard warns'
+        assert isinstance(result, InflightEntry), 'dispatch must succeed even when guard warns'
         assert result.verify_task is not None, (
             'guard is observational: it must not withhold the verify task'
         )
@@ -1559,7 +1526,7 @@ async def _dispatch_on_main(
         return main_sha
 
     entry = await _dispatch(worker, git_ops, item, _return_main)
-    assert entry is not None and entry.verify_task is not None, 'dispatch was refused'
+    assert isinstance(entry, InflightEntry) and entry.verify_task is not None, 'dispatch was refused'
     _seed_frozen(worker, entry)
     return entry
 

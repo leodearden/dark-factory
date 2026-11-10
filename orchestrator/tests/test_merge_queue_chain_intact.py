@@ -51,11 +51,12 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
 from orchestrator.merge_lane.remerge_base import RemergeClaim
-from orchestrator.merge_lane.speculation_controller import PermitLedger
+from orchestrator.merge_lane.speculation_controller import PermitLedger, SpeculationController
 from orchestrator.merge_lane.types import (
     InflightStatus,
     ItemLifecycleState,
     MergeRequest,
+    NoHost,
     RemergeBase,
     RemergeReason,
     SpecPermit,
@@ -732,12 +733,9 @@ def _ledger(worker: SpeculativeMergeWorker) -> PermitLedger[SpecPermit]:
 
 
 async def _remerge(
-    worker: SpeculativeMergeWorker, req: MergeRequest, claim: RemergeClaim | None = None,
+    worker: SpeculativeMergeWorker, req: MergeRequest, claim: RemergeClaim,
 ) -> SpeculativeItem:
-    remerge = worker._remerge
-    if claim is None:
-        return await remerge(req, None)
-    return await remerge(req, None, claim=claim)
+    return await worker._remerge(req, None, claim=claim)
 
 
 @pytest.mark.asyncio
@@ -782,21 +780,6 @@ class TestRemergeOntoTheClaimedBase:
         assert out.speculative is False
         assert out.permit is None
         assert out.remerge_base == claim.anchor
-
-    async def test_no_claim_on_an_empty_frontier_falls_to_main(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ) -> None:
-        worker = _make_worker(git_ops)
-        req, _ = await _make_merged_item(git_ops, config, 'task/no-claim', 'nc.py', 'n=1\n')
-
-        out = await _remerge(worker, req)
-
-        assert isinstance(out, RealMergeItem)
-        assert out.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
-        assert out.base_sha == await git_ops.get_main_sha()
-        assert out.speculative is False
-        assert out.permit is None
-        assert _ledger(worker).live == frozenset()
 
     async def test_a_failed_remerge_releases_the_claimed_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -851,16 +834,18 @@ async def _live_tip(
 
 async def _dead_based_straggler(
     worker: SpeculativeMergeWorker, git_ops: GitOps, config: OrchestratorConfig,
+    filename: str = 'disp_s.py',
 ) -> tuple[RealMergeItem, SpecPermit]:
-    """A speculative straggler built on a recorded-dead commit, holding a permit."""
+    """A speculative straggler adding *filename*, built on a recorded-dead
+    commit and holding a permit."""
     worker._record_dead_base(_DEAD, killer=_KILLER)
-    _, built = await _make_merged_item(git_ops, config, 'task/disp-strag', 'disp_s.py', 's=1\n')
+    _, built = await _make_merged_item(git_ops, config, 'task/disp-strag', filename, 's=1\n')
     permit = await _ledger(worker).acquire()
     straggler = dataclasses.replace(built, base_sha=_DEAD, speculative=True, permit=permit)
     return straggler, permit
 
 
-async def _dispatch(worker: SpeculativeMergeWorker, item: RealMergeItem) -> InflightEntry | None:
+async def _dispatch(worker: SpeculativeMergeWorker, item: RealMergeItem) -> InflightEntry | NoHost:
     return await worker._dispatch_item(item)
 
 
@@ -870,8 +855,8 @@ def _the_row(store: _LateArrivalFakeEventStore, event_type: EventType) -> dict[s
     return rows[0]['data']
 
 
-def _replacement(entry: InflightEntry | None) -> RealMergeItem:
-    assert entry is not None
+def _replacement(entry: InflightEntry | NoHost) -> RealMergeItem:
+    assert isinstance(entry, InflightEntry), entry
     assert isinstance(entry.item, RealMergeItem), entry.item
     return entry.item
 
@@ -897,7 +882,7 @@ class TestDispatchSitesReanchor:
         assert replacement.base_sha == tip
         assert replacement.speculative is True
         assert replacement.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
-        assert entry is not None and entry.permit is permit
+        assert isinstance(entry, InflightEntry) and entry.permit is permit
         row = _the_row(store, EventType.verdict_voided)
         assert row['point'] == 'dispatch'
         assert (row['anchor_reason'], row['anchor_base']) == ('live_tip', tip)
@@ -918,7 +903,7 @@ class TestDispatchSitesReanchor:
         assert replacement.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
         assert permit.released is True
         assert permit not in _ledger(worker).live
-        assert entry is not None and entry.permit is None
+        assert isinstance(entry, InflightEntry) and entry.permit is None
         row = _the_row(store, EventType.verdict_voided)
         assert (row['anchor_reason'], row['anchor_base']) == ('no_tip', None)
 
@@ -926,29 +911,89 @@ class TestDispatchSitesReanchor:
         self, git_ops: GitOps, config: OrchestratorConfig,
         monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
     ) -> None:
-        """The re-merge falls to main and frees the permit, then no host is
-        free: the replacement is parked, and it re-dispatches as-is, holding
-        no speculation slot."""
+        """Driven through ``_verifier_loop``: the re-merge falls to main and
+        frees the permit, then the free host is taken before the acquire.  The
+        replacement is parked, and it re-dispatches as-is, holding no
+        speculation slot."""
         store = _LateArrivalFakeEventStore()
         worker = _dispatching_worker(git_ops, store, monkeypatch)
         straggler, permit = await _dead_based_straggler(worker, git_ops, config)
-        worker._register_item(straggler, ItemLifecycleState.DISPATCHING)
         allocator = _fake_local_allocator()
-        monkeypatch.setattr(worker, '_host_allocator', allocator)
         lease = allocator.acquire.return_value
-        allocator.acquire.return_value = None
 
-        assert await _dispatch(worker, straggler) is None
-        parked = worker._unhosted_redispatch_item(straggler)
+        def _slot_taken_meanwhile(*_args: object, **_kwargs: object) -> None:
+            allocator.free_host_count.return_value = 0
 
+        allocator.acquire.side_effect = _slot_taken_meanwhile
+        monkeypatch.setattr(worker, '_host_allocator', allocator)
+        worker._register_item(straggler, ItemLifecycleState.REDISPATCH_PARKED)
+        worker._intake.request_redispatch(straggler)
+
+        await _drive_cascade_recording(worker, lambda: allocator.acquire.await_count >= 1)
+
+        parked = _parked(worker, straggler.request.task_id)
+        assert isinstance(parked, RealMergeItem) and parked is not straggler
         assert permit.released is True
         assert parked.base_sha == await git_ops.get_main_sha()
         assert (parked.speculative, parked.permit) == (False, None)
+        assert parked.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)
+        assert _awaiting_host(worker) == [straggler.request.task_id]
+        allocator.acquire.side_effect = None
         allocator.acquire.return_value = lease
+        allocator.free_host_count.return_value = 1
         await _live_tip(worker, git_ops, config, verifies)
         entry = await _dispatch(worker, parked)
-        assert entry is not None and entry.item is parked
+        assert isinstance(entry, InflightEntry) and entry.item is parked
         assert entry.permit is None and not _ledger(worker).live
+
+    async def test_a_launch_that_raises_after_a_re_anchor_frees_the_replacement(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        """A live-tip claim took a fresh slot for the replacement, then the
+        host acquire raised.  The caller resolves only the item it handed in,
+        so the dispatch itself frees the replacement's permit and worktree."""
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        await _live_tip(worker, git_ops, config, verifies)
+        straggler, permit = await _dead_based_straggler(worker, git_ops, config)
+        _ledger(worker).release(permit)
+        allocator = _fake_local_allocator()
+        allocator.acquire.side_effect = RuntimeError('acquire blew up')
+        monkeypatch.setattr(worker, '_host_allocator', allocator)
+        cleanup = AsyncMock()
+        monkeypatch.setattr(worker, '_cleanup_owned_merge_worktree', cleanup)
+
+        with pytest.raises(RuntimeError, match='acquire blew up'):
+            await _dispatch(worker, straggler)
+
+        assert _ledger(worker).live == frozenset()
+        cleaned = [call.args[0] for call in cleanup.await_args_list]
+        assert len(cleaned) == 2, cleaned
+        assert cleaned[0] == straggler.merge_wt
+        assert cleaned[1] != straggler.merge_wt
+
+    async def test_a_re_anchor_that_conflicts_with_the_live_tip_is_a_terminal_conflict(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        """A straggler whose branch clashes with the live tip's resolves as a
+        terminal conflict, as the merger's own speculative merges onto an
+        unverified base do; its permit rides the passthrough to finalize."""
+        store = _LateArrivalFakeEventStore()
+        worker = _dispatching_worker(git_ops, store, monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
+        straggler, permit = await _dead_based_straggler(
+            worker, git_ops, config, filename='disp_tip.py',
+        )
+
+        entry = await _dispatch(worker, straggler)
+
+        assert isinstance(entry, InflightEntry) and isinstance(entry.item, DecidedItem)
+        assert entry.passthrough_outcome is not None
+        assert entry.passthrough_outcome.status == 'conflict'
+        assert entry.item.remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
+        assert entry.permit is permit
 
     async def test_a_released_held_permit_is_never_reused_by_a_live_tip_claim(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -963,7 +1008,7 @@ class TestDispatchSitesReanchor:
         entry = await _dispatch(worker, straggler)
 
         assert _replacement(entry).remerge_base == RemergeBase(tip, RemergeReason.LIVE_TIP)
-        assert entry is not None and entry.permit is not permit
+        assert isinstance(entry, InflightEntry) and entry.permit is not permit
         assert entry.permit in _ledger(worker).live
 
     async def test_a_vacated_tip_owner_sends_the_straggler_to_main(
@@ -983,7 +1028,7 @@ class TestDispatchSitesReanchor:
         assert replacement.base_sha == await git_ops.get_main_sha()
         assert replacement.remerge_base == RemergeBase(None, RemergeReason.TIP_VACATED)
         assert permit.released is True
-        assert entry is not None and entry.permit is None
+        assert isinstance(entry, InflightEntry) and entry.permit is None
         row = _the_row(store, EventType.verdict_voided)
         assert row['anchor_reason'] == 'tip_vacated'
 
@@ -1165,12 +1210,16 @@ _TIP_T = '3' * 40       # a live frontier entry's merge commit
 _HELD_DEAD = '4' * 40   # the base the merger holds, about to be recorded dead
 
 
+def _controller(worker: SpeculativeMergeWorker) -> SpeculationController:
+    return worker._speculation_controller
+
+
 async def _merger_holding(
     worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path, base: str,
 ) -> None:
     """Put the merger in state A: a look-ahead found, its permit retained,
     stacked on *base*."""
-    controller = worker._speculation_controller
+    controller = _controller(worker)
     await controller.acquire_for_lookahead()
     req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
     controller.on_lookahead_found(req, base)
@@ -1295,7 +1344,7 @@ class TestADispatchVoidHandsTheMergerTheReplacement:
         worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
         tip = await _live_tip(worker, git_ops, config, verifies)
         straggler, _ = await _dead_based_straggler(worker, git_ops, config)
-        worker._speculation_controller.on_lookahead_pending(
+        _controller(worker).on_lookahead_pending(
             _straggler_commit(straggler), straggler.request,
         )
 
@@ -1305,7 +1354,7 @@ class TestADispatchVoidHandsTheMergerTheReplacement:
         assert replacement.base_sha == tip
         assert spec['pending_spec_base'] == replacement.merge_result.merge_commit
         assert spec['pending_spec_base'] != tip
-        assert spec['pending_predecessor_task_id'] == straggler.request.task_id
+        assert spec['pending_predecessor_task_id'] == replacement.request.task_id
 
     async def test_a_merger_in_state_a_re_points_at_the_replacement(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
@@ -1315,8 +1364,26 @@ class TestADispatchVoidHandsTheMergerTheReplacement:
         await _live_tip(worker, git_ops, config, verifies)
         straggler, _ = await _dead_based_straggler(worker, git_ops, config)
         next_req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
-        worker._speculation_controller.on_lookahead_found(next_req, _straggler_commit(straggler))
+        _controller(worker).on_lookahead_found(next_req, _straggler_commit(straggler))
 
         replacement = _replacement(await _dispatch(worker, straggler))
 
         assert _speculation(worker)['spec_base'] == replacement.merge_result.merge_commit
+
+    async def test_a_raising_re_merge_still_re_points_the_merger_at_the_live_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch, verifies: VerifyTasks,
+    ) -> None:
+        worker = _dispatching_worker(git_ops, _LateArrivalFakeEventStore(), monkeypatch)
+        tip = await _live_tip(worker, git_ops, config, verifies)
+        straggler, _ = await _dead_based_straggler(worker, git_ops, config)
+        next_req, _ = _make_fake_item('merger-next', config=config, git_repo=git_repo)
+        _controller(worker).on_lookahead_found(next_req, _straggler_commit(straggler))
+        monkeypatch.setattr(
+            worker, '_remerge_inner', AsyncMock(side_effect=RuntimeError('merge blew up')),
+        )
+
+        with pytest.raises(RuntimeError, match='merge blew up'):
+            await _dispatch(worker, straggler)
+
+        assert _speculation(worker)['spec_base'] == tip

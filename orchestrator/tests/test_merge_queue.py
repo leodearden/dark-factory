@@ -30,6 +30,7 @@ from _merge_lane_fakes import (
     merge_through_lane,
     passes,
     raises,
+    remerge_on_main,
     running_lane,
     times_out,
 )
@@ -6339,7 +6340,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         # Build a real flowing item BEFORE the patch block so _remerge's
         # own merge paths run against the real git_ops (not the raising mock).
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -8953,7 +8954,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -10612,7 +10613,7 @@ class TestMergeFailureDiagnostic:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         req = _make_request('ghost', 'ghost', git_ops.project_root, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, DecidedItem)
         outcome = item.immediate_outcome
@@ -12323,7 +12324,7 @@ class TestSpeculationRaceRetry:
         actual_main = await git_ops.get_main_sha()
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            item = await worker._remerge(req, None)
+            item = await remerge_on_main(worker, req)
 
         # merge_to_main must have been called exactly twice
         assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
@@ -12419,7 +12420,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
@@ -12503,7 +12504,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_base_is_main)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 1, (
             f'Expected exactly 1 call (base==main, not a race), got {call_count}'
@@ -12533,7 +12534,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_non_loadbearing)
-        item2 = await worker._remerge(req2, None)
+        item2 = await remerge_on_main(worker, req2)
 
         assert call_count == 1, (
             f'Expected 1 call (non-race stderr), got {call_count}'
@@ -12603,7 +12604,7 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'cleanup_merge_worktree', fake_cleanup)
         monkeypatch.setattr('orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
@@ -12677,7 +12678,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
         assert isinstance(item, RealMergeItem), (
@@ -12710,7 +12711,7 @@ class TestSpeculationRaceRetry:
         """task-1724: _remerge always returns skip_verify=False (unconditionally fail-closed).
 
         The force_verify/prev_skip_verify/prev_merge_tree parameters were removed.
-        _remerge(req, None) with pre_rebased=True and main unchanged yields
+        remerge_on_main(worker, req) with pre_rebased=True and main unchanged yields
         skip_verify=False regardless of request state.
         """
         wt = await _make_branch_with_file(
@@ -12720,7 +12721,7 @@ class TestSpeculationRaceRetry:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('fv-a', 'fv-a', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12766,7 +12767,7 @@ class TestRemergeAlwaysVerifies:
         req = _make_request('tp-a', 'tp-a', wt, config, pre_rebased=True)
 
         # task-1724: simplified call — no probe needed, no kwargs.
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12793,7 +12794,7 @@ class TestRemergeAlwaysVerifies:
     ) -> None:
         """(b) Minimal call → always fail-closed → skip_verify=False.
 
-        _remerge(req, None) is the canonical production call shape after task-1724.
+        remerge_on_main(worker, req) is the no-tip production call shape after task-1724.
         The prev_skip_verify/prev_merge_tree parameters were removed; skip_verify
         is structurally always False on the return value.
         """
@@ -12802,7 +12803,7 @@ class TestRemergeAlwaysVerifies:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('tp-c', 'tp-c', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         _wt = item_merge_wt(item)
         if _wt:
             await git_ops.cleanup_merge_worktree(_wt)
@@ -16586,7 +16587,7 @@ class TestReverifyRebasedTree:
 class TestSpeculativeMergeWorkerGate:
     """End-to-end integration tests for the disjoint-delta re-verify gate.
 
-    Each test builds a SpeculativeItem via worker._remerge(req, None),
+    Each test builds a SpeculativeItem via remerge_on_main(worker, req),
     simulates intervening main movement by committing directly in
     project_root, then drives drive_verify_and_advance(worker, item) and asserts
     the expected outcome and run_scoped_verification call count.
@@ -16655,7 +16656,7 @@ class TestSpeculativeMergeWorkerGate:
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
         # _remerge: merge branch into current main
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16723,7 +16724,7 @@ class TestSpeculativeMergeWorkerGate:
 
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16793,7 +16794,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Move main: add a DISJOINT file (no shared files touched)
@@ -16855,7 +16856,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Drift from a writer that is NOT the merge queue — never registered
@@ -16900,7 +16901,7 @@ class TestSpeculativeMergeWorkerGate:
         )
         req = _make_request(branch, branch, branch_wt, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # main does NOT move
