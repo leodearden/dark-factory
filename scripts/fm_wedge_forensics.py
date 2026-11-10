@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import enum
 import json
 import re
 import sys
@@ -88,6 +89,14 @@ PORT_DOWN = "port-down"
 # silence is from the regime in which the process bound port 8002 itself (OPERATIONS.md §"Socket activation").
 FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT = dt.datetime.fromisoformat("2026-09-25T13:06:26+01:00")
 
+
+class SocketState(enum.Enum):
+    """fused-memory.socket's state, as its own latest lifecycle line reports it."""
+
+    LISTENING = "listening"
+    CLOSED = "closed"
+
+
 # How many lines before the silence to keep as context. Enough to reach past
 # the HTTP access-log chatter into the application's own loggers on the
 # REDUCED captures this is normally fed; raise --context on a full window,
@@ -118,8 +127,12 @@ _WRITER_PATTERN = re.compile(r"^\S+ \S+ (?P<identifier>\S+)\[(?P<pid>\d+)\]:")
 
 _SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
 _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
-_SOCKET_CLOSED_MARKERS = ("Closed fused-memory.socket",)
-_SOCKET_LIFECYCLE_MARKERS = ("Listening on fused-memory.socket", *_SOCKET_CLOSED_MARKERS)
+_SOCKET_UNIT = "fused-memory.socket"
+_SOCKET_CLOSED_MARKERS = (f"Closed {_SOCKET_UNIT}",)
+_SOCKET_STATE_MARKERS = (
+    (SocketState.LISTENING, (f"Listening on {_SOCKET_UNIT}",)),
+    (SocketState.CLOSED, _SOCKET_CLOSED_MARKERS),
+)
 # A stall that BEGINS here began with the unit already down.
 # The stop-time accounting earns its place: systemd emits it as the unit
 # deactivates, which makes that the LAST line of a real stop sequence, so
@@ -287,15 +300,15 @@ class StallEpisode:
 
     *restart_sequence* is the systemd restart THIS stall triggered, and is
     empty when it triggered none. *pre_stall_context* is the tail of what came
-    before the silence. *last_socket_line_before_stall* is fused-memory.socket's
-    last `Listening on`/`Closed` line at or before the silence began, None when
-    the capture carries none.
+    before the silence. *socket_state_before_stall* is what fused-memory.socket's
+    latest `Listening on`/`Closed` line at or before the silence reports, None
+    when the capture carries none.
     """
 
     stall_started_at: dt.datetime
     stall_ended_at: dt.datetime
     last_line_before_stall: str
-    last_socket_line_before_stall: str | None
+    socket_state_before_stall: SocketState | None
     pre_stall_context: tuple[str, ...]
     restart_sequence: tuple[tuple[dt.datetime, str], ...]
     unit_process_names: frozenset[str]
@@ -339,10 +352,10 @@ class StallEpisode:
         where :attr:`port_witnessed_closed`. There are two witnesses. One is the
         capture predating socket activation, when the stopped process took its
         own socket with it. The other is fused-memory.socket's own latest
-        `Closed` line. Otherwise this is None: under socket activation a
-        restart or crash keeps the socket bound and logs nothing on it, so the
-        probe could have read either verdict (OPERATIONS.md §"fused-memory
-        liveness revive").
+        lifecycle line reporting it closed. Otherwise this is None: under
+        socket activation a restart or crash keeps the socket bound and logs
+        nothing on it, so the probe could have read either verdict
+        (OPERATIONS.md §"fused-memory liveness revive").
         """
         if not self.began_with_unit_down:
             return WEDGED
@@ -353,9 +366,9 @@ class StallEpisode:
         """Does this capture witness port 8002 closed when a down-unit silence began?"""
         if not self.began_with_unit_down:
             return False
-        socket_line = self.last_socket_line_before_stall
-        return self.stall_started_at < FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT or (
-            socket_line is not None and _carries_marker(socket_line, _SOCKET_CLOSED_MARKERS)
+        return (
+            self.stall_started_at < FUSED_MEMORY_SOCKET_FIRST_COMMITTED_AT
+            or self.socket_state_before_stall is SocketState.CLOSED
         )
 
     @property
@@ -478,15 +491,28 @@ def restart_sequence_after(lines: list[tuple[dt.datetime, str]], stall_end: int)
     return tuple(sequence)
 
 
-def _last_line_carrying(
-    lines: list[tuple[dt.datetime, str]],
-    end: int,
-    markers: tuple[str | re.Pattern[str], ...],
-) -> str | None:
-    """The last of the first *end* lines that carries any of *markers*, or None."""
-    for _, line in reversed(lines[:end]):
+def _socket_states_before(lines: list[tuple[dt.datetime, str]]) -> list[SocketState | None]:
+    """fused-memory.socket's latest reported state before each line, in one forward pass.
+
+    Element *i* is what the last lifecycle line among the first *i* lines
+    reports, None until there is one, so the list is one longer than *lines*.
+    """
+    state: SocketState | None = None
+    states = [state]
+    for _, line in lines:
+        reported = _socket_state_reported_by(line)
+        if reported is not None:
+            state = reported
+        states.append(state)
+    return states
+
+
+def _socket_state_reported_by(line: str) -> SocketState | None:
+    if _SOCKET_UNIT not in line:
+        return None
+    for state, markers in _SOCKET_STATE_MARKERS:
         if _carries_marker(line, markers):
-            return line
+            return state
     return None
 
 
@@ -521,6 +547,7 @@ def analyze(
     """Report every silence longer than *stall_threshold_seconds*, in order."""
     lines = timestamped_lines(journal_text)
     names, pids = journal_writers(lines)
+    socket_states = _socket_states_before(lines)
     starts = [
         index
         for index in range(1, len(lines))
@@ -533,9 +560,7 @@ def analyze(
                 stall_started_at=lines[index - 1][0],
                 stall_ended_at=lines[index][0],
                 last_line_before_stall=lines[index - 1][1],
-                last_socket_line_before_stall=_last_line_carrying(
-                    lines, index, _SOCKET_LIFECYCLE_MARKERS
-                ),
+                socket_state_before_stall=socket_states[index],
                 pre_stall_context=tuple(
                     line for _, line in lines[max(0, index - context_lines):index]
                 ),
@@ -551,12 +576,14 @@ def as_dict(episode: StallEpisode) -> dict:
     """The episode as plain JSON-able data, absences preserved as null."""
     resources = episode.resources
     costs = episode.costs
+    socket_state = episode.socket_state_before_stall
     return {
         "stall_started_at": episode.stall_started_at.isoformat(),
         "stall_ended_at": episode.stall_ended_at.isoformat(),
         "stall_seconds": episode.stall_seconds,
         "outcome": episode.outcome,
         "watchdog_verdict": episode.watchdog_verdict,
+        "socket_state_before_stall": socket_state.value if socket_state is not None else None,
         "pre_stall_context": list(episode.pre_stall_context),
         "resources": dataclasses.asdict(resources) if resources else None,
         "killed_processes": [
@@ -580,7 +607,7 @@ def format_report(episodes: list[StallEpisode]) -> str:
         lines = [
             f"stall {number}: {episode.stall_seconds:.0f}s silent "
             f"({episode.stall_started_at:%H:%M:%S} -> {episode.stall_ended_at:%H:%M:%S})",
-            f"  outcome          {episode.outcome} ({_show_verdict(episode.watchdog_verdict)})",
+            f"  outcome          {episode.outcome} ({_show_verdict(episode)})",
             f"  teardown         {_show_seconds(costs.teardown_seconds)}",
             f"  startup          {_show_seconds(costs.startup_seconds)}",
             f"  total            {_show_seconds(costs.total_seconds)}",
@@ -616,13 +643,20 @@ def _show_gigabytes(byte_count: float | None) -> str:
     return "not measured" if byte_count is None else f"{byte_count / 1024**3:.1f}G"
 
 
-def _show_verdict(verdict: str | None) -> str:
-    if verdict is None:
+def _show_verdict(episode: StallEpisode) -> str:
+    verdict = episode.watchdog_verdict
+    if verdict is not None:
+        return f"watchdog would report {verdict}"
+    if episode.socket_state_before_stall is SocketState.LISTENING:
         return (
-            "watchdog verdict not witnessed: port 8002 may have stayed bound in "
-            "fused-memory.socket; add -u fused-memory.socket to the capture"
+            "watchdog verdict not witnessed: fused-memory.socket was last seen listening, "
+            "so port 8002 stayed bound and the verdict turned on how fast a "
+            "probe-activated unit answered /alive"
         )
-    return f"watchdog would report {verdict}"
+    return (
+        "watchdog verdict not witnessed: port 8002 may have stayed bound in "
+        "fused-memory.socket; add -u fused-memory.socket to the capture"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

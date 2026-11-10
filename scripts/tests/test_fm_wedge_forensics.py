@@ -835,7 +835,27 @@ def test_cli_reports_an_unwitnessed_watchdog_verdict_as_such():
     json_result = _run_cli(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL, "--json")
 
     assert json_result.returncode == 0, f"stderr={json_result.stderr!r}"
-    assert json.loads(json_result.stdout)["episodes"][0]["watchdog_verdict"] is None
+    episode = json.loads(json_result.stdout)["episodes"][0]
+    assert episode["watchdog_verdict"] is None
+    assert episode["socket_state_before_stall"] is None
+
+
+def test_cli_does_not_ask_for_a_socket_unit_the_capture_already_carries():
+    """A capture that saw the socket listening is not missing the socket unit,
+    so advising `add -u fused-memory.socket` would send the operator to re-run
+    a capture they already have."""
+    result = _run_cli(REOPENED_SOCKET_THEN_RESTART_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "fused-memory.socket was last seen listening" in result.stdout
+    assert "add -u fused-memory.socket" not in result.stdout
+
+    json_result = _run_cli(REOPENED_SOCKET_THEN_RESTART_JOURNAL, "--json")
+
+    assert json_result.returncode == 0, f"stderr={json_result.stderr!r}"
+    episode = json.loads(json_result.stdout)["episodes"][0]
+    assert episode["watchdog_verdict"] is None
+    assert episode["socket_state_before_stall"] == "listening"
 
 
 def test_cli_fails_loudly_when_nothing_in_the_input_parses():
