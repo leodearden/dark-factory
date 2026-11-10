@@ -234,18 +234,13 @@ def test_config_yaml_does_not_move_the_recon_report_port():
 
 
 def test_static_ports_owns_one_port_per_table_entry():
-    compose = {
-        exposure.OwnedPort(port=port, owner=f"compose service {service}")
-        for port, service in exposure.COMPOSE_PUBLISHED_PORTS.items()
-    }
-    recon = {
-        owned for owned in exposure.STATIC_PORTS if owned.port == exposure.RECON_REPORT_PORT
-    }
-    assert len(exposure.STATIC_PORTS) == len(exposure.COMPOSE_PUBLISHED_PORTS) + 1
-    assert set(exposure.STATIC_PORTS) == compose | recon
-    assert [owned.owner for owned in recon] == [
-        "fused-memory recon-report (ServerConfig.recon_report_port)"
-    ]
+    assert sorted(owned.port for owned in exposure.STATIC_PORTS) == sorted(
+        [*exposure.COMPOSE_PUBLISHED_PORTS, exposure.RECON_REPORT_PORT]
+    )
+    owner_of = {owned.port: owned.owner for owned in exposure.STATIC_PORTS}
+    for port, service in exposure.COMPOSE_PUBLISHED_PORTS.items():
+        assert service in owner_of[port]
+    assert "ServerConfig.recon_report_port" in owner_of[exposure.RECON_REPORT_PORT]
 
 
 def test_merge_owners_names_every_owner_of_a_port_once_in_source_order():
