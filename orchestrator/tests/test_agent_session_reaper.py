@@ -469,3 +469,81 @@ class TestZombieSidecarReap:
             'unresolvable': 0,
             'status_read_error': None,
         }
+
+
+def _seed_plan_worktree(base: Path, task_id: str) -> Path:
+    """A cold worktree whose plan has completed work, so recovery pre-loads it."""
+    plan = {
+        'task_id': task_id,
+        'title': 'Test Task',
+        'steps': [
+            {'id': 'step-1', 'description': 'Step 1', 'status': 'done', 'commit': 'abc0'},
+            {'id': 'step-2', 'description': 'Step 2', 'status': 'pending', 'commit': None},
+        ],
+    }
+    entry = base / task_id
+    _write_json(entry / '.task' / 'plan.json', plan)
+    return entry
+
+
+@pytest.mark.asyncio
+class TestReaperWiredIntoCrashRecovery:
+    """Where the reaper hangs off step 2c, and where it must NOT run."""
+
+    async def test_runs_once_after_the_sweep_and_before_the_first_cleanup(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+    ):
+        order: list[str] = []
+        monkeypatch.setattr(
+            harness, '_sweep_orphaned_transcripts',
+            MagicMock(side_effect=lambda *a, **k: order.append('sweep') or 0),
+        )
+        real_reap = harness._reap_zombie_sidecars
+
+        async def _reap() -> ReapTally:
+            order.append('reap')
+            return await real_reap()
+
+        monkeypatch.setattr(harness, '_reap_zombie_sidecars', _reap)
+
+        async def _cleanup(*a, **k):
+            order.append('cleanup')
+
+        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=_cleanup)
+        (harness.git_ops.worktree_base / '71').mkdir(parents=True, exist_ok=True)
+
+        await harness._recover_crashed_tasks()
+
+        assert order.count('reap') == 1
+        assert order.index('sweep') < order.index('reap') < order.index('cleanup')
+
+    async def test_not_run_when_pool_storage_absent(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '72', owner_pid=_DEAD_PID, task_id='72')
+        get_statuses = _serve_statuses(harness, {'72': 'pending'})
+        monkeypatch.setattr(harness.git_ops, 'pool_in_use', MagicMock(return_value=True))
+        monkeypatch.setattr(
+            harness.git_ops, 'pool_storage_present', MagicMock(return_value=False),
+        )
+        monkeypatch.setattr(harness, '_file_pool_storage_absent_escalation', MagicMock())
+
+        await harness._recover_crashed_tasks()
+
+        assert sidecar.exists()
+        get_statuses.assert_not_awaited()
+
+    async def test_reaper_failure_is_a_partial_outcome_and_plans_still_recover(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setattr(
+            harness, '_reap_zombie_sidecars',
+            AsyncMock(side_effect=RuntimeError('reaper bug')),
+        )
+        _seed_plan_worktree(harness.git_ops.worktree_base, '73')
+
+        failures = await harness._recover_crashed_tasks()
+
+        assert [f.exception_type for f in failures.failures] == ['RuntimeError']
+        assert '73' in harness._recovered_plans
