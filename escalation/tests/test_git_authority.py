@@ -19,6 +19,7 @@ import dataclasses
 import enum
 import logging
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -492,16 +493,19 @@ class TestProbeLanding:
             'commit_citation_pattern opt-out weakened merge_sha'
         )
 
-    @pytest.mark.parametrize('arm', ['marker', 'ancestor'])
+    @pytest.mark.parametrize('make_git_ops', [
+        pytest.param(lambda: _marker_git_ops(marker='d' * 40), id='marker'),
+        pytest.param(
+            lambda: _ancestor_git_ops(tip='a' * 40, citation='c' * 40), id='ancestor',
+        ),
+    ])
     @pytest.mark.parametrize('key', ['801', 'task/801'], ids=['bare', 'prefixed'])
     async def test_metadata_is_read_by_the_bare_task_id_for_either_key_shape(
-        self, tmp_path: Path, key: str, arm: str,
+        self, tmp_path: Path, key: str,
+        make_git_ops: Callable[[], types.SimpleNamespace],
     ) -> None:
         """probe_landing derives the task id it reads metadata by from either key shape."""
-        git_ops = {
-            'marker': lambda: _marker_git_ops(marker='d' * 40),
-            'ancestor': lambda: _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
-        }[arm]()
+        git_ops = make_git_ops()
         harness = _harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}}))
 
         verdict = await probe_landing(
