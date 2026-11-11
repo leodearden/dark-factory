@@ -624,8 +624,7 @@ class Backfill:
 def _entry_ids_by_filed_title(cb: Mapping[str, Any]) -> dict[str, str]:
     """Each entry under the task title its own title files as, and under that
     of any candidate promoted to it, which a later correction may have
-    retitled away from. Where titles collide the last entry wins, as in
-    census._find_adjudicated_candidate."""
+    retitled away from. Where titles collide the last entry wins."""
     promoted_titles: dict[str, list[str]] = {}
     for candidate in cb.get("candidates") or []:
         if isinstance(candidate.get("promoted_to"), str) and isinstance(candidate.get("title"), str):
