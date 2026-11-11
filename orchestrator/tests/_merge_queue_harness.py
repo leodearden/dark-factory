@@ -116,12 +116,45 @@ async def finalize_through_gate(
     on_park: Callable[[], object] = lambda: None,
 ) -> bool:
     """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
-    re-verify (task 6155).  Returns True iff main was advanced.
+    re-verify (task 6155), and following its rebased head when the gate's
+    re-verify became a dispatch (task 8525).  Returns True iff main was advanced.
 
-    *on_park* runs each time the entry parks, before its gate has started.
+    *on_park* runs each time the entry parks, before its gate has started,
+    and once more before a dispatched rebased head is followed.
     """
     while True:
         advanced = await worker._finalize_inflight(entry)
         if entry.gate is None:
-            return advanced
+            break
         on_park()
+    head = None if advanced else _take_rebased_head(worker, entry)
+    if head is None:
+        return advanced
+    on_park()
+    return await drive_verify_and_advance(worker, head)
+
+
+def _take_rebased_head(
+    worker: SpeculativeMergeWorker, entry: InflightEntry,
+) -> RealMergeItem | None:
+    """Pop the rebased head *entry*'s gate parked for redispatch, as the lane's dispatch would.
+
+    None unless the redispatch park's front item is that head: a real item
+    for *entry*'s request carrying ``gate_rebase_of``.
+    """
+    parked = worker._intake.pending_redispatch()
+    head = parked[0] if parked else None
+    if not (
+        isinstance(head, _mq.RealMergeItem)
+        and head.gate_rebase_of is not None
+        and head.request.request_id == entry.item.request.request_id
+    ):
+        return None
+    worker._intake.next_redispatch()
+    states = _mq.ItemLifecycleState
+    request_id = head.request.request_id
+    worker._note_transition(
+        request_id, states.REDISPATCH_PARKED, states.DISPATCHING, live_obj=head,
+    )
+    worker._note_transition(request_id, states.DISPATCHING, states.VERIFYING)
+    return head

@@ -11,8 +11,10 @@ before B's verdict is spent or adopted:
 * built-awaiting-host B (one host): re-merged onto real main at dispatch,
   so its only verify runs on the rebased landing, and B lands without a gate
   re-verify of its own;
-* mid-verify B (two hosts): its verdict is voided at adoption and re-run on
-  real main, instead of being CAS-rebased through a gate re-verify;
+* mid-verify B (two hosts): A's gate re-verify becomes a dispatch of A's
+  rebased commit, so B's verify is cancelled and B re-anchors on that commit
+  at its own dispatch, landing with no voided verdict and no gate of its own
+  (task 8525);
 * a head that lands by a plain advance supersedes nothing, so a successor on
   its merge commit is never voided, even after main moves on past it;
 * a depth-2 follower C stacked on B, with no host free when B's verdict is
@@ -194,6 +196,17 @@ def _gate_retries(store: _LateArrivalFakeEventStore, task_id: str) -> list[dict]
     ]
 
 
+def _rows(store: _LateArrivalFakeEventStore, task_id: str) -> list[tuple[EventType, dict]]:
+    """Every row *store* holds for *task_id*, in emit order."""
+    return [(e['type'], e['data']) for e in store.events if e['task_id'] == task_id]
+
+
+async def _first_parent(repo: Path, commit: str) -> str:
+    rc, out, err = await _run(['git', 'rev-parse', f'{commit}^1'], cwd=repo)
+    assert rc == 0, err
+    return out.strip()
+
+
 async def _stacked_base(store: _LateArrivalFakeEventStore, task_id: str) -> str:
     await _until(
         lambda: bool(_events(store, EventType.speculative_merge, task_id)),
@@ -253,7 +266,7 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             assert _gate_retries(store, 'rb-b') == []
             assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
 
-    async def test_mid_verify_successor_verdict_is_voided_not_rebase_landed(
+    async def test_mid_verify_successor_reanchors_on_the_dispatched_rebased_head(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         head_gate = asyncio.Event()
@@ -265,36 +278,86 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
         store = _LateArrivalFakeEventStore()
 
         async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
-            _inject_two_host_allocator(
-                lane, _gated_runner(b_release, b_entered, passed=True, name='remote-mv'),
-            )
-            req_a = await _submitted(git_ops, config, 'mv-a')
-            req_b = await _submitted(git_ops, config, 'mv-b')
-            await queue.put(req_a)
-            await queue.put(req_b)
-            await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-            await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
-            a_pre = await _stacked_base(store, 'mv-b')
+            try:
+                _inject_two_host_allocator(
+                    lane, _gated_runner(b_release, b_entered, passed=True, name='remote-mv'),
+                )
+                req_a = await _submitted(git_ops, config, 'mv-a')
+                req_b = await _submitted(git_ops, config, 'mv-b')
+                await queue.put(req_a)
+                await queue.put(req_b)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
+                a_pre = await _stacked_base(store, 'mv-b')
 
-            await _land_foreign_commit(git_repo)
-            head_gate.set()
-            await _assert_landed_rebased(store, req_a, a_pre)
-            # The 2026-08-12 shape (task 5302): B verifies on A's superseded
-            # speculative commit, so it is an INV-3 dead link, not a
-            # verify-base divergence — B was dispatched on the right tip.
-            mid_flight = lane.two_layer_invariants(await git_ops.get_main_sha())
-            naming_b = [v for v in mid_flight if req_b.request_id in v]
-            assert len(naming_b) == 1 and 'INV-3' in naming_b[0], mid_flight
-            assert lane.snapshot()['verify_base_divergences'] == []
-            b_release.set()
+                await _land_foreign_commit(git_repo)
+                head_gate.set()
+                outcome_a = await _assert_landed_rebased(store, req_a, a_pre)
+                a_rebased = outcome_a.merge_sha
+                assert a_rebased
+                mid_flight = lane.two_layer_invariants(await git_ops.get_main_sha())
+                assert [
+                    v for v in mid_flight if req_b.request_id in v and 'INV-3' in v
+                ] == [], mid_flight
+                assert lane.snapshot()['verify_base_divergences'] == []
 
-            outcome_b = await wait_responsive(req_b.result, label='mv-b outcome')
+                outcome_b = await wait_responsive(req_b.result, label='mv-b outcome')
+            finally:
+                b_release.set()
+
             assert outcome_b.status == 'done', outcome_b
-            voids = _events(store, EventType.verdict_voided, 'mv-b')
-            assert [(v['point'], v['reason'], v['dead_link'], v['killer']) for v in voids] == [
-                ('adoption', 'chain_dead', a_pre, {'site': 'gate_rebased', 'task_id': 'mv-a'}),
+            landings = [
+                e['task_id'] for e in store.events
+                if e['type'] is EventType.merge_attempt and e['data'].get('outcome') == 'done'
             ]
-            assert voids[0]['item_commit'] and voids[0]['item_commit'] != a_pre
+            assert landings == ['mv-a', 'mv-b'], landings
+
+            a_rows = _rows(store, 'mv-a')
+            [gate_at] = [
+                i for i, (kind, data) in enumerate(a_rows)
+                if kind is EventType.merge_reverify_gate and data['reverify'] is True
+            ]
+            assert a_rows[gate_at][1]['merge_sha'] == a_rebased
+            rebased_verifies = [
+                (i, data) for i, (kind, data) in enumerate(a_rows)
+                if kind is EventType.merge_verify and data.get('merge_sha') == a_rebased
+            ]
+            assert rebased_verifies, a_rows
+            verify_at, a_verify = rebased_verifies[0]
+            assert gate_at < verify_at, a_rows
+            assert a_rebased != a_pre
+            assert (a_verify['speculative'], a_verify['base_relation']) == (False, 'main'), a_verify
+            assert a_verify['runner_reason'] != 'gate_on_head_host', a_verify
+            assert [row['gate_clearance'] for row in _gate_retries(store, 'mv-a')] == [
+                'reverified',
+            ]
+
+            b_rows = _rows(store, 'mv-b')
+            cancels = [
+                (i, data) for i, (kind, data) in enumerate(b_rows)
+                if kind is EventType.merge_verify_cancelled
+            ]
+            assert [data['cause'] for _, data in cancels] == ['gate_reanchor'], b_rows
+            b_reverify = next(
+                data for i, (kind, data) in enumerate(b_rows)
+                if i > cancels[0][0] and kind is EventType.merge_verify
+            )
+            assert b_reverify['base_relation'] == 'rebased_head', b_reverify
+            assert await _first_parent(git_repo, b_reverify['merge_sha']) == a_rebased
+
+            assert _events(store, EventType.verdict_voided, 'mv-b') == []
+            reanchors = [
+                data for data in _events(store, EventType.speculative_discard, 'mv-b')
+                if data.get('reason') == 'base_rebased'
+            ]
+            assert [
+                (d['dead_link'], d['killer'], d['anchor_reason'], d['anchor_base'])
+                for d in reanchors
+            ] == [
+                (a_pre, {'site': 'gate_rebased', 'task_id': 'mv-a'}, 'live_tip', a_rebased),
+            ]
+            assert reanchors[0]['item_commit']
+            assert _events(store, EventType.merge_reverify_gate, 'mv-b') == []
             assert _gate_retries(store, 'mv-b') == []
             assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
 

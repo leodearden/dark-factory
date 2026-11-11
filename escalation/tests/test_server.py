@@ -4949,14 +4949,45 @@ class TestGetMergeQueue:
     @staticmethod
     async def _finalize_through_gate(worker, entry) -> bool:
         """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
-        re-verify (task 6155), as
+        re-verify (task 6155) and following its rebased head when the gate's
+        re-verify became a dispatch (task 8525), as
         ``orchestrator/tests/_merge_queue_harness.py::finalize_through_gate``
         does for the orchestrator suite.  Returns True iff main advanced.
+
+        This suite's entries carry ``verify_task=None``, a pre-established
+        pass, so the followed head is finalized as one too.
         """
+        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+            InflightEntry,
+            ItemLifecycleState,
+            RealMergeItem,
+        )
+
         while True:
             advanced = await worker._finalize_inflight(entry)
-            if entry.gate is None:
+            if entry.gate is not None:
+                continue
+            parked = worker._intake.pending_redispatch()
+            head = parked[0] if parked else None
+            if advanced or not (
+                isinstance(head, RealMergeItem)
+                and head.gate_rebase_of is not None
+                and head.request.request_id == entry.item.request.request_id
+            ):
                 return advanced
+            worker._intake.next_redispatch()
+            worker._note_transition(
+                head.request.request_id, ItemLifecycleState.REDISPATCH_PARKED,
+                ItemLifecycleState.DISPATCHING, live_obj=head,
+            )
+            entry = InflightEntry(
+                item=head, lease=None, verify_task=None, merge_wt=head.merge_wt,
+                was_speculative=False,
+            )
+            worker._note_transition(
+                head.request.request_id, ItemLifecycleState.DISPATCHING,
+                ItemLifecycleState.VERIFYING, live_obj=entry,
+            )
 
     def _make_finalize_fixture(
         self,
