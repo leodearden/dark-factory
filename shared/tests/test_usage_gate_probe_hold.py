@@ -55,6 +55,15 @@ async def _cancel(task: asyncio.Task) -> None:
         await task
 
 
+async def _until_holding(holder: asyncio.Task, holding: asyncio.Event) -> None:
+    holding_seen = asyncio.ensure_future(holding.wait())
+    try:
+        await asyncio.wait({holding_seen, holder}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        await _cancel(holding_seen)
+    assert holding.is_set(), f'the holder exited before it held the slot: {holder!r}'
+
+
 async def test_a_long_running_probe_holder_does_not_starve_a_second_caller_after_resume():
     gate = make_gate(
         ['max-a', 'max-c'],
@@ -85,7 +94,7 @@ async def test_a_long_running_probe_holder_does_not_starve_a_second_caller_after
                 model='sonnet',
             )
         )
-        await asyncio.wait_for(holding.wait(), timeout=_SERVED_WITHIN_SECS)
+        await _until_holding(watcher, holding)
 
         implementer = await asyncio.wait_for(
             invoke_with_cap_retry(
