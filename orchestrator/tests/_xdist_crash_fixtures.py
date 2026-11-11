@@ -226,6 +226,26 @@ XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT = (
     + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
 )
 
+# task 5891: the 2026-10-30 laptop investigation's shape A. A test that runs a
+# nested pytest, as tests/scripts/nested_pytest_session.py::run_nested_pytest
+# does, failed, and its captured stdout carries the nested run's own progress
+# line and crash notice, printed AFTER the outer session's [100%].
+NESTED_RUN_FAILED_NODEID = 'orchestrator/tests/test_nested.py::test_nested_run'
+PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT = (
+    ('.' * 40 + 'F').ljust(73) + '[100%]\n'
+    + ' FAILURES '.center(80, '=') + '\n'
+    + ' test_nested_run '.center(80, '_') + '\n'
+    + 'orchestrator/tests/test_nested.py:12: in test_nested_run\n'
+    + '    assert result.returncode == 0\n'
+    + 'E   assert 1 == 0\n'
+    + ' Captured stdout call '.center(80, '-') + '\n'
+    + '......'.ljust(73) + '[ 60%]\n'
+    + '[gw0] node down: Not properly terminated\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0\n'
+    + '1 failed, 40 passed in 3.00s\n'
+)
+
 # task 5492: the multi-module join `verify.py::_aggregate_results` performs —
 # each module leg's test_output joined with '\n' — with the TRUNCATED module
 # NOT last. A completed -q module follows it, so the joined text's FINAL

@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
+    NESTED_RUN_FAILED_NODEID,
+    PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT,
     XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
     XDIST_BAILOUT_LINE,
     XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
@@ -4298,6 +4300,19 @@ class TestCompleteSessionIsNotLabelledAborted:
         assert self.HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_nested_runs_progress_line_in_captured_output_is_not_the_sessions(self):
+        output = PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0', (
+            f'Unexpected hint: {hint!r}'
+        )
 
 
 class TestVerifyResultCauseHint:
