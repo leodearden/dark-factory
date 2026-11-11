@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _plan_model_helpers import read_model
 from _review_fixtures import review_aggregation, review_issue
 from _review_payloads import blocking_review, pass_review
 from escalation.disposition import ReviewerDisposition
@@ -26,7 +27,9 @@ from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
+    PlanConfirmation,
     PlanMutexNotHeld,
+    PlanState,
     ReviewAggregation,
     ReviewsRootMissing,
     TaskArtifacts,
@@ -476,37 +479,70 @@ VALID_PLAN_WITH_STEPS = {
     ],
 }
 
+CONFIRMED_AT = '2026-01-01T00:00:00+00:00'
+CONFIRMED_PLAN_WITH_STEPS = {**VALID_PLAN_WITH_STEPS, '_finalized_at': CONFIRMED_AT}
+
+
+def _artifacts_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == 'orchestrator.artifacts' and record.levelname == 'WARNING'
+    ]
+
 
 class TestPlanProvenance:
     def test_stamp_plan_provenance_adds_session_id_and_created_at(self, artifacts: TaskArtifacts):
         # Must use a valid plan with at least one step (empty steps raises ValueError)
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         updated = artifacts.read_plan()
         assert updated['_session_id'] == 'session-abc123'
         assert '_created_at' in updated
 
-    def test_stamp_plan_provenance_backfills_finalized_marker(self, artifacts: TaskArtifacts):
-        # Invariant: a provenance-stamped plan is complete, so it carries the
-        # completeness marker even when confirm_plan was not the writer (eval
-        # initial_plan / SIMPLE_TASK paths).
+    def test_stamping_an_unconfirmed_plan_confirms_it_injected_and_warns(
+        self, artifacts: TaskArtifacts, caplog: pytest.LogCaptureFixture,
+    ):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
-        artifacts.stamp_plan_provenance('session-abc123')
-        assert artifacts.read_plan()['_finalized_at']
+        with caplog.at_level('WARNING', logger='orchestrator.artifacts'):
+            artifacts.stamp_plan_provenance('session-abc123')
+        plan = read_model(artifacts)
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmation is PlanConfirmation.INJECTED
+        assert artifacts.read_plan()['_confirmed_by'] == 'injected'
+        (warning,) = _artifacts_warnings(caplog)
+        assert 'task-1' in warning
+        assert 'partial' in warning
+
+    def test_stamping_a_confirmed_plan_keeps_its_confirmation_silently_and_returns_the_plan(
+        self, artifacts: TaskArtifacts, caplog: pytest.LogCaptureFixture,
+    ):
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, '_confirmed_by': 'architect'})
+        with caplog.at_level('WARNING', logger='orchestrator.artifacts'):
+            written = artifacts.stamp_plan_provenance('session-abc123')
+        plan = read_model(artifacts)
+        assert written == plan
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmed_at == CONFIRMED_AT
+        assert plan.lifecycle.confirmed_by is PlanConfirmation.ARCHITECT
+        assert _artifacts_warnings(caplog) == []
+
+    def test_the_returned_plan_is_the_plan_on_disk_for_an_unversioned_plan(self, artifacts: TaskArtifacts):
+        artifacts.artifact_path('plan.json').write_text(json.dumps(CONFIRMED_PLAN_WITH_STEPS))
+        written = artifacts.stamp_plan_provenance('session-abc123')
+        assert written.lifecycle.schema_version == PLAN_SCHEMA_VERSION
+        assert written == read_model(artifacts)
 
     def test_stamp_plan_provenance_preserves_existing_finalized_marker(self, artifacts: TaskArtifacts):
-        # setdefault must not clobber a marker the architect already stamped.
-        plan = dict(VALID_PLAN_WITH_STEPS)
-        plan['_finalized_at'] = '2026-01-01T00:00:00+00:00'
-        artifacts.write_plan(plan)
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
-        assert artifacts.read_plan()['_finalized_at'] == '2026-01-01T00:00:00+00:00'
+        assert artifacts.read_plan()['_finalized_at'] == CONFIRMED_AT
 
     def test_stamp_plan_provenance_preserves_existing_plan_data(self, artifacts: TaskArtifacts):
         plan = {
             'task_id': 'task-1',
             'analysis': 'Some analysis',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
+            '_finalized_at': CONFIRMED_AT,
         }
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('session-abc123')
@@ -518,7 +554,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_writes_the_task_text_fingerprint(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
         updated = artifacts.read_plan()
         assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
@@ -528,14 +564,14 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_fingerprint_overwrites_a_stale_one(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan({**VALID_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
         artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
         assert artifacts.read_plan()[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
 
     def test_stamp_plan_provenance_without_fingerprint_keeps_the_existing_one(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('planner', task_text_fp='tfp:authored')
         artifacts.stamp_plan_provenance('implementer-iteration')
         updated = artifacts.read_plan()
@@ -545,7 +581,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_without_fingerprint_adds_none(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
 
@@ -559,17 +595,17 @@ class TestPlanProvenance:
         assert plan_task_text_fp(plan) is None
 
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-abc123') is True
 
     def test_validate_plan_owner_false_for_mismatched_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
         assert artifacts.validate_plan_owner('session-different') is False
 
     def test_validate_plan_owner_false_when_no_provenance(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         # Not stamped — no _session_id in plan
         assert artifacts.validate_plan_owner('session-abc123') is False
 
@@ -582,7 +618,7 @@ class TestPlanProvenance:
         sessions must be accepted as valid owners; a third party still
         is not.
         """
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('orig-planner')
         artifacts.bump_revalidation_stamp('reval-runner')
 
@@ -656,7 +692,7 @@ class TestBumpRevalidationStamp:
     """Tests for ``bump_revalidation_stamp`` — Lever B's confirm_plan-equivalent."""
 
     def test_stamps_revalidated_at_and_session(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         artifacts.bump_revalidation_stamp('sess-1')
         updated = artifacts.read_plan()
         assert '_revalidated_at' in updated
@@ -666,7 +702,7 @@ class TestBumpRevalidationStamp:
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
-        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         ta.bump_revalidation_stamp('sess-1', base_commit='newsha456')
         assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'newsha456'
         assert ta.read_base_commit() == 'originalsha'
@@ -675,7 +711,7 @@ class TestBumpRevalidationStamp:
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
-        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
         ta.stamp_plan_provenance('s0', base_commit='planbase')
         ta.bump_revalidation_stamp('sess-1')  # base_commit=None default
         assert ta.read_base_commit() == 'originalsha'
@@ -689,6 +725,16 @@ class TestBumpRevalidationStamp:
         artifacts.artifact_path('plan.json').write_text('{"steps": []}')
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.bump_revalidation_stamp('sess-1')
+
+    def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('planner')
+        before = read_model(artifacts)
+        artifacts.bump_revalidation_stamp('reval', base_commit='newbase')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.confirmed_at == before.lifecycle.confirmed_at
+        assert after.lifecycle.session_id == 'planner'
 
 
 class TestSetPlanFiles:
@@ -705,6 +751,7 @@ class TestSetPlanFiles:
                 {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending', 'commit': None},
             ],
             'design_decisions': [{'decision': 'Use X', 'rationale': 'Because Y'}],
+            '_finalized_at': CONFIRMED_AT,
         }
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('S')
@@ -722,7 +769,7 @@ class TestSetPlanFiles:
     def test_preserves_original_session_id_when_owner_via_revalidation(
         self, artifacts: TaskArtifacts,
     ):
-        plan = dict(VALID_PLAN_WITH_STEPS)
+        plan = dict(CONFIRMED_PLAN_WITH_STEPS)
         plan['files'] = ['a.py']
         artifacts.write_plan(plan)
         artifacts.stamp_plan_provenance('orig-planner')
@@ -735,6 +782,33 @@ class TestSetPlanFiles:
         assert updated['_session_id'] == 'orig-planner'
         assert updated['_revalidated_by_session'] == 'reval-runner'
         assert artifacts.validate_plan_owner('reval-runner') is True
+
+    def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('S')
+        before = read_model(artifacts)
+        artifacts.set_plan_files(['a.py'], 'S')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle == before.lifecycle
+
+    def test_an_unowned_confirmed_plan_passes_to_the_caller_with_created_at_backfilled(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(CONFIRMED_PLAN_WITH_STEPS))
+        artifacts.set_plan_files(['a.py'], 'scope')
+        after = read_model(artifacts)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at is not None
+        assert after.lifecycle.confirmed_at == CONFIRMED_AT
+
+    def test_an_ownership_transfer_does_not_clobber_an_existing_created_at(self, artifacts: TaskArtifacts):
+        artifacts.write_plan({**CONFIRMED_PLAN_WITH_STEPS, '_created_at': CONFIRMED_AT})
+        artifacts.set_plan_files(['a.py'], 'scope')
+        after = read_model(artifacts)
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at == CONFIRMED_AT
 
 
 class TestStalePlanLock:

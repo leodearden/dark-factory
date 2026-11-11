@@ -3,7 +3,8 @@
 The parametrization of ``test_a_mutator_waits_for_the_mutex_and_both_writes_survive``
 is the census of plan.json writers on this server: a new mutator belongs in it.
 Each case races the mutator, on a second thread, against a holder already inside
-the mutex (``_plan_mutex_race``); both writes surviving is the property.
+the mutex (``_plan_mutex_race``); both writes surviving is the property. The census
+also pins each writer's lifecycle side: the PlanState it leaves a STAMPED plan in.
 """
 from __future__ import annotations
 
@@ -16,9 +17,10 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
+from _plan_model_helpers import read_model
 from _plan_mutex_race import HOLDER_MARKER_KEY, mark_holder, race_writer_against_held_mutex
 
-from orchestrator.artifacts import PlanMutexNotHeld, TaskArtifacts
+from orchestrator.artifacts import PlanMutexNotHeld, PlanState, TaskArtifacts
 from orchestrator.mcp import plan_markup_stamp
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
@@ -95,6 +97,7 @@ def _one_rejection_carried(plan: dict) -> bool:
 class _Case:
     mutate: Callable[[TaskArtifacts, str], dict[str, Any]]
     landed: Callable[[dict, str], bool]
+    after_stamped: PlanState
     holder_edit: Callable[[dict], None] = mark_holder
     holder_landed: Callable[[dict], bool] = _holder_marked
 
@@ -105,24 +108,29 @@ _CENSUS = [
         landed=lambda plan, head: plan['title'] == 'Re-plan',
         holder_edit=_stamp_one_rejection,
         holder_landed=_one_rejection_carried,
+        after_stamped=PlanState.SHELL,
     ), id='create_plan'),
     pytest.param(_Case(
         mutate=lambda ta, head: _add_plan_step(ta, 'step-3', 'impl', 'third'),
         landed=lambda plan, head: _ids(plan) == ['step-1', 'step-2', 'step-3'],
+        after_stamped=PlanState.PARTIAL,
     ), id='add_plan_step'),
     pytest.param(_Case(
         mutate=lambda ta, head: _add_prerequisite(ta, 'pre-1', 'a prerequisite'),
         landed=lambda plan, head: _ids(plan, 'prerequisites') == ['pre-1'],
+        after_stamped=PlanState.PARTIAL,
     ), id='add_prerequisite'),
     pytest.param(_Case(
         mutate=lambda ta, head: _add_design_decision(ta, 'D', 'R'),
         landed=lambda plan, head: plan['design_decisions'] == [
             {'decision': 'D', 'rationale': 'R'},
         ],
+        after_stamped=PlanState.STAMPED,
     ), id='add_design_decision'),
     pytest.param(_Case(
         mutate=lambda ta, head: _add_reuse_item(ta, 'W', 'H', 'how'),
         landed=lambda plan, head: plan['reuse'] == [{'what': 'W', 'where': 'H', 'how': 'how'}],
+        after_stamped=PlanState.STAMPED,
     ), id='add_reuse_item'),
     pytest.param(_Case(
         mutate=lambda ta, head: _drop_plan_file(ta, 'b.py', 'reason'),
@@ -130,12 +138,14 @@ _CENSUS = [
             plan['files'] == ['a.py']
             and [drop['path'] for drop in plan['dropped_files']] == ['b.py']
         ),
+        after_stamped=PlanState.STAMPED,
     ), id='drop_plan_file'),
     pytest.param(_Case(
         mutate=lambda ta, head: _mark_step_done(ta, 'step-1', head),
         landed=lambda plan, head: (
             _step(plan, 'step-1')['status'] == 'done' and _step(plan, 'step-1')['commit'] == head
         ),
+        after_stamped=PlanState.STAMPED,
     ), id='mark_step_done'),
     pytest.param(_Case(
         mutate=lambda ta, head: _record_step_deviation(
@@ -144,6 +154,7 @@ _CENSUS = [
         landed=lambda plan, head: [
             d['observed'] for d in _step(plan, 'step-1')['deviations']
         ] == ['observed'],
+        after_stamped=PlanState.STAMPED,
     ), id='record_step_deviation'),
     pytest.param(_Case(
         mutate=lambda ta, head: _record_descoped_step(
@@ -152,22 +163,27 @@ _CENSUS = [
         landed=lambda plan, head: [
             (d['step_id'], d['commit']) for d in plan['_descoped_steps']
         ] == [('step-1', head)] and '_rescoped_at' in plan,
+        after_stamped=PlanState.PARTIAL,
     ), id='record_descoped_step'),
     pytest.param(_Case(
         mutate=lambda ta, head: _update_plan_metadata(ta, analysis='new'),
         landed=lambda plan, head: plan['analysis'] == 'new',
+        after_stamped=PlanState.STAMPED,
     ), id='update_plan_metadata'),
     pytest.param(_Case(
         mutate=lambda ta, head: _remove_plan_step(ta, 'step-2'),
         landed=lambda plan, head: _ids(plan) == ['step-1'],
+        after_stamped=PlanState.PARTIAL,
     ), id='remove_plan_step'),
     pytest.param(_Case(
         mutate=lambda ta, head: _replace_plan_step(ta, 'step-2', 'impl', 'new'),
         landed=lambda plan, head: _step(plan, 'step-2')['description'] == 'new',
+        after_stamped=PlanState.PARTIAL,
     ), id='replace_plan_step'),
     pytest.param(_Case(
         mutate=lambda ta, head: _confirm_plan(ta),
         landed=lambda plan, head: '_finalized_at' in plan,
+        after_stamped=PlanState.STAMPED,
     ), id='confirm_plan'),
     pytest.param(_Case(
         mutate=lambda ta, head: _mark_step_committed(ta, 'step-1', head),
@@ -175,6 +191,7 @@ _CENSUS = [
             _step(plan, 'step-1')['status'] == 'done'
             and _step(plan, 'step-1')['description'] == f'[COMMITTED {head[:12]}] first'
         ),
+        after_stamped=PlanState.STAMPED,
     ), id='mark_step_committed'),
 ]
 
@@ -194,6 +211,17 @@ def test_a_mutator_waits_for_the_mutex_and_both_writes_survive(lane: _Lane, case
     assert envelopes[0].get('status') != 'error', envelopes[0]
     assert case.holder_landed(outcome.plan), f'the holder write was lost: {outcome.plan}'
     assert case.landed(outcome.plan, lane.head), f'the mutator write was lost: {outcome.plan}'
+
+
+@pytest.mark.parametrize('case', _CENSUS)
+def test_a_mutator_s_lifecycle_side(lane: _Lane, case: _Case) -> None:
+    assert _confirm_plan(lane.artifacts)['status'] == 'ok'
+    lane.artifacts.stamp_plan_provenance('stamper')
+
+    envelope = case.mutate(lane.artifacts, lane.head)
+
+    assert envelope.get('status') != 'error', envelope
+    assert read_model(lane.artifacts).state is case.after_stamped
 
 
 def test_mark_step_done_validates_against_the_plan_it_writes(lane: _Lane) -> None:

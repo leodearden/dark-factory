@@ -173,14 +173,15 @@ _TEXT_DRIFT_NOTICES = {
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
         'plan was authored. Re-read them and change the plan to cover the '
-        'amended scope; call confirm_plan() only if it already does.'
+        'amended scope, then call confirm_plan(); if it already covers it, '
+        'confirm it unchanged.'
     ),
     TaskTextDrift.UNSTAMPED: (
         '## The Task Text May Have Changed\n\n'
         'This plan carries no record of the task text it was authored against, '
         'so the description or details under # Task may have been amended '
-        'since. Re-read them and change the plan if its scope has moved; call '
-        'confirm_plan() only if it already covers it.'
+        'since. Re-read them and change the plan if its scope has moved, then '
+        'call confirm_plan(); if it already covers it, confirm it unchanged.'
     ),
 }
 
@@ -729,6 +730,10 @@ and either confirm it, update it, or recreate it from scratch.
    human ratification marker. A revalidation that drops a done step without
    that record, or newly marks a step done at another done step's commit, is
    refused.
+6. Once the plan is valid, after (a), (b) or (c) alike, call `confirm_plan()`
+   as your FINAL action. Editing the step set (b) or calling `create_plan` (c)
+   clears the plan's confirmation, so a revalidation that stops without it
+   leaves an unconfirmed plan.
 """
 
     async def build_plan_completion_prompt(
@@ -992,6 +997,8 @@ The implementation was reviewed and blocking issues were found.
 4. Keep every existing step in place, in order: do not remove or reorder
    steps, and do not call `create_plan` — it replaces the plan wholesale and
    would discard completed steps.
+5. Call `confirm_plan()` as your FINAL action. Adding steps clears the plan's
+   confirmation, so a replan that stops without it leaves an unconfirmed plan.
 """
 
     async def build_simple_task_prompt(
