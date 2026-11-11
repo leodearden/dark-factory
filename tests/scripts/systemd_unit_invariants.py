@@ -2,8 +2,8 @@
 
 This module holds NO test functions of its own.  It exists because the
 restart-backoff invariant below is applied from two places — the dashboard
-unit/template suite (tests/scripts/test_dashboard_service_template.py, which
-also owns the helper's negative-case guard) and the fleet-wide sweep
+restart-policy suite (tests/scripts/test_dashboard_unit_restart_policy.py,
+which also owns the helper's negative-case guard) and the fleet-wide sweep
 (tests/scripts/test_systemd_restart_backoff.py) — and duplicating it into
 both is how the two copies drift until one silently stops catching the
 defect.  Written for task 3333, lifted here by task 3408.  The same
@@ -231,7 +231,7 @@ def config_arg_from_exec_start(
 # The effective ExecStart= command
 #
 # Read by tests/scripts/test_orchestrator_service_files.py::
-# _exec_start_config_arg, tests/scripts/test_dashboard_service_template.py::
+# _exec_start_config_arg, tests/scripts/test_dashboard_unit_uvicorn_timeouts.py::
 # _uvicorn_int_flag and tests/scripts/test_uv_run_venv_isolation.py::
 # discover_uv_run_units.  Its home is here because those three carried three
 # disagreeing copies.  Its negative-case guard lives in
@@ -312,27 +312,31 @@ def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
 # unit's text reveals this; the only signal is a load-time warning nobody reads.
 #
 # The invariant below is RELATIONAL and CONDITIONAL, mirroring
-# _assert_drain_bounded in the dashboard suite: the defect is the missing
-# PAIRING, not the absence of either directive on its own.  RestartSteps= alone
-# is meaningless and RestartMaxDelaySec= alone is thrown away, while a unit that
-# deliberately declares no cap is not in violation of anything.
+# tests/scripts/test_dashboard_unit_uvicorn_timeouts.py::_assert_drain_bounded:
+# the defect is the missing PAIRING, not the absence of either directive on
+# its own.  RestartSteps= alone is meaningless and RestartMaxDelaySec= alone is
+# thrown away, while a unit that deliberately declares no cap is not in
+# violation of anything.
 # ---------------------------------------------------------------------------
 
 
 def restart_directive(path: pathlib.Path, name: str) -> str | None:
     r"""Return the effective value of ``<name>=`` in *path*, or None if absent.
 
-    Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
-    captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
-    spelling (``RestartMaxDelaySec=60s``, ``RestartSec=1min``) is reported as the
-    present directive it is rather than misdiagnosed as a missing line.  Matching
+    Mirrors the opaque-token-then-parse style of
+    tests/scripts/test_dashboard_unit_uvicorn_timeouts.py::_timeout_stop_sec: the
+    value is captured as ``(.*)`` and interpreted by the caller, so a
+    valid-but-unexpected spelling (``RestartMaxDelaySec=60s``,
+    ``RestartSec=1min``) is reported as the present directive it is rather than
+    misdiagnosed as a missing line.  Matching
     ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
     skip the pairing invariant silently — the worst possible failure for a guard
     whose entire job is to notice a directive that is being ignored.
 
     LAST occurrence wins, not the first, which is why this uses ``findall`` and
-    not ``search`` (the same reasoning _success_exit_statuses applies to
-    repeated directives, reaching the opposite conclusion only because
+    not ``search`` (the same reasoning
+    tests/scripts/test_dashboard_unit_restart_policy.py::_success_exit_statuses
+    applies to repeated directives, reaching the opposite conclusion only because
     SuccessExitStatus= is one of the few systemd directives that ACCUMULATES).
     These restart directives are scalars, and systemd overwrites on each repeat.
     Measured on this host (systemd 255.4): a unit carrying ``RestartSteps=4``
@@ -480,7 +484,7 @@ FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 # parity.py became its second consumer: exactly the trigger condition this
 # module's own docstring describes.  Its negative-case guard stays where it
 # was written, in test_know_live_installed_unit_parity.py, mirroring how
-# test_dashboard_service_template.py owns assert_restart_backoff_effective's.
+# test_dashboard_unit_restart_policy.py owns assert_restart_backoff_effective's.
 # ---------------------------------------------------------------------------
 
 
