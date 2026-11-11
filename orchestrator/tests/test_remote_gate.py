@@ -81,9 +81,10 @@ FAKE_FINGERPRINT = 'a' * 64
 def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     """A changed vector means a wire shape changed: re-pin it deliberately.
 
-    ``fused-memory/scripts/check_bare_magicmock_config.py`` keeps a second,
-    exhaustive copy of ``VerifyResult``'s field list for its mock-shape rule;
-    a field change must update it too (folding the two is a follow-up).
+    The Rule B mock-shape registry
+    (``fused-memory/scripts/check_bare_magicmock_config.py::_DATACLASS_SHAPES``)
+    derives ``VerifyResult``'s fields from the same class definition, so a field
+    change re-pins only this vector.
     """
     assert wire_fingerprint(wire_classes()) == (
         '3076fb1cad4f7b75b1c1671568bcb88b1eba726d7c1ffcec5522a10ca5002605'

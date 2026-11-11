@@ -219,9 +219,12 @@ This script is intentionally stdlib-only (ast, collections.abc, pathlib, sys, ty
 plus its stdlib-only sibling _lint_cli.py) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.  This is why
-``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
-describes: ``import orchestrator.verify`` would need pydantic and break every caller.
-The hardcoded copy's drift guards live in the test, which CAN import it:
+``_DATACLASS_SHAPES`` never imports the dataclasses it describes: ``import
+orchestrator.verify`` would need pydantic and break every caller.  Instead it reads
+each one's fields from its defining source with ``dataclass_field_names``: the same
+class definition orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint
+hashes via ``wire_classes()``, so one wire-shape change reaches both (task 7268).
+The reader's agreement with ``dataclasses.fields`` is guarded in
 fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry.
 """
 
@@ -232,6 +235,8 @@ import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -301,12 +306,14 @@ class _DataclassShape(NamedTuple):
     VerifyResult does not have, so a subset rule would have missed precisely the
     defect this rule exists to catch.
 
-    ``factory`` names the helper the message offers as the remedy, and
-    ``factory_home`` the repo-relative path of the module that defines it.
+    ``source`` is the repo-relative path of the module that defines the dataclass,
+    which Rule B reads its ``fields`` from.  ``factory`` names the helper the message
+    offers as the remedy, and ``factory_home`` the repo-relative path of the module
+    that defines it.
     """
 
     name: str
-    module: str
+    source: str
     fields: frozenset[str]
     anchors: frozenset[str]
     min_field_matches: int
@@ -314,48 +321,32 @@ class _DataclassShape(NamedTuple):
     factory_home: str
 
 
-# Registered shapes.  The field lists are LITERALS, not imports: this script is
-# stdlib-only by hard contract (see module docstring) so hooks/project-checks and
-# all seven package lint_commands can run it under bare ``python3`` with no venv
-# resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
-#
-# VerifyResult's field list is a stdlib-only copy of
-# orchestrator/src/orchestrator/verify.py::VerifyResult, kept EXHAUSTIVE: a field
-# missing here does not count toward the overlap floor, so a double built from it
-# slips through.  Its drift guards are in
-# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
-# which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
-# one test per drift direction, and parse ``factory_home`` for ``factory``.
+def _registered_shape(
+    *,
+    name: str,
+    source: str,
+    anchors: frozenset[str],
+    min_field_matches: int,
+    factory: str,
+    factory_home: str,
+) -> _DataclassShape:
+    return _DataclassShape(
+        name=name,
+        source=source,
+        fields=dataclass_field_names(_REPO_ROOT / source, name),
+        anchors=anchors,
+        min_field_matches=min_field_matches,
+        factory=factory,
+        factory_home=factory_home,
+    )
+
+
+# Registered shapes: each one's fields are read from its defining source (see the
+# module docstring's last paragraph for why it is never imported).
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
-    _DataclassShape(
+    _registered_shape(
         name='VerifyResult',
-        module='orchestrator.verify',
-        fields=frozenset({
-            'passed',
-            'test_output',
-            'lint_output',
-            'type_output',
-            'summary',
-            'timed_out',
-            'cause_hint',
-            'category',
-            'worktree_log_paths',
-            'archive_log_paths',
-            'contention',
-            'plan',
-            'failing_test_ids',
-            'failing_test_ids_by_module',
-            'skipped_test_ids',
-            'failing_leg_categories',
-            'run_all_failed_members',
-            'trivial',
-            'duration_secs',
-            'flake_suppression',
-            'admission_legs',
-            'units',
-            'cache_mode',
-            'test_leg_failed',
-        }),
+        source='orchestrator/src/orchestrator/verify.py',
         anchors=frozenset({'passed'}),
         min_field_matches=2,
         factory='fake_verify_result',
@@ -454,7 +445,7 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
             f' of {shape.name}, which a bare MagicMock accepts silently.'
         )
     return (
-        f'unspecced MagicMock shaped like {shape.module}.{shape.name}'
+        f'unspecced MagicMock shaped like {shape.source}::{shape.name}'
         f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
         ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
         f' of raising AttributeError.{drift_clause}'
