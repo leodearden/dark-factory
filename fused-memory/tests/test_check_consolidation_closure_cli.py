@@ -34,6 +34,7 @@ from _fm_helpers import load_script_module
 from shared.project_id import project_id_for_root
 from shared.project_layout import default_project_root, tasks_db
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -41,6 +42,8 @@ from fused_memory.reconciliation.consolidation_gate import (
     closure_exists_probe,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = _ROOT / 'scripts' / 'check_consolidation_closure.py'

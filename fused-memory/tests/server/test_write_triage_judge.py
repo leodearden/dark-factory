@@ -44,6 +44,7 @@ from _mock_openai_server import mock_openai_server
 from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
 from _unreached_provider import skip_if_provider_unreached
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -107,6 +108,8 @@ from fused_memory.server.write_triage_judge import (
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
 from fused_memory.utils.clip_disclosure import TruncationFact, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _payload(word: object, candidate_id: object = None) -> str:

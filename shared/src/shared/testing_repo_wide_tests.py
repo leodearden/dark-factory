@@ -72,6 +72,20 @@ COMMITTED_CONFIG_NAMES = (
 )
 
 _REPO_ANCHOR_NAME = re.compile(r'_*(PROJECT_ROOT|REPO_ROOT)')
+
+
+def _vocabulary_pattern(names: tuple[str, ...]) -> re.Pattern[str]:
+    """Any of *names* as a substring; a name opening with '.' is an extension, so it must also end the word.
+
+    Without that, ``.service`` would match every ``pkg.services.module`` path.
+    """
+    return re.compile('|'.join(
+        re.escape(name) + (r'(?!\w)' if name.startswith('.') else '') for name in names
+    ))
+
+
+_COMMITTED_DOC_NAME = _vocabulary_pattern(COMMITTED_DOC_NAMES)
+_COMMITTED_CONFIG_NAME = _vocabulary_pattern(COMMITTED_CONFIG_NAMES)
 _GIT_LS_FILES = 'ls-files'
 
 
@@ -117,9 +131,9 @@ def _is_tree_walk_call(node: ast.Call) -> bool:
 def _string_signals(text: str) -> Iterator[RepoWideSignal]:
     if text == _GIT_LS_FILES:
         yield RepoWideSignal.TREE_WALK
-    if any(name in text for name in COMMITTED_DOC_NAMES):
+    if _COMMITTED_DOC_NAME.search(text):
         yield RepoWideSignal.COMMITTED_DOC_NAME
-    if any(name in text for name in COMMITTED_CONFIG_NAMES):
+    if _COMMITTED_CONFIG_NAME.search(text):
         yield RepoWideSignal.COMMITTED_CONFIG_NAME
 
 

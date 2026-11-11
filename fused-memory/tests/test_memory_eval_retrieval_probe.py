@@ -35,8 +35,11 @@ from _fm_helpers import load_script_module
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
 from shared.testing_streams import closed_pipe_stdout
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.eval import retrieval_probe, topic_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'

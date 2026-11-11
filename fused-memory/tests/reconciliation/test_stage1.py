@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _fm_helpers import complete_paged_read, incomplete_paged_read
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -84,6 +85,8 @@ from fused_memory.services.live_workflow_detector import WorkflowLiveness
 # Add a new shared consolidator fixture there, not here.
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 from reconciliation.harness_fixtures import make_harness, make_harness_config
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # project_root in legacy (time-windowed) assemble_payload

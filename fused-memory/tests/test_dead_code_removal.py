@@ -14,6 +14,11 @@ import importlib
 import importlib.util
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # Root of the repository (two levels up from fused-memory/tests/)
 _REPO_ROOT = Path(__file__).parent.parent.parent
 

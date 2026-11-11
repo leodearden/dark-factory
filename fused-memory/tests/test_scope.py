@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from shared.project_layout import known_project_roots
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
@@ -18,6 +19,8 @@ from fused_memory.models.scope import (
     resolve_project_id,
     resolve_project_id_for_root,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestResolveProjectId:

@@ -22,9 +22,9 @@ pytestmark = [
 
 _TESTS_DIR = Path(__file__).resolve().parent
 
-#: Set well below the 782 files and 164 repo-wide modules measured on
+#: Set well below the 782 files and 136 repo-wide modules measured on
 #: 2026-11-11, so a relocation of a few modules elsewhere cannot trip it.
-_FLOORS = RepoWideFloors(test_files=470, repo_wide_modules=82)
+_FLOORS = RepoWideFloors(test_files=470, repo_wide_modules=68)
 
 
 @functools.cache

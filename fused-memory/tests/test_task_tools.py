@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
 

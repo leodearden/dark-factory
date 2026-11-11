@@ -18,9 +18,12 @@ import pytest
 from pydantic import ValidationError
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import BeforeDone
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = 'scripts/check.sh'
 

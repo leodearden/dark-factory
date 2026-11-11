@@ -115,8 +115,12 @@ def test_committed_config_name_is_detected(word: str) -> None:
     assert _signals(f'name = {f"cfg/{word}"!r}\n') == {RepoWideSignal.COMMITTED_CONFIG_NAME}
 
 
-def test_committed_config_name_is_not_detected() -> None:
-    assert RepoWideSignal.COMMITTED_CONFIG_NAME not in _signals("name = 'pyproject.toml'\n")
+@pytest.mark.parametrize('name', [
+    pytest.param('pyproject.toml', id='other-config'),
+    pytest.param('fused_memory.services.write_journal', id='extension-inside-a-dotted-path'),
+])
+def test_committed_config_name_is_not_detected(name: str) -> None:
+    assert RepoWideSignal.COMMITTED_CONFIG_NAME not in _signals(f'name = {name!r}\n')
 
 
 _EVERY_WORD = (

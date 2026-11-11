@@ -21,6 +21,9 @@ from typing import NamedTuple
 import pytest
 from _fm_helpers import load_script_module
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -1276,10 +1279,12 @@ def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
 
 
 def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
-    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests do not.
+    """The scan classes' items resolve the repo-scan ceiling; this module's unit tests resolve the family's.
 
     Reads get_closest_marker on the collected items, which is what pytest-timeout
-    reads. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    reads. The unit tests carry the family ceiling through module-level membership
+    in the task-role whole-tree guard family. Family rationale:
+    shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
     """
     scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
     scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
@@ -1298,10 +1303,10 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
         'on a scan test REPLACES it.'
     )
     own = _timeout_seconds(request.node.get_closest_marker('timeout'))
-    assert own is None or own <= ini_default, (
-        f"this module's unit tests resolve a {own}s timeout mark, above the {ini_default}s ini "
-        'default. A mark overrides verify\'s CLI --timeout too, so a hang in any of them would '
-        'surface that much later; bind the repo-scan ceiling on the scan classes only.'
+    assert own == WHOLE_TREE_SCAN_TEST_TIMEOUT, (
+        f"this module's unit tests resolve a {own}s timeout mark, not the "
+        f'{WHOLE_TREE_SCAN_TEST_TIMEOUT}s whole-tree guard family ceiling its module-level '
+        'pytestmark binds; bind the repo-scan ceiling on the scan classes only.'
     )
 
 

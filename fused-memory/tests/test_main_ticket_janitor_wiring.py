@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.curation_deferral import DeferReason
@@ -28,6 +29,8 @@ from fused_memory.middleware.ticket_janitor import curation_backlog_anchor
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'

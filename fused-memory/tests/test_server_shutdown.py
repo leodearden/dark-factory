@@ -6,8 +6,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.main import _build_uvicorn_config, _graceful_shutdown, _run_shielded
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _parse_timeout_stop_sec(unit_file_path: Path) -> float:
