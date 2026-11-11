@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pytest
 import yaml
-from _quality_fixture import append_events, config_reload, routing_decision
+from _quality_fixture import (
+    append_events,
+    config_reload,
+    routing_decision,
+    write_invocations,
+    write_runs_rows,
+)
 from _runs_db_fixture import EventRow, write_runs_db
 from shared.quality_series.stats import RegimeEvent
 from shared.tasks_db_readonly import connect_ro
@@ -31,8 +37,11 @@ from dashboard.data.quality_markers import (
     RoutingFold,
     RoutingStep,
     RuleSpan,
+    SnapshotIdentity,
     SourceType,
     availability_flags,
+    derive,
+    derived_markers,
     fold_routing_decisions,
     load_curated_markers,
     read_config_changes,
@@ -872,3 +881,177 @@ class TestConfigChanges:
             ConfigChange(event_id=1, at=_t(1), path='max_concurrent_tasks', old=4, new=6,
                          applied=False),
         ), skipped=2)
+
+
+SHA_A = 'a' * 40
+SHA_B = 'b' * 40
+
+
+def _derived(
+    store: Path, snapshots: tuple[SnapshotIdentity, ...] = (), project_id: str = 'dark_factory',
+) -> list[Marker]:
+    with closing(connect_ro(store)) as conn:
+        return derived_markers(conn, project_id, snapshots)
+
+
+class TestOtherDerivedSources:
+    def test_an_applied_briefing_change_is_a_reviewer_policy_marker_at_the_reload(
+        self, tmp_path: Path,
+    ) -> None:
+        store = _runs(tmp_path, [config_reload(_t(1), applied={
+            'review.reviewer_briefing': {'old': 'diff-only', 'new': 'd2'},
+        })])
+
+        (marker,) = _derived(store)
+
+        assert (marker.kind, marker.at) == (MarkerKind.REVIEWER_POLICY, _t(1))
+        assert marker.source == MarkerSource(SourceType.CONFIG_RELOAD, path='review.reviewer_briefing')
+        assert 'diff-only -> d2' in marker.label
+
+    def test_a_restart_required_briefing_or_an_unmatched_routing_reload_is_no_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        store = _runs(tmp_path, [
+            config_reload(_t(1), restart_required={
+                'review.reviewer_briefing': {'old': 'diff-only', 'new': 'd2'},
+            }),
+            config_reload(_t(2), applied={'models.architect': {'old': 'opus', 'new': 'fable'}}),
+        ])
+
+        assert _derived(store) == []
+
+    @pytest.mark.parametrize(('quiet_days', 'expected'), [
+        (6.9, [(_t(1), 'first')]),
+        (7, [(_t(1), 'first'), (_t(2), 'last')]),
+    ])
+    def test_a_policy_rule_marks_its_appearance_and_after_a_quiet_week_its_last(
+        self, tmp_path: Path, quiet_days: float, expected: list[tuple[datetime, str]],
+    ) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'implementer', layer='policy_rule', rule_id='retry-tier-up'),
+            _decision(2, 'implementer', layer='policy_rule', rule_id='retry-tier-up'),
+            _decision(2 + quiet_days * 24 * 60, 'merger'),
+        ])
+
+        markers = _derived(store)
+
+        assert all(marker.kind is MarkerKind.ROUTING_RULE for marker in markers)
+        assert all(marker.source == MarkerSource(SourceType.POLICY_RULE, rule='retry-tier-up')
+                   for marker in markers)
+        assert [(marker.at, marker.marker_id.rsplit(':', 1)[-1]) for marker in markers] == expected
+
+    def test_code_sha_change_points_are_deploy_markers(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [_decision(1, 'merger')])
+        write_runs_rows(store, [
+            ('r5', _t(50), SHA_A),
+            ('r1', _t(10), SHA_A),
+            ('r2', _t(20), None),
+            ('r3', _t(30), SHA_B),
+            ('r4', _t(40), SHA_B),
+        ])
+
+        markers = _derived(store)
+
+        assert [(m.kind, m.at, m.ref) for m in markers] == [
+            (MarkerKind.DEPLOY, _t(30), SHA_B), (MarkerKind.DEPLOY, _t(50), SHA_A),
+        ]
+        assert all(m.source == MarkerSource(SourceType.DEPLOY) for m in markers)
+
+    def test_no_runs_table_or_no_code_sha_column_is_no_deploy_marker(self, tmp_path: Path) -> None:
+        bare = _runs(tmp_path, [_decision(1, 'merger')], 'bare')
+        old = _runs(tmp_path, [_decision(1, 'merger')], 'old')
+        with closing(sqlite3.connect(old)) as conn:
+            conn.execute('CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL)')
+            conn.execute("INSERT INTO runs VALUES ('r1', '2026-10-21T00:00:00+00:00')")
+            conn.commit()
+
+        assert _derived(bare) == []
+        assert _derived(old) == []
+
+    def test_a_new_model_id_per_alias_after_the_first_is_a_model_marker(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [_decision(1, 'merger')])
+        write_invocations(store, [
+            ('opus', 'claude-opus-5-1', _t(10)),
+            ('sonnet', 'claude-sonnet-4', _t(20)),
+            ('opus', 'claude-opus-5-5', _t(30)),
+            ('opus', 'claude-opus-5-1', _t(40)),
+            ('opus', None, _t(50)),
+        ])
+
+        (marker,) = _derived(store)
+
+        assert (marker.kind, marker.at) == (MarkerKind.MODEL, _t(30))
+        assert marker.source == MarkerSource(SourceType.MODEL_VERSION, alias='opus')
+        assert marker.label == 'opus -> claude-opus-5-5'
+
+    def test_no_invocations_table_is_no_model_marker(self, tmp_path: Path) -> None:
+        assert _derived(_runs(tmp_path, [_decision(1, 'merger')])) == []
+
+    def test_a_params_change_between_snapshots_is_an_instrument_marker(self, tmp_path: Path) -> None:
+        snapshots = (
+            SnapshotIdentity(as_of_sha=SHA_A, committed_at=_t(10), params={'a': 1, 'b': 2}),
+            SnapshotIdentity(as_of_sha='c' * 40, committed_at=_t(20), params={'a': 1, 'b': 2}),
+            SnapshotIdentity(as_of_sha=SHA_B, committed_at=_t(30), params={'a': 1, 'b': 3, 'c': 1}),
+        )
+
+        (marker,) = _derived(_runs(tmp_path, [_decision(1, 'merger')]), snapshots)
+
+        assert (marker.kind, marker.at, marker.ref) == (MarkerKind.INSTRUMENT, _t(30), SHA_B)
+        assert 'b' in marker.label and 'c' in marker.label and 'a' not in marker.label.split(':')[-1]
+
+    def test_unreadable_source_rows_are_skipped_and_counted(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [_decision(1, 'merger'), (_t(2), None, 'config_reload', '{bad')])
+        write_runs_rows(store, [('r1', '2026-10-21T00:00:00', SHA_A), ('r2', _t(5), SHA_B)])
+
+        with closing(connect_ro(store)) as conn:
+            derived = derive(_fold(store), conn, ())
+
+        assert derived.skipped == 2
+        assert derived.markers == ()
+
+
+def _every_source(tmp_path: Path) -> Path:
+    store = _runs(tmp_path, [
+        *(_decision(minute, 'reviewer_comprehensive') for minute in range(1, 5)),
+        config_reload(_t(5), applied={'effort.reviewer': {'old': 'high', 'new': 'xhigh'},
+                                      'review.reviewer_briefing': {'old': 'a', 'new': 'b'}}),
+        *(_decision(minute, 'reviewer_comprehensive', effort='xhigh') for minute in range(6, 10)),
+        _decision(10, 'implementer', layer='policy_rule', rule_id='large-plan-steps'),
+        _decision(60 * 24 * 9, 'merger'),
+    ])
+    write_runs_rows(store, [('r1', _t(1), SHA_A), ('r2', _t(7), SHA_B)])
+    write_invocations(store, [('opus', 'claude-opus-5-1', _t(1)), ('opus', 'claude-opus-5-5', _t(8))])
+    return store
+
+
+class TestDerivedMarkers:
+    SNAPSHOTS = (
+        SnapshotIdentity(as_of_sha=SHA_A, committed_at=_t(1), params={'v': 1}),
+        SnapshotIdentity(as_of_sha=SHA_B, committed_at=_t(9), params={'v': 2}),
+    )
+
+    def test_every_derived_marker_is_scoped_to_the_project_for_every_series(
+        self, tmp_path: Path,
+    ) -> None:
+        markers = _derived(_every_source(tmp_path), self.SNAPSHOTS, project_id='reify')
+
+        assert {marker.kind for marker in markers} == {
+            MarkerKind.EFFORT, MarkerKind.REVIEWER_POLICY, MarkerKind.ROUTING_RULE,
+            MarkerKind.DEPLOY, MarkerKind.MODEL, MarkerKind.INSTRUMENT,
+        }
+        assert {marker.scope for marker in markers} == {'reify'}
+        assert {marker.series for marker in markers} == {None}
+        assert markers == sorted(markers, key=lambda marker: (marker.at, marker.marker_id))
+
+    def test_it_is_idempotent_and_equals_the_incremental_path(self, tmp_path: Path) -> None:
+        store = _every_source(tmp_path)
+        fold = RoutingFold.empty('dark_factory')
+        with closing(connect_ro(store)) as conn:
+            while not fold.complete:
+                fold = fold_routing_decisions(conn, fold, batch=2)
+            incremental = derive(fold, conn, self.SNAPSHOTS)
+
+        full = _derived(store, self.SNAPSHOTS)
+
+        assert full == _derived(store, self.SNAPSHOTS)
+        assert list(incremental.markers) == full
