@@ -2415,7 +2415,7 @@ class _ServiceDouble:
         # Recorded separately from search_calls so the depth a run actually
         # searched at can be asserted against the depth it DISCLOSED.
         self.search_limits: list[int] = []
-        self.initialized = False
+        self.opened_for_reads = False
         self.closed = False
         self.mem0 = self
 
@@ -2441,13 +2441,19 @@ class _ServiceDouble:
         return list(seeded)
 
     # -- lifecycle ---------------------------------------------------------
-    async def initialize(self):
-        self.initialized = True
+    async def initialize_for_reads(self):
+        self.opened_for_reads = True
 
     async def close(self):
         self.closed = True
 
     # -- every write path is a tripwire ------------------------------------
+    async def initialize(self):
+        raise _ReadOnlyViolation(
+            'the sweep took the full open, which starts the durable write queue '
+            'and runs Graphiti startup maintenance'
+        )
+
     async def add_memory(self, *a, **kw):
         raise _ReadOnlyViolation('the sweep called add_memory')
 
@@ -2550,7 +2556,7 @@ class TestReadOnlyGuarantee:
         )
 
         assert code == 0
-        assert double.initialized and double.closed
+        assert double.opened_for_reads and double.closed
         # And it did real work rather than completing by doing nothing.
         assert double.scroll_calls
         assert double.id_reads
@@ -2562,8 +2568,9 @@ class TestReadOnlyGuarantee:
 
         double = _ServiceDouble()
         for method in (
-            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
-            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+            'initialize', 'add_memory', 'add_episode', 'add_system_record',
+            'delete_memory', 'delete_episode', 'update_edge', 'merge_entities',
+            'delete_entity',
         ):
             with pytest.raises(_ReadOnlyViolation):
                 asyncio.run(getattr(double, method)())
