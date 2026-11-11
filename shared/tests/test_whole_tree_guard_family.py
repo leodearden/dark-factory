@@ -17,6 +17,7 @@ from shared.whole_tree_guard_family import (
     WHOLE_TREE_SCAN_TIMEOUT_NAME,
     is_whole_tree_guard_ast,
     is_whole_tree_guard_module,
+    min_leg_budget_for_family,
     module_level_timeout_arguments,
 )
 
@@ -195,3 +196,30 @@ def test_module_level_timeout_arguments_returns_the_name_node_unevaluated() -> N
     (argument,) = module_level_timeout_arguments(_HOUSE_GUARD_SOURCE)
     assert isinstance(argument, ast.Name)
     assert argument.id == 'WHOLE_TREE_SCAN_TEST_TIMEOUT'
+
+
+_RECORDED_WORST_GREEN_RUNS = [0.0, 296.88, 397.47, 930.59, 1695.08, 4626.17]
+
+
+@pytest.mark.parametrize('worst_green_run_secs', _RECORDED_WORST_GREEN_RUNS)
+def test_min_leg_budget_is_the_next_whole_hundred_past_a_late_hang_reaching_the_ceiling(
+    worst_green_run_secs: float,
+) -> None:
+    budget = min_leg_budget_for_family(worst_green_run_secs)
+    late_hang_fires_at = worst_green_run_secs + WHOLE_TREE_SCAN_TEST_TIMEOUT
+    assert isinstance(budget, int)
+    assert budget % 100 == 0
+    assert budget >= late_hang_fires_at
+    assert budget - late_hang_fires_at < 100
+
+
+def test_min_leg_budget_adds_nothing_when_the_sum_is_already_a_whole_hundred() -> None:
+    worst_green_run_secs = float(100 - WHOLE_TREE_SCAN_TEST_TIMEOUT % 100)
+    assert min_leg_budget_for_family(worst_green_run_secs) == (
+        worst_green_run_secs + WHOLE_TREE_SCAN_TEST_TIMEOUT
+    )
+
+
+def test_min_leg_budget_never_shrinks_as_the_worst_green_run_grows() -> None:
+    budgets = [min_leg_budget_for_family(w) for w in sorted(_RECORDED_WORST_GREEN_RUNS)]
+    assert budgets == sorted(budgets)
