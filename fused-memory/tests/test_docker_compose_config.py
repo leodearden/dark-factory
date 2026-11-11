@@ -1,10 +1,13 @@
-"""Contract tests for the falkordb service in fused-memory/docker/docker-compose.yml.
+"""Contract tests for fused-memory/docker/docker-compose.yml.
+
+Every service publishes its ports on host loopback only.
 
 The falkordb image entrypoint (/var/lib/falkordb/bin/run.sh) runs
 ``redis-server ${REDIS_ARGS} --dir /var/lib/falkordb/data ...`` with no config
 file, so the compose file is the only durable home for redis options.
 """
 
+import ipaddress
 import re
 from pathlib import Path
 from typing import Any
@@ -22,9 +25,28 @@ EXPECTED_FALKORDB_MODULE_ARGS = {
 }
 
 
+def _compose_services() -> dict[str, dict[str, Any]]:
+    return yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))["services"]
+
+
 def _falkordb_service() -> dict[str, Any]:
-    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
-    return compose["services"]["falkordb"]
+    return _compose_services()["falkordb"]
+
+
+def _is_loopback_ip(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_loopback_publish(entry: object) -> bool:
+    if isinstance(entry, dict):
+        return _is_loopback_ip(str(entry.get("host_ip") or ""))
+    if not isinstance(entry, str):
+        return False
+    host_and_published = entry.rpartition(":")[0]
+    return _is_loopback_ip(host_and_published.rpartition(":")[0])
 
 
 def _service_env(service: dict[str, Any]) -> dict[str, str]:
@@ -127,4 +149,18 @@ def test_compose_timeout_is_the_timeout_fused_memory_expects() -> None:
         "the compose TIMEOUT and config.yaml graphiti.falkordb.expected_graph_timeout_ms "
         "must agree, or fused-memory warns about a server that is configured as intended; "
         f"compose TIMEOUT = {module_args['TIMEOUT']!r}, expected = {expected!r}"
+    )
+
+
+def test_every_compose_publish_binds_host_loopback() -> None:
+    offenders = [
+        (name, entry)
+        for name, service in _compose_services().items()
+        for entry in service.get("ports") or []
+        if not _is_loopback_publish(entry)
+    ]
+    assert offenders == [], (
+        "every published port must name a loopback host IP, e.g. \"127.0.0.1:6379:6379\": "
+        "a publish without one binds every host interface, IPv4 and IPv6. "
+        + "; ".join(f"{name}: {entry!r}" for name, entry in offenders)
     )
