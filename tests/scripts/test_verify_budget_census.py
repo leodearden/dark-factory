@@ -1,15 +1,19 @@
 """scripts/verify_budget_census.py's main(argv, now) and the one report dict both
-renderings read, including its provenance and the budget floor it derives
-through module_budget_family.census_budget_floor.
+renderings read, including its provenance and a budget floor that follows the
+rule the budget gate applies to the censused module.
 
 The synthetic-corpus norm lives in tests/scripts/verify_budget_census_fixture.py.
 """
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
+from typing import Any
 
+import module_budget_family
 import pytest
+import verify_budget_census_records
 from verify_budget_census_fixture import (
     FULL_SUITE,
     command_entry,
@@ -18,6 +22,30 @@ from verify_budget_census_fixture import (
     write_corpus,
     write_worktree_record,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _budget_section(text: str) -> str:
+    """The text report's floor section: its header line up to the next blank line."""
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith('DERIVED BUDGET FLOOR'))
+    end = next((i for i in range(start, len(lines)) if not lines[i].strip()), len(lines))
+    return '\n'.join(lines[start:end])
+
+
+def _module_level_literal(path: Path, symbol: str) -> Any:
+    """The literal bound to module-level *symbol* in *path*, or None if unbound."""
+    for node in ast.parse(path.read_text(encoding='utf-8')).body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == symbol for target in targets):
+            return ast.literal_eval(value)
+    return None
 
 
 class TestTheCliContract:
@@ -434,29 +462,21 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         its name: a moved record would leave a name-only check passing on a
         stale path (task 6172).
         """
-        import verify_budget_census_records
+        check = self._report(tmp_path, capsys, command_entry(duration_secs=4626.0))['budget_check']
+        feeds = check['feeds']
+        resolver = 'scripts/verify_budget_census.py::gate_floor_rule'
 
-        report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.0))
-
-        path, sep, name = report['budget_check']['feeds'].partition('::')
-        assert sep == '::', (
-            f'feeds={report["budget_check"]["feeds"]!r} is not a path::symbol '
-            'citation; repoint scripts/verify_budget_census.py::FEEDS_CONSTANT'
-        )
-        assert (Path(__file__).resolve().parents[2] / path).resolve() == Path(
+        assert check['rule'] == 'd17_census'
+        assert (REPO_ROOT / feeds['path']).resolve() == Path(
             verify_budget_census_records.__file__,
         ).resolve(), (
-            f'feeds names {path!r}, not the census record home '
-            f'{verify_budget_census_records.__file__}; repoint '
-            'scripts/verify_budget_census.py::FEEDS_CONSTANT'
+            f"feeds names {feeds['path']!r}, not the census record home "
+            f'{verify_budget_census_records.__file__}; repoint {resolver}'
         )
-        assert isinstance(
-            getattr(verify_budget_census_records, name, None),
-            verify_budget_census_records.BudgetCensus,
-        ), (
-            f'feeds names {name!r}, which is not a BudgetCensus record in '
-            'verify_budget_census_records; repoint '
-            'scripts/verify_budget_census.py::FEEDS_CONSTANT'
+        cited = getattr(verify_budget_census_records, feeds['symbol'], {})
+        assert cited.get(feeds['key']) is verify_budget_census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+            f"feeds names {feeds['symbol']}[{feeds['key']!r}], which is not "
+            f'verify_budget_census_records.ORCHESTRATOR_BUDGET_CENSUS; repoint {resolver}'
         )
 
     def test_the_section_names_the_refusal_ceiling_and_its_meaning(
@@ -491,7 +511,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         )
 
         assert '7000' in out
-        assert 'ORCHESTRATOR_BUDGET_CENSUS' in out
+        assert "RULED_BUDGET_CENSUS['orchestrator']" in out
 
     def test_the_floor_is_whatever_the_family_returns(
         self, tmp_path, capsys, monkeypatch,
@@ -577,3 +597,114 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         assert check['derived_floor'] is None
         assert 'unavailable' in check['note'].lower()
         assert check['exceeds_refusal_ceiling'] is False
+
+
+class TestTheFloorSectionFollowsTheRuleTheGateApplies:
+    """Task 7929: the section states the floor the budget gate enforces for --module.
+
+    Only the modules in ``verify_budget_census_records.RULED_BUDGET_CENSUS`` are
+    held to D17's census floor. The gate holds every other module to
+    ``min_budget(W)``, so the section must derive that floor and cite where W lives.
+    """
+
+    def _check(self, tmp_path, capsys, module):
+        _rc, out, _err = run_main(capsys, '--root', str(tmp_path), '--module', module, '--json')
+        return json.loads(out)['budget_check']
+
+    def _section(self, tmp_path, capsys, module):
+        _rc, out, _err = run_main(capsys, '--root', str(tmp_path), '--module', module)
+        return _budget_section(out)
+
+    def test_a_gate_table_module_gets_min_budget_and_cites_its_row(self, tmp_path, capsys):
+        worst = 1695.0841336008161
+        write_corpus(tmp_path, command_entry(duration_secs=worst), prefix='fused-memory')
+
+        check = self._check(tmp_path, capsys, 'fused-memory')
+
+        assert check['rule'] == 'min_budget'
+        assert check['derived_floor'] == module_budget_family.min_budget(worst)
+        assert check['refusal_ceiling'] is None
+        assert check['exceeds_refusal_ceiling'] is False
+        assert check['provenance'] == 'fused-memory/orchestrator.yaml'
+        feeds = check['feeds']
+        assert feeds['key'] == 'fused-memory'
+        cited_path = (REPO_ROOT / feeds['path']).resolve()
+        assert cited_path == module_budget_family.FAMILY_READER_PATH.resolve()
+        assert 'fused-memory' in (_module_level_literal(cited_path, feeds['symbol']) or {}), (
+            f"feeds cites {feeds['path']}::{feeds['symbol']}[{feeds['key']!r}], "
+            'which does not resolve'
+        )
+
+    def test_the_text_section_states_the_min_budget_rule_and_nothing_of_d17(
+        self, tmp_path, capsys,
+    ):
+        write_corpus(
+            tmp_path, command_entry(duration_secs=1695.0841336008161), prefix='fused-memory',
+        )
+
+        section = self._section(tmp_path, capsys, 'fused-memory')
+
+        for expected in (
+            '3300',
+            'min_budget',
+            "MEASURED_MODULE_SUITE_WORST_SECS['fused-memory']",
+            'fused-memory/orchestrator.yaml',
+        ):
+            assert expected in section, section
+        for absent in (
+            'D17', '1.5x', 'refusal ceiling', 'RULED_BUDGET_CENSUS', 'ORCHESTRATOR_BUDGET_CENSUS',
+        ):
+            assert absent not in section, section
+
+    def test_the_min_budget_floor_is_whatever_the_family_returns(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        monkeypatch.setattr(module_budget_family, 'min_budget', lambda _worst: 4343)
+        write_corpus(
+            tmp_path, command_entry(duration_secs=1695.0841336008161), prefix='fused-memory',
+        )
+
+        assert self._check(tmp_path, capsys, 'fused-memory')['derived_floor'] == 4343
+        assert '4343' in self._section(tmp_path, capsys, 'fused-memory')
+
+    def test_a_degenerate_floor_of_zero_prints_as_zero(self, tmp_path, capsys):
+        """min_budget legitimately returns 0 for a suite under ~50s."""
+        write_corpus(tmp_path, command_entry(duration_secs=22.49), prefix='fused-memory')
+
+        assert self._check(tmp_path, capsys, 'fused-memory')['derived_floor'] == 0
+        section = self._section(tmp_path, capsys, 'fused-memory')
+        floor_line = next(
+            line for line in section.splitlines() if line.strip().startswith('derived floor')
+        )
+        assert floor_line.split()[2] == '0', floor_line
+        assert '<none>' not in floor_line
+
+    def test_an_unreadable_ruled_table_derives_nothing_rather_than_guessing(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """Without the ruled table the rule is unknowable, so no rule is assumed.
+
+        A min_budget guess would print 9200 for orchestrator; a D17 guess would
+        reproduce task 7929's defect for every other module.
+        """
+        import sys  # noqa: PLC0415
+
+        import verify_budget_census as mod  # noqa: PLC0415
+
+        no_records = tmp_path / 'no-records'
+        no_records.mkdir()
+        monkeypatch.setattr(mod, '_FAMILY_DIR', no_records)
+        monkeypatch.setattr(sys, 'path', [
+            entry for entry in sys.path
+            if not (Path(entry or '.') / 'verify_budget_census_records.py').exists()
+        ])
+        monkeypatch.delitem(sys.modules, 'verify_budget_census_records', raising=False)
+        write_corpus(tmp_path, command_entry(duration_secs=4626.166946739017))
+
+        check = self._check(tmp_path, capsys, 'orchestrator')
+
+        assert check['rule'] is None
+        assert check['derived_floor'] is None
+        assert check['feeds'] is None
+        assert check['exceeds_refusal_ceiling'] is False
+        assert 'unavailable' in check['note'].lower()
