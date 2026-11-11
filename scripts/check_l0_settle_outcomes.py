@@ -323,6 +323,46 @@ def measure(records: Sequence[Record], *, now: datetime, window_days: int, max_p
     )
 
 
+class Breach(enum.StrEnum):
+    STRANDED_RATE = 'stranded_rate'
+    REAPER_WRONG = 'reaper_wrong'
+    PENDING_OVER_H = 'pending_over_h'
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    baseline_stranded_per_100: float
+    ratio: float
+    min_stranded: int
+    max_reaper_wrong: int
+    max_pending_hours: float
+
+
+def stranded_bar_per_100(report: Report, thresholds: Thresholds) -> float:
+    """R * max(pre rate, F): an empty pre window counts as 0, so the baseline floor F applies."""
+    return thresholds.ratio * max(report.pre.stranded_per_100 or 0.0, thresholds.baseline_stranded_per_100)
+
+
+def judge(report: Report, thresholds: Thresholds) -> list[Breach]:
+    post_rate = report.post.stranded_per_100
+    breaches: list[Breach] = []
+    if (
+        post_rate is not None
+        and post_rate >= stranded_bar_per_100(report, thresholds)
+        and report.post.stranded >= thresholds.min_stranded
+    ):
+        breaches.append(Breach.STRANDED_RATE)
+    if report.post.reaper_wrong >= thresholds.max_reaper_wrong:
+        breaches.append(Breach.REAPER_WRONG)
+    if report.pending_over_h > 0:
+        breaches.append(Breach.PENDING_OVER_H)
+    return breaches
+
+
+def resolve_exit_code(breaches: Sequence[Breach]) -> int:
+    return 1 if breaches else 0
+
+
 def _shown_rate(rate: float | None) -> str:
     return 'n/a' if rate is None else f'{rate:.{RATE_DIGITS}f}/100'
 
@@ -349,6 +389,33 @@ def render(report: Report) -> list[str]:
     ]
 
 
+def breach_line(breach: Breach, report: Report, thresholds: Thresholds) -> str:
+    post = report.post
+    match breach:
+        case Breach.STRANDED_RATE:
+            measured = (
+                f'post {_shown_rate(post.stranded_per_100)} >= bar '
+                f'{_shown_rate(stranded_bar_per_100(report, thresholds))} '
+                f'(ratio {thresholds.ratio:g} x max(pre {_shown_rate(report.pre.stranded_per_100)}, '
+                f'baseline {thresholds.baseline_stranded_per_100:g}/100)) '
+                f'and post stranded {post.stranded} >= {thresholds.min_stranded}'
+            )
+        case Breach.REAPER_WRONG:
+            measured = f'post reaper_wrong {post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
+        case Breach.PENDING_OVER_H:
+            measured = f'{report.pending_over_h} blocking L0s pending longer than {thresholds.max_pending_hours:g}h'
+    return f'breach: {breach}: {measured}'
+
+
+def verdict_json(report: Report, thresholds: Thresholds, breaches: Sequence[Breach]) -> dict[str, Any]:
+    return {
+        **report.as_json(),
+        'stranded_bar_per_100': round(stranded_bar_per_100(report, thresholds), RATE_DIGITS),
+        'breaches': [breach.value for breach in breaches],
+        'follow_up': REDESIGN_FOLLOW_UP if breaches else None,
+    }
+
+
 def compact_json(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, separators=(',', ':'), sort_keys=True)
 
@@ -367,14 +434,25 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    thresholds = Thresholds(
+        baseline_stranded_per_100=args.baseline_stranded_per_100,
+        ratio=args.ratio,
+        min_stranded=args.min_stranded,
+        max_reaper_wrong=args.max_reaper_wrong,
+        max_pending_hours=args.max_pending_hours,
+    )
     records = load_records(args.queue_dir)
     report = measure(
-        records, now=datetime.now(UTC), window_days=args.window_days, max_pending_hours=args.max_pending_hours,
+        records, now=datetime.now(UTC), window_days=args.window_days, max_pending_hours=thresholds.max_pending_hours,
     )
-    for line in render(report):
+    breaches = judge(report, thresholds)
+    lines = [*render(report), *(breach_line(breach, report, thresholds) for breach in breaches)]
+    if breaches:
+        lines.append(f'follow-up: {REDESIGN_FOLLOW_UP}')
+    for line in lines:
         print(line)
-    print(compact_json(report.as_json()))
-    return 0
+    print(compact_json(verdict_json(report, thresholds, breaches)))
+    return resolve_exit_code(breaches)
 
 
 if __name__ == '__main__':
