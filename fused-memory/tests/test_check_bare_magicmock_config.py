@@ -731,7 +731,7 @@ class TestDataclassShapeRegistry:
         """Every registered field is one VerifyResult really has, read at runtime.
 
         The script must stay stdlib-only, so the registry derives its fields from
-        ``shape.source`` with ``dataclass_field_names``; a stale name means that reader
+        ``shape.home`` with ``dataclass_field_names``; a stale name means that reader
         disagrees with ``dataclasses.fields``.  This test owns the STALE direction; the
         MISSING direction is owned by
         test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
@@ -760,7 +760,7 @@ class TestDataclassShapeRegistry:
         The behavioural consequence of the registry: a field VerifyResult has but the
         registry lacks would not count toward ``min_field_matches``, so a double built
         from it would slip through.  The registry derives its fields from
-        ``shape.source`` with ``dataclass_field_names``, so a missing name means that
+        ``shape.home`` with ``dataclass_field_names``, so a missing name means that
         reader disagrees with ``dataclasses.fields``.
         """
         unflagged = []
@@ -798,31 +798,28 @@ class TestDataclassShapeRegistry:
                 f'stray anchors={sorted(shape.anchors - shape.fields)}'
             )
 
-    def test_every_shape_names_its_source_and_factory_remedy(self):
+    def test_every_shape_names_its_home_and_factory_remedy(self):
         """Each shape carries the provenance the violation message is built from."""
         for shape in _checker._DATACLASS_SHAPES:
-            assert shape.source, f'{shape.name}: source must be set (message provenance)'
+            assert shape.home, f'{shape.name}: home must be set (message provenance)'
             assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
             assert shape.factory_home, (
                 f'{shape.name}: factory_home must name the file defining {shape.factory}'
             )
         verify_result = _checker._DATACLASS_SHAPES[0]
-        assert verify_result.source == 'orchestrator/src/orchestrator/verify.py'
         assert verify_result.factory == 'fake_verify_result'
         assert verify_result.factory_home == 'orchestrator/tests/_verify_result_doubles.py'
 
-    def test_registry_reads_the_file_defining_the_fingerprinted_verify_result(self):
-        """The registry's source file is where the fingerprinted VerifyResult lives."""
-        shape = _checker._DATACLASS_SHAPES[0]
-        source_file = inspect.getsourcefile(_fingerprinted_class(shape.name))
-        assert source_file is not None, f'{shape.name} has no Python source file'
-        fingerprinted = Path(source_file).resolve()
-        registered = (_REPO_ROOT / shape.source).resolve()
-        assert fingerprinted == registered, (
-            f'the Rule B registry reads {registered} but the wire fingerprint hashes the '
-            f'{shape.name} defined in {fingerprinted}; the registry and '
-            'orchestrator/src/orchestrator/remote_gate.py::wire_classes must read one '
-            'class definition'
+    def test_message_cites_the_file_defining_the_fingerprinted_verify_result(self):
+        """Rule B reads the VerifyResult the wire fingerprint hashes, and cites its file."""
+        source_file = inspect.getsourcefile(_fingerprinted_class('VerifyResult'))
+        assert source_file is not None, 'VerifyResult has no Python source file'
+        defining = Path(source_file).resolve().relative_to(_REPO_ROOT.resolve()).as_posix()
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert f'{defining}::VerifyResult' in message, (
+            f'Rule B must read the VerifyResult defined in {defining}, the class '
+            'orchestrator/src/orchestrator/remote_gate.py::wire_classes fingerprints; '
+            f'got {message!r}'
         )
 
     def test_the_registered_factory_is_defined_at_its_registered_home(self):
@@ -1057,7 +1054,6 @@ class TestDataclassDoubleMessage:
         message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
         for needle in (
             'VerifyResult',
-            'orchestrator/src/orchestrator/verify.py::VerifyResult',
             'fake_verify_result',
             'orchestrator/tests/_verify_result_doubles.py',
             'spec=VerifyResult',

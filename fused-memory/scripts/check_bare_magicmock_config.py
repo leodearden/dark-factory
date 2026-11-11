@@ -221,7 +221,7 @@ hooks/project-checks can invoke it via plain python3 without uv env-resolution o
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` never imports the dataclasses it describes: ``import
 orchestrator.verify`` would need pydantic and break every caller.  Instead it reads
-each one's fields from its defining source with ``dataclass_field_names``: the same
+each one's fields from its defining module with ``dataclass_field_names``: the same
 class definition orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint
 hashes via ``wire_classes()``, so one wire-shape change reaches both (task 7268).
 The reader's agreement with ``dataclasses.fields`` is guarded in
@@ -251,11 +251,11 @@ finally:
 _CONFIG_EXACT: frozenset[str] = frozenset({'config', 'cfg'})
 _CONFIG_SUFFIXES: tuple[str, ...] = ('_config', '_cfg')
 
-_DATACLASS_PSEUDO_FIELD_MARKERS: frozenset[str] = frozenset({'ClassVar', 'InitVar'})
+_DATACLASS_PSEUDO_FIELD_MARKERS: frozenset[str] = frozenset({'ClassVar', 'InitVar', 'KW_ONLY'})
 
 
 def _is_dataclass_pseudo_field(annotation: ast.expr) -> bool:
-    """Return True if *annotation* is ``ClassVar``/``InitVar``, bare or subscripted."""
+    """Return True if *annotation* marks a pseudo-field: ``ClassVar``, ``InitVar`` or ``KW_ONLY``."""
     marker = annotation.value if isinstance(annotation, ast.Subscript) else annotation
     if isinstance(marker, ast.Name):
         return marker.id in _DATACLASS_PSEUDO_FIELD_MARKERS
@@ -264,29 +264,30 @@ def _is_dataclass_pseudo_field(annotation: ast.expr) -> bool:
     return False
 
 
-def dataclass_field_names(source: Path, class_name: str) -> frozenset[str]:
+def dataclass_field_names(path: Path, class_name: str) -> frozenset[str]:
     """Mirror ``dataclasses.fields()`` for a base-less dataclass, without importing it."""
-    tree = ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
     matches = [
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == class_name
     ]
     if len(matches) != 1:
         raise ValueError(
-            f'expected exactly one top-level class {class_name!r} in {source}, '
+            f'expected exactly one top-level class {class_name!r} in {path}, '
             f'found {len(matches)}'
         )
     (cls,) = matches
     if cls.bases:
         bases = ', '.join(ast.unparse(base) for base in cls.bases)
         raise ValueError(
-            f'class {class_name!r} in {source} has base classes ({bases}); '
+            f'class {class_name!r} in {path} has base classes ({bases}); '
             'inherited fields are invisible to a stdlib AST read'
         )
     return frozenset(
         stmt.target.id
         for stmt in cls.body
         if isinstance(stmt, ast.AnnAssign)
+        and stmt.simple
         and isinstance(stmt.target, ast.Name)
         and not _is_dataclass_pseudo_field(stmt.annotation)
     )
@@ -306,14 +307,14 @@ class _DataclassShape(NamedTuple):
     VerifyResult does not have, so a subset rule would have missed precisely the
     defect this rule exists to catch.
 
-    ``source`` is the repo-relative path of the module that defines the dataclass,
+    ``home`` is the repo-relative path of the module that defines the dataclass,
     which Rule B reads its ``fields`` from.  ``factory`` names the helper the message
     offers as the remedy, and ``factory_home`` the repo-relative path of the module
     that defines it.
     """
 
     name: str
-    source: str
+    home: str
     fields: frozenset[str]
     anchors: frozenset[str]
     min_field_matches: int
@@ -324,7 +325,7 @@ class _DataclassShape(NamedTuple):
 def _registered_shape(
     *,
     name: str,
-    source: str,
+    home: str,
     anchors: frozenset[str],
     min_field_matches: int,
     factory: str,
@@ -332,8 +333,8 @@ def _registered_shape(
 ) -> _DataclassShape:
     return _DataclassShape(
         name=name,
-        source=source,
-        fields=dataclass_field_names(_REPO_ROOT / source, name),
+        home=home,
+        fields=dataclass_field_names(_REPO_ROOT / home, name),
         anchors=anchors,
         min_field_matches=min_field_matches,
         factory=factory,
@@ -341,12 +342,12 @@ def _registered_shape(
     )
 
 
-# Registered shapes: each one's fields are read from its defining source (see the
+# Registered shapes: each one's fields are read from its ``home`` module (see the
 # module docstring's last paragraph for why it is never imported).
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _registered_shape(
         name='VerifyResult',
-        source='orchestrator/src/orchestrator/verify.py',
+        home='orchestrator/src/orchestrator/verify.py',
         anchors=frozenset({'passed'}),
         min_field_matches=2,
         factory='fake_verify_result',
@@ -445,7 +446,7 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
             f' of {shape.name}, which a bare MagicMock accepts silently.'
         )
     return (
-        f'unspecced MagicMock shaped like {shape.source}::{shape.name}'
+        f'unspecced MagicMock shaped like {shape.home}::{shape.name}'
         f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
         ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
         f' of raising AttributeError.{drift_clause}'
