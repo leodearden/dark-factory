@@ -1883,19 +1883,22 @@ def _unit_restart_status(unit: str) -> UnitRestartStatus:
 UNIT_DEAD_ACTIVE_STATES = frozenset({"inactive", "failed"})
 
 
-def main() -> None:
+def main(
+    read_status: Callable[[str], UnitRestartStatus] = _unit_restart_status,
+) -> None:
     """Sample every watched unit's restart status, then revive each dead one.
 
     Phase one, crash_loop_pass (scripts/_watchdog_crash_loop.py), reads every
-    WATCHED unit's NRestarts/Result and pages a crash loop. It runs before
-    every liveness gate by construction, enabled and startup grace included,
-    because the grace window is what hid the 2026-10-26 loop. Phase two hands
-    each unit and its status to _revive_if_dead inside a per-unit guard, so
-    one unit's failure cannot leave the rest unprobed.
+    WATCHED unit's NRestarts/Result through *read_status* and pages a crash
+    loop. It runs before every liveness gate by construction, enabled and
+    startup grace included, because the grace window is what hid the
+    2026-10-26 loop. Phase two hands each unit and its status to
+    _revive_if_dead inside a per-unit guard, so one unit's failure cannot
+    leave the rest unprobed.
     """
     statuses = crash_loop_pass(
         [unit for _port, unit in WATCHED],
-        _unit_restart_status,
+        read_status,
         repo_dir=REPO_DIR,
         log=log,
     )

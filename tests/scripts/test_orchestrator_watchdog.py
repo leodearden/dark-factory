@@ -79,7 +79,7 @@ def _isolate_crash_loop_state(
 
     REPO_DIR is the live checkout, so without this every main() test would
     write the live restart-rate state and stamp live revive clocks, and a test
-    missing its _stub_restart_status could page through real uv.
+    that left main() on its real status reader could page through real uv.
     test_boundary7_liveness_during_window_does_not_stamp_clock patches
     time.time to 2e9: a revive clock it stamped in the live tree would be
     future-dated and suppress real revives for years. The satellite reads
@@ -93,12 +93,9 @@ def _isolate_crash_loop_state(
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(root / "no-such-uv"))
 
 
-def _stub_restart_status(
-    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, status=None
-) -> None:
-    """Answer main()'s NRestarts/Result read without systemd (healthy by default)."""
-    answer = status or wdog.UnitRestartStatus(n_restarts=0, result="success")
-    monkeypatch.setattr(wdog, "_unit_restart_status", lambda _u: answer)
+def _healthy_restart_status(_unit: str) -> crash_loop.UnitRestartStatus:
+    """main()'s NRestarts/Result reader for tests about something else: no systemd, healthy."""
+    return crash_loop.UnitRestartStatus(n_restarts=0, result="success")
 
 
 def _neutralize_fleet_clock_gates(
@@ -789,8 +786,7 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"Expected only df unit restarted, got: {restarted}"
@@ -821,8 +817,7 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(log_messages) >= 1, "Expected at least one log() call for the restarted unit"
     # At least one message must mention the unit being restarted
@@ -861,8 +856,7 @@ def test_main_isolates_per_unit_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "log", fake_log)
 
     # Must not raise
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert "orchestrator-reify.service" in restarted, (
         "reify unit must still be processed even if df probe raised"
@@ -894,8 +888,7 @@ def test_main_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert probed == [], (
         f"probe_port must not be called inside the grace window; was called for ports: {probed}"
@@ -931,8 +924,7 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"All watched ports must be probed when outside grace window; probed: {probed}"
@@ -971,8 +963,7 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
     monkeypatch.setattr(wdog, "log", fake_log)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert len(probed) == len(wdog.WATCHED), (
         f"When elapsed is None, all watched ports must be probed; probed: {probed}"
@@ -1083,8 +1074,7 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     # df is disabled → skipped (port 8102 never probed)
     assert 8102 not in probed, (
@@ -1206,7 +1196,6 @@ def _wire_main_all_ports_up(
     monkeypatch.setattr(wdog, "_unit_active_state", active_state)
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
-    _stub_restart_status(wdog, monkeypatch)
     return restarted
 
 
@@ -1222,7 +1211,7 @@ def test_main_revives_dead_enabled_unit_whose_port_still_listens(
     wdog = _load_watchdog()
     restarted = _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: dead_state)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [u for _p, u in wdog.WATCHED], (
         f"every enabled unit reporting ActiveState={dead_state!r} while its port "
@@ -1251,7 +1240,7 @@ def test_main_does_not_revive_a_unit_in_a_transitional_active_state(
         wdog, monkeypatch, active_state=lambda _u: transitional_state
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"ActiveState={transitional_state!r} while the port listens must not "
@@ -1282,8 +1271,7 @@ def test_main_does_not_query_active_state_when_the_port_is_down(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"the down-port unit must still be revived; got {restarted}"
     assert queried == [], (
@@ -1302,7 +1290,7 @@ def test_main_log_line_names_the_active_state_signal(monkeypatch: pytest.MonkeyP
     _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "failed")
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     restart_lines = [m for m in logged if "restarting" in m]
     assert restart_lines, f"expected at least one 'restarting' log line: {logged}"
@@ -1328,8 +1316,7 @@ def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: None)
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert (
         f"{_DF_UNIT} escalation port {_DF_PORT} not listening; restarting" in logged
@@ -1409,30 +1396,28 @@ def test_unit_restart_status_fails_soft(
     assert (status.n_restarts, status.result) == expected
 
 
-def _record_restart_status_reads(
-    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> list[str]:
+def _recording_restart_status_reader():
+    """A healthy main() reader that records each unit it is asked about; return (reads, reader)."""
     reads: list[str] = []
 
-    def reader(unit: str):
+    def reader(unit: str) -> crash_loop.UnitRestartStatus:
         reads.append(unit)
-        return wdog.UnitRestartStatus(n_restarts=0, result="success")
+        return _healthy_restart_status(unit)
 
-    monkeypatch.setattr(wdog, "_unit_restart_status", reader)
-    return reads
+    return reads, reader
 
 
 def test_main_samples_every_unit_inside_the_grace_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wdog = _load_watchdog()
-    reads = _record_restart_status_reads(wdog, monkeypatch)
+    reads, reader = _recording_restart_status_reader()
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
     monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("inside grace"))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=reader)
 
     units = [u for _p, u in wdog.WATCHED]
     assert reads == units
@@ -1442,12 +1427,12 @@ def test_main_samples_every_unit_inside_the_grace_window(
 
 def test_main_samples_a_disabled_unit(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
-    reads = _record_restart_status_reads(wdog, monkeypatch)
+    reads, reader = _recording_restart_status_reader()
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
     monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("disabled"))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=reader)
 
     assert reads == [u for _p, u in wdog.WATCHED]
 
@@ -1466,18 +1451,17 @@ def test_main_pages_a_restart_burst_once_per_window(
     _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "active")
     burst = wdog.UnitRestartStatus(n_restarts=5, result="success")
     healthy = wdog.UnitRestartStatus(n_restarts=0, result="success")
-    monkeypatch.setattr(
-        wdog, "_unit_restart_status", lambda u: burst if u == _DF_UNIT else healthy
-    )
+    def read_status(unit: str) -> crash_loop.UnitRestartStatus:
+        return burst if unit == _DF_UNIT else healthy
 
-    wdog.main()
+    wdog.main(read_status=read_status)
 
     calls = recorded_argvs(record)
     assert len(calls) == 1
     assert argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
     assert argv_flag(calls[0], "--severity") == "critical"
 
-    wdog.main()
+    wdog.main(read_status=read_status)
 
     assert len(recorded_argvs(record)) == 1
 
@@ -1658,7 +1642,6 @@ def _wire_revive_cap(
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: active_state)
     monkeypatch.setattr(wdog, "restart_unit", restarted.append)
     monkeypatch.setattr(wdog, "log", logged.append)
-    _stub_restart_status(wdog, monkeypatch)
     return restarted, logged, clock
 
 
@@ -1678,9 +1661,9 @@ def test_liveness_revive_is_capped_to_one_per_interval_per_unit(
         wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     clock["now"] = _CAP_T + 600
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT]
     capped = [m for m in logged if _DF_UNIT in m and "capped" in m]
@@ -1689,7 +1672,7 @@ def test_liveness_revive_is_capped_to_one_per_interval_per_unit(
     assert "300s remain" in capped[-1]
 
     clock["now"] = _CAP_T + 901
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT, _DF_UNIT]
     assert fleet_clock.read_text() == fleet_body
@@ -1708,10 +1691,10 @@ def test_liveness_revive_cap_is_per_unit(
         watched=[(_DF_PORT, _DF_UNIT), (_REIFY_PORT, _REIFY_UNIT)],
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     down.add(_REIFY_PORT)
     clock["now"] = _CAP_T + 60
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT, _REIFY_UNIT]
 
@@ -1725,15 +1708,15 @@ def test_liveness_revive_cap_is_shared_by_both_dead_signals(
         wdog, monkeypatch, tmp_path, down_ports=down, active_state="failed"
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     assert restarted == [_DF_UNIT]
     assert _revive_clock_file(_DF_UNIT).exists()
 
     clock["now"] = _CAP_T + 60
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     down.add(_DF_PORT)
     clock["now"] = _CAP_T + 120
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT]
 
@@ -1753,9 +1736,9 @@ def test_liveness_revive_cap_is_armed_even_when_the_restart_raises(
 
     monkeypatch.setattr(wdog, "restart_unit", raising_restart)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     clock["now"] = _CAP_T + 60
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert attempts == [_DF_UNIT]
     assert any("watchdog error" in m and "systemctl exploded" in m for m in logged), logged
@@ -1772,7 +1755,7 @@ def test_an_unarmable_revive_cap_is_logged_loudly(
         wdog, monkeypatch, tmp_path, down_ports={_DF_PORT}
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT]
     assert any(_DF_UNIT in m and "could NOT be armed" in m for m in logged), logged
@@ -1784,7 +1767,7 @@ def test_liveness_revive_clock_is_a_per_unit_stamp_clock(
     wdog = _load_watchdog()
     _wire_revive_cap(wdog, monkeypatch, tmp_path, down_ports={_DF_PORT})
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     body = json.loads(_revive_clock_file(_DF_UNIT).read_text())
     assert body["ts"] == int(_CAP_T)
@@ -1818,9 +1801,9 @@ def test_a_zero_revive_min_interval_disables_the_cap_without_reading_a_clock(
         wdog, "read_clock_epoch", lambda *_a: pytest.fail("a disabled cap reads no clock")
     )
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
     clock["now"] = _CAP_T + 1
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT, _DF_UNIT]
 
@@ -3852,8 +3835,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must still restart a port-down unit even when the fleet-deploy "
@@ -3900,8 +3882,7 @@ def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"a live lease that names no unit yet must suppress liveness for NO "
@@ -6009,8 +5990,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    _stub_restart_status(wdog, monkeypatch)
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == ["orchestrator-dark-factory.service"], (
         f"main() must immediately revive a port-down unit even inside the "
@@ -12125,7 +12105,6 @@ def _wire_liveness_probe(
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != down_port)
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
-    _stub_restart_status(wdog, monkeypatch)
     return restarted
 
 
@@ -12144,7 +12123,7 @@ def test_main_skips_the_liveness_restart_of_the_unit_the_sweep_is_restarting(
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], (
         f"a unit the in-flight sweep is restarting must not also be restarted "
@@ -12179,7 +12158,7 @@ def test_main_still_restarts_a_different_unit_while_a_sweep_holds_the_lease(
     )
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"liveness must stay intact for every unit the sweep is not touching; "
@@ -12205,7 +12184,7 @@ def test_main_restarts_the_unit_when_the_lease_is_not_live(
     _write_lease(wdog, monkeypatch, tmp_path, body)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], (
         f"a {why} lease must not suppress a liveness restart; got {restarted}"
@@ -12221,7 +12200,7 @@ def test_main_liveness_is_byte_identical_when_no_lease_file_exists(
     monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent.json"))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [_DF_UNIT], f"no lease means no suppression; got {restarted}"
 
@@ -12246,7 +12225,7 @@ def test_main_does_not_read_the_lease_when_every_probe_is_up(
     monkeypatch.setattr(wdog, "_live_fleet_lease", _counting_read)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     assert restarted == [], "sanity: no probe failed, so nothing may restart"
     assert reads == [], (
