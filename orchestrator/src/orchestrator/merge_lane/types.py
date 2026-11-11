@@ -1342,6 +1342,9 @@ class RealMergeItem:
     # rebuild that re-anchors base_sha (gate rebase, CAS retry) passes None, so
     # the anchor never outlives the base it describes.
     remerge_base: RemergeBase | None = None
+    # The commit a gate-rebased head supersedes, set only by
+    # rebased_head.py::rebased_head_item (plans/merge-lane-policy-prd.md D3).
+    gate_rebase_of: str | None = None
 
 
 @dataclass

@@ -24,6 +24,8 @@ class DeadBaseSite(StrEnum):
     RUNNER_UNAVAILABLE = 'runner_unavailable'
     #: A head that landed rebased, superseding its pre-rebase commit.
     GATE_REBASED = 'gate_rebased'
+    #: A successor torn down so it re-anchors on its head's gate-rebased commit.
+    GATE_REANCHOR = 'gate_reanchor'
     #: A dead-base straggler discarded and re-merged at dispatch.
     DISPATCH_VOID = 'dispatch_void'
     #: A stale merge discarded at dispatch (Mechanism 2).
