@@ -5,12 +5,17 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from shared.plan_deviation import DeviationRecord
 
+from orchestrator import plan_descope
 from orchestrator.artifacts import (
     PLAN_BASE_COMMIT_KEY,
     PLAN_SCHEMA_VERSION,
@@ -24,6 +29,15 @@ from orchestrator.artifacts import (
     TaskArtifacts,
     plan_base_commit,
     plan_task_text_fp,
+)
+from orchestrator.mcp import plan_markup_stamp
+from orchestrator.mcp.plan_tools import (
+    _add_plan_step,
+    _confirm_plan,
+    _create_plan,
+    _drop_plan_file,
+    _record_descoped_step,
+    _update_plan_metadata,
 )
 
 _FIXTURES = Path(__file__).parent / 'fixtures'
@@ -613,3 +627,139 @@ def test_step_progress_keeps_a_stamped_plan_stamped(artifacts: TaskArtifacts, wr
     assert after.state is PlanState.STAMPED
     assert after.lifecycle == before.lifecycle
     assert after.steps != before.steps
+
+
+_SEED = RepoSeed(files=(('.gitignore', '.task/\n'), ('m.py', 'x = 1\n')), message='Initial')
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals() -> Iterator[None]:
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
+
+
+@dataclass(frozen=True)
+class _Lane:
+    artifacts: TaskArtifacts
+    head: str
+
+
+@pytest.fixture
+def lane(tmp_path: Path) -> _Lane:
+    repo = seed_repo(tmp_path / 'lane', _SEED)
+    lane_artifacts = TaskArtifacts(repo)
+    lane_artifacts.init('test-1', 'Test task', 'A test')
+    head = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return _Lane(lane_artifacts, head)
+
+
+def _build_two_step_plan(artifacts: TaskArtifacts) -> None:
+    assert _create_plan(artifacts, 'test-1', 'T', 'A', ['a.py', 'b.py'])['status'] == 'ok'
+    assert _add_plan_step(artifacts, 'step-1', 'test', 'first')['status'] == 'ok'
+    assert _add_plan_step(artifacts, 'step-2', 'impl', 'second')['status'] == 'ok'
+
+
+def _stamped_lane_plan(artifacts: TaskArtifacts) -> Plan:
+    _build_two_step_plan(artifacts)
+    assert _confirm_plan(artifacts)['status'] == 'ok'
+    stamped = artifacts.stamp_plan_provenance('stamper', task_text_fp='tfp:authored', base_commit='base0')
+    assert stamped.state is PlanState.STAMPED
+    return stamped
+
+
+def _model(artifacts: TaskArtifacts) -> Plan:
+    plan = artifacts.read_plan_model()
+    assert plan is not None
+    return plan
+
+
+def test_row_1_an_authored_plan_confirms_as_the_architect_with_today_s_bytes(lane: _Lane):
+    _build_two_step_plan(lane.artifacts)
+    assert _confirm_plan(lane.artifacts)['status'] == 'ok'
+
+    plan = _model(lane.artifacts)
+    assert plan.state is PlanState.CONFIRMED
+    assert plan.lifecycle.confirmation is PlanConfirmation.ARCHITECT
+    on_disk = _on_disk(lane.artifacts)
+    assert on_disk['_finalized_at'] == on_disk['_revalidated_at']
+    expected = {
+        'task_id': 'test-1',
+        'title': 'T',
+        'analysis': 'A',
+        'files': ['a.py', 'b.py'],
+        'prerequisites': [],
+        'steps': [
+            {'id': 'step-1', 'type': 'test', 'description': 'first', 'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'description': 'second', 'status': 'pending', 'commit': None},
+        ],
+        'design_decisions': [],
+        'reuse': [],
+        'dropped_files': [],
+        '_schema_version': PLAN_SCHEMA_VERSION,
+        '_finalized_at': on_disk['_finalized_at'],
+        '_confirmed_by': 'architect',
+        '_revalidated_at': on_disk['_revalidated_at'],
+    }
+    assert _plan_path(lane.artifacts).read_text() == json.dumps(expected, indent=2) + '\n'
+
+
+def test_row_2_create_plan_over_a_stamped_plan_gives_a_shell_keeping_the_carried_blocks(lane: _Lane):
+    _build_two_step_plan(lane.artifacts)
+    assert _record_descoped_step(lane.artifacts, 'step-1', lane.head, 'orphan', 'esc-probe', 'note')['status'] == 'ok'
+    with lane.artifacts.plan_mutex():
+        document = lane.artifacts.read_plan()
+        document[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = plan_markup_stamp.block_of(
+            plan_markup_stamp.build_event({'tool': 'add_plan_step', 'param': 'description', 'outcome': 'rejected'}),
+        )
+        lane.artifacts.write_plan(document, mutex_held=True)
+    assert _confirm_plan(lane.artifacts)['status'] == 'ok'
+    lane.artifacts.stamp_plan_provenance('stamper', task_text_fp='tfp:authored')
+    before = lane.artifacts.read_plan()
+
+    assert _create_plan(lane.artifacts, 'test-1', 'Re-plan', 'A2', ['a.py'])['status'] == 'ok'
+
+    plan = _model(lane.artifacts)
+    assert plan.state is PlanState.SHELL
+    assert plan.lifecycle.markers_present() == ('_schema_version',)
+    after = lane.artifacts.read_plan()
+    for key in (plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY, *plan_descope.DESCOPE_PLAN_KEYS):
+        assert after[key] == before[key], key
+
+
+def test_row_3_stamping_a_partial_plan_is_refused_and_writes_nothing(lane: _Lane):
+    _build_two_step_plan(lane.artifacts)
+    before = _plan_path(lane.artifacts).read_bytes()
+    with pytest.raises(PlanNotConfirmed) as excinfo:
+        lane.artifacts.write_plan_model(
+            _model(lane.artifacts).stamped(session_id='stamper', at=_LATER, task_text_fp=None, base_commit=None),
+        )
+    message = str(excinfo.value)
+    assert 'test-1' in message
+    assert 'partial' in message
+    assert '_schema_version' in message
+    assert _plan_path(lane.artifacts).read_bytes() == before
+
+
+def test_row_3b_a_step_set_edit_on_a_stamped_plan_clears_confirmation(lane: _Lane):
+    stamped = _stamped_lane_plan(lane.artifacts)
+    assert _add_plan_step(lane.artifacts, 'step-3', 'impl', 'third')['status'] == 'ok'
+    plan = _model(lane.artifacts)
+    assert plan.state is PlanState.PARTIAL
+    assert plan.lifecycle.session_id == stamped.lifecycle.session_id
+    assert plan.lifecycle.task_text_fp == stamped.lifecycle.task_text_fp
+
+
+@pytest.mark.parametrize('tighten', [
+    pytest.param(lambda a: _update_plan_metadata(a, files=['a.py']), id='update_plan_metadata'),
+    pytest.param(lambda a: _drop_plan_file(a, 'b.py', 'narrowed at merge'), id='drop_plan_file'),
+])
+def test_row_3c_a_files_only_tightening_pass_keeps_a_stamped_plan_stamped(lane: _Lane, tighten: Any):
+    stamped = _stamped_lane_plan(lane.artifacts)
+    assert tighten(lane.artifacts)['status'] == 'ok'
+    plan = _model(lane.artifacts)
+    assert plan.state is PlanState.STAMPED
+    assert plan.lifecycle.confirmed_at == stamped.lifecycle.confirmed_at
+    assert plan.to_json()['files'] == ['a.py']
