@@ -116,8 +116,7 @@ class TestPlainPureGate:
 
     def test_fields_are_frozen(self):
         fields = _build(_plain_gate(), None)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            fields.category = 'review_due'  # type: ignore[misc]
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, fields, 'category', 'review_due')
 
     def test_operational_llm_gate_keeps_its_token_prefix(self):
         task = _plain_gate()
