@@ -12,14 +12,24 @@ resolved when it is served rather than stored. Design: plans/quality-dashboard-p
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
 
+import yaml
 from shared.quality_series.stats import RegimeEvent
+
+logger = logging.getLogger(__name__)
+
+CURATED_MARKERS_PATH = Path(__file__).resolve().parents[3] / 'regime-markers.yaml'
+"""The committed curated file, dashboard/regime-markers.yaml; read at call time."""
 
 FLEET_SCOPE = 'fleet'
 """The wire scope of a marker that applies to every project."""
@@ -245,3 +255,143 @@ class Marker:
             return RegimeEvent(event_id=self.marker_id, at=self.at, until=self.until,
                                series=self.series, artefact=True)
         return None
+
+
+class CuratedMarkers(NamedTuple):
+    markers: tuple[Marker, ...]
+    parse_failures: int
+
+
+class _CuratedFieldError(ValueError):
+    def __init__(self, field: str, value: object) -> None:
+        super().__init__(f'{field}: unusable value {value!r}')
+
+
+def load_curated_markers(path: Path | None = None) -> CuratedMarkers:
+    """The curated markers in file order, and how many entries were rejected; never raises.
+
+    A missing file is no markers and no failure. An unreadable file, or one whose top level is
+    not a list, is one failure. Every rejected entry is one counted, logged failure, and its
+    valid siblings still load (INV-4). Unknown keys are ignored.
+    """
+    source = CURATED_MARKERS_PATH if path is None else path
+    if not source.exists():
+        return CuratedMarkers((), 0)
+    try:
+        entries = yaml.safe_load(source.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning('curated markers %s unreadable: %s', source, exc)
+        return CuratedMarkers((), 1)
+    if not isinstance(entries, list):
+        logger.warning('curated markers %s: top level is a %s, not a list',
+                       source, type(entries).__name__)
+        return CuratedMarkers((), 1)
+    markers: dict[str, Marker] = {}
+    failures = 0
+    for index, entry in enumerate(entries):
+        try:
+            marker = _curated_marker(entry, source.name)
+            if marker.marker_id in markers:
+                raise _CuratedFieldError('entry', 'a duplicate of an earlier entry')
+        except (MarkerInvariantError, _CuratedFieldError) as exc:
+            failures += 1
+            logger.warning('curated marker #%d in %s rejected: %s', index, source, exc)
+            continue
+        markers[marker.marker_id] = marker
+    return CuratedMarkers(tuple(markers.values()), failures)
+
+
+def _curated_marker(entry: object, file_name: str) -> Marker:
+    if not isinstance(entry, dict):
+        raise _CuratedFieldError('entry', entry)
+    at = _curated_instant(entry.get('date'), 'date', end_of_day=False)
+    raw_until = entry.get('until')
+    until = None if raw_until is None else _curated_instant(raw_until, 'until', end_of_day=True)
+    kind = _curated_kind(entry.get('kind'))
+    scope = _curated_project(entry.get('project'))
+    series = _curated_series(entry.get('series'))
+    label = _curated_label(entry.get('label'))
+    return Marker(
+        marker_id=_curated_id(at, until, kind, scope, series, label),
+        at=at, kind=kind, scope=scope, series=series, until=until, label=label,
+        source=MarkerSource(SourceType.CURATED, file=file_name),
+        tasks=_curated_tasks(entry.get('tasks')),
+    )
+
+
+def _curated_instant(value: object, field: str, *, end_of_day: bool) -> datetime:
+    """A date is that UTC day's first instant, or for an inclusive end its last; a naive time is refused."""
+    if isinstance(value, str):
+        value = _iso_value(value, field)
+    if isinstance(value, datetime):
+        if value.utcoffset() is None:
+            raise _CuratedFieldError(field, value)
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, time.max if end_of_day else time.min, tzinfo=UTC)
+    raise _CuratedFieldError(field, value)
+
+
+def _iso_value(text: str, field: str) -> date | datetime:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        raise _CuratedFieldError(field, text) from None
+
+
+def _curated_kind(value: object) -> MarkerKind:
+    if value is None:
+        return MarkerKind.REGIME
+    if isinstance(value, str) and value in MarkerKind:
+        return MarkerKind(value)
+    raise _CuratedFieldError('kind', value)
+
+
+def _curated_project(value: object) -> str | None:
+    if value is None or (isinstance(value, str) and value):
+        return value
+    raise _CuratedFieldError('project', value)
+
+
+def _curated_series(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, list) and all(isinstance(series, str) for series in value):
+        return tuple(value)
+    raise _CuratedFieldError('series', value)
+
+
+def _curated_label(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    raise _CuratedFieldError('label', value)
+
+
+def _curated_tasks(value: object) -> tuple[int | str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list) and all(
+        isinstance(task, (int, str)) and not isinstance(task, bool) for task in value
+    ):
+        return tuple(value)
+    raise _CuratedFieldError('tasks', value)
+
+
+def _curated_id(
+    at: datetime, until: datetime | None, kind: MarkerKind, scope: str | None,
+    series: tuple[str, ...] | None, label: str,
+) -> str:
+    """A content hash, so an entry keeps its id when the file is reordered or another is inserted."""
+    canonical = json.dumps({
+        'date': _iso_utc(at),
+        'until': None if until is None else _iso_utc(until),
+        'kind': kind.value,
+        'project': scope,
+        'series': None if series is None else list(series),
+        'label': label,
+    }, sort_keys=True)
+    return 'curated:' + hashlib.sha256(canonical.encode()).hexdigest()[:16]
