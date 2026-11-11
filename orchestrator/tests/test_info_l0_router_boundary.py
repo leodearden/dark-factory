@@ -8,7 +8,10 @@ esc-4851-*) are unrecoverable, so the factories below rebuild their shapes.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -18,6 +21,7 @@ from _info_l0_router_fixtures import (
     LostVerdictReviewer,
     RouterRun,
     assignment,
+    handing_off_steward,
     reaper_harness,
     router_reaper_config,
 )
@@ -111,6 +115,18 @@ def watcher_l2(
     )
     queue.submit(l2)
     return l2
+
+
+def blocking_l0(queue: EscalationQueue, task_id: str = TASK_ID) -> Escalation:
+    """An agent's blocking L0, the record a steward takes."""
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id, agent_role='implementer',
+        severity='blocking', category='task_failure',
+        summary='cannot proceed: lib.py contract is ambiguous',
+        detail='The plan and the existing tests disagree on greet().',
+    )
+    queue.submit(esc)
+    return esc
 
 
 def starvation_notice(queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0) -> Escalation:
@@ -413,3 +429,183 @@ class TestRow06TerminalStatusCancelDuringTheTail:
         await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
 
         assert _l1s(run.queue, agent_role=ORPHAN_REAPER) == []
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, check=False)
+
+
+def _file_bytes(queue: EscalationQueue, esc: Escalation) -> bytes:
+    return (queue.queue_dir / f'{esc.id}.json').read_bytes()
+
+
+class _FilesAtMergeEntry(FakeScheduler):
+    """Files records when ``_stamp_merge_phase_entered`` persists its stamp.
+
+    That stamp is written after the post-implementer gate and before the
+    merge-entry gate (``TaskWorkflow._run_merge_phase``), so a record filed
+    here is first seen by the merge-entry gate.
+    """
+
+    def __init__(self, file_records: Callable[[], list[Escalation]]) -> None:
+        super().__init__()
+        self._file_records = file_records
+        self.filed: list[Escalation] = []
+        self.snapshots: dict[str, bytes] = {}
+        self.branch_head: str | None = None
+
+    async def update_task(self, task_id: str, metadata: str | dict, *, append: bool = False) -> bool:
+        if not self.filed and isinstance(metadata, dict) and 'merge_phase_liveness' in metadata:
+            self.filed = self._file_records()
+        return await super().update_task(task_id, metadata, append=append)
+
+
+def _merge_entry_run(
+    tmp_path: Path, monkeypatch, file_records: Callable[[EscalationQueue], list[Escalation]],
+) -> tuple[RouterRun, _FilesAtMergeEntry, list[str]]:
+    queue = EscalationQueue(tmp_path / 'escalation_queue')
+    constructions: list[str] = []
+    holder: dict[str, RouterRun] = {}
+
+    def _file() -> list[Escalation]:
+        records = file_records(queue)
+        scheduler.snapshots = {e.id: _file_bytes(queue, e) for e in records}
+        worktree = holder['run'].workflow.worktree
+        assert worktree is not None
+        scheduler.branch_head = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        return records
+
+    scheduler = _FilesAtMergeEntry(_file)
+    run = RouterRun(
+        tmp_path, monkeypatch, DispositioningReviewer(), queue=queue, scheduler=scheduler,
+        steward_factory=_recording_steward(constructions),
+    )
+    holder['run'] = run
+    return run, scheduler, constructions
+
+
+@pytest.mark.asyncio
+class TestRow07InfoL2AtMergeEntryMerges:
+    """E3 (task 4314 run 2): an info L2 over an info L1 is open at merge entry."""
+
+    async def test_the_task_merges_and_the_cluster_is_untouched(self, tmp_path, monkeypatch):
+        def _cluster(queue: EscalationQueue) -> list[Escalation]:
+            source = architect_note(queue)
+            l1 = orphan_reaper_l1(queue, source)
+            queue.resolve(source.id, f'Auto-promoted to level 1: {l1.id}', dismiss=True, resolved_by=ORPHAN_REAPER)
+            return [watcher_l2(queue, [l1], severity='info'), l1]
+
+        run, scheduler, constructions = _merge_entry_run(tmp_path, monkeypatch, _cluster)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert len(scheduler.filed) == 2, 'the merge-entry stamp never fired'
+        repo = run.workflow.config.project_root
+        assert scheduler.branch_head
+        assert _git(repo, 'merge-base', '--is-ancestor', scheduler.branch_head, 'main').returncode == 0
+        assert 'blocked' not in scheduler.statuses[TASK_ID]
+        for esc in scheduler.filed:
+            assert _file_bytes(run.queue, esc) == scheduler.snapshots[esc.id]
+        assert constructions == []
+
+
+@pytest.mark.asyncio
+class TestRow08BlockingL2AtMergeEntryGates:
+    async def test_the_task_blocks_naming_the_l2_and_no_steward(self, tmp_path, monkeypatch):
+        run, scheduler, constructions = _merge_entry_run(
+            tmp_path, monkeypatch, lambda queue: [watcher_l2(queue, [], severity='blocking')],
+        )
+        repo = run.workflow.config.project_root
+        main_before = _git(repo, 'rev-parse', 'main').stdout.strip()
+
+        report = await run.workflow.run()
+
+        (l2,) = scheduler.filed
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason == f'Gated by open L2 {l2.id}; no steward applicable'
+        assert 'Steward re-escalated' not in report.detail
+        assert _git(repo, 'rev-parse', 'main').stdout.strip() == main_before
+        assert constructions == []
+        assert _file_bytes(run.queue, l2) == scheduler.snapshots[l2.id]
+
+
+@pytest.mark.asyncio
+class TestRow14BlockedExitKeepsInfoNotes:
+    async def test_the_steward_hands_off_the_blocker_and_the_finalizer_holds_the_note(
+        self, tmp_path, monkeypatch, mock_orch_config,
+    ):
+        queue = EscalationQueue(tmp_path / 'escalation_queue')
+        run = RouterRun(
+            tmp_path, monkeypatch, DispositioningReviewer(), queue=queue,
+            steward_factory=handing_off_steward(queue, TASK_ID, severity='blocking'),
+        )
+        filed: list[Escalation] = []
+
+        async def _escalate() -> WorkflowOutcome:
+            filed.extend([blocking_l0(queue), implementer_note(queue)])
+            return WorkflowOutcome.ESCALATED
+
+        monkeypatch.setattr(run.workflow, '_execute_verify_review_loop', _escalate)
+
+        report = await asyncio.wait_for(run.workflow.run(), 60)
+
+        blocker, note = filed
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason == 'Steward re-escalated to human'
+        assert run.current(blocker).status == 'dismissed'
+        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'blocked')]
+        assert read_hold(run.current(note)) is not None
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+
+        assert _l1s(run.queue, agent_role=ORPHAN_REAPER) == []
+
+
+async def _requeued_incarnation(tmp_path: Path, monkeypatch) -> tuple[RouterRun, Escalation]:
+    """Incarnation 1 exits REQUEUED; the exit, not what produced it, is under test."""
+    run = RouterRun(tmp_path / 'incarnation-1', monkeypatch, DispositioningReviewer())
+    note = implementer_note(run.queue)
+
+    async def _drive() -> WorkflowOutcome:
+        await run.scheduler.set_task_status(TASK_ID, 'pending')
+        return WorkflowOutcome.REQUEUED
+
+    run.workflow._drive = _drive
+
+    assert await run.run() == WorkflowOutcome.REQUEUED
+
+    after = run.current(note)
+    assert (after.status, after.triaged_by) == ('pending', None)
+    assert _trail(run, note.id) == [('defer', 'workflow-finalizer', 'requeued')]
+    return run, note
+
+
+@pytest.mark.asyncio
+class TestRow15RequeuedExitDefers:
+    async def test_the_next_incarnations_reviewer_is_briefed_and_closes_it(self, tmp_path, monkeypatch):
+        first, note = await _requeued_incarnation(tmp_path, monkeypatch)
+        reviewer = DispositioningReviewer()
+        second = RouterRun(tmp_path / 'incarnation-2', monkeypatch, reviewer, queue=first.queue)
+        reviewer.note_dispositions = [_disposition(note.id, 'addressed')]
+
+        assert await second.run() == WorkflowOutcome.DONE
+
+        assert [ids for _generation, ids in second.briefing.briefed] == [[note.id]]
+        closed = second.current(note)
+        assert (closed.resolution_class, closed.resolved_by) == ('addressed', REVIEWER_LEG_ID)
+
+    async def test_with_no_next_incarnation_the_reaper_holds_it_once_it_ages(
+        self, tmp_path, monkeypatch, mock_orch_config,
+    ):
+        run, note = await _requeued_incarnation(tmp_path, monkeypatch)
+        deferred = run.current(note)
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=60.0)
+
+        assert run.current(note) == deferred
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+
+        hold = read_hold(run.current(note))
+        assert hold is not None and hold.ticket == 'tkt_1'
+        assert _trail(run, note.id)[-1] == ('convert-pending', 'orphan-reaper', 'orphan')
