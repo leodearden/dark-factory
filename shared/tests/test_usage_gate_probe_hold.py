@@ -3,13 +3,16 @@
 The claim (PROBING -> PROBE_IN_FLIGHT) lets one caller test a resumed account
 before the pool piles onto it. Its verdict arrives only when the holder's
 session exits, so an unbounded claim parks every other caller for the
-holder's whole lifetime (task 9327). These tests drive the public seams only.
+holder's whole lifetime (task 9327). These tests drive public seams, with the
+probe subprocess stubbed by ``make_gate``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pydantic
@@ -171,40 +174,73 @@ def _recorded_loop_errors():
         loop.set_exception_handler(previous)
 
 
-async def test_a_verdict_inside_the_hold_disarms_it():
-    with _recorded_loop_errors() as loop_errors:
-        await _settle_each_verdict_inside_the_hold(hold_secs=0.05)
-    assert loop_errors == []
-
-
-async def _settle_each_verdict_inside_the_hold(hold_secs: float) -> None:
-    confirmed = make_gate(['max-a'], probe_slot_hold_secs=hold_secs)
+async def test_a_confirm_inside_the_hold_is_never_overridden_by_it():
+    hold_secs = 0.05
+    gate = make_gate(['max-a'], probe_slot_hold_secs=hold_secs)
     try:
-        await _report_cap(confirmed, _a_minute_ago())
-        async with confirmed.invoke_slot() as holder:
-            holder.confirm()
-        lease_b = await asyncio.wait_for(
-            confirmed.before_invoke(), timeout=_SERVED_WITHIN_SECS,
-        )
-        assert lease_b is not None
+        with _recorded_loop_errors() as loop_errors:
+            await _report_cap(gate, _a_minute_ago())
+            async with gate.invoke_slot() as holder:
+                holder.confirm()
+            lease = await asyncio.wait_for(
+                gate.before_invoke(), timeout=_SERVED_WITHIN_SECS,
+            )
+            assert lease is not None
 
-        await asyncio.sleep(hold_secs * 3)
+            await asyncio.sleep(hold_secs * 3)
 
-        assert confirmed.lease_is_current(lease_b)
+            assert gate.lease_is_current(lease)
+        assert loop_errors == []
     finally:
-        await confirmed.shutdown()
+        await gate.shutdown()
 
-    capped = make_gate(['max-a'], probe_slot_hold_secs=hold_secs)
+
+async def test_a_cap_verdict_inside_the_hold_is_never_overridden_by_it():
+    hold_secs = 0.05
+    gate = make_gate(['max-a'], probe_slot_hold_secs=hold_secs)
     try:
-        await _report_cap(capped, _a_minute_ago())
-        async with capped.invoke_slot() as holder:
-            holder.report(_cap_hit(_an_hour_from_now()))
+        with _recorded_loop_errors() as loop_errors:
+            await _report_cap(gate, _a_minute_ago())
+            async with gate.invoke_slot() as holder:
+                holder.report(_cap_hit(_an_hour_from_now()))
 
-        await asyncio.sleep(hold_secs * 3)
+            await asyncio.sleep(hold_secs * 3)
 
-        assert capped.capped_account_names == ('max-a',)
+            assert gate.capped_account_names == ('max-a',)
+        assert loop_errors == []
     finally:
-        await capped.shutdown()
+        await gate.shutdown()
+
+
+def _park_payloads(caplog) -> list[dict]:
+    payloads = []
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get('event') == 'all_capped_park':
+            payloads.append(payload)
+    return payloads
+
+
+async def test_a_park_behind_a_held_claim_names_the_account_awaiting_its_verdict(caplog):
+    caplog.set_level(logging.WARNING, logger='shared.usage_gate')
+    gate = make_gate(['max-a'], probe_slot_hold_secs=60)
+    parked = None
+    try:
+        await _report_cap(gate, _a_minute_ago())
+        async with gate.invoke_slot():
+            parked = asyncio.create_task(gate.before_invoke())
+            await _eventually(lambda: _park_payloads(caplog))
+
+        payload = _park_payloads(caplog)[0]
+        assert payload['probe_in_flight_accounts'] == ['max-a'], payload
+        assert payload['capped_accounts'] == [], payload
+    finally:
+        if parked is not None:
+            await _cancel(parked)
+        await gate.shutdown()
 
 
 async def test_shutdown_disarms_a_pending_hold():

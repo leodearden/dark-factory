@@ -69,7 +69,9 @@ class UsageCapConfig(BaseModel):
             "The longest a resumed account's single probe claim waits for its "
             "holder's verdict before the account opens to every caller. A "
             'capped account fails its first API call during CLI startup, so a '
-            'holder still running past this bound is being served (task 9327).'
+            'holder still running past this bound is being served (task 9327). '
+            'A bound shorter than CLI startup opens the account before that '
+            'first call can report a cap, which forfeits single-task testing.'
         ),
     )
     auth_reprobe_secs: int = Field(

@@ -1551,6 +1551,9 @@ class UsageGate:
                                 'account_count': self.account_count,
                                 'capped_accounts': list(self.capped_account_names),
                                 'auth_failed_accounts': list(self.auth_failed_account_names),
+                                'probe_in_flight_accounts': list(
+                                    self.probe_in_flight_account_names
+                                ),
                                 'soonest_open_at': (
                                     self.soonest_resets_at.isoformat()
                                     if self.soonest_resets_at
@@ -2323,13 +2326,11 @@ class UsageGate:
             pass
 
     def _arm_probe_hold(self, acct: AccountState) -> None:
-        """Bound the probe claim just taken on *acct* (task 9327).
+        """Bound the probe claim just taken on *acct*; see
+        ``UsageCapConfig.probe_slot_hold_secs``.
 
-        A capped account fails its holder's first API call within CLI
-        startup, so a claim still unsettled after
-        ``UsageCapConfig.probe_slot_hold_secs`` belongs to a holder that is
-        being served. A loop-less ``try_lease`` caller arms nothing: its
-        contract is one invocation at a time, so no second caller can starve.
+        A loop-less ``try_lease`` caller arms nothing: its contract is one
+        invocation at a time, so no second caller can starve.
         """
         if getattr(self, '_shutting_down', False):
             return
@@ -3036,6 +3037,12 @@ class UsageGate:
     def auth_failed_account_names(self) -> tuple[str, ...]:
         """Names of the accounts currently AUTH_FAILED, in roster order."""
         return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
+    def probe_in_flight_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts whose probe claim awaits its holder's
+        verdict, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.probe_in_flight)
 
     @property
     def capped_account_names(self) -> tuple[str, ...]:
