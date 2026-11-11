@@ -331,6 +331,48 @@ class TestMergeVerifySpec:
         restored = MergeVerifySpec.from_dict(legacy)
         assert restored.verify_cold_preprovision_command == ''
 
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    def test_scope_cargo_and_config_only_globs_round_trip(self):
+        spec = dataclasses.replace(
+            self._make_spec(),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=(
+                'dark-factory-orchestrator.yaml', 'crates/*/Cargo.toml',
+            ),
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored == spec
+        assert isinstance(restored.merge_config_only_full_gate_globs, tuple)
+        assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_scope_cargo_and_config_only_globs_default_to_not_carried(self):
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.scope_cargo is None
+        assert spec.merge_config_only_full_gate_globs is None
+
+    def test_from_dict_back_compat_missing_scope_cargo_and_globs(self):
+        """BACK-COMPAT: a pre-7465 dispatcher's dict lacks both keys and decodes
+        to None, which leaves the consuming host's own values in force."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("scope_cargo", None)
+        legacy.pop("merge_config_only_full_gate_globs", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.scope_cargo is None
+        assert restored.merge_config_only_full_gate_globs is None
+
+    def test_empty_globs_round_trip_as_carried(self):
+        """() is a carried value that replaces the host's globs, never None."""
+        spec = dataclasses.replace(self._make_spec(), merge_config_only_full_gate_globs=())
+        assert MergeVerifySpec.from_dict(spec.to_dict()).merge_config_only_full_gate_globs == ()
+        assert spec_from_json(spec_to_json(spec)).merge_config_only_full_gate_globs == ()
+
 
 # ---------------------------------------------------------------------------
 # VerifyResult codec  (result_to_dict / result_from_dict)
