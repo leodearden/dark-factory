@@ -32,7 +32,7 @@ from shared.followup_items import (
 )
 from shared.mcp_envelope import write_failure_reason
 from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
-from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.task_metadata import DoneProvenance
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
@@ -109,7 +109,11 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
-from fused_memory.middleware.metadata_dict import extract_metadata_dict, fresh_metadata_copy
+from fused_memory.middleware.metadata_dict import (
+    extract_metadata_dict,
+    fresh_metadata_copy,
+    raw_metadata_dict,
+)
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
     pure_gate_routing_notice,
@@ -194,17 +198,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not resolve any dict at all.
-# Only these are loud from the read-path parsers below; 'unknown_key' /
-# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
-# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
-# and belong to the write boundary (W3-β's _emit_schema_warning census),
-# not these read-path helpers — emitting them here would flood the
-# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
-# for zero lines against schema-clean metadata.
-_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
-
 # The escalation-gate stamp, named once so the writers stay greppably
 # coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
 # (the declared execution_class='operational'|'decision' boundary coercion)
@@ -234,28 +227,6 @@ class _CombineRewrite(TypedDict):
     details: str
 
 
-def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
-
-    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
-    readable metadata, and ``(None, warnings)`` for present-but-unreadable
-    metadata. *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
-    its ``unparseable_json`` / ``not_an_object`` codes cover every value
-    ``coerce_task_metadata`` rejects, so the list is never empty.
-
-    ``parse_metadata`` runs only on that failure path, for its diagnosis.
-    The returned dict is never ``parse_metadata(...).model_dump()``, so
-    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
-    gaining ``TaskMetadata``'s typed-field defaults.
-    """
-    meta = coerce_task_metadata(metadata)
-    if meta is not None:
-        return meta, []
-    _, warnings = parse_metadata(metadata, direction='read')
-    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-
-
 def _has_branch_base_sha(metadata: Any) -> bool:
     """True when *metadata* records a non-blank ``branch_base_sha``.
 
@@ -263,20 +234,9 @@ def _has_branch_base_sha(metadata: Any) -> bool:
     (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
     Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
     """
-    meta, _warnings = _parse_metadata_value(metadata)
+    meta = coerce_task_metadata(metadata)
     sha = (meta or {}).get('branch_base_sha')
     return isinstance(sha, str) and sha.strip() != ''
-
-
-def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
-    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
-    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
-    logger.warning(
-        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
-        source,
-        reason,
-        type(metadata).__name__,
-    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -2521,17 +2481,11 @@ class TaskInterceptor:
         callers such as :meth:`_extract_meta_files` and
         :meth:`_build_candidate` can read keys without additional guarding.
 
-        The absent/readable/unreadable rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`. Unreadable metadata emits a
-        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
-        — I4: this replaces a silent ``{}`` coercion.
+        Resolved by ``fused_memory/middleware/metadata_dict.py::raw_metadata_dict``,
+        so unreadable metadata emits a ``task_metadata.schema_warning`` WARNING
+        before collapsing to ``{}`` — I4: this replaces a silent ``{}`` coercion.
         """
-        metadata = kwargs.get('metadata')
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
-        return parsed if parsed is not None else {}
+        return raw_metadata_dict(kwargs.get('metadata'), source='TaskInterceptor._parse_metadata')
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -3586,7 +3540,7 @@ class TaskInterceptor:
             return None
 
         target_metadata = target.get('metadata')
-        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+        target_meta = coerce_task_metadata(target_metadata)
         candidate_meta = (
             extract_metadata_dict(candidate_metadata, source='TaskInterceptor._execute_combine') or {}
         )
@@ -7018,13 +6972,13 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
 def _extract_reopen_at(before: Any) -> str | None:
     """Return ``metadata.reopen_at`` from a Taskmaster ``before`` snapshot.
 
-    Uses :func:`_parse_metadata_value` so a JSON-string metadata blob is
-    handled identically to an already-parsed dict. Returns None when
-    absent, empty, or unresolvable — callers treat that as "never
+    Uses ``shared.task_metadata_wire.coerce_task_metadata`` so a JSON-string
+    metadata blob is handled identically to an already-parsed dict. Returns
+    None when absent, empty, or unresolvable — callers treat that as "never
     reopened" (the reopen-freshness gate stays inert).
     """
     raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, _warnings = _parse_metadata_value(raw)
+    parsed = coerce_task_metadata(raw)
     if not isinstance(parsed, dict):
         return None
     reopen_at = parsed.get('reopen_at')
