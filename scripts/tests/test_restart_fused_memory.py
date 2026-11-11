@@ -500,3 +500,30 @@ def test_exits_nonzero_when_health_never_ready(tmp_path):
         f"the restart must still have occurred; the failure is the verify gate; "
         f"state={state!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# (g) argument parsing: two orthogonal axes, gate (--now|--drain) and
+# --rebind-socket; an unknown flag or two gates is a usage error (exit 2)
+# ---------------------------------------------------------------------------
+
+def test_unknown_argument_prints_usage_naming_rebind_socket_and_exits_2(tmp_path):
+    result = _run_script(tmp_path, "--bogus")
+    assert result.returncode == 2, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "--bogus" in result.stderr, f"stderr={result.stderr!r}"
+    usage = [line for line in result.stderr.splitlines() if line.startswith("Usage:")]
+    assert usage and "--rebind-socket" in usage[0], f"stderr={result.stderr!r}"
+    assert _state(tmp_path)["systemctl_calls"] == []
+
+
+def test_now_and_drain_are_mutually_exclusive(tmp_path):
+    result = _run_script(tmp_path, "--now", "--drain")
+    assert result.returncode == 2, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "--now" in result.stderr and "--drain" in result.stderr, (
+        f"stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["systemctl_calls"] == []
