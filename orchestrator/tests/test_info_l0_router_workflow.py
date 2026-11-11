@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
-from _info_l0_router_fixtures import reaper_harness, router_reaper_config
+from _info_l0_router_fixtures import disposition_rows, reaper_harness, router_reaper_config
 from _orch_helpers import wait_responsive
 from _workflow_helpers import (
     AgentStub,
@@ -30,7 +30,7 @@ from test_workflow_escalated_steward_stall import _wire_resolve_callback
 
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
 from orchestrator.escalation_router import ROUTER_ID, hold_note, read_hold
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import (
@@ -387,12 +387,6 @@ def _current(queue: EscalationQueue, esc: Escalation) -> Escalation:
     return current
 
 
-def _dispositions(workflow: TaskWorkflow) -> list[dict]:
-    store = workflow.event_store
-    assert store is not None
-    return [row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)]
-
-
 def _unrouted_info_notes(queue: EscalationQueue) -> list[Escalation]:
     return [
         e for e in queue.get_by_task(TASK_ID, status='pending', level=0)
@@ -452,7 +446,7 @@ class TestExitFinalizerRoutesInfoNotes:
         assert hold is not None and hold.ticket == 'tkt_1'
         assert len(curator.calls_named('submit_task')) == 1
         assert _current(queue, observation).resolution_class == 'observation-consumed'
-        rows = _dispositions(workflow)
+        rows = disposition_rows(workflow.event_store)
         assert sorted(r['class'] for r in rows) == ['convert-pending', 'observation-consumed']
         assert {(r['by'], r['exit_kind']) for r in rows} == {('workflow-finalizer', exit_kind)}
         assert await _reaper_l1s_after_aging(mock_orch_config, queue) == []
@@ -465,7 +459,7 @@ class TestExitFinalizerRoutesInfoNotes:
 
         after = _current(queue, note)
         assert (after.status, after.triaged_by) == ('pending', None)
-        (row,) = _dispositions(workflow)
+        (row,) = disposition_rows(workflow.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('defer', 'workflow-finalizer', 'requeued')
         assert curator.calls == []
 
@@ -490,7 +484,7 @@ class TestExitFinalizerRoutesInfoNotes:
 
         assert report.outcome == WorkflowOutcome.DONE
         assert read_hold(_current(queue, note)) is not None
-        (row,) = _dispositions(workflow)
+        (row,) = disposition_rows(workflow.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == (
             'convert-pending', 'workflow-finalizer', 'cancelled',
         )
@@ -507,7 +501,7 @@ class TestExitFinalizerNoOps:
 
         assert _current(queue, note).status == 'pending'
         assert curator.calls == []
-        assert _dispositions(workflow) == []
+        assert disposition_rows(workflow.event_store) == []
 
     async def test_with_the_router_disabled_the_note_is_left_alone(self, tmp_path: Path):
         workflow, queue, curator, _cleanups = _finalizer_workflow(tmp_path, router_enabled=False)
@@ -517,7 +511,7 @@ class TestExitFinalizerNoOps:
 
         assert _current(queue, note).status == 'pending'
         assert curator.calls == []
-        assert _dispositions(workflow) == []
+        assert disposition_rows(workflow.event_store) == []
 
     async def test_a_held_note_is_left_for_the_reaper(self, tmp_path: Path):
         workflow, queue, curator, _cleanups = _finalizer_workflow(tmp_path)

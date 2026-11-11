@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
-from _info_l0_router_fixtures import reaper_harness, router_reaper_config
+from _info_l0_router_fixtures import disposition_rows, reaper_harness, router_reaper_config
 from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -109,12 +109,6 @@ def _aggregates(harness: Harness, sentinel: str) -> list[Escalation]:
     ]
 
 
-def _dispositions(harness: Harness) -> list[dict]:
-    store = harness.event_store
-    assert store is not None
-    return [row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)]
-
-
 @pytest.mark.asyncio
 class TestReaperFinishesHolds:
     async def test_a_created_ticket_converts_the_held_record(self, harness: Harness):
@@ -190,7 +184,7 @@ class TestReaperRoutesInfoOrphans:
         assert held.status == 'pending'
         hold = read_hold(held)
         assert hold is not None and hold.ticket == 'tkt_1'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('convert-pending', 'orphan-reaper', 'orphan')
 
     async def test_an_open_l1_of_another_category_does_not_swallow_an_info_note(
@@ -226,7 +220,7 @@ class TestReaperRoutesInfoOrphans:
         after = _current(harness, esc.id)
         assert (after.status, after.triaged_by) == ('pending', None)
         assert _curator(harness).calls == []
-        assert _dispositions(harness) == []
+        assert disposition_rows(harness.event_store) == []
 
     async def test_an_eval_lane_info_note_is_still_dismissed_by_the_eval_rule(self, harness: Harness):
         esc = _submit_aged(harness, '2339', worktree=EVAL_WORKTREE)
@@ -330,7 +324,7 @@ class TestStartupAmnestyRoutesInfoNotes:
         assert (held.status, held.resolved_by) == ('pending', None)
         hold = read_hold(held)
         assert hold is not None and hold.ticket == 'tkt_1'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('convert-pending', 'startup-amnesty', 'restart')
         assert _strand_events(harness) == []
 
@@ -353,7 +347,7 @@ class TestStartupAmnestyRoutesInfoNotes:
         await harness._dismiss_stale_escalations()
 
         assert _current(harness, esc.id).resolution_class == 'converted'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['exit_kind']) == ('converted', 'restart')
 
     async def test_an_undecided_hold_from_before_the_restart_stays_pending(self, harness: Harness):
@@ -404,4 +398,4 @@ class TestStartupAmnestyRoutesInfoNotes:
                 'dismissed', 'auto-dismissed',
             )
         assert _curator(harness).calls == []
-        assert _dispositions(harness) == []
+        assert disposition_rows(harness.event_store) == []

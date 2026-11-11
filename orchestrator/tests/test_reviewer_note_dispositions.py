@@ -15,6 +15,7 @@ from _info_l0_router_fixtures import (
     DispositioningReviewer,
     LostVerdictReviewer,
     RouterRun,
+    disposition_entry,
 )
 from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
@@ -47,10 +48,6 @@ def _file_note(
     )
     queue.submit(note)
     return note
-
-
-def _disposition(esc_id: str, disposition: str) -> dict:
-    return {'escalation_id': esc_id, 'disposition': disposition, 'rationale': f'{disposition} rationale'}
 
 
 @pytest.mark.asyncio
@@ -126,7 +123,7 @@ class TestReviewLoopAppliesDispositions:
         stub = DispositioningReviewer()
         run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, disposition)]
+        stub.note_dispositions = [disposition_entry(note.id, disposition)]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -144,7 +141,7 @@ class TestReviewLoopAppliesDispositions:
         stub = DispositioningReviewer()
         run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, 'work')]
+        stub.note_dispositions = [disposition_entry(note.id, 'work')]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -166,7 +163,7 @@ class TestReviewLoopAppliesDispositions:
         stub = DispositioningReviewer()
         run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue, suggested_action='no action needed for this task')
-        stub.note_dispositions = [_disposition(note.id, 'work')]
+        stub.note_dispositions = [disposition_entry(note.id, 'work')]
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -182,7 +179,7 @@ class TestReviewLoopAppliesDispositions:
         run = RouterRun(tmp_path, monkeypatch, stub)
         foreign = _file_note(run.queue, task_id='99')
         stub.note_dispositions = [
-            _disposition(UNKNOWN_ID, 'addressed'), _disposition(foreign.id, 'no_action'),
+            disposition_entry(UNKNOWN_ID, 'addressed'), disposition_entry(foreign.id, 'no_action'),
         ]
 
         assert await run.run() == WorkflowOutcome.DONE
@@ -201,7 +198,7 @@ class TestReviewLoopAppliesDispositions:
         stub = LostVerdictReviewer()
         run = RouterRun(tmp_path, monkeypatch, stub)
         note = _file_note(run.queue)
-        stub.note_dispositions = [_disposition(note.id, 'addressed')]
+        stub.note_dispositions = [disposition_entry(note.id, 'addressed')]
 
         assert await run.run() == WorkflowOutcome.BLOCKED
 
@@ -224,7 +221,7 @@ class TestReviewLoopAppliesDispositions:
         stub = DispositioningReviewer()
         run = RouterRun(tmp_path, monkeypatch, stub)
         notice = _file_note(run.queue, **CORRUPTION)
-        stub.note_dispositions = [_disposition(notice.id, 'no_action')]
+        stub.note_dispositions = [disposition_entry(notice.id, 'no_action')]
 
         assert await run.run() == WorkflowOutcome.DONE
 

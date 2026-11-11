@@ -11,6 +11,7 @@ A consuming test module that runs a full workflow must re-export
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,8 +20,8 @@ from _curator_fake import FakeCurator
 from _workflow_helpers import (
     AgentStub,
     FakeBriefing,
+    FakeMcp,
     FakeScheduler,
-    _build_workflow_with_escalation,
     _init_repo,
     _make_git_ops,
     agent_side_artifacts,
@@ -42,15 +43,15 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.mcp.verdict_tools import _envelope
+from orchestrator.merge_lane import MergeLane
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 TASK_ID = '42'
 PASSED = VerifyResult(
     passed=True, test_output='', lint_output='', type_output='', summary='All checks passed',
 )
-IN_PROGRESS_ROW: dict = {'status': 'in-progress', 'metadata': {}}
 
 
 def run_config(
@@ -76,6 +77,25 @@ def run_config(
         ),
         sandbox=SandboxConfig(enabled=False),
     )
+
+
+def disposition_entry(esc_id: str, disposition: str) -> dict:
+    """One entry of a reviewer verdict's ``note_dispositions``."""
+    return {'escalation_id': esc_id, 'disposition': disposition, 'rationale': f'{disposition} rationale'}
+
+
+def disposition_events(store: EventStore | None, esc_id: str | None = None) -> list[dict]:
+    """The ``info_l0_dispositioned`` events in *store*, only *esc_id*'s when given."""
+    assert store is not None
+    return [
+        row for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)
+        if esc_id is None or row['data']['escalation_id'] == esc_id
+    ]
+
+
+def disposition_rows(store: EventStore | None, esc_id: str | None = None) -> list[dict]:
+    """The data of :func:`disposition_events`."""
+    return [row['data'] for row in disposition_events(store, esc_id)]
 
 
 def assignment() -> TaskAssignment:
@@ -165,27 +185,40 @@ class RouterRun:
         repo = tmp_path / 'repo'
         repo.mkdir(parents=True)
         _init_repo(repo)
-        config = run_config(repo, briefing=briefing, router_enabled=router_enabled)
-        self.workflow, self.scheduler, self.queue = _build_workflow_with_escalation(
-            config, _make_git_ops(config.project_root), assignment(), reviewer, tmp_path,
-            spawn_merge_worker=merge_queue is None, steward_factory=steward_factory,
-            queue=queue,
-        )
-        if scheduler is not None:
-            self.scheduler = scheduler
-            self.workflow.scheduler = scheduler
-        if merge_queue is not None:
-            self.workflow.merge_queue = merge_queue
+        self.config = run_config(repo, briefing=briefing, router_enabled=router_enabled)
+        self._git_ops = _make_git_ops(repo)
+        self.queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalation_queue')
+        self.curator = FakeCurator()
+        self.scheduler = scheduler if scheduler is not None else FakeScheduler()
+        self.scheduler.dispatch_tool = self.curator
         self.briefing = NoteRecordingBriefing()
-        self.workflow.briefing = self.briefing
+        self.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        self._steward_factory = steward_factory
+        self._merge_queue: asyncio.Queue = merge_queue if merge_queue is not None else asyncio.Queue()
+        self._merge_worker = None
+        if merge_queue is None:
+            self._merge_worker = MergeLane(self._git_ops, self._merge_queue)
+            asyncio.create_task(self._merge_worker.run(), name='test-merge-worker')
         self._monkeypatch = monkeypatch
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', reviewer.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=PASSED),
         )
-        self.workflow.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
-        self.curator = FakeCurator()
-        self.workflow.scheduler.dispatch_tool = self.curator
+        self.workflow = self.build_workflow()
+
+    def build_workflow(self, *, cancel_event: asyncio.Event | None = None) -> TaskWorkflow:
+        """A fresh ``TaskWorkflow`` over this run's collaborators; it becomes ``self.workflow``.
+
+        A harness slot builds its workflow with the ``cancel_event`` it registers.
+        """
+        self.workflow = TaskWorkflow(
+            assignment=assignment(), config=self.config, git_ops=self._git_ops,
+            scheduler=self.scheduler, briefing=self.briefing, mcp=FakeMcp(),
+            escalation_queue=self.queue, steward_factory=self._steward_factory,
+            merge_queue=self._merge_queue, merge_worker=self._merge_worker,
+            event_store=self.event_store, cancel_event=cancel_event,
+        )
+        return self.workflow
 
     def fail_the_first_queue_read_after_verification(self) -> None:
         """The reviewer's note read is the first queue read once verification passes."""
@@ -216,24 +249,23 @@ class RouterRun:
         return current
 
     def rows(self, esc_id: str) -> list[dict]:
-        store = self.workflow.event_store
-        assert store is not None
-        return [
-            row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)
-            if row['data']['escalation_id'] == esc_id
-        ]
+        return disposition_rows(self.event_store, esc_id)
 
 
 def router_reaper_config(
-    config: MagicMock, *, orphan_timeout_secs: float = 60.0,
+    base: MagicMock, *, router_enabled: bool = True, orphan_timeout_secs: float = 60.0,
     ticket_timeout_secs: float = 900.0, max_conversions: int = 20,
 ) -> MagicMock:
-    """Set the orphan-reaper and info-L0-router knobs on a ``mock_orch_config``."""
+    """A copy of a ``mock_orch_config`` with the orphan-reaper and info-L0-router knobs set.
+
+    *base* is left as it was, so two sites built from one fixture keep their own knobs.
+    """
+    config = copy.copy(base)
     config.orphan_l0_reaper_enabled = True
     config.orphan_l0_timeout_secs = orphan_timeout_secs
     config.orphan_l0_check_interval_secs = 1.0
     config.orphan_l0_dispatch_freshness_secs = 120.0
-    config.info_l0_router_enabled = True
+    config.info_l0_router_enabled = router_enabled
     config.info_l0_router_ticket_timeout_secs = ticket_timeout_secs
     config.info_l0_router_max_conversions_per_sweep = max_conversions
     return config
@@ -256,7 +288,7 @@ def reaper_harness(
         harness = Harness(config)
     harness.scheduler.is_actively_held = MagicMock(return_value=False)
     harness.scheduler.get_task = AsyncMock(
-        return_value=dict(IN_PROGRESS_ROW) if task_row is None else task_row,
+        return_value={'status': 'in-progress', 'metadata': {}} if task_row is None else task_row,
     )
     harness.scheduler.dispatch_tool = curator
     harness.event_store = event_store

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -25,6 +26,9 @@ from _info_l0_router_fixtures import (
     LostVerdictReviewer,
     RouterRun,
     assignment,
+    disposition_entry,
+    disposition_events,
+    disposition_rows,
     handing_off_steward,
     reaper_harness,
     router_reaper_config,
@@ -65,6 +69,7 @@ ORPHAN_REAPER = 'harness-orphan-reaper'
 STARVATION = 'orchestrator-starvation-watchdog'
 MERGE_SKEW = 'orchestrator-merge-skew-tripwire'
 AGED_SECS = 300.0
+ORPHAN_AGE_PREFIX = re.compile(r'^Orphan L0 \(\d+s old, ')
 AUTHOR_DETAIL = (
     'Seen while editing foo.py: bar.py carries a private copy of foo.helper; '
     'fold it into one helper in a follow-up.'
@@ -145,24 +150,49 @@ def blocking_l0(queue: EscalationQueue, task_id: str = TASK_ID) -> Escalation:
     return esc
 
 
-def starvation_notice(
-    queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0,
-    agent_role: str = STARVATION, suggested_action: str = 'none',
+def mechanical_notice(
+    queue: EscalationQueue, task_id: str, *, agent_role: str, category: str, summary: str,
+    detail: str, suggested_action: str = 'none', seconds_ago: float = 0.0,
 ) -> Escalation:
-    """The esc-4851-* shape: one of the weekend's 489 starvation-watchdog notices."""
+    """An info notice filed by a harness monitor rather than an agent."""
     notice = Escalation(
         id=queue.make_id(task_id), task_id=task_id, agent_role=agent_role,
-        severity='info', category='infra_issue',
-        summary=f'task {task_id} starved of a slot for 30 min',
-        detail='No slot became free for this task in the last starvation window.',
+        severity='info', category=category, summary=summary, detail=detail,
         suggested_action=suggested_action, timestamp=_timestamp(seconds_ago),
     )
     queue.submit(notice)
     return notice
 
 
-def _disposition(esc_id: str, disposition: str) -> dict:
-    return {'escalation_id': esc_id, 'disposition': disposition, 'rationale': f'{disposition} rationale'}
+def starvation_notice(queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0) -> Escalation:
+    """The esc-4851-* shape: one of the weekend's 489 starvation-watchdog notices."""
+    return mechanical_notice(
+        queue, task_id, agent_role=STARVATION, category='infra_issue',
+        summary=f'task {task_id} starved of a slot for 30 min',
+        detail='No slot became free for this task in the last starvation window.',
+        seconds_ago=seconds_ago,
+    )
+
+
+def merge_skew_notice(queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0) -> Escalation:
+    """The merge_lane/skew_tripwire.py shape: a landing overlaps an in-flight branch."""
+    return mechanical_notice(
+        queue, task_id, agent_role=MERGE_SKEW, category='risk_identified',
+        summary=f'Pipeline landing 5050aaaa5050 touches load-bearing files also present on 1 in-flight branch(es): {task_id}',
+        detail=f'In-flight branches with overlapping edits:\n- task {task_id} (branch task/{task_id}): lib.py',
+        suggested_action='Port the landed change into each named in-flight branch before it merges.',
+        seconds_ago=seconds_ago,
+    )
+
+
+def done_step_orphan_notice(queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0) -> Escalation:
+    """The TaskWorkflow._escalate_unreconciled_done_step shape: a done step's commit is orphaned."""
+    return mechanical_notice(
+        queue, task_id, agent_role='orchestrator', category='infra_issue',
+        summary="Done step step-1's commit 4851bbbb48 is orphaned and could not be auto-reconciled",
+        detail='Step step-1 recorded commit 4851bbbb48, which is no longer reachable from HEAD.',
+        suggested_action='verify_wip_reconciliation', seconds_ago=seconds_ago,
+    )
 
 
 def _harness_after(run: RouterRun, config, **knobs) -> Harness:
@@ -172,30 +202,41 @@ def _harness_after(run: RouterRun, config, **knobs) -> Harness:
     statuses = run.scheduler.statuses.get(TASK_ID, [])
     return reaper_harness(
         router_reaper_config(config, **knobs), EscalationQueue(run.queue.queue_dir),
-        curator=run.curator, event_store=run.workflow.event_store,
+        curator=run.curator, event_store=run.event_store,
         task_row={'status': statuses[-1] if statuses else None, 'metadata': {}},
     )
 
 
+async def _sweep_orphans(harness: Harness) -> None:
+    """One orphan-reaper pass; the suite's one call of that private seam."""
+    await harness._reap_orphan_l0_escalations()
+
+
+async def _amnesty(harness: Harness) -> None:
+    """One startup-amnesty pass; the suite's one call of that private seam."""
+    await harness._dismiss_stale_escalations()
+
+
 async def _reap(run: RouterRun, config, **knobs) -> Harness:
     harness = _harness_after(run, config, **knobs)
-    await harness._reap_orphan_l0_escalations()
+    await _sweep_orphans(harness)
     return harness
 
 
 def _l1s(queue: EscalationQueue, *, agent_role: str, task_id: str = TASK_ID) -> list[Escalation]:
-    return [e for e in queue.get_by_task(task_id, level=1) if e.agent_role == agent_role]
+    return queue.get_by_task(task_id, level=1, agent_role=agent_role)
 
 
-def _trail(run: RouterRun, esc_id: str) -> list[tuple]:
-    return [(row['class'], row['by'], row['exit_kind']) for row in run.rows(esc_id)]
+def _trail(store: EventStore | None, esc_id: str) -> list[tuple]:
+    """Each routing of *esc_id*: (class, by, exit_kind)."""
+    return [(row['class'], row['by'], row['exit_kind']) for row in disposition_rows(store, esc_id)]
 
 
 async def _held_after_a_work_verdict(tmp_path, monkeypatch) -> tuple[RouterRun, Escalation]:
     reviewer = DispositioningReviewer()
     run = RouterRun(tmp_path, monkeypatch, reviewer)
     note = implementer_note(run.queue)
-    reviewer.note_dispositions = [_disposition(note.id, 'work')]
+    reviewer.note_dispositions = [disposition_entry(note.id, 'work')]
 
     assert await run.run() == WorkflowOutcome.DONE
 
@@ -246,19 +287,19 @@ class TestRow01AddressedClosesAtTheReviewer:
         reviewer = DispositioningReviewer()
         run = RouterRun(tmp_path, monkeypatch, reviewer)
         note = implementer_note(run.queue)
-        reviewer.note_dispositions = [_disposition(note.id, 'addressed')]
+        reviewer.note_dispositions = [disposition_entry(note.id, 'addressed')]
 
         assert await run.run() == WorkflowOutcome.DONE
 
         closed = run.current(note)
         assert (closed.resolution_class, closed.resolved_by) == ('addressed', REVIEWER_LEG_ID)
-        assert _trail(run, note.id) == [('addressed', REVIEWER_LEG_ID, None)]
+        assert _trail(run.event_store, note.id) == [('addressed', REVIEWER_LEG_ID, None)]
 
         harness = await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
-        await harness._dismiss_stale_escalations()
+        await _amnesty(harness)
 
         assert run.queue.get_by_task(TASK_ID, level=1) == []
-        assert _trail(run, note.id) == [('addressed', REVIEWER_LEG_ID, None)]
+        assert _trail(run.event_store, note.id) == [('addressed', REVIEWER_LEG_ID, None)]
 
 
 @pytest.mark.asyncio
@@ -279,7 +320,7 @@ class TestRow02WorkConvertsThroughTheHold:
         closed = run.current(note)
         assert (closed.status, closed.resolution_class) == ('dismissed', 'converted')
         assert 'converted:9001' in (closed.resolution or '')
-        assert _trail(run, note.id) == [
+        assert _trail(run.event_store, note.id) == [
             ('defer', REVIEWER_LEG_ID, None),
             ('convert-pending', 'workflow-finalizer', 'done'),
             ('converted', 'orphan-reaper', 'orphan'),
@@ -327,11 +368,11 @@ class TestRow17LostVerdictIsRoutedAtTheExit:
         reviewer = LostVerdictReviewer()
         run = RouterRun(tmp_path, monkeypatch, reviewer)
         note = implementer_note(run.queue)
-        reviewer.note_dispositions = [_disposition(note.id, 'addressed')]
+        reviewer.note_dispositions = [disposition_entry(note.id, 'addressed')]
 
         assert await run.run() == WorkflowOutcome.BLOCKED
 
-        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'blocked')]
+        assert _trail(run.event_store, note.id) == [('convert-pending', 'workflow-finalizer', 'blocked')]
         hold = read_hold(run.current(note))
         assert hold is not None and hold.ticket == 'tkt_1'
 
@@ -339,7 +380,7 @@ class TestRow17LostVerdictIsRoutedAtTheExit:
         await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
 
         assert run.current(note).resolution_class == 'converted'
-        assert _trail(run, note.id)[-1] == ('converted', 'orphan-reaper', 'orphan')
+        assert _trail(run.event_store, note.id)[-1] == ('converted', 'orphan-reaper', 'orphan')
 
 
 @pytest.mark.asyncio
@@ -360,7 +401,7 @@ class TestRow05CoalesceParkHoldsTheNote:
         written = run.scheduler.statuses[TASK_ID]
         assert written[-1] == 'merge-deferred'
         assert 'done' not in written
-        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'merge_deferred')]
+        assert _trail(run.event_store, note.id) == [('convert-pending', 'workflow-finalizer', 'merge_deferred')]
         assert read_hold(run.current(note)) is not None
 
         await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
@@ -392,9 +433,9 @@ class TestRow06TerminalStatusCancelDuringTheTail:
     """E2 (task 5131): the row flips done while the workflow is still in its
     tail, and the terminal-status watcher soft-cancels the slot.
 
-    ``build_workflow`` is patched to hand the slot this run's workflow; the
-    stand-in binds the slot's ``cancel_event`` to it as the real factory does,
-    so the watcher's soft cancel reaches the workflow.
+    ``build_workflow`` is patched to build the slot this run's workflow with the
+    slot's ``cancel_event``, as the real factory does, so the watcher's soft
+    cancel reaches the workflow.
     """
 
     @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
@@ -408,9 +449,8 @@ class TestRow06TerminalStatusCancelDuringTheTail:
             scheduler=flips, steward_factory=_recording_steward(constructions),
         )
         note = implementer_note(run.queue)
-        events = run.workflow.event_store
-        assert events is not None
-        config = run.workflow.config.model_copy(update={'terminal_status_hard_cancel_polls': 3})
+        events = run.event_store
+        config = run.config.model_copy(update={'terminal_status_hard_cancel_polls': 3})
         harness = _build_harness(config)
         scheduler = Scheduler(config)
         monkeypatch.setattr(scheduler, 'dispatch_tool', AsyncMock(return_value={}))
@@ -421,8 +461,7 @@ class TestRow06TerminalStatusCancelDuringTheTail:
         assert scheduler.lock_table.try_acquire(TASK_ID, ['lib'])
 
         def _build_this_runs_workflow(**kwargs):
-            run.workflow._cancel_event = kwargs['cancel_event']
-            return run.workflow
+            return run.build_workflow(cancel_event=kwargs['cancel_event'])
 
         with patch('orchestrator.harness.build_workflow', side_effect=_build_this_runs_workflow):
             slot = asyncio.create_task(harness._run_slot(assignment(), asyncio.Semaphore(0)))
@@ -432,12 +471,9 @@ class TestRow06TerminalStatusCancelDuringTheTail:
 
         assert report is not None and report.outcome == WorkflowOutcome.DONE
         assert constructions == []
-        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'cancelled')]
+        assert _trail(events, note.id) == [('convert-pending', 'workflow-finalizer', 'cancelled')]
         assert read_hold(run.current(note)) is not None
-        (routed,) = [
-            row for row in events.fetch_events_by_type(EventType.info_l0_dispositioned)
-            if row['data']['escalation_id'] == note.id
-        ]
+        (routed,) = disposition_events(events, note.id)
         released = [
             row for row in events.fetch_events_by_type(EventType.lock_released)
             if row['task_id'] == TASK_ID
@@ -519,7 +555,7 @@ class TestRow07InfoL2AtMergeEntryMerges:
         assert await run.run() == WorkflowOutcome.DONE
 
         assert len(scheduler.filed) == 2, 'the merge-entry stamp never fired'
-        repo = run.workflow.config.project_root
+        repo = run.config.project_root
         assert scheduler.branch_head
         assert _git(repo, 'merge-base', '--is-ancestor', scheduler.branch_head, 'main').returncode == 0
         assert 'blocked' not in scheduler.statuses[TASK_ID]
@@ -534,7 +570,7 @@ class TestRow08BlockingL2AtMergeEntryGates:
         run, scheduler, constructions = _merge_entry_run(
             tmp_path, monkeypatch, lambda queue: [watcher_l2(queue, [], severity='blocking')],
         )
-        repo = run.workflow.config.project_root
+        repo = run.config.project_root
         main_before = _git(repo, 'rev-parse', 'main').stdout.strip()
 
         report = await run.workflow.run()
@@ -572,7 +608,7 @@ class TestRow14BlockedExitKeepsInfoNotes:
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.reason == 'Steward re-escalated to human'
         assert run.current(blocker).status == 'dismissed'
-        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'blocked')]
+        assert _trail(run.event_store, note.id) == [('convert-pending', 'workflow-finalizer', 'blocked')]
         assert read_hold(run.current(note)) is not None
 
         await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
@@ -580,22 +616,27 @@ class TestRow14BlockedExitKeepsInfoNotes:
         assert _l1s(run.queue, agent_role=ORPHAN_REAPER) == []
 
 
+def _exit_without_driving(run: RouterRun, status: str, outcome: WorkflowOutcome) -> None:
+    """Replace ``_drive`` with one that writes *status* and returns *outcome*; the exit finalizer stays real."""
+
+    async def _drive() -> WorkflowOutcome:
+        await run.scheduler.set_task_status(TASK_ID, status)
+        return outcome
+
+    run.workflow._drive = _drive
+
+
 async def _requeued_incarnation(tmp_path: Path, monkeypatch) -> tuple[RouterRun, Escalation]:
     """Incarnation 1 exits REQUEUED; the exit, not what produced it, is under test."""
     run = RouterRun(tmp_path / 'incarnation-1', monkeypatch, DispositioningReviewer())
     note = implementer_note(run.queue)
-
-    async def _drive() -> WorkflowOutcome:
-        await run.scheduler.set_task_status(TASK_ID, 'pending')
-        return WorkflowOutcome.REQUEUED
-
-    run.workflow._drive = _drive
+    _exit_without_driving(run, 'pending', WorkflowOutcome.REQUEUED)
 
     assert await run.run() == WorkflowOutcome.REQUEUED
 
     after = run.current(note)
     assert (after.status, after.triaged_by) == ('pending', None)
-    assert _trail(run, note.id) == [('defer', 'workflow-finalizer', 'requeued')]
+    assert _trail(run.event_store, note.id) == [('defer', 'workflow-finalizer', 'requeued')]
     return run, note
 
 
@@ -605,7 +646,7 @@ class TestRow15RequeuedExitDefers:
         first, note = await _requeued_incarnation(tmp_path, monkeypatch)
         reviewer = DispositioningReviewer()
         second = RouterRun(tmp_path / 'incarnation-2', monkeypatch, reviewer, queue=first.queue)
-        reviewer.note_dispositions = [_disposition(note.id, 'addressed')]
+        reviewer.note_dispositions = [disposition_entry(note.id, 'addressed')]
 
         assert await second.run() == WorkflowOutcome.DONE
 
@@ -627,7 +668,7 @@ class TestRow15RequeuedExitDefers:
 
         hold = read_hold(run.current(note))
         assert hold is not None and hold.ticket == 'tkt_1'
-        assert _trail(run, note.id)[-1] == ('convert-pending', 'orphan-reaper', 'orphan')
+        assert _trail(run.event_store, note.id)[-1] == ('convert-pending', 'orphan-reaper', 'orphan')
 
 
 @dataclass
@@ -640,7 +681,7 @@ class _ReaperSite:
     events: EventStore | None
 
     async def reap(self) -> None:
-        await self.harness._reap_orphan_l0_escalations()
+        await _sweep_orphans(self.harness)
 
     def current(self, esc: Escalation) -> Escalation:
         current = self.queue.get(esc.id)
@@ -648,17 +689,12 @@ class _ReaperSite:
         return current
 
     def trail(self, esc_id: str) -> list[tuple]:
-        assert self.events is not None
-        return [
-            (row['data']['class'], row['data']['by'], row['data']['exit_kind'])
-            for row in self.events.fetch_events_by_type(EventType.info_l0_dispositioned)
-            if row['data']['escalation_id'] == esc_id
-        ]
+        return _trail(self.events, esc_id)
 
     def aggregates(self, sentinel: str) -> list[Escalation]:
         return [
-            e for e in self.queue.get_by_task(sentinel, status='pending', level=1)
-            if e.agent_role == AGGREGATE_ROLE and e.category == AGGREGATE_CATEGORY
+            e for e in self.queue.get_by_task(sentinel, status='pending', level=1, agent_role=AGGREGATE_ROLE)
+            if e.category == AGGREGATE_CATEGORY
         ]
 
     def every_record(self) -> list[dict]:
@@ -691,25 +727,22 @@ def _seed(n: int, first_task: int, file_one: Callable[[str], Escalation]) -> lis
 class TestRow11MechanicalStormClosesUnderOneAggregatePerClass:
     """The esc-4851 storm: 489 starvation notices, beside two other mechanical classes."""
 
-    async def test_one_sweep_closes_every_notice_status_info_and_pins_nothing(
+    async def test_no_open_notice_pins_its_task_and_one_sweep_closes_every_one_status_info(
         self, tmp_path, mock_orch_config,
     ):
         site = _site(tmp_path, mock_orch_config, events=False)  # 492 durable event commits cost seconds
         storm = _seed(489, 10_000, lambda tid: starvation_notice(site.queue, tid, seconds_ago=AGED_SECS))
-        skew = _seed(2, 7_000, lambda tid: starvation_notice(
-            site.queue, tid, seconds_ago=AGED_SECS, agent_role=MERGE_SKEW,
-        ))
-        done_step = _seed(1, 8_000, lambda tid: starvation_notice(
-            site.queue, tid, seconds_ago=AGED_SECS, agent_role='orchestrator',
-            suggested_action='verify_wip_reconciliation',
-        ))
+        skew = _seed(2, 7_000, lambda tid: merge_skew_notice(site.queue, tid, seconds_ago=AGED_SECS))
+        done_step = _seed(1, 8_000, lambda tid: done_step_orphan_notice(site.queue, tid, seconds_ago=AGED_SECS))
         classes = {STARVATION: storm, MERGE_SKEW: skew, DONE_STEP_COMMIT_ORPHAN_CLASS: done_step}
+        notices = [e for records in classes.values() for e in records]
+        open_by_task = site.queue.get_pending_by_task()
+        assert all([r.id for r in open_by_task[e.task_id]] == [e.id] for e in notices)
+        assert not any(classify_pins(e.task_id, open_by_task[e.task_id], live_claimant=False).pins for e in notices)
 
         await site.reap()
 
-        assert all(
-            site.current(e).resolution_class == 'status-info' for records in classes.values() for e in records
-        )
+        assert all(site.current(e).resolution_class == 'status-info' for e in notices)
         aggregates = {}
         for class_key, records in classes.items():
             (aggregate,) = site.aggregates(status_info_sentinel(class_key))
@@ -722,10 +755,7 @@ class TestRow11MechanicalStormClosesUnderOneAggregatePerClass:
         assert [e for e in pending if e.level >= 2] == []
         assert site.curator.calls == []
         pending_by_task = site.queue.get_pending_by_task()
-        assert not any(
-            classify_pins(e.task_id, pending_by_task.get(e.task_id, []), live_claimant=False).pins
-            for e in storm
-        )
+        assert [e.id for e in notices if pending_by_task.get(e.task_id)] == []
 
         later = _seed(3, 20_000, lambda tid: starvation_notice(site.queue, tid, seconds_ago=AGED_SECS))
         await site.reap()
@@ -739,8 +769,10 @@ class TestRow11MechanicalStormClosesUnderOneAggregatePerClass:
 class TestRow12UnknownMechanicalRoleGoesToTheCurator:
     async def test_an_unregistered_monitor_is_converted_never_status_info(self, tmp_path, mock_orch_config):
         site = _site(tmp_path, mock_orch_config)
-        notice = starvation_notice(
-            site.queue, '42', seconds_ago=AGED_SECS, agent_role='orchestrator-some-new-monitor',
+        notice = mechanical_notice(
+            site.queue, '42', agent_role='orchestrator-some-new-monitor', category='infra_issue',
+            summary='some new monitor tripped on task 42', detail='A monitor no class registry knows yet.',
+            seconds_ago=AGED_SECS,
         )
 
         await site.reap()
@@ -770,7 +802,13 @@ def _aged_blocking_orphan(queue: EscalationQueue, task_id: str, worktree: Path) 
 
 
 def _promotion_fields(esc: Escalation) -> dict:
-    return {k: v for k, v in asdict(esc).items() if k not in ('id', 'timestamp', 'resolved_at')}
+    """Every field but the record's identity, its times, and the summary's age prefix,
+    which reads the wall clock at the sweep."""
+    fields = {k: v for k, v in asdict(esc).items() if k not in ('id', 'timestamp', 'resolved_at')}
+    age_prefix = ORPHAN_AGE_PREFIX.match(esc.summary)
+    assert age_prefix is not None, esc.summary
+    fields['summary'] = esc.summary[age_prefix.end():]
+    return fields
 
 
 @pytest.mark.asyncio
@@ -785,8 +823,7 @@ class TestRow13BlockingOrphanIsPromotedAsItWasBeforeTheRouter:
         note = implementer_note(routed.queue, task_id, seconds_ago=AGED_SECS)
         await routed.reap()
 
-        disabled = _site(tmp_path, mock_orch_config, name='router-off')
-        mock_orch_config.info_l0_router_enabled = False
+        disabled = _site(tmp_path, mock_orch_config, name='router-off', router_enabled=False)
         off_orphan = _aged_blocking_orphan(disabled.queue, task_id, worktree)
         await disabled.reap()
 
@@ -810,7 +847,7 @@ class TestRow16RestartAmnestyRoutesInfoNotes:
         notice = starvation_notice(site.queue, '43', seconds_ago=AGED_SECS)
         strand = _aged_blocking_orphan(site.queue, '5189', tmp_path / '.worktrees' / '5189')
 
-        await site.harness._dismiss_stale_escalations()
+        await _amnesty(site.harness)
 
         assert read_hold(site.current(note)) is not None
         assert site.trail(note.id) == [('convert-pending', 'startup-amnesty', 'restart')]
@@ -866,16 +903,6 @@ class TestRow19ConversionCapOverflows:
         assert all(read_hold(site.current(n)) is not None for n in fresh)
 
 
-def _exit_done_without_driving(run: RouterRun) -> None:
-    """Replace ``_drive`` with one that writes 'done' and returns DONE; the exit finalizer stays real."""
-
-    async def _drive() -> WorkflowOutcome:
-        await run.scheduler.set_task_status(TASK_ID, 'done')
-        return WorkflowOutcome.DONE
-
-    run.workflow._drive = _drive
-
-
 @pytest.mark.asyncio
 class TestRow18DeliberateHoldIsUnaffected:
     """A parked L2 and a separate L2 are holds, so every router path leaves them alone.
@@ -899,12 +926,11 @@ class TestRow18DeliberateHoldIsUnaffected:
         separate = watcher_l2(queue, [], severity='blocking')
         note = implementer_note(queue)
         held_bytes = {hold.id: _file_bytes(queue, hold) for hold in (parked, separate)}
-        events = run.workflow.event_store
-        assert events is not None
+        events = run.event_store
 
         def _assert_the_holds_are_untouched() -> None:
             assert {hold_id: (queue.queue_dir / f'{hold_id}.json').read_bytes() for hold_id in held_bytes} == held_bytes
-            rows = [row['data'] for row in events.fetch_events_by_type(EventType.info_l0_dispositioned)]
+            rows = disposition_rows(events)
             assert {r['class'] for r in rows if r['escalation_id'] in held_bytes} <= {'rejected_disposition'}
             assert {r['escalation_id'] for r in rows if r['class'] != 'rejected_disposition'} == {note.id}
             assert run.scheduler.statuses[TASK_ID] == ['done']
@@ -912,14 +938,14 @@ class TestRow18DeliberateHoldIsUnaffected:
             assert pins.pins
             assert set(pins.queue_handoff) == set(held_bytes)
 
-        _exit_done_without_driving(run)
+        _exit_without_driving(run, 'done', WorkflowOutcome.DONE)
         assert await run.run() == WorkflowOutcome.DONE
         assert read_hold(run.current(note)) is not None
         _assert_the_holds_are_untouched()
 
         ports = RouterPorts(
             queue=queue, event_store=events, dispatch_tool=run.curator,
-            project_root=str(run.workflow.config.project_root), filing_claimant_run_id=None,
+            project_root=str(run.config.project_root), filing_claimant_run_id=None,
         )
         for hold_id in held_bytes:
             applied = apply_reviewer_disposition(
@@ -932,7 +958,7 @@ class TestRow18DeliberateHoldIsUnaffected:
         await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
         _assert_the_holds_are_untouched()
 
-        await _harness_after(run, mock_orch_config)._dismiss_stale_escalations()
+        await _amnesty(_harness_after(run, mock_orch_config))
         _assert_the_holds_are_untouched()
 
 
@@ -959,7 +985,7 @@ class TestRow20RouterFailureNeverChangesTheExit:
         run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer(), queue=queue)
         note = implementer_note(queue, suggested_action='No action needed')
         queue.armed = note.id
-        repo = run.workflow.config.project_root
+        repo = run.config.project_root
         main_before = _git(repo, 'rev-parse', 'main').stdout.strip()
 
         with caplog.at_level(logging.ERROR, logger='orchestrator.escalation_router'):
