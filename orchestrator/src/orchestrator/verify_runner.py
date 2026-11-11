@@ -81,7 +81,11 @@ from orchestrator.remote_gate import (
     reap_script_text,
     shim_suspected,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
+from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
+    collapsed_module_overrides,
+    task_spec_to_json,
+)
 from orchestrator.verify import (
     VerifyResult,
     _archive_merge_verify_logs,
@@ -554,7 +558,20 @@ def build_merge_verify_spec(
         merge_verify_breadth=config.merge_verify_breadth,
         global_verify_command=global_verify_command_for(config, verify_commands),
         verify_cold_preprovision_command=config.verify_cold_preprovision_command,
+        scope_cargo=_carried_scope_cargo(config, module_configs),
+        merge_config_only_full_gate_globs=tuple(config.git.merge_config_only_full_gate_globs),
     )
+
+
+def _carried_scope_cargo(config: OrchestratorConfig, module_configs: list[ModuleConfig]) -> bool:
+    """The scope_cargo the spec ships: False when a per-module override cannot ride it.
+
+    module_config_from_command drops a per-module scope_cargo, and on the remote
+    a spec-level False can only widen cargo scope (verify.py::_apply_cargo_scope);
+    η (task 9135) makes per-module carriage lossless.
+    """
+    collapsed = collapsed_module_overrides(module_configs)
+    return config.scope_cargo and not any(c.field == 'scope_cargo' for c in collapsed)
 
 
 # ---------------------------------------------------------------------------
