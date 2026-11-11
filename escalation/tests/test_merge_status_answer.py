@@ -363,6 +363,9 @@ class TestHints:
         for token in ('task_id', 'branch', 'request_id', 'get_merge_queue'):
             assert token in hint, f'{token!r} missing from {hint!r}'
         assert 'Submit it with merge_request' not in hint
+        resubmit_sentences = [s for s in hint.split('. ') if 'resubmit' in s.lower()]
+        assert resubmit_sentences, hint
+        assert all('licensed only' in s for s in resubmit_sentences), hint
 
 
 class TestLastOutcome:
