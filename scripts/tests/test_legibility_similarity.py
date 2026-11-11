@@ -12,6 +12,7 @@ import pytest
 from legibility import (
     census_findings,
     codebook,
+    codebook_lifecycle,
     config,
     embeddings,
     similarity,
@@ -597,6 +598,16 @@ class TestAdjudicateMembers:
 
         with pytest.raises(ValueError, match='cand-20260801-1.*pending'):
             similarity.adjudicate_members(verified, offered)
+
+    def test_a_member_already_rejected_is_refused_by_the_lifecycle_table(self):
+        cb = self._pending()
+        offered = self._offered(cb)
+        rejected = copy.deepcopy(cb)
+        _by_id(rejected, 'cand-20260805-1')['disposition'] = 'rejected'
+        _by_id(rejected, 'cand-20260801-1')['disposition'] = 'rejected'
+
+        with pytest.raises(codebook_lifecycle.IllegalTransition, match=r'^reject: .*cand-20260801-1'):
+            similarity.adjudicate_members(rejected, offered)
 
 
 class TestAdjudicationReport:
