@@ -985,7 +985,7 @@ class AmendmentReviewContext:
 
 
 @dataclass(frozen=True)
-class _LedgerVerdict:
+class LedgerVerdict:
     """Result of a pure anti-thrash evaluator (task 2172 / W3-ε).
 
     Bundles the updated :class:`~shared.task_metadata.RetryLedger` with the
@@ -1023,7 +1023,7 @@ def _build_retry_ledger(metadata: dict) -> RetryLedger:
         return RetryLedger()
 
 
-def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerdict:
+def evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> LedgerVerdict:
     """Pure decision core for the no-plan-failure anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1057,15 +1057,15 @@ def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerd
         'consecutive_no_plan_failures': counter,
         'total_no_plan_failures': total,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
-def _evaluate_infra_resume(
+def evaluate_infra_resume(
     ledger: RetryLedger,
     current_iter_count: int,
     recent_category: str | None,
     threshold: int,
-) -> _LedgerVerdict:
+) -> LedgerVerdict:
     """Pure decision core for the infra-resume-thrash anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1099,7 +1099,7 @@ def _evaluate_infra_resume(
         'consecutive_infra_resume_failures': counter,
         'last_infra_resume_iteration_count': current_iter_count,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
 def evaluate_merge_thrash(
@@ -1107,7 +1107,7 @@ def evaluate_merge_thrash(
     prev_signature: str | None,
     current_signature: str,
     threshold: int,
-) -> _LedgerVerdict:
+) -> LedgerVerdict:
     """Pure decision core for the merge-outcome-thrash anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1135,7 +1135,7 @@ def evaluate_merge_thrash(
         'consecutive_merge_thrash': counter,
         'last_merge_outcome_signature': current_signature,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
 @dataclass
@@ -6591,7 +6591,7 @@ class TaskWorkflow:
 
         Fix C — increments ``consecutive_no_plan_failures`` keyed by
         ``last_no_plan_main_sha`` inside the typed ``metadata.retry_ledger``
-        blob (see :func:`_evaluate_no_plan`).  When the counter hits ≥ 2
+        blob (see :func:`evaluate_no_plan`).  When the counter hits ≥ 2
         with the same main SHA, the no-plan loop has been observed and we
         escalate to a human directly (skip the steward) rather than
         letting the workflow re-pend.
@@ -6620,7 +6620,7 @@ class TaskWorkflow:
         metadata = self.task.get('metadata') or {}
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_no_plan(ledger, current_main_sha)
+        verdict = evaluate_no_plan(ledger, current_main_sha)
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
@@ -6752,7 +6752,7 @@ class TaskWorkflow:
         L0 was an ``infra_issue`` and the iteration log has not grown since
         the previous resume, increment ``consecutive_infra_resume_failures``
         inside the typed ``metadata.retry_ledger`` blob (see
-        :func:`_evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
+        :func:`evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
         route to ``_mark_blocked(escalate_to_human=True)`` instead of
         dispatching the implementer again.
 
@@ -6820,7 +6820,7 @@ class TaskWorkflow:
 
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_infra_resume(
+        verdict = evaluate_infra_resume(
             ledger, current_iter_count, recent_category,
             self.config.max_consecutive_infra_resumes,
         )
