@@ -72,6 +72,7 @@ from _watchdog_crash_loop import (
 from _watchdog_dashboard_parity import print_unit_parity, unit_parity_pass
 from _watchdog_state import (
     atomic_write_json,
+    min_interval_remaining_secs,
     read_clock_epoch,
     read_json_state,
     stamp_clock,
@@ -493,6 +494,25 @@ FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
     os.path.join(
         REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
     ),
+)
+
+# The orchestrator liveness revive cap (task 8270): the per-unit sibling of
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS, so a wedged unit is still revived
+# within this interval while a crash-looping one is revived at most once per
+# it. Sizing: OPERATIONS.md §8. <=0 disables the cap; env-with-fallback.
+try:
+    ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS = int(
+        os.environ["ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS"]
+    )
+except (KeyError, ValueError):
+    ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS = 900
+
+# That cap's OWN clocks, one file per unit: a separate family from every
+# deploy clock in both directions (FM_LIVENESS_RESTART_CLOCK_PATH's I5
+# reasoning), stamped only by a liveness revive and read only by its cap.
+ORCH_LIVENESS_RESTART_CLOCK_DIR = os.environ.get(
+    "ORCH_LIVENESS_RESTART_CLOCK_DIR",
+    os.path.join(REPO_DIR, "data", "orchestrator", "liveness-restart"),
 )
 
 
@@ -1605,6 +1625,29 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     return stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH, log)
 
 
+def _orch_liveness_restart_clock_path(unit: str) -> str:
+    return os.path.join(ORCH_LIVENESS_RESTART_CLOCK_DIR, f"{unit}.json")
+
+
+def _orch_liveness_revive_wait_secs(unit: str) -> float:
+    """Seconds before *unit* may be liveness-revived again; 0.0 when it may be now."""
+    path = _orch_liveness_restart_clock_path(unit)
+    return min_interval_remaining_secs(
+        ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS,
+        lambda: read_clock_epoch(path, f"{unit} liveness restart clock", log),
+    )
+
+
+def _stamp_orch_liveness_restart_clock(unit: str) -> bool:
+    """Arm *unit*'s liveness revive cap; True iff it landed.
+
+    The return value is load-bearing, as _stamp_fm_liveness_restart_clock's
+    is: nothing else rebuilds this clock, so the caller must say loudly when
+    the cap is unarmed.
+    """
+    return stamp_clock(_orch_liveness_restart_clock_path(unit), log)
+
+
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
     """Persist the current consecutive-non-healthy-verdict streak (task 3764).
 
@@ -1882,8 +1925,9 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
 
     Either signal takes the same revive path — restart_unit()'s
     reset-failed + restart --no-block — gated by the same is_unit_enabled /
-    STARTUP_GRACE_SECS / in-flight-fleet-lease checks, and the log line names
-    which signal fired.
+    STARTUP_GRACE_SECS / in-flight-fleet-lease checks and the same per-unit
+    revive cap (ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS, task 8270), and the
+    log line names which signal fired.
 
     One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
     sweep is currently restarting is skipped, because a unit mid-restart is
@@ -1939,11 +1983,12 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
     # overwhelmingly common case) costs zero extra I/O, and the
     # read is maximally fresh at the decision point.
     #
-    # Scoped to current_unit and nothing else: I5 (liveness stays
-    # uncapped, non-clock-gated and non-stamping — brokenness is
-    # not a scheduled deploy) must survive for every OTHER unit. A
-    # blanket liveness disable for the ~80 minutes of a sweep would
-    # leave a genuinely wedged unit unattended for over an hour.
+    # Scoped to current_unit and nothing else: I5 (liveness is not
+    # gated by any deploy clock and never stamps one; it is capped only
+    # by its own per-unit revive clock, task 8270 — brokenness is not a
+    # scheduled deploy) must survive for every OTHER unit. A blanket
+    # liveness disable for the ~80 minutes of a sweep would leave a
+    # genuinely wedged unit unattended for over an hour.
     lease = _live_fleet_lease()
     if lease is not None and lease.get("current_unit") == unit:
         log(
@@ -1952,12 +1997,29 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
             "is restarting this unit; skipping the liveness restart"
         )
         return
+    wait = _orch_liveness_revive_wait_secs(unit)
+    if wait > 0:
+        log(
+            f"{unit} {reason}, but a liveness revive is capped to one per "
+            f"{ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS}s per unit; "
+            f"{wait:.0f}s remain; skipping"
+        )
+        return
     # Covers wedged-active, dead-enabled (boot-race cancelled), and
     # dead-but-socket-held: restart_unit's reset-failed + restart --no-block
     # sequence revives every case.
     log(f"{unit} {reason}; restarting")
-    restart_unit(unit)
-    log(f"{unit} restart issued")
+    try:
+        restart_unit(unit)
+        log(f"{unit} restart issued")
+    finally:
+        # Armed on the raising path too, as fused_memory_liveness_pass does.
+        if not _stamp_orch_liveness_restart_clock(unit):
+            log(
+                f"{unit} liveness revive cap could NOT be armed; further revives "
+                f"are unbounded until {_orch_liveness_restart_clock_path(unit)} "
+                "is writable"
+            )
 
 
 def fused_memory_liveness_pass() -> None:
@@ -2472,7 +2534,8 @@ def staleness_pass() -> None:
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
     _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
-    (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
+    (liveness is not gated by any deploy clock and never stamps one; it is
+    capped only by its own per-unit revive clock, task 8270 — I5:
     brokenness is not a scheduled deploy). Task 4755 added the single
     exception, and it is deliberately as narrow as one: main() skips the
     liveness restart of the ONE unit a live lease names as current_unit,
@@ -2628,8 +2691,8 @@ def fused_memory_staleness_pass() -> None:
     (mirroring fused_memory_liveness_pass()'s isolation) so a probe hiccup is
     logged and swallowed rather than crashing the oneshot watchdog. Uses
     _delegate_fm_restart() (detached defer-if-busy chokepoint), never
-    restart_unit() directly — liveness stays the only uncapped, non-clock-gated
-    revive path (I5: brokenness is not a scheduled deploy).
+    restart_unit() directly — liveness stays the only revive path no deploy
+    clock gates (I5: brokenness is not a scheduled deploy).
     """
     if _within_fm_deploy_min_interval():
         # Bucket on wall-clock time — see SKIP_LOG_INTERVAL_SECS. The gate

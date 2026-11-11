@@ -3813,7 +3813,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
 
     main() still restarts a port-down unit via restart_unit even when
     _within_fleet_deploy_min_interval() would report True (inside the 8h
-    fleet-deploy window) — liveness is uncapped, non-clock-gated, and
+    fleet-deploy window) — liveness is not deploy-clock-gated and
     non-stamping; brokenness is not a scheduled deploy.
     """
     wdog = _load_watchdog()
@@ -5897,7 +5897,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     """Scenario 7 (I5) -- liveness during the 8h window, non-stamping: with
     a REAL on-disk fleet-deploy clock dated ~1h ago (inside the window,
     sentinel {ts, iso}), main() still immediately revives a port-down unit
-    (liveness is uncapped and not clock-gated) AND the clock file is left
+    (liveness is not deploy-clock-gated) AND the clock file is left
     byte-identical afterward -- a single wedged-unit revive must never
     advance the fleet-wide deploy clock. Extends
     test_main_liveness_unaffected_by_fleet_deploy_gate above (which
@@ -12007,7 +12007,7 @@ def test_staleness_pass_still_delegates_exactly_once_when_nothing_changes(
 # code=killed status=9/KILL.
 #
 # The suppression is scoped to the lease's current_unit and NOTHING else. I5 —
-# liveness stays uncapped, non-clock-gated and non-stamping, because brokenness
+# liveness stays not deploy-clock-gated and non-stamping, because brokenness
 # is not a scheduled deploy — must survive for every other unit. A blanket
 # liveness disable during a sweep is explicitly forbidden.
 #
