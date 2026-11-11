@@ -1221,6 +1221,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
+    # Gates both the deterministic recon sweep and the scheduled-deploy
+    # settler, which share this interval.
+    config.deterministic_recon_sweep_enabled = False
+    config.deterministic_recon_sweep_interval_secs = 900.0
+    # Always-on services (task 5344): no enable gate, so the interval must be real.
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires
