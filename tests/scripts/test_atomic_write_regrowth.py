@@ -70,6 +70,9 @@ from typing import NamedTuple
 
 import pytest
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
 # below the repo root, so this constant carried over verbatim from the guard's

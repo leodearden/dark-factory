@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_fixture import (
     FULL_SUITE,
     command_entry,
@@ -18,6 +19,8 @@ from verify_budget_census_fixture import (
     write_corpus,
     write_worktree_record,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestTheCliContract:

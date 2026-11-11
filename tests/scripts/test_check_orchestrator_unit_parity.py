@@ -88,6 +88,9 @@ from setup_host_sections import (
     systemctl_calls,
     write_checker,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"

@@ -122,8 +122,11 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

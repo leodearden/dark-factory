@@ -13,6 +13,9 @@ import types
 
 import pytest
 from shared.proc_liveness import pid_alive
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"

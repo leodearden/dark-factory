@@ -15,11 +15,14 @@ import importlib.util
 import pathlib
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     ALL_ORCHESTRATOR_SERVICE_FILES,
     REPO_ROOT,
     parse_sections,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = REPO_ROOT / "scripts"
 HOOK = "ExecStopPost=-/home/leo/src/dark-factory/scripts/stop-socket-unless-restarting.sh %n"

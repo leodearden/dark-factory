@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_fixture import (
     FULL_SUITE,
     command_entry,
@@ -19,6 +20,8 @@ from verify_budget_census_fixture import (
     write_module_yaml,
     write_worktree_record,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # "Whatever the start instant reads" — a sentinel, because `None` is itself a
 # MEANINGFUL end reading here (a degraded component) and cannot double as the

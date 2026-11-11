@@ -85,6 +85,9 @@ import yaml
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 from orchestrator.verify_cmd import split_top_level_and
 from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
