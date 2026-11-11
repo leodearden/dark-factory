@@ -14,33 +14,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _zcode_fixture import (
+    BASE_URL,
+    OPERATOR_EMAIL,
+    OPERATOR_ENV_VARS,
+    OPERATOR_IGNORED_FILE,
+    measured_output,
+    plan_tools_mcp,
+    write_operator_home,
+)
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.zcode_backend import ZCodeEndpointMissing
 
-BASE_URL = 'https://api.z.ai/api/anthropic'
 SECRET = 'k-secret'
 ENDPOINT_OVERRIDES = {'ANTHROPIC_BASE_URL': BASE_URL, 'ANTHROPIC_AUTH_TOKEN': SECRET}
-PLAN_TOOLS_MCP = {'mcpServers': {'plan-tools': {
-    'command': '/venv/bin/python', 'args': ['-m', 'plan_tools'],
-}}}
 PRICES = {'glm-5.3': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
-
-MEASURED_OUTPUT = {
-    'sessionId': 'sess_fake',
-    'traceId': 'trace-1',
-    'turnId': 'turn-1',
-    'response': 'probe complete',
-    'usage': {
-        'source': 'provider', 'modelRequestCount': 2, 'inputTokens': 1000,
-        'outputTokens': 50, 'totalTokens': 1050, 'cacheReadTokens': 300,
-        'cacheWriteTokens': 100, 'reasoningTokens': 0,
-    },
-    'eventCount': 12,
-    'projection': {'status': 'idle', 'turnCount': 1},
-}
 
 FAKE_ZCODE = '''#!/usr/bin/env python3
 import json
@@ -67,7 +58,7 @@ def git_probe():
     repo = Path(os.environ['TMPDIR'], 'probe-repo')
     repo.mkdir()
     (repo / 'kept.txt').write_text('kept\\n')
-    (repo / 'dropped.operator-ignored').write_text('dropped\\n')
+    (repo / OPERATOR_IGNORED_FILE).write_text('dropped\\n')
     git(repo, 'init', '-q')
     git(repo, 'add', '-A')
     commit = git(repo, 'commit', '-q', '-m', 'probe')
@@ -109,7 +100,11 @@ def fake_zcode(tmp_path, monkeypatch) -> FakeZCode:
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     script = bin_dir / 'zcode'
-    script.write_text(FAKE_ZCODE.replace('MEASURED_JSON', repr(json.dumps(MEASURED_OUTPUT))))
+    script.write_text(
+        FAKE_ZCODE
+        .replace('MEASURED_JSON', repr(json.dumps(measured_output())))
+        .replace('OPERATOR_IGNORED_FILE', repr(OPERATOR_IGNORED_FILE)),
+    )
     script.chmod(0o755)
     monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ.get("PATH", "")}')
     capture_path = tmp_path / 'capture.json'
@@ -117,23 +112,12 @@ def fake_zcode(tmp_path, monkeypatch) -> FakeZCode:
     return FakeZCode(capture_path=capture_path)
 
 
-OPERATOR_TOOL_VARS = (
-    'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
-    'CARGO_HOME', 'RUSTUP_HOME', 'GIT_CONFIG_GLOBAL',
-)
-
-
 @pytest.fixture
 def operator_home(tmp_path, monkeypatch) -> Path:
-    op = tmp_path / 'operator'
-    op.mkdir()
-    (op / '.gitconfig').write_text('[user]\n\tname = Op Erator\n\temail = op@example.test\n')
-    ignore = op / '.config' / 'git' / 'ignore'
-    ignore.parent.mkdir(parents=True)
-    ignore.write_text('*.operator-ignored\n')
+    op = write_operator_home(tmp_path / 'operator')
     monkeypatch.setenv('HOME', str(op))
     monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
-    for name in OPERATOR_TOOL_VARS:
+    for name in OPERATOR_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     return op
 
@@ -158,7 +142,7 @@ async def _invoke(worktree: Path, **overrides: Any):
         'model': 'glm-5.3',
         'backend': 'zcode',
         'env_overrides': dict(ENDPOINT_OVERRIDES),
-        'mcp_config': PLAN_TOOLS_MCP,
+        'mcp_config': plan_tools_mcp(),
         'disallowed_tools': ['Bash(git push:*)', 'Write'],
         'timeout_seconds': 30,
         'prices': PRICES,
@@ -171,6 +155,11 @@ def _flag_value(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
+def _inline_value(argv: list[str], flag: str) -> str:
+    [value] = [arg.removeprefix(f'{flag}=') for arg in argv if arg.startswith(f'{flag}=')]
+    return value
+
+
 @pytest.mark.asyncio
 class TestInvokeZCode:
 
@@ -178,7 +167,7 @@ class TestInvokeZCode:
         result = await _invoke(worktree)
         assert result.success is True
         assert result.output == 'probe complete'
-        assert result.session_id == 'sess_fake'
+        assert result.session_id == 'sess-123'
         assert result.turns == 2
         assert result.input_tokens == 600
         assert result.cache_read_tokens == 300
@@ -190,7 +179,7 @@ class TestInvokeZCode:
     async def test_the_argv_runs_one_headless_prompt_in_the_worktree(self, fake_zcode, worktree):
         await _invoke(worktree)
         argv = fake_zcode.capture()['argv']
-        assert _flag_value(argv, '--prompt') == 'do step-1'
+        assert _inline_value(argv, '--prompt') == 'do step-1'
         assert _flag_value(argv, '--cwd') == str(worktree)
         assert _flag_value(argv, '--mode') == 'yolo'
         assert _flag_value(argv, '--output-format') == 'json'
@@ -276,7 +265,7 @@ class TestInvokeZCode:
         capture = fake_zcode.capture()
         probe = capture['git_probe']
         assert probe['commit_rc'] == 0, probe['commit_stderr']
-        assert probe['author_email'] == 'op@example.test'
+        assert probe['author_email'] == OPERATOR_EMAIL
         assert probe['tracked'] == ['kept.txt']
         environ = capture['environ']
         assert environ['CARGO_HOME'] == str(operator_home / '.cargo')

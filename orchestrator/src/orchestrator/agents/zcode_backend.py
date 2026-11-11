@@ -28,6 +28,7 @@ AUTH_TOKEN_VAR = 'ANTHROPIC_AUTH_TOKEN'
 PROVIDER_ID = 'dark-factory'
 INTERACTIVE_TOOLS = ('AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode')
 MAX_ARG_STRLEN = 131072
+PROMPT_FLAG = '--prompt'
 # HOME-derived tool locations the agent's commands keep at the operator's values; see plans/zcode-harness-probe-2026-11.md.
 OPERATOR_TOOL_HOMES: tuple[tuple[str, str], ...] = (
     ('XDG_CONFIG_HOME', '.config'),
@@ -206,22 +207,25 @@ def _operator_tool_homes(base_env: Mapping[str, str], operator_home: Path) -> di
 
 
 def zcode_argv(prompt: str, cwd: Path, disallowed_tools: Iterable[str] | None) -> list[str]:
-    _require_fits_one_argument(prompt)
     return [
-        'zcode', '--prompt', prompt, '--cwd', str(cwd), '--mode', 'yolo',
+        'zcode', _prompt_argument(prompt), '--cwd', str(cwd), '--mode', 'yolo',
         '--output-format', 'json', '--no-color',
         '--disallowed-tools', ' '.join(_disallowed_tool_names(disallowed_tools)),
     ]
 
 
-def _require_fits_one_argument(prompt: str) -> None:
-    size = len(prompt.encode())
+def _prompt_argument(prompt: str) -> str:
+    """Inline, because strict parseArgs refuses a separate value that starts with '-'."""
+    argument = f'{PROMPT_FLAG}={prompt}'
+    size = len(argument.encode())
     if size >= MAX_ARG_STRLEN:
         raise ValueError(
-            f'the zcode prompt is {size} bytes, but zcode takes it only as one argument and '
-            f'Linux execve refuses an argument of {MAX_ARG_STRLEN} bytes or more, counting '
-            'its terminating NUL (MAX_ARG_STRLEN)',
+            f'the zcode prompt is {len(prompt.encode())} bytes, so its {PROMPT_FLAG}= argument '
+            f'is {size} bytes, but zcode takes the prompt only as that one argument and Linux '
+            f'execve refuses an argument of {MAX_ARG_STRLEN} bytes or more, counting its '
+            'terminating NUL (MAX_ARG_STRLEN)',
         )
+    return argument
 
 
 def _disallowed_tool_names(specs: Iterable[str] | None) -> list[str]:

@@ -15,6 +15,14 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from _zcode_fixture import (
+    BASE_URL,
+    OPERATOR_EMAIL,
+    OPERATOR_IGNORED_FILE,
+    measured_output,
+    plan_tools_mcp,
+    write_operator_home,
+)
 from shared.cli_invoke import _SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
@@ -31,29 +39,10 @@ from orchestrator.agents.zcode_backend import (
     zcode_spawn_env,
 )
 
-BASE_URL = 'https://api.z.ai/api/anthropic'
 TOKEN = 'k-secret-value'
 ENDPOINT = ZCodeEndpoint(base_url=BASE_URL, api_key=TOKEN)
 ALWAYS_DISALLOWED = 'AskUserQuestion EnterPlanMode ExitPlanMode'
-
-MEASURED_OUTPUT = {
-    'sessionId': 'sess-123',
-    'traceId': 'trace-1',
-    'turnId': 'turn-1',
-    'response': 'probe complete',
-    'usage': {
-        'source': 'provider',
-        'modelRequestCount': 2,
-        'inputTokens': 1000,
-        'outputTokens': 50,
-        'totalTokens': 1050,
-        'cacheReadTokens': 300,
-        'cacheWriteTokens': 100,
-        'reasoningTokens': 0,
-    },
-    'eventCount': 12,
-    'projection': {'status': 'completed', 'turnCount': 1},
-}
+PROMPT_PREFIX_BYTES = len('--prompt=')
 
 
 def _subprocess_result(
@@ -115,6 +104,9 @@ class TestZCodeEndpoint:
 
     def test_the_refusal_is_a_value_error(self):
         assert issubclass(ZCodeEndpointMissing, ValueError)
+
+    def test_the_key_stays_out_of_the_repr(self):
+        assert TOKEN not in repr(ZCodeEndpoint(base_url=BASE_URL, api_key=TOKEN))
 
 
 class TestZCodeProviderConfig:
@@ -204,9 +196,15 @@ class TestZCodeArgv:
     def test_the_headless_argv_always_removes_the_interactive_tools(self, tmp_path):
         argv = zcode_argv('do step-1', tmp_path, None)
         assert argv == [
-            'zcode', '--prompt', 'do step-1', '--cwd', str(tmp_path), '--mode', 'yolo',
+            'zcode', '--prompt=do step-1', '--cwd', str(tmp_path), '--mode', 'yolo',
             '--output-format', 'json', '--no-color', '--disallowed-tools', ALWAYS_DISALLOWED,
         ]
+
+    @pytest.mark.parametrize('prompt', ['- do step-1', '---\ntitle: x\n---\n', '--cwd=/', ''])
+    def test_a_prompt_that_looks_like_an_option_stays_inline_in_one_token(self, tmp_path, prompt):
+        argv = zcode_argv(prompt, tmp_path, None)
+        assert argv[1] == f'--prompt={prompt}'
+        assert argv[2:4] == ['--cwd', str(tmp_path)]
 
     def test_plain_tool_names_are_appended_once(self, tmp_path):
         argv = zcode_argv('p', tmp_path, ['Write', 'mcp__plan-tools__mark_step_done', 'Write',
@@ -230,14 +228,21 @@ class TestZCodeArgv:
         assert any(spec in r.getMessage() for r in warnings)
 
     def test_the_largest_single_argument_linux_accepts_passes(self, tmp_path):
-        prompt = 'x' * 131071
-        assert zcode_argv(prompt, tmp_path, None)[2] == prompt
+        prompt = 'x' * (131071 - PROMPT_PREFIX_BYTES)
+        assert zcode_argv(prompt, tmp_path, None)[1] == f'--prompt={prompt}'
 
-    @pytest.mark.parametrize('n_bytes', [131072, 131073, 200_000])
+    @pytest.mark.parametrize('n_bytes', [
+        131072 - PROMPT_PREFIX_BYTES, 131072, 131073, 200_000,
+    ])
     def test_a_prompt_beyond_max_arg_strlen_is_refused_with_its_byte_count(
         self, tmp_path, n_bytes,
     ):
         with pytest.raises(ValueError, match=str(n_bytes)):
+            zcode_argv('x' * n_bytes, tmp_path, None)
+
+    def test_the_refusal_counts_the_flag_prefix_in_the_argument_size(self, tmp_path):
+        n_bytes = 131072 - PROMPT_PREFIX_BYTES
+        with pytest.raises(ValueError, match='131072 bytes, but'):
             zcode_argv('x' * n_bytes, tmp_path, None)
 
     def test_the_bound_counts_utf8_bytes_not_characters(self, tmp_path):
@@ -251,7 +256,7 @@ class TestParseZCodeOutput:
     def test_the_measured_success_json(self):
         cost_of, calls = _recording_cost_of()
         result = parse_zcode_output(
-            _subprocess_result(stdout=json.dumps(MEASURED_OUTPUT)), cost_of=cost_of,
+            _subprocess_result(stdout=json.dumps(measured_output())), cost_of=cost_of,
         )
         assert result.success is True
         assert result.subtype == 'success'
@@ -269,10 +274,8 @@ class TestParseZCodeOutput:
         assert result.timed_out is False
 
     def test_cached_tokens_above_input_clamp_the_uncached_input_to_zero(self, caplog):
-        payload = {**MEASURED_OUTPUT, 'usage': {
-            **MEASURED_OUTPUT['usage'], 'inputTokens': 200,
-            'cacheReadTokens': 300, 'cacheWriteTokens': 100,
-        }}
+        payload = measured_output()
+        payload['usage'].update(inputTokens=200, cacheReadTokens=300, cacheWriteTokens=100)
         cost_of, calls = _recording_cost_of()
         with caplog.at_level(logging.WARNING, logger='orchestrator.agents.zcode_backend'):
             result = parse_zcode_output(
@@ -306,7 +309,7 @@ class TestParseZCodeOutput:
 
     @pytest.mark.parametrize('timed_out', [False, True])
     @pytest.mark.parametrize(('stdout', 'stderr', 'returncode'), [
-        (json.dumps(MEASURED_OUTPUT), '', 0),
+        (json.dumps(measured_output()), '', 0),
         ('partial', 'Error: boom', 1),
         ('', '', 0),
         ('not json', '', 0),
@@ -324,11 +327,6 @@ class TestParseZCodeOutput:
             assert result.success is False
 
 
-PLAN_TOOLS_MCP = {'mcpServers': {'plan-tools': {
-    'command': '/venv/bin/python', 'args': ['-m', 'plan_tools'],
-}}}
-
-
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
@@ -339,7 +337,7 @@ OPERATOR_HOME = Path('/home/operator')
 def _run_home(system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_HOME):
     return zcode_run_home(
         system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
-        mcp_config=PLAN_TOOLS_MCP, operator_home=operator_home,
+        mcp_config=plan_tools_mcp(), operator_home=operator_home,
     )
 
 
@@ -368,7 +366,7 @@ class TestZCodeRunHome:
             )
             assert _mode(home.provider_config_path) == 0o600
             cli_config = home.root / '.zcode' / 'cli' / 'config.json'
-            assert json.loads(cli_config.read_text()) == zcode_cli_config(PLAN_TOOLS_MCP)
+            assert json.loads(cli_config.read_text()) == zcode_cli_config(plan_tools_mcp())
             assert (home.root / '.zcode' / 'AGENTS.md').read_text() == 'SYS PROMPT'
             assert (home.root / 'tmp').is_dir()
 
@@ -457,25 +455,13 @@ def _git(repo: Path, env: dict[str, str], *args: str) -> subprocess.CompletedPro
     )
 
 
-def _operator_home(root: Path, *, with_gitconfig: bool = True) -> Path:
-    root.mkdir()
-    if with_gitconfig:
-        (root / '.gitconfig').write_text(
-            '[user]\n\tname = Op Erator\n\temail = op@example.test\n',
-        )
-    ignore = root / '.config' / 'git' / 'ignore'
-    ignore.parent.mkdir(parents=True)
-    ignore.write_text('*.operator-ignored\n')
-    return root
-
-
 def _repo(root: Path) -> Path:
     root.mkdir()
     subprocess.run(['git', 'init', '-q', str(root)], check=True, env={
         'PATH': os.environ['PATH'], 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1',
     })
     (root / 'kept.txt').write_text('kept\n')
-    (root / 'dropped.operator-ignored').write_text('dropped\n')
+    (root / OPERATOR_IGNORED_FILE).write_text('dropped\n')
     return root
 
 
@@ -485,21 +471,22 @@ def _operator_env(operator_home: Path) -> dict[str, str]:
 
 class TestZCodeSpawnEnvGit:
 
-    def test_git_sees_the_operator_identity_and_excludes(self, tmp_path):
-        op = _operator_home(tmp_path / 'operator')
+    @pytest.mark.parametrize('home_name', ['operator', 'op#1;x', 'op"q\\z'])
+    def test_git_sees_the_operator_identity_and_excludes(self, tmp_path, home_name):
+        op = write_operator_home(tmp_path / home_name)
         repo = _repo(tmp_path / 'repo')
         with _run_home(operator_home=op) as home:
             env = zcode_spawn_env(_operator_env(op), home)
             ident = _git(repo, env, 'var', 'GIT_AUTHOR_IDENT')
             staged = _git(repo, env, 'add', '-A', '--dry-run')
         assert ident.returncode == 0, ident.stderr
-        assert 'op@example.test' in ident.stdout
+        assert OPERATOR_EMAIL in ident.stdout
         assert staged.returncode == 0, staged.stderr
         assert 'kept.txt' in staged.stdout
-        assert 'dropped.operator-ignored' not in staged.stdout
+        assert OPERATOR_IGNORED_FILE not in staged.stdout
 
     def test_an_operator_home_without_a_gitconfig_is_not_an_error(self, tmp_path):
-        op = _operator_home(tmp_path / 'operator', with_gitconfig=False)
+        op = write_operator_home(tmp_path / 'operator', with_gitconfig=False)
         repo = _repo(tmp_path / 'repo')
         with _run_home(operator_home=op) as home:
             status = _git(repo, zcode_spawn_env(_operator_env(op), home), 'status')

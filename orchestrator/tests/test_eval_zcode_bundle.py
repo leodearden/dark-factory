@@ -21,7 +21,7 @@ from orchestrator.evals.configs import (
     get_config_by_name,
     ofat_candidates,
 )
-from orchestrator.evals.metrics import RoleUnderTest, resolve_cost_usd
+from orchestrator.evals.metrics import RoleUnderTest, is_proxied_endpoint, resolve_cost_usd
 from orchestrator.evals.runner import build_eval_orch_config
 from orchestrator.shadow_types import CostBasis
 
@@ -75,9 +75,11 @@ def test_the_cell_runs_zcode_and_prices_glm_as_imputed(tmp_path):
     assert orch_config.backends.implementer == 'zcode'
     assert orch_config.backends.debugger == 'zcode'
     assert configs.GLM_MODEL in orch_config.prices
+    is_local_model = is_proxied_endpoint(orch_config.env_overrides)
+    assert is_local_model is True
     _, cost_source = resolve_cost_usd(
         1000, 50, model=configs.GLM_MODEL, prices=orch_config.prices,
-        cli_cost_usd=0.0, is_local_model=True,
+        cli_cost_usd=0.0, is_local_model=is_local_model,
     )
     assert cost_source == 'price_table'
     assert configs.CANDIDATE_ENDPOINT_PRICES[configs.GLM_MODEL].cost_basis is CostBasis.SUBSCRIPTION
