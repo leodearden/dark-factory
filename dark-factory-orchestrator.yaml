@@ -914,16 +914,16 @@ verify_admission_pytest_n: "8"
 # test legs run at once, admitted through the per-project flock; merge legs never
 # take a slot. The code default is 1
 # (config.py::OrchestratorConfig.verify_admission_task_slots).
-# 3 since 2026-11-10: Leo's progressive-slot rule (raise one step at a time
-# while task admission wait >= 5 min and idle CPU >= 0.5 threads, ceiling 5).
-# Basis, step-down triggers and the dated value history (two earlier raises
-# were measured and reverted): plans/verify-admission-task-slots-gate.md.
+# 2 since 2026-11-11: stepped down from 3 under Leo's progressive-slot rule
+# (local merge verifies ran over the +20% line twice in a row at 3 slots).
+# Basis, step-down triggers and the dated value history:
+# plans/verify-admission-task-slots-gate.md.
 # Any change to this value appends a dated entry there AND rewrites the
 # "N since DATE" sentence above, in the same commit.
 # GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
 # applies via reload_config with no restart, which matters: a restart destroys
 # the in-flight work this knob protects.
-verify_admission_task_slots: 3
+verify_admission_task_slots: 2
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a

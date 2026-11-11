@@ -212,6 +212,28 @@ the 34.3 baseline) or above 46 min; landings per 2 h below the baseline over
 at least 4 ticks; any oom_kill; MemAvailable below 16 GB; or reify or a solar
 project resuming.
 
+### 2026-11-11 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-11 13:26Z under the 2026-11-10 entry's trigger: two
+consecutive local merge verifies of different tasks at 3 slots ran over the
+41-min line (20% over the 34.3-min baseline):
+
+| Run end | Task | Runner | Duration | Host PSI during run |
+|---|---|---|---|---|
+| 12:28Z | 6425 | local | 44.8 min, passed | 30.6 |
+| 13:17Z | 9308 | local | 43.6 min, passed | — |
+
+Laptop merge verifies over the same window were 19.7-24.1 min. Context at the
+step: host PSI 2 h median 30.5, mean idle 4.0 threads, task-leg admission
+wait 2.9 min (n 22), 6 landings in 2 h, MemAvailable 65 GB, oom_kill 0. The
+3-slot period ran 2026-11-10 21:00Z to 11-11 13:26Z, but most of it was
+confounded: a fleet-restart drain (21:00-23:48Z) and an account-pool usage
+cap (about 01:00-10:33Z) left little verify demand. Its 3-slot evidence is
+roughly the 3 h after 10:33Z.
+
+Re-raise to 3 under the same rule (2 h mean task wait >= 5 min and idle
+>= 0.5 threads), no earlier than 2 h after this step.
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise
