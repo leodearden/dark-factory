@@ -66,10 +66,13 @@ def _observe(
 # ---------------------------------------------------------------------------
 
 
+def _assign(obj: object, field: str, value: object) -> None:
+    setattr(obj, field, value)
+
+
 def test_unit_restart_status_is_frozen() -> None:
-    status = _status(3)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        status.n_restarts = 4  # type: ignore[misc]
+        _assign(_status(3), "n_restarts", 4)
 
 
 @pytest.mark.parametrize(
@@ -254,7 +257,7 @@ def test_observe_unit_does_not_mutate_its_input() -> None:
 
     assert history == before
     with pytest.raises(dataclasses.FrozenInstanceError):
-        history.start_limit_paged = True  # type: ignore[misc]
+        _assign(history, "start_limit_paged", True)
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,8 @@ import enum
 import math
 import os
 import subprocess
+import time
+from collections.abc import Callable
 
 from _watchdog_state import LogSink, atomic_write_json, read_json_state
 
@@ -373,3 +375,60 @@ def file_crash_loop_escalation(alarm: CrashLoopAlarm, *, repo_dir: str, log: Log
         return False
     log(f"filed born-at-L2 crash-loop page {alarm.task_sentinel} ({alarm.kind})")
     return True
+
+
+def crash_loop_pass(
+    units: list[str],
+    read_status: Callable[[str], UnitRestartStatus],
+    *,
+    repo_dir: str,
+    log: LogSink,
+    now: float | None = None,
+    alarm_count: int = RESTART_RATE_ALARM_COUNT,
+    window_secs: int = RESTART_RATE_ALARM_WINDOW_SECS,
+) -> dict[str, UnitRestartStatus]:
+    """Sample every unit's restart status once, page on a crash loop, and return the statuses read.
+
+    The watchdog runs this before every liveness gate, enabled and startup
+    grace included, because the grace window is what blinded it to the
+    2026-10-26 loop; OPERATIONS.md §8 "Crash loop" has the rationale. Each
+    unit is read inside its own guard, so one failing read cannot blind the
+    rest, and a unit whose read failed is absent from the result. The state
+    is loaded and saved once per pass. Never raises.
+    """
+    statuses: dict[str, UnitRestartStatus] = {}
+    try:
+        now = time.time() if now is None else now
+        path = restart_rate_state_path(repo_dir)
+        histories = load_restart_histories(path, log)
+        for unit in units:
+            try:
+                status = read_status(unit)
+                statuses[unit] = status
+                obs = observe_unit(
+                    unit,
+                    histories.get(unit, UnitRestartHistory()),
+                    status,
+                    now=now,
+                    alarm_count=alarm_count,
+                    window_secs=window_secs,
+                )
+                _act_on(obs, now=now, repo_dir=repo_dir, log=log)
+                histories[unit] = obs.history
+            except Exception as exc:
+                log(f"crash-loop detector error for {unit}: {exc!r}")
+        save_restart_histories(path, histories, log)
+    except Exception as exc:
+        log(f"crash-loop detector pass error: {exc!r}")
+    return statuses
+
+
+def _act_on(obs: Observation, *, now: float, repo_dir: str, log: LogSink) -> None:
+    if obs.alarm is not None:
+        file_crash_loop_escalation(obs.alarm, repo_dir=repo_dir, log=log)
+    elif obs.held is not None:
+        age = now - (obs.history.last_escalation_epoch or now)
+        log(
+            f"crash loop on {obs.held.unit} ({obs.held.kind}): a page was filed "
+            f"{age:.0f}s ago, inside the {obs.held.window_secs}s window; not re-filing"
+        )
