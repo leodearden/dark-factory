@@ -4279,6 +4279,9 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         assert hint == failed_line, f'Unexpected hint: {hint!r}'
 
 
+_SESSION_START = ' test session starts '.center(80, '=') + '\n'
+
+
 class TestCompleteSessionIsNotLabelledAborted:
     """task 5891: a session whose every collected test reported is complete,
     whatever worker-death text appears in its output."""
@@ -4313,6 +4316,62 @@ class TestCompleteSessionIsNotLabelledAborted:
         assert hint == f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0', (
             f'Unexpected hint: {hint!r}'
         )
+
+    def test_an_earlier_sessions_recovered_crash_lends_nothing_to_a_later_session(self):
+        """The root test_command &&-chains default-verbosity sessions. A crash
+        the first session recovered from must not complete the -q witness for
+        a later session that ``-x`` stopped short."""
+        failed_line = 'FAILED orchestrator/tests/test_x.py::test_real - assert 0'
+        recovered_session = (
+            _SESSION_START
+            + '.' * 30 + '[gw0] node down: Not properly terminated\n'
+            + 'replacing crashed worker gw0\n'
+            + '.' * 41 + ' ' * 31 + '[100%]\n'
+            + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+        )
+        stopped_session = (
+            _SESSION_START
+            + '....F'.ljust(73) + '[ 10%]\n'
+            + ' FAILURES '.center(80, '=') + '\n'
+            + 'E   assert 0\n'
+            + ' short test summary info '.center(80, '=') + '\n'
+            + failed_line + '\n'
+            + ' stopping after 1 failures '.center(80, '!') + '\n'
+            + ' 1 failed, 4 passed in 0.10s '.center(80, '=') + '\n'
+        )
+        output = recovered_session + stopped_session
+        summary = _test_leg_result(output).summary
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+    @pytest.mark.parametrize(
+        'truncated_session',
+        [
+            XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
+            ''.join(
+                line
+                for line in XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT.splitlines(keepends=True)
+                if XDIST_RESTART_DISABLED_MESSAGE not in line
+            ),
+        ],
+        ids=['with-bailout-literal', 'stopped-progress-only'],
+    )
+    def test_a_truncated_last_session_after_a_passing_one_is_still_labelled(
+        self, truncated_session,
+    ):
+        """GUARD: a session header must not hide the progress that follows it,
+        and an earlier session's [100%] must not veto the last session."""
+        passing_session = (
+            _SESSION_START
+            + '.' * 72 + ' [100%]\n'
+            + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+        )
+        output = passing_session + _SESSION_START + truncated_session
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        summary = _test_leg_result(output).summary
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
 
 
 class TestVerifyResultCauseHint:
