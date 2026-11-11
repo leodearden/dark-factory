@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import redis.exceptions
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _import_closure import SRC, modules_loaded_by_importing
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 
@@ -24,7 +25,7 @@ from fused_memory.backends.falkor_read_only import (
     ReadOnlyGraphReader,
     open_graph,
 )
-from fused_memory.backends.graphiti_client import (
+from fused_memory.backends.paged_read import (
     INCOMPLETE_STRUCTURAL_REFUSAL,
     PagedRead,
 )
@@ -353,12 +354,22 @@ class TestOpening:
         with pytest.raises(ValueError, match='uri'):
             open_graph('g', uri='redis://x', **address)
 
-    def test_the_module_never_constructs_or_directly_imports_the_graphiti_driver(self) -> None:
-        """graphiti's FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write.
+    def test_importing_the_seam_never_loads_the_graphiti_driver(self) -> None:
+        """FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write, so the seam must not even load the driver's module."""
+        probe = modules_loaded_by_importing(
+            'fused_memory.backends.falkor_read_only',
+            (
+                'graphiti_core.driver.falkordb_driver',
+                'graphiti_core',
+                'fused_memory.backends.graphiti_client',
+            ),
+        )
 
-        Direct imports only: graphiti_client, which this module imports, loads
-        the driver module transitively.
-        """
+        assert Path(probe.file).resolve() == SRC / 'fused_memory' / 'backends' / 'falkor_read_only.py'
+        assert probe.loaded == ()
+
+    def test_the_module_never_constructs_or_lazily_imports_the_graphiti_driver(self) -> None:
+        """Catches what the import probe cannot see: a FalkorDriver construction or a function-local graphiti_core import."""
         tree = ast.parse(Path(falkor_read_only.__file__).read_text(encoding='utf-8'))
         calls = [
             node.lineno for node in ast.walk(tree)
