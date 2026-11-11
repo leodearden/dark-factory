@@ -6610,6 +6610,31 @@ class TestDriftDetectorCheckEnvInconclusive:
         assert pool.is_quarantined('laptop') is False
 
 
+class TestEnvDriftCheckResultUnavailableReasonInvariant:
+    """A reason rides only on a faithful INCONCLUSIVE: check_env_safely trusts it to mean that."""
+
+    def test_reason_on_a_faithful_inconclusive_is_accepted(self):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        result = EnvDriftCheckResult(
+            verdict=DriftVerdict.INCONCLUSIVE, is_faithful=True, unavailable_reason='ssh down',
+        )
+        assert result.unavailable_reason == 'ssh down'
+
+    @pytest.mark.parametrize(
+        ('verdict_name', 'is_faithful'),
+        [('AGREE', True), ('DIVERGE', False), ('INCONCLUSIVE', False)],
+    )
+    def test_reason_on_any_other_result_is_rejected(self, verdict_name, is_faithful):
+        from orchestrator.verify_runner import DriftVerdict, EnvDriftCheckResult
+        verdict = DriftVerdict[verdict_name]
+        with pytest.raises(ValueError) as excinfo:
+            EnvDriftCheckResult(
+                verdict=verdict, is_faithful=is_faithful, unavailable_reason='ssh down',
+            )
+        assert f'verdict={verdict}' in str(excinfo.value)
+        assert f'is_faithful={is_faithful}' in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 class TestDriftDetectorCheckEnvSafelyInconclusiveReason:
     """check_env_safely(): the land-hook path is where an INCONCLUSIVE's reason is seen.

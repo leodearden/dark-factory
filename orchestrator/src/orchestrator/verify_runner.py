@@ -3343,6 +3343,8 @@ class EnvDriftCheckResult:
                       such as an unbindable ControlPath can be told from an
                       unreachable host.  None on every other result, including
                       the INCONCLUSIVE guards for a check that was not taken.
+                      Construction rejects a reason on anything but a faithful
+                      INCONCLUSIVE, because check_env_safely logs it as one.
     """
     verdict: DriftVerdict
     is_faithful: bool
@@ -3351,6 +3353,17 @@ class EnvDriftCheckResult:
     remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     escalated: bool = False
     unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.unavailable_reason is None:
+            return
+        if self.verdict is not DriftVerdict.INCONCLUSIVE or not self.is_faithful:
+            raise ValueError(
+                'EnvDriftCheckResult: unavailable_reason is set only on a faithful '
+                f'INCONCLUSIVE; got verdict={self.verdict}, '
+                f'is_faithful={self.is_faithful}, '
+                f'unavailable_reason={self.unavailable_reason!r}'
+            )
 
 
 class DriftDetector:
