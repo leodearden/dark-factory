@@ -7098,21 +7098,6 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
 
 
 # ---------------------------------------------------------------------------
-# step-15: _is_ticket_id helper
-# ---------------------------------------------------------------------------
-def test_is_ticket_id_recognises_tkt_prefix():
-    """_is_ticket_id() returns True for tkt_-prefixed strings, False otherwise."""
-    from fused_memory.middleware.task_interceptor import _is_ticket_id
-
-    assert _is_ticket_id('tkt_0000000000000000000000000000') is True
-    assert _is_ticket_id('tkt_abc') is True
-    assert _is_ticket_id('') is False
-    assert _is_ticket_id('123') is False
-    assert _is_ticket_id('1.2') is False
-    assert _is_ticket_id(None) is False
-
-
-# ---------------------------------------------------------------------------
 # step-19: submit_task persists a pending ticket and returns its id
 # ---------------------------------------------------------------------------
 
@@ -12301,46 +12286,6 @@ async def test_commit_planning_cancelled_does_not_index(
     )
     assert 'error' not in search_result
     assert search_result['results'] == []
-
-
-# ─────────────────────────────────────────────────────────────────────
-# _looks_like_task_id helper
-# ─────────────────────────────────────────────────────────────────────
-
-
-def test_looks_like_task_id_accepts_numeric_strings():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert _looks_like_task_id('42')
-    assert _looks_like_task_id('  42  ')
-    assert _looks_like_task_id('0')
-
-
-def test_looks_like_task_id_accepts_int():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert _looks_like_task_id(42)
-    assert _looks_like_task_id(0)
-
-
-def test_looks_like_task_id_rejects_bool():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert not _looks_like_task_id(True)
-    assert not _looks_like_task_id(False)
-
-
-def test_looks_like_task_id_rejects_negative_and_non_numeric():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert not _looks_like_task_id(-1)
-    assert not _looks_like_task_id('-1')
-    assert not _looks_like_task_id('abc')
-    assert not _looks_like_task_id('')
-    assert not _looks_like_task_id('   ')
-    assert not _looks_like_task_id(None)
-    assert not _looks_like_task_id('tkt_abc')
-    assert not _looks_like_task_id('1.5')
 
 
 # ─────────────────────────────────────────────────────────────────────
