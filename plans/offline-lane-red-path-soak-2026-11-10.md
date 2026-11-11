@@ -91,3 +91,8 @@ The three NO_DATA rows are vacuous: no lane fix task was filed since T, because 
 - **What fails instead:** every other failure, a read timeout or an over-budget judge call included, fails and goes through flake debt. Task 8436's earlier over-budget skip is gone.
 - **Lasting outages:** these are `fused-memory/scripts/lane_dependency_probe.py`'s to report.
 - **Rejected:** counting skips as no-signal debts (B) and forbidding skips in the lane (C).
+
+**Amended 2026-11-11 (Leo, on esc-flake-regressed-after-resolution-4 through -11).** A 00:09Z OpenAI connection blip failed 15 live tests in pass 20261111T000934-ba1793, and all 15 cleared on confirm.
+- Most of those failures were a connect-phase `ConnectError`, which the rule above does not cover. The frontier-arm test's failure was swallowed by the judge's fail-open, so the skip never saw it.
+- Leo widened "never reached" to the whole connect phase (ConnectError as well as ConnectTimeout), and to a judge fail-open whose cause was an unreached provider. Failures after connect still go to flake debt.
+- The work is ticket `tkt_0RWVSAA56BDDHW4C0NN5ZCRXEH`, awaiting curation. The 15 flake-debt tasks from that pass (9290-9304) were cancelled and the 8 escalations closed.
