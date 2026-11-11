@@ -42,7 +42,7 @@ from shared.task_metadata import (
     DoneProvenance,
     TriggerChain,
 )
-from shared.task_read import TaskFound, TaskReadFailed
+from shared.task_read import TaskRead, TaskReadFailed
 
 from orchestrator import systemd_inspect
 from orchestrator.before_done_script import (
@@ -81,12 +81,14 @@ from orchestrator.proc_supervision import (
 )
 from orchestrator.review_due import (
     REVIEW_DUE_CATEGORY,
-    CompletionGateUnread,
+    CompletionGateReading,
     HumanGateFacts,
     InvalidTriggerChain,
+    ReviewDueWithheld,
+    build_review_due,
+    completion_gate_reading,
+    first_completion_gate,
     human_gate_chain,
-    is_completion_gate,
-    review_due,
 )
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import (
@@ -332,9 +334,6 @@ def _snippet_project_root(scheduler) -> str:
     return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
 
-_PROJECT_ID_PLACEHOLDER: str = '<project_id>'
-
-
 def _configured_project_id(scheduler) -> str | None:
     """The scheduler's configured fused-memory project_id, or None if unusable.
 
@@ -426,7 +425,8 @@ def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | Non
     exists to sharpen.  So filter to the gate category first and take the
     newest of those; fall back to the newest own record only when no
     gate-category record survives (e.g. a human gate filed as
-    ``milestone_gate`` before ``review_due`` existed), and return ``None``
+    ``milestone_gate`` before ``review_due`` existed, or with its
+    ``review_due`` withheld for an unusable config), and return ``None``
     for an empty list (an empty list must
     never be indexed; ``_build_done_provenance``'s ``exclude_none=True`` then
     simply drops the key).
@@ -698,7 +698,7 @@ def _dependency_ids(task: dict) -> list[str]:
 
 
 def gate_escalation_category(metadata: dict) -> str:
-    """The category a pure gate files under and its done provenance cites."""
+    """The category a pure gate's done provenance cites: ``review_due`` for a valid human-gate chain."""
     if isinstance(human_gate_chain(metadata), TriggerChain):
         return REVIEW_DUE_CATEGORY
     return MILESTONE_GATE_CATEGORY
@@ -707,7 +707,7 @@ def gate_escalation_category(metadata: dict) -> str:
 def build_gate_escalation_fields(
     task: dict | None,
     metadata: dict,
-    human_gate: HumanGateFacts | None,
+    human_gate: HumanGateFacts | ReviewDueWithheld | None,
     *,
     escalation_id: str,
     fired_at: str,
@@ -715,34 +715,29 @@ def build_gate_escalation_fields(
     """The one builder both pure-gate producers file through.
 
     ``DeterministicRunner._file_milestone_gate_and_block`` and
-    ``Harness._recover_stranded_deterministic_gate`` both call it, so a
-    recovered gate matches the runner's filing. A ``trigger_chain`` human gate
-    files ``review_due`` (plans/completion-driven-triggers-prd.md C4) and
-    needs *human_gate* from :func:`read_human_gate_facts`; every other gate
-    files ``milestone_gate``. The operational-LLM token prefix applies to
-    either.
+    ``Harness._recover_stranded_deterministic_gate`` both call it with
+    *human_gate* from :func:`read_human_gate_facts`, so a recovered gate
+    matches the runner's filing. ``HumanGateFacts`` files ``review_due``
+    (plans/completion-driven-triggers-prd.md C4); anything else files
+    ``milestone_gate``, a ``ReviewDueWithheld`` with a detail line saying why.
+    The operational-LLM token prefix applies to either.
     """
     task = task or {}
     dep_ids = _dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-    category = gate_escalation_category(metadata)
+    category = MILESTONE_GATE_CATEGORY
     summary = task.get('title', '')
     payload: ReviewDueState | None = None
-    chain = human_gate_chain(metadata)
-    if isinstance(chain, InvalidTriggerChain):
-        detail_parts.append(chain.detail_line())
-    elif chain is not None:
-        if human_gate is None:
-            raise ValueError(
-                f'task {task.get("id")!r} is a trigger_chain human gate: read its '
-                'HumanGateFacts with read_human_gate_facts before building its escalation'
-            )
-        due = review_due(
-            chain, human_gate, human_gate_task_id=str(task.get('id')),
+    if isinstance(human_gate, ReviewDueWithheld):
+        detail_parts.append(human_gate.detail_line())
+    elif human_gate is not None:
+        due = build_review_due(
+            human_gate, human_gate_task_id=str(task.get('id')),
             escalation_id=escalation_id, fired_at=fired_at,
         )
+        category = REVIEW_DUE_CATEGORY
         summary = due.summary
         payload = due.payload
         detail_parts.extend(due.detail_lines)
@@ -767,38 +762,55 @@ def build_gate_escalation_fields(
 
 async def read_human_gate_facts(
     scheduler, task: dict | None, metadata: dict,
-) -> HumanGateFacts | None:
-    """The facts a human gate's escalation needs; ``None``, unread, for any other gate.
+) -> HumanGateFacts | ReviewDueWithheld | None:
+    """A human gate's chain and facts, or why it withholds ``review_due``; ``None`` for any other gate.
 
     Both producers call it before :func:`build_gate_escalation_fields`, so
-    they cannot read the project or the completion gate differently.
+    they cannot read the chain, the project or the completion gate
+    differently. Nothing is read for a gate that is not a human gate.
     """
-    if not isinstance(human_gate_chain(metadata), TriggerChain):
+    chain = human_gate_chain(metadata)
+    if chain is None:
         return None
+    if isinstance(chain, InvalidTriggerChain):
+        return ReviewDueWithheld(f'trigger_chain is invalid: {chain.reason}')
+    project_id = _configured_project_id(scheduler)
+    project_root = _configured_project_root(scheduler)
+    if project_id is None or project_root is None:
+        unusable = ' and '.join(
+            name for name, value in (
+                ('fused_memory.project_id', project_id), ('project_root', project_root),
+            ) if value is None
+        )
+        return ReviewDueWithheld(f'the orchestrator config has no usable {unusable}')
     return HumanGateFacts(
-        project_id=_configured_project_id(scheduler) or _PROJECT_ID_PLACEHOLDER,
-        project_root=_snippet_project_root(scheduler),
+        chain=chain,
+        project_id=project_id,
+        project_root=str(project_root),
         completion_gate=await _read_completion_gate(scheduler, task or {}),
     )
 
 
-async def _read_completion_gate(scheduler, task: dict) -> dict | CompletionGateUnread | None:
-    """The first dependency that is a completion gate; else the first failed read; else None."""
-    first_unread: CompletionGateUnread | None = None
-    for dep_id in _dependency_ids(task):
-        try:
-            read = await scheduler.read_task(dep_id)
-        except Exception as exc:
-            logger.warning(
-                'DeterministicRunner: task %s dependency %s read raised %s: %s',
-                task.get('id'), dep_id, type(exc).__name__, exc,
-            )
-            read = TaskReadFailed(f'{type(exc).__name__}: {exc}')
-        if isinstance(read, TaskFound) and is_completion_gate(read.task):
-            return read.task
-        if isinstance(read, TaskReadFailed) and first_unread is None:
-            first_unread = CompletionGateUnread(task_id=dep_id, reason=read.reason)
-    return first_unread
+async def _read_completion_gate(scheduler, task: dict) -> CompletionGateReading:
+    """Every dependency, read concurrently, then :func:`first_completion_gate` in dependency order."""
+    dep_ids = _dependency_ids(task)
+    reads = await asyncio.gather(
+        *(_read_dependency(scheduler, task.get('id'), dep_id) for dep_id in dep_ids),
+    )
+    return first_completion_gate(
+        completion_gate_reading(dep_id, read) for dep_id, read in zip(dep_ids, reads, strict=True)
+    )
+
+
+async def _read_dependency(scheduler, task_id: object, dep_id: str) -> TaskRead:
+    try:
+        return await scheduler.read_task(dep_id)
+    except Exception as exc:
+        logger.warning(
+            'DeterministicRunner: task %s dependency %s read raised %s: %s',
+            task_id, dep_id, type(exc).__name__, exc,
+        )
+        return TaskReadFailed(f'{type(exc).__name__}: {exc}')
 
 
 class DeterministicRunner:

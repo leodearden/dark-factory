@@ -7,6 +7,7 @@ gate files ``review_due`` with a typed payload; every other pure gate files
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.task_metadata import TriggerChain
 from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
 from test_deterministic_runner import _make_assignment, _seed_escalation
 
@@ -26,10 +28,10 @@ from orchestrator.deterministic_runner import (
     REVIEW_DUE_CATEGORY,
     DeterministicRunner,
     GateEscalationFields,
-    HumanGateFacts,
     build_gate_escalation_fields,
+    read_human_gate_facts,
 )
-from orchestrator.review_due import CompletionGateUnread
+from orchestrator.review_due import CompletionGateUnread, HumanGateFacts, ReviewDueWithheld
 from orchestrator.workflow import WorkflowOutcome
 
 RUN_ID = 'review-dark_factory-20261004'
@@ -38,6 +40,7 @@ PROJECT_ROOT = '/home/leo/src/dark-factory'
 ESC_ID = 'esc-42-1'
 FIRED_AT = '2026-10-05T00:00:00+00:00'
 VERDICT = {'verdict': 'pass', 'share': 0.75, 'by_priority': {'high': [3, 1, 0]}}
+CHAIN = TriggerChain(role='human_gate', skill='review', run_id=RUN_ID)
 
 
 def _plain_gate(task_id: str = '42', deps: list | None = None) -> dict:
@@ -70,7 +73,7 @@ def _human_gate_task(
     return task
 
 
-def _completion_gate(task_id: str = '41', verdict: object = None) -> dict:
+def _completion_gate(task_id: str = '41', verdict: object = None, skill: str = 'review') -> dict:
     return {
         'id': task_id,
         'title': 'Run review-dark_factory-20261004 is complete',
@@ -78,7 +81,7 @@ def _completion_gate(task_id: str = '41', verdict: object = None) -> dict:
         'metadata': {
             'task_kind': 'deterministic',
             'trigger_chain': {
-                'role': 'completion_gate', 'skill': 'review', 'run_id': RUN_ID,
+                'role': 'completion_gate', 'skill': skill, 'run_id': RUN_ID,
                 'superseded_by': None,
             },
             'predicate_verdict': dict(VERDICT) if verdict is None else verdict,
@@ -88,11 +91,14 @@ def _completion_gate(task_id: str = '41', verdict: object = None) -> dict:
 
 def _facts(completion_gate: dict | CompletionGateUnread | None) -> HumanGateFacts:
     return HumanGateFacts(
-        project_id=PROJECT_ID, project_root=PROJECT_ROOT, completion_gate=completion_gate,
+        chain=CHAIN, project_id=PROJECT_ID, project_root=PROJECT_ROOT,
+        completion_gate=completion_gate,
     )
 
 
-def _build(task: dict, human_gate: HumanGateFacts | None) -> GateEscalationFields:
+def _build(
+    task: dict, human_gate: HumanGateFacts | ReviewDueWithheld | None,
+) -> GateEscalationFields:
     return build_gate_escalation_fields(
         task, task['metadata'], human_gate, escalation_id=ESC_ID, fired_at=FIRED_AT,
     )
@@ -127,13 +133,17 @@ class TestPlainPureGate:
         assert fields.detail.startswith(f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] ')
         assert fields.detail.endswith(_plain_detail(task))
 
-    def test_completion_gate_role_builds_a_plain_milestone_gate(self):
-        task = _human_gate_task(role='completion_gate')
-        fields = _build(task, None)
+    def test_withheld_review_due_files_milestone_gate_saying_why(self):
+        task = _human_gate_task()
+        fields = _build(task, ReviewDueWithheld('the config is unusable'))
         assert fields.category == 'milestone_gate'
         assert fields.summary == task['title'][:200]
-        assert fields.detail == _plain_detail(task)
         assert fields.review_due is None
+        plain = _plain_detail(task)
+        assert fields.detail.startswith(plain)
+        extra = [line for line in fields.detail[len(plain):].splitlines() if line]
+        assert len(extra) == 1
+        assert 'the config is unusable' in extra[0]
 
 
 class TestHumanGate:
@@ -196,19 +206,6 @@ class TestHumanGate:
         assert len(extra) == 1
         assert 'str' in extra[0]
 
-    def test_slash_spelled_skill_files_milestone_gate_naming_the_bare_form(self):
-        task = _human_gate_task(skill='/review')
-        fields = _build(task, _facts(_completion_gate()))
-        assert fields.category == 'milestone_gate'
-        assert fields.review_due is None
-        assert "must be the bare skill name 'review'" in fields.detail
-        assert fields.detail.startswith(_plain_detail(task))
-
-    def test_valid_chain_without_facts_raises(self):
-        task = _human_gate_task()
-        with pytest.raises(ValueError, match='HumanGateFacts') as excinfo:
-            _build(task, None)
-        assert '42' in str(excinfo.value)
 
 
 FIXED_NOW = datetime(2026, 10, 5, 12, 30, tzinfo=UTC)
@@ -232,6 +229,84 @@ def _chain_scheduler(task: dict, reads: Mapping[str, TaskRead | BaseException]) 
     scheduler.set_task_status = AsyncMock()
     scheduler.update_task = AsyncMock(return_value=True)
     return scheduler
+
+
+@pytest.mark.asyncio
+class TestReadHumanGateFacts:
+    async def test_valid_human_gate_carries_its_chain_and_completion_gate(self):
+        task = _human_gate_task()
+        gate = _completion_gate()
+        scheduler = _chain_scheduler(task, {'41': TaskFound(gate)})
+
+        facts = await read_human_gate_facts(scheduler, task, task['metadata'])
+
+        assert facts == HumanGateFacts(
+            chain=CHAIN, project_id=PROJECT_ID, project_root=PROJECT_ROOT, completion_gate=gate,
+        )
+
+    @pytest.mark.parametrize('task', [
+        _plain_gate(), _human_gate_task(role='completion_gate'),
+    ], ids=['plain-gate', 'completion-gate-role'])
+    async def test_other_gates_have_none_and_read_nothing(self, task: dict):
+        scheduler = _chain_scheduler(task, {})
+
+        assert await read_human_gate_facts(scheduler, task, task['metadata']) is None
+        scheduler.read_task.assert_not_awaited()
+
+    async def test_slash_spelled_skill_withholds_review_due_naming_the_bare_form(self):
+        task = _human_gate_task(skill='/review')
+        scheduler = _chain_scheduler(task, {})
+
+        human_gate = await read_human_gate_facts(scheduler, task, task['metadata'])
+
+        assert isinstance(human_gate, ReviewDueWithheld)
+        fields = _build(task, human_gate)
+        assert fields.category == 'milestone_gate'
+        assert fields.review_due is None
+        assert "must be the bare skill name 'review'" in fields.detail
+        assert fields.detail.startswith(_plain_detail(task))
+        scheduler.read_task.assert_not_awaited()
+
+    @pytest.mark.parametrize('config, unusable', [
+        (SimpleNamespace(project_root=PROJECT_ROOT, fused_memory=None), 'fused_memory.project_id'),
+        (SimpleNamespace(project_root=None, fused_memory=SimpleNamespace(project_id=PROJECT_ID)),
+         'project_root'),
+    ], ids=['no-project-id', 'no-project-root'])
+    async def test_unusable_config_withholds_review_due_naming_the_field(
+        self, config: SimpleNamespace, unusable: str,
+    ):
+        task = _human_gate_task()
+        scheduler = _chain_scheduler(task, {'41': TaskFound(_completion_gate())})
+        scheduler.config = config
+
+        human_gate = await read_human_gate_facts(scheduler, task, task['metadata'])
+
+        assert human_gate == ReviewDueWithheld(f'the orchestrator config has no usable {unusable}')
+        scheduler.read_task.assert_not_awaited()
+
+    async def test_dependencies_are_read_concurrently(self):
+        task = _human_gate_task(deps=['30', '31', '41'])
+        gate = _completion_gate()
+        reads: dict[str, TaskRead] = {'30': TaskAbsent(), '31': TaskAbsent(), '41': TaskFound(gate)}
+        in_flight = 0
+        peak = 0
+
+        async def read_task(task_id: str) -> TaskRead:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return reads[task_id]
+
+        scheduler = _chain_scheduler(task, reads)
+        scheduler.read_task = AsyncMock(side_effect=read_task)
+
+        facts = await read_human_gate_facts(scheduler, task, task['metadata'])
+
+        assert isinstance(facts, HumanGateFacts)
+        assert facts.completion_gate == gate
+        assert peak == 3
 
 
 async def _fire(
@@ -313,6 +388,58 @@ class TestRunnerFilesTheHumanGate:
         unread_lines = [line for line in esc.detail.splitlines() if error_text in line]
         assert len(unread_lines) == 1
         assert '41' in unread_lines[0]
+
+    async def test_a_later_completion_gate_wins_over_an_earlier_failed_read(self, tmp_path: Path):
+        task = _human_gate_task(deps=['40', '41'])
+        outcome, queue, _ = await _fire(
+            tmp_path, task,
+            {'40': TaskReadFailed('get_task error=boom'), '41': TaskFound(_completion_gate())},
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        esc = _only_pending(queue, '42')
+        assert esc.review_due is not None
+        assert esc.review_due['verdict'] == VERDICT
+        assert esc.review_due['completion_gate_task_id'] == '41'
+        assert 'boom' not in esc.detail
+        assert esc.detail == _plain_detail(task)
+
+    async def test_a_failed_read_before_a_plain_dependency_is_named(self, tmp_path: Path):
+        task = _human_gate_task(deps=['40', '41'])
+        outcome, queue, _ = await _fire(
+            tmp_path, task,
+            {
+                '40': TaskReadFailed('get_task error=boom'),
+                '41': TaskFound({'id': '41', 'title': 'a run task', 'metadata': {}}),
+            },
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        esc = _only_pending(queue, '42')
+        assert esc.review_due is not None
+        assert esc.review_due['verdict'] is None
+        assert esc.review_due['completion_gate_task_id'] is None
+        unread_lines = [line for line in esc.detail.splitlines() if 'boom' in line]
+        assert len(unread_lines) == 1
+        assert '40' in unread_lines[0]
+
+    async def test_a_completion_gate_with_an_invalid_chain_is_named_not_trusted(
+        self, tmp_path: Path,
+    ):
+        task = _human_gate_task()
+        outcome, queue, _ = await _fire(
+            tmp_path, task, {'41': TaskFound(_completion_gate(skill='/review'))},
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        esc = _only_pending(queue, '42')
+        assert esc.category == 'review_due'
+        assert esc.review_due is not None
+        assert esc.review_due['verdict'] is None
+        assert esc.review_due['completion_gate_task_id'] is None
+        invalid_lines = [line for line in esc.detail.splitlines() if 'trigger_chain is invalid' in line]
+        assert len(invalid_lines) == 1
+        assert '41' in invalid_lines[0]
 
     async def test_plain_gate_files_milestone_gate_without_reading_dependencies(self, tmp_path: Path):
         task = _plain_gate()
