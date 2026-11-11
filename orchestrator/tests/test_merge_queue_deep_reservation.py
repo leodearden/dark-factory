@@ -26,11 +26,13 @@ from _merge_lane_fakes import (
     FakeRemoteRunner,
     FakeVerifier,
     VerifyScript,
+    fails,
     hangs_until,
     healthy_verify_clock,
     lane_scene_config,
     lane_state,
     make_lane,
+    raises,
     running_lane,
 )
 from _orch_helpers import wait_responsive
@@ -134,6 +136,18 @@ async def _landed_task_files(scene: _Scene) -> list[str]:
     return landed
 
 
+class _FirstVerifyScripted(FakeVerifier):
+    """S's FIRST verify (the chain tip) follows its script; every later verify passes."""
+
+    def __init__(self, first: dict[str, VerifyScript]) -> None:
+        super().__init__()
+        self._first = first
+
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        scripted = self._first.pop(task_id or '', None)
+        return scripted if scripted is not None else super().next_script(task_id)
+
+
 @dataclasses.dataclass
 class _Round:
     """A running lane mid-round: H verifies on 'head-host', P behind it on
@@ -175,7 +189,8 @@ async def _deep_round(
     awaited: bool = False,
     **lane_kwargs: Any,
 ) -> AsyncIterator[_Round]:
-    """Run a lane until S has dispatched with *followers* buffered behind it."""
+    """Run a lane until S has dispatched with *followers* buffered behind it;
+    S's first verify follows *s_script*."""
     names = ('H', 'P', 'S', *followers, *extra)
     reqs = {
         name: await _request(scene, name, awaited_by_workflow=awaited) for name in names
@@ -186,7 +201,7 @@ async def _deep_round(
         FakeRemoteRunner(_HEAD_HOST, release=release_head, entered=head_entered),
         FakeRemoteRunner('p-host', release=release_p, entered=p_entered),
     ]
-    verifier = FakeVerifier(scripts={'S': s_script})
+    verifier = _FirstVerifyScripted({'S': s_script})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock(),
@@ -337,3 +352,68 @@ class TestACoalescingAbsorbsNoReservedLink:
             assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
             assert _reservations(rnd.lane) == []
 
+
+
+def _hang_then(release: asyncio.Event, entered: asyncio.Event, then: VerifyScript) -> VerifyScript:
+    return dataclasses.replace(then, release=release, entered=entered)
+
+
+class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
+    """E: a tip that fails, raises or is abandoned only releases the reservation.
+
+    No outcome is rendered for a link by that round: each link later lands on
+    its own, verified on its own, and nothing is blocked.
+    """
+
+    async def _assert_links_go_their_own_way(
+        self, scene: _Scene, rnd: _Round, *, s_status: str = 'done',
+    ) -> None:
+        reqs = rnd.reqs
+        await _until(lambda: _reservations(rnd.lane) == [], label='the reservation released')
+        for name in ('F1', 'F2'):
+            assert not reqs[name].result.done(), name
+        await rnd.land_head_and_p()
+        names = ('F1', 'F2') if s_status != 'done' else ('S', 'F1', 'F2')
+        outcomes = await _outcomes(rnd, names)
+        assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
+        assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names)
+        for name in ('F1', 'F2'):
+            own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
+            assert own, f'{name} was never verified on its own'
+        assert await _landed_task_files(scene) == ['H', 'P', *names]
+        assert _reservations(rnd.lane) == []
+        _assert_no_live_permit(rnd.lane)
+
+    async def test_a_red_tip_releases_the_links(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        red = _hang_then(release_s, s_entered, fails(category='test', summary='red tip'))
+        async with _deep_round(scene, ('F1', 'F2'), s_script=red) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            release_s.set()
+            await self._assert_links_go_their_own_way(scene, rnd)
+
+    async def test_a_raised_tip_releases_the_links(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        boom = _hang_then(release_s, s_entered, raises(RuntimeError('tip verify exploded')))
+        async with _deep_round(scene, ('F1', 'F2'), s_script=boom) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            release_s.set()
+            await self._assert_links_go_their_own_way(scene, rnd)
+
+    async def test_an_abandoned_round_releases_the_links(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        s_entered = asyncio.Event()
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(asyncio.Event(), entered=s_entered),
+        ) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            rnd.reqs['S'].result.cancel()
+            await self._assert_links_go_their_own_way(scene, rnd, s_status='abandoned')
