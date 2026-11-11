@@ -190,6 +190,42 @@ XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT = (
     + ' 1 failed, 73 passed in 5.52s '.center(80, '=') + '\n'
 )
 
+# task 5891: default-verbosity bailouts that nonetheless COMPLETED. xdist printed
+# the bailout literal, but every collected test had already reported, so the
+# final progress line reads [100%] and the tally is whole. Measured live
+# (pytest 9.0.3, pytest-xdist 3.8.0, ``-n 2 --max-worker-restart=0``, one
+# os._exit test beside 40 passing), rebased onto this module's worker and
+# in-flight node-id.
+_XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY = (
+    ' FAILURES '.center(80, '=') + '\n'
+    + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
+    + '[gw3] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+    + f"worker 'gw3' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
+    + XDIST_BAILOUT_LINE
+    + ' short test summary info '.center(80, '=') + '\n'
+    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+    + ' 1 failed, 40 passed in 1.12s '.center(80, '=') + '\n'
+)
+
+# Default ``--dist load``: the crashed test was the last one outstanding.
+XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT = (
+    '.' * 40 + '[gw3] node down: Not properly terminated\n'
+    + 'F\n'
+    + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    + ' ' * 73 + '[100%]\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# ``--dist loadfile``: the worker died early, and the peer worker then finished
+# the queue already assigned to it, so the literal PRECEDES [100%].
+XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT = (
+    '.' * 6 + '[gw3] node down: Not properly terminated\n'
+    + 'F\n'
+    + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    + ('.' * 34).ljust(73) + '[100%]\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
 # task 5492: the multi-module join `verify.py::_aggregate_results` performs —
 # each module leg's test_output joined with '\n' — with the TRUNCATED module
 # NOT last. A completed -q module follows it, so the joined text's FINAL

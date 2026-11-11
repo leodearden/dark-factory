@@ -12,7 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
+    XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
     XDIST_BAILOUT_LINE,
+    XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
@@ -4273,6 +4275,29 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
         hint = _extract_cause_hint(output)
         assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+
+class TestCompleteSessionIsNotLabelledAborted:
+    """task 5891: a session whose every collected test reported is complete,
+    whatever worker-death text appears in its output."""
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @pytest.mark.parametrize(
+        'output',
+        [XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT, XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT],
+        ids=['crashed-test-was-last', 'peer-finished-its-queue'],
+    )
+    def test_a_bailout_that_still_reached_100_percent_keeps_its_verdict(self, output):
+        assert XDIST_RESTART_DISABLED_MESSAGE in output
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
 
 class TestVerifyResultCauseHint:
