@@ -82,6 +82,28 @@ prints 0.17.1.
   `Bash(git *)` would remove all of Bash; the arm drops such specs with a
   warning rather than passing them.
 
+## Agent tool environment
+
+- ZCode resolves its own state through Node's `homedir()`. Upstream
+  `zai-org/ZCode` a9fe401eed keeps the session db, logs, workflows and the CLI
+  config under `~/.zcode/cli`, so the run home must be `HOME`. ZCode passes
+  that env to its Bash tool and stdio MCP children, stripping only the proxy,
+  CA and telemetry variables
+  (`packages/shared/src/runtimeEnv.ts::SANITIZED_RUNTIME_ENV_KEYS`).
+- Measured 2026-11-11 with git 2.43.0: with `HOME` redirected alone,
+  `git var GIT_AUTHOR_IDENT` exits 128 "Author identity unknown", and
+  `git add -A` stages a file that the operator's `~/.config/git/ignore`
+  excludes. On this host that ignore file is what keeps `.claude/` artifacts
+  out of a commit.
+- The arm's remedy. A run-home `.gitconfig` includes the operator's
+  `~/.gitconfig`; git skips the include when the file is missing (measured).
+  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+  `CARGO_HOME` and `RUSTUP_HOME` are pinned to the operator's values, as
+  `orchestrator/src/orchestrator/agents/zcode_backend.py::OPERATOR_TOOL_HOMES`
+  defines. The agent's commands therefore resolve the same git identity, git
+  excludes, uv cache, uv Pythons and Rust toolchain as the commands of the
+  `glm-5.3-endpoint` control.
+
 ## Protocol
 
 ZCode's built-in "Z.ai Coding Plan" provider template
@@ -115,8 +137,22 @@ providers were not verified upstream.
 - Telemetry defaults. The environment variable
   `ZCODE_MODEL_TELEMETRY_ENABLED` exists; its default was not measured.
 - The cache-token arithmetic above, against a real provider.
+- The agent tool environment under the redirected `HOME`, beyond what the
+  remedy pins. These residual differences from the control remain:
+  - ZCode's login-shell snapshot sources the run home's rc files, which do
+    not exist, instead of the operator's `~/.bashrc` and `~/.profile`. PATH
+    entries and variables exported from rc files therefore come only from the
+    orchestrator's env.
+  - `~` paths inside the operator's git config resolve against the run home.
+  - Other `HOME`-relative dotfiles, such as `~/.npmrc`, `~/.docker` and
+    `~/go`, are not carried.
+  - A single-executable (SEA) ZCode build would cache its assets under the
+    pinned `XDG_CACHE_HOME`
+    (`apps/zcode-cli/packages/cli/src/tui-runtime-loader.ts`). The arm runs
+    the source-built `zcode.cjs`, so this does not arise today.
 
-All four are left to task 8939 (from ticket `tkt_0RWSZ5GKKD78GK8FKD16G2X67J`),
+All five are left to task 8939 (from ticket `tkt_0RWSZ5GKKD78GK8FKD16G2X67J`),
 the operator task that installs the ZCode CLI on the orchestrator host and runs
-the paired `glm-5.3-zcode` / `glm-5.3-endpoint` eval cells. Until task 8939 is
-done, the arm is built and awaiting its live run, not measured.
+the paired `glm-5.3-zcode` / `glm-5.3-endpoint` eval cells. Task 8939's live
+run should also confirm that an implementer step commits under the arm. Until
+task 8939 is done, the arm is built and awaiting its live run, not measured.
