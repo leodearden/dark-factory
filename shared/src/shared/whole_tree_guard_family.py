@@ -13,6 +13,7 @@ Pure stdlib plus ``shared.pytest_mark_grammar``, which owns the reading of
 from __future__ import annotations
 
 import ast
+import math
 
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 
@@ -21,6 +22,7 @@ __all__ = [
     'WHOLE_TREE_SCAN_TIMEOUT_NAME',
     'is_whole_tree_guard_ast',
     'is_whole_tree_guard_module',
+    'min_leg_budget_for_family',
     'module_level_timeout_arguments',
 ]
 
@@ -112,6 +114,15 @@ __all__ = [
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # orchestrator/tests/test_whole_tree_scan_timeout_guard.py).
+#
+# PER-LEG BUDGET: a per-test ceiling is a backstop only inside a verify leg
+# whose whole-run budget outlasts it; below that, verify kills the leg first
+# and an attributable hang becomes a retried, unattributed infra_timeout.  So
+# every registered verify leg whose tree holds a member must declare
+# `verify_command_timeout_secs >= min_leg_budget_for_family(W)`, W being that
+# leg's recorded worst green run, gated by
+# tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
+# Raising this ceiling is therefore also a budget change for those legs.
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 
 #: The spelling that admits a module to the family.  Membership is decided by
@@ -119,6 +130,11 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 1200
 #: would silently part from it on the next retune, while every module spelled
 #: through the name moves with it.
 WHOLE_TREE_SCAN_TIMEOUT_NAME = 'WHOLE_TREE_SCAN_TEST_TIMEOUT'
+
+
+def min_leg_budget_for_family(worst_green_run_secs: float) -> int:
+    """The smallest whole-100s leg budget at which a hang starting when the leg's slowest green run ends still reaches the ceiling."""
+    return math.ceil((worst_green_run_secs + WHOLE_TREE_SCAN_TEST_TIMEOUT) / 100) * 100
 
 
 def _parse(source: str | None) -> ast.Module | None:
