@@ -49,9 +49,7 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
-from fused_memory.middleware.dead_letter_escalator import (
-    emit_dead_letter_escalation,
-)
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dependency_direction_check import (
     DependencyDirectionFinding,
     build_dependency_index,
@@ -2712,7 +2710,7 @@ class MemoryService:
             # directly would stall the pool that is draining every other group.
             # Same call-site discipline as _record_entity_mint.
             await asyncio.to_thread(
-                emit_dead_letter_escalation,
+                dead_letter_escalator.emit_dead_letter_escalation,
                 project_root,
                 project_id=project_id,
                 operation=event.operation,
