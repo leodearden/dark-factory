@@ -23,7 +23,12 @@ from escalation.store_identity import StoreIdentity
 PROJECT_ID = 'proj'
 
 # The reads plans/escalation-store-ambiguity-prd.md §6.3 guards.
-GUARDED_READS = ('get_pending_escalations', 'get_escalation', 'get_task_escalation_history')
+GUARDED_READS = (
+    'get_pending_escalations',
+    'get_escalation',
+    'get_task_escalation_history',
+    'get_task_escalations',
+)
 # The writes the same §6.3 guards.
 GUARDED_WRITES = ('escalate_info', 'escalate_blocker')
 

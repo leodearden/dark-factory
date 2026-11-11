@@ -43,6 +43,7 @@ def arguments(name: str, escalation_id: str) -> dict[str, Any]:
         'get_pending_escalations': {'task_id': TASK},
         'get_escalation': {'escalation_id': escalation_id},
         'get_task_escalation_history': {'task_id': TASK},
+        'get_task_escalations': {'task_id': TASK},
         'escalate_info': _FILING,
         'escalate_blocker': _FILING,
     }
