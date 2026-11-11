@@ -20,6 +20,18 @@ import pytest
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 
 
+def _consolidation_gate_metadata() -> dict:
+    from fused_memory.reconciliation.consolidation_gate import (
+        build_consolidation_gate_task,
+    )
+
+    return build_consolidation_gate_task(topic='pure-gate-provenance-probe').metadata
+
+
+def _declared_decision_gate_metadata() -> dict:
+    return {'task_kind': 'deterministic', 'always_escalates': True, 'execution_class': 'decision'}
+
+
 class TestInjectOperationalRoutingMatrix:
     """Contract table for inject_operational_routing(metadata) -> Any.
 
@@ -258,6 +270,58 @@ class TestInjectOperationalRoutingMatrix:
         result = inject_operational_routing(json.dumps({'execution_class': 'operational'}))
 
         assert result[PURE_GATE_FROM_KEY] == 'execution_class=operational'
+
+    # -- provenance stamp: only a rewrite of the routing is stamped ---------
+
+    @pytest.mark.parametrize(
+        'factory',
+        [_consolidation_gate_metadata, _declared_decision_gate_metadata],
+        ids=['consolidation_gate', 'declared_decision_gate'],
+    )
+    def test_declared_pure_gate_is_not_stamped_and_gets_no_notice(self, factory):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+            pure_gate_routing_notice,
+        )
+
+        result = inject_operational_routing(factory())
+
+        assert PURE_GATE_FROM_KEY not in result
+        assert result['task_kind'] == 'deterministic'
+        assert result['always_escalates'] is True
+        assert pure_gate_routing_notice(result) == {}
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'execution_class': 'operational', 'task_kind': 'deterministic'},
+            {
+                'execution_class': 'operational',
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'script', 'script': 'x.sh'},
+            },
+        ],
+        ids=['no_always_escalates', 'has_before_done'],
+    )
+    def test_partially_declared_gate_is_stamped(self, metadata):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        assert inject_operational_routing(metadata)[PURE_GATE_FROM_KEY] == 'execution_class=operational'
+
+    def test_second_application_keeps_the_first_stamp(self):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+            pure_gate_routing_notice,
+        )
+
+        once = inject_operational_routing({'execution_class': 'operational'})
+        twice = inject_operational_routing(once)
+
+        assert twice[PURE_GATE_FROM_KEY] == 'execution_class=operational'
+        assert pure_gate_routing_notice(twice)['routing_notice']['pure_gate_from'] == 'execution_class=operational'
 
     # -- marker constant hygiene -------------------------------------------
 

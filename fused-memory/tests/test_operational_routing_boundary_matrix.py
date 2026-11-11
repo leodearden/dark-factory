@@ -48,6 +48,7 @@ from fused_memory.middleware.curator_types import CuratorDecision
 from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
 from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
 from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.reconciliation.consolidation_gate import build_consolidation_gate_task
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -408,6 +409,19 @@ def _inject_operational_registry(
     )
 
 
+_LEGACY_PROBE_ENTRY = OperationalAskEntry(
+    name='zeta_legacy_probe',
+    reason="ζ scenario 5: untagged-legacy operational maintenance probe",
+    title_substrings=['legacy operational maintenance'],
+    description_substrings=['dry-run then apply against a live external store'],
+)
+_LEGACY_PROBE_TITLE = 'Zeta boundary probe: legacy operational maintenance ask'
+_LEGACY_PROBE_DESCRIPTION = (
+    'Recurring housekeeping: dry-run then apply against a live '
+    'external store, zero repo files modified.'
+)
+
+
 # ---------------------------------------------------------------------------
 # Scenario 5 — untagged legacy ask -> curator substring fallback intact
 # (matrix row 5: the delta-retained untagged-legacy path; NOT owned by the
@@ -431,13 +445,7 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
     post-boundary, short-circuiting before any LLM call
     (task_curator.py:1261).
     """
-    entry = OperationalAskEntry(
-        name='zeta_legacy_probe',
-        reason="ζ scenario 5: untagged-legacy operational maintenance probe",
-        title_substrings=['legacy operational maintenance'],
-        description_substrings=['dry-run then apply against a live external store'],
-    )
-    _inject_operational_registry(monkeypatch, entry)
+    _inject_operational_registry(monkeypatch, _LEGACY_PROBE_ENTRY)
 
     server, _interceptor = _real_stack
     root = str(tmp_path / 'proj')
@@ -446,11 +454,8 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
         'submit_task',
         {
             'project_root': root,
-            'title': 'Zeta boundary probe: legacy operational maintenance ask',
-            'description': (
-                'Recurring housekeeping: dry-run then apply against a live '
-                'external store, zero repo files modified.'
-            ),
+            'title': _LEGACY_PROBE_TITLE,
+            'description': _LEGACY_PROBE_DESCRIPTION,
         },
     )
     assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
@@ -615,6 +620,57 @@ async def test_unconverted_submission_carries_no_routing_notice_or_stamp(
 
     assert 'routing_notice' not in result, f'got {result!r}'
     meta = await _get_task_meta(server, root, result['task_id'])
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_declared_consolidation_gate_gets_no_notice_or_stamp(_real_stack, tmp_path):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+    spec = build_consolidation_gate_task(topic='routing-notice-declared-gate')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task', {**spec.as_submit_task_kwargs(), 'project_root': root, 'planning_mode': True},
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert 'routing_notice' not in result, f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta['execution_class'] == 'operational', f'got {meta!r}'
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_untagged_declared_gate_routed_by_registry_is_not_stamped(
+    _real_stack, tmp_path, monkeypatch,
+):
+    _inject_operational_registry(monkeypatch, _LEGACY_PROBE_ENTRY)
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    submit_result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': _LEGACY_PROBE_TITLE,
+            'description': _LEGACY_PROBE_DESCRIPTION,
+            'task_kind': 'deterministic',
+            'metadata': {'always_escalates': True},
+        },
+    )
+    assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
+
+    resolved = await server._tool_manager.call_tool(
+        'resolve_ticket',
+        {'ticket': submit_result['ticket'], 'project_root': root, 'timeout_seconds': 30},
+    )
+    assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
+
+    meta = await _get_task_meta(server, root, resolved['task_id'])
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
     assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
 
 
