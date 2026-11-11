@@ -37,6 +37,7 @@ from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.pins import is_queue_handoff
 from pydantic import ValidationError
 from shared.cli_invoke import (
+    PROGRESS_TIMEOUT_RESUME_PROMPT,
     AgentFailureKind,
     AllAccountsCappedException,
     PromptBuilder,
@@ -1601,14 +1602,19 @@ class TaskWorkflow:
         # the workflow never loops the narrowing pass on the same task.
         self._plan_tightened: bool = False
 
-        # Crash-recovery resume: when the harness detected a surviving
-        # agent-session sidecar at startup, it injects the parsed dict
-        # here.  The next _invoke whose role matches will use --resume
-        # against the original Claude session and a "continue" prompt
-        # instead of spawning a fresh agent.  Consumed (set to None) on
-        # first use so subsequent invocations are fresh.
+        # Pending resume, armed by crash recovery (the harness detected a
+        # surviving agent-session sidecar at startup and injects the parsed
+        # dict here) or by the γ progress-timeout branch of
+        # _execute_iterations.  The next _invoke whose role matches will use
+        # --resume against the original Claude session and a continuation
+        # prompt naming that cause instead of spawning a fresh agent.
+        # Consumed (set to None) on first use so subsequent invocations are
+        # fresh.
         self._pending_resume_session_id: str | None = None
         self._pending_resume_role: str | None = None
+        # The continuation the pending resume sends; None means cli_invoke's
+        # crash-recovery default, so the ctor's sidecar path never sets it.
+        self._pending_resume_prompt: str | None = None
         # Cumulative adopted-resume count carried across restarts in the v2
         # sidecar (task 2771).  β populates 'resume_count' in the recovered
         # sidecar dict; α reads it defensively (absent → 0) and applies the +1
@@ -9545,6 +9551,7 @@ class TaskWorkflow:
                     return WorkflowOutcome.BLOCKED
                 self._pending_resume_session_id = self._last_invoke_session_id
                 self._pending_resume_role = IMPLEMENTER.name
+                self._pending_resume_prompt = PROGRESS_TIMEOUT_RESUME_PROMPT
                 logger.info(
                     'Task %s: implementer timed out with progress '
                     '(transcript_turns=%s) — resuming session %s next iteration',
@@ -14711,9 +14718,11 @@ class TaskWorkflow:
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
         #
-        # cli_invoke owns the resume-continuation prompt swap; a fresh
-        # fallback is briefed by build_prompt, handed down as rebuild_prompt.
+        # cli_invoke owns the resume-continuation prompt swap and the pending
+        # prompt picks which continuation it sends; a fresh fallback is
+        # briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
+        resume_prompt: str | None = None
         if (
             self._pending_resume_session_id
             and self._pending_resume_role == role.name
@@ -14890,11 +14899,14 @@ class TaskWorkflow:
             # sid we just proved unreachable must not be re-attempted on every
             # subsequent invocation of this role.
             pending_count = self._pending_resume_count
+            pending_prompt = self._pending_resume_prompt
             self._pending_resume_session_id = None
             self._pending_resume_role = None
             self._pending_resume_count = 0
+            self._pending_resume_prompt = None
             if corroborated:
                 resume_session_id = session_id_val
+                resume_prompt = pending_prompt
                 # Adopted resume: bump the cumulative count off the recovered
                 # base (it was reset above, consumed-on-first-use).
                 resume_count_to_write = pending_count + 1
@@ -15021,6 +15033,7 @@ class TaskWorkflow:
                     absolute_cap_secs=self.config.invocation_timeout,
                     session_id=session_id_val,
                     resume_session_id=resume_session_id,
+                    resume_prompt=resume_prompt,
                     # Judge is safe by OMISSION from config.role_env_overrides (the
                     # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
                     # no longer gates roles by a hardcoded allow-list, so the judge
