@@ -1501,12 +1501,16 @@ def _wire_start_limit(
     result: str,
     port_up: bool,
     active_state: str = "active",
+    now: float | None = None,
 ) -> tuple[list[list[str]], list[str], str]:
     """Drive main() for the df unit alone through a recording subprocess.run.
 
     Returns (every argv run, every log line, the uv path the page runs).
-    restart_unit is left REAL, so a revive shows up as systemctl argv.
+    restart_unit is left REAL, so a revive shows up as systemctl argv. *now*
+    defaults to the start of a SKIP_LOG_INTERVAL_SECS emit slot.
     """
+    tick = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 if now is None else now
+    monkeypatch.setattr(wdog.time, "time", lambda: tick)
     uv = str(tmp_path / "fake-uv")
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", uv)
     calls: list[list[str]] = []
@@ -1556,12 +1560,32 @@ def test_main_leaves_a_start_limit_hit_unit_down_and_pages_once(
     pages = _pages(calls, uv)
     assert len(pages) == 1
     assert argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
-    assert any(_DF_UNIT in m and "start-limit-hit" in m for m in logged), logged
+    assert any(_DF_UNIT in m and "leaving it down" in m for m in logged), logged
 
     wdog.main()
 
     assert _systemctl_mutations(calls) == []
     assert len(_pages(calls, uv)) == 1
+
+
+def test_the_start_limit_hit_hold_line_is_journalled_only_in_the_skip_log_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A unit can sit in start-limit-hit for days; one line per 60s tick would flood the journal."""
+    wdog = _load_watchdog()
+    calls, logged, _uv = _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=False,
+        now=wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert not any("leaving it down" in m for m in logged), logged
 
 
 def test_main_does_not_revive_a_start_limit_hit_unit_whose_socket_still_listens(

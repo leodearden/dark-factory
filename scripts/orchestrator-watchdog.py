@@ -1971,11 +1971,14 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
         reason = f"escalation port {port} not listening"
 
     if status.start_limit_hit:
-        log(
-            f"{unit} {reason}, but systemd reports Result=start-limit-hit; leaving "
-            f"it down for a human (crash-loop page {CRASH_LOOP_SENTINEL_PREFIX}{unit}); "
-            "not running reset-failed or restart"
-        )
+        # The hold lasts until a human acts, possibly days, so bucket the line
+        # on wall-clock time like the skip lines — see SKIP_LOG_INTERVAL_SECS.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                f"{unit} {reason}, but systemd reports Result=start-limit-hit; leaving "
+                f"it down for a human (crash-loop page {CRASH_LOOP_SENTINEL_PREFIX}{unit}); "
+                "not running reset-failed or restart"
+            )
         return
 
     # The lease read is LAZY — it happens only HERE, after a dead
