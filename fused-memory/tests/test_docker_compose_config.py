@@ -7,12 +7,12 @@ The falkordb image entrypoint (/var/lib/falkordb/bin/run.sh) runs
 file, so the compose file is the only durable home for redis options.
 """
 
-import ipaddress
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+from _loopback_host import is_loopback_host
 
 FUSED_MEMORY_DIR = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = FUSED_MEMORY_DIR / "docker" / "docker-compose.yml"
@@ -33,20 +33,13 @@ def _falkordb_service() -> dict[str, Any]:
     return _compose_services()["falkordb"]
 
 
-def _is_loopback_ip(host: str) -> bool:
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
 def _is_loopback_publish(entry: object) -> bool:
     if isinstance(entry, dict):
-        return _is_loopback_ip(str(entry.get("host_ip") or ""))
+        return is_loopback_host(str(entry.get("host_ip") or ""))
     if not isinstance(entry, str):
         return False
     host_and_published = entry.rpartition(":")[0]
-    return _is_loopback_ip(host_and_published.rpartition(":")[0])
+    return is_loopback_host(host_and_published.rpartition(":")[0])
 
 
 def _service_env(service: dict[str, Any]) -> dict[str, str]:

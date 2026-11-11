@@ -9,12 +9,12 @@ ensures that even if the dedicated-thread heartbeat is delayed, systemd gives
 the process 120s before SIGABRT (was 30s — too tight with the old on-loop design).
 """
 
-import ipaddress
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import yaml
+from _loopback_host import is_loopback_host
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -246,12 +246,8 @@ class TestSocketActivation:
         ]
         assert listen_streams, f"{_SOCKET_UNIT.name} declares no ListenStream="
         for directive in listen_streams:
-            host = directive.split("=", 1)[1].rpartition(":")[0].strip("[]")
-            try:
-                is_loopback = ipaddress.ip_address(host).is_loopback
-            except ValueError:
-                is_loopback = False
-            assert is_loopback, (
+            host = directive.split("=", 1)[1].rpartition(":")[0]
+            assert is_loopback_host(host), (
                 f"{_SOCKET_UNIT.name}: {directive!r} does not bind a loopback IP address"
             )
 
