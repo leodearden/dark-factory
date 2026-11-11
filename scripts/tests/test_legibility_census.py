@@ -1157,7 +1157,7 @@ _NO_INSTRUMENT_RECORDS_NOTE = (
 """The inputs note of a project carrying no other instrument's record."""
 
 _NOTHING_SCREENED = prescreen.ScreenReport(
-    screen=prescreen.Screen((), (), ()),
+    screen=prescreen.Screen(records=(), to_verify=(), uncatalogued=(), screened=(), surfaced=()),
     surfaced_by_key=(),
     attached=(),
     re_observed=(),

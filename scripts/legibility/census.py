@@ -1449,33 +1449,44 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
     for record in records:
         if is_duplicate(record):
             continue
-        session = record.get("session")
         for candidate in record.get("candidates") or []:
             title = candidate.get("title")
             if not title or title in seen_titles:
                 continue
             seen_titles.add(title)
-            origin_phase = candidate.get("origin_phase") or "unknown"
-            manifested_phase = candidate.get("manifested_phase") or "unknown"
-            evidence_quote = candidate.get("evidence_quote")
-            clusters.append(
-                _cluster_record(
-                    title=title,
-                    cause=candidate.get("cause"),
-                    area=candidate.get("area"),
-                    origin_phase=origin_phase,
-                    manifested_phase=manifested_phase,
-                    evidence=[evidence_quote] if evidence_quote else [],
-                    sightings=[
-                        {
-                            "session": session,
-                            "origin_phase": origin_phase,
-                            "manifested_phase": manifested_phase,
-                        }
-                    ],
-                )
-            )
+            clusters.append(_payload_cluster(record.get("session"), candidate))
     return clusters
+
+
+def _payload_cluster(session: str | None, payload: Mapping[str, Any]) -> dict:
+    """The verification cluster of one mined candidate *payload* from *session*."""
+    origin_phase = payload.get("origin_phase") or "unknown"
+    manifested_phase = payload.get("manifested_phase") or "unknown"
+    evidence_quote = payload.get("evidence_quote")
+    return _cluster_record(
+        title=payload.get("title"),
+        cause=payload.get("cause"),
+        area=payload.get("area"),
+        origin_phase=origin_phase,
+        manifested_phase=manifested_phase,
+        evidence=[evidence_quote] if evidence_quote else [],
+        sightings=[{"session": session, "origin_phase": origin_phase, "manifested_phase": manifested_phase}],
+    )
+
+
+def _screened_clusters(screen: prescreen.Screen) -> tuple[list[dict], list[dict]]:
+    """The clusters *screen* leaves to verify and the uncatalogued ones among
+    them, one per distinct title, first occurrence first. A stand-in that keeps
+    verdicts title-resolvable until clusters are grouped by candidate id."""
+    by_ref: dict[codebook.PayloadRef, dict] = {}
+    seen_titles: set[str] = set()
+    for ref in screen.to_verify:
+        record = screen.records[ref.record]
+        payload = record["candidates"][ref.candidate]
+        if payload["title"] not in seen_titles:
+            seen_titles.add(payload["title"])
+            by_ref[ref] = _payload_cluster(record.get("session"), payload)
+    return list(by_ref.values()), [by_ref[ref] for ref in screen.uncatalogued if ref in by_ref]
 
 
 def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
@@ -2717,7 +2728,7 @@ def run_census(
     ordering -- deterministic given the run, with no invented "most important first" heuristic (any such ranking
     would need a signal the census does not have pre-verification). The
     deferred remainder is NOT dropped: the codebook merge below consumes
-    every mining record (``prescreen.routed_records``), not the verified clusters, so a
+    every mining record (``prescreen.screen``'s routed batch), not the verified clusters, so a
     deferred cluster still lands as a ``pending`` candidate that
     ``codebook.py::pending_titled`` can resolve later. That later pickup is
     CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
@@ -2863,15 +2874,15 @@ def run_census(
     # a surfaced cluster is verified, never similarity-screened
     # (prescreen.py::Screen.uncatalogued).
     catalogue = prescreen.Catalogue.of(codebook_dict)
-    screen = prescreen.screen(_novel_clusters(mining_result.records), catalogue)
-    routed_records = prescreen.routed_records(mining_result.records, catalogue, run_id=run_id)
+    screen = prescreen.screen(mining_result.records, catalogue, run_id=run_id)
+    to_verify, uncatalogued = _screened_clusters(screen)
     session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
     view = similarity.build_view(
-        codebook_dict, screen.uncatalogued, embedder=embedder, settings=config.census.adjudication,
+        codebook_dict, uncatalogued, embedder=embedder, settings=config.census.adjudication,
     )
     if view.skipped is not None:
         _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=escalate_fn)
-    novel_clusters = [cluster for cluster in screen.to_verify if not view.screens(cluster)]
+    novel_clusters = [cluster for cluster in to_verify if not view.screens(cluster)]
     if max_verify_clusters is None:
         clusters_to_verify = novel_clusters
         verify_coverage = None
@@ -2984,7 +2995,7 @@ def run_census(
     rejected = [_with_finding(cluster, area_map) for cluster in rejected]
 
     merge = codebook.apply_coding_records(
-        codebook_dict, routed_records, invariant_slugs=invariant_slugs,
+        codebook_dict, screen.records, invariant_slugs=invariant_slugs,
     )
     updated_codebook = merge.codebook
     logger.info("census: merge: %s", merge.summary())
