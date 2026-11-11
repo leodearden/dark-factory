@@ -130,7 +130,7 @@ class ServerConfig(BaseModel):
     """Server configuration."""
 
     transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
-    host: str = Field(default='0.0.0.0', description='Server host')
+    host: str = Field(default='127.0.0.1', description='Bind host of the MCP and recon-report listeners (loopback by default)')
     port: int = Field(default=8002, description='Server port (canonical: 8002)')
     stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
