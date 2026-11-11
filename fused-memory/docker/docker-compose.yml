@@ -43,6 +43,53 @@ services:
       retries: 5
     restart: unless-stopped
 
+  embedder:
+    # Permanent local embedder: vLLM pooling runner serving granite-embedding-english-r2
+    # (768 dims). Contract: fused-memory's embedder.model must equal the served name
+    # below (C3), and config-docker.yaml addresses this service by the name
+    # `embedder` (κ2, task 6810). The image digest and the model parameters are the
+    # granite entry of scripts/local-model-serving/arms.yaml.
+    image: vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    command:
+      - --model
+      - ibm-granite/granite-embedding-english-r2
+      - --served-model-name
+      - granite-embedding-english-r2
+      - --runner
+      - pooling
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "32"
+      # A literal, not computed: est_vram_gib 1.0 + 0.5 GiB over a 24576 MiB card
+      # (lms_serve.py::_memory_share_for). Bounds vLLM's KV cache so whisper-writer
+      # stays resident on the shared card.
+      - --gpu-memory-utilization
+      - "0.062"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      # Loopback only. Never 0.0.0.0: the endpoint is unauthenticated.
+      - "127.0.0.1:8420:8000"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Bounded: a crash-looping container (NVIDIA runtime error, bad cache) stops
+    # after 5 restarts instead of churning the shared GPU forever.
+    restart: on-failure:5
+
   fused-mcp:
     build:
       context: ..
