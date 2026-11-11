@@ -263,20 +263,13 @@ class KeyAttach:
         return None if standing == offered else (standing, offered)
 
 
-def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict:
-    for record in records:
-        if record.get("id") == record_id:
-            return record
-    raise ValueError(f"attach_by_key: no {kind} {record_id!r}")
-
-
 def attach_by_key(
     cb: dict, candidate_id: str, entry_id: str, found: verdict.Verdict, *, run_id: str,
 ) -> tuple[dict, KeyAttach]:
     """A new codebook in which pending *candidate_id* joins keyed entry
     *entry_id* (``entry_join.py::join_entry``), and the attach it made. The
     sightings it appends carry the attach and the verifier's tags."""
-    target = _record_by_id(cb.get("entries") or [], entry_id, kind="entry")
+    target = codebook.record_by_id(cb.get("entries") or [], entry_id, kind="entry")
     identity = census_findings.FindingIdentity.from_record(target)
     if identity is None:
         raise ValueError(f"attach_by_key: entry {entry_id!r} carries no finding identity")
@@ -287,7 +280,7 @@ def attach_by_key(
         sighting_fields={"attached_by": attached_by, "verifier_tags": list(found.tags)},
     )
     return result, KeyAttach(
-        title=_record_by_id(result["candidates"], candidate_id, kind="candidate").get("title") or "",
+        title=codebook.record_by_id(result["candidates"], candidate_id, kind="candidate").get("title") or "",
         candidate_id=candidate_id,
         entry_id=entry_id,
         identity=identity,

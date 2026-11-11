@@ -129,11 +129,6 @@ def test_join_entry_names_a_missing_record(candidate_id, entry_id, named):
         _join(_codebook(), entry_id=entry_id, candidate_id=candidate_id)
 
 
-def test_join_entry_refuses_a_candidate_that_is_not_pending():
-    with pytest.raises(ValueError, match="cand-20261001-1.*pending"):
-        _join(_codebook(), candidate_id="cand-20261001-1")
-
-
 def test_join_entry_refuses_a_candidate_that_is_not_pending_through_the_lifecycle_table():
-    with pytest.raises(codebook_lifecycle.IllegalTransition, match=r"^promote: .*cand-20261001-1"):
+    with pytest.raises(codebook_lifecycle.IllegalTransition, match=r"^promote: .*cand-20261001-1.*pending"):
         _join(_codebook(), candidate_id="cand-20261001-1")

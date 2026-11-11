@@ -372,16 +372,9 @@ class Adjudicated:
     members: tuple[str, ...]
 
 
-def _candidate(cb: Mapping[str, Any], candidate_id: str) -> dict:
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("id") == candidate_id:
-            return candidate
-    raise ValueError(f"similarity adjudication: no candidate {candidate_id!r}")
-
-
 def _rejected_with(cb: dict, member_id: str, representative: Mapping[str, Any]) -> dict:
     result = copy.deepcopy(cb)
-    member = _candidate(result, member_id)
+    member = codebook.record_by_id(result.get("candidates") or [], member_id, kind="queue member")
     codebook_lifecycle.transit(member, codebook_lifecycle.Transition.REJECT)
     identity = census_findings.FindingIdentity.from_record(representative)
     if identity is not None:
@@ -401,7 +394,9 @@ def adjudicate_members(
     result = cb
     outcomes: list[Adjudicated] = []
     for queued in offered:
-        representative = _candidate(result, queued.representative.key)
+        representative = codebook.record_by_id(
+            result.get("candidates") or [], queued.representative.key, kind="queue representative",
+        )
         others = tuple(member.key for member in queued.others)
         if representative.get("disposition") == "promoted":
             for member_id in others:

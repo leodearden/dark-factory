@@ -5,17 +5,10 @@ share (plans/census-incremental-prd.md L6, L7)."""
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from legibility import census_findings, codebook, codebook_lifecycle
-
-
-def _record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict:
-    for record in records:
-        if record.get("id") == record_id:
-            return record
-    raise ValueError(f"join_entry: no {kind} {record_id!r}")
 
 
 def join_entry(
@@ -33,9 +26,9 @@ def join_entry(
     its sightings from a session the entry does not carry is appended to the
     entry with *sighting_fields*."""
     result = copy.deepcopy(cb)
-    candidate = _record_by_id(result.get("candidates") or [], candidate_id, kind="candidate")
+    candidate = codebook.record_by_id(result.get("candidates") or [], candidate_id, kind="candidate")
     codebook_lifecycle.transit(candidate, codebook_lifecycle.Transition.PROMOTE)
-    target = _record_by_id(result.get("entries") or [], entry_id, kind="entry")
+    target = codebook.record_by_id(result.get("entries") or [], entry_id, kind="entry")
     identity = census_findings.FindingIdentity.from_record(target)
     if identity is not None:
         candidate.update(census_findings.stamped(candidate, identity))

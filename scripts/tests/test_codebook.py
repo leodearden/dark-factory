@@ -3492,18 +3492,10 @@ def test_validate_accepts_a_promoted_candidate_whose_entry_resolves():
     assert mod.validate(_codebook_with_promoted_candidate(promoted_to="entry-a")) == []
 
 
-def test_the_filing_vocabulary_is_the_codebooks():
-    assert (mod.ENTRY_FILING_KEY, mod.ENTRY_FILING_WITHHELD, mod.ENTRY_FILING_FILED) == (
-        "filing",
-        "withheld",
-        "filed",
-    )
-
-
 @pytest.mark.parametrize("filing", ["withheld", "filed"])
 def test_validate_accepts_an_entry_filing_marker_of_the_vocabulary(filing):
     codebook = _minimal_v2()
-    codebook["entries"][0][mod.ENTRY_FILING_KEY] = filing
+    codebook["entries"][0]["filing"] = filing
 
     assert mod.validate(codebook) == []
 

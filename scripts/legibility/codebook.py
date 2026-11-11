@@ -21,6 +21,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, fields
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -829,10 +830,14 @@ class MergeResult:
     def mutated(self) -> bool:
         return self.counts.mutations > 0
 
+    @cached_property
+    def _resolution_by_payload(self) -> Mapping[PayloadRef, Resolution]:
+        return {resolution.payload: resolution for resolution in self.resolutions}
+
     def resolution_at(self, ref: PayloadRef) -> Resolution | None:
         """The candidate payload *ref* resolved to, or None when the merge
         skipped its record or *ref* names no payload of it."""
-        return next((resolution for resolution in self.resolutions if resolution.payload == ref), None)
+        return self._resolution_by_payload.get(ref)
 
     def summary(self) -> str:
         values = {f.name: getattr(self.counts, f.name) for f in fields(self.counts)}
@@ -1236,9 +1241,18 @@ def validate_coding_record(record: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Reading records: their sessions, fixed entries, the pending candidate of a
-# title, and an entry through the candidate promoted to it
+# Reading records: one by id, their sessions, fixed entries, and an entry
+# through the candidate promoted to it
 # ---------------------------------------------------------------------------
+
+def record_by_id(records: Iterable[dict], record_id: str, *, kind: str) -> dict:
+    """The one of *records* whose id is *record_id*; ValueError naming the
+    *kind* of record sought when none is."""
+    for record in records:
+        if record.get("id") == record_id:
+            return record
+    raise ValueError(f"no {kind} {record_id!r}")
+
 
 def sessions_of(record: Mapping[str, Any]) -> list[str]:
     """The session of each of *record*'s sightings, in order, repeats kept."""

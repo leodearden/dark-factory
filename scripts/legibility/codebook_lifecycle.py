@@ -80,13 +80,6 @@ def transit(record: dict, transition: Transition) -> None:
     record[rule.field] = rule.target
 
 
-def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
-    for item in items:
-        if item.get("id") == item_id:
-            return item
-    raise ValueError(f"{kind}: no id {item_id!r} found")
-
-
 def promote_candidate(
     cb: dict, cand_id: str, entry_fields: dict, *,
     finding: census_findings.FindingIdentity | None = None,
@@ -103,7 +96,7 @@ def promote_candidate(
     A *withheld* entry is marked withheld by the singleton filing gate.
     """
     result = copy.deepcopy(cb)
-    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
+    candidate = codebook.record_by_id(result.get("candidates") or [], cand_id, kind="candidate")
     transit(candidate, Transition.PROMOTE)
     if finding is not None:
         candidate.update(census_findings.stamped(candidate, finding))
@@ -127,7 +120,7 @@ def reject_candidate(
     """A new codebook in which pending candidate *cand_id* is rejected, and
     stamped with *finding* when given. The candidate stays."""
     result = copy.deepcopy(cb)
-    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="reject_candidate")
+    candidate = codebook.record_by_id(result.get("candidates") or [], cand_id, kind="candidate")
     transit(candidate, Transition.REJECT)
     if finding is not None:
         candidate.update(census_findings.stamped(candidate, finding))
@@ -139,7 +132,7 @@ def reject_candidate(
 def retire_entry(cb: dict, entry_id: str) -> dict:
     """A new codebook in which entry *entry_id* is retired. The entry stays."""
     result = copy.deepcopy(cb)
-    entry = _find_by_id(result.get("entries") or [], entry_id, kind="retire_entry")
+    entry = codebook.record_by_id(result.get("entries") or [], entry_id, kind="entry")
     transit(entry, Transition.RETIRE)
 
     codebook.assert_no_deletion(cb, result)
@@ -149,7 +142,7 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 def mark_entry_filed(cb: dict, entry_id: str) -> dict:
     """A new codebook in which withheld entry *entry_id* is marked filed."""
     result = copy.deepcopy(cb)
-    entry = _find_by_id(result.get("entries") or [], entry_id, kind="mark_entry_filed")
+    entry = codebook.record_by_id(result.get("entries") or [], entry_id, kind="entry")
     transit(entry, Transition.FILE)
 
     codebook.assert_no_deletion(cb, result)
