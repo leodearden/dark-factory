@@ -623,6 +623,25 @@ def test_file_escalation_survives_a_missing_uv(
     assert logged
 
 
+def test_file_escalation_survives_undecodable_submit_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """subprocess.run(text=True) decodes after the child exits, so the page may have landed."""
+
+    def undecodable(*_args, **_kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(crash_loop.subprocess, "run", undecodable)
+    logged: list[str] = []
+
+    filed = crash_loop.file_crash_loop_escalation(
+        _RATE_ALARM, repo_dir=str(tmp_path), log=logged.append
+    )
+
+    assert filed is False
+    assert any("UnicodeDecodeError" in m and _RATE_ALARM.task_sentinel in m for m in logged)
+
+
 # ---------------------------------------------------------------------------
 # crash_loop_pass: one tick over every unit
 # ---------------------------------------------------------------------------
@@ -729,6 +748,31 @@ def test_pass_retries_a_start_limit_hit_page_that_failed_to_file(
 
     _tick(tmp_path, stuck, T + 3 * WINDOW)
     assert len(recorded_argvs(record)) == 3
+
+
+def test_pass_keeps_the_attempt_stamped_when_filing_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A raise after the decision must not unstamp it, or every tick would re-page."""
+    attempts: list[crash_loop.CrashLoopAlarm] = []
+
+    def raising_file(alarm, **_kwargs):
+        attempts.append(alarm)
+        raise RuntimeError("boom after submit")
+
+    monkeypatch.setattr(crash_loop, "file_crash_loop_escalation", raising_file)
+
+    _tick(tmp_path, {UNIT: _status(0)}, T)
+    _tick(tmp_path, {UNIT: _status(5)}, T + 600)
+
+    assert len(attempts) == 1
+    unit_state = _state(tmp_path)[UNIT]
+    assert unit_state["samples"] == [[T, 0], [T + 600, 5]]
+    assert unit_state["last_escalation_epoch"] == T + 600
+
+    _tick(tmp_path, {UNIT: _status(6)}, T + 660)
+
+    assert len(attempts) == 1
 
 
 def test_pass_returns_every_status_and_one_unit_cannot_blind_the_rest(

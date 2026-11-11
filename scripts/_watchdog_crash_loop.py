@@ -348,10 +348,11 @@ def crash_loop_submit_argv(
 def file_crash_loop_escalation(alarm: CrashLoopAlarm, *, repo_dir: str, log: LogSink) -> bool:
     """File *alarm* into *repo_dir*'s escalation queue; True iff submit succeeded.
 
-    Never raises: a missing uv, a timeout or a non-zero exit is logged and
-    reported as False. Deduplication is the caller's: observe_unit stamps the
-    page epoch on attempt and mark_page_landed sets the episode flag only on a
-    True return, so a broken submit of either kind retries at window cadence.
+    Never raises: a missing uv, a timeout, undecodable output or a non-zero
+    exit is logged and reported as False. Deduplication is the caller's:
+    observe_unit stamps the page epoch on attempt and mark_page_landed sets
+    the episode flag only on a True return, so a broken submit of either kind
+    retries at window cadence.
     """
     argv = crash_loop_submit_argv(
         alarm,
@@ -367,10 +368,10 @@ def file_crash_loop_escalation(alarm: CrashLoopAlarm, *, repo_dir: str, log: Log
             check=False,
             timeout=CRASH_LOOP_SUBMIT_TIMEOUT_SECS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except Exception as exc:
         log(
-            f"crash-loop page {alarm.task_sentinel} NOT filed: could not run "
-            f"`escalation submit` ({type(exc).__name__}: {exc})"
+            f"crash-loop page {alarm.task_sentinel} not confirmed filed: "
+            f"`escalation submit` raised {type(exc).__name__}: {exc}"
         )
         return False
     if result.returncode != 0:
@@ -399,8 +400,10 @@ def crash_loop_pass(
     grace included, because the grace window is what blinded it to the
     2026-10-26 loop; OPERATIONS.md §8 "Crash loop" has the rationale. Each
     unit is read inside its own guard, so one failing read cannot blind the
-    rest, and a unit whose read failed is absent from the result. The state
-    is loaded and saved once per pass. Never raises.
+    rest, and a unit whose read failed is absent from the result. A unit's
+    observed history is kept before its page is filed, so a filing that
+    raises still leaves the attempt stamped. The state is loaded and saved
+    once per pass. Never raises.
     """
     statuses: dict[str, UnitRestartStatus] = {}
     try:
@@ -419,6 +422,7 @@ def crash_loop_pass(
                     alarm_count=alarm_count,
                     window_secs=window_secs,
                 )
+                histories[unit] = obs.history
                 histories[unit] = _act_on(obs, now=now, repo_dir=repo_dir, log=log)
             except Exception as exc:
                 log(f"crash-loop detector error for {unit}: {exc!r}")
