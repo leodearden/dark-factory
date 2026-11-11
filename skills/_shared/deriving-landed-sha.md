@@ -499,10 +499,16 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
   server-issued `done` must not be overridden ([step 3](#step-3)).
 - **You hold no request-scoped `done`** → first poll `merge_status(branch="task/<TASK_ID>")`. Its
   patch-id arm (`escalation/src/escalation/git_authority.py::probe_landing`, deciding through
-  `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) runs check
-  (c) server-side, behind the degeneracy and empty-net-diff guards, and attributes a sha WITHOUT a
-  request: the task's most recent subject-citing commit on main, else the branch tip's patch-id
-  twin on main.
+  `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) decides
+  containment with `patch_content_contained`, behind the degeneracy and empty-net-diff guards, and
+  attributes a sha WITHOUT a request: the task's most recent subject-citing commit on main, else
+  the branch tip's patch-id twin on main. That is check (c) WITHOUT its empty-output rule, because
+  the server reads empty `git cherry` output as contained. So run `git cherry main task/<TASK_ID>`
+  whatever the server answers. If it prints nothing, treat the server's answer as "any other
+  answer" below. With a recorded `branch_base_sha`, a branch whose only commit beyond main is a
+  sync merge passes the server's empty-net-diff guard. It can then come back `found_on_main` at an
+  earlier round's citing commit, or `landing_unattributable`. That is residual (b) in
+  `escalation/src/escalation/git_authority.py::found_on_main_response`.
   - `state: "done"`, `kind: "found_on_main"`, `source: "git"` → landed. Stamp
     `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "rebased solo landing confirmed by
     merge_status's git tier (patch-id arm); branch tip <git rev-parse task/<TASK_ID>>"}`. This
