@@ -1321,6 +1321,7 @@
     "orchestrator/tests/test_done_phase_wedge.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_dry_run_unblock.py": {"patch_targets": [], "private_reads": 3},
     "orchestrator/tests/test_ephemeral_worktree.py": {"patch_targets": [], "private_reads": 3},
+    "orchestrator/tests/test_escalation_scan_off_loop.py": {"patch_targets": [], "private_reads": 20},
     "orchestrator/tests/test_eval_mcp_isolation.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_git_ops.py": {"patch_targets": [], "private_reads": 101},
     "orchestrator/tests/test_git_ops_checked_lookups.py": {"patch_targets": [], "private_reads": 0},

@@ -16721,7 +16721,8 @@ class Harness:
                     # `escalation.pins.is_queue_handoff` from task 5221, so a
                     # comment there claiming permanence would be false on
                     # arrival.  The boundary is recorded here instead.
-                    if self._escalation_queue.get_by_task(
+                    if await asyncio.to_thread(
+                        self._escalation_queue.get_by_task,
                         tid, agent_role=DETERMINISTIC_AGENT_ROLE,
                     ):
                         continue

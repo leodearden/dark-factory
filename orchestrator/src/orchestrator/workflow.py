@@ -3253,7 +3253,7 @@ class TaskWorkflow:
                     # implementer's briefing/_task_files never reflect the
                     # expanded scope. granted_files is read from resolved
                     # escalation records, not from the prose in `carried`.
-                    granted = self._collect_granted_files()
+                    granted = await self._collect_granted_files()
                     if granted:
                         current_files = self.plan.get('files', [])
                         new_files = current_files + [
@@ -6789,10 +6789,11 @@ class TaskWorkflow:
         # (e.g. eval mode), we cannot classify — fall through.
         recent_category: str | None = None
         if self.escalation_queue:
+            records = await asyncio.to_thread(
+                self.escalation_queue.get_by_task, self.task_id,
+            )
             resolved = [
-                e
-                for e in self.escalation_queue.get_by_task(self.task_id)
-                if e.level == 0 and e.status == 'resolved'
+                e for e in records if e.level == 0 and e.status == 'resolved'
             ]
             if resolved:
                 resolved.sort(
@@ -6856,7 +6857,7 @@ class TaskWorkflow:
 
         return None
 
-    def _collect_granted_files(self) -> list[str]:
+    async def _collect_granted_files(self) -> list[str]:
         """Union ``granted_files`` across every resolved escalation for this
         task (task 2505) — the steward's structured scope-expansion grant
         stamped via ``resolve_issue(..., granted_files=[...])`` when
@@ -6873,7 +6874,10 @@ class TaskWorkflow:
             return []
         seen: set[str] = set()
         granted: list[str] = []
-        for esc in self.escalation_queue.get_by_task(self.task_id):
+        records = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
+        for esc in records:
             if esc.status != 'resolved':
                 continue
             for f in esc.granted_files:
@@ -15564,8 +15568,13 @@ class TaskWorkflow:
         if pending_l2:
             raise _NoStewardApplicable(pending_l2)
         open_ids_at_entry = {e.id for e in open_at_entry}
+        resolved_at_entry = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id, status='resolved',
+        )
+        # A record still open at entry was not resolved before this round, even
+        # when a concurrent resolve lands before the scan above reads it.
         resolved_before_round = frozenset(
-            e.id for e in self.escalation_queue.get_by_task(self.task_id, status='resolved')
+            e.id for e in resolved_at_entry if e.id not in open_ids_at_entry
         )
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
@@ -15740,9 +15749,11 @@ class TaskWorkflow:
                 raise _StewardReescalated(handoffs)
             raise _NoStewardApplicable(handoffs)
 
+        records = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
         return select_carried_resolutions(
-            self.escalation_queue.get_by_task(self.task_id),
-            resolved_before_round=resolved_before_round,
+            records, resolved_before_round=resolved_before_round,
         )
 
     async def _get_head_commit(self) -> str:
@@ -18470,7 +18481,7 @@ class TaskWorkflow:
         # the steward-escalation fallback path.
         if self.mcp is None:
             if self.escalation_queue:
-                self._escalate_suggestions(reviews)
+                await self._escalate_suggestions(reviews)
                 # Record the hash after a successful fallback so identical
                 # re-entries skip the escalation queue entirely.  The queue's
                 # own dedup would also catch it, but the in-task fast-path
@@ -18511,7 +18522,7 @@ class TaskWorkflow:
         )
         return SuggestionDisposition.CURATOR
 
-    def _escalate_suggestions(self, reviews) -> None:
+    async def _escalate_suggestions(self, reviews) -> None:
         """Submit review suggestions as an info escalation for steward triage.
 
         Retained as the steward-escalation fallback even though the primary
@@ -18534,7 +18545,11 @@ class TaskWorkflow:
         # Content fingerprint: skip if identical suggestions already escalated.
         content_hash = review_suggestion_payload_hash(suggestions)
 
-        existing = self.escalation_queue.get_by_task(self.task_id)
+        # Only the read hops: submit() below fires Harness._on_escalation,
+        # whose asyncio.Event.set() is not thread-safe.
+        existing = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
         prior = find_prior_review_suggestion(existing, content_hash)
         if prior is not None:
             logger.info(
