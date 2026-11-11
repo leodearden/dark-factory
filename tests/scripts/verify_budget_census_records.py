@@ -12,7 +12,8 @@ record. Consumers:
   * ``tests/scripts/test_module_verify_budgets.py::test_module_carries_its_own_measured_verify_budget``,
     which reads ``RULED_BUDGET_CENSUS``
   * ``tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS``
-  * ``scripts/verify_budget_census.py::FEEDS_CONSTANT``, which points here
+  * ``scripts/verify_budget_census.py::gate_floor_rule``, which reads
+    ``RULED_BUDGET_CENSUS`` to decide which modules the D17 floor applies to
 """
 from __future__ import annotations
 

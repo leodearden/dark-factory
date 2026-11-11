@@ -520,14 +520,13 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         follows it anywhere.
 
         The import is the mechanism, so its absence is the failure mode — but
-        the absence is only observable by running the thing. `_census_budget_
-        floor` performs its `from module_budget_family import
-        census_budget_floor` INSIDE the function body, so the name is resolved
-        at CALL time and this patch is seen. A census that re-spelled the
-        multiple for itself — `1.5 * worst`, `worst * 1.5`, `3 * worst / 2`,
-        `Fraction(3, 2) * worst`, any of them — would keep returning the real
-        floor here and go red, which no source-text pattern over this file
-        reliably distinguishes.
+        the absence is only observable by running the thing. `gate_floor_rule`
+        imports `module_budget_family` at CALL time and reads
+        `census_budget_floor` off the module object, so this patch is seen. A
+        census that re-spelled the multiple for itself — `1.5 * worst`,
+        `worst * 1.5`, `3 * worst / 2`, `Fraction(3, 2) * worst`, any of them —
+        would keep returning the real floor here and go red, which no
+        source-text pattern over this file reliably distinguishes.
         """
         import module_budget_family  # noqa: PLC0415
 
@@ -574,7 +573,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
 
         Evicting the module from `sys.modules` is not enough on its own:
         `tests/scripts` sits on `sys.path` (conftest puts it there) and
-        `_census_budget_floor` re-inserts `_FAMILY_DIR` itself, so both have to
+        `_import_from_family_dir` re-inserts `_FAMILY_DIR` itself, so both have to
         go for the import to actually fail.
         """
         import sys  # noqa: PLC0415
