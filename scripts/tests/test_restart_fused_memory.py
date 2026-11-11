@@ -17,11 +17,18 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "restart-fused-memory.sh"
+SOCKET_TEMPLATE = SCRIPT.parent / "fused-memory.socket.template"
 UNIT = "fused-memory"
+STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
+STALENESS_PROBE = ["is-active", STALENESS_REDEPLOY_UNIT]
+STOP_THEN_START = [["stop", UNIT], ["start", "fused-memory.socket", UNIT]]
 
 # The drained marker the script greps journalctl for (task 2702's converging
 # drain). The fake journalctl emits this exact literal, so the test pins the
@@ -31,11 +38,22 @@ DRAIN_MARKER = "Harness fully drained"
 
 _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake systemctl: record every call (minus --user); snapshot the curl-call
-count at the (single) restart so a test can prove the recon gate polled
-before the restart. Always succeeds."""
+count at the first `restart` or `start` so a test can prove the recon gate
+polled before the service came back.
+
+`is-active UNIT` answers from the `unit_states` map (absent -> "inactive"):
+it prints the state and exits 0 for "active", 3 otherwise; a null state
+prints nothing and exits 1 (no answer). `daemon-reload` snapshots the
+installed socket unit's text (null if absent) as
+`socket_unit_at_daemon_reload`. Every other call succeeds."""
 import json
 import os
 import sys
+
+SOCKET_UNIT = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "systemd", "user", "fused-memory.socket",
+)
 
 STATE_PATH = os.environ["FAKE_STATE_PATH"]
 
@@ -50,13 +68,31 @@ def _save(state):
         json.dump(state, f)
 
 
+def _read_socket_unit():
+    try:
+        with open(SOCKET_UNIT) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 def main(argv):
     state = _load()
     call = [a for a in argv[1:] if a != "--user"]
     state.setdefault("systemctl_calls", []).append(call)
-    if call and call[0] == "restart" and "curl_calls_at_restart" not in state:
+    verb = call[0] if call else None
+    if verb in ("restart", "start") and "curl_calls_at_restart" not in state:
         state["curl_calls_at_restart"] = len(state.get("curl_calls", []))
+    if verb == "daemon-reload":
+        state["socket_unit_at_daemon_reload"] = _read_socket_unit()
     _save(state)
+    if verb == "is-active":
+        unit_states = state.get("unit_states", {})
+        unit_state = unit_states.get(call[1], "inactive")
+        if unit_state is None:
+            return 1
+        sys.stdout.write(unit_state + "\\n")
+        return 0 if unit_state == "active" else 3
     return 0
 
 
@@ -65,7 +101,8 @@ if __name__ == "__main__":
 '''
 
 _FAKE_CURL_SRC = '''#!/usr/bin/env python3
-"""Fake curl. Two phases, discriminated by whether a restart has happened:
+"""Fake curl. Two phases, discriminated by whether a systemctl `restart` or
+`start` has happened:
 
 BEFORE restart -> recon-gate body fetch (`curl -s --max-time N URL`):
   - curl_unreachable True  -> emit nothing, exit 1 (endpoint unreachable)
@@ -118,7 +155,7 @@ def main(argv):
     state = _load()
     state.setdefault("curl_calls", []).append(argv[1:])
     restart_done = any(
-        c and c[0] == "restart" for c in state.get("systemctl_calls", [])
+        c and c[0] in ("restart", "start") for c in state.get("systemctl_calls", [])
     )
     if not restart_done:
         if state.get("curl_unreachable"):
@@ -212,6 +249,7 @@ def _write_fakes(
     journalctl_marker="",
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
+    unit_states=None,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -236,12 +274,17 @@ def _write_fakes(
         "journalctl_marker": journalctl_marker,
         "journalctl_marker_after": journalctl_marker_after,
         "journalctl_marker_padding_bytes": journalctl_marker_padding_bytes,
+        "unit_states": unit_states or {},
     }))
     return bin_dir, state_path
 
 
 def _state(tmp_path):
     return json.loads(_state_path(tmp_path).read_text())
+
+
+def _socket_unit_path(tmp_path):
+    return tmp_path / "config" / "systemd" / "user" / "fused-memory.socket"
 
 
 def _run_script(
@@ -255,6 +298,7 @@ def _run_script(
     journalctl_marker="",
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
+    unit_states=None,
 ):
     bin_dir, state_path = _write_fakes(
         tmp_path,
@@ -265,7 +309,10 @@ def _run_script(
         journalctl_marker=journalctl_marker,
         journalctl_marker_after=journalctl_marker_after,
         journalctl_marker_padding_bytes=journalctl_marker_padding_bytes,
+        unit_states=unit_states,
     )
+    _socket_unit_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "home").mkdir(exist_ok=True)
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_STATE_PATH"] = str(state_path)
@@ -278,6 +325,10 @@ def _run_script(
     full_env.setdefault("CURL_MAX_TIME", "2")
     if env:
         full_env.update(env)
+    # Unconditional, after `env`: no run may install into the live
+    # ~/.config/systemd/user/fused-memory.socket.
+    full_env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+    full_env["HOME"] = str(tmp_path / "home")
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         env=full_env,
@@ -527,3 +578,109 @@ def test_now_and_drain_are_mutually_exclusive(tmp_path):
         f"stderr={result.stderr!r}"
     )
     assert _state(tmp_path)["systemctl_calls"] == []
+
+
+# ---------------------------------------------------------------------------
+# (h) --rebind-socket, before the service comes back: refuse while a
+# staleness redeploy runs, install the committed socket template, reload,
+# keep the chosen gate, then stop and start instead of restarting
+# ---------------------------------------------------------------------------
+
+def _stops_then_starts(calls):
+    return any(calls[i:i + 2] == STOP_THEN_START for i in range(len(calls)))
+
+
+@pytest.mark.parametrize("redeploy_state", ["active", "activating", "deactivating", None])
+def test_rebind_refuses_while_staleness_redeploy_is_in_flight(tmp_path, redeploy_state):
+    result = _run_script(
+        tmp_path, "--rebind-socket",
+        unit_states={STALENESS_REDEPLOY_UNIT: redeploy_state},
+    )
+    assert result.returncode == 3, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    read_state = redeploy_state or "no answer"
+    refusals = [
+        line for line in (result.stdout + result.stderr).splitlines()
+        if line.startswith("rebind_socket:")
+        and STALENESS_REDEPLOY_UNIT in line and read_state in line
+    ]
+    assert refusals, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert _state(tmp_path)["systemctl_calls"] == [STALENESS_PROBE]
+    assert not _socket_unit_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("redeploy_state", ["inactive", "failed"])
+def test_rebind_proceeds_when_staleness_redeploy_is_not_running(tmp_path, redeploy_state):
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        unit_states={STALENESS_REDEPLOY_UNIT: redeploy_state},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _stops_then_starts(_state(tmp_path)["systemctl_calls"])
+
+
+def test_rebind_installs_the_template_verbatim_then_reloads(tmp_path):
+    installed = _socket_unit_path(tmp_path)
+    installed.parent.mkdir(parents=True)
+    installed.write_text("[Socket]\nListenStream=0.0.0.0:8002\n")
+    installed.chmod(0o600)
+    result = _run_script(tmp_path, "--rebind-socket", "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert installed.read_bytes() == SOCKET_TEMPLATE.read_bytes()
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+    assert _state(tmp_path)["socket_unit_at_daemon_reload"] == SOCKET_TEMPLATE.read_text()
+
+
+def test_rebind_stops_then_starts_instead_of_restarting(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["systemctl_calls"] == [
+        STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
+    ]
+
+
+def test_rebind_keeps_the_recon_gate(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", recon_busy_remaining=2)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state.get("curl_calls_at_restart", 0) >= 3, f"state={state!r}"
+    assert "deferring" in result.stdout, f"stdout={result.stdout!r}"
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--rebind-socket", "--now"], ["--now", "--rebind-socket"]],
+    ids=["rebind-first", "now-first"],
+)
+def test_rebind_composes_with_now_in_either_order(tmp_path, args):
+    result = _run_script(tmp_path, *args, recon_busy_remaining=5)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state.get("curl_calls_at_restart") == 0, f"state={state!r}"
+    assert "recon_gate:" not in result.stdout, f"stdout={result.stdout!r}"
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+
+
+@pytest.mark.parametrize("args", [[], ["--now"]], ids=["default", "now"])
+def test_plain_modes_leave_the_socket_unit_alone(tmp_path, args):
+    result = _run_script(tmp_path, *args)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = _state(tmp_path)["systemctl_calls"]
+    socket_verbs = {"is-active", "daemon-reload", "stop", "start"}
+    assert not [c for c in calls if c[0] in socket_verbs], f"calls={calls!r}"
+    assert not _socket_unit_path(tmp_path).exists()
+    assert ["restart", UNIT] in calls, f"calls={calls!r}"
