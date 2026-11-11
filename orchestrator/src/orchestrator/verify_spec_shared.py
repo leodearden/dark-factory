@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -111,8 +110,8 @@ def apply_spec_to_host_config(
     global_verify_command: VerifyCommand | None,
     module_configs: Sequence[ModuleConfig],
     field_overrides: Mapping[str, Any],
+    git_field_overrides: Mapping[str, Any],
     verify_cold_preprovision_command: str,
-    git_field_overrides: Mapping[str, Any] = MappingProxyType({}),
 ) -> OrchestratorConfig:
     """Return a copy of the consuming host's *config* with a spec applied onto it.
 
@@ -144,7 +143,8 @@ def apply_spec_to_host_config(
       fix is the live case) is never wiped.  PRD:
       plans/remote-task-leg-verify-prd.md §4.1.
     - *git_field_overrides* (task 7465): the spec's verdict-deciding GitConfig
-      leaves, under the same strict check as *field_overrides*.
+      leaves, under the same strict check as *field_overrides*; ``{}`` when
+      the spec carries none and the host's GitConfig decides.
 
     Three spelling hazards, all because ``model_copy`` carries field and
     private-attribute VALUES over by reference: verify_env is a FRESH dict

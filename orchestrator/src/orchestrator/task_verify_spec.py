@@ -195,6 +195,7 @@ def apply_task_verify_spec(
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
         field_overrides={'scope_cargo': spec.scope_cargo},
+        git_field_overrides={},
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
     return applied, module_configs

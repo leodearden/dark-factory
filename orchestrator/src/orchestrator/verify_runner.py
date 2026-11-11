@@ -679,8 +679,8 @@ async def run_merge_verify_on_worktree(
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
         field_overrides=_spec_field_overrides(spec),
-        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
         git_field_overrides=_spec_git_field_overrides(spec),
+        verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
     runner = LocalRunner(

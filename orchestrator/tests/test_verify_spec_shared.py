@@ -8,6 +8,7 @@ that host's config. These tests pin each rule at its one home.
 """
 
 import dataclasses
+import inspect
 import json
 from pathlib import Path
 
@@ -110,9 +111,16 @@ class TestApplySpecToHostConfig:
             'global_verify_command': None,
             'module_configs': [],
             'field_overrides': {},
+            'git_field_overrides': {},
             'verify_cold_preprovision_command': '',
         }
         return apply_spec_to_host_config(config, **{**arguments, **overrides})
+
+    def test_every_spec_keyword_is_required(self):
+        """Each consumer states what its spec ships; a default would silently keep the host's own."""
+        parameters = inspect.signature(apply_spec_to_host_config).parameters.values()
+
+        assert [p.name for p in parameters if p.default is not inspect.Parameter.empty] == []
 
     def test_spec_env_wins_and_host_only_keys_survive(self, tmp_path: Path):
         config = _host_config(tmp_path)
