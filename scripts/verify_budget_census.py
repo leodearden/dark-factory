@@ -1441,6 +1441,14 @@ def gate_floor_rule(module: str) -> GateFloorRule | None:
             refusal_ceiling=REFUSAL_CEILING,
             feeds=Citation(_checkout_relative(Path(inspect.getfile(records))), RULED_TABLE, module),
         )
+    publisher = family.published_pairs().get(module)
+    if publisher is not None:
+        return GateFloorRule(
+            rule=FloorRule.MIN_BUDGET,
+            derive=family.min_budget,
+            refusal_ceiling=None,
+            feeds=Citation(_checkout_relative(publisher.path), family.WORST_NAME, None),
+        )
     return GateFloorRule(
         rule=FloorRule.MIN_BUDGET,
         derive=family.min_budget,
