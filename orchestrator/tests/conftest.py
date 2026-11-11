@@ -1221,6 +1221,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires
