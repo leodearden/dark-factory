@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 from _orch_helpers import (
     wire_clear_claim_then_set_status,
     wire_live_status_from_get_task,
@@ -1430,6 +1431,17 @@ class TestVetoStreakAlarmSurvivesRestart:
         await _sweeps(harness, clock, 1)
 
         assert _alarms(harness, 'T1') == []
+
+    async def test_a_null_task_id_record_does_not_stop_the_inheritance(self, clocked):
+        harness, clock = clocked
+        null_record = submit_null_task_escalation(_queue(harness))
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+        assert null_record.id in {esc.id for esc in _queue(harness).get_pending()}
 
     async def test_a_task_still_held_keeps_one_alarm_until_the_hold_clears(
         self, clocked,

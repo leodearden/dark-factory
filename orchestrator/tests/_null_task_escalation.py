@@ -10,12 +10,14 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 
-def submit_null_task_escalation(queue: EscalationQueue) -> Escalation:
-    """Submit the 2026-11-10 trigger record to *queue* and return it."""
+def submit_null_task_escalation(
+    queue: EscalationQueue, *, agent_role: str = 'fused-memory',
+) -> Escalation:
+    """Submit the 2026-11-10 trigger record, filed as *agent_role*, to *queue* and return it."""
     record = Escalation.from_dict({
         'id': 'esc-reconciliation-backlog-dark_factory-2026-11-10T225816_4098180000',
         'task_id': None,
-        'agent_role': 'fused-memory',
+        'agent_role': agent_role,
         'severity': 'blocking',
         'category': 'infra_issue',
         'summary': 'Reconciliation backlog over threshold for dark_factory',
