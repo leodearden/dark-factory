@@ -1299,7 +1299,7 @@
     "orchestrator/tests/_workflow_helpers.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/conftest.py": {"patch_targets": ["worker.run_scoped_verification"], "private_reads": 1},
     "orchestrator/tests/test_agent_capability_wiring.py": {"patch_targets": [], "private_reads": 1},
-    "orchestrator/tests/test_agent_session_reaper.py": {"patch_targets": [], "private_reads": 21},
+    "orchestrator/tests/test_agent_session_reaper.py": {"patch_targets": [], "private_reads": 14},
     "orchestrator/tests/test_already_landed_citation_pattern.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_already_landed_tick_view.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_architect_all_committed_plan.py": {"patch_targets": [], "private_reads": 50},

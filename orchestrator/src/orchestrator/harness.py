@@ -3587,7 +3587,8 @@ class Harness:
         The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
         ``TaskArtifacts._clear_path``: clearing only the resolved path risks
         the OTHER root resurrecting it via the new-then-old read fallback on
-        a later call.  Idempotent (``missing_ok=True``); never raises.
+        a later call.  Idempotent (``missing_ok=True``); any other OSError
+        propagates.
         """
         (TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name).unlink(
             missing_ok=True
@@ -3758,10 +3759,18 @@ class Harness:
         claims: list[SessionSidecarClaim] = []
         unresolvable = 0
         for entry in sorted(self.git_ops.worktree_base.iterdir()):
-            if not entry.is_dir():
-                continue
-            sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
-            if not sidecar_path.exists():
+            try:
+                if not entry.is_dir():
+                    continue
+                sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
+                if not sidecar_path.exists():
+                    continue
+            except OSError as exc:
+                logger.warning(
+                    'Sidecar reap: %s unreadable (%s) — counted unresolvable',
+                    entry, exc,
+                )
+                unresolvable += 1
                 continue
             fallback = entry.name if classify_worktree_entry(entry.name) == 'task' else None
             claim = read_sidecar_claim(
@@ -3791,13 +3800,22 @@ class Harness:
             )
             statuses = {}
         verdicts: list[ReapVerdict] = []
+        clear_failed = 0
         for claim, alive in liveness:
             status = statuses.get(claim.task_id)
             verdict = reap_verdict(owner_alive=alive, status=status)
             verdicts.append(verdict)
             if verdict is not ReapVerdict.REAP:
                 continue
-            self._clear_recovery_artifact(claim.entry, 'agent_session.json')
+            try:
+                self._clear_recovery_artifact(claim.entry, 'agent_session.json')
+            except OSError as exc:
+                logger.warning(
+                    'Sidecar reap: could not clear %s (task %s): %s',
+                    claim.sidecar_path, claim.task_id, exc,
+                )
+                clear_failed += 1
+                continue
             logger.info(
                 'Sidecar reap: cleared %s (task %s, status %s, dead owner_pid '
                 '%r, age %ss)',
@@ -3812,6 +3830,7 @@ class Harness:
                 )
         tally = ReapTally.from_verdicts(
             verdicts,
+            clear_failed=clear_failed,
             unresolvable=unresolvable,
             status_read_error=None if err is None else f'{type(err).__name__}: {err}',
         )
@@ -4351,8 +4370,9 @@ class Harness:
         # finds nothing, and a "swept 0" tally would read as "no orphans"
         # rather than "not mounted".
         self._sweep_orphaned_transcripts()
-        # Siting is the PRD F4 rule (plans/session-resume-eligibility-seam-prd.md):
-        # 2c must precede 2d's re-pend, and the sweep above reads the session first.
+        # Siting (plans/session-resume-eligibility-seam-prd.capability-manifest.md
+        # §F4): before 2d's re-pend, so 'in-progress' is still ground truth; and
+        # before the per-entry loop below, so no sidecar is adopted then cleared.
         try:
             await self._reap_zombie_sidecars()
         except Exception as exc:

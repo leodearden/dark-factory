@@ -25,7 +25,7 @@ from orchestrator.agent_session_reaper import (
     read_sidecar_claim,
     reap_verdict,
 )
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import AgentSession, TaskArtifacts
 from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
@@ -42,17 +42,22 @@ def _write_json(path: Path, payload: object) -> Path:
 
 
 def _v2_payload(**overrides: object) -> dict:
-    payload: dict = {
-        'session_id': 'sess-1',
-        'role': 'implementer',
-        'started_at': (_NOW - timedelta(seconds=3600)).isoformat(),
-        'owner_pid': 4242,
-        'task_id': '42',
-        'resume_count': 0,
-        'schema_version': 2,
-    }
-    payload.update(overrides)
-    return payload
+    session = AgentSession(
+        session_id='sess-1',
+        role='implementer',
+        started_at=(_NOW - timedelta(seconds=3600)).isoformat(),
+        owner_pid=4242,
+        task_id='42',
+    )
+    return {**session.to_dict(), **overrides}
+
+
+_V2_ONLY_KEYS = ('task_id', 'resume_count', 'schema_version')
+
+
+def _as_v1(payload: dict) -> dict:
+    """The same sidecar as a pre-v2 writer left it: without the keys v2 added."""
+    return {k: v for k, v in payload.items() if k not in _V2_ONLY_KEYS}
 
 
 def _claim(owner_pid: object) -> SessionSidecarClaim:
@@ -105,9 +110,7 @@ class TestReadSidecarClaim:
         assert claim.sidecar_path == path
 
     def test_v1_sidecar_uses_the_fallback_task_id(self, tmp_path: Path):
-        payload = _v2_payload()
-        del payload['task_id']
-        path = _write_json(tmp_path / 'agent_session.json', payload)
+        path = _write_json(tmp_path / 'agent_session.json', _as_v1(_v2_payload()))
 
         claim = read_sidecar_claim(tmp_path, path, fallback_task_id='77', now=_NOW)
 
@@ -115,9 +118,7 @@ class TestReadSidecarClaim:
         assert claim.task_id == '77'
 
     def test_v1_sidecar_without_a_fallback_is_unresolvable(self, tmp_path: Path):
-        payload = _v2_payload()
-        del payload['task_id']
-        path = _write_json(tmp_path / 'agent_session.json', payload)
+        path = _write_json(tmp_path / 'agent_session.json', _as_v1(_v2_payload()))
 
         assert read_sidecar_claim(tmp_path, path, fallback_task_id=None, now=_NOW) is None
 
@@ -153,6 +154,13 @@ class TestReadSidecarClaim:
 
         assert claim is not None
         assert claim.age_secs == 90.0
+
+    def test_uncoercible_resume_count_returns_none(self, tmp_path: Path):
+        path = _write_json(
+            tmp_path / 'agent_session.json', _v2_payload(resume_count='many'),
+        )
+
+        assert read_sidecar_claim(tmp_path, path, fallback_task_id='1', now=_NOW) is None
 
     def test_corrupt_json_returns_none(self, tmp_path: Path):
         path = tmp_path / 'agent_session.json'
@@ -207,22 +215,47 @@ class TestReapTally:
                 ReapVerdict.KEEP_STATUS_UNKNOWN,
                 ReapVerdict.KEEP_STATUS_UNKNOWN,
             ],
+            clear_failed=0,
             unresolvable=4,
             status_read_error=None,
         )
 
         assert tally.reaped == 2
+        assert tally.clear_failed == 0
         assert tally.kept_owner_alive == 1
         assert tally.kept_in_progress == 1
         assert tally.kept_status_unknown == 3
         assert tally.unresolvable == 4
         assert tally.status_read_error is None
 
+    def test_a_failed_clear_is_not_counted_reaped(self):
+        tally = ReapTally.from_verdicts(
+            [ReapVerdict.REAP] * 3,
+            clear_failed=1,
+            unresolvable=0,
+            status_read_error=None,
+        )
+
+        assert tally.reaped == 2
+        assert tally.clear_failed == 1
+
+    def test_more_failed_clears_than_reap_verdicts_is_rejected(self):
+        with pytest.raises(ValueError, match='clear_failed'):
+            ReapTally.from_verdicts(
+                [ReapVerdict.REAP, ReapVerdict.KEEP_IN_PROGRESS],
+                clear_failed=2,
+                unresolvable=0,
+                status_read_error=None,
+            )
+
     def test_event_data_exposes_exactly_the_counts_and_the_error(self):
-        tally = ReapTally.from_verdicts([], unresolvable=0, status_read_error='boom')
+        tally = ReapTally.from_verdicts(
+            [], clear_failed=0, unresolvable=0, status_read_error='boom',
+        )
 
         assert tally.event_data() == {
             'reaped': 0,
+            'clear_failed': 0,
             'kept_owner_alive': 0,
             'kept_in_progress': 0,
             'kept_status_unknown': 0,
@@ -284,30 +317,32 @@ def _seed_sidecar(
     base: Path,
     entry_name: str,
     *,
-    owner_pid: object,
+    owner_pid: int,
     task_id: str | None = None,
-    started_at: str | None = None,
     root: Literal['legacy', 'meta'] = 'legacy',
 ) -> Path:
     """Write a v2 sidecar for *entry_name* (v1 when *task_id* is None)."""
     entry = base / entry_name
     entry.mkdir(parents=True, exist_ok=True)
-    payload: dict = {
-        'session_id': f'sess-{entry_name}',
-        'role': 'implementer',
-        'started_at': started_at
-        or (datetime.now(UTC) - timedelta(hours=176)).isoformat(),
-        'owner_pid': owner_pid,
-        'resume_count': 0,
-    }
-    if task_id is not None:
-        payload['task_id'] = task_id
-        payload['schema_version'] = 2
+    payload = AgentSession(
+        session_id=f'sess-{entry_name}',
+        role='implementer',
+        started_at=(datetime.now(UTC) - timedelta(hours=176)).isoformat(),
+        owner_pid=owner_pid,
+        task_id=task_id,
+    ).to_dict()
+    if task_id is None:
+        payload = _as_v1(payload)
     if root == 'legacy':
         path = entry / '.task' / 'agent_session.json'
     else:
         path = TaskArtifacts.meta_root_for(base, entry_name) / 'agent_session.json'
     return _write_json(path, payload)
+
+
+async def _boot(harness: Harness):
+    """Run step 2c's boot recovery scan, which the reaper hangs off."""
+    return await harness._recover_crashed_tasks()
 
 
 def _summary(harness: Harness) -> dict:
@@ -340,7 +375,7 @@ class TestZombieSidecarReap:
         cleanup = AsyncMock()
         harness.git_ops.cleanup_worktree = cleanup
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert not legacy.exists()
         assert not meta.exists()
@@ -364,7 +399,7 @@ class TestZombieSidecarReap:
         sidecar = _seed_sidecar(base, '62', owner_pid=_DEAD_PID, task_id='62')
         _serve_statuses(harness, {'62': 'in-progress'})
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert sidecar.exists()
         assert '62' in harness._recovered_sessions
@@ -376,7 +411,7 @@ class TestZombieSidecarReap:
         sidecar = _seed_sidecar(base, '64', owner_pid=os.getpid(), task_id='64')
         _serve_statuses(harness, {'64': 'pending'})
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert sidecar.exists()
         assert '64' in harness._recovered_sessions
@@ -387,7 +422,7 @@ class TestZombieSidecarReap:
         sidecar = _seed_sidecar(base, '65', owner_pid=_DEAD_PID, task_id='65')
         _serve_statuses(harness, {})
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert sidecar.exists()
         assert _reaped_rows(harness) == []
@@ -400,7 +435,7 @@ class TestZombieSidecarReap:
         sidecar = _seed_sidecar(base, '66', owner_pid=_DEAD_PID, task_id='66')
         _serve_statuses(harness, {'66': 'pending'}, err=RuntimeError('boom'))
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert sidecar.exists()
         assert _reaped_rows(harness) == []
@@ -418,7 +453,7 @@ class TestZombieSidecarReap:
         v1 = _seed_sidecar(base, '_lane-1', owner_pid=_DEAD_PID, root='meta')
         _serve_statuses(harness, {'63': 'pending'})
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert not v2.exists()
         assert v1.exists()
@@ -426,6 +461,60 @@ class TestZombieSidecarReap:
         summary = _summary(harness)
         assert summary['reaped'] == 1
         assert summary['unresolvable'] == 1
+
+    async def test_v1_sidecar_on_a_cold_worktree_reaps_under_the_entry_name(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '67', owner_pid=_DEAD_PID)
+        _serve_statuses(harness, {'67': 'pending'})
+
+        await _boot(harness)
+
+        assert not sidecar.exists()
+        rows = _reaped_rows(harness)
+        assert [row['task_id'] for row in rows] == ['67']
+        assert rows[0]['data']['task_id'] == '67'
+        assert _summary(harness)['unresolvable'] == 0
+
+    async def test_an_entry_that_cannot_be_read_costs_only_itself(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = harness.git_ops.worktree_base
+        _seed_sidecar(base, '81', owner_pid=_DEAD_PID, task_id='81')
+        sibling = _seed_sidecar(base, '82', owner_pid=_DEAD_PID, task_id='82')
+        _serve_statuses(harness, {'81': 'pending', '82': 'pending'})
+        real_resolve = harness._resolve_recovery_artifact
+
+        def _resolve(entry: Path, name: str) -> Path:
+            if entry.name == '81':
+                raise PermissionError(13, 'Permission denied', str(entry))
+            return real_resolve(entry, name)
+
+        monkeypatch.setattr(harness, '_resolve_recovery_artifact', _resolve)
+
+        tally = await harness._reap_zombie_sidecars()
+
+        assert not sibling.exists()
+        assert (tally.reaped, tally.unresolvable) == (1, 1)
+        assert _summary(harness)['unresolvable'] == 1
+
+    async def test_a_sidecar_that_cannot_be_cleared_costs_only_itself(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        _seed_sidecar(base, '83', owner_pid=_DEAD_PID, task_id='83', root='meta')
+        (base / '83' / '.task' / 'agent_session.json').mkdir(parents=True)
+        sibling = _seed_sidecar(base, '84', owner_pid=_DEAD_PID, task_id='84')
+        _serve_statuses(harness, {'83': 'pending', '84': 'pending'})
+
+        tally = await harness._reap_zombie_sidecars()
+
+        assert not sibling.exists()
+        assert [row['task_id'] for row in _reaped_rows(harness)] == ['84']
+        assert (tally.reaped, tally.clear_failed) == (1, 1)
+        summary = _summary(harness)
+        assert (summary['reaped'], summary['clear_failed']) == (1, 1)
 
     async def test_mixed_boot_makes_one_bulk_read_of_the_dead_owner_ids(
         self, harness: Harness,
@@ -440,12 +529,13 @@ class TestZombieSidecarReap:
             {'71': 'pending', '72': 'done', '73': 'in-progress', '74': 'pending'},
         )
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert get_statuses.await_count == 1
         assert sorted(_awaited_ids(get_statuses)) == ['71', '72', '73']
         assert _summary(harness) == {
             'reaped': 2,
+            'clear_failed': 0,
             'kept_owner_alive': 1,
             'kept_in_progress': 1,
             'kept_status_unknown': 0,
@@ -458,11 +548,12 @@ class TestZombieSidecarReap:
     ):
         get_statuses = _serve_statuses(harness, {})
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         get_statuses.assert_not_awaited()
         assert _summary(harness) == {
             'reaped': 0,
+            'clear_failed': 0,
             'kept_owner_alive': 0,
             'kept_in_progress': 0,
             'kept_status_unknown': 0,
@@ -490,14 +581,11 @@ def _seed_plan_worktree(base: Path, task_id: str) -> Path:
 class TestReaperWiredIntoCrashRecovery:
     """Where the reaper hangs off step 2c, and where it must NOT run."""
 
-    async def test_runs_once_after_the_sweep_and_before_the_first_cleanup(
+    async def test_runs_once_before_the_first_cleanup(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
     ):
+        """Before the per-entry loop, so no sidecar is adopted and then cleared."""
         order: list[str] = []
-        monkeypatch.setattr(
-            harness, '_sweep_orphaned_transcripts',
-            MagicMock(side_effect=lambda *a, **k: order.append('sweep') or 0),
-        )
         real_reap = harness._reap_zombie_sidecars
 
         async def _reap() -> ReapTally:
@@ -512,10 +600,10 @@ class TestReaperWiredIntoCrashRecovery:
         harness.git_ops.cleanup_worktree = AsyncMock(side_effect=_cleanup)
         (harness.git_ops.worktree_base / '71').mkdir(parents=True, exist_ok=True)
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert order.count('reap') == 1
-        assert order.index('sweep') < order.index('reap') < order.index('cleanup')
+        assert order.index('reap') < order.index('cleanup')
 
     async def test_not_run_when_pool_storage_absent(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch,
@@ -529,7 +617,7 @@ class TestReaperWiredIntoCrashRecovery:
         )
         monkeypatch.setattr(harness, '_file_pool_storage_absent_escalation', MagicMock())
 
-        await harness._recover_crashed_tasks()
+        await _boot(harness)
 
         assert sidecar.exists()
         get_statuses.assert_not_awaited()
@@ -543,7 +631,7 @@ class TestReaperWiredIntoCrashRecovery:
         )
         _seed_plan_worktree(harness.git_ops.worktree_base, '73')
 
-        failures = await harness._recover_crashed_tasks()
+        failures = await _boot(harness)
 
         assert [f.exception_type for f in failures.failures] == ['RuntimeError']
         assert '73' in harness._recovered_plans

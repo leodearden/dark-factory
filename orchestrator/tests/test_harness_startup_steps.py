@@ -19,6 +19,7 @@ import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import AgentSession
 from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
@@ -328,21 +329,19 @@ class TestStrandedSweepAtStartup:
 def _seed_dead_owner_sidecar(worktree_base: Path, task_id: str) -> Path:
     sidecar = worktree_base / task_id / '.task' / 'agent_session.json'
     sidecar.parent.mkdir(parents=True)
-    sidecar.write_text(json.dumps({
-        'session_id': f'sess-{task_id}',
-        'role': 'implementer',
-        'started_at': '2026-11-01T00:00:00+00:00',
-        'owner_pid': 2**31 - 1,
-        'task_id': task_id,
-        'resume_count': 0,
-        'schema_version': 2,
-    }))
+    sidecar.write_text(json.dumps(AgentSession(
+        session_id=f'sess-{task_id}',
+        role='implementer',
+        started_at='2026-11-01T00:00:00+00:00',
+        owner_pid=2**31 - 1,
+        task_id=task_id,
+    ).to_dict()))
     return sidecar
 
 
 @pytest.mark.asyncio
 class TestZombieSidecarReaperSiting:
-    """The sidecar reaper reads pre-2d ground truth (plans/session-resume-eligibility-seam-prd.md F4)."""
+    """The sidecar reaper reads pre-2d ground truth (plans/session-resume-eligibility-seam-prd.capability-manifest.md §F4)."""
 
     async def test_reaper_runs_in_2c_before_2d_re_pends_stranded_tasks(
         self, make_startup_harness,

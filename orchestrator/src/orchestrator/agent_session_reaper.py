@@ -13,6 +13,8 @@ from pathlib import Path
 from shared.proc_liveness import pid_alive
 from shared.task_statuses import TaskStatus
 
+from orchestrator.artifacts import AgentSession
+
 
 class ReapVerdict(StrEnum):
     REAP = 'reap'
@@ -71,20 +73,20 @@ def read_sidecar_claim(
     """The sidecar's claim on *entry*, or None when it is unreadable or names no task. Never raises."""
     try:
         data = json.loads(sidecar_path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        if not isinstance(data, dict):
+            return None
+        session = AgentSession.from_mapping(data)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
         return None
-    if not isinstance(data, dict):
-        return None
-    own_task_id = data.get('task_id')
-    task_id = str(own_task_id) if own_task_id else fallback_task_id
+    task_id = str(session.task_id) if session.task_id else fallback_task_id
     if task_id is None:
         return None
     return SessionSidecarClaim(
         entry=entry,
         sidecar_path=sidecar_path,
         task_id=task_id,
-        owner_pid=data.get('owner_pid'),
-        age_secs=_age_secs(data.get('started_at'), now),
+        owner_pid=session.owner_pid,
+        age_secs=_age_secs(session.started_at, now),
     )
 
 
@@ -94,7 +96,10 @@ def owner_alive(claim: SessionSidecarClaim) -> bool:
 
 @dataclass(frozen=True)
 class ReapTally:
+    """Per-boot counts; ``reaped`` counts only the REAP verdicts whose clear succeeded."""
+
     reaped: int
+    clear_failed: int
     kept_owner_alive: int
     kept_in_progress: int
     kept_status_unknown: int
@@ -106,12 +111,18 @@ class ReapTally:
         cls,
         verdicts: Iterable[ReapVerdict],
         *,
+        clear_failed: int,
         unresolvable: int,
         status_read_error: str | None,
     ) -> ReapTally:
         counts = Counter(verdicts)
+        if not 0 <= clear_failed <= counts[ReapVerdict.REAP]:
+            raise ValueError(
+                f'clear_failed={clear_failed} outside 0..{counts[ReapVerdict.REAP]} REAP verdicts'
+            )
         return cls(
-            reaped=counts[ReapVerdict.REAP],
+            reaped=counts[ReapVerdict.REAP] - clear_failed,
+            clear_failed=clear_failed,
             kept_owner_alive=counts[ReapVerdict.KEEP_OWNER_ALIVE],
             kept_in_progress=counts[ReapVerdict.KEEP_IN_PROGRESS],
             kept_status_unknown=counts[ReapVerdict.KEEP_STATUS_UNKNOWN],
@@ -122,6 +133,7 @@ class ReapTally:
     def event_data(self) -> dict:
         return {
             'reaped': self.reaped,
+            'clear_failed': self.clear_failed,
             'kept_owner_alive': self.kept_owner_alive,
             'kept_in_progress': self.kept_in_progress,
             'kept_status_unknown': self.kept_status_unknown,
