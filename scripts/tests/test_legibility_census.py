@@ -27,7 +27,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pytest
@@ -37,6 +37,7 @@ from legibility import (
     alarm,
     census_findings,
     census_identity,
+    census_state,
     census_trigger,
     census_window,
     check_census_report,
@@ -52,6 +53,7 @@ from legibility import (
     session_ledger,
     session_runner,
     similarity,
+    state_docs,
     synthesis,
     task_store,
     trickle_state,
@@ -1197,90 +1199,6 @@ def test_retire_entry_sets_status_retained():
     codebook.assert_no_deletion(before, result)
 
     assert before["entries"][0]["status"] == "open"
-
-
-# ---------------------------------------------------------------------------
-# advance_census_state() -- the five-key census-state (PRD census-incremental
-# §4.2; the done-count baseline is retired with tasks-landed, C7)
-# ---------------------------------------------------------------------------
-
-_STATE_KEYS = [
-    "last_census_at",
-    "last_census_run_id",
-    "last_census_report",
-    "last_census_as_of_sha",
-    "session_watermark",
-]
-
-
-def _advance(path, **overrides):
-    kwargs: dict[str, Any] = dict(
-        census_at="2026-07-14",
-        run_id="census-dark_factory-20260714",
-        report_path="plans/confusion-census-2026-07-14.md",
-        as_of_sha="a" * 40,
-        session_watermark="2026-07-14T00:00:00+00:00",
-    )
-    kwargs.update(overrides)
-    mod.advance_census_state(path, **kwargs)
-
-
-def test_advance_census_state_writes_exactly_the_five_keys_in_order(tmp_path):
-    path = tmp_path / "census-state.json"
-
-    _advance(path)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert list(data) == _STATE_KEYS
-    assert data == {
-        "last_census_at": "2026-07-14",
-        "last_census_run_id": "census-dark_factory-20260714",
-        "last_census_report": "plans/confusion-census-2026-07-14.md",
-        "last_census_as_of_sha": "a" * 40,
-        "session_watermark": "2026-07-14T00:00:00+00:00",
-    }
-
-
-def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_path):
-    """A run with no mining window (an injected batch source) has no
-    watermark; the key is still written, as null."""
-    path = tmp_path / "census-state.json"
-
-    _advance(path, session_watermark=None)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert list(data) == _STATE_KEYS
-    assert data["session_watermark"] is None
-
-
-@pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
-def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
-    path = tmp_path / "census-state.json"
-
-    _advance(path, session_watermark=watermark)
-
-    status, data = census_trigger.load_census_state(path)
-    assert status == "ok"
-    assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
-    assert data["last_census_at"] == "2026-07-14"
-    assert data["last_census_run_id"] == "census-dark_factory-20260714"
-    assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
-    assert data["last_census_as_of_sha"] == "a" * 40
-    assert data["session_watermark"] == watermark
-
-
-def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
-    path = tmp_path / "census-state.json"
-    path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
-
-    _advance(path)
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert list(data) == _STATE_KEYS
-    assert "stale" not in data, "pre-existing state must be FULLY replaced"
-
-    leftovers = [p for p in tmp_path.iterdir() if p.name != "census-state.json"]
-    assert leftovers == [], "no partial/temp file left behind"
 
 
 # ---------------------------------------------------------------------------
@@ -3394,9 +3312,9 @@ def _census_repo(tmp_path):
     codebook_path = legibility_dir / "confusion-codebook.yaml"
     codebook.dump(_minimal_v2_codebook(), codebook_path)
     census_state_path = legibility_dir / "census-state.json"
-    mod.advance_census_state(
+    census_state.advance(
         census_state_path,
-        census_at="2026-06-01",
+        census_at=date(2026, 6, 1),
         run_id="census-dark_factory-20260601",
         report_path="plans/confusion-census-2026-06-01.md",
         as_of_sha="b" * 40,
@@ -4525,9 +4443,20 @@ def test_run_census_advances_census_state_when_the_status_fetch_fails(
     assert kwargs["report_path"].exists(), "the paid-for report must survive"
     assert len(fake_commit.calls) == 1, "the run must still commit"
 
-    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
-    assert list(state) == _STATE_KEYS
-    assert "last_census_done_count" not in state
+    read = census_state.load(kwargs["census_state_path"])
+    assert isinstance(read, state_docs.Ok)
+    assert read.value.last_census_run_id == kwargs["run_id"]
+    assert read.value.last_census_as_of_sha == kwargs["as_of_sha"]
+    assert read.value.last_census_report == "confusion-census-2026-07-14.md"
+    assert read.value.last_census_at == date.fromisoformat(kwargs["date"])
+    raw = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert set(raw) == {
+        "last_census_at",
+        "last_census_run_id",
+        "last_census_report",
+        "last_census_as_of_sha",
+        "session_watermark",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5389,7 +5318,7 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
 # ---------------------------------------------------------------------------
 # task 3280 step-18: RED — the dry-run WARNING must describe the state the run
 # ACTUALLY left behind. A dry run is NOT a no-op that can be replayed: the
-# codebook merge, the promotions, codebook.dump and advance_census_state all
+# codebook merge, the promotions, codebook.dump and census_state.advance all
 # really happened, so re-running the census files NOTHING (the same confusions
 # now code as `matches` against the advanced codebook, `_novel_clusters` comes
 # back empty, build_task_payloads returns [], and the mined sessions are
@@ -5825,7 +5754,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6006,7 +5935,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6032,7 +5961,7 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    def fake_decide(project_root, *, now=None, completion_runner=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=["completion: landed -> FIRE"])
 
     monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
@@ -6042,6 +5971,33 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
     assert exit_code == 0
     assert len(fake_run_census.calls) == 1
     assert fake_run_census.calls[0]["force"] is False
+
+
+def test_main_gate_decides_on_the_config_main_loaded(tmp_path, monkeypatch):
+    """Task 3269 / PRD D8: the gate decides on the --config main() loaded, a
+    file outside the project root, never on a re-read of the root's own."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside_config = _census_project(project_root, config_path=tmp_path / "outside.yaml")
+    with outside_config.open("a", encoding="utf-8") as f:
+        f.write("census:\n  floor_days: 3\n")
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    received = []
+
+    def fake_decide(cfg, *, now=None, completion_runner=None):
+        received.append(cfg)
+        return census_trigger.Decision(fire=False, reasons=["completion: not yet due"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    exit_code = mod.main(["--project-root", str(project_root), "--config", str(outside_config)])
+
+    assert exit_code == 0
+    assert fake_run_census.calls == []
+    assert len(received) == 1
+    assert isinstance(received[0], config_mod.LegibilityConfig)
+    assert received[0].census.floor_days == 3
 
 
 def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):
@@ -6935,7 +6891,7 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
 # reply therefore fires on ordinary healthy output.
 #
 # The consequence is worse than merely over-deferring: _defer returns before
-# every write AND before advance_census_state, so last_census_at is untouched,
+# every write AND before census_state.advance, so last_census_at is untouched,
 # the next run re-mines the same window, re-hits the same cluster and aborts
 # again -- a permanent census stall plus a stream of false infra_issue
 # escalations claiming the account is capped.
@@ -7015,7 +6971,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     detector -> _defer -> abort-before-persistence chain is in the loop.
 
     The load-bearing assertions are that report_path / codebook_path /
-    census_state_path all EXIST -- i.e. advance_census_state ran and
+    census_state_path all EXIST -- i.e. census_state.advance ran and
     last_census_at MOVED. That is what pins this defect as non-self-
     perpetuating: with the pre-parse scan in place the run aborts before every
     write, last_census_at is untouched, and the next run re-mines the same
@@ -7057,7 +7013,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     assert kwargs["report_path"].exists(), "the report was written"
     assert kwargs["codebook_path"].exists(), "the codebook merge was persisted"
     assert kwargs["census_state_path"].exists(), (
-        "advance_census_state ran: last_census_at MOVED, so the next run does "
+        "census_state.advance ran: last_census_at MOVED, so the next run does "
         "not re-mine this window and re-hit the same cluster forever"
     )
     assert len(fake_submit_fn.calls) == 1, "the verified cluster was filed"

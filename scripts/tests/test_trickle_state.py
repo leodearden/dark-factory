@@ -1580,7 +1580,7 @@ class TestReadLastCensusAt:
         pytest.param('[1, 2]', id='not-an-object'),
     ])
     def test_an_unusable_file_is_malformed_and_quiet(self, tmp_path, caplog, content):
-        """Quiet because census_trigger.load_census_state already logs the
+        """Quiet because census_state.load already logs the
         malformed WARNING for the same file on the same night."""
         path = tmp_path / 'census-state.json'
         path.write_text(content, encoding='utf-8')

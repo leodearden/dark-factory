@@ -22,7 +22,15 @@ from typing import Any
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import census_findings, codebook, config, embeddings, entry_join, report_text
+from legibility import (
+    census_findings,
+    codebook,
+    config,
+    embeddings,
+    entry_join,
+    layout,
+    report_text,
+)
 
 Vector = tuple[float, ...]
 
@@ -596,8 +604,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     queue; 1 when the stage is skipped. Writes only the vector cache."""
     args = build_parser().parse_args(argv)
     root = args.project_root
-    cfg = config.load_config(args.config or root / "docs" / "legibility" / "legibility.yaml")
-    cb = codebook.load(root / "docs" / "legibility" / "confusion-codebook.yaml")
+    cfg = config.load_config(args.config or layout.config_path(root))
+    cb = codebook.load(layout.codebook_path(root))
     view = build_view(
         cb,
         (),
