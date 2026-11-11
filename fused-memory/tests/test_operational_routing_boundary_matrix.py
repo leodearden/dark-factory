@@ -167,7 +167,7 @@ async def _get_task_meta(server, root: str, task_id: str) -> dict:
 
 
 async def _submit_normal_and_get(
-    stack: tuple, root: str, metadata: dict, monkeypatch: pytest.MonkeyPatch,
+    stack: tuple, root: str, metadata: dict | None, monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[dict, dict]:
     """Drive a NORMAL (non-planning_mode) submit_task -> resolve_ticket ->
     get_task round-trip, with the curator neutralized to a no-op 'create'.
@@ -624,6 +624,76 @@ async def test_unconverted_submission_carries_no_routing_notice_or_stamp(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('metadata', [None, {'execution_class': 'code_tdd'}], ids=['none', 'code_tdd'])
+async def test_normal_submit_unconverted_ticket_carries_no_routing_notice_or_stamp(
+    _real_stack, tmp_path, monkeypatch, metadata,
+):
+    root = str(tmp_path / 'proj')
+
+    submit_result, meta = await _submit_normal_and_get(_real_stack, root, metadata, monkeypatch)
+
+    assert 'ticket' in submit_result, f'got {submit_result!r}'
+    assert 'routing_notice' not in submit_result, f'got {submit_result!r}'
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_failed_write_carries_no_routing_notice(_real_stack, tmp_path, monkeypatch):
+    server, interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+    monkeypatch.setattr(
+        interceptor.taskmaster, 'add_task', AsyncMock(side_effect=RuntimeError('backend down')),
+    )
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: failed planning_mode write',
+            'description': 'Operational ask whose planning_mode insert fails.',
+            'planning_mode': True,
+            'metadata': {'execution_class': 'operational'},
+        },
+    )
+
+    assert result.get('error_type') == 'RuntimeError', f'got {result!r}'
+    assert 'routing_notice' not in result, f'got {result!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('task_kind', 'metadata'),
+    [
+        ('deterministic', {'always_escalates': True, 'execution_class': 'operational'}),
+        ('normal', {'execution_class': 'code_tdd'}),
+    ],
+    ids=['declared_gate', 'code_tdd'],
+)
+async def test_caller_supplied_stamp_is_dropped_at_the_submit_boundary(
+    _real_stack, tmp_path, task_kind, metadata,
+):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Routing notice probe: caller-supplied stamp',
+            'description': 'Metadata cloned from get_task, still carrying a pure_gate_from stamp.',
+            'planning_mode': True,
+            'task_kind': task_kind,
+            'metadata': {**metadata, PURE_GATE_FROM_KEY: 'execution_class=operational'},
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+
+    assert 'routing_notice' not in result, f'got {result!r}'
+    meta = await _get_task_meta(server, root, result['task_id'])
+    assert PURE_GATE_FROM_KEY not in meta, f'got {meta!r}'
+
+
+@pytest.mark.asyncio
 async def test_planning_mode_declared_consolidation_gate_gets_no_notice_or_stamp(_real_stack, tmp_path):
     server, _interceptor = _real_stack
     root = str(tmp_path / 'proj')
@@ -667,6 +737,7 @@ async def test_untagged_declared_gate_routed_by_registry_is_not_stamped(
         {'ticket': submit_result['ticket'], 'project_root': root, 'timeout_seconds': 30},
     )
     assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
+    assert resolved['reason'].startswith('create: route_deterministic'), f'got {resolved!r}'
 
     meta = await _get_task_meta(server, root, resolved['task_id'])
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'

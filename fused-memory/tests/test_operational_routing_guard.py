@@ -380,7 +380,7 @@ class TestPureGateRoutingNotice:
             {'execution_class': 'code_tdd'},
             {'task_kind': 'deterministic', 'always_escalates': True},
             {'pure_gate_from': 'execution_class=operational', 'task_kind': 'normal'},
-            {'pure_gate_from': 'bogus', 'always_escalates': True},
+            {'pure_gate_from': 'bogus', 'task_kind': 'deterministic', 'always_escalates': True},
         ],
         ids=[
             'none',

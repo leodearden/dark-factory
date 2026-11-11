@@ -1586,8 +1586,10 @@ Three of the entries belong to the completion-driven trigger chain
   `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
   declared `75` carried no JSON object (§6).
 
-`pure_gate_from` is machine-written at conversion, never author-supplied:
-`TaskInterceptor._inject_deterministic_pure_gate` stamps it with a
+`pure_gate_from` is machine-written at conversion, never author-supplied: the
+`submit_task` tool drops a caller-supplied value (metadata cloned from
+`get_task`, say), and `TaskInterceptor._inject_deterministic_pure_gate`
+stamps it with a
 `shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
 is written only when the conversion rewrote the submission's routing: a
 submission that already declared the pure-gate shape
