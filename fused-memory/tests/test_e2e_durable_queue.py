@@ -19,12 +19,12 @@ from _fm_polling import poll_until
 from _queued_write_fixtures import insert_raw_row, queued
 
 from fused_memory.backends.llm_token_usage import measure_llm_tokens
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dead_letter_escalator import (
     _REPORTED_TO_CALLER,
     _REPORTED_TO_CALLER_DEFAULT,
 )
 from fused_memory.models.enums import SourceStore
-from fused_memory.services import memory_service
 from fused_memory.services.memory_service import MemoryService
 
 
@@ -1224,7 +1224,7 @@ class TestUndecodableRowIsRefusedNotExecuted:
         queue = svc.durable_queue
         filed: list[dict] = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *args, **kwargs: filed.append(kwargs),
         )
         svc.set_known_projects({'main': str(tmp_path)})

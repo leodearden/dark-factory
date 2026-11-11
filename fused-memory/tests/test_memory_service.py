@@ -25,6 +25,7 @@ from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
 from fused_memory.backends.falkor_server_settings import FalkorServerSettings
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope, resolve_project_id_for_root
@@ -14872,7 +14873,7 @@ class TestDeadLetterAlarmWiring:
 
         emitted = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: emitted.append((a, kw)),
         )
         service.set_known_projects({'somewhere_else': '/root/elsewhere'})
@@ -14902,7 +14903,7 @@ class TestDeadLetterAlarmWiring:
 
         calls = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: calls.append((a, kw)),
         )
         service.set_known_projects({'proj1': '/root/proj1'})
@@ -14936,7 +14937,7 @@ class TestDeadLetterAlarmWiring:
         assert kwargs['post_execute'] is False
         assert kwargs['content_preview'] == 'lost content'
         assert kwargs['caller_reference'] == 'corr-1'
-        assert memory_service.emit_dead_letter_escalation in threads, (
+        assert dead_letter_escalator.emit_dead_letter_escalation in threads, (
             'the blocking escalation write must not run on the event loop'
         )
 
@@ -14951,7 +14952,7 @@ class TestDeadLetterAlarmWiring:
             raise OSError('escalation queue is on fire')
 
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation', _explode
+            dead_letter_escalator, 'emit_dead_letter_escalation', _explode
         )
         service.set_known_projects({'proj1': '/root/proj1'})
 
@@ -14973,7 +14974,7 @@ class TestDeadLetterAlarmWiring:
 
         calls = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: calls.append((a, kw)),
         )
         service.set_known_projects({'proj1': '/root/proj1'})
@@ -14997,7 +14998,7 @@ class TestDeadLetterAlarmWiring:
 
         calls = []
         monkeypatch.setattr(
-            memory_service, 'emit_dead_letter_escalation',
+            dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *a, **kw: calls.append((a, kw)),
         )
         service.set_known_projects({'proj1': '/root/proj1'})

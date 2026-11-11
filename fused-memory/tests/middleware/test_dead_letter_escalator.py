@@ -28,6 +28,7 @@ from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import dead_letter_escalator as dle_mod
 from fused_memory.middleware.dead_letter_escalator import emit_dead_letter_escalation
+from fused_memory.services.queued_writes import QueueOperation
 
 pytestmark = pytest.mark.skipif(
     not dle_mod.HAS_ESCALATION,
@@ -72,16 +73,13 @@ def _emit(root, *, project_id=_PROJECT, operation='add_episode',
 class TestImportsCleanlyOnItsOwn:
     """This module must be importable FIRST, before the service layer.
 
-    Regression pin for a real cycle. `_error_class` needs
-    `POST_EXECUTE_DEAD_PREFIX` from `services.durable_queue`; importing that at
-    MODULE scope reaches `services/__init__`, which eagerly imports
-    `MemoryService`, which imports this module back — so whichever of the two
-    loads first finds the other half-initialized. It bit asymmetrically and was
-    therefore easy to miss: most test modules pull in `memory_service` first
-    via some other import and the cycle resolves, but collecting
-    `tests/middleware/` on its own imports this module first and the whole file
-    errors out at collection. The remedy is the deferred import inside
-    `_error_class`, and this is what keeps it deferred.
+    Regression pin for a real cycle. This module imports the services layer
+    (`QueueOperation`, `POST_EXECUTE_DEAD_PREFIX`) at module scope, which runs
+    `services/__init__`, which eagerly imports `MemoryService`, which imports
+    this module back while it is half-initialized. That is safe only because
+    `memory_service` imports this MODULE rather than a name from it. It bites
+    asymmetrically: most test modules pull in `memory_service` first, but
+    collecting `tests/middleware/` on its own imports this module first.
 
     A SUBPROCESS is load-bearing: by the time any in-process test runs, both
     modules are long since in `sys.modules`, so an in-process import assertion
@@ -121,6 +119,17 @@ class TestImportsCleanlyOnItsOwn:
             'from fused_memory.middleware.dead_letter_escalator import ('
             '    emit_dead_letter_escalation,\n)\n'
             'assert MemoryService is not None and callable(emit_dead_letter_escalation)\n'
+            'print("ok")\n'
+        )
+        assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
+        assert 'ok' in proc.stdout
+
+    def test_importing_the_durable_queue_first_still_works(self):
+        proc = self._run(
+            'from fused_memory.services.durable_queue import DurableWriteQueue\n'
+            'from fused_memory.middleware.dead_letter_escalator import ('
+            '    emit_dead_letter_escalation,\n)\n'
+            'assert DurableWriteQueue is not None and callable(emit_dead_letter_escalation)\n'
             'print("ok")\n'
         )
         assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
@@ -577,6 +586,21 @@ class TestWhatTheCallerWasTold:
     ):
         """A forgotten entry must under-claim, not claim optimistically."""
         _emit(tmp_path, operation='mem0_classify_and_add', write_op_id=None)
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail
+
+    def test_every_claim_is_keyed_on_a_queue_operation(self):
+        keys = set(dle_mod._REPORTED_TO_CALLER)
+
+        assert keys == {QueueOperation.ADD_EPISODE, QueueOperation.ADD_MEMORY_GRAPHITI}
+        assert all(type(key) is QueueOperation for key in keys), keys
+
+    def test_an_operation_outside_the_vocabulary_falls_back_to_the_neutral_default(
+        self, tmp_path,
+    ):
+        """An undecodable row reports its raw operation string."""
+        _emit(tmp_path, operation='typo_op', write_op_id=None)
         detail = _filed(tmp_path)[0]['detail']
 
         assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail
