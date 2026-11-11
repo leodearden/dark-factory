@@ -17,9 +17,9 @@ from shared.task_metadata import RetryLedger
 
 from orchestrator.workflow import (  # type: ignore[attr-defined]
     _evaluate_infra_resume,
-    _evaluate_merge_thrash,
     _evaluate_no_plan,
     _LedgerVerdict,
+    evaluate_merge_thrash,
 )
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ def test_infra_resume_verdict_exposes_trigger_field():
 
 
 # ---------------------------------------------------------------------------
-# _evaluate_merge_thrash
+# evaluate_merge_thrash
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +198,7 @@ def test_merge_thrash_matching_signature_increments():
         consecutive_merge_thrash=1,
         last_merge_outcome_signature='sig-abc',
     )
-    verdict = _evaluate_merge_thrash(ledger, 'sig-abc', 'sig-abc', 2)
+    verdict = evaluate_merge_thrash(ledger, 'sig-abc', 'sig-abc', 2)
 
     assert verdict.ledger.consecutive_merge_thrash == 2
     assert verdict.ledger.last_merge_outcome_signature == 'sig-abc'
@@ -210,7 +210,7 @@ def test_merge_thrash_differing_signature_resets_to_one():
         consecutive_merge_thrash=1,
         last_merge_outcome_signature='sig-abc',
     )
-    verdict = _evaluate_merge_thrash(ledger, 'sig-abc', 'sig-xyz', 2)
+    verdict = evaluate_merge_thrash(ledger, 'sig-abc', 'sig-xyz', 2)
 
     assert verdict.ledger.consecutive_merge_thrash == 1
     assert verdict.ledger.last_merge_outcome_signature == 'sig-xyz'
@@ -219,7 +219,7 @@ def test_merge_thrash_differing_signature_resets_to_one():
 
 def test_merge_thrash_none_prev_signature_resets_to_one():
     ledger = RetryLedger()
-    verdict = _evaluate_merge_thrash(ledger, None, 'sig-1', 2)
+    verdict = evaluate_merge_thrash(ledger, None, 'sig-1', 2)
 
     assert verdict.ledger.consecutive_merge_thrash == 1
     assert verdict.ledger.last_merge_outcome_signature == 'sig-1'
@@ -231,7 +231,7 @@ def test_merge_thrash_threshold_is_configurable():
         consecutive_merge_thrash=1,
         last_merge_outcome_signature='sig-abc',
     )
-    verdict = _evaluate_merge_thrash(ledger, 'sig-abc', 'sig-abc', 3)
+    verdict = evaluate_merge_thrash(ledger, 'sig-abc', 'sig-abc', 3)
 
     assert verdict.ledger.consecutive_merge_thrash == 2
     assert verdict.escalate is False
@@ -239,7 +239,7 @@ def test_merge_thrash_threshold_is_configurable():
 
 def test_merge_thrash_verdict_exposes_trigger_field():
     ledger = RetryLedger()
-    verdict = _evaluate_merge_thrash(ledger, None, 'sig', 2)
+    verdict = evaluate_merge_thrash(ledger, None, 'sig', 2)
 
     assert isinstance(verdict.trigger, str)
 

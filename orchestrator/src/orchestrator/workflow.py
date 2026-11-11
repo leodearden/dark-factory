@@ -1102,7 +1102,7 @@ def _evaluate_infra_resume(
     return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
-def _evaluate_merge_thrash(
+def evaluate_merge_thrash(
     ledger: RetryLedger,
     prev_signature: str | None,
     current_signature: str,
@@ -6911,7 +6911,7 @@ class TaskWorkflow:
         returns ``REQUEUED`` (steward resolved an L0 and the loop is about
         to resubmit).  If the merge-outcome signature matches the previous
         attempt, increment ``consecutive_merge_thrash`` inside the typed
-        ``metadata.retry_ledger`` blob (see :func:`_evaluate_merge_thrash`).
+        ``metadata.retry_ledger`` blob (see :func:`evaluate_merge_thrash`).
         At ``max_consecutive_merge_thrash``, route to
         ``_mark_blocked(escalate_to_human=True)`` instead of resubmitting.
 
@@ -6940,7 +6940,7 @@ class TaskWorkflow:
 
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_merge_thrash(
+        verdict = evaluate_merge_thrash(
             ledger, prev_signature, current_signature,
             self.config.max_consecutive_merge_thrash,
         )
