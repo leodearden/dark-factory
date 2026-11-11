@@ -63,6 +63,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
     'dashboard/tests/test_tab_tasks_deferral.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
     'dashboard/tests/test_tab_tasks_invariant_chip.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
+    'escalation/tests/_rebased_landing_git.py': (
+        'every builder takes a caller-built repo root and caps discovery there'
+    ),
+    'escalation/tests/test_merge_status_git_authority.py': _SEEDS_ITS_OWN_REPO,
     'fused-memory/tests/server/test_topic_cluster_store.py': (
         'the match is memory-text prose passed to pytest.param; no git runs'
     ),
