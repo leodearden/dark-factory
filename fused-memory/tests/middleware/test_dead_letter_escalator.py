@@ -589,11 +589,15 @@ class TestWhatTheCallerWasTold:
 
         assert dle_mod._REPORTED_TO_CALLER_DEFAULT in detail, detail
 
-    def test_every_claim_is_keyed_on_a_queue_operation(self):
-        keys = set(dle_mod._REPORTED_TO_CALLER)
+    @pytest.mark.parametrize(
+        'operation', [QueueOperation.ADD_EPISODE, QueueOperation.ADD_MEMORY_GRAPHITI],
+    )
+    def test_a_claimed_operation_passed_as_the_enum_files_its_claim(self, tmp_path, operation):
+        _emit(tmp_path, operation=operation, write_op_id='W-9')
+        detail = _filed(tmp_path)[0]['detail']
 
-        assert keys == {QueueOperation.ADD_EPISODE, QueueOperation.ADD_MEMORY_GRAPHITI}
-        assert all(type(key) is QueueOperation for key in keys), keys
+        assert dle_mod._REPORTED_TO_CALLER[operation].text in detail, detail
+        assert dle_mod._REPORTED_TO_CALLER_DEFAULT not in detail, detail
 
     def test_an_operation_outside_the_vocabulary_falls_back_to_the_neutral_default(
         self, tmp_path,
