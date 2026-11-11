@@ -43,6 +43,11 @@ DRAIN_POLL_INTERVAL="${DRAIN_POLL_INTERVAL:-5}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+# scripts/orchestrator-watchdog.py::FM_STALENESS_REDEPLOY_UNIT — a transient
+# systemd-run unit, so `is-active` answers inactive when it is absent.
+STALENESS_REDEPLOY_UNIT="fm-staleness-redeploy.service"
 
 usage_error() {
     echo "ERROR: $1" >&2
@@ -68,6 +73,28 @@ for arg in "$@"; do
         *)               usage_error "unknown argument: ${arg}" ;;
     esac
 done
+
+# The fused-memory tier has no restart lease, so a staleness redeploy in
+# flight would restart the service again underneath the rebind.
+refuse_while_staleness_redeploy_runs() {
+    local state
+    state="$(systemctl --user is-active "$STALENESS_REDEPLOY_UNIT" || true)"
+    if [[ "$state" == "inactive" || "$state" == "failed" ]]; then
+        return 0
+    fi
+    echo "rebind_socket: REFUSED: ${STALENESS_REDEPLOY_UNIT} is '${state:-no answer}'; nothing was changed." >&2
+    echo "rebind_socket: re-run once \`systemctl --user is-active ${STALENESS_REDEPLOY_UNIT}\` answers inactive." >&2
+    exit 3
+}
+
+# 0. --rebind-socket: adopt the committed socket unit before the gate, so the
+#    stop/start below brings the listeners up on the template's endpoints.
+if [[ "$rebind_socket" == 1 ]]; then
+    refuse_while_staleness_redeploy_runs
+    install -m 0644 "$SCRIPT_DIR/fused-memory.socket.template" "$UNIT_DIR/fused-memory.socket"
+    systemctl --user daemon-reload
+    echo "rebind_socket: installed $SCRIPT_DIR/fused-memory.socket.template as $UNIT_DIR/fused-memory.socket"
+fi
 
 # 1. DEFAULT: defer while a full recon cycle is in flight.
 if [[ "$gate" == "recon" ]]; then
@@ -136,9 +163,18 @@ if [[ "$gate" == "drain" ]]; then
     fi
 fi
 
-# 3. Restart.
-echo "Restarting fused-memory..."
-systemctl --user restart "$SERVICE"
+# 3. Restart. A socket that is already listening cannot rebind while the
+#    service holds the old listener, and a combined restart of socket and
+#    service is refused, so --rebind-socket stops then starts both
+#    (OPERATIONS.md §"Socket activation (MCP ports survive restarts)").
+if [[ "$rebind_socket" == 1 ]]; then
+    echo "rebind_socket: stopping fused-memory (its ExecStopPost stops fused-memory.socket), then starting both"
+    systemctl --user stop fused-memory
+    systemctl --user start fused-memory.socket fused-memory
+else
+    echo "Restarting fused-memory..."
+    systemctl --user restart "$SERVICE"
+fi
 
 # 4. Post-start /health verification (all paths).
 echo -n "Waiting for health..."
