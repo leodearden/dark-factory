@@ -752,6 +752,13 @@ PROGRESS_RESUME_CHURN_REASON = (
     'productive session without convergence)'
 )
 
+# Appended to the task-verify inherited-break L0's detail when no fix-main task
+# could be filed or adopted, so the steward's fallback reaches it at runtime.
+INHERITED_BREAK_NO_FIX_OWNER_LINE = (
+    'No fix-main task could be filed: if the failures reproduce in isolation, '
+    're-escalate so one is filed.'
+)
+
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
 # fires.  When this is the only cause hint there is no actionable signal for
@@ -12872,12 +12879,16 @@ class TaskWorkflow:
 
         Ensures the break's fix-main task (task 5471) and names it on the
         cross-task-folded L0 the task's steward reads, which asks the steward
-        to re-run the failures in isolation before deferring to that owner.
+        to re-run the failures in isolation before deferring to that owner, or,
+        with none, re-escalating so one is filed.
         """
         owner = await self._ensure_main_fix_owner(info['main_break'])
+        detail = owner.escalation_detail(info['detail'])
+        if owner.task_id is None:
+            detail = f'{detail}\n\n{INHERITED_BREAK_NO_FIX_OWNER_LINE}'
         return await self._mark_blocked(
             info['reason'],
-            detail=owner.escalation_detail(info['detail']),
+            detail=detail,
             category=info['category'],
             dedupe_fingerprint=info['fingerprint'],
             suggested_action=MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION,

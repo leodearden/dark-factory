@@ -45,7 +45,7 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import INHERITED_BREAK_NO_FIX_OWNER_LINE, TaskWorkflow, WorkflowOutcome
 
 OTHER_MAIN_SHA = 'cafef00d0987654321'
 
@@ -460,7 +460,7 @@ class TestNoOutcomeTerminatesOwnerless:
     every escalation it files names that site's next action."""
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
-    def test_every_outcome_has_an_open_fix_task_and_an_owned_escalation(
+    def test_every_outcome_has_an_open_fix_task_and_files_its_sites_next_action(
         self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = FakeTaskStore()
@@ -483,7 +483,8 @@ class TestNoOutcomeTerminatesOwnerless:
 
 class TestTaskVerifyArmGuidesTheSteward:
     """The task-verify L0 asks its steward to re-run the failures in isolation,
-    and its detail names the fix owner the steward defers to if they fail again."""
+    and its detail names the fix owner the steward defers to if they fail again,
+    or, with none, asks for a re-escalation so one is filed."""
 
     @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
     def test_the_l0_asks_for_an_isolated_rerun_and_names_the_owner(
@@ -498,16 +499,17 @@ class TestTaskVerifyArmGuidesTheSteward:
         [owner] = store.open_owners(brk.signature)
         assert f'task {owner}' in detail
         assert detail.startswith(VERIFY_ARM_CASES[case].failure_report())
+        assert INHERITED_BREAK_NO_FIX_OWNER_LINE not in detail
 
     @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
-    def test_without_a_task_store_the_l0_still_asks_for_an_isolated_rerun(
+    def test_without_a_task_store_the_l0_asks_for_an_isolated_rerun_then_a_re_escalation(
         self, tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _brk, filed = _run_site('task_verify', case, tmp_path, None, monkeypatch)
 
         [(action, detail)] = filed
         assert action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
-        assert 'Fix owner:' not in detail
+        assert detail == f'{VERIFY_ARM_CASES[case].failure_report()}\n\n{INHERITED_BREAK_NO_FIX_OWNER_LINE}'
 
 
 class TestOneTaskPerSignature:
