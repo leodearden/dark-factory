@@ -15,6 +15,8 @@ before B's verdict is spent or adopted:
   rebased commit, so B's verify is cancelled and B re-anchors on that commit
   at its own dispatch, landing with no voided verdict and no gate of its own
   (task 8525);
+* a rebased head parked with no free host waits first in line, ahead of a
+  later arrival, and takes the first host that frees (task 8525);
 * a head that lands by a plain advance supersedes nothing, so a successor on
   its merge commit is never voided, even after main moves on past it;
 * a depth-2 follower C stacked on B, with no host free when A's gate
@@ -206,6 +208,15 @@ async def _first_parent(repo: Path, commit: str) -> str:
     rc, out, err = await _run(['git', 'rev-parse', f'{commit}^1'], cwd=repo)
     assert rc == 0, err
     return out.strip()
+
+
+def _awaiting_host(lane: MergeLane) -> list[str]:
+    """The task ids waiting for a host, in the order the lane will dispatch them."""
+    return [e['task_id'] for e in lane.snapshot()['entries'] if e['state'] == 'awaiting_host']
+
+
+def _leased_task_ids(lane: MergeLane) -> list[str]:
+    return [row['task_id'] for row in lane.snapshot()['occupancy']['leases']]
 
 
 async def _stacked_base(store: _LateArrivalFakeEventStore, task_id: str) -> str:
@@ -483,3 +494,77 @@ class TestTornDownSuccessorRecordsItsCommitDead:
             assert allocator.held_local is not None
             await allocator.release(allocator.held_local)
             assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestRebasedHeadWaitsFirstForAHost:
+
+    async def test_a_rebased_head_with_no_free_host_waits_first_in_line_and_takes_the_first_free_host(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        head_gate = asyncio.Event()
+        remote_release = asyncio.Event()
+        verifier = _BaseRecordingVerifier(scripts={
+            'wh-a': VerifyScript(result=passes().result, release=head_gate),
+        })
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
+            remote = _gated_runner(remote_release, name='remote-wh')
+            allocator = _inject_two_host_allocator(
+                lane, remote, allocator_cls=_LocalSlotTakenOnceFreed,
+            )
+            assert isinstance(allocator, _LocalSlotTakenOnceFreed)
+            held_remote: HostLease | None = None
+            try:
+                req_a = await _submitted(git_ops, config, 'wh-a')
+                await queue.put(req_a)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                held_remote = allocator.acquire_remote()
+                assert held_remote is not None, 'precondition: the remote was free to hold'
+
+                await _land_foreign_commit(git_repo)
+                head_gate.set()
+                await _until(
+                    lambda: _awaiting_host(lane) == ['wh-a'] and allocator.held_local is not None,
+                    what="A's rebased head to wait for a host, with both hosts held",
+                )
+                assert verifier.verified == ['wh-a'], verifier.verified
+                assert 'wh-a' not in _leased_task_ids(lane), lane.snapshot()['occupancy']
+
+                req_x = await _submitted(git_ops, config, 'wh-x')
+                await queue.put(req_x)
+                try:
+                    await _until(
+                        lambda: 'wh-x' in _awaiting_host(lane),
+                        what='X to wait for a host', timeout=5,
+                    )
+                except AssertionError:
+                    snap = lane.snapshot()
+                    raise AssertionError(repr([(e['task_id'], e['state']) for e in snap['entries']]) + repr(snap.get('speculation')) + repr(snap.get('merger')))
+                assert _awaiting_host(lane) == ['wh-a', 'wh-x'], lane.snapshot()['entries']
+                assert verifier.verified == ['wh-a'], verifier.verified
+
+                assert allocator.held_local is not None
+                await allocator.release(allocator.held_local)
+                outcome_a = await wait_responsive(req_a.result, label='wh-a outcome')
+                outcome_x = await wait_responsive(req_x.result, label='wh-x outcome')
+            finally:
+                remote_release.set()
+                if held_remote is not None:
+                    await allocator.release(held_remote)
+
+            assert (outcome_a.status, outcome_x.status) == ('done', 'done'), (outcome_a, outcome_x)
+            assert verifier.verified == ['wh-a', 'wh-a', 'wh-x'], verifier.verified
+            a_verifies = [
+                data['merge_sha'] for kind, data in _rows(store, 'wh-a')
+                if kind is EventType.merge_verify
+            ]
+            assert a_verifies[-1] == outcome_a.merge_sha, a_verifies
+            landings = [
+                e['task_id'] for e in store.events
+                if e['type'] is EventType.merge_attempt and e['data'].get('outcome') == 'done'
+            ]
+            assert landings == ['wh-a', 'wh-x'], landings
+            remote.run_merge_verify.assert_not_awaited()
