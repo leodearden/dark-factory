@@ -24,27 +24,36 @@ from shared.quality_series.stats import RegimeEvent
 from shared.tasks_db_readonly import connect_ro
 
 from dashboard.data import quality_markers
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.quality_markers import (
     AvailabilityFlag,
+    AxisLanding,
     ConfigChange,
     ConfigChanges,
     CuratedMarkers,
+    DerivedState,
     Marker,
     MarkerInvariant,
     MarkerInvariantError,
     MarkerKind,
     MarkerSource,
+    MarkerStream,
+    PromptCoverage,
     RoutingFold,
     RoutingStep,
     RuleSpan,
     SnapshotIdentity,
     SourceType,
+    StoredMarkerState,
     availability_flags,
     derive,
     derived_markers,
     fold_routing_decisions,
     load_curated_markers,
+    marker_datum,
+    marker_stream,
     read_config_changes,
+    resolve_ordinals,
     routing_markers,
 )
 from dashboard.data.quality_series import CATALOGUE
@@ -1055,3 +1064,209 @@ class TestDerivedMarkers:
 
         assert full == _derived(store, self.SNAPSHOTS)
         assert list(incremental.markers) == full
+
+
+AXIS = (
+    AxisLanding(ordinal=11, landed_at=_t(10)),
+    AxisLanding(ordinal=12, landed_at=_t(20)),
+    AxisLanding(ordinal=13, landed_at=_t(30)),
+)
+
+
+class TestResolveOrdinals:
+    @pytest.mark.parametrize(('minutes', 'ordinal'), [(5, 11), (15, 12), (20, 12), (30, 13), (31, None)])
+    def test_a_marker_sits_at_the_first_landing_at_or_after_it(
+        self, minutes: float, ordinal: int | None,
+    ) -> None:
+        marker = _marker(at=_t(minutes))
+
+        (resolved,) = resolve_ordinals([marker], AXIS)
+
+        assert (resolved.ordinal, resolved.until_ordinal) == (ordinal, None)
+        assert marker.ordinal is None
+
+    @pytest.mark.parametrize(('start', 'end', 'ordinals'), [
+        (15, 30, (12, 13)),
+        (10, 10, (11, 11)),
+        (21, 29, (13, None)),
+        (31, 40, (None, None)),
+        (0, 5, (11, None)),
+    ])
+    def test_an_artefact_spans_the_landings_inside_its_range(
+        self, start: float, end: float, ordinals: tuple[int | None, int | None],
+    ) -> None:
+        (resolved,) = resolve_ordinals([_artefact(at=_t(start), until=_t(end))], AXIS)
+
+        assert (resolved.ordinal, resolved.until_ordinal) == ordinals
+
+    def test_no_landings_resolve_nothing(self) -> None:
+        (resolved,) = resolve_ordinals([_marker()], ())
+
+        assert resolved.ordinal is None
+
+
+NOW = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+COUNTED = PromptCoverage(digest_since=None, roles_py_landings=4, counted_since=_t(0), reason=None)
+
+
+def _deploy(minutes: float) -> Marker:
+    return Marker(marker_id=f'deploy:r{minutes}', at=_t(minutes), kind=MarkerKind.DEPLOY,
+                  scope='dark_factory', series=None, until=None, label='deploy abc',
+                  source=MarkerSource(SourceType.DEPLOY), ref='abc')
+
+
+def _state(
+    *, complete: bool = True, refreshed_at: datetime = NOW - timedelta(minutes=5),
+) -> DerivedState:
+    merger = (_Steps('merger').add('2026-10-01T00:00:00', 30, model='fable')
+              .add('2026-10-27T13:46:00', 1, layer='role_default')
+              .add('2026-10-27T20:12:00', 6, model='fable'))
+    fold = replace(_routing_fold(merger, newest_at='2026-11-01T00:00:00'), complete=complete,
+                   skipped=2)
+    return DerivedState(
+        fold=fold, markers=(_deploy(25), replace(EFFORT_MARKER, at=_t(12))), skipped=3,
+        prompt_coverage=COUNTED, refreshed_at=refreshed_at,
+    )
+
+
+def _curated_set() -> CuratedMarkers:
+    fleet = Marker(marker_id='curated:fleet', at=_t(1), kind=MarkerKind.REGIME, scope=None,
+                   series=None, until=None, label='fleet regime',
+                   source=MarkerSource(SourceType.CURATED, file='regime-markers.yaml'))
+    return CuratedMarkers(markers=(
+        fleet,
+        _artefact(marker_id='curated:ours', scope='Dark-Factory', at=_t(15), until=_t(20)),
+        replace(fleet, marker_id='curated:theirs', scope='reify'),
+    ), parse_failures=2)
+
+
+class TestMarkerStream:
+    def test_it_serves_derived_and_in_scope_curated_markers_with_ordinals(self) -> None:
+        stream = marker_stream('dark_factory', _state(), _curated_set(), AXIS)
+
+        assert [(m.marker_id, m.ordinal, m.until_ordinal) for m in stream.markers] == [
+            ('curated:fleet', 11, None),
+            ('routing:reviewer_comprehensive:42', 12, None),
+            ('curated:ours', 12, 12),
+            ('deploy:r25', 13, None),
+        ]
+        assert stream.availability == (AvailabilityFlag(
+            role='merger', from_at=_at('2026-10-27T13:46:00'), until_at=_at('2026-10-27T20:12:00'),
+            decisions=1, model='opus',
+        ),)
+        assert (stream.curated_parse_failures, stream.skipped_records) == (2, 5)
+        assert stream.prompt_coverage == COUNTED
+
+    def test_its_regime_events_are_the_boundaries_and_exclusions_only(self) -> None:
+        stream = marker_stream('dark_factory', _state(), _curated_set(), AXIS)
+
+        assert [event.event_id for event in stream.regime_events()] == [
+            'curated:fleet', 'routing:reviewer_comprehensive:42', 'curated:ours',
+        ]
+        assert [event.artefact for event in stream.regime_events()] == [False, False, True]
+
+    def test_its_wire_shape(self) -> None:
+        wire = marker_stream('dark_factory', _state(), _curated_set(), AXIS).to_wire()
+
+        assert set(wire) == {'markers', 'availability', 'prompt_coverage',
+                             'curated_parse_failures', 'skipped_records'}
+        assert wire['availability'] == [{
+            'role': 'merger', 'from_at': '2026-10-27T13:46:00+00:00',
+            'until_at': '2026-10-27T20:12:00+00:00', 'decisions': 1, 'model': 'opus',
+        }]
+        assert wire['prompt_coverage'] == {
+            'state': 'not_yet_written', 'since': None, 'roles_py_landings': 4,
+            'counted_since': _t(0).isoformat(), 'reason': None,
+        }
+        assert isinstance(wire['markers'], list) and len(wire['markers']) == 4
+
+
+class TestPromptCoverage:
+    def test_a_written_digest_serves_its_first_appearance_and_no_count(self) -> None:
+        coverage = PromptCoverage(digest_since=_t(5), roles_py_landings=None, counted_since=None,
+                                  reason=None)
+
+        assert coverage.to_wire() == {'state': 'written', 'since': _t(5).isoformat(),
+                                      'roles_py_landings': None, 'counted_since': None,
+                                      'reason': None}
+
+    def test_an_unwritten_digest_without_a_count_serves_why(self) -> None:
+        coverage = PromptCoverage(digest_since=None, roles_py_landings=None, counted_since=None,
+                                  reason='factory repo unreadable')
+
+        assert coverage.to_wire()['state'] == 'not_yet_written'
+        assert coverage.to_wire()['reason'] == 'factory repo unreadable'
+
+    @pytest.mark.parametrize(('digest_since', 'landings', 'since', 'reason'), [
+        (_t(5), 3, _t(0), None),
+        (_t(5), None, None, 'why'),
+        (None, None, None, None),
+        (None, 3, None, None),
+        (None, 3, _t(0), 'both'),
+        (None, -1, _t(0), None),
+    ])
+    def test_it_refuses_an_inconsistent_coverage(
+        self, digest_since: datetime | None, landings: int | None, since: datetime | None,
+        reason: str | None,
+    ) -> None:
+        with pytest.raises(MarkerInvariantError) as err:
+            PromptCoverage(digest_since=digest_since, roles_py_landings=landings,
+                           counted_since=since, reason=reason)
+
+        assert err.value.invariant is MarkerInvariant.PROMPT_COVERAGE
+
+
+class TestMarkerDatum:
+    def _datum(self, stored: StoredMarkerState | None):
+        datum = marker_datum('dark_factory', stored, _curated_set(), AXIS, now=NOW,
+                             freshness_bound_seconds=1200)
+        validate_datum(datum, NOW)
+        return datum
+
+    def test_nothing_derived_yet_is_unknown_naming_the_project(self) -> None:
+        datum = self._datum(None)
+
+        assert (datum.state, datum.value) == (DatumState.UNKNOWN, None)
+        assert 'dark_factory' in (datum.reason or '')
+        assert 'not been derived' in (datum.reason or '')
+
+    def test_nothing_derived_and_a_failure_is_unknown_naming_the_failure(self) -> None:
+        datum = self._datum(StoredMarkerState(derived=None, attempted_at=NOW,
+                                              failure='runs.db is absent'))
+
+        assert datum.state is DatumState.UNKNOWN
+        assert 'runs.db is absent' in (datum.reason or '')
+
+    def test_a_failed_newest_attempt_serves_the_previous_state_stale(self) -> None:
+        state = _state()
+        datum = self._datum(StoredMarkerState(derived=state, attempted_at=NOW,
+                                              failure='over its 30 s budget'))
+
+        assert datum.state is DatumState.STALE
+        assert 'over its 30 s budget' in (datum.reason or '')
+        assert datum.as_of == state.refreshed_at
+        assert isinstance(datum.value, MarkerStream)
+
+    def test_an_incomplete_fold_is_stale(self) -> None:
+        state = _state(complete=False)
+        datum = self._datum(StoredMarkerState(derived=state, attempted_at=state.refreshed_at,
+                                              failure=None))
+
+        assert datum.state is DatumState.STALE
+        assert 'incomplete' in (datum.reason or '')
+
+    def test_a_state_past_the_bound_is_stale(self) -> None:
+        state = _state(refreshed_at=NOW - timedelta(seconds=1201))
+        datum = self._datum(StoredMarkerState(derived=state, attempted_at=state.refreshed_at,
+                                              failure=None))
+
+        assert datum.state is DatumState.STALE
+        assert 'freshness bound' in (datum.reason or '')
+
+    def test_a_complete_recent_state_is_fresh(self) -> None:
+        state = _state()
+        datum = self._datum(StoredMarkerState(derived=state, attempted_at=state.refreshed_at,
+                                              failure=None))
+
+        assert (datum.state, datum.as_of, datum.reason) == (DatumState.FRESH, state.refreshed_at, None)
+        assert datum.freshness_bound_seconds == 1200
