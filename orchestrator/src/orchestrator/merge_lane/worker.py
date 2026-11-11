@@ -164,7 +164,6 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
-    entry_chain_tip,
     entry_commit,
     entry_successor_base,
     frontier_tip,
@@ -10647,7 +10646,7 @@ class SpeculativeMergeWorker:
         return tuple(items)
 
     def _newest_frozen_commit(self) -> str | None:
-        """Return the newest frozen entry's merge_commit, or None (ε=1890).
+        """Return what a successor of the newest frozen entry stacks on, or None (ε=1890).
 
         The tip has one definition, :func:`~orchestrator.merge_lane.remerge_base.frontier_tip`,
         over :func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`
@@ -10659,8 +10658,9 @@ class SpeculativeMergeWorker:
     def frozen_prefix_tip(self, main_sha: str) -> str:
         """Return the base SHA that η should stack bounce/verify onto (ε=1890).
 
-        Returns the newest frozen item's merge_commit (the tip of the frozen
-        speculative stack) when the frozen prefix is non-empty, or main_sha
+        Returns what a successor of the newest frozen item stacks on (the tip
+        of the frozen speculative stack: its chain tip when it chained, else
+        its merge commit) when the frozen prefix is non-empty, or main_sha
         when the frozen prefix is empty (tip == main when no item is verifying).
 
         Pure/synchronous (takes main_sha as a parameter to stay await-free,
@@ -15360,8 +15360,8 @@ class SpeculativeMergeWorker:
                     # _resolve_merging_requests) now read to see that (task
                     # 2435 kappa-b: self._inflight_req field deleted).
 
-                    chain_tip = await self._await_chain_decision(req) if held else None
-                    if await self._look_ahead(req, chain_tip or merge_commit):
+                    decided_base = await self._await_dispatch_decision(req) if held else None
+                    if await self._look_ahead(req, decided_base or merge_commit):
                         break  # shutdown sentinel and nothing left to speculate
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
@@ -15490,10 +15490,10 @@ class SpeculativeMergeWorker:
                 await self._verifier_queue.put(None)
 
     def _holds_lookahead(self, item: RealMergeItem) -> bool:
-        """Whether the merger waits for *item*'s chain decision before its
-        look-ahead pop (task 7720): only a speculative item can chain, only
-        while ``merge_deep.chain_cap`` (read live) is on, and only a live
-        verifier loop can decide."""
+        """Whether the merger waits for *item*'s dispatch before its look-ahead
+        pop (task 7720): only a speculative item can chain, only while
+        ``merge_deep.chain_cap`` (read live) is on, and only a live verifier
+        loop can decide."""
         verifier = self._verifier_task
         return (
             item.speculative
@@ -15502,8 +15502,9 @@ class SpeculativeMergeWorker:
             and not verifier.done()
         )
 
-    async def _await_chain_decision(self, req: MergeRequest) -> str | None:
-        """The chain tip *req*'s dispatch built, or None for no chain.
+    async def _await_dispatch_decision(self, req: MergeRequest) -> str | None:
+        """What *req*'s successors stack on, as its dispatch left it, or None
+        when no dispatch decided (see :meth:`_dispatch_deciding`).
 
         Races the verifier loop, so a verifier that dies undecided can never
         wedge the merger; ``stop()`` releases every hold.
@@ -15516,7 +15517,8 @@ class SpeculativeMergeWorker:
         """Pre-pick the request to merge after *req*, onto *base*.
 
         *base* is what *req*'s successors stack on: its chain tip when its
-        dispatch built a chain, else its own merge commit
+        dispatch built a chain, else its own merge commit, re-merged when its
+        dispatch re-merged it
         (:func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`).
         Returns True when the shutdown sentinel arrived and nothing was left
         to speculate on.
@@ -20854,10 +20856,12 @@ class SpeculativeMergeWorker:
         self._intake.request_redispatch(item, front=front)
 
     async def _dispatch_deciding(self, item: SpeculativeItem) -> InflightEntry | NoHost:
-        """:meth:`_dispatch_item`, publishing *item*'s chain decision to a merger
-        held on it (task 7720): the chain tip when the dispatch built a chain,
-        None for any other dispatch or a raise. A :class:`NoHost` return
-        decides nothing, since the item dispatches again later."""
+        """:meth:`_dispatch_item`, publishing to a merger held on *item* (task
+        7720) what *item*'s successors stack on: the dispatched entry's chain
+        tip, else its own commit, which a dispatch-time re-merge replaced
+        after the merger queued it. None on a raise, or when the entry built
+        no commit. A :class:`NoHost` return decides nothing, since the item
+        dispatches again later."""
         rid = item.request.request_id
         try:
             dispatched = await self._dispatch_item(item)
@@ -20865,7 +20869,7 @@ class SpeculativeMergeWorker:
             self._lookahead_hold.decide(rid, None)
             raise
         if not isinstance(dispatched, NoHost):
-            self._lookahead_hold.decide(rid, entry_chain_tip(dispatched))
+            self._lookahead_hold.decide(rid, entry_successor_base(dispatched))
         return dispatched
 
     async def _dispatch_item(

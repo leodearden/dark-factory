@@ -760,3 +760,48 @@ class TestCAnItemBehindTheChainStacksOnTheChainTip:
             assert len(spare.calls) == 1
             assert verifier.verified == []
             _assert_no_live_permit(run.lane)
+
+
+class TestTheMergerStacksOnWhatTheDispatchVerifies:
+    """The decision the merger waits for is what S's successors stack on, as
+    S's dispatch left it: a dispatch-time re-merge replaces S's commit."""
+
+    async def test_a_re_merged_s_is_what_the_merger_stacks_on(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """H fails while S waits for the one host; S is re-merged onto main at
+        its dispatch, and the merger's pending base is that re-merge, not S's
+        first merge on H's dead commit."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({
+            'H': _hang_then(release_h, h_entered, fails(category='test', summary='red head')),
+            'S': hangs_until(release_s, entered=s_entered),
+        })
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
+            run.put(reqs['H'])
+            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            run.put(reqs['S'])
+            await _until(
+                lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
+                label='S merged on H and waiting for the host',
+            )
+            release_h.set()
+            assert (await wait_responsive(reqs['H'].result, label='H outcome')).status == 'blocked'
+            await wait_responsive(s_entered.wait(), label="S's re-merge verifying on local")
+
+            def _pending() -> dict[str, Any]:
+                return run.lane.snapshot()['speculation']
+
+            await _until(
+                lambda: _pending()['pending_predecessor_task_id'] == 'S',
+                label='the merger waiting for a late arrival behind S',
+            )
+            pending_base = _pending()['pending_spec_base']
+            assert await _first_parent(scene, pending_base) == await _main_sha(scene)
+            release_s.set()
+            outcome = await wait_responsive(reqs['S'].result, label='S outcome')
+            assert outcome.status == 'done', outcome
+            assert await _landed_task_files(scene) == ['S']
