@@ -139,8 +139,9 @@ class UnitRestartHistory:
 
     *samples* are ``(epoch, NRestarts)`` pairs pruned to the alarm window;
     *sampling_since* is never pruned, so it shows how long sampling has run.
-    *last_escalation_epoch* caps pages to one per window, whichever kind;
-    *start_limit_paged* caps start-limit-hit pages to one per episode.
+    *last_escalation_epoch* caps page attempts to one per window, whichever
+    kind; *start_limit_paged* is set only once a start-limit-hit page has
+    landed, which caps it to one landed page per episode.
     """
 
     samples: tuple[tuple[int, int], ...] = ()
@@ -180,10 +181,12 @@ def observe_unit(
 ) -> Observation:
     """Fold one status read into *history* and decide whether *unit* pages.
 
-    A page is filed only when no page for *unit* landed within *window_secs*;
-    otherwise the alarm comes back as *held*. A filed page stamps
-    last_escalation_epoch on attempt, and a start-limit-hit page also marks
-    its episode paged until a different known Result clears it.
+    A page is filed only when no page for *unit* was attempted within
+    *window_secs*; otherwise the alarm comes back as *held*. The page epoch
+    is stamped on attempt, so any page, landed or not, is capped to one
+    attempt per window. The episode flag is not observe_unit's to set:
+    mark_page_landed sets it after a successful submit, and a different
+    known Result clears it here.
     """
     history = _record_sample(history, status, now=now, window_secs=window_secs)
     candidate = _alarm_candidate(
@@ -196,13 +199,15 @@ def observe_unit(
     last = history.last_escalation_epoch
     if last is not None and now - last < window_secs:
         return Observation(history, alarm=None, held=candidate)
-    filed = dataclasses.replace(
-        history,
-        last_escalation_epoch=int(now),
-        start_limit_paged=history.start_limit_paged
-        or candidate.kind is AlarmKind.START_LIMIT_HIT,
-    )
-    return Observation(filed, alarm=candidate, held=None)
+    attempted = dataclasses.replace(history, last_escalation_epoch=int(now))
+    return Observation(attempted, alarm=candidate, held=None)
+
+
+def mark_page_landed(history: UnitRestartHistory, alarm: CrashLoopAlarm) -> UnitRestartHistory:
+    """A landed start-limit-hit page closes its episode; a failed one leaves it open, so it retries at window cadence."""
+    if alarm.kind is AlarmKind.START_LIMIT_HIT:
+        return dataclasses.replace(history, start_limit_paged=True)
+    return history
 
 
 def _record_sample(
@@ -345,7 +350,8 @@ def file_crash_loop_escalation(alarm: CrashLoopAlarm, *, repo_dir: str, log: Log
 
     Never raises: a missing uv, a timeout or a non-zero exit is logged and
     reported as False. Deduplication is the caller's: observe_unit stamps the
-    page epoch on attempt, so a broken submit retries at window cadence.
+    page epoch on attempt and mark_page_landed sets the episode flag only on a
+    True return, so a broken submit of either kind retries at window cadence.
     """
     argv = crash_loop_submit_argv(
         alarm,
@@ -413,8 +419,7 @@ def crash_loop_pass(
                     alarm_count=alarm_count,
                     window_secs=window_secs,
                 )
-                _act_on(obs, now=now, repo_dir=repo_dir, log=log)
-                histories[unit] = obs.history
+                histories[unit] = _act_on(obs, now=now, repo_dir=repo_dir, log=log)
             except Exception as exc:
                 log(f"crash-loop detector error for {unit}: {exc!r}")
         save_restart_histories(path, histories, log)
@@ -423,12 +428,17 @@ def crash_loop_pass(
     return statuses
 
 
-def _act_on(obs: Observation, *, now: float, repo_dir: str, log: LogSink) -> None:
+def _act_on(
+    obs: Observation, *, now: float, repo_dir: str, log: LogSink
+) -> UnitRestartHistory:
+    """File or log *obs*'s page and return the history to persist."""
     if obs.alarm is not None:
-        file_crash_loop_escalation(obs.alarm, repo_dir=repo_dir, log=log)
-    elif obs.held is not None:
+        filed = file_crash_loop_escalation(obs.alarm, repo_dir=repo_dir, log=log)
+        return mark_page_landed(obs.history, obs.alarm) if filed else obs.history
+    if obs.held is not None:
         age = now - (obs.history.last_escalation_epoch or now)
         log(
-            f"crash loop on {obs.held.unit} ({obs.held.kind}): a page was filed "
-            f"{age:.0f}s ago, inside the {obs.held.window_secs}s window; not re-filing"
+            f"crash loop on {obs.held.unit} ({obs.held.kind}): the last page attempt "
+            f"was {age:.0f}s ago, inside the {obs.held.window_secs}s window; not re-filing"
         )
+    return obs.history
