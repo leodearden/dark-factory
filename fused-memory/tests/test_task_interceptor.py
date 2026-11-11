@@ -14435,6 +14435,48 @@ async def test_dispatch_route_deterministic_overrides_incoming_metadata_variants
 
 
 @pytest.mark.asyncio
+async def test_dispatch_route_deterministic_discards_unreadable_metadata_naming_its_site(
+    interceptor, taskmaster, caplog,
+):
+    """Unreadable curator metadata becomes the bare pure gate, discarded loudly under its site."""
+    from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
+
+    with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
+        await interceptor._dispatch_ticket_decision(
+            ticket_id='t1',
+            project_root='/project',
+            project_id=resolve_project_id('/project'),
+            candidate=None,
+            decision=CuratorDecision(
+                action='route_deterministic',
+                justification='operational-ask-registry: x: y',
+            ),
+            kwargs={'title': 'Run prune_recon_cycle_summaries --apply'},
+            metadata='{not json',
+            curator=None,
+        )
+
+    taskmaster.add_task.assert_awaited_once()
+    _, call_kwargs = taskmaster.add_task.call_args
+    assert json.loads(call_kwargs['metadata']) == pure_gate_stamped(
+        {}, PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
+    )
+    messages = [
+        r.getMessage() for r in caplog.records
+        if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
+    ]
+    site_lines = [
+        m for m in messages if m.startswith('deterministic-pure-gate: non-dict metadata discarded')
+    ]
+    census = [
+        m for m in messages
+        if m.startswith('task_metadata.schema_warning source=deterministic-pure-gate ')
+    ]
+    assert len(site_lines) == 1, f'expected one site-named discard WARNING; got {messages!r}'
+    assert len(census) == 1, f'expected one census line naming the site; got {messages!r}'
+
+
+@pytest.mark.asyncio
 async def test_dispatch_create_decision_unaffected_by_pure_gate_stamping(
     interceptor, taskmaster,
 ):
