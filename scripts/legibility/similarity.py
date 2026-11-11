@@ -25,6 +25,7 @@ if __name__ == "__main__":
 from legibility import (
     census_findings,
     codebook,
+    codebook_lifecycle,
     config,
     embeddings,
     entry_join,
@@ -368,14 +369,11 @@ def _candidate(cb: Mapping[str, Any], candidate_id: str) -> dict:
 def _rejected_with(cb: dict, member_id: str, representative: Mapping[str, Any]) -> dict:
     result = copy.deepcopy(cb)
     member = _candidate(result, member_id)
-    if member.get("disposition") != "pending":
-        raise ValueError(
-            f"similarity adjudication: member {member_id!r} is {member.get('disposition')!r}, not pending",
-        )
+    codebook_lifecycle.transit(member, codebook_lifecycle.Transition.REJECT)
     identity = census_findings.FindingIdentity.from_record(representative)
     if identity is not None:
         member.update(census_findings.stamped(member, identity))
-    member.update(disposition="rejected", adjudicated_with=representative["id"])
+    member["adjudicated_with"] = representative["id"]
     codebook.assert_no_deletion(cb, result)
     return result
 
