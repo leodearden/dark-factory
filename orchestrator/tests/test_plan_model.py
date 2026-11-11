@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
+from shared.plan_deviation import DeviationRecord
 
 from orchestrator.artifacts import (
     PLAN_BASE_COMMIT_KEY,
+    PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     Plan,
     PlanConfirmation,
     PlanLifecycle,
+    PlanMutexNotHeld,
     PlanNotConfirmed,
     PlanState,
+    TaskArtifacts,
     plan_base_commit,
     plan_task_text_fp,
 )
@@ -484,3 +489,127 @@ def test_every_value_method_leaves_its_receiver_unchanged(method: Any):
     method(plan)
     assert plan.to_json() == LIVE_SHAPED_PLAN
     assert list(plan.to_json()) == list(LIVE_SHAPED_PLAN)
+
+
+@pytest.fixture
+def artifacts(tmp_path: Path) -> TaskArtifacts:
+    worktree = tmp_path / 'worktree'
+    worktree.mkdir()
+    task_artifacts = TaskArtifacts(worktree)
+    task_artifacts.init('task-1', 'Test Task', 'A test task description')
+    return task_artifacts
+
+
+def _plan_path(artifacts: TaskArtifacts) -> Path:
+    return artifacts.artifact_path('plan.json')
+
+
+def _on_disk(artifacts: TaskArtifacts) -> dict[str, Any]:
+    return json.loads(_plan_path(artifacts).read_text())
+
+
+def _listing(artifacts: TaskArtifacts) -> list[str]:
+    return sorted(path.name for path in _plan_path(artifacts).parent.iterdir())
+
+
+MALFORMED_SHAPED_PLAN: dict[str, Any] = {
+    'task_id': 'task-1',
+    'title': 'Test Task',
+    'tdd_steps': ['write the test', 'make it pass'],
+}
+
+
+class TestReadAndPeek:
+    def test_no_plan_file_reads_as_none(self, artifacts: TaskArtifacts):
+        assert artifacts.read_plan_model() is None
+        assert artifacts.peek_plan_model() is None
+
+    def test_an_empty_document_reads_as_a_shell(self, artifacts: TaskArtifacts):
+        _plan_path(artifacts).write_text('{}')
+        for plan in (artifacts.read_plan_model(), artifacts.peek_plan_model()):
+            assert plan is not None
+            assert plan.state is PlanState.SHELL
+
+    def test_read_repairs_a_malformed_shape_once_and_returns_what_it_wrote(self, artifacts: TaskArtifacts):
+        _plan_path(artifacts).write_text(json.dumps(MALFORMED_SHAPED_PLAN))
+        raw_bytes = _plan_path(artifacts).read_bytes()
+        os.utime(_plan_path(artifacts), ns=(0, 0))
+        plan = artifacts.read_plan_model()
+        assert plan is not None
+        assert plan.state is PlanState.PARTIAL
+        assert [step['description'] for step in plan.steps] == MALFORMED_SHAPED_PLAN['tdd_steps']
+        assert _plan_path(artifacts).read_bytes() != raw_bytes
+        assert _plan_path(artifacts).stat().st_mtime_ns != 0
+        assert _on_disk(artifacts)['_schema_version'] == PLAN_SCHEMA_VERSION
+        assert plan.to_json() == _on_disk(artifacts)
+        assert Plan.from_json(_on_disk(artifacts)) == plan
+
+        repaired_bytes = _plan_path(artifacts).read_bytes()
+        os.utime(_plan_path(artifacts), ns=(0, 0))
+        assert artifacts.read_plan_model() == plan
+        assert _plan_path(artifacts).read_bytes() == repaired_bytes
+        assert _plan_path(artifacts).stat().st_mtime_ns == 0
+
+    def test_peek_normalizes_the_same_shape_without_writing(self, artifacts: TaskArtifacts):
+        _plan_path(artifacts).write_text(json.dumps({**MALFORMED_SHAPED_PLAN, '_schema_version': PLAN_SCHEMA_VERSION}))
+        raw_bytes = _plan_path(artifacts).read_bytes()
+        listing = _listing(artifacts)
+        peeked = artifacts.peek_plan_model()
+        assert _plan_path(artifacts).read_bytes() == raw_bytes
+        assert _listing(artifacts) == listing
+        assert peeked is not None
+        assert peeked.state is PlanState.PARTIAL
+        assert peeked == artifacts.read_plan_model()
+
+
+class TestWritePlanModel:
+    def test_the_write_stamps_the_schema_version(self, artifacts: TaskArtifacts):
+        plan = Plan.from_json(VALID_PLAN_WITH_STEPS)
+        artifacts.write_plan_model(plan)
+        expected = {**plan.to_json(), '_schema_version': PLAN_SCHEMA_VERSION}
+        assert list(_on_disk(artifacts).items()) == list(expected.items())
+
+    def test_a_claimed_mutex_that_is_not_held_writes_nothing(self, artifacts: TaskArtifacts):
+        artifacts.write_plan_model(Plan.from_json(VALID_PLAN_WITH_STEPS))
+        before = _plan_path(artifacts).read_bytes()
+        with pytest.raises(PlanMutexNotHeld):
+            artifacts.write_plan_model(Plan.from_json(LIVE_SHAPED_PLAN), mutex_held=True)
+        assert _plan_path(artifacts).read_bytes() == before
+
+    @pytest.mark.parametrize('document', ROUND_TRIP_INPUTS)
+    def test_the_dict_adapter_writes_the_same_bytes(self, artifacts: TaskArtifacts, document: dict[str, Any]):
+        artifacts.write_plan(copy.deepcopy(document))
+        through_adapter = _plan_path(artifacts).read_bytes()
+        artifacts.write_plan_model(Plan.from_json(document))
+        assert _plan_path(artifacts).read_bytes() == through_adapter
+
+    def test_the_dict_adapter_still_stamps_the_caller_s_dict(self, artifacts: TaskArtifacts):
+        document = copy.deepcopy(VALID_PLAN_WITH_STEPS)
+        artifacts.write_plan(document)
+        assert document['_schema_version'] == PLAN_SCHEMA_VERSION
+
+
+_STEP_PROGRESS_WRITERS = [
+    pytest.param(lambda a: a.update_step_status('step-2', 'done', 'd' * 40), id='update_step_status'),
+    pytest.param(lambda a: a.mark_step_committed('step-2', 'd' * 40), id='mark_step_committed'),
+    pytest.param(
+        lambda a: a.append_step_deviation('step-1', DeviationRecord(
+            kind='other', observed='o', expected='e', action_taken='a', prose_only=False, note='',
+            recorded_at=_LATER, recorded_by=None,
+        )),
+        id='append_step_deviation',
+    ),
+]
+
+
+@pytest.mark.parametrize('write', _STEP_PROGRESS_WRITERS)
+def test_step_progress_keeps_a_stamped_plan_stamped(artifacts: TaskArtifacts, write: Any):
+    artifacts.write_plan(copy.deepcopy(LIVE_SHAPED_PLAN))
+    before = artifacts.read_plan_model()
+    assert before is not None
+    write(artifacts)
+    after = artifacts.read_plan_model()
+    assert after is not None
+    assert after.state is PlanState.STAMPED
+    assert after.lifecycle == before.lifecycle
+    assert after.steps != before.steps
