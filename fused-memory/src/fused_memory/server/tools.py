@@ -9380,6 +9380,12 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
+        ``metadata.execution_class`` 'operational' or 'decision' converts the
+        submission into a deterministic pure gate that escalates to a HUMAN at
+        dispatch; the response then carries ``routing_notice`` and the task
+        carries ``metadata.pure_gate_from``. A docs, comment or rename edit is
+        agent work: ``task_kind='normal'`` + ``metadata.complexity='simple'``.
+
         Any string argument carrying a raw MCP envelope fragment — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
