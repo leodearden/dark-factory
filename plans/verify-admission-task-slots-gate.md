@@ -234,6 +234,28 @@ roughly the 3 h after 10:33Z.
 Re-raise to 3 under the same rule (2 h mean task wait >= 5 min and idle
 >= 0.5 threads), no earlier than 2 h after this step.
 
+### 2026-11-11 — 2 -> 3 (progressive-slot rule, re-raise)
+
+Re-raised at 2026-11-11 23:27Z, 10 h after the step-down. Two earlier ticks
+met the rule's numbers on a single burst that then cleared (16:11-16:34Z, and
+21:51-22:06Z). The operator held each for one tick and required legs admitted
+after the burst to queue too. That condition was met at 23:26Z:
+
+| Measure | Value | Rule |
+|---|---|---|
+| task-leg admission wait, 2 h mean | 8.6 min (n 12) | >= 5 |
+| task legs admitted after the 21:51 burst | waited 0.3 / 7.7 / 9.9 min | still queueing |
+| mean idle threads, last 30 min | 6.4 of 32 | >= 0.5 |
+| oldest background waiter (23:19Z heartbeat) | 28.5 min | — |
+| local merge-verify median at 2 slots | 33.4 min (n 3) | baseline stays 34.3 |
+| MemAvailable | 73 GB | — |
+| oom_kill | 0 | — |
+
+Same step-down triggers as the 2026-11-10 entry (local merge-verify median
+over 41 min on two consecutive runs of different tasks, or over 46 min;
+landings below baseline over 4 ticks; any oom_kill; MemAvailable under
+16 GB; a paused project resuming).
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise
