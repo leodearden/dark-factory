@@ -37,7 +37,7 @@ from _merge_lane_fakes import (
     raises,
     running_lane,
 )
-from _orch_helpers import wait_responsive
+from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 from test_merge_lane_coalesce_admission import _TrainHooks
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -556,9 +556,9 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             scene, verifier=verifier, remotes=remotes, speculation_depth=3,
         ) as run:
             run.put(reqs['H'])
-            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            await wait_responsive(head_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on head-host')
             run.put(reqs['S'], reqs['S1'], reqs['S2'])
-            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            await wait_responsive(s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's tip verify under way")
             rows = [(r['owner_task_id'], r['link_task_ids']) for r in _reservations(run.lane)]
             assert rows == [('S', ['S1', 'S2'])]
             assert run.lane.unfrozen_suffix() == (reqs['S1'].request_id, reqs['S2'].request_id)
@@ -593,10 +593,10 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             scene, verifier=verifier, remotes=remotes, speculation_depth=3,
         ) as run:
             run.put(reqs['H'])
-            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            await wait_responsive(head_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on head-host')
             run.put(reqs['S'], reqs['S1'], reqs['S2'])
-            await wait_responsive(s_entered.wait(), label="S's verify under way on s-host")
-            await wait_responsive(verifier.await_entry(1), label='S1 verified on local')
+            await wait_responsive(s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's verify under way on s-host")
+            await wait_responsive(verifier.await_entry(1), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='S1 verified on local')
             assert verifier.verified == ['S1']
             assert not release_s.is_set()
             assert _reservations(run.lane) == []
@@ -623,7 +623,7 @@ class TestDTheLookAheadWaitsForTheChainDecision:
         verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
         async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
             run.put(reqs['H'])
-            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            await wait_responsive(h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on local')
             run.put(reqs['S'], reqs['S1'])
             await _until(
                 lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
@@ -664,12 +664,12 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             scene, verifier=FakeVerifier(), remotes=remotes, speculation_depth=2,
         ) as run:
             run.put(reqs['H'])
-            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            await wait_responsive(head_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on head-host')
             run.put(reqs['S'])
-            await wait_responsive(s_entered.wait(), label="S's verify under way on s-host")
+            await wait_responsive(s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's verify under way on s-host")
             assert _reservations(run.lane) == []
             run.put(reqs['L'])
-            await wait_responsive(l_entered.wait(), label="L's verify under way on l-host")
+            await wait_responsive(l_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="L's verify under way on l-host")
             assert await _first_parent(scene, l_host.calls[0]) == s_host.calls[0]
 
             release_head.set()
@@ -694,7 +694,7 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             scene, verifier=verifier, remotes=[], speculation_depth=2, stop_timeout=15.0,
         ) as run:
             run.put(reqs['H'])
-            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            await wait_responsive(h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on local')
             run.put(reqs['S'], reqs['S1'])
             await _until(
                 lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
@@ -734,15 +734,15 @@ class TestCAnItemBehindTheChainStacksOnTheChainTip:
             scene, verifier=verifier, remotes=remotes, speculation_depth=3,
         ) as run:
             run.put(reqs['H'])
-            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            await wait_responsive(head_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on head-host')
             run.put(reqs['S'], reqs['F1'], reqs['F2'])
-            await wait_responsive(s_entered.wait(), label="S's tip verify under way on s-host")
+            await wait_responsive(s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's tip verify under way on s-host")
             (row,) = _reservations(run.lane)
             assert (row['owner_task_id'], row['link_task_ids']) == ('S', ['F1', 'F2'])
             assert s_host.calls == [row['tip']]
 
             run.put(reqs['X'])
-            await wait_responsive(x_entered.wait(), label="X's verify under way on spare")
+            await wait_responsive(x_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="X's verify under way on spare")
             assert not release_s.is_set()
             assert await _first_parent(scene, spare.calls[0]) == row['tip']
             assert run.lane.check_frozen_prefix_invariant(await _main_sha(scene)) == []
@@ -782,7 +782,7 @@ class TestTheMergerStacksOnWhatTheDispatchVerifies:
         })
         async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
             run.put(reqs['H'])
-            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            await wait_responsive(h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on local')
             run.put(reqs['S'])
             await _until(
                 lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
@@ -790,7 +790,7 @@ class TestTheMergerStacksOnWhatTheDispatchVerifies:
             )
             release_h.set()
             assert (await wait_responsive(reqs['H'].result, label='H outcome')).status == 'blocked'
-            await wait_responsive(s_entered.wait(), label="S's re-merge verifying on local")
+            await wait_responsive(s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's re-merge verifying on local")
 
             def _pending() -> dict[str, Any]:
                 return run.lane.snapshot()['speculation']
