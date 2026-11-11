@@ -10,6 +10,7 @@ site's result, so the hop cannot pass by stubbing the scan out.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import threading
 from pathlib import Path
@@ -259,3 +260,91 @@ async def test_recon_sweep_gate_proof_is_read_off_loop(tmp_path: Path):
     refiled = probe.get_by_task(tid, status='pending')
     assert [(e.category, e.level) for e in refiled] == [('milestone_gate', 2)]
     _assert_own_role_archive_scan_ran_off_loop(probe)
+
+
+_GUARDED_MODULES = tuple(
+    Path(__file__).resolve().parents[1] / 'src' / 'orchestrator' / name
+    for name in ('workflow.py', 'deterministic_runner.py', 'harness.py')
+)
+
+
+class _InlineScan(NamedTuple):
+    function: str
+    lineno: int
+
+
+def _status_argument(call: ast.Call) -> ast.expr | None:
+    for keyword in call.keywords:
+        if keyword.arg == 'status':
+            return keyword.value
+    return call.args[1] if len(call.args) >= 2 else None
+
+
+def _is_pending_literal(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value == 'pending'
+
+
+def _get_by_task_census(source: str) -> tuple[int, list[_InlineScan]]:
+    """Count ``get_by_task`` references and list archive-inclusive calls inlined in a coroutine.
+
+    A call is inlined in a coroutine when its NEAREST enclosing def is async.
+    ``asyncio.to_thread(q.get_by_task, ...)`` passes the bound method rather
+    than calling it, so it counts as a reference and is never flagged.
+    """
+    references = 0
+    inline: list[_InlineScan] = []
+
+    def visit(node: ast.AST, enclosing: ast.FunctionDef | ast.AsyncFunctionDef | None) -> None:
+        nonlocal references
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Attribute) and child.attr == 'get_by_task':
+                references += 1
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == 'get_by_task'
+                and isinstance(enclosing, ast.AsyncFunctionDef)
+                and not _is_pending_literal(_status_argument(child))
+            ):
+                inline.append(_InlineScan(enclosing.name, child.lineno))
+            is_def = isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+            visit(child, child if is_def else enclosing)
+
+    visit(ast.parse(source), None)
+    return references, inline
+
+
+@pytest.mark.parametrize(('source', 'flagged'), [
+    ('async def f(q):\n    q.get_by_task(t)\n', [_InlineScan('f', 2)]),
+    ('async def f(q):\n    q.get_by_task(t, status="resolved")\n', [_InlineScan('f', 2)]),
+    ('async def f(q, s):\n    q.get_by_task(t, s)\n', [_InlineScan('f', 2)]),
+    ('async def f(q):\n    q.get_by_task(t, status="pending")\n', []),
+    ('async def f(q):\n    q.get_by_task(t, "pending", level=0)\n', []),
+    ('async def f(q):\n    await asyncio.to_thread(q.get_by_task, t)\n', []),
+    ('def f(q):\n    q.get_by_task(t)\n', []),
+    ('async def f(q):\n    def g():\n        q.get_by_task(t)\n', []),
+])
+def test_inline_scan_detector_flags_only_archive_inclusive_coroutine_calls(source, flagged):
+    _, inline = _get_by_task_census(source)
+
+    assert inline == flagged
+
+
+def test_no_archive_inclusive_get_by_task_runs_inline_in_a_coroutine():
+    """No archive-inclusive ``get_by_task`` call sits lexically inside an ``async def``.
+
+    Blind spot: a SYNC helper called from a coroutine is invisible here, which
+    is why ``_collect_granted_files`` and ``_escalate_suggestions`` are async.
+    """
+    offenders: list[str] = []
+    for path in _GUARDED_MODULES:
+        references, inline = _get_by_task_census(path.read_text())
+        assert references, f'{path.name}: no get_by_task reference found; the census is vacuous'
+        offenders += [
+            f'{path.name}:{scan.lineno} in {scan.function}()' for scan in inline
+        ]
+
+    assert not offenders, (
+        'archive-inclusive get_by_task called inline in a coroutine; wrap it in '
+        f'await asyncio.to_thread(queue.get_by_task, ...): {offenders}'
+    )
