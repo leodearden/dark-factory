@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
@@ -876,3 +877,182 @@ def _shown(field: RouteField, value: object) -> str:
     if isinstance(value, float):
         return f'{value:g}'
     return str(value)
+
+
+REVIEWER_BRIEFING_PATH = 'review.reviewer_briefing'
+"""The one config change routing_decision cannot see, so it is marked from the reload itself."""
+
+
+def reviewer_policy_markers(project_id: str, changes: Iterable[ConfigChange]) -> list[Marker]:
+    """An applied reviewer-briefing change, at its reload; restart-required ones never ran yet."""
+    return [
+        Marker(
+            marker_id=f'config_reload:{change.event_id}:{change.path}', at=change.at,
+            kind=MarkerKind.REVIEWER_POLICY, scope=project_id, series=None, until=None,
+            label=f'reviewer briefing {change.old} -> {change.new}',
+            source=MarkerSource(SourceType.CONFIG_RELOAD, path=change.path),
+            ref=str(change.event_id),
+        )
+        for change in changes
+        if change.applied and change.path == REVIEWER_BRIEFING_PATH
+    ]
+
+
+RULE_QUIET_DAYS = 7
+"""A policy rule that has not matched for this long, at the fold's newest decision, is retired."""
+
+
+def rule_markers(fold: RoutingFold) -> list[Marker]:
+    """Each policy rule's first match, and its last once it has been quiet for RULE_QUIET_DAYS."""
+    markers: list[Marker] = []
+    for span in fold.rules:
+        markers.append(_rule_marker(fold.project_id, span, 'first', span.first_at,
+                                    ref=str(span.first_event_id)))
+        quiet = fold.newest_at is not None and (
+            fold.newest_at - span.last_at >= timedelta(days=RULE_QUIET_DAYS)
+        )
+        if quiet:
+            markers.append(_rule_marker(fold.project_id, span, 'last', span.last_at, ref=None))
+    return markers
+
+
+def _rule_marker(
+    project_id: str, span: RuleSpan, end: str, at: datetime, *, ref: str | None,
+) -> Marker:
+    return Marker(
+        marker_id=f'policy_rule:{span.rule_id}:{end}', at=at, kind=MarkerKind.ROUTING_RULE,
+        scope=project_id, series=None, until=None,
+        label=f'routing rule {span.rule_id}: {end} match',
+        source=MarkerSource(SourceType.POLICY_RULE, rule=span.rule_id), ref=ref,
+    )
+
+
+class SourceMarkers(NamedTuple):
+    markers: list[Marker]
+    skipped: int
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> frozenset[str]:
+    """The table's column names; empty when the table does not exist."""
+    return frozenset(row[1] for row in conn.execute(f'PRAGMA table_info({table})'))
+
+
+def _dated_rows(rows: Iterable[tuple[str, object, object]]) -> tuple[list[tuple[datetime, str, str]], int]:
+    """(at, key, value) for each row whose instant parses and whose key and value are text."""
+    dated: list[tuple[datetime, str, str]] = []
+    skipped = 0
+    for key, timestamp, value in rows:
+        try:
+            at = parse_utc(timestamp) if isinstance(timestamp, str) else None
+        except ValueError:
+            at = None
+        if at is None or not isinstance(value, str):
+            skipped += 1
+            continue
+        dated.append((at, key, value))
+    return sorted(dated), skipped
+
+
+def deploy_markers(conn: sqlite3.Connection, project_id: str) -> SourceMarkers:
+    """A marker at each run whose code_sha differs from the previous run's; the first is the baseline."""
+    if not {'run_id', 'started_at', 'code_sha'} <= _columns(conn, 'runs'):
+        return SourceMarkers([], 0)
+    runs, skipped = _dated_rows(conn.execute(
+        'SELECT run_id, started_at, code_sha FROM runs WHERE code_sha IS NOT NULL'))
+    markers = [
+        Marker(
+            marker_id=f'deploy:{run_id}', at=at, kind=MarkerKind.DEPLOY, scope=project_id,
+            series=None, until=None, label=f'deploy {sha[:12]}',
+            source=MarkerSource(SourceType.DEPLOY), ref=sha,
+        )
+        for (_, _, previous), (at, run_id, sha) in pairwise(runs)
+        if sha != previous
+    ]
+    return SourceMarkers(markers, skipped)
+
+
+def model_version_markers(conn: sqlite3.Connection, project_id: str) -> SourceMarkers:
+    """Per model alias, a marker at the first invocation of each model id after the alias's first."""
+    if not {'model', 'model_id', 'started_at'} <= _columns(conn, 'invocations'):
+        return SourceMarkers([], 0)
+    first_seen, skipped = _dated_rows(conn.execute(
+        'SELECT model, MIN(started_at), model_id FROM invocations '
+        'WHERE model_id IS NOT NULL GROUP BY model, model_id'))
+    by_alias: dict[str, list[tuple[datetime, str]]] = {}
+    for at, alias, model_id in first_seen:
+        by_alias.setdefault(alias, []).append((at, model_id))
+    markers = [
+        Marker(
+            marker_id=f'model_version:{alias}:{model_id}', at=at, kind=MarkerKind.MODEL,
+            scope=project_id, series=None, until=None, label=f'{alias} -> {model_id}',
+            source=MarkerSource(SourceType.MODEL_VERSION, alias=alias), ref=model_id,
+        )
+        for alias, ids in by_alias.items()
+        for at, model_id in ids[1:]
+    ]
+    return SourceMarkers(markers, skipped)
+
+
+@dataclass(frozen=True)
+class SnapshotIdentity:
+    """Which instrument produced a quality-metrics snapshot: its sha, commit time and params."""
+
+    as_of_sha: str
+    committed_at: datetime
+    params: Mapping[str, object]
+
+
+def instrument_markers(project_id: str, snapshots: Iterable[SnapshotIdentity]) -> list[Marker]:
+    """A marker at each snapshot whose params differ from the previous snapshot's, naming the keys."""
+    ordered = sorted(snapshots, key=lambda snapshot: snapshot.committed_at)
+    markers: list[Marker] = []
+    for before, after in pairwise(ordered):
+        keys = sorted(key for key in before.params.keys() | after.params.keys()
+                      if before.params.get(key) != after.params.get(key))
+        if keys:
+            markers.append(Marker(
+                marker_id=f'instrument:{after.as_of_sha}', at=after.committed_at,
+                kind=MarkerKind.INSTRUMENT, scope=project_id, series=None, until=None,
+                label=f'instrument params changed: {", ".join(keys)}',
+                source=MarkerSource(SourceType.INSTRUMENT), ref=after.as_of_sha,
+            ))
+    return markers
+
+
+class DerivedMarkers(NamedTuple):
+    markers: tuple[Marker, ...]
+    skipped: int
+
+
+def derive(
+    fold: RoutingFold, conn: sqlite3.Connection, snapshots: Iterable[SnapshotIdentity],
+) -> DerivedMarkers:
+    """Every derived marker of *fold*'s project, re-read from the small sources; sorted by (at, id).
+
+    ``skipped`` counts unreadable config_reload, runs and invocations records; the fold counts
+    its own.
+    """
+    project_id = fold.project_id
+    changes = read_config_changes(conn)
+    deploys = deploy_markers(conn, project_id)
+    models = model_version_markers(conn, project_id)
+    markers = [
+        *routing_markers(fold, changes.changes),
+        *reviewer_policy_markers(project_id, changes.changes),
+        *rule_markers(fold),
+        *deploys.markers,
+        *models.markers,
+        *instrument_markers(project_id, snapshots),
+    ]
+    return DerivedMarkers(
+        tuple(sorted(markers, key=lambda marker: (marker.at, marker.marker_id))),
+        changes.skipped + deploys.skipped + models.skipped,
+    )
+
+
+def derived_markers(
+    runs_db: sqlite3.Connection, project_id: str, snapshots: Iterable[SnapshotIdentity],
+) -> list[Marker]:
+    """The full derivation from nothing: one complete fold of *runs_db*, then :func:`derive`."""
+    fold = fold_routing_decisions(runs_db, RoutingFold.empty(project_id), batch=None)
+    return list(derive(fold, runs_db, snapshots).markers)
