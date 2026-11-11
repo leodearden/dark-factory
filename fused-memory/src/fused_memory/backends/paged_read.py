@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # plans/falkordb-resultset-cap-audit.md is the one place for the dated row
 # counts, the measured paging cost, the per-read classification of every read
-# in graphiti_client.py, the open residual, and the ticket cross-references.
-# Update it there, not here.
+# routed through this primitive, the open residual, and the ticket
+# cross-references.  Update it there, not here.
 
 RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
@@ -105,9 +105,10 @@ INCOMPLETE_STRUCTURAL_KINDS = frozenset(
 
 Both are fully determined by configuration and code: they reproduce exactly
 on retry and can never be caused by a concurrent write.  That is what makes
-them safe to RAISE on (see graphiti_client.py's shims), where the empirical
-kinds are not — a census disagreeing by a handful of rows is the expected
-signature of a live graph being written to mid-read.
+them safe to RAISE on, where the empirical kinds are not — a census
+disagreeing by a handful of rows is the expected signature of a live graph
+being written to mid-read.  The raise lives in
+``fused_memory/backends/graphiti_client.py::apply_incompleteness_policy``.
 
 Callers should branch on membership in this set rather than on a specific
 kind, so a future fifth structural path is covered by construction.
@@ -183,8 +184,8 @@ def _render_page_bounds(page_template: str, *, skip: int, limit: int) -> str:
     """Substitute the two SKIP/LIMIT placeholders, leaving every other brace alone.
 
     Deliberately NOT ``str.format``.  Cypher map patterns carry literal braces
-    — ``MATCH (n:Entity {name: $name})``, a shape several queries in graphiti_client.py
-    already use — and ``str.format`` raises ``KeyError``/``ValueError`` on
+    — ``MATCH (n:Entity {name: $name})``, a shape ordinary Cypher reads use
+    routinely — and ``str.format`` raises ``KeyError``/``ValueError`` on
     one of those BEFORE any query is issued, from a traceback that points at a
     formatting call rather than at the offending template.  Since more reads
     are meant to be routed through this primitive, that trap would be one map
