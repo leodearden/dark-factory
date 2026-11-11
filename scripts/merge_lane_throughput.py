@@ -1063,10 +1063,11 @@ def compute_speculation(
 # Mirrors `orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
 # for which the attempt/merge is still live. Copied as literal strings, NOT
 # imported: scripts/ must stay importable without the orchestrator package
-# (this module's test gate runs under `uv run --project shared`). The set is
-# documented there as a FROZEN CONTRACT that names this copy as its mirror,
-# so a change there must update this set in the same commit.
-_NON_TERMINAL_OUTCOMES = frozenset({
+# (this module's test gate runs under `uv run --project shared`). The name is
+# public because the set is a cross-layer contract:
+# `orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract`
+# loads this file by path and fails if the two sets differ.
+NON_TERMINAL_OUTCOMES = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
     'plan_files_narrowed',
 })
@@ -1123,7 +1124,7 @@ def compute_mixes(
     row with the key missing buckets under :data:`UNKNOWN`.
 
     Outcomes are additionally split terminal / non-terminal (see
-    :data:`_NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
+    :data:`NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
     attempt is still live, so folding them in with terminal outcomes makes the
     mix read as a landing tally when it is not.
 
@@ -1134,9 +1135,9 @@ def compute_mixes(
     )
     counts: dict[str, int] = outcomes['counts']
     non_terminal = {
-        k: v for k, v in counts.items() if k in _NON_TERMINAL_OUTCOMES
+        k: v for k, v in counts.items() if k in NON_TERMINAL_OUTCOMES
     }
-    terminal = {k: v for k, v in counts.items() if k not in _NON_TERMINAL_OUTCOMES}
+    terminal = {k: v for k, v in counts.items() if k not in NON_TERMINAL_OUTCOMES}
     outcomes.update({
         'non_terminal': non_terminal,
         'terminal': terminal,
