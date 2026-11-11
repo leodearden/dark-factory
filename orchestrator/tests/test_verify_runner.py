@@ -5997,6 +5997,7 @@ class TestDriftDetectorCheckEnvFaithful:
         assert result.verdict == DriftVerdict.AGREE
         assert result.is_faithful is True
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
 
     async def test_matching_probes_emit_exactly_one_parity_event(self):
         from orchestrator.event_store import EventType
@@ -6124,6 +6125,7 @@ class TestDriftDetectorCheckEnvDivergence:
         assert result.verdict == DriftVerdict.DIVERGE
         assert result.is_faithful is False
         assert result.drift_dimensions == ('extra_probes',)
+        assert result.unavailable_reason is None
 
     async def test_divergence_event_emitted_exactly_once(self):
         from orchestrator.event_store import EventType
@@ -6501,6 +6503,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         result = await detector.check_env([], local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert result.drift_dimensions == ()
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6525,6 +6528,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6544,6 +6548,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
 
     async def test_remote_without_env_probe_run_is_inconclusive(self):
         """A non-RemoteRunner stand-in: duck-typed, so VerifyRunner stays unwidened.
@@ -6566,6 +6571,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason is None
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6580,6 +6586,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=event_store, escalation_queue=queue)
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'laptop unreachable'
         event_store.emit.assert_not_called()
         assert queue.submitted == []
 
@@ -6591,6 +6598,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.unavailable_reason == 'local seam down'
 
     async def test_inconclusive_does_not_quarantine(self):
         from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
@@ -6763,6 +6771,46 @@ class TestDriftDetectorCheckEnvUnreachableRemote:
         result = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
         assert result.verdict == DriftVerdict.INCONCLUSIVE
         assert queue.submitted == []
+
+    async def test_unbindable_control_path_reason_survives_on_the_result(self):
+        """A dispatcher-side ssh fault must be told apart from a sleeping laptop.
+
+        Both exit 255 and both are INCONCLUSIVE, so the verdict alone cannot
+        say whether the probe master's ControlPath could not be bound on THIS
+        host (fixable here, and the check never runs until it is) or the remote
+        is simply asleep (the common, self-healing case).  ssh's own stderr is
+        what distinguishes them, so it has to reach the result.
+        """
+        from orchestrator.verify_runner import DriftVerdict
+        control_path_fault = (
+            _SSH_UNREACHABLE_RC,
+            '',
+            'unix_listener: cannot bind to path '
+            '/home/leo/.df-env-probe-0123abcd.XyZ: Permission denied',
+        )
+        detector, pool, event_store, queue = self._detector(
+            _make_ssh_seam(default=control_path_fault)
+        )
+        local_run = _make_probe_run(_MATCHING_PROBE_OUTPUT)
+        unbindable = await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run)
+
+        assert unbindable.verdict == DriftVerdict.INCONCLUSIVE
+        assert unbindable.is_faithful is True
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+        assert pool.is_quarantined('laptop') is False
+        assert unbindable.unavailable_reason is not None
+        assert 'unix_listener: cannot bind to path' in unbindable.unavailable_reason
+        assert 'laptop.local' in unbindable.unavailable_reason
+
+        asleep_detector, _, _, _ = self._detector(_make_ssh_seam())
+        asleep = await asleep_detector.check_env(
+            _ENV_PROBE_SPECS, local_run=_make_probe_run(_MATCHING_PROBE_OUTPUT)
+        )
+        assert asleep.verdict == DriftVerdict.INCONCLUSIVE
+        assert asleep.unavailable_reason is not None
+        assert 'No route to host' in asleep.unavailable_reason
+        assert asleep.unavailable_reason != unbindable.unavailable_reason
 
     async def test_remote_binary_absent_is_still_real_divergence(self):
         """The guard must not over-broaden to 'any non-zero rc is transport'.
