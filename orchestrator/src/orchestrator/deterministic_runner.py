@@ -408,11 +408,12 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
-def _cite_gate_escalation_id(own_records: list) -> str | None:
+def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | None:
     """Pick the escalation a `deterministic-gate` close should CITE.
 
-    Cite the GATE record — NOT merely the newest own-role one (reviewer
-    amendment, task 3341).  The standard curator remediation round-trip
+    Cite the gate record of this gate's own *gate_category*
+    (:func:`gate_escalation_category`), NOT merely the newest own-role one
+    (reviewer amendment, task 3341).  The standard curator remediation round-trip
     leaves TWO own-role records behind:
       (A) the original `milestone_gate`, resolved WITHOUT a stamp — the
           record that proves rung one, and
@@ -424,8 +425,9 @@ def _cite_gate_escalation_id(own_records: list) -> str | None:
     nothing about the gate — quietly mis-aiming the audit trail this citation
     exists to sharpen.  So filter to the gate category first and take the
     newest of those; fall back to the newest own record only when no
-    gate-category record survives (e.g. a gate filed under an older
-    category), and return ``None`` for an empty list (an empty list must
+    gate-category record survives (e.g. a human gate filed as
+    ``milestone_gate`` before ``review_due`` existed), and return ``None``
+    for an empty list (an empty list must
     never be indexed; ``_build_done_provenance``'s ``exclude_none=True`` then
     simply drops the key).
 
@@ -435,10 +437,11 @@ def _cite_gate_escalation_id(own_records: list) -> str | None:
     Neither arm can actually reach the ``None`` return: both run only after
     the zero-record strand branch has re-filed the gate and returned BLOCKED.
 
-    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record
-    and test_pure_gate_resume_cites_the_gate_record_not_the_newest.
+    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record,
+    test_pure_gate_resume_cites_the_gate_record_not_the_newest and
+    test_human_gate_cites_its_review_due_over_a_newer_milestone_gate.
     """
-    gate_records = [e for e in own_records if e.category == 'milestone_gate']
+    gate_records = [e for e in own_records if e.category == gate_category]
     citable = gate_records or own_records
     if not citable:
         return None
@@ -694,6 +697,13 @@ def _dependency_ids(task: dict) -> list[str]:
     return [str(d.get('id', d) if isinstance(d, dict) else d) for d in deps]
 
 
+def gate_escalation_category(metadata: dict) -> str:
+    """The category a pure gate files under and its done provenance cites."""
+    if isinstance(human_gate_chain(metadata), TriggerChain):
+        return REVIEW_DUE_CATEGORY
+    return MILESTONE_GATE_CATEGORY
+
+
 def build_gate_escalation_fields(
     task: dict | None,
     metadata: dict,
@@ -717,7 +727,7 @@ def build_gate_escalation_fields(
     detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-    category = MILESTONE_GATE_CATEGORY
+    category = gate_escalation_category(metadata)
     summary = task.get('title', '')
     payload: ReviewDueState | None = None
     chain = human_gate_chain(metadata)
@@ -733,7 +743,6 @@ def build_gate_escalation_fields(
             chain, human_gate, human_gate_task_id=str(task.get('id')),
             escalation_id=escalation_id, fired_at=fired_at,
         )
-        category = REVIEW_DUE_CATEGORY
         summary = due.summary
         payload = due.payload
         detail_parts.extend(due.detail_lines)
@@ -3107,7 +3116,9 @@ class DeterministicRunner:
                                 'human curator gate: per-entry content '
                                 f'adjudication confirmed at {_stamp_for_note}'
                             ),
-                            escalation_id=_cite_gate_escalation_id(own_records),
+                            escalation_id=_cite_gate_escalation_id(
+                                own_records, gate_escalation_category(metadata),
+                            ),
                         ),
                     )
                 else:
@@ -3127,7 +3138,9 @@ class DeterministicRunner:
                         done_provenance=_build_done_provenance(
                             'deterministic-gate',
                             note='pure gate resolved',
-                            escalation_id=_cite_gate_escalation_id(own_records),
+                            escalation_id=_cite_gate_escalation_id(
+                                own_records, gate_escalation_category(metadata),
+                            ),
                         ),
                     )
                 return WorkflowOutcome.DONE
