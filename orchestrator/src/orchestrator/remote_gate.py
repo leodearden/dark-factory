@@ -140,13 +140,18 @@ def wire_fingerprint(classes: typing.Iterable[type]) -> str:
 
 
 def wire_classes() -> tuple[type, ...]:
-    """The dataclasses whose shape crosses the dispatcher/remote boundary."""
-    from orchestrator.flake_ledger import FlakeSuppression
+    """The dataclasses whose shape crosses the dispatcher/remote boundary.
+
+    Every dataclass nested in a listed class's fields is listed too, pinned by
+    orchestrator/tests/test_remote_gate.py::test_every_dataclass_nested_in_a_wire_class_is_a_wire_class.
+    """
+    from orchestrator.flake_ledger import FailureEvidence, FlakeSuppression
     from orchestrator.task_verify_spec import TaskVerifySpec
     from orchestrator.verify import VerifyResult
     from orchestrator.verify_admission_record import AdmissionLeg
     from orchestrator.verify_evidence import VerifyUnit
-    from orchestrator.verify_runner import MergeVerifySpec
+    from orchestrator.verify_runner import MergeVerifySpec, UnscopedTypecheckSpec
+    from orchestrator.verify_spec_shared import VerifyCommand
 
     return (
         VerifyResult,
@@ -155,6 +160,9 @@ def wire_classes() -> tuple[type, ...]:
         AdmissionLeg,
         FlakeSuppression,
         VerifyUnit,
+        VerifyCommand,
+        UnscopedTypecheckSpec,
+        FailureEvidence,
     )
 
 
