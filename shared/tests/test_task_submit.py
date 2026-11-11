@@ -121,3 +121,7 @@ class TestIdPredicates:
     @pytest.mark.parametrize('value', [-1, '-1', 'abc', '', '   ', None, 'tkt_abc', '1.5'])
     def test_looks_like_task_id_rejects_negative_and_non_numeric(self, value):
         assert looks_like_task_id(value) is False
+
+    @pytest.mark.parametrize('value', ['²', '١٢', '４２'], ids=['superscript', 'arabic-indic', 'fullwidth'])
+    def test_looks_like_task_id_rejects_non_ascii_digits(self, value):
+        assert looks_like_task_id(value) is False

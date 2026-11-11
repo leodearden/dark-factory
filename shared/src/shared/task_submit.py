@@ -17,6 +17,10 @@ branches on a type instead of on the shape of a string:
 * :class:`SubmitFailed` — the tool reported an error, or the response could not
   be read; ``reason`` carries the server's own text when it gave one.
 
+The module also owns the predicates that tell those two id kinds apart,
+:func:`is_ticket_id` and :func:`looks_like_task_id`, so ``resolve_ticket`` can
+recognise a task id handed back where a ticket id was expected.
+
 Lives in ``shared`` because ``orchestrator/src/orchestrator/flake_ledger.py``
 depends on ``shared`` alone (see its ``FlakeLedgerTaskClient`` docstring).
 """
@@ -50,8 +54,9 @@ def is_ticket_id(value: object) -> bool:
 def looks_like_task_id(value: object) -> bool:
     """Return True when *value* parses as a non-negative integer task id.
 
-    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
-    trimmed). Rejects empty strings, negatives, and non-numeric strings.
+    Accepts ``int`` directly, plus strings of ASCII digits (with surrounding
+    whitespace trimmed). Rejects empty strings, negatives, non-numeric strings,
+    and non-ASCII digits such as ``'²'``, which ``str.isdigit`` would accept.
 
     Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
     task id that came back from ``submit_task(planning_mode=True)`` — the
@@ -65,9 +70,7 @@ def looks_like_task_id(value: object) -> bool:
         return value >= 0
     if isinstance(value, str):
         stripped = value.strip()
-        if not stripped:
-            return False
-        return stripped.isdigit()
+        return stripped.isascii() and stripped.isdigit()
     return False
 
 
