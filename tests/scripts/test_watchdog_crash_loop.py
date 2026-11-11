@@ -8,6 +8,7 @@ pure core (status, growth, observation, alarm text) needs no I/O at all.
 import dataclasses
 import importlib.util
 import pathlib
+import sys
 import types
 
 import _watchdog_crash_loop as crash_loop
@@ -67,10 +68,9 @@ def test_start_limit_hit_only_for_that_result(result: str | None, hit: bool) -> 
 
 def test_render_is_one_whitespace_free_token() -> None:
     assert _status(3).render() == "3/success"
-    assert crash_loop.UNKNOWN_RESTART_STATUS.render() == "?/?"
-    assert crash_loop.UNKNOWN_RESTART_STATUS == UnitRestartStatus(
-        n_restarts=None, result=None
-    )
+    unknown = crash_loop.UNKNOWN_RESTART_STATUS
+    assert unknown.render() == "?/?"
+    assert (unknown.n_restarts, unknown.result) == (None, None)
     for status in (_status(10, "start-limit-hit"), crash_loop.UNKNOWN_RESTART_STATUS):
         assert len(status.render().split()) == 1
 
@@ -273,16 +273,19 @@ def test_start_limit_alarm_text_says_start_limit_hit() -> None:
 
 # ---------------------------------------------------------------------------
 # Env knobs, read at import time: load a FRESH copy (the by-name import is
-# cached in sys.modules, so setenv after it would never reach it).
+# cached in sys.modules, so setenv after it would never reach it). The copy is
+# registered under its throwaway name while it executes, because dataclasses
+# resolves a class's module through sys.modules.
 # ---------------------------------------------------------------------------
 
+_FRESH_COPY_NAME = "_watchdog_crash_loop_fresh_copy"
 
-def _fresh_copy() -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "_watchdog_crash_loop_fresh_copy", CRASH_LOOP_PATH
-    )
+
+def _fresh_copy(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(_FRESH_COPY_NAME, CRASH_LOOP_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, _FRESH_COPY_NAME, module)
     spec.loader.exec_module(module)
     return module
 
@@ -298,7 +301,8 @@ def test_alarm_count_knob(
         monkeypatch.delenv("ORCH_RESTART_RATE_ALARM_COUNT", raising=False)
     else:
         monkeypatch.setenv("ORCH_RESTART_RATE_ALARM_COUNT", raw)
-    assert _fresh_copy().RESTART_RATE_ALARM_COUNT == expected
+    count = _fresh_copy(monkeypatch).RESTART_RATE_ALARM_COUNT
+    assert count == expected
 
 
 @pytest.mark.parametrize(
@@ -312,4 +316,5 @@ def test_alarm_window_knob(
         monkeypatch.delenv("ORCH_RESTART_RATE_ALARM_WINDOW_SECS", raising=False)
     else:
         monkeypatch.setenv("ORCH_RESTART_RATE_ALARM_WINDOW_SECS", raw)
-    assert _fresh_copy().RESTART_RATE_ALARM_WINDOW_SECS == expected
+    window = _fresh_copy(monkeypatch).RESTART_RATE_ALARM_WINDOW_SECS
+    assert window == expected
