@@ -1063,9 +1063,10 @@ def compute_speculation(
 # Mirrors `orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
 # for which the attempt/merge is still live. Copied as literal strings, NOT
 # imported: scripts/ must stay importable without the orchestrator package
-# (this module's test gate runs under `uv run --project shared`). The set is
-# documented there as a FROZEN CONTRACT that names this copy as its mirror,
-# so a change there must update this set in the same commit.
+# (this module's test gate runs under `uv run --project shared`). The name is
+# public because the set is a cross-layer contract:
+# `orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract`
+# loads this file by path and fails if the two sets differ.
 NON_TERMINAL_OUTCOMES = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
     'plan_files_narrowed',

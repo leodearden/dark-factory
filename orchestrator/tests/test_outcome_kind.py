@@ -6,7 +6,8 @@ These tests pin: the exact 23-member vocabulary, str-compatibility (existing
 ``==``/``in``/json comparisons must keep working unchanged), the
 ``is_terminal`` classification, byte-identical payloads through the real
 ``EventStore`` emit chokepoint, and the non-terminal set as a frozen contract
-(stated at ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``).
+(stated at ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``)
+and its scripts/ mirror.
 """
 
 from __future__ import annotations
@@ -139,15 +140,16 @@ class TestOutcomeKindPayloadIdentity:
 
 
 class TestOutcomeKindFrozenContract:
-    """Pins the non-terminal set as a frozen contract.
+    """Pins the non-terminal set as a frozen contract, and its scripts/ mirror to it.
 
     The set decides which merge_attempt outcomes mean the attempt or merge is
-    still live. ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
-    mirrors it as literal strings with no orchestrator import, so changing the
-    set REQUIRES updating that mirror in the SAME change — nothing on the
-    script's side fails automatically. This test is the drift tripwire; the
-    contract itself lives at
+    still live; the contract lives at
     ``orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES``.
+    ``test_non_terminal_set_is_frozen`` pins it against this file's literal.
+    ``scripts/merge_lane_throughput.py::NON_TERMINAL_OUTCOMES`` keeps it as
+    literal strings because scripts/ must import without orchestrator;
+    ``test_merge_lane_throughput_mirror_matches`` loads that script by path and
+    compares its copy to ``OutcomeKind.is_terminal``.
     """
 
     def test_non_terminal_set_is_frozen(self) -> None:
