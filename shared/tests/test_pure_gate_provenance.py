@@ -101,12 +101,19 @@ class TestPureGateStamped:
         declared = {'task_kind': 'deterministic', 'always_escalates': True, 'operational_mode': 'gate'}
         assert pure_gate_stamped(declared, PureGateTrigger.EXECUTION_CLASS_OPERATIONAL) == declared
 
-    def test_an_existing_stamp_is_kept(self):
-        stamped = pure_gate_stamped(
-            {'task_kind': 'normal', 'pure_gate_from': 'operational_ask_registry'},
-            PureGateTrigger.EXECUTION_CLASS_DECISION,
-        )
+    def test_an_existing_stamp_on_a_pure_gate_is_kept(self):
+        already_coerced = {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'pure_gate_from': 'operational_ask_registry',
+        }
+        stamped = pure_gate_stamped(already_coerced, PureGateTrigger.EXECUTION_CLASS_DECISION)
         assert stamped['pure_gate_from'] == 'operational_ask_registry'
+
+    def test_a_stale_stamp_on_a_rewritten_submission_names_the_new_trigger(self):
+        retyped = {'task_kind': 'normal', 'pure_gate_from': 'operational_ask_registry'}
+        stamped = pure_gate_stamped(retyped, PureGateTrigger.EXECUTION_CLASS_DECISION)
+        assert stamped['pure_gate_from'] == 'execution_class=decision'
 
     def test_input_is_not_mutated_and_a_new_dict_is_returned(self):
         original = {'keep': 1, 'before_done': {'kind': 'script', 'script': 'x.sh'}}

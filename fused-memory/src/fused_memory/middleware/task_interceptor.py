@@ -31,7 +31,7 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
-from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
+from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -212,8 +212,8 @@ _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 # The escalation-gate stamp, named once so the writers stay greppably
 # coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
 # (the declared execution_class='operational'|'decision' boundary coercion)
-# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
-# route_deterministic fallback), which between them set every key below.
+# and ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (via the
+# curator's route_deterministic fallback), which between them set every key below.
 #
 # NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
 # does NOT consult this constant — its gate predicate is deliberately
@@ -3973,36 +3973,6 @@ class TaskInterceptor:
         return meta
 
     @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any, *, trigger: PureGateTrigger) -> dict:
-        """Return a metadata dict stamped as a deterministic PURE-GATE.
-
-        Builds on ``metadata_dict.py::fresh_metadata_copy`` to normalise the incoming
-        shape (absent or unreadable → fresh dict) before writing the keys, so
-        the result is always a plain dict ready for JSON serialisation —
-        mirrors :meth:`_inject_routing_override`.
-
-        Unconditionally sets ``task_kind='deterministic'`` and
-        ``always_escalates=True``, and DELETES any ``before_done`` key so the
-        result always satisfies the pure-gate invariant enforced by
-        :func:`deterministic_task_guard.deterministic_task_error` — a
-        deterministic task with no action must always escalate, never be an
-        ill-formed no-op. This holds regardless of what task_kind/before_done
-        the recon LLM originally supplied in metadata.
-
-        Stamps ``pure_gate_from`` with ``trigger`` only when the conversion
-        rewrote the routing: metadata already in the pure-gate shape stays
-        unstamped, and an existing stamp is kept.
-        """
-        meta = fresh_metadata_copy(metadata, site='deterministic-pure-gate')
-        declared = is_pure_gate_shape(meta)
-        meta['task_kind'] = 'deterministic'
-        meta['always_escalates'] = True
-        meta.pop('before_done', None)
-        if not declared:
-            meta[PURE_GATE_FROM_KEY] = trigger.value
-        return meta
-
-    @staticmethod
     def _attach_possible_scope_mismatch(
         kwargs: dict[str, Any],
         verdict: PathGuardVerdict,
@@ -4210,7 +4180,7 @@ class TaskInterceptor:
         # tools.py). Idempotent, so for MCP-tool callers — where tools.py has
         # already coerced before delegating — re-running here is a no-op; the
         # twin's real job is the direct caller. Distinct from
-        # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
+        # _dispatch_ticket_decision's pure_gate_stamped call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
         # The routing notice is derived here so it is right whichever layer
@@ -4931,8 +4901,8 @@ class TaskInterceptor:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
-                # submission metadata — the same object stamped by
-                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # submission metadata — the same value stamped by
+                # pure_gate_stamped and serialised into tm.add_task
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
@@ -4975,8 +4945,9 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(
-                metadata, trigger=PureGateTrigger.OPERATIONAL_ASK_REGISTRY
+            metadata = pure_gate_stamped(
+                fresh_metadata_copy(metadata, site='deterministic-pure-gate'),
+                PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
             )
 
         # ── Create task ───────────────────────────────────────────────

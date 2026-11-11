@@ -1728,7 +1728,7 @@ async def test_curator_combine_fingerprint_normalization(
 
 # The escalation-gate stamp as written at the submit boundary by
 # operational_routing_guard.inject_operational_routing /
-# TaskInterceptor._inject_deterministic_pure_gate, plus two ordinary
+# shared/src/shared/pure_gate_provenance.py::pure_gate_stamped, plus two ordinary
 # submit-time keys that the 'replace' write destroyed just as thoroughly.
 _GATE_TARGET_METADATA = {
     'execution_class': 'operational',

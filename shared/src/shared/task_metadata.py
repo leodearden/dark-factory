@@ -1626,7 +1626,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # unrepairable until task 3777 lifts the presence-only write-authority
         # floor.
         'execution_class',
-        # Written by fused-memory's TaskInterceptor._inject_deterministic_pure_gate when a
+        # Written by shared/src/shared/pure_gate_provenance.py::pure_gate_stamped when a
         # conversion rewrites a submission's routing; values:
         # shared/src/shared/pure_gate_provenance.py::PureGateTrigger.
         PURE_GATE_FROM_KEY,

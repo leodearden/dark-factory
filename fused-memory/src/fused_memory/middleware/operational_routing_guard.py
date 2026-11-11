@@ -25,7 +25,7 @@ submit path (normal, planning_mode, direct interceptor).
 with no action must always escalate, never be an ill-formed no-op) — plus
 ``pure_gate_from`` naming the triggering execution_class when the
 submission was not already in that shape. The stamp itself is delegated verbatim to
-:meth:`TaskInterceptor._inject_deterministic_pure_gate` (INV-5 — the
+``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (INV-5 — the
 pure-gate stamp is reused, never re-implemented).
 
 Only exact ``operational_mode == 'llm'`` takes the llm sub-branch;
@@ -55,14 +55,6 @@ boundary (task ζ integration matrix), not β.
   branch (the reused stamp shallow-copies), and the *original* object is
   returned verbatim on the non-coercion branch (a byte-identical no-op for
   every ``code_tdd``/absent/``None``/``str`` submission).
-
-## Import-cycle note
-
-:func:`inject_operational_routing` lazily imports ``TaskInterceptor`` *inside*
-the function. ``task_interceptor.py`` imports this module at top level (for
-its direct-path twin), so a top-level import of ``TaskInterceptor`` here would
-be circular; the lazy import breaks the cycle (by call time ``task_interceptor``
-is fully loaded). Lazy imports are an established pattern in this codebase.
 """
 
 from __future__ import annotations
@@ -71,7 +63,12 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
+from shared.pure_gate_provenance import (
+    PURE_GATE_FROM_KEY,
+    PureGateTrigger,
+    is_pure_gate_shape,
+    pure_gate_stamped,
+)
 
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
@@ -120,11 +117,7 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
         # code_tdd / absent / anything not operational|decision → untouched.
         return metadata
 
-    # INV-5: reuse the pure-gate stamp verbatim (never re-implement). Lazy
-    # import breaks the task_interceptor↔guard cycle — see module docstring.
-    from fused_memory.middleware.task_interceptor import TaskInterceptor
-
-    coerced = TaskInterceptor._inject_deterministic_pure_gate(metadata, trigger=trigger)
+    coerced = pure_gate_stamped(parsed, trigger)
     if execution_class == 'operational' and parsed.get('operational_mode') == 'llm':
         # Dedicated llm-gate marker (task γ/2803 consumes it). operational_mode
         # itself is ALSO preserved by the pure-gate stamp, so γ may read either.
