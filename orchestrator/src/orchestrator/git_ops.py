@@ -67,6 +67,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
+from shared.branch_names import canonical_queued_branch_name
 from shared.git_async import run_git
 from shared.proc_group import (
     reap_process_groups,
@@ -9698,10 +9699,21 @@ class GitOps:
         so both tasks diffed against the same main share BASE coordinates that
         are directly comparable for stackability.
 
+        *ref* may be a bare task id or an already-prefixed branch name; it is
+        canonicalised through
+        ``shared/src/shared/branch_names.py::canonical_queued_branch_name`` so a
+        bare id can never be resolved by git as an abbreviated commit SHA.
+
         Returns an empty dict when the diff is empty (no changes vs main).
+
+        Raises:
+            GitQueryFailed: the diff could not be computed (for example a
+                missing ref), naming the command (and so the ref), the exit code and
+                stderr.
         """
-        _, diff, _ = await _run(
-            ['git', 'diff', f'{self.config.main_branch}...{ref}',
+        branch = canonical_queued_branch_name(ref, self.config.branch_prefix)
+        diff = await _git_query(
+            ['git', 'diff', f'{self.config.main_branch}...{branch}',
              '--unified=0', '--no-color'],
             cwd=self.project_root,
         )

@@ -35,6 +35,7 @@ from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     CommitEffectProbe,
     GitOps,
+    GitQueryFailed,
     MergeParkContentionError,
     MergeParkError,
     MergeParkLockContentionError,
@@ -9076,7 +9077,7 @@ class TestGetChangedLineRanges:
 
         captured_cmds: list[list[str]] = []
 
-        async def mock_run(cmd, cwd=None):
+        async def mock_run(cmd, cwd=None, input_text=None):
             captured_cmds.append(cmd)
             return (0, CANNED_DIFF_TWO_FILES, '')
 
@@ -9097,7 +9098,7 @@ class TestGetChangedLineRanges:
         ops = GitOps(git_config, git_repo)
         ref = 'task/456'
 
-        async def mock_run(cmd, cwd=None):
+        async def mock_run(cmd, cwd=None, input_text=None):
             return (0, CANNED_DIFF_TWO_FILES, '')
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
@@ -9109,13 +9110,60 @@ class TestGetChangedLineRanges:
     async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
         ops = GitOps(git_config, git_repo)
 
-        async def mock_run(cmd, cwd=None):
+        async def mock_run(cmd, cwd=None, input_text=None):
             return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result = await ops.get_changed_line_ranges('task/789')
 
         assert result == {}
+
+
+@pytest.mark.asyncio
+class TestGetChangedLineRangesRealGit:
+    """PRD merge-pre-verify-screen §7 S1.3 ref: real-git, not a mocked ``_run``."""
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> None:
+        subprocess.run(
+            ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+    def _commit_file_on(self, repo: Path, branch: str, name: str) -> None:
+        self._git(repo, 'checkout', '-q', '-b', branch, 'main')
+        (repo / name).write_text('changed\n')
+        self._git(repo, 'add', name)
+        self._git(repo, 'commit', '-q', '-m', f'add {name}')
+        self._git(repo, 'checkout', '-q', 'main')
+
+    async def test_bare_id_diffs_the_task_branch_not_a_same_named_ref(self, git_config, git_repo):
+        self._commit_file_on(git_repo, 'task/5563', 'task_file.txt')
+        self._commit_file_on(git_repo, '5563', 'unrelated_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('5563')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_prefixed_ref_still_works(self, git_config, git_repo):
+        self._commit_file_on(git_repo, 'task/77', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('task/77')
+
+        assert set(result) == {'task_file.txt'}
+
+    async def test_missing_ref_raises_naming_ref_rc_and_stderr(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+
+        with pytest.raises(GitQueryFailed) as excinfo:
+            await ops.get_changed_line_ranges('9999')
+
+        message = str(excinfo.value)
+        assert 'main...task/9999' in message
+        assert 'exited 128' in message
+        assert 'task/9999' in message.partition('exited 128')[2]
 
 
 # ---------------------------------------------------------------------------
