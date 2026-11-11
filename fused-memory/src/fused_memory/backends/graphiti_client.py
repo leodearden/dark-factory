@@ -2329,11 +2329,13 @@ class GraphitiBackend:
         Losslessly PRESERVED (copied by direct ``old.<prop>`` reference, which
         also preserves the vecf32 ``fact_embedding`` type): the edge ``uuid``,
         ``name``, ``fact``, ``fact_embedding``, ``valid_at``, ``invalid_at``,
-        ``expired_at``, ``created_at``, ``group_id``, and ``episodes``. The
-        UNCHANGED endpoint is pinned from the matched TOPOLOGY node (never the
-        unreliable ``old.<end>_node_uuid`` property, which ``redirect_node_edges``
-        can leave absent). ``new.reassigned_from_node_uuid`` records the prior
-        endpoint uuid for audit.
+        ``expired_at``, ``created_at``, ``group_id``, ``episodes``, and
+        ``superseded_edge_uuid`` (a merge-lineage stamp, carried unchanged and
+        never minted here). The UNCHANGED endpoint is pinned from the matched
+        TOPOLOGY node (never the unreliable ``old.<end>_node_uuid`` property,
+        which ``redirect_node_edges`` can leave absent).
+        ``new.reassigned_from_node_uuid`` records the endpoint this move left and
+        is overwritten on each move, as ``redirect_node_edges`` does.
 
         A no-op guard returns ``moved=False`` without issuing any write when
         ``new_endpoint_uuid`` already equals the endpoint being moved (making
@@ -2442,6 +2444,7 @@ class GraphitiBackend:
                     'MATCH (new_src:Entity {uuid: $new_endpoint_uuid}) '
                     'CREATE (new_src)-[new:RELATES_TO]->(target) '
                     'SET new.uuid = old.uuid, '
+                    '    new.superseded_edge_uuid = old.superseded_edge_uuid, '
                     '    new.name = old.name, '
                     '    new.fact = old.fact, '
                     '    new.fact_embedding = old.fact_embedding, '
@@ -2462,6 +2465,7 @@ class GraphitiBackend:
                     'MATCH (new_tgt:Entity {uuid: $new_endpoint_uuid}) '
                     'CREATE (source)-[new:RELATES_TO]->(new_tgt) '
                     'SET new.uuid = old.uuid, '
+                    '    new.superseded_edge_uuid = old.superseded_edge_uuid, '
                     '    new.name = old.name, '
                     '    new.fact = old.fact, '
                     '    new.fact_embedding = old.fact_embedding, '
@@ -3238,12 +3242,14 @@ class GraphitiBackend:
         ``old.<prop>`` reference, which also preserves the vecf32
         ``fact_embedding`` type): ``name``, ``fact``, ``fact_embedding``,
         ``valid_at``, ``invalid_at``, ``expired_at``, ``created_at``,
-        ``group_id`` and ``episodes`` — the same set ``reassign_edge``
-        preserves, which is this method's single-edge sibling and the reason
-        that set is stated here rather than left to be diffed. The edge
-        ``uuid`` is the ONE exception, and deliberately so: it is re-minted
-        fresh per redirect for the dup-uuid reason above, with the original
-        recorded as ``superseded_edge_uuid``.
+        ``group_id`` and ``episodes`` — a set ``reassign_edge``, this method's
+        single-edge sibling, also preserves, which is the reason that set is
+        stated here rather than left to be diffed. The edge ``uuid`` is the ONE
+        exception, and deliberately so: it is re-minted fresh per redirect for
+        the dup-uuid reason above, with the original recorded as
+        ``superseded_edge_uuid``, overwriting any stamp the edge already
+        carried. ``reassign_edge`` keeps the uuid, so it carries that stamp
+        unchanged instead.
 
         ``expired_at`` is load-bearing and its loss was silent (task 4986):
         ``expired_at`` SET with ``invalid_at`` NULL is the restore hooks'
@@ -3259,10 +3265,11 @@ class GraphitiBackend:
         ``superseded_edge_uuid``'s "which edge this replaced". It reuses
         ``reassign_edge``'s property name rather than minting a merge-specific
         one, so merge relocations are visible to the audits already written
-        against that spelling. The two operations stay distinguishable without
-        extra vocabulary: a merge relocation also mints a fresh uuid and
-        stamps ``superseded_edge_uuid``, which a uuid-preserving
-        ``reassign_edge`` never does.
+        against that spelling. A merge relocation also mints a fresh uuid and
+        stamps ``superseded_edge_uuid``; a uuid-preserving ``reassign_edge``
+        never mints a stamp, but carries an existing one. So an unstamped edge
+        was never re-minted by a merge, while a stamp names the merge that last
+        re-minted the edge's uuid, not necessarily the edge's last relocation.
 
         This trades a single bulk statement per direction for one query per
         edge (N+1 round-trips) — the deliberate cost of the ID(old) keying
