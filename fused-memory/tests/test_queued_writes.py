@@ -13,9 +13,11 @@ import json
 import pathlib
 import sys
 from datetime import UTC, datetime
+from typing import TypeVar
 
 import pytest
 from _ast_guard import parse_python_module
+
 from fused_memory.services.queued_writes import (
     NO_REFERENTS,
     DecodedReferents,
@@ -31,7 +33,6 @@ from fused_memory.services.queued_writes import (
     decode_queue_callback,
     decode_queued_write,
 )
-
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import ReferentResolution
 
@@ -120,8 +121,17 @@ ALL_VALUES = [
 ]
 
 
-def _decode(operation: str, body: dict, *, group_id: str = 'dark_factory'):
-    return decode_queued_write(operation, json.dumps(body), group_id=group_id, row_id=7)
+_Value = TypeVar(
+    '_Value', QueuedEpisodeWrite, QueuedGraphitiMemoryWrite, QueuedMem0Fact, QueuedMem0Add,
+)
+
+
+def _decode(value_type: type[_Value], body: dict, *, group_id: str = 'dark_factory') -> _Value:
+    value = decode_queued_write(
+        value_type.operation.value, json.dumps(body), group_id=group_id, row_id=7,
+    )
+    assert isinstance(value, value_type)
+    return value
 
 
 class TestVocabulary:
@@ -244,7 +254,7 @@ class TestLegacyRowsDecode:
     """Rows in the shapes producers wrote before the value types (``6551b75aba``)."""
 
     def test_add_memory_graphiti_without_project_id_derives_it_from_the_group(self):
-        value = _decode('add_memory_graphiti', {
+        value = _decode(QueuedGraphitiMemoryWrite, {
             'name': 'memory_decisions_and_rationale',
             'content': 'Task 3127 chose retries in the caller',
             'source': 'text',
@@ -264,7 +274,7 @@ class TestLegacyRowsDecode:
         assert value.memory_category == 'decisions_and_rationale'
 
     def test_a_replay_from_store_row_decodes_with_no_journal_ids(self):
-        value = _decode('add_memory_graphiti', {
+        value = _decode(QueuedGraphitiMemoryWrite, {
             'name': 'replay_observations_and_summaries',
             'content': 'replayed prose',
             'source': 'text',
@@ -282,7 +292,7 @@ class TestLegacyRowsDecode:
 
     def test_a_pre_3561_uuid_key_is_ignored_and_warned_about(self, caplog):
         with caplog.at_level('WARNING'):
-            value = _decode('add_episode', {
+            value = _decode(QueuedEpisodeWrite, {
                 'uuid': 'legacy-uuid',
                 'name': 'episode_test',
                 'content': 'test content',
@@ -298,14 +308,14 @@ class TestLegacyRowsDecode:
 
     def test_a_row_with_no_referents_key_decodes_to_no_referents(self, caplog):
         with caplog.at_level('WARNING'):
-            value = _decode('add_episode', {'content': 'c', 'group_id': 'dark_factory'})
+            value = _decode(QueuedEpisodeWrite, {'content': 'c', 'group_id': 'dark_factory'})
 
         assert value.referents == DecodedReferents((), 'none', None)
         assert value.referents == NO_REFERENTS
         assert not caplog.records
 
     def test_a_referent_blob_without_ambiguous_decodes_its_refs(self):
-        value = _decode('add_episode', {
+        value = _decode(QueuedEpisodeWrite, {
             'content': 'c',
             'group_id': 'dark_factory',
             'referents': {'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}]},
@@ -316,7 +326,7 @@ class TestLegacyRowsDecode:
         assert value.referents.ambiguous is None
 
     def test_a_mem0_fact_without_project_id_defaults_to_main(self):
-        value = _decode('mem0_classify_and_add', {
+        value = _decode(QueuedMem0Fact, {
             'fact_text': 'a fact',
             'agent_id': None,
             'session_id': None,
@@ -333,7 +343,7 @@ class TestLegacyRowsDecode:
 
     def test_an_invalid_reference_time_decodes_to_none_and_warns(self, caplog):
         with caplog.at_level('WARNING'):
-            value = _decode('add_episode', {
+            value = _decode(QueuedEpisodeWrite, {
                 'content': 'c', 'group_id': 'dark_factory', 'reference_time': 'not-a-time',
             })
 
@@ -346,20 +356,20 @@ class TestLegacyRowsDecode:
 
     def test_a_valid_reference_time_decodes_to_a_datetime(self):
         stamp = datetime(2026, 11, 1, 12, 30, tzinfo=UTC)
-        value = _decode('add_episode', {
+        value = _decode(QueuedEpisodeWrite, {
             'content': 'c', 'group_id': 'dark_factory', 'reference_time': stamp.isoformat(),
         })
         assert value.reference_time == stamp
 
     def test_unknown_extra_keys_are_ignored(self):
-        value = _decode('add_episode', {
+        value = _decode(QueuedEpisodeWrite, {
             'content': 'c', 'group_id': 'dark_factory', 'some_future_key': [1, 2],
         })
         assert value.content == 'c'
         assert 'some_future_key' not in json.loads(value.to_json())
 
     def test_a_mem0_add_row_decodes(self):
-        value = _decode('mem0_add', {
+        value = _decode(QueuedMem0Add, {
             'content': 'c', 'project_id': 'dark_factory', 'metadata': {'category': 'x'},
         }, group_id='mem0_dark_factory')
         assert isinstance(value, QueuedMem0Add)
@@ -410,7 +420,7 @@ class TestDecodeErrors:
 
     def test_a_group_mismatch_names_both_groups(self):
         with pytest.raises(QueueDecodeError) as excinfo:
-            _decode('add_episode', {'content': 'c', 'group_id': 'reify'}, group_id='dark_factory')
+            _decode(QueuedEpisodeWrite, {'content': 'c', 'group_id': 'reify'}, group_id='dark_factory')
         assert 'reify' in str(excinfo.value)
         assert 'dark_factory' in str(excinfo.value)
 
@@ -422,11 +432,11 @@ class TestDecodeErrors:
 
     def test_mem0_add_requires_project_id(self):
         with pytest.raises(QueueDecodeError):
-            _decode('mem0_add', {'content': 'c'}, group_id='mem0_main')
+            _decode(QueuedMem0Add, {'content': 'c'}, group_id='mem0_main')
 
     def test_mem0_fact_requires_fact_text(self):
         with pytest.raises(QueueDecodeError):
-            _decode('mem0_classify_and_add', {'project_id': 'main'}, group_id='mem0_main')
+            _decode(QueuedMem0Fact, {'project_id': 'main'}, group_id='mem0_main')
 
     def test_the_cause_is_chained(self):
         with pytest.raises(QueueDecodeError) as excinfo:
@@ -674,7 +684,7 @@ class TestReferentWireCodecDegradation:
 
     @pytest.mark.parametrize('blob', _UNREADABLE_BLOBS)
     def test_an_unreadable_blob_still_decodes_the_write(self, blob):
-        value = _decode('add_episode', {'content': 'c', 'referents': blob})
+        value = _decode(QueuedEpisodeWrite, {'content': 'c', 'referents': blob})
         assert value.referents == NO_REFERENTS
 
     def test_an_absent_blob_does_not_warn(self, caplog):
