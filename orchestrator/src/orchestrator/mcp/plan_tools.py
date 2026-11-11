@@ -105,7 +105,7 @@ from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator import plan_descope
-from orchestrator.artifacts import Plan, PlanConfirmation, TaskArtifacts
+from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 
 logger = logging.getLogger(__name__)
@@ -1099,6 +1099,7 @@ def _create_plan(
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
     carried: dict[str, Any] = {}
+    replaced = Plan.from_json({})
     try:
         # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
         # (task 4597).
@@ -1140,6 +1141,7 @@ def _create_plan(
         # dropped; a wholesale overwrite must not erase it.
         if isinstance(existing, dict):
             carried.update(plan_descope.descope_record_of(existing))
+            replaced = Plan.from_json(existing)
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1148,7 +1150,7 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    recreated = Plan.from_json({}).recreated(
+    recreated = replaced.recreated(
         task_id=task_id, title=title, analysis=analysis, files=files, carried=carried,
     )
     artifacts.write_plan_model(recreated, mutex_held=True)
@@ -1739,7 +1741,8 @@ def _confirm_plan(
 
     if not plan:
         return _respond({'status': 'error', 'message': 'No plan exists.'})
-    if not plan.get('steps'):
+    model = Plan.from_json(plan)
+    if model.state is PlanState.SHELL:
         return _respond(
             {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
         )
@@ -1753,14 +1756,12 @@ def _confirm_plan(
         })
 
     # What confirmation records, and what clears it: ``orchestrator/artifacts.py::Plan.confirmed``.
-    confirmed = Plan.from_json(plan).confirmed(
-        at=datetime.now(UTC).isoformat(), by=PlanConfirmation.ARCHITECT,
-    )
+    confirmed = model.confirmed(at=datetime.now(UTC).isoformat(), by=PlanConfirmation.ARCHITECT)
     artifacts.write_plan_model(confirmed, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
-        'steps': len(plan['steps']),
+        'steps': len(model.steps),
         'files': len(plan.get('files', [])),
     })
 

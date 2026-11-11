@@ -312,10 +312,25 @@ _LIFECYCLE_KEYS: Mapping[str, str] = MappingProxyType({
     'schema_version': '_schema_version',
 })
 _LIFECYCLE_DISK_KEYS = frozenset(_LIFECYCLE_KEYS.values())
-_STR_LIFECYCLE_FIELDS = tuple(name for name in _LIFECYCLE_KEYS if name not in ('confirmed_by', 'schema_version'))
-_CREATED_PLAN_KEY_ORDER = (
-    'task_id', 'title', 'analysis', 'files', 'prerequisites', 'steps', 'design_decisions', 'reuse', 'dropped_files',
-)
+_CONFIRMER_VALUES = frozenset(confirmer.value for confirmer in PlanConfirmation)
+_LIFECYCLE_REQUIREMENTS: Mapping[str, str] = MappingProxyType({
+    'confirmed_by': 'must be a PlanConfirmation or None',
+    'schema_version': 'must be an int (not a bool) or None',
+})
+_STR_LIFECYCLE_REQUIREMENT = 'must be a non-empty str or None'
+
+
+def _well_formed(name: str, value: object) -> bool:
+    """Whether *value* may be held by the set PlanLifecycle field *name*: the one definition parse and construction share."""
+    if name == 'confirmed_by':
+        return isinstance(value, PlanConfirmation)
+    if name == 'schema_version':
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, str) and bool(value)
+
+
+def _unpaired_confirmer(confirmed_by: object, confirmed_at: object) -> bool:
+    return confirmed_by is not None and confirmed_at is None
 
 
 def _malformed_lifecycle(name: str, value: object, requirement: str) -> ValueError:
@@ -337,18 +352,12 @@ class PlanLifecycle:
     schema_version: int | None = None
 
     def __post_init__(self) -> None:
-        for name in _STR_LIFECYCLE_FIELDS:
+        for name in _LIFECYCLE_KEYS:
             value = getattr(self, name)
-            if value is not None and not (isinstance(value, str) and value):
-                raise _malformed_lifecycle(name, value, 'must be a non-empty str or None')
-        if self.confirmed_by is not None:
-            if not isinstance(self.confirmed_by, PlanConfirmation):
-                raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'must be a PlanConfirmation or None')
-            if self.confirmed_at is None:
-                raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'is set without confirmed_at')
-        version = self.schema_version
-        if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
-            raise _malformed_lifecycle('schema_version', version, 'must be an int (not a bool) or None')
+            if value is not None and not _well_formed(name, value):
+                raise _malformed_lifecycle(name, value, _LIFECYCLE_REQUIREMENTS.get(name, _STR_LIFECYCLE_REQUIREMENT))
+        if _unpaired_confirmer(self.confirmed_by, self.confirmed_at):
+            raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'is set without confirmed_at')
 
     @property
     def confirmation(self) -> PlanConfirmation | None:
@@ -366,16 +375,9 @@ class PlanLifecycle:
         return tuple(sorted(key for name, key in _LIFECYCLE_KEYS.items() if getattr(self, name) is not None))
 
 
-def _parse_marker(name: str, value: object) -> object:
-    if name == 'schema_version':
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-    if not (isinstance(value, str) and value):
-        return None
-    if name == 'confirmed_by':
-        try:
-            return PlanConfirmation(value)
-        except ValueError:
-            return None
+def _decoded_marker(name: str, value: object) -> object:
+    if name == 'confirmed_by' and isinstance(value, str) and value in _CONFIRMER_VALUES:
+        return PlanConfirmation(value)
     return value
 
 
@@ -386,12 +388,12 @@ def _parse_lifecycle(data: Mapping[str, object]) -> tuple[PlanLifecycle, frozens
     for name, key in _LIFECYCLE_KEYS.items():
         if key not in data:
             continue
-        value = _parse_marker(name, data[key])
-        if value is None:
-            malformed.add(key)
-        else:
+        value = _decoded_marker(name, data[key])
+        if _well_formed(name, value):
             fields[name] = value
-    if 'confirmed_by' in fields and 'confirmed_at' not in fields:
+        else:
+            malformed.add(key)
+    if _unpaired_confirmer(fields.get('confirmed_by'), fields.get('confirmed_at')):
         del fields['confirmed_by']
         malformed.add(_LIFECYCLE_KEYS['confirmed_by'])
     return PlanLifecycle(**fields), frozenset(malformed)
@@ -407,11 +409,19 @@ def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
     return _parse_lifecycle(plan)[0].task_text_fp
 
 
-def _plain(value: Any) -> Any:
+def _frozen(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_plain(item) for item in value]
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thawed(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thawed(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thawed(item) for item in value]
     return copy.deepcopy(value)
 
 
@@ -420,11 +430,11 @@ def _is_step_list(value: object) -> bool:
 
 
 def _freeze_steps(steps: list | tuple) -> tuple[Mapping[str, Any], ...]:
-    return tuple(MappingProxyType(_plain(step)) for step in steps)
+    return tuple(_frozen(step) for step in steps)
 
 
 def _freeze_body(body: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType({key: _plain(value) for key, value in body.items()})
+    return MappingProxyType({key: _frozen(value) for key, value in body.items()})
 
 
 class PlanNotConfirmed(ValueError):
@@ -443,7 +453,11 @@ class PlanNotConfirmed(ValueError):
 
 @dataclass(frozen=True)
 class Plan:
-    """One plan.json document: the typed lifecycle, the steps, and every other key verbatim."""
+    """One plan.json document: the typed lifecycle, the steps, and every other key verbatim.
+
+    Immutable all the way down: nested mappings are read-only proxies and
+    lists are tuples. :meth:`to_json` hands back a fresh, editable document.
+    """
 
     lifecycle: PlanLifecycle
     steps: tuple[Mapping[str, Any], ...]
@@ -485,9 +499,9 @@ class Plan:
         )
 
     def to_json(self) -> dict[str, Any]:
-        fresh = {key: _plain(value) for key, value in self.body.items()}
+        fresh = {key: _thawed(value) for key, value in self.body.items()}
         if 'steps' not in fresh and (self.steps or 'steps' in self.key_order):
-            fresh['steps'] = [_plain(step) for step in self.steps]
+            fresh['steps'] = [_thawed(step) for step in self.steps]
         for name, key in _LIFECYCLE_KEYS.items():
             value = getattr(self.lifecycle, name)
             if value is not None:
@@ -499,22 +513,29 @@ class Plan:
     def recreated(
         self, *, task_id: str, title: str, analysis: str, files: list[str], carried: Mapping[str, Any],
     ) -> Plan:
-        """The fresh create_plan shell, carrying *carried* keys; the lifecycle is cleared."""
+        """The fresh create_plan shell that replaces this plan wholesale, carrying *carried* keys.
+
+        Nothing of this plan survives, its lifecycle included.
+        """
         refused = sorted((_LIFECYCLE_DISK_KEYS | {'steps'}) & set(carried))
         if refused:
             raise ValueError(f'create_plan cannot carry lifecycle keys or steps: {refused}')
-        body = {
+        return Plan.from_json({
             'task_id': task_id, 'title': title, 'analysis': analysis, 'files': files,
-            'prerequisites': [], 'design_decisions': [], 'reuse': [], 'dropped_files': [], **carried,
-        }
-        key_order = (*_CREATED_PLAN_KEY_ORDER, *carried)
-        return Plan(lifecycle=PlanLifecycle(), steps=(), body=_freeze_body(body), key_order=key_order)
+            'prerequisites': [], 'steps': [], 'design_decisions': [], 'reuse': [], 'dropped_files': [], **carried,
+        })
 
     def restructured(self, **changes: Any) -> Plan:
         """A step-set edit: *changes* applied and confirmation cleared."""
         return self._with_body(changes)._with_markers(confirmed_at=None, confirmed_by=None)
 
     def confirmed(self, *, at: str, by: PlanConfirmation) -> Plan:
+        """Confirmed at *at* by *by*, which dates the LATEST confirm, never the first.
+
+        Also sets ``revalidated_at``, the fallback after ``created_at`` that
+        ``workflow.py::TaskWorkflow._can_skip_revalidation`` ages the plan by.
+        Only :meth:`restructured` and :meth:`recreated` clear a confirmation.
+        """
         if not self.steps:
             raise self._refusal('confirm')
         return self._with_markers(confirmed_at=at, confirmed_by=by, revalidated_at=at)
@@ -969,14 +990,17 @@ class TaskArtifacts:
         lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
-    def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> None:
+    def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> Plan:
         """Write .task/plan.json, stamped with the current schema version: its only writer.
+
+        Returns the Plan as written, which is *plan* at the current schema version.
 
         A bare overwrite holds ``plan_mutex()`` for the write alone. The write
         that ends a read-modify-write passes ``mutex_held=True``, a claim that
         is VERIFIED: if the calling thread does not hold the mutex it raises
         :class:`PlanMutexNotHeld` and writes nothing.
         """
+        written = _at_current_schema(plan)
         with nullcontext() if mutex_held else self.plan_mutex():
             lock_path = self._plan_mutex_path()
             if lock_path is not None and not file_mutex.held(lock_path):
@@ -984,7 +1008,8 @@ class TaskArtifacts:
                     f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
                     'run the whole read-modify-write inside plan_mutex()'
                 )
-            self._write_json('plan.json', _at_current_schema(plan).to_json())
+            self._write_json('plan.json', written.to_json())
+        return written
 
     def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
         """The dict adapter over :meth:`write_plan_model`; also stamps the schema version on *plan* itself."""
@@ -1365,9 +1390,7 @@ class TaskArtifacts:
                         'Plan normalization applied — writing corrected plan to %s',
                         self.artifact_path('plan.json'),
                     )
-                    written = _at_current_schema(Plan.from_json(document))
-                    self.write_plan_model(written, mutex_held=True)
-                    return written
+                    return self.write_plan_model(Plan.from_json(document), mutex_held=True)
         return Plan.from_json(document) if document is not None else None
 
     def peek_plan_model(self) -> Plan | None:
@@ -1378,8 +1401,11 @@ class TaskArtifacts:
         ``orchestrator/task_runtime.py::_read_task_entry``) and must not
         rewrite it under the agent that owns it.
         """
-        document, _needs_repair = self._read_normalized_plan()
-        return Plan.from_json(document) if document is not None else None
+        document, needs_repair = self._read_normalized_plan()
+        if document is None:
+            return None
+        plan = Plan.from_json(document)
+        return _at_current_schema(plan) if needs_repair else plan
 
     def _read_normalized_plan(self) -> tuple[dict | None, bool]:
         plan_path = self.artifact_path('plan.json')
@@ -1745,8 +1771,7 @@ class TaskArtifacts:
             stamped = plan.stamped(
                 session_id=session_id, at=now, task_text_fp=task_text_fp, base_commit=base_commit,
             )
-            self.write_plan_model(stamped, mutex_held=True)
-        return stamped
+            return self.write_plan_model(stamped, mutex_held=True)
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.

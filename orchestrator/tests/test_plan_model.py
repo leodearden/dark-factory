@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
+from _plan_model_helpers import read_model
 from shared.plan_deviation import DeviationRecord
 
 from orchestrator import plan_descope
@@ -497,6 +498,19 @@ _VALUE_METHODS = [
 ]
 
 
+def test_nested_values_are_frozen_so_a_derived_plan_cannot_reach_its_receiver():
+    plan = Plan.from_json(LIVE_SHAPED_PLAN)
+    derived = plan.restructured()
+    with pytest.raises(AttributeError):
+        derived.steps[0]['deviations'].append('leak')
+    with pytest.raises(TypeError):
+        derived.steps[0]['deviations'][0]['kind'] = 'leak'
+    with pytest.raises(AttributeError):
+        derived.body['files'].append('leak')
+    assert plan.to_json() == LIVE_SHAPED_PLAN
+    assert derived.to_json()['steps'][0]['deviations'] == LIVE_SHAPED_PLAN['steps'][0]['deviations']
+
+
 @pytest.mark.parametrize('method', _VALUE_METHODS)
 def test_every_value_method_leaves_its_receiver_unchanged(method: Any):
     plan = Plan.from_json(LIVE_SHAPED_PLAN)
@@ -565,7 +579,7 @@ class TestReadAndPeek:
         assert _plan_path(artifacts).stat().st_mtime_ns == 0
 
     def test_peek_normalizes_the_same_shape_without_writing(self, artifacts: TaskArtifacts):
-        _plan_path(artifacts).write_text(json.dumps({**MALFORMED_SHAPED_PLAN, '_schema_version': PLAN_SCHEMA_VERSION}))
+        _plan_path(artifacts).write_text(json.dumps(MALFORMED_SHAPED_PLAN))
         raw_bytes = _plan_path(artifacts).read_bytes()
         listing = _listing(artifacts)
         peeked = artifacts.peek_plan_model()
@@ -582,6 +596,12 @@ class TestWritePlanModel:
         artifacts.write_plan_model(plan)
         expected = {**plan.to_json(), '_schema_version': PLAN_SCHEMA_VERSION}
         assert list(_on_disk(artifacts).items()) == list(expected.items())
+
+    def test_the_write_returns_the_plan_it_wrote(self, artifacts: TaskArtifacts):
+        written = artifacts.write_plan_model(Plan.from_json(VALID_PLAN_WITH_STEPS))
+        assert written.lifecycle.schema_version == PLAN_SCHEMA_VERSION
+        assert written.to_json() == _on_disk(artifacts)
+        assert written == read_model(artifacts)
 
     def test_a_claimed_mutex_that_is_not_held_writes_nothing(self, artifacts: TaskArtifacts):
         artifacts.write_plan_model(Plan.from_json(VALID_PLAN_WITH_STEPS))
@@ -670,17 +690,11 @@ def _stamped_lane_plan(artifacts: TaskArtifacts) -> Plan:
     return stamped
 
 
-def _model(artifacts: TaskArtifacts) -> Plan:
-    plan = artifacts.read_plan_model()
-    assert plan is not None
-    return plan
-
-
 def test_row_1_an_authored_plan_confirms_as_the_architect_with_today_s_bytes(lane: _Lane):
     _build_two_step_plan(lane.artifacts)
     assert _confirm_plan(lane.artifacts)['status'] == 'ok'
 
-    plan = _model(lane.artifacts)
+    plan = read_model(lane.artifacts)
     assert plan.state is PlanState.CONFIRMED
     assert plan.lifecycle.confirmation is PlanConfirmation.ARCHITECT
     on_disk = _on_disk(lane.artifacts)
@@ -721,7 +735,7 @@ def test_row_2_create_plan_over_a_stamped_plan_gives_a_shell_keeping_the_carried
 
     assert _create_plan(lane.artifacts, 'test-1', 'Re-plan', 'A2', ['a.py'])['status'] == 'ok'
 
-    plan = _model(lane.artifacts)
+    plan = read_model(lane.artifacts)
     assert plan.state is PlanState.SHELL
     assert plan.lifecycle.markers_present() == ('_schema_version',)
     after = lane.artifacts.read_plan()
@@ -729,12 +743,27 @@ def test_row_2_create_plan_over_a_stamped_plan_gives_a_shell_keeping_the_carried
         assert after[key] == before[key], key
 
 
+def test_confirm_refuses_a_step_list_holding_a_non_step_with_its_envelope(lane: _Lane):
+    _build_two_step_plan(lane.artifacts)
+    with lane.artifacts.plan_mutex():
+        document = lane.artifacts.read_plan()
+        document['steps'].append(None)
+        lane.artifacts.write_plan(document, mutex_held=True)
+    before = _plan_path(lane.artifacts).read_bytes()
+
+    envelope = _confirm_plan(lane.artifacts)
+
+    assert envelope['status'] == 'error'
+    assert 'no steps' in envelope['message']
+    assert _plan_path(lane.artifacts).read_bytes() == before
+
+
 def test_row_3_stamping_a_partial_plan_is_refused_and_writes_nothing(lane: _Lane):
     _build_two_step_plan(lane.artifacts)
     before = _plan_path(lane.artifacts).read_bytes()
     with pytest.raises(PlanNotConfirmed) as excinfo:
         lane.artifacts.write_plan_model(
-            _model(lane.artifacts).stamped(session_id='stamper', at=_LATER, task_text_fp=None, base_commit=None),
+            read_model(lane.artifacts).stamped(session_id='stamper', at=_LATER, task_text_fp=None, base_commit=None),
         )
     message = str(excinfo.value)
     assert 'test-1' in message
@@ -746,7 +775,7 @@ def test_row_3_stamping_a_partial_plan_is_refused_and_writes_nothing(lane: _Lane
 def test_row_3b_a_step_set_edit_on_a_stamped_plan_clears_confirmation(lane: _Lane):
     stamped = _stamped_lane_plan(lane.artifacts)
     assert _add_plan_step(lane.artifacts, 'step-3', 'impl', 'third')['status'] == 'ok'
-    plan = _model(lane.artifacts)
+    plan = read_model(lane.artifacts)
     assert plan.state is PlanState.PARTIAL
     assert plan.lifecycle.session_id == stamped.lifecycle.session_id
     assert plan.lifecycle.task_text_fp == stamped.lifecycle.task_text_fp
@@ -759,7 +788,7 @@ def test_row_3b_a_step_set_edit_on_a_stamped_plan_clears_confirmation(lane: _Lan
 def test_row_3c_a_files_only_tightening_pass_keeps_a_stamped_plan_stamped(lane: _Lane, tighten: Any):
     stamped = _stamped_lane_plan(lane.artifacts)
     assert tighten(lane.artifacts)['status'] == 'ok'
-    plan = _model(lane.artifacts)
+    plan = read_model(lane.artifacts)
     assert plan.state is PlanState.STAMPED
     assert plan.lifecycle.confirmed_at == stamped.lifecycle.confirmed_at
     assert plan.to_json()['files'] == ['a.py']

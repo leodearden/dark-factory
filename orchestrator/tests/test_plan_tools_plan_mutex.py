@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
+from _plan_model_helpers import read_model
 from _plan_mutex_race import HOLDER_MARKER_KEY, mark_holder, race_writer_against_held_mutex
 
 from orchestrator.artifacts import PlanMutexNotHeld, PlanState, TaskArtifacts
@@ -220,9 +221,7 @@ def test_a_mutator_s_lifecycle_side(lane: _Lane, case: _Case) -> None:
     envelope = case.mutate(lane.artifacts, lane.head)
 
     assert envelope.get('status') != 'error', envelope
-    plan = lane.artifacts.read_plan_model()
-    assert plan is not None
-    assert plan.state is case.after_stamped
+    assert read_model(lane.artifacts).state is case.after_stamped
 
 
 def test_mark_step_done_validates_against_the_plan_it_writes(lane: _Lane) -> None:
