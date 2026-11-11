@@ -650,17 +650,27 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # never label a session aborted (verify.py serves projects whose cap may be
 # non-zero).
 #
-# Not line-anchored: xdist prints the message bare through `report_line` and
-# again as ``=== xdist: <msg> ===`` in its terminal summary.
+# xdist prints the message bare on its own line through `report_line`, and
+# again as ``=== xdist: <msg> ===`` in its terminal summary:
+# _XDIST_BAILOUT_LINE_RE matches exactly those two whole lines, and truncation
+# evidence searches it over the last session's own stream only, because
+# assertion text, captured output and INTERNALERROR lines can quote the
+# literal (task 5891). The unanchored _XDIST_SESSION_ABORTED_RE serves only
+# _shows_xdist_worker_death, which is deliberately wider.
 #
 # Both emissions are gated on ``verbose >= 0``, so under ``-q`` (every
 # module-scoped leg in dark-factory-orchestrator.yaml) the literal is absent;
 # _crashed_session_stop_percent below is the ``-q``-robust second witness. The
 # absence of ``replacing crashed worker`` is no substitute (``-q`` suppresses it
 # too), and the crash signature alone never labels a session aborted.
-_XDIST_SESSION_ABORTED_RE = re.compile(
+_XDIST_BAILOUT_MESSAGE = (
     r"worker gw\d+ crashed and worker restarting disabled"
-    r"|maximum crashed workers reached: \d+",
+    r"|maximum crashed workers reached: \d+"
+)
+_XDIST_SESSION_ABORTED_RE = re.compile(_XDIST_BAILOUT_MESSAGE)
+_XDIST_BAILOUT_LINE_RE = re.compile(
+    rf'^(?:=+ xdist: )?(?P<message>{_XDIST_BAILOUT_MESSAGE})(?: =+)?$',
+    re.MULTILINE,
 )
 
 
@@ -767,9 +777,9 @@ def _worker_death_truncation_evidence(output: str) -> str | None:
     final_line = _final_progress_line(stream)
     if final_line is not None and int(final_line.group(1)) == 100:
         return None
-    bailout = _XDIST_SESSION_ABORTED_RE.search(output)
+    bailout = _XDIST_BAILOUT_LINE_RE.search(stream)
     if bailout is not None:
-        return bailout.group(0)
+        return bailout.group('message')
     stop_percent = _crashed_session_stop_percent(stream)
     if stop_percent is None:
         return None
