@@ -62,6 +62,7 @@ from types import ModuleType
 
 # Flat siblings in scripts/, found because a directly executed script puts its
 # own directory at sys.path[0]; never run this file via `python -m` or `-I`.
+from _watchdog_crash_loop import UNKNOWN_RESTART_STATUS, UnitRestartStatus, crash_loop_pass
 from _watchdog_dashboard_parity import print_unit_parity, unit_parity_pass
 from _watchdog_state import (
     atomic_write_json,
@@ -1784,6 +1785,38 @@ def _unit_active_state(unit: str) -> str | None:
     return state or None
 
 
+def _unit_restart_status(unit: str) -> UnitRestartStatus:
+    """Return *unit*'s systemd NRestarts and Result; None in a field that cannot be read.
+
+    NRestarts counts only Restart= restarts and is flushed by any manual start
+    (task 5739 constraint 6); _watchdog_crash_loop.py::restart_growth counts
+    through the flush. Parsed by key, because systemd prints Result before
+    NRestarts whatever the --property order.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=NRestarts,Result"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return UNKNOWN_RESTART_STATUS
+        fields = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        try:
+            n_restarts = int(fields.get("NRestarts", "").strip())
+        except ValueError:
+            n_restarts = None
+        return UnitRestartStatus(
+            n_restarts=n_restarts, result=fields.get("Result", "").strip() or None
+        )
+    except Exception as exc:
+        logger.warning(f"could not read NRestarts/Result for {unit}: {exc!r}")
+        return UNKNOWN_RESTART_STATUS
+
+
 # ActiveState values under which an enabled unit counts as dead even while its
 # escalation port still listens (systemd socket activation — module
 # docstring). Deliberately NOT derived from UNIT_IN_FLIGHT_ACTIVE_STATES /
@@ -1800,7 +1833,30 @@ UNIT_DEAD_ACTIVE_STATES = frozenset({"inactive", "failed"})
 
 
 def main() -> None:
-    """Probe each watched unit; restart it on either of two dead signals.
+    """Sample every watched unit's restart status, then revive each dead one.
+
+    Phase one, crash_loop_pass (scripts/_watchdog_crash_loop.py), reads every
+    WATCHED unit's NRestarts/Result and pages a crash loop. It runs before
+    every liveness gate by construction, enabled and startup grace included,
+    because the grace window is what hid the 2026-10-26 loop. Phase two hands
+    each unit and its status to _revive_if_dead inside a per-unit guard, so
+    one unit's failure cannot leave the rest unprobed.
+    """
+    statuses = crash_loop_pass(
+        [unit for _port, unit in WATCHED],
+        _unit_restart_status,
+        repo_dir=REPO_DIR,
+        log=log,
+    )
+    for port, unit in WATCHED:
+        try:
+            _revive_if_dead(port, unit, statuses.get(unit, UNKNOWN_RESTART_STATUS))
+        except Exception as exc:  # noqa: BLE001
+            log(f"watchdog error for {unit} (port {port}): {exc}")
+
+
+def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
+    """Probe one watched unit; restart it on either of two dead signals.
 
     ``probe_port`` reads LISTEN False — the original signal: a wedged-but-
     active unit, or a dead-but-enabled one whose port was never (re)bound.
@@ -1825,68 +1881,64 @@ def main() -> None:
     sweep is currently restarting is skipped, because a unit mid-restart is
     indistinguishable from a dead one to either probe.
     """
-    for port, unit in WATCHED:
-        try:
-            if not is_unit_enabled(unit):
-                # Disabled (or unknown) — respect operator intent, skip silently.
-                continue
-            elapsed = _unit_start_elapsed_secs(unit)
-            if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
-                log(
-                    f"{unit} started {elapsed:.0f}s ago; "
-                    f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
-                )
-                continue
+    if not is_unit_enabled(unit):
+        # Disabled (or unknown) — respect operator intent, skip silently.
+        return
+    elapsed = _unit_start_elapsed_secs(unit)
+    if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+        log(
+            f"{unit} started {elapsed:.0f}s ago; "
+            f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
+        )
+        return
 
-            port_up = probe_port(port)
-            if port_up:
-                # Socket activation keeps the port LISTEN-ing across a dead
-                # service, so a live port no longer proves a live process —
-                # ask systemd directly. This runs on every healthy tick (the
-                # cost socket activation adds); the lease read below stays
-                # lazy regardless.
-                state = _unit_active_state(unit)
-                if state not in UNIT_DEAD_ACTIVE_STATES:
-                    continue
-                reason = (
-                    f"ActiveState={state!r} while escalation port {port} "
-                    "still listens (socket activation)"
-                )
-            else:
-                # A down port means this unit is wedged, dead — or being
-                # restarted right now by an in-flight fleet sweep, which the
-                # probe cannot tell apart from the other two precisely BECAUSE
-                # the sweep is restarting it. Measured: the probe cancelled the
-                # sweep's own restart jobs ("Job for ... canceled"), twice
-                # escalating to code=killed status=9/KILL.
-                reason = f"escalation port {port} not listening"
+    port_up = probe_port(port)
+    if port_up:
+        # Socket activation keeps the port LISTEN-ing across a dead
+        # service, so a live port no longer proves a live process —
+        # ask systemd directly. This runs on every healthy tick (the
+        # cost socket activation adds); the lease read below stays
+        # lazy regardless.
+        state = _unit_active_state(unit)
+        if state not in UNIT_DEAD_ACTIVE_STATES:
+            return
+        reason = (
+            f"ActiveState={state!r} while escalation port {port} "
+            "still listens (socket activation)"
+        )
+    else:
+        # A down port means this unit is wedged, dead — or being
+        # restarted right now by an in-flight fleet sweep, which the
+        # probe cannot tell apart from the other two precisely BECAUSE
+        # the sweep is restarting it. Measured: the probe cancelled the
+        # sweep's own restart jobs ("Job for ... canceled"), twice
+        # escalating to code=killed status=9/KILL.
+        reason = f"escalation port {port} not listening"
 
-            # The lease read is LAZY — it happens only HERE, after a dead
-            # signal has already fired, so an all-healthy tick (the
-            # overwhelmingly common case) costs zero extra I/O, and the
-            # read is maximally fresh at the decision point.
-            #
-            # Scoped to current_unit and nothing else: I5 (liveness stays
-            # uncapped, non-clock-gated and non-stamping — brokenness is
-            # not a scheduled deploy) must survive for every OTHER unit. A
-            # blanket liveness disable for the ~80 minutes of a sweep would
-            # leave a genuinely wedged unit unattended for over an hour.
-            lease = _live_fleet_lease()
-            if lease is not None and lease.get("current_unit") == unit:
-                log(
-                    f"{unit} {reason}, but an "
-                    f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
-                    "is restarting this unit; skipping the liveness restart"
-                )
-                continue
-            # Covers wedged-active, dead-enabled (boot-race cancelled, or
-            # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
-            # reset-failed + restart --no-block sequence revives every case.
-            log(f"{unit} {reason}; restarting")
-            restart_unit(unit)
-            log(f"{unit} restart issued")
-        except Exception as exc:  # noqa: BLE001
-            log(f"watchdog error for {unit} (port {port}): {exc}")
+    # The lease read is LAZY — it happens only HERE, after a dead
+    # signal has already fired, so an all-healthy tick (the
+    # overwhelmingly common case) costs zero extra I/O, and the
+    # read is maximally fresh at the decision point.
+    #
+    # Scoped to current_unit and nothing else: I5 (liveness stays
+    # uncapped, non-clock-gated and non-stamping — brokenness is
+    # not a scheduled deploy) must survive for every OTHER unit. A
+    # blanket liveness disable for the ~80 minutes of a sweep would
+    # leave a genuinely wedged unit unattended for over an hour.
+    lease = _live_fleet_lease()
+    if lease is not None and lease.get("current_unit") == unit:
+        log(
+            f"{unit} {reason}, but an "
+            f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+            "is restarting this unit; skipping the liveness restart"
+        )
+        return
+    # Covers wedged-active, dead-enabled (boot-race cancelled, or
+    # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
+    # reset-failed + restart --no-block sequence revives every case.
+    log(f"{unit} {reason}; restarting")
+    restart_unit(unit)
+    log(f"{unit} restart issued")
 
 
 def fused_memory_liveness_pass() -> None:
