@@ -2962,6 +2962,13 @@ def report() -> int:
     defers on; idle proceeds immediately and stale/absent proceed after the
     gate's short unknown-grace.
 
+    RESTARTS is each unit's systemd NRestarts/Result (task 8270), read by
+    _unit_restart_status with ``show`` only; ``?`` marks an unreadable field.
+    It sits left of VERDICT, as one whitespace-free token, so the readers that
+    index rows by whitespace position keep their indices. NRestarts counts only
+    Restart= restarts and resets on any manual start; OPERATIONS.md §8,
+    "Crash loop", says what the detector does with it.
+
     FLEET-LEASE is a single fleet-wide LINE printed above the table (task
     4755), not an eighth column: the lease is one fact about the whole fleet,
     so a column would repeat it on every row for no gain — DEPLOY-AGE already
@@ -2992,7 +2999,8 @@ def report() -> int:
     print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
         f"{'UNIT':<50} {'START':<24} {'CODE-SHA':<14} {'NEWEST WATCHED COMMIT':<24} "
-        f"{'VERDICT':<10} {'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
+        f"{'RESTARTS':<20} {'VERDICT':<10} {'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} "
+        "WOULD-DEFER"
     )
 
     any_stale = False
@@ -3009,9 +3017,11 @@ def report() -> int:
         merge_verdict = _classify_unit_heartbeat(unit, now)
         would_defer = "yes" if merge_verdict == "busy" else "no"
         code_sha = _unit_code_sha(unit)
+        restarts = _unit_restart_status(unit).render()
         print(
-            f"{unit:<50} {start_str:<24} {code_sha:<14} {commit_str:<24} {verdict:<10} "
-            f"{deploy_age_str:<12} {merge_verdict:<12} {would_defer}"
+            f"{unit:<50} {start_str:<24} {code_sha:<14} {commit_str:<24} "
+            f"{restarts:<20} {verdict:<10} {deploy_age_str:<12} {merge_verdict:<12} "
+            f"{would_defer}"
         )
 
     return 1 if any_stale else 0
