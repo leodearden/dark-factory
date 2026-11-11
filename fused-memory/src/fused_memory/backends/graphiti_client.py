@@ -36,6 +36,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
+from fused_memory.backends.falkor_entity_edges import bind_entity_endpoints
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.falkor_indices import (
@@ -2374,11 +2375,13 @@ class GraphitiBackend:
         # e.source_node_uuid/e.target_node_uuid PROPERTIES: redirect_node_edges
         # sets only the moved side's property and leaves the other absent/NULL,
         # and graphiti_core itself derives endpoints from topology (project
-        # memory 41edcf81). The directed MATCH resolves source vs target
-        # unambiguously.
+        # memory 41edcf81). startNode/endNode fix source vs target; binding
+        # them rather than anchoring on labelled endpoints lets FalkorDB seek
+        # the edge index, see
+        # fused_memory/backends/falkor_entity_edges.py::bind_entity_endpoints.
         topo = await graph.ro_query(
-            'MATCH (s:Entity)-[e:RELATES_TO {uuid: $edge_uuid}]->(t:Entity) '
-            'RETURN s.uuid, t.uuid',
+            bind_entity_endpoints('MATCH ()-[e:RELATES_TO {uuid: $edge_uuid}]->()')
+            + ' RETURN n.uuid, m.uuid',
             {'edge_uuid': edge_uuid},
         )
         if not topo.result_set:
