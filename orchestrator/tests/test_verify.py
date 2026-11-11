@@ -14,6 +14,7 @@ from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJEC
 from _xdist_crash_fixtures import (
     NESTED_RUN_FAILED_NODEID,
     PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
     PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT,
     PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
     PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
@@ -35,6 +36,8 @@ from _xdist_crash_fixtures import (
     XDIST_Q_TRUNCATED_OUTPUT,
     XDIST_RESTART_DISABLED_MESSAGE,
     XDIST_SESSION_ABORTED_OUTPUT,
+    XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+    XDIST_V_BAILOUT_TRUNCATED_OUTPUT,
     XDIST_WORKER_CRASH_OUTPUT,
     XDIST_WORKER_REPLACED_OUTPUT,
 )
@@ -4297,6 +4300,17 @@ _STOPPED_PROGRESS_ONLY_OUTPUT = ''.join(
 )
 
 
+def _assert_labelled_aborted(output: str) -> None:
+    hint = _extract_cause_hint(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+    result = _test_leg_result(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in result.summary, (
+        f'Unexpected summary: {result.summary!r}'
+    )
+    report = result.failure_report()
+    assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+
 async def _segmented_chain_output(*segments: tuple[int, str]) -> str:
     """The aggregated output ``_run_segmented`` builds when each segment of a
     two-subproject chain returns its ``(rc, output)`` pair, in order."""
@@ -4326,8 +4340,12 @@ class TestCompleteSessionIsNotLabelledAborted:
 
     @pytest.mark.parametrize(
         'output',
-        [XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT, XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT],
-        ids=['crashed-test-was-last', 'peer-finished-its-queue'],
+        [
+            XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
+            XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
+            XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+        ],
+        ids=['crashed-test-was-last', 'peer-finished-its-queue', 'verbose-crashed-test-was-last'],
     )
     def test_a_bailout_that_still_reached_100_percent_keeps_its_verdict(self, output):
         assert XDIST_RESTART_DISABLED_MESSAGE in output
@@ -4339,6 +4357,10 @@ class TestCompleteSessionIsNotLabelledAborted:
         assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_verbose_bailout_short_of_100_percent_is_still_labelled(self):
+        """GUARD: the -v outcome lines' percentage vetoes only at 100."""
+        _assert_labelled_aborted(XDIST_V_BAILOUT_TRUNCATED_OUTPUT)
 
     def test_a_nested_runs_progress_line_in_captured_output_is_not_the_sessions(self):
         output = PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT
@@ -4422,17 +4444,6 @@ class TestATruncatedSessionIsLabelledWhereverItSits:
     segmented fallback runs every segment, so a truncated session need not be
     last."""
 
-    @staticmethod
-    def _assert_labelled(output: str) -> None:
-        hint = _extract_cause_hint(output)
-        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
-        result = _test_leg_result(output)
-        assert WORKER_DEATH_SUMMARY_MARKER in result.summary, (
-            f'Unexpected summary: {result.summary!r}'
-        )
-        report = result.failure_report()
-        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ('first', 'second'),
@@ -4449,11 +4460,34 @@ class TestATruncatedSessionIsLabelledWhereverItSits:
     )
     async def test_a_truncated_segment_ahead_of_a_complete_one_is_labelled(self, first, second):
         output = await _segmented_chain_output(first, second)
-        self._assert_labelled(output)
+        _assert_labelled_aborted(output)
 
     def test_a_plain_join_of_a_truncated_session_then_a_complete_one_is_labelled(self):
         output = _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT + _PASSING_SESSION
-        self._assert_labelled(output)
+        _assert_labelled_aborted(output)
+
+    def test_a_truncated_q_module_after_a_completed_failing_one_is_labelled(self):
+        """The header-less -q join ``_aggregate_results`` builds: the earlier
+        module's stats line closes its report body, so the truncated module's
+        run stream is read."""
+        aggregated = _aggregate_results([
+            _test_leg_result(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, module='orchestrator'),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT, module='fused-memory'),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(aggregated.test_output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_truncated_q_module_after_a_completed_verbose_one_is_labelled(self):
+        """The -q module joins the -v session's stream, and its later progress
+        reading, not the -v session's [100%], decides the veto."""
+        aggregated = _aggregate_results([
+            _test_leg_result(_SESSION_START + XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
 
     @pytest.mark.asyncio
     async def test_a_complete_segment_ahead_of_a_passing_one_keeps_its_verdict(self):

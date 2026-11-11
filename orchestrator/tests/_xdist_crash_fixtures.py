@@ -196,15 +196,21 @@ XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT = (
 # (pytest 9.0.3, pytest-xdist 3.8.0, ``-n 2 --max-worker-restart=0``, one
 # os._exit test beside 40 passing), rebased onto this module's worker and
 # in-flight node-id.
-_XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY = (
-    ' FAILURES '.center(80, '=') + '\n'
-    + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
-    + '[gw3] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
-    + f"worker 'gw3' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
-    + XDIST_BAILOUT_LINE
-    + ' short test summary info '.center(80, '=') + '\n'
-    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
-    + ' 1 failed, 40 passed in 1.12s '.center(80, '=') + '\n'
+def _xdist_bailout_session_summary(tally: str) -> str:
+    return (
+        ' FAILURES '.center(80, '=') + '\n'
+        + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
+        + '[gw3] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+        + f"worker 'gw3' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
+        + XDIST_BAILOUT_LINE
+        + ' short test summary info '.center(80, '=') + '\n'
+        + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+        + f' {tally} '.center(80, '=') + '\n'
+    )
+
+
+_XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY = _xdist_bailout_session_summary(
+    '1 failed, 40 passed in 1.12s',
 )
 
 # Default ``--dist load``: the crashed test was the last one outstanding.
@@ -224,6 +230,37 @@ XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT = (
     + XDIST_RESTART_DISABLED_MESSAGE + '\n'
     + ('.' * 34).ljust(73) + '[100%]\n'
     + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# task 5891 review: the same two outcomes under ``-v``, whose xdist outcome
+# lines carry the progress percentage (``[gwN] [ P%] <OUTCOME> <nodeid> ``,
+# with pytest's trailing space). Measured live as above with ``-v``.
+def _xdist_v_crash_report(percent_field: str) -> str:
+    return (
+        '[gw3] node down: Not properly terminated\n'
+        + f'[gw3] {percent_field} FAILED {XDIST_IN_FLIGHT_NODEID} \n'
+        + '\n'
+        + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    )
+
+
+# The crashed test was the last one outstanding.
+XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT = (
+    'orchestrator/tests/test_config.py::TestFoo::test_ok_39 \n'
+    + '[gw1] [ 97%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_39 \n'
+    + _xdist_v_crash_report('[100%]')
+    + '\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# The worker died at 12%, and the session stopped at 51% once the peer worker
+# finished its in-flight queue.
+XDIST_V_BAILOUT_TRUNCATED_OUTPUT = (
+    '[gw1] [ 12%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_048 \n'
+    + _xdist_v_crash_report('[ 12%]')
+    + '[gw1] [ 51%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_125 \n'
+    + '\n'
+    + _xdist_bailout_session_summary('1 failed, 102 passed in 2.10s')
 )
 
 # task 5891: the 2026-10-30 laptop investigation's shape A. A test that runs a
@@ -247,12 +284,13 @@ PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT = (
 )
 
 # task 5891: shape B. The bailout literal QUOTED by test-controlled text rather
-# than printed by xdist, in -v sessions under xdist, whose outcome lines carry
-# no trailing percentage, so no [100%] progress line can veto the label.
+# than printed by xdist, in -v sessions under xdist with the ``count`` console
+# style, whose outcome lines carry ``[N/M]`` rather than a percentage, so the
+# [100%] veto cannot read their progress.
 QUOTED_BAILOUT_FAILED_NODEID = 'orchestrator/tests/test_quote.py::test_quote'
 _PYTEST_V_XDIST_RUN_PREFIX = (
-    '[gw0] [ 50%] PASSED orchestrator/tests/test_a.py::test_ok\n'
-    + f'[gw1] [100%] FAILED {QUOTED_BAILOUT_FAILED_NODEID}\n'
+    '[gw0] [1/2] PASSED orchestrator/tests/test_a.py::test_ok \n'
+    + f'[gw1] [2/2] FAILED {QUOTED_BAILOUT_FAILED_NODEID} \n'
 )
 _QUOTED_BAILOUT_FAILURES_HEAD = (
     ' FAILURES '.center(80, '=') + '\n'
