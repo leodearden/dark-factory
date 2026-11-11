@@ -8,6 +8,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import stat
+import tempfile
+from pathlib import Path
 
 import pytest
 from shared.cli_invoke import _SubprocessResult
@@ -16,10 +19,13 @@ from shared.process_cost import ProcessCostBasis
 from orchestrator.agents.zcode_backend import (
     ZCodeEndpoint,
     ZCodeEndpointMissing,
+    ZCodeRunHome,
     parse_zcode_output,
     zcode_argv,
     zcode_cli_config,
     zcode_provider_config,
+    zcode_run_home,
+    zcode_spawn_env,
 )
 
 BASE_URL = 'https://api.z.ai/api/anthropic'
@@ -313,3 +319,83 @@ class TestParseZCodeOutput:
         assert result.timed_out is timed_out
         if timed_out:
             assert result.success is False
+
+
+PLAN_TOOLS_MCP = {'mcpServers': {'plan-tools': {
+    'command': '/venv/bin/python', 'args': ['-m', 'plan_tools'],
+}}}
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _run_home(system_prompt: str = 'SYS PROMPT'):
+    return zcode_run_home(
+        system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
+        mcp_config=PLAN_TOOLS_MCP,
+    )
+
+
+class TestZCodeRunHome:
+
+    def test_the_home_holds_the_provider_mcp_and_instruction_files(self, tmp_path):
+        with _run_home() as home:
+            assert home.root.is_dir()
+            assert _mode(home.root) == 0o700
+            assert home.root.is_relative_to(Path(tempfile.gettempdir()))
+            assert not home.root.is_relative_to(tmp_path)
+            assert home.provider_config_path == home.root / '.zcode' / 'v2' / 'provider_config.json'
+            assert json.loads(home.provider_config_path.read_text()) == zcode_provider_config(
+                'glm-5.3', ENDPOINT,
+            )
+            assert _mode(home.provider_config_path) == 0o600
+            cli_config = home.root / '.zcode' / 'cli' / 'config.json'
+            assert json.loads(cli_config.read_text()) == zcode_cli_config(PLAN_TOOLS_MCP)
+            assert (home.root / '.zcode' / 'AGENTS.md').read_text() == 'SYS PROMPT'
+            assert (home.root / 'tmp').is_dir()
+
+    def test_each_invocation_gets_a_fresh_home(self):
+        with _run_home() as first, _run_home() as second:
+            assert first.root != second.root
+
+    def test_the_home_value_is_frozen(self):
+        with _run_home() as home:
+            for field in dataclasses.fields(ZCodeRunHome):
+                with pytest.raises(dataclasses.FrozenInstanceError):
+                    setattr(home, field.name, Path('/elsewhere'))
+
+    def test_the_home_is_removed_after_the_block(self):
+        with _run_home() as home:
+            root = home.root
+        assert not root.exists()
+
+    def test_the_home_is_removed_when_the_block_raises(self):
+        with pytest.raises(RuntimeError, match='body failed'), _run_home() as home:
+            root = home.root
+            raise RuntimeError('body failed')
+        assert not root.exists()
+
+
+class TestZCodeSpawnEnv:
+
+    def test_the_child_env_points_zcode_at_the_run_home_and_drops_every_secret(self):
+        base_env = {
+            'PATH': '/usr/local/bin:/usr/bin',
+            'ZAI_API_KEY': 'zai-secret',
+            'ANTHROPIC_AUTH_TOKEN': TOKEN,
+            'ANTHROPIC_BASE_URL': BASE_URL,
+            'SOME_TOKEN': 'some-secret',
+            'HOME': '/home/operator',
+        }
+        with _run_home() as home:
+            env = zcode_spawn_env(base_env, home)
+            assert env['HOME'] == str(home.root)
+            assert env['USERPROFILE'] == str(home.root)
+            assert env['ZCODE_DATA_BASE_DIR'] == str(home.root)
+            assert env['ZCODE_PERSONAL_PROVIDER_CONFIG_FILE'] == str(home.provider_config_path)
+            assert env['TMPDIR'] == str(home.root / 'tmp')
+        assert env['PATH'] == '/usr/local/bin:/usr/bin'
+        for name in ('ZAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'SOME_TOKEN'):
+            assert name not in env
+        assert TOKEN not in env.values()
