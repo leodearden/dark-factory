@@ -4,7 +4,9 @@
 invocation into a shared JSON state file so tests can assert the recon-busy
 defer gate, the --drain SIGUSR1 signal + drained-marker wait, and the
 post-start /health verification — never touching a live systemd or
-fused-memory. Template: test_deploy_w5_recon_reliability.py.
+fused-memory. One test runs the committed scripts/check_network_exposure.py
+with systemctl and ip faked; it makes loopback-only TCP connects to the
+host's factory ports. Template: test_deploy_w5_recon_reliability.py.
 
 The test owns BOTH sides of the /health-body contract (the fake curl serves
 a busy/idle body it controls) and the journalctl drained-marker contract
@@ -29,6 +31,7 @@ UNIT = "fused-memory"
 STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 STALENESS_PROBE = ["is-active", STALENESS_REDEPLOY_UNIT]
 STOP_THEN_START = [["stop", UNIT], ["start", "fused-memory.socket", UNIT]]
+DRAIN_SIGNAL = ["kill", "--kill-who=main", "--signal=SIGUSR1", UNIT]
 _FAKE_CHECK_NAME = "fake_check_network_exposure.py"
 
 # The drained marker the script greps journalctl for (task 2702's converging
@@ -44,9 +47,10 @@ polled before the service came back.
 
 `is-active UNIT` answers from the `unit_states` map (absent -> "inactive"):
 it prints the state and exits 0 for "active", 3 otherwise; a null state
-prints nothing and exits 1 (no answer). `daemon-reload` snapshots the
-installed socket unit's text (null if absent) as
-`socket_unit_at_daemon_reload`. Every other call succeeds."""
+prints nothing and exits 1 (no answer). A list answers its states in order,
+repeating the last. `daemon-reload` snapshots the installed socket unit's
+text (null if absent) as `socket_unit_at_daemon_reload`, and the curl-call
+count as `curl_calls_at_daemon_reload`. Every other call succeeds."""
 import json
 import os
 import sys
@@ -77,6 +81,13 @@ def _read_socket_unit():
         return None
 
 
+def _next_unit_state(state, unit):
+    answer = state.get("unit_states", {}).get(unit, "inactive")
+    if not isinstance(answer, list):
+        return answer
+    return answer.pop(0) if len(answer) > 1 else answer[0]
+
+
 def main(argv):
     state = _load()
     call = [a for a in argv[1:] if a != "--user"]
@@ -86,15 +97,16 @@ def main(argv):
         state["curl_calls_at_restart"] = len(state.get("curl_calls", []))
     if verb == "daemon-reload":
         state["socket_unit_at_daemon_reload"] = _read_socket_unit()
+        state["curl_calls_at_daemon_reload"] = len(state.get("curl_calls", []))
+    if verb != "is-active":
+        _save(state)
+        return 0
+    unit_state = _next_unit_state(state, call[1])
     _save(state)
-    if verb == "is-active":
-        unit_states = state.get("unit_states", {})
-        unit_state = unit_states.get(call[1], "inactive")
-        if unit_state is None:
-            return 1
-        sys.stdout.write(unit_state + "\\n")
-        return 0 if unit_state == "active" else 3
-    return 0
+    if unit_state is None:
+        return 1
+    sys.stdout.write(unit_state + "\\n")
+    return 0 if unit_state == "active" else 3
 
 
 if __name__ == "__main__":
@@ -613,8 +625,9 @@ def test_now_and_drain_are_mutually_exclusive(tmp_path):
 
 # ---------------------------------------------------------------------------
 # (h) --rebind-socket, before the service comes back: refuse while a
-# staleness redeploy runs, install the committed socket template, reload,
-# keep the chosen gate, then stop and start instead of restarting
+# staleness redeploy runs, before the gate and again after it; keep the
+# chosen gate; then install the committed socket template, reload, and stop
+# and start instead of restarting
 # ---------------------------------------------------------------------------
 
 def _stops_then_starts(calls):
@@ -673,8 +686,42 @@ def test_rebind_stops_then_starts_instead_of_restarting(tmp_path):
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     assert _state(tmp_path)["systemctl_calls"] == [
-        STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
+        STALENESS_PROBE, STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
     ]
+
+
+@pytest.mark.parametrize(
+    ("args", "gate_calls"),
+    [(["--rebind-socket"], []), (["--rebind-socket", "--drain"], [DRAIN_SIGNAL])],
+    ids=["recon-gate", "drain"],
+)
+def test_rebind_rechecks_the_staleness_redeploy_after_the_gate(tmp_path, args, gate_calls):
+    result = _run_script(
+        tmp_path, *args,
+        recon_busy_remaining=1,
+        journalctl_marker=DRAIN_MARKER,
+        unit_states={STALENESS_REDEPLOY_UNIT: ["inactive", "active"]},
+    )
+    assert result.returncode == 3, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["systemctl_calls"] == [STALENESS_PROBE, *gate_calls, STALENESS_PROBE], (
+        f"state={state!r}"
+    )
+    assert not _socket_unit_path(tmp_path).exists()
+
+
+def test_rebind_reloads_the_socket_unit_only_after_the_recon_gate(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", recon_busy_remaining=2)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["curl_calls_at_daemon_reload"] >= 3, f"state={state!r}"
+    assert state["curl_calls_at_daemon_reload"] == state["curl_calls_at_restart"], (
+        f"state={state!r}"
+    )
 
 
 def test_rebind_keeps_the_recon_gate(tmp_path):
@@ -702,6 +749,28 @@ def test_rebind_composes_with_now_in_either_order(tmp_path, args):
     assert state.get("curl_calls_at_restart") == 0, f"state={state!r}"
     assert "recon_gate:" not in result.stdout, f"stdout={result.stdout!r}"
     assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--rebind-socket", "--drain"], ["--drain", "--rebind-socket"]],
+    ids=["rebind-first", "drain-first"],
+)
+def test_rebind_composes_with_drain_in_either_order(tmp_path, args):
+    result = _run_script(
+        tmp_path, *args,
+        journalctl_marker=DRAIN_MARKER,
+        journalctl_marker_after=1,
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["systemctl_calls"] == [
+        STALENESS_PROBE, DRAIN_SIGNAL, STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
+    ], f"state={state!r}"
+    assert len(state["journalctl_calls"]) == 2, f"state={state!r}"
+    assert DRAIN_MARKER.lower() in result.stdout.lower(), f"stdout={result.stdout!r}"
 
 
 @pytest.mark.parametrize("args", [[], ["--now"]], ids=["default", "now"])

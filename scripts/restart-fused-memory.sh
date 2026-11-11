@@ -18,10 +18,11 @@ set -euo pipefail
 #                      #   then stop and start socket and service together
 #
 # --rebind-socket composes with --now or --drain, in either order. It refuses
-# (exit 3, changing nothing) while fm-staleness-redeploy.service runs; else it
-# installs scripts/fused-memory.socket.template verbatim, daemon-reloads, runs
-# the chosen gate, stops then starts, waits for /health, and exits with
-# scripts/check_network_exposure.py's status. On a converged host it is
+# (exit 3) while fm-staleness-redeploy.service runs, asking before the chosen
+# gate and again after it. Seconds before it stops then starts, it installs
+# scripts/fused-memory.socket.template verbatim and daemon-reloads. Once
+# /health answers, it exits with scripts/check_network_exposure.py's
+# status. On a converged host it is
 # idempotent: the same unit is installed and the same endpoints come back.
 #
 # The DEFAULT path polls /health and pipes the body to recon_busy_check.py:
@@ -90,18 +91,15 @@ refuse_while_staleness_redeploy_runs() {
     if [[ "$state" == "inactive" || "$state" == "failed" ]]; then
         return 0
     fi
-    echo "rebind_socket: REFUSED: ${STALENESS_REDEPLOY_UNIT} is '${state:-no answer}'; nothing was changed." >&2
+    echo "rebind_socket: REFUSED: ${STALENESS_REDEPLOY_UNIT} is '${state:-no answer}'; the socket unit was not installed and fused-memory was not restarted." >&2
     echo "rebind_socket: re-run once \`systemctl --user is-active ${STALENESS_REDEPLOY_UNIT}\` answers inactive." >&2
     exit 3
 }
 
-# 0. --rebind-socket: adopt the committed socket unit before the gate, so the
-#    stop/start below brings the listeners up on the template's endpoints.
+# 0. --rebind-socket: refuse before a gate that can hold for RECON_GATE_TIMEOUT
+#    or DRAIN_TIMEOUT.
 if [[ "$rebind_socket" == 1 ]]; then
     refuse_while_staleness_redeploy_runs
-    install -m 0644 "$SCRIPT_DIR/fused-memory.socket.template" "$UNIT_DIR/fused-memory.socket"
-    systemctl --user daemon-reload
-    echo "rebind_socket: installed $SCRIPT_DIR/fused-memory.socket.template as $UNIT_DIR/fused-memory.socket"
 fi
 
 # 1. DEFAULT: defer while a full recon cycle is in flight.
@@ -175,7 +173,14 @@ fi
 #    service holds the old listener, and a combined restart of socket and
 #    service is refused, so --rebind-socket stops then starts both
 #    (OPERATIONS.md §"Socket activation (MCP ports survive restarts)").
+#    The install and reload sit here, seconds before the start: after the
+#    reload, a restart of fused-memory may no longer inherit a listener whose
+#    endpoint the template changed.
 if [[ "$rebind_socket" == 1 ]]; then
+    refuse_while_staleness_redeploy_runs
+    install -m 0644 "$SCRIPT_DIR/fused-memory.socket.template" "$UNIT_DIR/fused-memory.socket"
+    systemctl --user daemon-reload
+    echo "rebind_socket: installed $SCRIPT_DIR/fused-memory.socket.template as $UNIT_DIR/fused-memory.socket"
     echo "rebind_socket: stopping fused-memory (its ExecStopPost stops fused-memory.socket), then starting both"
     systemctl --user stop fused-memory
     systemctl --user start fused-memory.socket fused-memory
