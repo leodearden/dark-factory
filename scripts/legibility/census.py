@@ -881,22 +881,11 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
     return result
 
 
-ENTRY_FILING_KEY = "filing"
-ENTRY_FILING_WITHHELD = "withheld"
-ENTRY_FILING_FILED = "filed"
-"""An entry's filing marker, written by the census and never by codebook.py
-(the v2 entry schema is open-world). WITHHELD means the singleton filing gate
-held the entry back until it recurs; FILED means a ticket was filed for it
-since. An entry with no marker is not the gate's concern -- it was filed on
-first sight, or predates the gate -- and is never re-filed. Plain ``str``, not
-an Enum: ``codebook.dump`` is ``yaml.safe_dump``, which cannot represent one."""
-
-
 def mark_entry_filed(cb: dict, entry_id: str) -> dict:
     """Mark entry *entry_id* withheld -> filed on a deep copy, RETAINED."""
     result = copy.deepcopy(cb)
     entry = _find_by_id(result.get("entries") or [], entry_id, kind="mark_entry_filed")
-    entry[ENTRY_FILING_KEY] = ENTRY_FILING_FILED
+    entry[codebook.ENTRY_FILING_KEY] = codebook.ENTRY_FILING_FILED
 
     codebook.assert_no_deletion(cb, result)
     return result
@@ -1682,7 +1671,7 @@ def _filing_queue(fileable: list[tuple[dict, str | None]], cb: dict) -> list[Pen
     verified by an earlier run, so it is not."""
     releasable = [
         entry for entry in cb.get("entries") or []
-        if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
+        if entry.get(codebook.ENTRY_FILING_KEY) == codebook.ENTRY_FILING_WITHHELD
         and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
     ]
     entry_id_by_title: dict[str | None, str] = {}
@@ -3184,7 +3173,7 @@ def run_census(
                 "manifested_phase": cluster.get("manifested_phase") or "unknown",
                 **census_findings.first_sighting_fields(run_id),
                 "first_seen_run": placement.first_seen_run(run_id),
-                **({ENTRY_FILING_KEY: ENTRY_FILING_WITHHELD} if held is not None else {}),
+                **({codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD} if held is not None else {}),
             }
             updated_codebook = promote_candidate(
                 updated_codebook, cand_id, entry_fields, finding=placement.identity,

@@ -65,6 +65,16 @@ STATUSES = ["open", "partially", "fixed", "retired", "mined-unverified", "accept
 
 DISPOSITIONS = ["pending", "promoted", "rejected"]
 
+ENTRY_FILING_KEY = "filing"
+ENTRY_FILING_WITHHELD = "withheld"
+ENTRY_FILING_FILED = "filed"
+ENTRY_FILINGS = (ENTRY_FILING_WITHHELD, ENTRY_FILING_FILED)
+"""An entry's filing marker. WITHHELD: the census's singleton filing gate held
+the entry back until it recurs; FILED: a ticket was filed for it since. An
+entry with no marker was filed on first sight, or predates the gate, and is
+never re-filed. Plain ``str``: ``dump`` is ``yaml.safe_dump``, which cannot
+represent an Enum."""
+
 _CANDIDATE_ID_RE = re.compile(r"^cand-\d{8}-\d+$")
 
 HEADER = """\
@@ -186,6 +196,7 @@ _ENTRY_SCHEMA = {
         "fixed_at_sha": {"type": "string", "pattern": r"^[0-9a-f]{7,40}$"},
         "accepted_by": {"type": "integer"},
         "corrected_by": {"type": "array", "items": _TASK_REF_SCHEMA},
+        ENTRY_FILING_KEY: {"enum": list(ENTRY_FILINGS)},
     },
     "required": [
         "id",
@@ -482,7 +493,8 @@ def validate(codebook: dict) -> list[str]:
     codebook is valid. Strict on v2-relevant fields (version, entry
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
     shape, candidate id regex + disposition, the optional C1 finding fields,
-    finding_identity_errors, accepted ⇒ accepted_by); permissive on v1
+    finding_identity_errors, accepted ⇒ accepted_by, promoted ⇒ a
+    promoted_to naming an entry, the entry filing marker); permissive on v1
     free-form fields (validate() never rejects on their presence, absence,
     or type).
     """
@@ -492,8 +504,8 @@ def validate(codebook: dict) -> list[str]:
         errors.extend(_finding_identity_errors_at(codebook.get("candidates"), "candidates"))
 
     entries = codebook.get("entries", []) if isinstance(codebook, dict) else []
+    seen_ids: set[str] = set()
     if isinstance(entries, list):
-        seen_ids: set[str] = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -524,6 +536,14 @@ def validate(codebook: dict) -> list[str]:
                 errors.append(f"duplicate candidate id: {cand_id!r}")
             else:
                 seen_cand_ids.add(cand_id)
+            promoted_to = candidate.get("promoted_to")
+            if candidate.get("disposition") == "promoted" and not (
+                isinstance(promoted_to, str) and promoted_to in seen_ids
+            ):
+                errors.append(
+                    f"candidate {cand_id!r}: disposition 'promoted' requires a promoted_to "
+                    f"naming an entry, got {promoted_to!r}"
+                )
 
     return errors
 

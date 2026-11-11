@@ -665,7 +665,7 @@ def test_merge_does_not_duplicate_promoted_candidate():
     assert candidate["sightings"][1]["session"] == "sess-new"
     assert merge.counts.candidate_disposition_conflicts == 1
     assert merge.counts.candidates_applied == 0
-    assert mod.validate(merge.codebook) == []
+    assert mod.validate(merge.codebook) == mod.validate(codebook) != []
 
 
 def test_merge_routes_promoted_recurrence_to_its_entry():
@@ -735,7 +735,7 @@ def test_merge_promoted_with_dangling_promoted_to_falls_back():
     assert candidate["sightings"][1]["session"] == "sess-new"
     assert merge.counts.matched == 0
     assert merge.counts.candidate_disposition_conflicts == 1
-    assert mod.validate(merge.codebook) == []
+    assert mod.validate(merge.codebook) == mod.validate(codebook) != []
 
 
 def test_merge_adjudicated_conflict_is_idempotent():
@@ -1397,6 +1397,7 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
     before = _codebook_with_candidate()
     after = copy.deepcopy(before)
     after["candidates"][0]["disposition"] = "promoted"
+    after["candidates"][0]["promoted_to"] = "entry-a"
 
     mod.assert_no_deletion(before, after)  # must not raise
 

@@ -4030,17 +4030,10 @@ def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
     is discarded (the CONTRADICTION an operator must act on), and the drop
     would be announced as an AGREEMENT with a standing rejection. Seeded in
     the order that makes the two answers differ, which is the order the live
-    codebook is known to carry (task 4144).
-
-    The second case pins the fall-through the merger also performs: a
-    `promoted` record whose `promoted_to` names no existing entry is NOT
-    authoritative, because no entry exists to carry the signal -- so the
-    later `rejected` record stands and the drop really is an agreement."""
+    codebook is known to carry (task 4144)."""
     cases = [
         ("promoted_to resolves",
          "entry-spurious", "cand-20260701-7", mod.DROP_CONTRADICTION),
-        ("promoted_to dangles",
-         "entry-that-never-existed", "cand-20260724-2", mod.DROP_AGREEMENT),
     ]
     for label, promoted_to, expected_id, expected_kind in cases:
         caplog.clear()
@@ -8907,7 +8900,7 @@ def test_run_census_marks_a_withheld_promotion_in_the_codebook(tmp_path):
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
 
 
 @pytest.mark.parametrize(
@@ -8922,7 +8915,7 @@ def test_run_census_leaves_a_fileable_promotion_unmarked(tmp_path, gate_override
 
     mod.run_census(**kwargs)
 
-    assert mod.ENTRY_FILING_KEY not in _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
+    assert codebook.ENTRY_FILING_KEY not in _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
 
 
 def _codebook_with_withheld_entry():
@@ -8936,7 +8929,7 @@ def _codebook_with_withheld_entry():
             "origin_phase": "implement",
             "manifested_phase": "verify",
             "sightings": [],
-            mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD,
+            codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
         }
     )
     return cb
@@ -8948,14 +8941,14 @@ def test_mark_entry_filed_flips_the_marker_retained():
     result = mod.mark_entry_filed(before, "entry-withheld")
 
     entry = next(e for e in result["entries"] if e["id"] == "entry-withheld")
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
     assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
     assert next(e for e in result["entries"] if e["id"] == "entry-a") == before["entries"][0]
 
     assert codebook.validate(result) == []
     codebook.assert_no_deletion(before, result)
 
-    assert before["entries"][1][mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD, (
+    assert before["entries"][1][codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD, (
         "the input is never mutated"
     )
 
@@ -8975,8 +8968,8 @@ def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     codebook.dump(loaded, path)
 
     entry = next(e for e in loaded["entries"] if e["id"] == "entry-withheld")
-    assert type(entry[mod.ENTRY_FILING_KEY]) is str
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert type(entry[codebook.ENTRY_FILING_KEY]) is str
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
     assert path.read_bytes() == first_bytes
 
 
@@ -9037,8 +9030,8 @@ def test_run_census_files_a_withheld_entry_once_a_matches_op_makes_it_recur(tmp_
     assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.released_entry_ids == (entry_id,)
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_FILED
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_FILED
 
 
 def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_path):
@@ -9100,8 +9093,8 @@ def test_run_census_files_a_miscoded_recurrence_once_and_releases_the_entry(tmp_
 
     assert len(second["submit_fn"].calls) == 1, "one ticket per title, never two"
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_FILED
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_FILED
 
 
 def _make_rejecting_submit_fn():
@@ -9127,8 +9120,8 @@ def test_run_census_keeps_the_marker_when_the_release_filing_fails(tmp_path, cap
     assert len(second["submit_fn"].calls) == 1
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
     assert any(
         r.levelno == logging.WARNING and _GATED_TITLE in r.getMessage() for r in caplog.records
     )
@@ -9156,8 +9149,8 @@ def test_run_census_dry_run_offers_a_released_entry_but_leaves_it_withheld(tmp_p
     [payload] = json.loads(payloads_path.read_text(encoding="utf-8"))
     assert payload["title"] == f"[legibility census] {_GATED_TITLE}"
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
 
 
 def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
@@ -9171,8 +9164,8 @@ def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
     assert second["submit_fn"].calls == []
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
 
 
 def test_run_census_does_not_release_an_entry_retired_this_run(tmp_path):
@@ -9823,7 +9816,7 @@ def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_o
     [filed] = kwargs["submit_fn"].calls
     assert filed["title"] == disposition.task_title(_PROMOTED_TITLE)
     structural = _persisted_entry(kwargs["codebook_path"], _STRUCTURAL_TITLE)
-    assert mod.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
+    assert codebook.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
     assert "filed_tickets" not in structural
     assert _run_record(kwargs)["filing"]["structural"] == [{
         "entry_id": structural["id"],
@@ -9917,7 +9910,7 @@ def test_run_census_records_a_verdictless_unremediated_cluster_as_structural(tmp
     assert kwargs["submit_fn"].calls == []
     assert outcome.withheld == ()
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
-    assert mod.ENTRY_FILING_KEY not in entry
+    assert codebook.ENTRY_FILING_KEY not in entry
     assert [item["entry_id"] for item in _run_record(kwargs)["filing"]["structural"]] == [entry["id"]]
 
 
@@ -10791,7 +10784,7 @@ def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tm
         for session in ("s-old-1", "s-old-2")
     ]
     kwargs = _outcome_kwargs(
-        tmp_path, "present", sightings=sightings, **{mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD},
+        tmp_path, "present", sightings=sightings, **{codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD},
     )
 
     outcome = mod.run_census(**kwargs)
@@ -11170,7 +11163,7 @@ def test_a_held_back_verdict_that_attaches_by_key_is_reported_withheld(tmp_path)
 
     assert outcome.status == "done"
     entry = _row5_entry(kwargs)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
     record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert record["withheld"] == [
@@ -11196,7 +11189,7 @@ def test_a_key_attach_that_raises_a_withheld_entry_to_two_sightings_files_and_re
 
     assert outcome.status == "done"
     entry = _row5_entry(kwargs)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
     assert {s["session"] for s in entry["sightings"]} == {"novel-verified", "novel-rejected"}
     record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["key"] == 1
