@@ -1698,26 +1698,24 @@ class TaskArtifacts:
                 callers should never invoke this on an empty plan.
         """
         with self.plan_mutex():
-            plan = self.read_plan()
-            if not plan.get('steps'):
+            plan = self.read_plan_model()
+            if plan is None or not plan.steps:
                 raise ValueError(
                     'bump_revalidation_stamp called before plan.json contains a '
                     'valid plan (missing or empty steps).'
                 )
-            plan['_revalidated_at'] = datetime.now(UTC).isoformat()
-            plan['_revalidated_by_session'] = session_id
-            if base_commit:
-                plan[PLAN_BASE_COMMIT_KEY] = base_commit
-            self.write_plan_model(Plan.from_json(plan), mutex_held=True)
+            revalidated = plan.revalidated(
+                at=datetime.now(UTC).isoformat(), by_session=session_id, base_commit=base_commit,
+            )
+            self.write_plan_model(revalidated, mutex_held=True)
 
     def stamp_plan_provenance(
         self, session_id: str, *, task_text_fp: str | None = None,
         base_commit: str | None = None,
-    ) -> None:
-        """Stamp _session_id and _created_at into plan.json.
+    ) -> Plan:
+        """Stamp _session_id and _created_at into plan.json, and return the Plan written.
 
-        Reads current plan.json, adds provenance fields, writes back.
-        ``task_text_fp=None`` leaves an existing fingerprint untouched (the
+        A falsy ``task_text_fp`` leaves an existing fingerprint untouched (the
         per-iteration and recovered-plan stamps rely on this); a falsy
         ``base_commit`` likewise leaves an existing ``_base_commit`` untouched.
 
@@ -1726,27 +1724,29 @@ class TaskArtifacts:
                 This prevents silently creating a provenance-only stub that passes
                 bool() checks but has no actual plan content.
         """
+        now = datetime.now(UTC).isoformat()
         with self.plan_mutex():
-            plan = self.read_plan()
-            if not plan.get('steps'):
+            plan = self.read_plan_model()
+            if plan is None or not plan.steps:
                 raise ValueError(
                     'stamp_plan_provenance called before plan.json contains a valid plan '
                     '(missing or empty steps). '
                     'Ensure the architect has written a complete plan before stamping provenance.'
                 )
-            plan['_session_id'] = session_id
-            plan['_created_at'] = datetime.now(UTC).isoformat()
-            # Invariant: a provenance-stamped plan is a complete plan, so it must
-            # carry the completeness marker.  The architect's confirm_plan normally
-            # sets this already (idempotent setdefault); paths that inject a
-            # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
-            # plan is not mistaken for an interrupted partial on a later requeue.
-            plan.setdefault('_finalized_at', plan['_created_at'])
-            if task_text_fp is not None:
-                plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
-            if base_commit:
-                plan[PLAN_BASE_COMMIT_KEY] = base_commit
-            self.write_plan_model(Plan.from_json(plan), mutex_held=True)
+            if plan.state is PlanState.PARTIAL:
+                # Transitional until beta: plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md D3.
+                logger.warning(
+                    'stamp_plan_provenance: confirming the %s plan of task %r as %s before stamping '
+                    '(lifecycle markers present: %s)',
+                    plan.state.value, plan.body.get('task_id'), PlanConfirmation.INJECTED.value,
+                    list(plan.lifecycle.markers_present()),
+                )
+                plan = plan.confirmed(at=now, by=PlanConfirmation.INJECTED)
+            stamped = plan.stamped(
+                session_id=session_id, at=now, task_text_fp=task_text_fp, base_commit=base_commit,
+            )
+            self.write_plan_model(stamped, mutex_held=True)
+        return stamped
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.
@@ -1764,9 +1764,7 @@ class TaskArtifacts:
         try:
             plan_path = self.artifact_path('plan.json')
             data = json.loads(plan_path.read_text())
-            if data.get('_session_id') == session_id:
-                return True
-            return data.get('_revalidated_by_session') == session_id
+            return Plan.from_json(data).lifecycle.owned_by(session_id)
         except Exception as exc:
             logger.warning(
                 'validate_plan_owner: failed to read/parse plan.json — treating as mismatch: %s',
@@ -1794,16 +1792,9 @@ class TaskArtifacts:
         for audit rather than being promoted.
         """
         with self.plan_mutex():
-            plan = self.read_plan()
-            plan['files'] = files
-            already_owner = (
-                plan.get('_session_id') == session_id
-                or plan.get('_revalidated_by_session') == session_id
-            )
-            if not already_owner:
-                plan['_session_id'] = session_id
-                plan.setdefault('_created_at', datetime.now(UTC).isoformat())
-            self.write_plan_model(Plan.from_json(plan), mutex_held=True)
+            plan = self.read_plan_model() or Plan.from_json({})
+            edited = plan.with_files(files, owner=session_id, at=datetime.now(UTC).isoformat())
+            self.write_plan_model(edited, mutex_held=True)
 
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".
