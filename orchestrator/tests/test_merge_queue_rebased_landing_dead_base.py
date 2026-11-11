@@ -516,13 +516,15 @@ class TestRebasedHeadWaitsFirstForAHost:
                 lane, remote, allocator_cls=_LocalSlotTakenOnceFreed,
             )
             assert isinstance(allocator, _LocalSlotTakenOnceFreed)
-            held_remote: HostLease | None = None
+            # Held before A dispatches: with a host free under A's verify the
+            # fill-ahead race would leave a queue getter that harvests X.
+            held_remote = allocator.acquire_remote()
+            assert held_remote is not None, 'precondition: the remote was free to hold'
+            local_handed_back = False
             try:
                 req_a = await _submitted(git_ops, config, 'wh-a')
                 await queue.put(req_a)
                 await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-                held_remote = allocator.acquire_remote()
-                assert held_remote is not None, 'precondition: the remote was free to hold'
 
                 await _land_foreign_commit(git_repo)
                 head_gate.set()
@@ -535,25 +537,21 @@ class TestRebasedHeadWaitsFirstForAHost:
 
                 req_x = await _submitted(git_ops, config, 'wh-x')
                 await queue.put(req_x)
-                try:
-                    await _until(
-                        lambda: 'wh-x' in _awaiting_host(lane),
-                        what='X to wait for a host', timeout=5,
-                    )
-                except AssertionError:
-                    snap = lane.snapshot()
-                    raise AssertionError(repr([(e['task_id'], e['state']) for e in snap['entries']]) + repr(snap.get('speculation')) + repr(snap.get('merger')))
+                await _until(lambda: 'wh-x' in _awaiting_host(lane), what='X to wait for a host')
                 assert _awaiting_host(lane) == ['wh-a', 'wh-x'], lane.snapshot()['entries']
                 assert verifier.verified == ['wh-a'], verifier.verified
 
                 assert allocator.held_local is not None
+                local_handed_back = True
                 await allocator.release(allocator.held_local)
                 outcome_a = await wait_responsive(req_a.result, label='wh-a outcome')
                 outcome_x = await wait_responsive(req_x.result, label='wh-x outcome')
             finally:
                 remote_release.set()
-                if held_remote is not None:
-                    await allocator.release(held_remote)
+                head_gate.set()
+                if allocator.held_local is not None and not local_handed_back:
+                    await allocator.release(allocator.held_local)
+                await allocator.release(held_remote)
 
             assert (outcome_a.status, outcome_x.status) == ('done', 'done'), (outcome_a, outcome_x)
             assert verifier.verified == ['wh-a', 'wh-a', 'wh-x'], verifier.verified
