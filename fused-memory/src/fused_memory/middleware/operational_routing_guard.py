@@ -22,7 +22,8 @@ submit path (normal, planning_mode, direct interceptor).
 "pure gate" = ``task_kind='deterministic'``, ``always_escalates=True``,
 ``before_done`` dropped — the shape enforced by
 ``deterministic_task_guard.deterministic_task_error`` (a deterministic task
-with no action must always escalate, never be an ill-formed no-op). The
+with no action must always escalate, never be an ill-formed no-op) — plus
+``pure_gate_from`` naming the triggering execution_class. The
 stamp itself is delegated verbatim to
 :meth:`TaskInterceptor._inject_deterministic_pure_gate` (INV-5 — the
 pure-gate stamp is reused, never re-implemented).
@@ -66,7 +67,11 @@ is fully loaded). Lazy imports are an established pattern in this codebase.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
+
+from shared.pure_gate_provenance import PureGateTrigger
 
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
@@ -82,7 +87,12 @@ __all__ = [
 #: needed. Task γ/2803 consumes it (or the preserved operational_mode='llm').
 OPERATIONAL_LLM_GATE_MARKER_KEY = 'x_operational_llm_gate'
 
-_COERCED_EXECUTION_CLASSES: frozenset[str] = frozenset({'operational', 'decision'})
+_TRIGGER_BY_EXECUTION_CLASS: Mapping[str, PureGateTrigger] = MappingProxyType(
+    {
+        'operational': PureGateTrigger.EXECUTION_CLASS_OPERATIONAL,
+        'decision': PureGateTrigger.EXECUTION_CLASS_DECISION,
+    }
+)
 
 
 def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
@@ -102,7 +112,8 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
     """
     parsed = raw_metadata_dict(metadata, source='operational_routing_guard')
     execution_class = parsed.get('execution_class')
-    if execution_class not in _COERCED_EXECUTION_CLASSES:
+    trigger = _TRIGGER_BY_EXECUTION_CLASS.get(execution_class)
+    if trigger is None:
         # code_tdd / absent / anything not operational|decision → untouched.
         return metadata
 
@@ -110,7 +121,7 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
     # import breaks the task_interceptor↔guard cycle — see module docstring.
     from fused_memory.middleware.task_interceptor import TaskInterceptor
 
-    coerced = TaskInterceptor._inject_deterministic_pure_gate(metadata)
+    coerced = TaskInterceptor._inject_deterministic_pure_gate(metadata, trigger=trigger)
     if execution_class == 'operational' and parsed.get('operational_mode') == 'llm':
         # Dedicated llm-gate marker (task γ/2803 consumes it). operational_mode
         # itself is ALSO preserved by the pure-gate stamp, so γ may read either.

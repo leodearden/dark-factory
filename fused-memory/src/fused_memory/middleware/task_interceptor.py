@@ -31,6 +31,7 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -4002,7 +4003,7 @@ class TaskInterceptor:
         return meta
 
     @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any) -> dict:
+    def _inject_deterministic_pure_gate(metadata: Any, *, trigger: PureGateTrigger) -> dict:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
         Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
@@ -4017,11 +4018,15 @@ class TaskInterceptor:
         deterministic task with no action must always escalate, never be an
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
+
+        Stamps ``pure_gate_from`` with ``trigger``, recording which conversion
+        produced the gate.
         """
         meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
+        meta[PURE_GATE_FROM_KEY] = trigger.value
         return meta
 
     @staticmethod
@@ -4992,7 +4997,9 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(metadata)
+            metadata = self._inject_deterministic_pure_gate(
+                metadata, trigger=PureGateTrigger.OPERATIONAL_ASK_REGISTRY
+            )
 
         # ── Create task ───────────────────────────────────────────────
         status: str = TicketStatus.FAILED
