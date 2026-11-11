@@ -8,13 +8,16 @@ esc-4851-*) are unrecoverable, so the factories below rebuild their shapes.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _curator_fake import FakeCurator
 from _info_l0_router_fixtures import (
     TASK_ID,
     DispositioningReviewer,
@@ -31,17 +34,22 @@ from _workflow_helpers import FakeScheduler, _build_harness
 from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
+from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
 from escalation.models import Escalation
+from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 
 from orchestrator.escalation_router import (
+    AGGREGATE_CATEGORY,
     AGGREGATE_ROLE,
     FALLBACK_ACTION,
+    OVERFLOW_SENTINEL,
     REVIEWER_LEG_ID,
     ROUTER_ID,
     read_hold,
+    status_info_sentinel,
 )
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import Scheduler
@@ -49,6 +57,8 @@ from orchestrator.workflow import WorkflowOutcome
 
 ORPHAN_REAPER = 'harness-orphan-reaper'
 STARVATION = 'orchestrator-starvation-watchdog'
+MERGE_SKEW = 'orchestrator-merge-skew-tripwire'
+AGED_SECS = 300.0
 AUTHOR_DETAIL = (
     'Seen while editing foo.py: bar.py carries a private copy of foo.helper; '
     'fold it into one helper in a follow-up.'
@@ -129,14 +139,17 @@ def blocking_l0(queue: EscalationQueue, task_id: str = TASK_ID) -> Escalation:
     return esc
 
 
-def starvation_notice(queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0) -> Escalation:
+def starvation_notice(
+    queue: EscalationQueue, task_id: str, *, seconds_ago: float = 0.0,
+    agent_role: str = STARVATION, suggested_action: str = 'none',
+) -> Escalation:
     """The esc-4851-* shape: one of the weekend's 489 starvation-watchdog notices."""
     notice = Escalation(
-        id=queue.make_id(task_id), task_id=task_id, agent_role=STARVATION,
+        id=queue.make_id(task_id), task_id=task_id, agent_role=agent_role,
         severity='info', category='infra_issue',
         summary=f'task {task_id} starved of a slot for 30 min',
         detail='No slot became free for this task in the last starvation window.',
-        suggested_action='none', timestamp=_timestamp(seconds_ago),
+        suggested_action=suggested_action, timestamp=_timestamp(seconds_ago),
     )
     queue.submit(notice)
     return notice
@@ -609,3 +622,239 @@ class TestRow15RequeuedExitDefers:
         hold = read_hold(run.current(note))
         assert hold is not None and hold.ticket == 'tkt_1'
         assert _trail(run, note.id)[-1] == ('convert-pending', 'orphan-reaper', 'orphan')
+
+
+@dataclass
+class _ReaperSite:
+    """The reaper and the amnesty over one real queue, with no workflow."""
+
+    harness: Harness
+    queue: EscalationQueue
+    curator: FakeCurator
+    events: EventStore | None
+
+    async def reap(self) -> None:
+        await self.harness._reap_orphan_l0_escalations()
+
+    def current(self, esc: Escalation) -> Escalation:
+        current = self.queue.get(esc.id)
+        assert current is not None
+        return current
+
+    def trail(self, esc_id: str) -> list[tuple]:
+        assert self.events is not None
+        return [
+            (row['data']['class'], row['data']['by'], row['data']['exit_kind'])
+            for row in self.events.fetch_events_by_type(EventType.info_l0_dispositioned)
+            if row['data']['escalation_id'] == esc_id
+        ]
+
+    def aggregates(self, sentinel: str) -> list[Escalation]:
+        return [
+            e for e in self.queue.get_by_task(sentinel, status='pending', level=1)
+            if e.agent_role == AGGREGATE_ROLE and e.category == AGGREGATE_CATEGORY
+        ]
+
+    def every_record(self) -> list[dict]:
+        """Every record on disk, archive included."""
+        return [json.loads(path.read_text()) for path in self.queue.queue_dir.rglob('esc-*.json')]
+
+
+def _site(tmp_path: Path, config, *, name: str = 'escalations', events: bool = True, **knobs) -> _ReaperSite:
+    queue = EscalationQueue(tmp_path / name)
+    curator = FakeCurator()
+    store = EventStore(tmp_path / f'{name}-runs.db', run_id='run-test') if events else None
+    harness = reaper_harness(
+        router_reaper_config(config, **knobs), queue, curator=curator, event_store=store,
+    )
+    return _ReaperSite(harness, queue, curator, store)
+
+
+def _listed(esc: Escalation) -> str:
+    """How an aggregate's detail lists one record."""
+    return f'{esc.id} (task {esc.task_id})'
+
+
+def _seed(n: int, first_task: int, file_one: Callable[[str], Escalation]) -> list[Escalation]:
+    """*n* records on distinct tasks; durable writes are not under test here."""
+    with patch('os.fsync'):
+        return [file_one(str(first_task + i)) for i in range(n)]
+
+
+@pytest.mark.asyncio
+class TestRow11MechanicalStormClosesUnderOneAggregatePerClass:
+    """The esc-4851 storm: 489 starvation notices, beside two other mechanical classes."""
+
+    async def test_one_sweep_closes_every_notice_status_info_and_pins_nothing(
+        self, tmp_path, mock_orch_config,
+    ):
+        site = _site(tmp_path, mock_orch_config, events=False)  # 492 durable event commits cost seconds
+        storm = _seed(489, 10_000, lambda tid: starvation_notice(site.queue, tid, seconds_ago=AGED_SECS))
+        skew = _seed(2, 7_000, lambda tid: starvation_notice(
+            site.queue, tid, seconds_ago=AGED_SECS, agent_role=MERGE_SKEW,
+        ))
+        done_step = _seed(1, 8_000, lambda tid: starvation_notice(
+            site.queue, tid, seconds_ago=AGED_SECS, agent_role='orchestrator',
+            suggested_action='verify_wip_reconciliation',
+        ))
+        classes = {STARVATION: storm, MERGE_SKEW: skew, DONE_STEP_COMMIT_ORPHAN_CLASS: done_step}
+
+        await site.reap()
+
+        assert all(
+            site.current(e).resolution_class == 'status-info' for records in classes.values() for e in records
+        )
+        aggregates = {}
+        for class_key, records in classes.items():
+            (aggregate,) = site.aggregates(status_info_sentinel(class_key))
+            aggregates[class_key] = aggregate
+            assert all(_listed(e) in aggregate.detail for e in records)
+            others = [e for key, rs in classes.items() if key != class_key for e in rs]
+            assert not any(e.id in aggregate.detail for e in others)
+        pending = site.queue.get_pending()
+        assert [e for e in pending if e.agent_role == ORPHAN_REAPER] == []
+        assert [e for e in pending if e.level >= 2] == []
+        assert site.curator.calls == []
+        pending_by_task = site.queue.get_pending_by_task()
+        assert not any(
+            classify_pins(e.task_id, pending_by_task.get(e.task_id, []), live_claimant=False).pins
+            for e in storm
+        )
+
+        later = _seed(3, 20_000, lambda tid: starvation_notice(site.queue, tid, seconds_ago=AGED_SECS))
+        await site.reap()
+
+        (still,) = site.aggregates(status_info_sentinel(STARVATION))
+        assert still.id == aggregates[STARVATION].id
+        assert all(_listed(e) in still.amendments[-1]['detail'] for e in later)
+
+
+@pytest.mark.asyncio
+class TestRow12UnknownMechanicalRoleGoesToTheCurator:
+    async def test_an_unregistered_monitor_is_converted_never_status_info(self, tmp_path, mock_orch_config):
+        site = _site(tmp_path, mock_orch_config)
+        notice = starvation_notice(
+            site.queue, '42', seconds_ago=AGED_SECS, agent_role='orchestrator-some-new-monitor',
+        )
+
+        await site.reap()
+
+        hold = read_hold(site.current(notice))
+        assert hold is not None and hold.ticket == 'tkt_1'
+        assert site.trail(notice.id) == [('convert-pending', 'orphan-reaper', 'orphan')]
+        assert site.aggregates(status_info_sentinel('orchestrator-some-new-monitor')) == []
+
+        site.curator.set_ticket('tkt_1', CREATED)
+        await site.reap()
+
+        assert site.current(notice).resolution_class == 'converted'
+        assert 'status-info' not in [row[0] for row in site.trail(notice.id)]
+
+
+def _aged_blocking_orphan(queue: EscalationQueue, task_id: str, worktree: Path) -> Escalation:
+    """The test_orphan_l0_reaper.py aged-orphan shape."""
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id, agent_role='integration-reviewer',
+        severity='blocking', category='design_concern', summary='Plan drift detected',
+        detail='The integration reviewer found drift between plan and code.',
+        worktree=str(worktree), timestamp=_timestamp(AGED_SECS),
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _promotion_fields(esc: Escalation) -> dict:
+    return {k: v for k, v in asdict(esc).items() if k not in ('id', 'timestamp', 'resolved_at')}
+
+
+@pytest.mark.asyncio
+class TestRow13BlockingOrphanIsPromotedAsItWasBeforeTheRouter:
+    """'Unchanged' is measured against the router-disabled reaper over the same record."""
+
+    async def test_the_promotion_equals_the_router_disabled_one(self, tmp_path, mock_orch_config):
+        task_id = '4242'
+        worktree = tmp_path / '.worktrees' / task_id
+        routed = _site(tmp_path, mock_orch_config, name='router-on')
+        on_orphan = _aged_blocking_orphan(routed.queue, task_id, worktree)
+        note = implementer_note(routed.queue, task_id, seconds_ago=AGED_SECS)
+        await routed.reap()
+
+        disabled = _site(tmp_path, mock_orch_config, name='router-off')
+        mock_orch_config.info_l0_router_enabled = False
+        off_orphan = _aged_blocking_orphan(disabled.queue, task_id, worktree)
+        await disabled.reap()
+
+        assert read_hold(routed.current(note)) is not None
+        (on_l1,) = _l1s(routed.queue, agent_role=ORPHAN_REAPER, task_id=task_id)
+        (off_l1,) = _l1s(disabled.queue, agent_role=ORPHAN_REAPER, task_id=task_id)
+        assert _promotion_fields(on_l1) == _promotion_fields(off_l1)
+        on, off = routed.current(on_orphan), disabled.current(off_orphan)
+        assert (on.status, on.resolved_by, on.resolution) == (off.status, off.resolved_by, off.resolution)
+        assert on_l1.suggested_action == 'manual_intervention'
+        assert f'branch=task/{task_id}' in on_l1.detail
+
+
+@pytest.mark.asyncio
+class TestRow16RestartAmnestyRoutesInfoNotes:
+    async def test_one_amnesty_pass_routes_the_notes_and_sweeps_only_the_strand(
+        self, tmp_path, mock_orch_config,
+    ):
+        site = _site(tmp_path, mock_orch_config)
+        note = implementer_note(site.queue, '42', seconds_ago=AGED_SECS)
+        notice = starvation_notice(site.queue, '43', seconds_ago=AGED_SECS)
+        strand = _aged_blocking_orphan(site.queue, '5189', tmp_path / '.worktrees' / '5189')
+
+        await site.harness._dismiss_stale_escalations()
+
+        assert read_hold(site.current(note)) is not None
+        assert site.trail(note.id) == [('convert-pending', 'startup-amnesty', 'restart')]
+        assert site.current(notice).resolution_class == 'status-info'
+        (aggregate,) = site.aggregates(status_info_sentinel(STARVATION))
+        assert _listed(notice) in aggregate.detail
+        swept = site.current(strand)
+        assert (swept.status, swept.resolved_by, swept.resolution_class) == (
+            'dismissed', 'auto-dismissed', 'stale-strand',
+        )
+        assert site.events is not None
+        (event,) = site.events.fetch_events_by_type(EventType.stale_l0_strand_dismissed)
+        assert event['data']['escalation_id'] == strand.id
+        assert [
+            r['id'] for r in site.every_record()
+            if r['severity'] == 'info' and r.get('resolved_by') == 'auto-dismissed'
+        ] == []
+
+        site.curator.set_ticket('tkt_1', CREATED)
+        await site.reap()
+
+        assert site.current(note).resolution_class == 'converted'
+
+
+@pytest.mark.asyncio
+class TestRow19ConversionCapOverflows:
+    async def test_past_the_cap_notes_promote_under_one_overflow_aggregate_per_sweep(
+        self, tmp_path, mock_orch_config,
+    ):
+        site = _site(tmp_path, mock_orch_config, max_conversions=2)
+        notes = [implementer_note(site.queue, str(4000 + i), seconds_ago=AGED_SECS) for i in range(4)]
+
+        await site.reap()
+
+        assert len(site.curator.calls_named('submit_task')) == 2
+        held = [n for n in notes if read_hold(site.current(n)) is not None]
+        overflow = [n for n in notes if site.current(n).status == 'dismissed']
+        assert (len(held), len(overflow)) == (2, 2)
+        for note in overflow:
+            (l1,) = _l1s(site.queue, agent_role=AGGREGATE_ROLE, task_id=note.task_id)
+            assert l1.suggested_action == FALLBACK_ACTION
+            assert l1.detail.startswith(note.detail)
+            assert 'conversion_cap' in l1.detail
+            assert note.id in l1.detail
+        (aggregate,) = site.aggregates(OVERFLOW_SENTINEL)
+        assert all(_listed(n) in aggregate.detail for n in overflow)
+        assert not any(n.id in aggregate.detail for n in held)
+
+        fresh = [implementer_note(site.queue, str(5000 + i), seconds_ago=AGED_SECS) for i in range(2)]
+        await site.reap()
+
+        assert len(site.curator.calls_named('submit_task')) == 4
+        assert all(read_hold(site.current(n)) is not None for n in fresh)

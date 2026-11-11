@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
@@ -169,36 +169,8 @@ class TestReaperFinishesHolds:
         assert [e for e in _queue(harness).get_pending() if e.level == 1] == []
 
 
-def _seed_storm(harness: Harness, first_task: int, n: int) -> list[Escalation]:
-    """*n* aged starvation-watchdog notes; durable writes are not under test here."""
-    with patch('os.fsync'):
-        return [
-            _submit_aged(harness, str(first_task + i), agent_role=STARVATION, category='infra_issue')
-            for i in range(n)
-        ]
-
-
 @pytest.mark.asyncio
 class TestReaperRoutesInfoOrphans:
-    async def test_a_mechanical_storm_closes_status_info_under_one_aggregate(self, harness: Harness):
-        harness.event_store = None  # 489 durable event commits cost seconds and are not under test
-        storm = _seed_storm(harness, 10_000, 489)
-
-        await harness._reap_orphan_l0_escalations()
-
-        assert all(_current(harness, e.id).resolution_class == 'status-info' for e in storm)
-        (aggregate,) = _aggregates(harness, status_info_sentinel(STARVATION))
-        assert all(e.id in aggregate.detail for e in storm)
-        assert _l1s(harness, agent_role='harness-orphan-reaper') == []
-        assert _curator(harness).calls == []
-
-        later = _seed_storm(harness, 20_000, 3)
-        await harness._reap_orphan_l0_escalations()
-
-        (still,) = _aggregates(harness, status_info_sentinel(STARVATION))
-        assert still.id == aggregate.id
-        assert all(e.id in still.amendments[-1]['detail'] for e in later)
-
     async def test_the_curator_candidate_names_the_subject_status(self, harness: Harness):
         harness.scheduler.get_task = AsyncMock(return_value={'status': 'done', 'metadata': {}})
         _submit_aged(harness, '42')
