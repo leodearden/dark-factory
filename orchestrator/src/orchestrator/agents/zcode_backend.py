@@ -7,14 +7,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from collections.abc import Callable, Iterable, Mapping
+import shutil
+import tempfile
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from shared.cli_invoke import AgentResult, _SubprocessResult
 from shared.process_cost import ProcessCostBasis
+from shared.secret_env import agent_subprocess_env, is_secret_env_name
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,68 @@ def _zcode_mcp_server(name: str, server: Mapping[str, Any]) -> dict[str, Any]:
     raise ValueError(
         f'MCP server {name!r} has neither a stdio command nor an http/sse url for zcode to carry',
     )
+
+
+@dataclass(frozen=True)
+class ZCodeRunHome:
+    root: Path
+    provider_config_path: Path
+
+
+@contextmanager
+def zcode_run_home(
+    *,
+    system_prompt: str,
+    model: str,
+    endpoint: ZCodeEndpoint,
+    mcp_config: Mapping[str, Any] | None,
+) -> Iterator[ZCodeRunHome]:
+    """A private home for one invocation, holding the only copy of the endpoint key; removed on exit."""
+    root = Path(tempfile.mkdtemp(prefix='zcode-home-'))
+    try:
+        zcode_dir = root / '.zcode'
+        provider_config_path = zcode_dir / 'v2' / 'provider_config.json'
+        _write_owner_only_json(provider_config_path, zcode_provider_config(model, endpoint))
+        cli_config_path = zcode_dir / 'cli' / 'config.json'
+        cli_config_path.parent.mkdir(parents=True)
+        cli_config_path.write_text(json.dumps(zcode_cli_config(mcp_config)))
+        (zcode_dir / 'AGENTS.md').write_text(system_prompt)
+        (root / 'tmp').mkdir()
+        yield ZCodeRunHome(root=root, provider_config_path=provider_config_path)
+    finally:
+        _remove_run_home(root)
+
+
+def _write_owner_only_json(path: Path, document: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as handle:
+        json.dump(document, handle)
+
+
+def _remove_run_home(root: Path) -> None:
+    try:
+        shutil.rmtree(root)
+    except OSError:
+        logger.warning(
+            'zcode backend: could not remove run home %s, which holds an endpoint key',
+            root, exc_info=True,
+        )
+
+
+def zcode_spawn_env(base_env: Mapping[str, str], home: ZCodeRunHome) -> dict[str, str]:
+    root = str(home.root)
+    inherited = {
+        name: value for name, value in agent_subprocess_env(base_env).items()
+        if not is_secret_env_name(name)
+    }
+    return {
+        **inherited,
+        'HOME': root,
+        'USERPROFILE': root,
+        'ZCODE_DATA_BASE_DIR': root,
+        'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE': str(home.provider_config_path),
+        'TMPDIR': str(home.root / 'tmp'),
+    }
 
 
 def zcode_argv(prompt: str, cwd: Path, disallowed_tools: Iterable[str] | None) -> list[str]:

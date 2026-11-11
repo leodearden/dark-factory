@@ -386,6 +386,7 @@ class TestZCodeSpawnEnv:
             'ANTHROPIC_AUTH_TOKEN': TOKEN,
             'ANTHROPIC_BASE_URL': BASE_URL,
             'SOME_TOKEN': 'some-secret',
+            'CLAUDE_CODE_OAUTH_TOKEN': 'claude-secret',
             'HOME': '/home/operator',
         }
         with _run_home() as home:
@@ -396,6 +397,7 @@ class TestZCodeSpawnEnv:
             assert env['ZCODE_PERSONAL_PROVIDER_CONFIG_FILE'] == str(home.provider_config_path)
             assert env['TMPDIR'] == str(home.root / 'tmp')
         assert env['PATH'] == '/usr/local/bin:/usr/bin'
-        for name in ('ZAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'SOME_TOKEN'):
+        for name in ('ZAI_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'SOME_TOKEN',
+                     'CLAUDE_CODE_OAUTH_TOKEN'):
             assert name not in env
         assert TOKEN not in env.values()
