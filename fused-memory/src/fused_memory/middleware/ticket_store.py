@@ -37,6 +37,7 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.task_submit import TICKET_ID_PREFIX
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 
@@ -120,7 +121,7 @@ def _new_ticket_id() -> str:
     for _ in range(26):
         chars.append(_CROCKFORD[n & 0x1F])
         n >>= 5
-    return 'tkt_' + ''.join(reversed(chars))
+    return TICKET_ID_PREFIX + ''.join(reversed(chars))
 
 logger = logging.getLogger(__name__)
 

@@ -312,9 +312,9 @@ def _resolve_backend_label(taskmaster: Any) -> str:
     return 'unknown'
 
 
-# Terminal statuses the server refuses to exit without a reopen_reason.
-# Re-exported from shared.task_statuses (PRD task-status-authority C1/C2) —
-# the single source of truth, imported above as TERMINAL_STATUSES.
+# Terminal statuses the server refuses to exit without a reopen_reason:
+# shared.task_statuses.TERMINAL (PRD task-status-authority C1/C2), the single
+# source of truth, imported above as TERMINAL_STATUSES.
 #
 # 'merge-deferred' is deliberately NOT in this set — a property of
 # shared.TERMINAL, not this module. It is a non-terminal holding state for
@@ -381,37 +381,8 @@ def _claimant_exception_entry(
     }
 
 
-def _is_ticket_id(value: object) -> bool:
-    """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
-    return isinstance(value, str) and value.startswith('tkt_')
-
-
 class TicketStoreNotConfiguredError(RuntimeError):
     """Raised by a read that needs the ticket store when the interceptor has none."""
-
-
-def _looks_like_task_id(value: object) -> bool:
-    """Return True when *value* parses as a non-negative integer task id.
-
-    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
-    trimmed). Rejects empty strings, negatives, and non-numeric strings.
-
-    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
-    task id that came back from ``submit_task(planning_mode=True)`` — the
-    planning-mode path returns the id synchronously, so the two-step
-    submit/resolve dance does not apply, but agents may still call it blindly.
-    """
-    if isinstance(value, bool):
-        # bool is a subclass of int in Python; reject explicitly.
-        return False
-    if isinstance(value, int):
-        return value >= 0
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return False
-        return stripped.isdigit()
-    return False
 
 
 @dataclasses.dataclass

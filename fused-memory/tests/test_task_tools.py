@@ -1847,7 +1847,7 @@ async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
 
     The MCP wire schema enforces ``ticket: str``, so int passthrough is
     only meaningful at the interceptor layer; it's covered by the
-    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    ``looks_like_task_id`` unit tests in shared/tests/test_task_submit.py.
     """
     from unittest.mock import AsyncMock
     task_interceptor.resolve_ticket = AsyncMock()

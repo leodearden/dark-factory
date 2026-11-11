@@ -34,10 +34,41 @@ __all__ = [
     'SubmittedTask',
     'SubmittedTicket',
     'TICKET_ID_PREFIX',
+    'is_ticket_id',
+    'looks_like_task_id',
     'parse_submit_task_result',
 ]
 
 TICKET_ID_PREFIX = 'tkt_'
+
+
+def is_ticket_id(value: object) -> bool:
+    """Return True when *value* is a two-phase ticket id (``tkt_…``), not a task id."""
+    return isinstance(value, str) and value.startswith(TICKET_ID_PREFIX)
+
+
+def looks_like_task_id(value: object) -> bool:
+    """Return True when *value* parses as a non-negative integer task id.
+
+    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
+    trimmed). Rejects empty strings, negatives, and non-numeric strings.
+
+    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
+    task id that came back from ``submit_task(planning_mode=True)`` — the
+    planning-mode path returns the id synchronously, so the two-step
+    submit/resolve dance does not apply, but agents may still call it blindly.
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int in Python; reject explicitly.
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        return stripped.isdigit()
+    return False
 
 
 @dataclass(frozen=True)
@@ -76,7 +107,7 @@ def parse_submit_task_result(result: Any) -> SubmitOutcome:
             f'submit_task error={inner.get("error")!r}, error_type={inner.get("error_type")!r}'
         )
     ticket = inner.get('ticket')
-    if isinstance(ticket, str) and ticket.startswith(TICKET_ID_PREFIX):
+    if is_ticket_id(ticket):
         return SubmittedTicket(ticket)
     task_id = inner.get('task_id')
     combined = bool(inner.get('combined', False))
