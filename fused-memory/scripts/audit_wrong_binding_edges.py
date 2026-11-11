@@ -99,7 +99,7 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
-from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.utils.canonical_labels import (
     Referent,
     parse_node_name,
