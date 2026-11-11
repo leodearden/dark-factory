@@ -12,7 +12,9 @@ the row's payload.
 The row is written BEFORE any re-verify runs, so it states what the gate
 decided, not how a fired re-verify ended: that verdict is the ``merge_verify``
 row with the same task id and merge sha, and the clearance a request advanced
-on is its ``merge_attempt{gate_retry}`` row.
+on is its ``merge_attempt{gate_retry}`` row. A re-verify handed back as a
+``ReverifyDispatch`` runs as the rebased head's own dispatch, so its verdict is
+that dispatch's ordinary ``merge_verify`` row.
 """
 
 from __future__ import annotations
@@ -106,6 +108,11 @@ class ReverifyGateDecision:
     def reverifies(self) -> bool:
         return self.reason.reverifies
 
+    @property
+    def dispatches(self) -> bool:
+        """A full re-verify of the rebased tree: it re-verifies and runs no history leg."""
+        return self.reverifies and self.history_leg_command is None
+
     def event_data(self) -> dict:
         return {
             'reason': str(self.reason),
@@ -118,6 +125,21 @@ class ReverifyGateDecision:
             'overlap_total': len(self.overlap),
             'blockers': list(self.blockers),
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class ReverifyDispatch:
+    """A gate decision whose full re-verify the caller runs as the rebased head's dispatch."""
+
+    decision: ReverifyGateDecision
+
+    def __post_init__(self) -> None:
+        if not self.decision.dispatches:
+            raise ValueError(
+                f'ReverifyDispatch for task {self.decision.task_id}: reason '
+                f'{self.decision.reason} does not dispatch; only a decision that '
+                f're-verifies with no history leg can be handed back as a dispatch'
+            )
 
 
 def emit_reverify_gate_decision(

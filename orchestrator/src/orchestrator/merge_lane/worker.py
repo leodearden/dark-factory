@@ -164,7 +164,7 @@ from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
     report_stuck_requests,
 )
-from orchestrator.merge_lane.reverify_gate_decision import GateClearance
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
 from orchestrator.merge_lane.shadow import (
     _alarm_warm_shadow_unparseable,
     _maybe_schedule_shadow_compare,
@@ -5940,6 +5940,9 @@ async def _advance_train(
             merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
             event_store=worker._event_store,
+        )
+        assert not isinstance(gate, ReverifyDispatch), (
+            f'a train gate re-verifies inline; got a ReverifyDispatch for {req.task_id}'
         )
         if isinstance(gate, MergeOutcome):
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
@@ -19495,6 +19498,10 @@ class SpeculativeMergeWorker:
                 _cancel_release = True
                 cleared = await gate.task
                 _cancel_release = False
+                assert not isinstance(cleared, ReverifyDispatch), (
+                    f'the single-branch gate re-verifies inline; got a '
+                    f'ReverifyDispatch for {req.task_id}'
+                )
                 candidate = await self._candidate_after_gate(entry, gate, cleared)
                 if candidate is None:
                     return False

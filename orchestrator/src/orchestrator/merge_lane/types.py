@@ -29,7 +29,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
-from orchestrator.merge_lane.reverify_gate_decision import GateClearance
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance, ReverifyDispatch
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -1838,7 +1838,7 @@ class PendingGate:
     is when the gate was parked, on the worker clock's wall ``now()`` scale.
     """
 
-    task: asyncio.Task[MergeOutcome | GateClearance]
+    task: asyncio.Task[MergeOutcome | GateClearance | ReverifyDispatch]
     candidate: LandingCandidate
     rebased_sha: str
     rebased_onto: str
