@@ -6610,6 +6610,75 @@ class TestDriftDetectorCheckEnvInconclusive:
         assert pool.is_quarantined('laptop') is False
 
 
+@pytest.mark.asyncio
+class TestDriftDetectorCheckEnvSafelyInconclusiveReason:
+    """check_env_safely(): the land-hook path is where an INCONCLUSIVE's reason is seen.
+
+    check_env_safely is the only production caller of check_env and discards
+    its result, so a reason that lived only on the result would never reach
+    the journal, and a dispatcher-side ssh fault would leave the env check
+    silently INCONCLUSIVE forever.  A sleeping laptop is the common case, so
+    the record is INFO, never a WARNING per check.
+    """
+
+    async def test_runner_unavailable_reason_is_logged_at_info_not_warning(self, caplog):
+        import logging
+
+        from orchestrator.config import EnvProbeConfig
+        from orchestrator.verify_runner import DriftDetector, RunnerUnavailable
+        reason = (
+            "ssh laptop.local exited 255 probing 'true': unix_listener: cannot "
+            'bind to path /home/leo/.df-env-probe-0123abcd.XyZ: Permission denied'
+        )
+        pool, _, _ = _make_env_drift_pool(remote_raises=RunnerUnavailable(reason))
+        event_store = MagicMock()
+        queue = _FakeEscQueue()
+        detector = DriftDetector(
+            pool, event_store=event_store, escalation_queue=queue,
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely(
+                [EnvProbeConfig(key='uv', argv=['uv', '--version'])]
+            )
+
+        verify_runner_records = [
+            r for r in caplog.records if r.name == 'orchestrator.verify_runner'
+        ]
+        reason_records = [
+            r for r in verify_runner_records
+            if r.levelno == logging.INFO
+            and 'unix_listener: cannot bind to path' in r.getMessage()
+            and 'task-7481-probe' in r.getMessage()
+        ]
+        assert len(reason_records) == 1, (
+            'expected exactly one INFO record naming the task and the '
+            f'RunnerUnavailable reason; saw: '
+            f'{[(r.levelname, r.getMessage()) for r in verify_runner_records]!r}'
+        )
+        assert [r for r in verify_runner_records if r.levelno >= logging.WARNING] == []
+        event_store.emit.assert_not_called()
+        assert queue.submitted == []
+
+    async def test_not_taken_guard_logs_nothing(self, caplog):
+        """The shipped default (verify_env_probes: []) stays silent."""
+        import logging
+
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_env_drift_pool()
+        detector = DriftDetector(
+            pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue(),
+            task_id='task-7481-probe',
+        )
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_runner'):
+            await detector.check_env_safely([])
+
+        assert [
+            r for r in caplog.records
+            if r.name == 'orchestrator.verify_runner' and r.levelno >= logging.INFO
+        ] == []
+
+
 # ---------------------------------------------------------------------------
 # task 4537: an UNREACHABLE remote is not divergence — through the REAL seam
 # ---------------------------------------------------------------------------
