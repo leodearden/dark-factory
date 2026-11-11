@@ -113,16 +113,25 @@ class TestZCodeProviderConfig:
     def test_one_anthropic_messages_rule_selected_as_the_default(self):
         doc = zcode_provider_config('glm-5.3', ENDPOINT)
         assert doc['schemaVersion'] == 1
-        [rule] = doc['providerRules']
-        config = rule['config']
-        assert config['api'] == {'type': 'anthropic-messages', 'baseUrl': BASE_URL}
-        assert config['access'] == {'type': 'api-key', 'apiKey': TOKEN}
-        assert config['personalModelIds'] == ['glm-5.3']
-        assert doc['defaultModelSelection'] == {
+        config = doc['config']
+        [rule] = config['providerConfigRules']['providerRules']
+        provider = rule['config']
+        assert provider['group'] == 'standard-personal'
+        assert provider['api'] == {'type': 'anthropic-messages', 'baseUrl': BASE_URL}
+        assert provider['access'] == {'type': 'api-key', 'apiKey': TOKEN}
+        assert provider['personalModelIds'] == ['glm-5.3']
+        assert config['defaultModelSelection'] == {
             'providerId': rule['providerId'], 'modelId': 'glm-5.3',
         }
-        assert doc['modelConfigRules'] == {
+        assert config['modelConfigRules'] == {
             'providerModelRules': [], 'manualProviderModelRules': [],
+        }
+
+    def test_only_keys_the_strict_upstream_codec_accepts(self):
+        doc = zcode_provider_config('glm-5.3', ENDPOINT)
+        assert set(doc) == {'schemaVersion', 'config'}
+        assert set(doc['config']) <= {
+            'providerOrder', 'providerConfigRules', 'modelConfigRules', 'defaultModelSelection',
         }
 
     def test_the_document_is_json_serialisable(self):
@@ -162,6 +171,12 @@ class TestZCodeCliConfig:
             'remote': {'type': transport, 'url': 'http://127.0.0.1:8002/mcp',
                        'headers': {'X-Task': '5399'}, 'enabled': True},
             'plain': {'type': transport, 'url': 'http://127.0.0.1:8003/mcp', 'enabled': True},
+        }
+
+    def test_a_url_server_without_a_type_is_http(self):
+        doc = zcode_cli_config({'mcpServers': {'remote': {'url': 'http://h/mcp'}}})
+        assert doc['mcp']['servers']['remote'] == {
+            'type': 'http', 'url': 'http://h/mcp', 'enabled': True,
         }
 
     @pytest.mark.parametrize('mcp_config', [None, {}, {'mcpServers': {}}])
