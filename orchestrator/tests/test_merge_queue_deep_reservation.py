@@ -484,3 +484,217 @@ class TestBTheReservationIsTimeLimited:
             await rnd.land_head_and_p()
             outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
             assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
+
+
+@dataclasses.dataclass
+class _Lane:
+    lane: MergeLane
+    queue: asyncio.Queue[Any]
+    clock: FakeClock
+
+    def put(self, *requests: MergeRequest) -> None:
+        for request in requests:
+            self.queue.put_nowait(request)
+
+
+@contextlib.asynccontextmanager
+async def _running(
+    scene: _Scene, *, verifier: FakeVerifier, remotes: list[FakeRemoteRunner],
+    speculation_depth: int, stop_timeout: float = 60.0,
+) -> AsyncIterator[_Lane]:
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    clock = healthy_verify_clock()
+    lane = make_lane(
+        scene.git_ops, queue, verifier=verifier, clock=clock,
+        speculation_depth=speculation_depth, remote_runners=remotes,
+        event_store=scene.events,
+    )
+    async with running_lane(lane, stop_timeout=stop_timeout):
+        yield _Lane(lane, queue, clock)
+
+
+async def _requests(scene: _Scene, *names: str) -> dict[str, MergeRequest]:
+    return {name: await _request(scene, name) for name in names}
+
+
+async def _first_parent(scene: _Scene, sha: str) -> str:
+    _, parent, _ = await _run(
+        ['git', 'rev-parse', f'{sha}^1'], cwd=scene.git_ops.project_root,
+    )
+    return parent.strip()
+
+
+async def _lane_time_passes(run: _Lane, secs: float) -> None:
+    """Let the running lane's loops carry its clock *secs* on."""
+    start = run.clock.monotonic()
+    await _until(lambda: run.clock.monotonic() > start + secs, label=f'{secs}s of lane time')
+
+
+_AWAITING_DISPATCH = ('awaiting_verify', 'awaiting_host')
+
+
+class TestDTheLookAheadWaitsForTheChainDecision:
+    """D: the merger's look-ahead waits until S's dispatch has decided its chain."""
+
+    async def test_a_free_permit_does_not_take_the_followers_before_s_dispatches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D1: speculation_depth 3 leaves a permit free after S, yet S1 and
+        S2 stay buffered until S's dispatch has chained them."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'S1', 'S2')
+        head_entered, release_head = asyncio.Event(), asyncio.Event()
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'S': hangs_until(release_s, entered=s_entered)})
+        remotes = [FakeRemoteRunner(_HEAD_HOST, release=release_head, entered=head_entered)]
+        async with _running(
+            scene, verifier=verifier, remotes=remotes, speculation_depth=3,
+        ) as run:
+            run.put(reqs['H'])
+            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            run.put(reqs['S'], reqs['S1'], reqs['S2'])
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            rows = [(r['owner_task_id'], r['link_task_ids']) for r in _reservations(run.lane)]
+            assert rows == [('S', ['S1', 'S2'])]
+            assert run.lane.unfrozen_suffix() == (reqs['S1'].request_id, reqs['S2'].request_id)
+
+            release_head.set()
+            release_s.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'S1', 'S2')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('S', 'S1', 'S2')] == [1, 1, 1]
+            assert verifier.verified == ['S']
+            assert await _landed_task_files(scene) == ['H', 'S', 'S1', 'S2']
+            _assert_no_live_permit(run.lane)
+
+    async def test_without_chains_the_look_ahead_is_not_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D2: at chain_cap 0 the look-ahead merges S1 at once, and S1 is
+        verified on its own while S's verify still runs."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(chain_cap=0))
+        reqs = await _requests(scene, 'H', 'S', 'S1', 'S2')
+        head_entered, release_head = asyncio.Event(), asyncio.Event()
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier()
+        remotes = [
+            FakeRemoteRunner(_HEAD_HOST, release=release_head, entered=head_entered),
+            FakeRemoteRunner('s-host', release=release_s, entered=s_entered),
+        ]
+        async with _running(
+            scene, verifier=verifier, remotes=remotes, speculation_depth=3,
+        ) as run:
+            run.put(reqs['H'])
+            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            run.put(reqs['S'], reqs['S1'], reqs['S2'])
+            await wait_responsive(s_entered.wait(), label="S's verify under way on s-host")
+            await wait_responsive(verifier.await_entry(1), label='S1 verified on local')
+            assert verifier.verified == ['S1']
+            assert not release_s.is_set()
+            assert _reservations(run.lane) == []
+
+            release_head.set()
+            release_s.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'S1', 'S2')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(outcomes)
+            assert await _landed_task_files(scene) == ['H', 'S', 'S1', 'S2']
+            assert _reservations(run.lane) == []
+
+    async def test_with_no_free_host_the_follower_waits_for_the_chain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D3: S waits for a host and the merger waits for S; S1 is not lost,
+        and S chains it once H's verify frees the host."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'S1')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
+            run.put(reqs['H'])
+            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            run.put(reqs['S'], reqs['S1'])
+            await _until(
+                lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
+                label='S merged and waiting for a host',
+            )
+            await _lane_time_passes(run, 300)
+            assert lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
+            assert run.lane.unfrozen_suffix() == (reqs['S1'].request_id,)
+            assert lane_state(run.lane, reqs['S1'].request_id) == 'queued'
+
+            release_h.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'S1')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('S', 'S1')] == [1, 1]
+            assert verifier.verified == ['H', 'S']
+            assert await _landed_task_files(scene) == ['H', 'S', 'S1']
+
+    async def test_a_declined_chain_releases_the_merger_at_dispatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D4: with nothing buffered behind S its dispatch builds no chain, the
+        merger goes on at once, and a late arrival still attaches behind S."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'L')
+        head_entered, release_head = asyncio.Event(), asyncio.Event()
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        l_entered = asyncio.Event()
+        s_host = FakeRemoteRunner('s-host', release=release_s, entered=s_entered)
+        l_host = FakeRemoteRunner('l-host', entered=l_entered)
+        remotes = [
+            FakeRemoteRunner(_HEAD_HOST, release=release_head, entered=head_entered),
+            s_host, l_host,
+        ]
+        async with _running(
+            scene, verifier=FakeVerifier(), remotes=remotes, speculation_depth=2,
+        ) as run:
+            run.put(reqs['H'])
+            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            run.put(reqs['S'])
+            await wait_responsive(s_entered.wait(), label="S's verify under way on s-host")
+            assert _reservations(run.lane) == []
+            run.put(reqs['L'])
+            await wait_responsive(l_entered.wait(), label="L's verify under way on l-host")
+            assert await _first_parent(scene, l_host.calls[0]) == s_host.calls[0]
+
+            release_head.set()
+            release_s.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'L')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert await _landed_task_files(scene) == ['H', 'S', 'L']
+            assert len(l_host.calls) == 1
+
+    async def test_stop_releases_a_held_merger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D4: a merger held on S's chain decision does not hold up the lane's stop."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'S1')
+        h_entered = asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(asyncio.Event(), entered=h_entered)})
+        async with _running(
+            scene, verifier=verifier, remotes=[], speculation_depth=2, stop_timeout=15.0,
+        ) as run:
+            run.put(reqs['H'])
+            await wait_responsive(h_entered.wait(), label='H verify under way on local')
+            run.put(reqs['S'], reqs['S1'])
+            await _until(
+                lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
+                label='S merged and waiting for a host',
+            )
+            await _lane_time_passes(run, 300)
+            assert lane_state(run.lane, reqs['S1'].request_id) == 'queued'
+        assert all(reqs[name].result.done() for name in ('H', 'S', 'S1'))
