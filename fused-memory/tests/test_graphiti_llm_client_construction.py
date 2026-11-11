@@ -253,8 +253,10 @@ class TestBuildLLMClientOpenAIGenericPath:
 # guards red.
 MAX_TOKENS_SENTINEL = 2048
 
-# Every arm of build_llm_client that reads cfg.llm.max_tokens, kept as one list
-# so an arm added or rebuilt without the kwarg goes red here.
+# Every arm of build_llm_client that reads cfg.llm.max_tokens. A listed arm
+# rebuilt without the kwarg goes red here; a new arm is guarded only once it is
+# added to this tuple, and an OpenAI-shaped one also to the parametrize list of
+# test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire.
 MAX_TOKENS_ARMS = (
     'openai',
     'openai_generic/auto',

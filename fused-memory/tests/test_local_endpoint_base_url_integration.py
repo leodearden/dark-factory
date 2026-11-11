@@ -186,7 +186,8 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
         ``self.max_tokens``, so ``GraphitiLLMConfig(max_tokens=...)`` alone never
         reaches the wire: the constructor kwarg is the only lever.
 
-        Both generic classes inherit ``OpenAIGenericClient.__init__``, and
+        ``TokenRecordingOpenAIGenericClient`` forwards its constructor arguments
+        to ``OpenAIGenericClient.__init__`` unchanged, and
         ``ForceJsonObjectOpenAIGenericClient`` overrides only
         ``_generate_response``, so one construction call serves both modes. Both
         modes are parametrized here so an arm that drifts goes red.
