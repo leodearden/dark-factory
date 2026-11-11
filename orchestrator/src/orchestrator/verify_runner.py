@@ -3337,6 +3337,14 @@ class EnvDriftCheckResult:
     remote_probes:    The remote host's extra_probes mapping ({} when unprobed).
     escalated:        True when a NEW env-divergence escalation was submitted
                       (False when deduped against an already-open L1).
+    unavailable_reason: str() of the RunnerUnavailable that made the check
+                      INCONCLUSIVE — for a remote, ssh's own stderr via
+                      ``RemoteRunner._probe_ssh`` — so a dispatcher-side fault
+                      such as an unbindable ControlPath can be told from an
+                      unreachable host.  None on every other result, including
+                      the INCONCLUSIVE guards for a check that was not taken.
+                      Construction rejects a reason on anything but a faithful
+                      INCONCLUSIVE, because check_env_safely logs it as one.
     """
     verdict: DriftVerdict
     is_faithful: bool
@@ -3344,6 +3352,18 @@ class EnvDriftCheckResult:
     local_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     escalated: bool = False
+    unavailable_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.unavailable_reason is None:
+            return
+        if self.verdict is not DriftVerdict.INCONCLUSIVE or not self.is_faithful:
+            raise ValueError(
+                'EnvDriftCheckResult: unavailable_reason is set only on a faithful '
+                f'INCONCLUSIVE; got verdict={self.verdict}, '
+                f'is_faithful={self.is_faithful}, '
+                f'unavailable_reason={self.unavailable_reason!r}'
+            )
 
 
 class DriftDetector:
@@ -3605,7 +3625,10 @@ class DriftDetector:
         ------------
         AGREE → emit ``verify_env_parity_ok`` (None-safe).
         DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
-        INCONCLUSIVE → nothing at all: no event, no escalation, no probe.
+        INCONCLUSIVE → no event, no escalation.  When a runner raised
+        RunnerUnavailable its message is kept on ``unavailable_reason``, which
+        :meth:`check_env_safely` logs once at INFO; every other INCONCLUSIVE
+        carries None.
         INCONCLUSIVE covers every reason the check could not be TAKEN — no
         probes declared, no local runner, no eligible remote (including one
         the verdict path just quarantined), a remote that is not a
@@ -3707,7 +3730,7 @@ class DriftDetector:
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Invariant 5: transport failure is not divergence.  A closed or
             # flaky laptop must never raise a false env-skew alarm — the same
             # reasoning check() applies to a failed verify dispatch.
@@ -3717,7 +3740,11 @@ class DriftDetector:
             # spawn failure) into RunnerUnavailable precisely so an unreachable
             # host lands here instead of comparing '<unavailable rc=255>'
             # against real local versions and alarming on every declared tool.
-            return inconclusive
+            return EnvDriftCheckResult(
+                verdict=DriftVerdict.INCONCLUSIVE,
+                is_faithful=True,
+                unavailable_reason=str(exc),
+            )
 
         parity = compare_env_fingerprints(local_fp, remote_fp, dimensions=dimensions)
 
@@ -3840,18 +3867,27 @@ class DriftDetector:
         here — an ssh probe hanging up, a malformed argv, a bug in
         ``check_env``, its ValueError for a bad selection — is logged at
         WARNING with the traceback and swallowed rather than allowed to skip
-        ``check``.
+        ``check``.  An INCONCLUSIVE caused by RunnerUnavailable is logged once
+        at INFO with its ``unavailable_reason``.
         """
-        import logging
-
         try:
-            await self.check_env([(probe.key, list(probe.argv)) for probe in probes])
+            result = await self.check_env(
+                [(probe.key, list(probe.argv)) for probe in probes]
+            )
         except Exception:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 'Env drift check failed for task %s; ignoring (detective control)',
                 self._task_id,
                 exc_info=True,
             )
+        else:
+            if result.unavailable_reason is not None:
+                logger.info(
+                    'Env drift check inconclusive for task %s '
+                    '(runner unavailable, not an alarm): %s',
+                    self._task_id,
+                    result.unavailable_reason,
+                )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:
