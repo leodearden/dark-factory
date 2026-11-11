@@ -69,8 +69,8 @@ _HINTS: Mapping[MergeReason, str] = types.MappingProxyType({
     ),
     MergeReason.prior_run_terminal: (
         "Only a previous orchestrator run's record exists (see last_outcome); it "
-        "is history, not this run's outcome. Resubmit with merge_request if the "
-        'work is still not on main.'
+        "is history, not this run's outcome. Do not resubmit on this answer: "
+        "resubmitting after a prior run's record is a human's decision."
     ),
     MergeReason.journaled_not_live: (
         'The durable merge journal holds this request, but the live worker '
