@@ -17,6 +17,7 @@ import types
 
 import _watchdog_crash_loop as crash_loop
 import pytest
+from fake_uv import argv_flag, recorded_argvs, write_fake_uv
 
 # Resolves because the root conftest.py appends the repo root to sys.path.
 from df_pytest_isolation import synthetic_unit
@@ -538,29 +539,6 @@ def test_load_drops_unusable_parts_of_a_hand_edited_entry(tmp_path: pathlib.Path
 _RATE_ALARM = crash_loop.CrashLoopAlarm(UNIT, AlarmKind.RESTART_RATE, 6, WINDOW)
 
 
-def _fake_uv(
-    tmp_path: pathlib.Path, *, exit_code: int = 0
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Write an executable stand-in for uv that records its argv; return (uv, record)."""
-    record = tmp_path / "fake-uv-calls.jsonl"
-    uv = tmp_path / "fake-uv"
-    uv.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
-        f"with open({str(record)!r}, 'a') as f:\n"
-        "    f.write(json.dumps(sys.argv) + '\\n')\n"
-        f"sys.exit({exit_code})\n"
-    )
-    uv.chmod(0o755)
-    return uv, record
-
-
-def _recorded(record: pathlib.Path) -> list[list[str]]:
-    if not record.exists():
-        return []
-    return [json.loads(line) for line in record.read_text().splitlines()]
-
-
 def test_submit_argv_is_the_born_at_l2_shape(tmp_path: pathlib.Path) -> None:
     repo = str(tmp_path)
     queue = str(tmp_path / "q")
@@ -596,7 +574,7 @@ def test_submit_argv_is_the_born_at_l2_shape(tmp_path: pathlib.Path) -> None:
 def test_file_escalation_runs_submit_once_and_logs_the_sentinel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    uv, record = _fake_uv(tmp_path)
+    uv, record = write_fake_uv(tmp_path)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
     logged: list[str] = []
 
@@ -605,7 +583,7 @@ def test_file_escalation_runs_submit_once_and_logs_the_sentinel(
     )
 
     assert filed is True
-    assert _recorded(record) == [
+    assert recorded_argvs(record) == [
         crash_loop.crash_loop_submit_argv(
             _RATE_ALARM,
             uv_bin=str(uv),
@@ -619,7 +597,7 @@ def test_file_escalation_runs_submit_once_and_logs_the_sentinel(
 def test_file_escalation_reports_a_failed_submit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    uv, _record = _fake_uv(tmp_path, exit_code=3)
+    uv, _record = write_fake_uv(tmp_path, exit_code=3)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
     logged: list[str] = []
 
@@ -682,32 +660,28 @@ def _state(tmp_path: pathlib.Path) -> dict:
     )
 
 
-def _flag(argv: list[str], name: str) -> str:
-    return argv[argv.index(name) + 1]
-
-
 def test_pass_pages_once_for_a_restart_burst(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    uv, record = _fake_uv(tmp_path)
+    uv, record = write_fake_uv(tmp_path)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
 
     _tick(tmp_path, {UNIT: _status(0)}, T)
     _tick(tmp_path, {UNIT: _status(5)}, T + 600)
 
-    calls = _recorded(record)
+    calls = recorded_argvs(record)
     assert len(calls) == 1
     argv = calls[0]
-    assert _flag(argv, "--task") == f"orchestrator-crash-loop-{UNIT}"
-    assert _flag(argv, "--severity") == "critical"
-    assert _flag(argv, "--category") == "infra_issue"
-    assert _flag(argv, "--agent-role").startswith("orchestrator-")
-    assert _flag(argv, "--queue-dir") == str(tmp_path / "data" / "escalations")
+    assert argv_flag(argv, "--task") == f"orchestrator-crash-loop-{UNIT}"
+    assert argv_flag(argv, "--severity") == "critical"
+    assert argv_flag(argv, "--category") == "infra_issue"
+    assert argv_flag(argv, "--agent-role").startswith("orchestrator-")
+    assert argv_flag(argv, "--queue-dir") == str(tmp_path / "data" / "escalations")
 
     logged: list[str] = []
     _tick(tmp_path, {UNIT: _status(6)}, T + 660, logged)
 
-    assert len(_recorded(record)) == 1
+    assert len(recorded_argvs(record)) == 1
     unit_state = _state(tmp_path)[UNIT]
     assert unit_state["samples"] == [[T, 0], [T + 600, 5], [T + 660, 6]]
     assert unit_state["last_escalation_epoch"] == T + 600
@@ -717,44 +691,44 @@ def test_pass_pages_once_for_a_restart_burst(
 def test_pass_pages_start_limit_hit_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    uv, record = _fake_uv(tmp_path)
+    uv, record = write_fake_uv(tmp_path)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
 
     _tick(tmp_path, {UNIT: _status(2, "start-limit-hit")}, T)
-    assert len(_recorded(record)) == 1
+    assert len(recorded_argvs(record)) == 1
 
     _tick(tmp_path, {UNIT: _status(2, "start-limit-hit")}, T + 2000)
-    assert len(_recorded(record)) == 1
+    assert len(recorded_argvs(record)) == 1
 
 
 def test_pass_retries_a_start_limit_hit_page_that_failed_to_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """A broken submit must not mark the episode paged: the unit stays down meanwhile."""
-    uv, record = _fake_uv(tmp_path, exit_code=3)
+    uv, record = write_fake_uv(tmp_path, exit_code=3)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
     stuck = {UNIT: _status(10, "start-limit-hit")}
 
     _tick(tmp_path, stuck, T)
-    assert len(_recorded(record)) == 1
+    assert len(recorded_argvs(record)) == 1
     assert _state(tmp_path)[UNIT]["start_limit_paged"] is False
 
     logged: list[str] = []
     _tick(tmp_path, stuck, T + 60, logged)
-    assert len(_recorded(record)) == 1
+    assert len(recorded_argvs(record)) == 1
     assert any("not re-filing" in m and "attempt" in m for m in logged), logged
 
     _tick(tmp_path, stuck, T + WINDOW)
-    assert len(_recorded(record)) == 2
+    assert len(recorded_argvs(record)) == 2
 
-    _fake_uv(tmp_path, exit_code=0)
+    write_fake_uv(tmp_path, exit_code=0)
 
     _tick(tmp_path, stuck, T + 2 * WINDOW)
-    assert len(_recorded(record)) == 3
+    assert len(recorded_argvs(record)) == 3
     assert _state(tmp_path)[UNIT]["start_limit_paged"] is True
 
     _tick(tmp_path, stuck, T + 3 * WINDOW)
-    assert len(_recorded(record)) == 3
+    assert len(recorded_argvs(record)) == 3
 
 
 def test_pass_returns_every_status_and_one_unit_cannot_blind_the_rest(
@@ -795,12 +769,12 @@ def test_pass_returns_statuses_when_the_state_cannot_be_written(
 def test_pass_with_every_status_unknown_files_nothing_but_saves(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    uv, record = _fake_uv(tmp_path)
+    uv, record = write_fake_uv(tmp_path)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
     unknown = crash_loop.UNKNOWN_RESTART_STATUS
 
     statuses = _tick(tmp_path, {UNIT: unknown, OTHER: unknown}, T)
 
     assert statuses == {UNIT: unknown, OTHER: unknown}
-    assert _recorded(record) == []
+    assert recorded_argvs(record) == []
     assert set(_state(tmp_path)) == {UNIT, OTHER}

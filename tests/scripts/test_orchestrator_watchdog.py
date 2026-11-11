@@ -24,6 +24,7 @@ import types
 
 import _watchdog_crash_loop as crash_loop
 import pytest
+from fake_uv import argv_flag, recorded_argvs, write_fake_uv
 
 # Importable by name only because tests/scripts/conftest.py puts this
 # directory on sys.path, which pytest's --import-mode=importlib deliberately
@@ -1348,30 +1349,6 @@ def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -
 _SHOW_RESTARTS_ARGV_TAIL = "--property=NRestarts,Result"
 
 
-def _fake_uv_recorder(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """An executable stand-in for uv that records its argv; return (uv, record)."""
-    record = tmp_path / "fake-uv-calls.jsonl"
-    uv = tmp_path / "fake-uv"
-    uv.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
-        f"with open({str(record)!r}, 'a') as f:\n"
-        "    f.write(json.dumps(sys.argv) + '\\n')\n"
-    )
-    uv.chmod(0o755)
-    return uv, record
-
-
-def _recorded_argvs(record: pathlib.Path) -> list[list[str]]:
-    if not record.exists():
-        return []
-    return [json.loads(line) for line in record.read_text().splitlines()]
-
-
-def _argv_flag(argv: list[str], name: str) -> str:
-    return argv[argv.index(name) + 1]
-
-
 def _restart_rate_state() -> dict:
     return json.loads(pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"]).read_text())
 
@@ -1479,7 +1456,7 @@ def test_main_pages_a_restart_burst_once_per_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     wdog = _load_watchdog()
-    uv, record = _fake_uv_recorder(tmp_path)
+    uv, record = write_fake_uv(tmp_path)
     monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
     state_path = pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"])
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1495,14 +1472,14 @@ def test_main_pages_a_restart_burst_once_per_window(
 
     wdog.main()
 
-    calls = _recorded_argvs(record)
+    calls = recorded_argvs(record)
     assert len(calls) == 1
-    assert _argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
-    assert _argv_flag(calls[0], "--severity") == "critical"
+    assert argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert argv_flag(calls[0], "--severity") == "critical"
 
     wdog.main()
 
-    assert len(_recorded_argvs(record)) == 1
+    assert len(recorded_argvs(record)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1578,7 +1555,7 @@ def test_main_leaves_a_start_limit_hit_unit_down_and_pages_once(
     assert _systemctl_mutations(calls) == []
     pages = _pages(calls, uv)
     assert len(pages) == 1
-    assert _argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
     assert any(_DF_UNIT in m and "start-limit-hit" in m for m in logged), logged
 
     wdog.main()
