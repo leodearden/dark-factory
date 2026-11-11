@@ -1,0 +1,54 @@
+{
+  "task_id": "8525",
+  "reason": "net-additive: gate re-verify dispatched as an item; successors re-anchor on the rebased head (the ReverifyDispatch arm in _reverify_rebased_tree/_finalize_inflight, ReverifyGateDecision.dispatches, and the test harness following a redispatched rebased head)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 358,
+      "current": 360
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+      "baseline": 3,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+      "baseline": 5,
+      "current": 7
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_finalize_inflight",
+      "baseline": 57,
+      "current": 59
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/_merge_queue_harness.py",
+      "baseline": 8,
+      "current": 16
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/_merge_queue_harness.py::finalize_through_gate",
+      "baseline": 3,
+      "current": 7
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/_merge_queue_harness.py",
+      "baseline": 4,
+      "current": 8
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6480,
+      "current": 6484
+    }
+  ]
+}

@@ -15879,8 +15879,9 @@ class SpeculativeMergeWorker:
 
                 if isinstance(dispatched, NoHost):
                     # No host available: park what the dispatch produced on the
-                    # redispatch park.
-                    self._park_unhosted(dispatched)
+                    # redispatch park's front (it came off the front, or the
+                    # park was empty).
+                    self._park_unhosted(dispatched, front=True)
                     fill_done = True
                     break
                 entry = dispatched
@@ -16200,9 +16201,11 @@ class SpeculativeMergeWorker:
                     continue
 
                 if isinstance(dispatched, NoHost):
-                    # No host (shouldn't happen with empty _inflight on a single-host
-                    # system, but handle defensively: park what the dispatch produced).
-                    self._park_unhosted(dispatched)
+                    # No host: park what the dispatch produced BEHIND the park.
+                    # This arm is reached with the park non-empty (a rebased head
+                    # waiting for a host, task 8525), and a queue item is newer
+                    # than every parked one.
+                    self._park_unhosted(dispatched, front=False)
                     continue
                 entry = dispatched
 
@@ -16261,9 +16264,9 @@ class SpeculativeMergeWorker:
         takes the blocking get, which stop()'s sentinel ends.
 
         Nothing is in flight, so no verify completion will wake the loop.  The
-        queue getter is deliberately left alone: while the queue is empty that
-        keeps a newer item from being appendleft-ed ahead of the parked one
-        (the blocking-get arm still does that once the queue is non-empty).
+        queue getter is deliberately left alone, and once the queue is
+        non-empty the blocking-get arm parks a hostless newer item behind the
+        parked one, never ahead of it (task 8525).
         """
         while True:
             with contextlib.suppress(TimeoutError):
@@ -19394,8 +19397,8 @@ class SpeculativeMergeWorker:
                 cleared = await gate.task
                 _cancel_release = False
                 if isinstance(cleared, ReverifyDispatch):
-                    if await self._dispatch_rebased_head(gate):
-                        _n_failed_val = False  # re-verifying as a dispatch, not failed
+                    # Re-verifying as a dispatch is not a failure; a refused dispatch is.
+                    _n_failed_val = not await self._dispatch_rebased_head(gate)
                     return False
                 candidate = await self._candidate_after_gate(entry, gate, cleared)
                 if candidate is None:
@@ -20570,14 +20573,14 @@ class SpeculativeMergeWorker:
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads
 
-    def _park_unhosted(self, no_host: NoHost) -> None:
+    def _park_unhosted(self, no_host: NoHost, *, front: bool) -> None:
         """Park the item a hostless dispatch produced on the redispatch park."""
         item = no_host.item
         self._note_transition(
             item.request.request_id, ItemLifecycleState.DISPATCHING,
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=item,
         )
-        self._intake.request_redispatch(item, front=True)
+        self._intake.request_redispatch(item, front=front)
 
     async def _dispatch_item(
         self,
