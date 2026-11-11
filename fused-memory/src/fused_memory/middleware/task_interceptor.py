@@ -31,7 +31,7 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
-from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -4020,14 +4020,17 @@ class TaskInterceptor:
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
 
-        Stamps ``pure_gate_from`` with ``trigger``, recording which conversion
-        produced the gate.
+        Stamps ``pure_gate_from`` with ``trigger`` only when the conversion
+        rewrote the routing: metadata already in the pure-gate shape stays
+        unstamped, and an existing stamp is kept.
         """
         meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
+        declared = is_pure_gate_shape(meta)
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
-        meta[PURE_GATE_FROM_KEY] = trigger.value
+        if not declared:
+            meta[PURE_GATE_FROM_KEY] = trigger.value
         return meta
 
     @staticmethod

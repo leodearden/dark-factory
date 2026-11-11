@@ -1626,8 +1626,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # unrepairable until task 3777 lifts the presence-only write-authority
         # floor.
         'execution_class',
-        # Written by fused-memory's TaskInterceptor._inject_deterministic_pure_gate on
-        # every pure-gate conversion; values: shared/pure_gate_provenance.py::PureGateTrigger.
+        # Written by fused-memory's TaskInterceptor._inject_deterministic_pure_gate when a
+        # conversion rewrites a submission's routing; values: shared/pure_gate_provenance.py::PureGateTrigger.
         PURE_GATE_FROM_KEY,
         # Merge-queue priority-lane selector (task 4888). The sole input to
         # lane selection anywhere in the system, and the only way a task can

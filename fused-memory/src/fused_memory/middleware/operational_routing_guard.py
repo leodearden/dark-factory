@@ -23,8 +23,8 @@ submit path (normal, planning_mode, direct interceptor).
 ``before_done`` dropped — the shape enforced by
 ``deterministic_task_guard.deterministic_task_error`` (a deterministic task
 with no action must always escalate, never be an ill-formed no-op) — plus
-``pure_gate_from`` naming the triggering execution_class. The
-stamp itself is delegated verbatim to
+``pure_gate_from`` naming the triggering execution_class when the
+submission was not already in that shape. The stamp itself is delegated verbatim to
 :meth:`TaskInterceptor._inject_deterministic_pure_gate` (INV-5 — the
 pure-gate stamp is reused, never re-implemented).
 
@@ -71,7 +71,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
 
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
@@ -136,12 +136,12 @@ def pure_gate_routing_notice(metadata: object) -> dict[str, Any]:
     """The submit-response notice for a submission converted into a pure gate, else ``{}``.
 
     Derived from the stored stamp, so the notice and the task record cannot
-    disagree. A stamp without ``always_escalates=True`` gets no notice: it
-    would claim a human gate that does not exist.
+    disagree. A stamp on metadata that is not in the pure-gate shape gets no
+    notice: it would claim a human gate that does not exist.
     """
     if not isinstance(metadata, Mapping):
         return {}
-    if metadata.get('always_escalates') is not True:
+    if not is_pure_gate_shape(metadata):
         return {}
     try:
         trigger = PureGateTrigger(metadata.get(PURE_GATE_FROM_KEY))
