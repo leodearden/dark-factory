@@ -25,6 +25,7 @@ from shared.delivered_check_polarity import (
     lint_delivered_checks,
     polarity_error,
 )
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
@@ -9380,6 +9381,15 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
+        ``metadata.execution_class`` 'operational' or 'decision' converts the
+        submission into a deterministic pure gate that escalates to a HUMAN at
+        dispatch; the response then carries ``routing_notice`` and the task
+        carries ``metadata.pure_gate_from``, unless the metadata already
+        declares that shape (``task_kind='deterministic'`` +
+        ``always_escalates=True``), in which case nothing is rewritten and
+        neither appears. A docs, comment or rename edit is agent work:
+        ``task_kind='normal'`` + ``metadata.complexity='simple'``.
+
         Any string argument carrying a raw MCP envelope fragment — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
@@ -9673,6 +9683,11 @@ def create_mcp_server(
         # the interceptor-side twin re-running on this coerced metadata is a
         # no-op. This deliberately reverses the declaration-only scoping of
         # tasks 2085/2563 (owner-greenlit 2026-07-19).
+        #
+        # pure_gate_from is machine-written, so a caller's copy (metadata
+        # cloned from get_task, say) is dropped here at the outer boundary,
+        # never in the twin, which must keep the stamp written just below.
+        metadata.pop(PURE_GATE_FROM_KEY, None)
         metadata = inject_operational_routing(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.

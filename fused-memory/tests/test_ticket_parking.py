@@ -314,6 +314,7 @@ class TestUncappedCurationUnchanged:
         }
         assert taskmaster.added_metadata() == [{
             **_FILED_METADATA, 'task_kind': 'deterministic', 'always_escalates': True,
+            'pure_gate_from': 'operational_ask_registry',
         }]
 
 

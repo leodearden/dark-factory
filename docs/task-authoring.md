@@ -867,8 +867,18 @@ operator (a ruling, an action no agent can take).
 docs edits). This mistake — declaring a mechanical docs leaf `'operational'`
 because it "isn't code" — has been made by multiple independent sessions
 (ruled by Leo 2026-08-24; tasks 4626/4671/4675/4680 were retyped out of it).
-The conversion is currently **silent** in the `submit_task` response; a
-submit-time notice + metadata provenance stamp is filed as its own task.
+The conversion is not silent. On both the ticket and the `planning_mode`
+path the `submit_task` response carries `routing_notice` (`pure_gate_from`,
+`detail`, `hint`), and the stored task carries `metadata.pure_gate_from`
+naming the trigger: `execution_class=operational`, `execution_class=decision`,
+or `operational_ask_registry` (vocabulary:
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger`). The last is the
+curator's route for an untagged ask matching the operational-ask registry. The
+curator decides that after `submit_task` has returned, so that path gets the
+stamp and `resolve_ticket`'s `route_deterministic` reason, but no response
+notice. Only a submission whose routing the conversion actually rewrites is
+marked: one that already declares the pure-gate shape, such as recon's
+consolidation gate, gets neither `routing_notice` nor `pure_gate_from`.
 
 ---
 
@@ -1529,8 +1539,9 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane, pending_since, pending_since_backfilled,
-claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
+execution_class, pure_gate_from, merge_lane, pending_since,
+pending_since_backfilled, claimant_exception, audit_trail_rotation,
+plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
 predicate_recheck, predicate_verdict
 ```
@@ -1574,6 +1585,20 @@ Three of the entries belong to the completion-driven trigger chain
   predicate's trailing JSON-object payload, parsed; or
   `{"elided": true, "chars": N}` over the 400-char cap; or `null` when a
   declared `75` carried no JSON object (§6).
+
+`pure_gate_from` is machine-written at conversion, never author-supplied: the
+`submit_task` tool drops a caller-supplied value (metadata cloned from
+`get_task`, say), and `TaskInterceptor._inject_deterministic_pure_gate`
+stamps it with a
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
+is written only when the conversion rewrote the submission's routing: a
+submission that already declared the pure-gate shape
+(`task_kind='deterministic'` with `always_escalates=True` and no
+`before_done`) is never stamped, whatever its `execution_class` (the rule is
+`shared/src/shared/pure_gate_provenance.py::is_pure_gate_shape`). It is history,
+not current state: `update_task`'s shallow metadata merge keeps it after a
+retype, so a watcher or retype workflow pairs it with the current
+`task_kind`/`always_escalates` before treating a task as a mis-filed conversion.
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not

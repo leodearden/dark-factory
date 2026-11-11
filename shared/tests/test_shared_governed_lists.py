@@ -161,6 +161,7 @@ BLESSED_TASK_METADATA_KEYS = governed_exceptions(
         'cancel_dispositions': Policy('inv12-task-metadata-blessed-keys'),
         'predicate_recheck': Policy('inv12-task-metadata-blessed-keys'),
         'predicate_verdict': Policy('inv12-task-metadata-blessed-keys'),
+        'pure_gate_from': Policy('inv12-task-metadata-blessed-keys'),
         'superseded_by': Policy('inv12-task-metadata-blessed-keys'),
         'trigger_chain': Policy('inv12-task-metadata-blessed-keys'),
     },

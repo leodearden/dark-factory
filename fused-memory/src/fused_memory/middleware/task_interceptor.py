@@ -31,6 +31,7 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
@@ -114,6 +115,7 @@ from fused_memory.middleware.lock_charter_guard import (
 # function to break the cycle), so this does not create a circular import.
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
+    pure_gate_routing_notice,
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
@@ -4002,7 +4004,7 @@ class TaskInterceptor:
         return meta
 
     @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any) -> dict:
+    def _inject_deterministic_pure_gate(metadata: Any, *, trigger: PureGateTrigger) -> dict:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
         Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
@@ -4017,11 +4019,18 @@ class TaskInterceptor:
         deterministic task with no action must always escalate, never be an
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
+
+        Stamps ``pure_gate_from`` with ``trigger`` only when the conversion
+        rewrote the routing: metadata already in the pure-gate shape stays
+        unstamped, and an existing stamp is kept.
         """
         meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
+        declared = is_pure_gate_shape(meta)
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
+        if not declared:
+            meta[PURE_GATE_FROM_KEY] = trigger.value
         return meta
 
     @staticmethod
@@ -4237,19 +4246,26 @@ class TaskInterceptor:
         # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
+        # The routing notice is derived here so it is right whichever layer
+        # (tools.py or this twin) converted; the curator's route_deterministic
+        # converts after this response is built, so it never carries one.
         metadata = inject_operational_routing(metadata)
+        routing_notice = pure_gate_routing_notice(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
         metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
-            return await self._submit_task_planning_mode(
+            result = await self._submit_task_planning_mode(
                 project_root=project_root,
                 project_id=project_id,
                 kwargs=kwargs,
                 metadata=metadata,
                 attribution=attribution,
             )
+            if routing_notice and interceptor_write_succeeded(result):
+                return {**result, **routing_notice}
+            return result
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -4277,7 +4293,7 @@ class TaskInterceptor:
             candidate_json=blob,
         )
         self._enqueue_ticket(project_id, ticket_id)
-        return {'ticket': ticket_id}
+        return {'ticket': ticket_id, **routing_notice}
 
     async def _submit_task_planning_mode(
         self,
@@ -4992,7 +5008,9 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(metadata)
+            metadata = self._inject_deterministic_pure_gate(
+                metadata, trigger=PureGateTrigger.OPERATIONAL_ASK_REGISTRY
+            )
 
         # ── Create task ───────────────────────────────────────────────
         status: str = TicketStatus.FAILED
