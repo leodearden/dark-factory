@@ -4669,6 +4669,68 @@ def test_report_extended_columns_stay_read_only(
 
 
 # ---------------------------------------------------------------------------
+# RESTARTS column (task 8270)
+#
+# NRestarts/Result per running unit, one whitespace-free token immediately
+# left of VERDICT, so the whitespace-positional readers above keep their
+# indices (tokens[-4:] is still VERDICT/DEPLOY-AGE/MERGE-IDLE/WOULD-DEFER).
+# ---------------------------------------------------------------------------
+
+
+def test_report_restarts_column_sits_left_of_verdict_and_stays_read_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wdog = _load_watchdog()
+    commit_epoch = 1_800_000_000
+    looping = synthetic_unit("restarts-looping")
+    stuck = synthetic_unit("restarts-stuck")
+    unreadable = synthetic_unit("restarts-unreadable")
+    restart_answers = {
+        looping: "Result=success\nNRestarts=3\n",
+        stuck: "Result=start-limit-hit\nNRestarts=10\n",
+    }
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        recorded_calls.append(list(cmd))
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(
+                f"{u} loaded active running desc\n" for u in (looping, stuck, unreadable)
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"] and _SHOW_RESTARTS_ARGV_TAIL in cmd:
+            unit = cmd[3]
+            if unit not in restart_answers:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such unit")
+            return subprocess.CompletedProcess(cmd, 0, stdout=restart_answers[unit], stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{commit_epoch + 100}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = wdog.report()
+
+    assert exit_code == 0, "staleness alone decides the exit code"
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("UNIT"))
+    assert "RESTARTS" in header
+    assert header.index("RESTARTS") < header.index("VERDICT")
+    rows = {line.split()[0]: line.split() for line in lines if line.split()[:1]}
+    expected = {looping: "3/success", stuck: "10/start-limit-hit", unreadable: "?/?"}
+    for unit, restarts in expected.items():
+        tokens = rows[unit]
+        assert tokens[-4] == "fresh", tokens
+        assert tokens[-5] == restarts, tokens
+    systemctl_verbs = {c[2] for c in recorded_calls if c[:1] == ["systemctl"]}
+    assert systemctl_verbs <= {"list-units", "show"}, systemctl_verbs
+
+
+# ---------------------------------------------------------------------------
 # _cli tests
 # ---------------------------------------------------------------------------
 
