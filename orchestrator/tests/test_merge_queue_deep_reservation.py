@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_deep_scene import _permit_census, _spy_chain_lane_release
 from _merge_lane_fakes import (
+    FakeClock,
     FakeRemoteRunner,
     FakeVerifier,
     VerifyScript,
@@ -166,6 +168,7 @@ class _Round:
     release_head: asyncio.Event
     release_p: asyncio.Event
     remotes: list[FakeRemoteRunner]
+    clock: FakeClock
 
     def put(self, *requests: MergeRequest) -> None:
         for request in requests:
@@ -203,12 +206,13 @@ async def _deep_round(
     ]
     verifier = _FirstVerifyScripted({'S': s_script})
     queue: asyncio.Queue[Any] = asyncio.Queue()
+    clock = healthy_verify_clock()
     lane = make_lane(
-        scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock(),
+        scene.git_ops, queue, verifier=verifier, clock=clock,
         speculation_depth=2, remote_runners=remotes, event_store=scene.events,
         **lane_kwargs,
     )
-    run_round = _Round(lane, queue, verifier, reqs, release_head, release_p, remotes)
+    run_round = _Round(lane, queue, verifier, reqs, release_head, release_p, remotes, clock)
     async with running_lane(lane):
         run_round.put(reqs['H'])
         await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
@@ -418,3 +422,68 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             rnd.reqs['S'].result.cancel()
             await self._assert_links_go_their_own_way(scene, rnd, s_status='abandoned')
+
+
+class TestBTheReservationIsTimeLimited:
+    """B: a confirmed reservation lasts merge_deep.chain_reservation_timeout_secs."""
+
+    async def test_an_expired_reservation_hands_the_links_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """B1: on expiry the links go back with a WARNING while the tip verify
+        continues; the passing tip then lands only what is still buffered, and
+        nothing lands twice."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(reservation_timeout=600))
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
+        ) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+
+            def _expiry_warned() -> bool:
+                return any(
+                    rec.name == 'orchestrator.merge_lane' and rec.levelno == logging.WARNING
+                    and 'expired' in rec.getMessage()
+                    and all(name in rec.getMessage() for name in ('S', 'F1', 'F2'))
+                    for rec in caplog.records
+                )
+
+            await _until(_expiry_warned, label='the reservation expired with a WARNING')
+            assert _reservations(rnd.lane) == []
+            await rnd.land_head_and_p()
+            await _until(
+                lambda: any(
+                    e['data'].get('chain_items') == 1
+                    for e in _verify_events_for(scene, {'F1'})
+                ),
+                label='F1 verified on its own by the ordinary pipeline',
+            )
+
+            release_s.set()
+            outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            landed = await _landed_task_files(scene)
+            assert sorted(landed) == ['F1', 'F2', 'H', 'P', 'S'], landed
+            assert rnd.lane.speculation_accounting_violations() == []
+
+    async def test_a_reservation_holds_before_its_deadline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B2: well inside the bound, the row is still there after the lane's
+        loops have run the clock on by an hour."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(reservation_timeout=1e9))
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
+        ) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            start = rnd.clock.monotonic()
+            await _until(
+                lambda: rnd.clock.monotonic() > start + 3600, label='an hour of lane time',
+            )
+            assert [r['link_task_ids'] for r in _reservations(rnd.lane)] == [['F1', 'F2']]
+            release_s.set()
+            await rnd.land_head_and_p()
+            outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
+            assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
