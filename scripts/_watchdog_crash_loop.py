@@ -18,9 +18,29 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 import os
+import subprocess
+
+from _watchdog_state import LogSink, atomic_write_json, read_json_state
 
 START_LIMIT_HIT_RESULT = "start-limit-hit"
+
+# The detector's own state, separate from every clock the watchdog keeps.
+# ORCH_RESTART_RATE_STATE overrides it (see restart_rate_state_path).
+RESTART_RATE_STATE_RELPATH = os.path.join(
+    "data", "orchestrator", "watchdog-restart-rate.json"
+)
+
+# The page's identity. escalation/src/escalation/submit.py enforces the
+# severity and role boundary these must satisfy.
+CRASH_LOOP_SENTINEL_PREFIX = "orchestrator-crash-loop-"
+# Kept exactly: the watcher-design ruling's rider (a) keys host-role records on it.
+CRASH_LOOP_AGENT_ROLE = "orchestrator-watchdog"
+# Born at L2: submit.py accepts only BORN_AT_L2_SEVERITIES.
+CRASH_LOOP_SEVERITY = "critical"
+CRASH_LOOP_CATEGORY = "infra_issue"
+CRASH_LOOP_SUBMIT_TIMEOUT_SECS = 60
 
 # Env-with-fallback: a typo must not crash the oneshot. Both clamp to >= 1:
 # a count of 0 would alarm on zero growth for every unit, and a window of 0
@@ -74,7 +94,7 @@ class CrashLoopAlarm:
 
     @property
     def task_sentinel(self) -> str:
-        return f"orchestrator-crash-loop-{self.unit}"
+        return f"{CRASH_LOOP_SENTINEL_PREFIX}{self.unit}"
 
     def summary(self) -> str:
         if self.kind is AlarmKind.START_LIMIT_HIT:
@@ -213,3 +233,143 @@ def _alarm_candidate(
     if growth >= alarm_count:
         return CrashLoopAlarm(unit, AlarmKind.RESTART_RATE, growth, window_secs)
     return None
+
+
+def restart_rate_state_path(repo_dir: str) -> str:
+    """Return the detector's state path: ORCH_RESTART_RATE_STATE, else under *repo_dir*."""
+    return os.environ.get(
+        "ORCH_RESTART_RATE_STATE", os.path.join(repo_dir, RESTART_RATE_STATE_RELPATH)
+    )
+
+
+def crash_loop_queue_dir(repo_dir: str) -> str:
+    """Return the escalation queue pages go to: ORCH_CRASH_LOOP_QUEUE_DIR, else *repo_dir*'s."""
+    return os.environ.get(
+        "ORCH_CRASH_LOOP_QUEUE_DIR", os.path.join(repo_dir, "data", "escalations")
+    )
+
+
+def watchdog_uv_bin() -> str:
+    """Return the uv that runs ``escalation submit``: absolute, as the watchdog unit sets no PATH.
+
+    Mirrors scripts/dashboard-watchdog.py::UV_BIN; ORCH_WATCHDOG_UV_BIN overrides it.
+    """
+    return os.environ.get("ORCH_WATCHDOG_UV_BIN", "/home/leo/.local/bin/uv")
+
+
+def load_restart_histories(path: str, log: LogSink) -> dict[str, UnitRestartHistory]:
+    """Read every unit's history from *path*; {} when there is none or it is unreadable.
+
+    A hand-edited entry loses only its unusable parts. An unusable
+    last_escalation_epoch reads as None, which fails toward paging.
+    """
+    state = read_json_state(path, log) or {}
+    histories: dict[str, UnitRestartHistory] = {}
+    for unit, entry in state.items():
+        if not isinstance(entry, dict):
+            log(f"ignoring non-object restart-rate entry for {unit} at {path}")
+            continue
+        histories[unit] = _history_from_json(entry)
+    return histories
+
+
+def save_restart_histories(
+    path: str, histories: dict[str, UnitRestartHistory], log: LogSink
+) -> bool:
+    """Write every unit's history to *path*; True iff the write landed."""
+    payload = {unit: dataclasses.asdict(history) for unit, history in histories.items()}
+    return atomic_write_json(path, payload, log)
+
+
+def _history_from_json(entry: dict) -> UnitRestartHistory:
+    raw_samples = entry.get("samples")
+    samples = raw_samples if isinstance(raw_samples, list) else []
+    return UnitRestartHistory(
+        samples=tuple(s for s in map(_as_sample, samples) if s is not None),
+        sampling_since=_as_count(entry.get("sampling_since")),
+        last_escalation_epoch=_as_count(entry.get("last_escalation_epoch")),
+        start_limit_paged=entry.get("start_limit_paged") is True,
+    )
+
+
+def _as_sample(raw: object) -> tuple[int, int] | None:
+    if not isinstance(raw, list) or len(raw) != 2:
+        return None
+    epoch, n = _as_count(raw[0]), _as_count(raw[1])
+    if epoch is None or n is None:
+        return None
+    return epoch, n
+
+
+def _as_count(raw: object) -> int | None:
+    """A non-negative finite number as an int; None for anything else, bools included."""
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    if not math.isfinite(raw) or raw < 0:
+        return None
+    return int(raw)
+
+
+def crash_loop_submit_argv(
+    alarm: CrashLoopAlarm, *, uv_bin: str, repo_dir: str, queue_dir: str
+) -> list[str]:
+    """The ``escalation submit`` argv that files *alarm* as a born-at-L2 record."""
+    return [
+        uv_bin,
+        "run",
+        "--project",
+        os.path.join(repo_dir, "escalation"),
+        "escalation",
+        "submit",
+        "--queue-dir",
+        queue_dir,
+        "--task",
+        alarm.task_sentinel,
+        "--severity",
+        CRASH_LOOP_SEVERITY,
+        "--category",
+        CRASH_LOOP_CATEGORY,
+        "--summary",
+        alarm.summary(),
+        "--detail",
+        alarm.detail(),
+        "--agent-role",
+        CRASH_LOOP_AGENT_ROLE,
+    ]
+
+
+def file_crash_loop_escalation(alarm: CrashLoopAlarm, *, repo_dir: str, log: LogSink) -> bool:
+    """File *alarm* into *repo_dir*'s escalation queue; True iff submit succeeded.
+
+    Never raises: a missing uv, a timeout or a non-zero exit is logged and
+    reported as False. Deduplication is the caller's: observe_unit stamps the
+    page epoch on attempt, so a broken submit retries at window cadence.
+    """
+    argv = crash_loop_submit_argv(
+        alarm,
+        uv_bin=watchdog_uv_bin(),
+        repo_dir=repo_dir,
+        queue_dir=crash_loop_queue_dir(repo_dir),
+    )
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CRASH_LOOP_SUBMIT_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(
+            f"crash-loop page {alarm.task_sentinel} NOT filed: could not run "
+            f"`escalation submit` ({type(exc).__name__}: {exc})"
+        )
+        return False
+    if result.returncode != 0:
+        log(
+            f"crash-loop page {alarm.task_sentinel} NOT filed: `escalation submit` "
+            f"exited {result.returncode}: {result.stderr.strip()[:500]!r}"
+        )
+        return False
+    log(f"filed born-at-L2 crash-loop page {alarm.task_sentinel} ({alarm.kind})")
+    return True
