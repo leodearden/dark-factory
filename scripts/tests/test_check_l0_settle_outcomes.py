@@ -13,8 +13,9 @@ from typing import Any
 
 import check_l0_settle_outcomes as settle
 import pytest
+from escalation import archive
 from escalation.archive import archive_dir_for_date
-from escalation.models import Escalation
+from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
 
 SCRIPT = Path(settle.__file__).resolve()
@@ -166,6 +167,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
 
     dismissed_then_refiled = build.ago(days=5)
     dismissed_then_refiled_late = build.ago(days=8)
+    dismissed_then_l2 = build.ago(days=12)
     post += [
         build.closed('11', build.ago(days=2), STEWARD),
         build.closed('12', build.ago(days=3), PROMOTION),
@@ -180,11 +182,13 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
         build.closed('19', build.ago(days=10), RESTART_DISMISSAL, late=True),
         build.closed('20', build.ago(days=11), WORKFLOW_DISMISSAL, late=True),
         build.pending('21', build.ago(hours=30)),
+        build.closed('22', dismissed_then_l2, REAPER_DISMISSAL),
     ]
     excluded += [
         build.closed('30', build.ago(days=3), PROMOTION, severity='info'),
         build.closed('__starvation_auto_pin_cap__', build.ago(days=4), PROMOTION),
         build.closed('31', build.ago(days=5), PROMOTION, level=1),
+        build.closed('22', dismissed_then_l2 + CLOSE_DELAY + timedelta(hours=2), STEWARD, level=2),
     ]
     pre += [build.closed(str(40 + n), build.ago(days=15 + n), STEWARD) for n in range(7)]
     pre += [build.closed('50', build.ago(days=25), PROMOTION)]
@@ -230,7 +234,7 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'stale_strands': 1,
         'stranded': 3,
         'stranded_per_100': rate(3, post_filed),
-        'reaper_dismissals': 4,
+        'reaper_dismissals': 5,
         'reaper_wrong': 2,
         'startup_dismissals': 2,
         'startup_wrong': 1,
@@ -253,7 +257,7 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
     assert payload['pending_over_h'] == 0
 
 
-def test_info_and_non_numeric_l0s_are_excluded(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+def test_uncounted_records_change_no_count(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
     _, with_excluded = run_main(capsys, settle_queue.queue_dir)
     for path in settle_queue.excluded:
         path.unlink()
@@ -274,6 +278,7 @@ REDESIGN_TEXT = 'open the joint L0 end-of-life redesign with the harness plan (S
 STRANDED_BREACH = {'ratio': '1.0', 'min_stranded': '3'}
 STRANDED_BELOW_MIN_COUNT = {'ratio': '1.0', 'min_stranded': '4'}
 STRANDED_UNDER_FLOOR = {**STRANDED_BREACH, 'baseline_stranded_per_100': '50'}
+STRANDED_UNDER_PRE_BAR = {'ratio': '2.0', 'min_stranded': '3', 'baseline_stranded_per_100': '3.6'}
 REAPER_WRONG_BREACH = {'max_reaper_wrong': '2'}
 REAPER_WRONG_UNDER = {'max_reaper_wrong': '3'}
 PENDING_BREACH = {'max_pending_hours': '24'}
@@ -282,6 +287,7 @@ THRESHOLD_CASES = (
     STRANDED_BREACH,
     STRANDED_BELOW_MIN_COUNT,
     STRANDED_UNDER_FLOOR,
+    STRANDED_UNDER_PRE_BAR,
     REAPER_WRONG_BREACH,
     REAPER_WRONG_UNDER,
     PENDING_BREACH,
@@ -326,6 +332,22 @@ def test_stranded_rate_uses_baseline_floor(settle_queue: SettleQueue, capsys: py
     assert pre_rate < post_rate < float(STRANDED_UNDER_FLOOR['baseline_stranded_per_100'])
 
     assert_clean(*run_main(capsys, settle_queue.queue_dir, **STRANDED_UNDER_FLOOR))
+
+
+def test_stranded_rate_bar_scales_the_pre_window_rate(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, permissive = run_main(capsys, settle_queue.queue_dir)
+    post_rate = trailing_json(permissive)['post']['stranded_per_100']
+    pre_rate = trailing_json(permissive)['pre']['stranded_per_100']
+    ratio = float(STRANDED_UNDER_PRE_BAR['ratio'])
+    floor = float(STRANDED_UNDER_PRE_BAR['baseline_stranded_per_100'])
+    assert ratio * floor < post_rate < ratio * pre_rate
+
+    code, lines = run_main(capsys, settle_queue.queue_dir, **STRANDED_UNDER_PRE_BAR)
+
+    assert_clean(code, lines)
+    assert trailing_json(lines)['stranded_bar_per_100'] == pytest.approx(ratio * pre_rate)
 
 
 def test_reaper_wrong_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
@@ -463,6 +485,43 @@ def test_non_record_files_are_ignored(settle_queue: SettleQueue, capsys: pytest.
 
     assert code == 0
     assert trailing_json(after) == trailing_json(before)
+
+
+def test_root_copy_wins_over_an_archived_copy(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    queue_dir = tmp_path / 'escalations'
+    filed_at = datetime.now(UTC) - timedelta(hours=3)
+    same_id = {
+        'id': 'esc-23-1',
+        'task_id': '23',
+        'severity': 'blocking',
+        'category': CATEGORY,
+        'level': 0,
+        'timestamp': iso(filed_at),
+    }
+    status, resolved_by, resolution, resolution_class = PROMOTION
+    archived = write_record(
+        queue_dir,
+        **same_id,
+        status=status,
+        resolved_at=iso(filed_at + CLOSE_DELAY),
+        resolved_by=resolved_by,
+        resolution=resolution.format(task_id='23'),
+        resolution_class=resolution_class,
+    )
+    live = write_record(queue_dir, **same_id, status='pending')
+    assert archived.parent != live.parent
+
+    _, lines = run_main(capsys, queue_dir, max_pending_hours='1')
+
+    payload = trailing_json(lines)
+    assert (payload['post']['filed'], payload['post']['reaper_promotions']) == (1, 0)
+    assert payload['pending_over_h'] == 1
+
+
+def test_mirrored_archive_layout_equals_the_escalation_producer() -> None:
+    assert settle.ARCHIVE_SUBDIR == archive.ARCHIVE_SUBDIR
+    assert settle.ARCHIVE_DAY_FORMAT == archive.DATE_FORMAT
+    assert settle.STALE_STRAND_CLASS in RESOLUTION_CLASSES
 
 
 def file_escalation(queue: EscalationQueue, task_id: str, summary: str, *, level: int = 0, filed_at: datetime) -> str:
