@@ -358,6 +358,15 @@ class MergeVerifySpec:
                           TaskVerifySpec's rule: non-empty replaces the host's
                           value, '' keeps the host's own. '' is also what a
                           pre-6127 dispatcher's spec decodes to.
+    scope_cargo         : the cargo-scoping switch that gates
+                          verify.py::_apply_cargo_scope, including the
+                          zero-module __cargo_scoped__ route (task 7465). None
+                          (a pre-7465 spec) keeps the host's own value; a
+                          carried value replaces it.
+    merge_config_only_full_gate_globs : task 2838's manifest-drift backstop,
+                          read by verify.py::_merge_config_only_diff_forces_full_gate
+                          (task 7465). None (a pre-7465 spec) keeps the host's
+                          own globs; a carried value, () included, replaces them.
 
     Note
     ----
@@ -386,6 +395,10 @@ class MergeVerifySpec:
     global_verify_command: VerifyCommand | None = None
     # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
     verify_cold_preprovision_command: str = ''
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    scope_cargo: bool | None = None
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    merge_config_only_full_gate_globs: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -403,6 +416,12 @@ class MergeVerifySpec:
                 else None
             ),
             "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
+            "scope_cargo": self.scope_cargo,
+            "merge_config_only_full_gate_globs": (
+                list(self.merge_config_only_full_gate_globs)
+                if self.merge_config_only_full_gate_globs is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -411,6 +430,7 @@ class MergeVerifySpec:
         # Back-compat: a legacy spec dict (pre-task-2883) lacks this key, so
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
+        _globs = d.get("merge_config_only_full_gate_globs")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -426,6 +446,8 @@ class MergeVerifySpec:
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
+            scope_cargo=d.get("scope_cargo"),
+            merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
         )
 
 
