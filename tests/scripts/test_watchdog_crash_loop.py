@@ -3,10 +3,14 @@
 The module is imported by name, so ``crash_loop`` is the sys.modules instance:
 the same object scripts/orchestrator-watchdog.py's from-import binds. The
 pure core (status, growth, observation, alarm text) needs no I/O at all.
+Every I/O test hands the detector tmp_path as its repo_dir, so its state and
+queue land under tmp_path by construction, and the escalation submit runs a
+recording fake uv rather than the real one.
 """
 
 import dataclasses
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -28,6 +32,21 @@ T = 1_800_000_000
 AlarmKind = crash_loop.AlarmKind
 UnitRestartHistory = crash_loop.UnitRestartHistory
 UnitRestartStatus = crash_loop.UnitRestartStatus
+
+
+@pytest.fixture(autouse=True)
+def _no_path_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ambient override would move a test's state, queue or uv out of tmp_path."""
+    for name in (
+        "ORCH_RESTART_RATE_STATE",
+        "ORCH_CRASH_LOOP_QUEUE_DIR",
+        "ORCH_WATCHDOG_UV_BIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _discard(_msg: str) -> None:
+    pass
 
 
 def _status(n: int | None, result: str | None = "success") -> UnitRestartStatus:
@@ -318,3 +337,245 @@ def test_alarm_window_knob(
         monkeypatch.setenv("ORCH_RESTART_RATE_ALARM_WINDOW_SECS", raw)
     window = _fresh_copy(monkeypatch).RESTART_RATE_ALARM_WINDOW_SECS
     assert window == expected
+
+
+# ---------------------------------------------------------------------------
+# Paths: resolved at CALL time, so a setenv after import still takes effect
+# ---------------------------------------------------------------------------
+
+
+def test_restart_rate_state_path_defaults_under_repo_dir(tmp_path: pathlib.Path) -> None:
+    assert crash_loop.restart_rate_state_path(str(tmp_path)) == str(
+        tmp_path / "data" / "orchestrator" / "watchdog-restart-rate.json"
+    )
+
+
+def test_restart_rate_state_path_override_is_read_per_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    override = str(tmp_path / "elsewhere.json")
+    monkeypatch.setenv("ORCH_RESTART_RATE_STATE", override)
+    assert crash_loop.restart_rate_state_path(str(tmp_path)) == override
+
+
+def test_crash_loop_queue_dir_defaults_to_the_repos_escalation_queue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    assert crash_loop.crash_loop_queue_dir(str(tmp_path)) == str(
+        tmp_path / "data" / "escalations"
+    )
+    monkeypatch.setenv("ORCH_CRASH_LOOP_QUEUE_DIR", str(tmp_path / "q"))
+    assert crash_loop.crash_loop_queue_dir(str(tmp_path)) == str(tmp_path / "q")
+
+
+def test_watchdog_uv_bin_is_absolute_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchdog unit sets no PATH, so a bare 'uv' would not resolve."""
+    assert crash_loop.watchdog_uv_bin() == "/home/leo/.local/bin/uv"
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", "/opt/uv")
+    assert crash_loop.watchdog_uv_bin() == "/opt/uv"
+
+
+# ---------------------------------------------------------------------------
+# State IO: load_restart_histories / save_restart_histories
+# ---------------------------------------------------------------------------
+
+
+def test_histories_round_trip_through_the_state_file(tmp_path: pathlib.Path) -> None:
+    path = str(tmp_path / "state" / "restart-rate.json")
+    histories = {
+        UNIT: UnitRestartHistory(
+            samples=((T - 60, 2), (T, 5)),
+            sampling_since=T - 86400,
+            last_escalation_epoch=T,
+            start_limit_paged=True,
+        ),
+        synthetic_unit("reify"): UnitRestartHistory(),
+    }
+
+    assert crash_loop.save_restart_histories(path, histories, _discard) is True
+
+    assert crash_loop.load_restart_histories(path, _discard) == histories
+    on_disk = json.loads(pathlib.Path(path).read_text())
+    assert set(on_disk) == set(histories)
+    assert on_disk[UNIT]["samples"] == [[T - 60, 2], [T, 5]]
+
+
+def test_save_reports_a_write_that_did_not_land(tmp_path: pathlib.Path) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    logged: list[str] = []
+
+    landed = crash_loop.save_restart_histories(
+        str(blocker / "restart-rate.json"), {UNIT: UnitRestartHistory()}, logged.append
+    )
+
+    assert landed is False
+    assert logged
+
+
+def test_load_missing_file_is_empty_and_silent(tmp_path: pathlib.Path) -> None:
+    logged: list[str] = []
+    assert crash_loop.load_restart_histories(str(tmp_path / "absent.json"), logged.append) == {}
+    assert logged == []
+
+
+def test_load_corrupt_file_is_empty_and_logged_once(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "restart-rate.json"
+    path.write_text('{"orchestrator-')
+    logged: list[str] = []
+
+    assert crash_loop.load_restart_histories(str(path), logged.append) == {}
+    assert len(logged) == 1
+
+
+def test_load_drops_unusable_parts_of_a_hand_edited_entry(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "restart-rate.json"
+    path.write_text(
+        json.dumps(
+            {
+                UNIT: {
+                    "samples": [
+                        [T - 60, 2],
+                        ["soon", 3],
+                        [T - 30, True],
+                        [T - 20],
+                        [T - 10, 4, 9],
+                        "junk",
+                        [T, 5],
+                    ],
+                    "sampling_since": T - 600,
+                    "last_escalation_epoch": -5,
+                    "start_limit_paged": True,
+                },
+                synthetic_unit("reify"): {"last_escalation_epoch": True},
+                synthetic_unit("hive"): {"last_escalation_epoch": "yesterday"},
+                synthetic_unit("broken"): ["not", "a", "dict"],
+            }
+        )
+    )
+
+    histories = crash_loop.load_restart_histories(str(path), _discard)
+
+    assert histories[UNIT] == UnitRestartHistory(
+        samples=((T - 60, 2), (T, 5)),
+        sampling_since=T - 600,
+        last_escalation_epoch=None,
+        start_limit_paged=True,
+    )
+    assert histories[synthetic_unit("reify")].last_escalation_epoch is None
+    assert histories[synthetic_unit("hive")].last_escalation_epoch is None
+    assert synthetic_unit("broken") not in histories
+
+
+# ---------------------------------------------------------------------------
+# The page: crash_loop_submit_argv / file_crash_loop_escalation
+# ---------------------------------------------------------------------------
+
+_RATE_ALARM = crash_loop.CrashLoopAlarm(UNIT, AlarmKind.RESTART_RATE, 6, WINDOW)
+
+
+def _fake_uv(
+    tmp_path: pathlib.Path, *, exit_code: int = 0
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Write an executable stand-in for uv that records its argv; return (uv, record)."""
+    record = tmp_path / "fake-uv-calls.jsonl"
+    uv = tmp_path / "fake-uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(record)!r}, 'a') as f:\n"
+        "    f.write(json.dumps(sys.argv) + '\\n')\n"
+        f"sys.exit({exit_code})\n"
+    )
+    uv.chmod(0o755)
+    return uv, record
+
+
+def _recorded(record: pathlib.Path) -> list[list[str]]:
+    if not record.exists():
+        return []
+    return [json.loads(line) for line in record.read_text().splitlines()]
+
+
+def test_submit_argv_is_the_born_at_l2_shape(tmp_path: pathlib.Path) -> None:
+    repo = str(tmp_path)
+    queue = str(tmp_path / "q")
+
+    argv = crash_loop.crash_loop_submit_argv(
+        _RATE_ALARM, uv_bin="/x/uv", repo_dir=repo, queue_dir=queue
+    )
+
+    assert argv == [
+        "/x/uv",
+        "run",
+        "--project",
+        str(tmp_path / "escalation"),
+        "escalation",
+        "submit",
+        "--queue-dir",
+        queue,
+        "--task",
+        f"orchestrator-crash-loop-{UNIT}",
+        "--severity",
+        "critical",
+        "--category",
+        "infra_issue",
+        "--summary",
+        _RATE_ALARM.summary(),
+        "--detail",
+        _RATE_ALARM.detail(),
+        "--agent-role",
+        "orchestrator-watchdog",
+    ]
+
+
+def test_file_escalation_runs_submit_once_and_logs_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    uv, record = _fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    logged: list[str] = []
+
+    filed = crash_loop.file_crash_loop_escalation(
+        _RATE_ALARM, repo_dir=str(tmp_path), log=logged.append
+    )
+
+    assert filed is True
+    assert _recorded(record) == [
+        crash_loop.crash_loop_submit_argv(
+            _RATE_ALARM,
+            uv_bin=str(uv),
+            repo_dir=str(tmp_path),
+            queue_dir=str(tmp_path / "data" / "escalations"),
+        )
+    ]
+    assert any("filed" in m and _RATE_ALARM.task_sentinel in m for m in logged), logged
+
+
+def test_file_escalation_reports_a_failed_submit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    uv, _record = _fake_uv(tmp_path, exit_code=3)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    logged: list[str] = []
+
+    filed = crash_loop.file_crash_loop_escalation(
+        _RATE_ALARM, repo_dir=str(tmp_path), log=logged.append
+    )
+
+    assert filed is False
+    assert any("exited 3" in m for m in logged), logged
+
+
+def test_file_escalation_survives_a_missing_uv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(tmp_path / "no-such-uv"))
+    logged: list[str] = []
+
+    filed = crash_loop.file_crash_loop_escalation(
+        _RATE_ALARM, repo_dir=str(tmp_path), log=logged.append
+    )
+
+    assert filed is False
+    assert logged
