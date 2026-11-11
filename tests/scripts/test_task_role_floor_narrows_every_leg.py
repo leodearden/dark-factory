@@ -79,6 +79,7 @@ def _task_role_pytest_run(mc: ModuleConfig, touched: str) -> PlannedRun:
 @pytest.mark.parametrize(('prefix', 'min_family_size'), [
     pytest.param('orchestrator', 10, id='orchestrator'),
     pytest.param('shared', 20, id='shared'),
+    pytest.param('fused-memory', 80, id='fused-memory'),
 ])
 def test_the_task_role_floor_narrows_to_the_guard_family(
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
