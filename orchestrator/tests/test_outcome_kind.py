@@ -16,6 +16,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from _scripts_loader import load_script
 
 from orchestrator.event_store import EventStore
 from orchestrator.merge_lane.types import OutcomeKind
@@ -152,6 +153,15 @@ class TestOutcomeKindFrozenContract:
     def test_non_terminal_set_is_frozen(self) -> None:
         non_terminal = {m for m in OutcomeKind if not m.is_terminal}
         assert non_terminal == {OutcomeKind(v) for v in _NON_TERMINAL_VALUES}
+
+    def test_merge_lane_throughput_mirror_matches(self) -> None:
+        script = load_script('merge_lane_throughput.py', '_merge_lane_throughput_outcome_mirror')
+        expected = {m.value for m in OutcomeKind if not m.is_terminal}
+        assert expected == script.NON_TERMINAL_OUTCOMES, (
+            'scripts/merge_lane_throughput.py::NON_TERMINAL_OUTCOMES has drifted from '
+            'orchestrator/src/orchestrator/merge_lane/types.py::_NON_TERMINAL_OUTCOMES: '
+            f'mirror={sorted(script.NON_TERMINAL_OUTCOMES)} canonical={sorted(expected)}'
+        )
 
 
 # ---------------------------------------------------------------------------
