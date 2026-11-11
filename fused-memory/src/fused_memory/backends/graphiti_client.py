@@ -220,13 +220,7 @@ def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
 
 
 def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
-    # LLMConfig's validator already rejects this combination at construction,
-    # but pydantic does not re-validate on attribute assignment, so a config
-    # mutated after loading — how tests and per-arm harnesses build variants —
-    # reaches here unchecked. Warn rather than raise: by this point the config
-    # is loaded and a hard failure would take down a server over a knob that is
-    # merely inert. Covers the anthropic arm too, where the mode is equally
-    # meaningless.
+    # LLMConfig rejects this at load; a config mutated afterwards is not re-validated.
     if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
         logger.warning(
             f'llm.structured_output_mode={cfg.llm.structured_output_mode!r} is IGNORED: '
@@ -238,15 +232,6 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
         api_key = cfg.llm.providers.openai.api_key
         if api_key:
-            # api_url has a non-None default ('https://api.openai.com/v1',
-            # config/schema.py OpenAIProviderConfig), so base_url below is now
-            # ALWAYS passed. That makes config authoritative over the ambient
-            # OPENAI_BASE_URL / OPENAI_API_BASE fallback the openai SDK would
-            # otherwise apply — which is the point of this plumbing, but it is
-            # not a no-op for a site that routes through a gateway by exporting
-            # OPENAI_BASE_URL without setting OPENAI_API_URL: that traffic now
-            # goes back to api.openai.com. An egress/billing change must not be
-            # silent, hence the warning.
             warn_if_ambient_base_url_is_overridden(
                 cfg.llm.providers.openai.api_url, context='graphiti LLM',
             )
@@ -256,40 +241,12 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 small_model=cfg.llm.model,
                 temperature=cfg.llm.temperature or 0.0,
                 max_tokens=cfg.llm.max_tokens,
-                # Mirrors the embedder (see build_embedder()) and the reranker
-                # (see initialize()), which have always passed the configured
-                # endpoint. The LLM
-                # path was the outlier: a configured api_url was silently
-                # dropped in favour of the openai SDK default.
                 base_url=cfg.llm.providers.openai.api_url,
             )
             llm_client: LLMClient
+            # max_tokens= below is load-bearing on both arms, not redundant with llm_config: see
+            # fused-memory/tests/test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire
             if cfg.llm.client_class == 'openai_generic':
-                # No preflight on this arm — deliberately. Its sole purpose is
-                # to guard OpenAIClient's client.responses.create call (see
-                # check_openai_responses_api above); OpenAIGenericClient drives
-                # chat.completions and never resolves that SDK surface, so the
-                # check is both unnecessary here and actively harmful — it
-                # would abort an otherwise-valid local endpoint on a
-                # requirement that endpoint does not have.
-                #
-                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
-                # above, and must not be "simplified" away: OpenAIGenericClient
-                # .__init__ declares its own `max_tokens: int = 16384` and
-                # re-assigns `self.max_tokens = max_tokens` immediately after
-                # super().__init__() has correctly set it from the config
-                # object. _generate_response then sends `self.max_tokens`,
-                # ignoring its per-call argument — so this constructor kwarg is
-                # the ONLY lever that reaches the wire. Without it every request
-                # on this arm asks for 16384 output tokens regardless of
-                # configuration, which a local endpoint may reject outright or
-                # which may overrun its served context.
-                # ForceJsonObjectOpenAIGenericClient overrides only
-                # _generate_response, so it inherits this __init__ unchanged —
-                # which is why the mode can select the CLASS and leave one
-                # shared construction call. Keeping a single call site is
-                # deliberate: two copies of the argument list are how one arm
-                # silently drifts from the other when a kwarg is added.
                 generic_cls: type[TokenRecordingOpenAIGenericClient] = (
                     ForceJsonObjectOpenAIGenericClient
                     if cfg.llm.structured_output_mode == 'json_object'
@@ -298,40 +255,7 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
                 check_openai_responses_api()
-                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
-                # above, and must not be "simplified" away — the same mechanism
-                # as the generic arm's, one class up the hierarchy:
-                # BaseOpenAIClient.__init__ (openai_base_client.py:51-67), which
-                # OpenAIClient derives from, declares its own
-                # `max_tokens: int = DEFAULT_MAX_TOKENS` (16384 on the 0.28.2
-                # wheel) and unconditionally re-assigns
-                # `self.max_tokens = max_tokens` immediately after
-                # super().__init__(config, cache) had correctly set it from the
-                # config object (client.py:80). _generate_response then sends
-                # `max_tokens or self.max_tokens` (:176,187), so this
-                # constructor kwarg is the ONLY lever that reaches the wire.
-                #
-                # This is a DELIBERATE behaviour change (task 3864): until it
-                # landed, the default arm asked for upstream's 16384 output
-                # tokens regardless of configuration, and now asks for the
-                # configured value (4096 with the shipped config). It restores
-                # agreement rather than inventing a new policy — the anthropic
-                # arm below (which honours a passed config, measured) and mem0
-                # (fused-memory/src/fused_memory/backends/mem0_client.py::Mem0Backend._build_config_dict)
-                # have always read the same cfg.llm.max_tokens knob. And if the
-                # configured value ever proves too small the failure is LOUD,
-                # never silent ('Output length exceeded max tokens <N>' from
-                # openai_base_client.py:191-192, or a truncated body failing
-                # json.loads), retried by graphiti and then dead-lettered
-                # visibly; whereas before, an operator hitting truncation had no
-                # working lever on this arm at all.
                 llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
-            # max_tokens is named here deliberately (task 3864): it is now
-            # authoritative on BOTH sub-arms, and the default arm's effective
-            # value changed from upstream's 16384 to the configured one without
-            # any other signal to the operator. Log cfg.llm.max_tokens rather
-            # than llm_client.max_tokens — the two are equal, and the config
-            # value is the one an operator can act on.
             logger.info(
                 f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
                 f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
@@ -350,10 +274,6 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     max_tokens=cfg.llm.max_tokens,
                 )
                 llm_client = AnthropicClient(config=llm_config)
-                # Same addition as the openai arm above, so the observability is
-                # uniform across arms rather than present only where the value
-                # changed. This arm has always honoured the knob (AnthropicClient
-                # .__init__ overrides config.max_tokens only when config is None).
                 logger.info(
                     f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
                     f'(max_tokens={cfg.llm.max_tokens})'
