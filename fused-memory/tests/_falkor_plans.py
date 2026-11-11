@@ -5,11 +5,14 @@ FalkorDB how it would plan one captured query, ``profile`` runs a captured
 query under GRAPH.PROFILE, ``non_leaf_scans`` reads the structured plan for
 scans that re-execute once per input row, ``scan_operators`` lists every scan
 the plan runs, and ``peak_records_produced`` reads the most records any
-operator of a profiled plan produced.
+operator of a profiled plan produced. ``match_pattern`` and
+``anchors_on_a_labelled_node`` are their static, connection-free counterparts:
+they read the Cypher text itself for the pattern FalkorDB plans its scans from.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -71,3 +74,13 @@ def scan_operators(plan: ExecutionPlan) -> list[str]:
 def peak_records_produced(plan: ExecutionPlan) -> int:
     """The most records any one operator of a profiled *plan* produced."""
     return max(operation.records_produced for operation in _operations(plan))
+
+
+def match_pattern(cypher: str) -> str:
+    """The text between MATCH and the first WITH, from which FalkorDB plans its scans."""
+    return cypher.split('MATCH', 1)[1].split('WITH', 1)[0]
+
+
+def anchors_on_a_labelled_node(pattern: str) -> bool:
+    """A labelled node such as ``(n:Entity)`` makes FalkorDB scan that label first."""
+    return re.search(r'\(\s*\w*\s*:', pattern) is not None
