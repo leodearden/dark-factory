@@ -69,6 +69,36 @@ def _load_watchdog() -> types.ModuleType:
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _isolate_crash_loop_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Point the crash-loop detector and the per-unit revive clocks at tmp_path.
+
+    REPO_DIR is the live checkout, so without this every main() test would
+    write the live restart-rate state and stamp live revive clocks, and a test
+    missing its _stub_restart_status could page through real uv.
+    test_boundary7_liveness_during_window_does_not_stamp_clock patches
+    time.time to 2e9: a revive clock it stamped in the live tree would be
+    future-dated and suppress real revives for years. The satellite reads
+    these per call, and the watchdog reads its clock dir at module exec, which
+    _load_watchdog re-runs per test, so both follow this setenv.
+    """
+    root = tmp_path / "crash-loop"
+    monkeypatch.setenv("ORCH_RESTART_RATE_STATE", str(root / "watchdog-restart-rate.json"))
+    monkeypatch.setenv("ORCH_CRASH_LOOP_QUEUE_DIR", str(root / "escalations"))
+    monkeypatch.setenv("ORCH_LIVENESS_RESTART_CLOCK_DIR", str(root / "liveness-restart"))
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(root / "no-such-uv"))
+
+
+def _stub_restart_status(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, status=None
+) -> None:
+    """Answer main()'s NRestarts/Result read without systemd (healthy by default)."""
+    answer = status or wdog.UnitRestartStatus(n_restarts=0, result="success")
+    monkeypatch.setattr(wdog, "_unit_restart_status", lambda _u: answer)
+
+
 def _neutralize_fleet_clock_gates(
     wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -757,6 +787,7 @@ def test_main_restarts_only_failed_probe(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert restarted == ["orchestrator-dark-factory.service"], (
@@ -788,6 +819,7 @@ def test_main_logs_each_action(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert len(log_messages) >= 1, "Expected at least one log() call for the restarted unit"
@@ -827,6 +859,7 @@ def test_main_isolates_per_unit_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "log", fake_log)
 
     # Must not raise
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert "orchestrator-reify.service" in restarted, (
@@ -859,6 +892,7 @@ def test_main_skips_probe_in_grace_window(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "log", fake_log)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert probed == [], (
@@ -895,6 +929,7 @@ def test_main_probes_after_grace_window(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "log", fake_log)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert len(probed) == len(wdog.WATCHED), (
@@ -934,6 +969,7 @@ def test_main_grace_window_skipped_when_elapsed_is_none(
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
     monkeypatch.setattr(wdog, "log", fake_log)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert len(probed) == len(wdog.WATCHED), (
@@ -1045,6 +1081,7 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(wdog, "restart_unit", fake_restart)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     # df is disabled → skipped (port 8102 never probed)
@@ -1167,6 +1204,7 @@ def _wire_main_all_ports_up(
     monkeypatch.setattr(wdog, "_unit_active_state", active_state)
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
+    _stub_restart_status(wdog, monkeypatch)
     return restarted
 
 
@@ -1242,6 +1280,7 @@ def test_main_does_not_query_active_state_when_the_port_is_down(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert restarted == [_DF_UNIT], f"the down-port unit must still be revived; got {restarted}"
@@ -1287,11 +1326,182 @@ def test_main_port_down_log_line_is_unchanged(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: None)
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert (
         f"{_DF_UNIT} escalation port {_DF_PORT} not listening; restarting" in logged
     ), logged
+
+
+# ---------------------------------------------------------------------------
+# main() crash-loop detector (task 8270)
+#
+# main() samples every WATCHED unit's NRestarts/Result before any liveness
+# gate, so the startup grace window that blinded the watchdog to the
+# 2026-10-26 loop cannot hide a crash loop, and a disabled unit is still
+# sampled. The detector itself is tested in
+# tests/scripts/test_watchdog_crash_loop.py; these pin its wiring into main().
+# ---------------------------------------------------------------------------
+
+_SHOW_RESTARTS_ARGV_TAIL = "--property=NRestarts,Result"
+
+
+def _fake_uv_recorder(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """An executable stand-in for uv that records its argv; return (uv, record)."""
+    record = tmp_path / "fake-uv-calls.jsonl"
+    uv = tmp_path / "fake-uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(record)!r}, 'a') as f:\n"
+        "    f.write(json.dumps(sys.argv) + '\\n')\n"
+    )
+    uv.chmod(0o755)
+    return uv, record
+
+
+def _recorded_argvs(record: pathlib.Path) -> list[list[str]]:
+    if not record.exists():
+        return []
+    return [json.loads(line) for line in record.read_text().splitlines()]
+
+
+def _argv_flag(argv: list[str], name: str) -> str:
+    return argv[argv.index(name) + 1]
+
+
+def _restart_rate_state() -> dict:
+    return json.loads(pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"]).read_text())
+
+
+def _fake_show(stdout: str = "", returncode: int = 0, raises: BaseException | None = None):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    return fake_run, calls
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["Result=start-limit-hit\nNRestarts=7\n", "NRestarts=7\nResult=start-limit-hit\n"],
+)
+def test_unit_restart_status_parses_by_key_in_either_order(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    """systemd prints Result before NRestarts whatever the --property order."""
+    wdog = _load_watchdog()
+    fake_run, calls = _fake_show(stdout)
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert status == wdog.UnitRestartStatus(n_restarts=7, result="start-limit-hit")
+    assert calls == [["systemctl", "--user", "show", _DF_UNIT, _SHOW_RESTARTS_ARGV_TAIL]]
+
+
+@pytest.mark.parametrize(
+    ("fake", "expected"),
+    [
+        (_fake_show("Result=success\nNRestarts=3\n", returncode=1)[0], (None, None)),
+        (_fake_show(raises=FileNotFoundError("systemctl"))[0], (None, None)),
+        (
+            _fake_show(raises=subprocess.TimeoutExpired(["systemctl"], 5))[0],
+            (None, None),
+        ),
+        (_fake_show("Result=success\nNRestarts=lots\n")[0], (None, "success")),
+        (_fake_show("Result=\nNRestarts=4\n")[0], (4, None)),
+    ],
+    ids=["nonzero-rc", "no-systemctl", "timeout", "bad-nrestarts", "empty-result"],
+)
+def test_unit_restart_status_fails_soft(
+    monkeypatch: pytest.MonkeyPatch, fake, expected: tuple[int | None, str | None]
+) -> None:
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog.subprocess, "run", fake)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    status = wdog._unit_restart_status(_DF_UNIT)
+
+    assert (status.n_restarts, status.result) == expected
+
+
+def _record_restart_status_reads(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    reads: list[str] = []
+
+    def reader(unit: str):
+        reads.append(unit)
+        return wdog.UnitRestartStatus(n_restarts=0, result="success")
+
+    monkeypatch.setattr(wdog, "_unit_restart_status", reader)
+    return reads
+
+
+def test_main_samples_every_unit_inside_the_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    reads = _record_restart_status_reads(wdog, monkeypatch)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("inside grace"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    units = [u for _p, u in wdog.WATCHED]
+    assert reads == units
+    state = _restart_rate_state()
+    assert {u: len(state[u]["samples"]) for u in units} == dict.fromkeys(units, 1)
+
+
+def test_main_samples_a_disabled_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    wdog = _load_watchdog()
+    reads = _record_restart_status_reads(wdog, monkeypatch)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: pytest.fail("disabled"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.main()
+
+    assert reads == [u for _p, u in wdog.WATCHED]
+
+
+def test_main_pages_a_restart_burst_once_per_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    uv, record = _fake_uv_recorder(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    state_path = pathlib.Path(os.environ["ORCH_RESTART_RATE_STATE"])
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({_DF_UNIT: {"samples": [[int(time.time()) - 600, 0]]}})
+    )
+    _wire_main_all_ports_up(wdog, monkeypatch, active_state=lambda _u: "active")
+    burst = wdog.UnitRestartStatus(n_restarts=5, result="success")
+    healthy = wdog.UnitRestartStatus(n_restarts=0, result="success")
+    monkeypatch.setattr(
+        wdog, "_unit_restart_status", lambda u: burst if u == _DF_UNIT else healthy
+    )
+
+    wdog.main()
+
+    calls = _recorded_argvs(record)
+    assert len(calls) == 1
+    assert _argv_flag(calls[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert _argv_flag(calls[0], "--severity") == "critical"
+
+    wdog.main()
+
+    assert len(_recorded_argvs(record)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3283,6 +3493,7 @@ def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.Monke
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert restarted == ["orchestrator-dark-factory.service"], (
@@ -3330,6 +3541,7 @@ def test_main_liveness_unaffected_by_fleet_redeploy_lease_for_other_units(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert restarted == ["orchestrator-dark-factory.service"], (
@@ -5376,6 +5588,7 @@ def test_boundary7_liveness_during_window_does_not_stamp_clock(
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
+    _stub_restart_status(wdog, monkeypatch)
     wdog.main()
 
     assert restarted == ["orchestrator-dark-factory.service"], (
@@ -11491,6 +11704,7 @@ def _wire_liveness_probe(
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != down_port)
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
     monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    _stub_restart_status(wdog, monkeypatch)
     return restarted
 
 
