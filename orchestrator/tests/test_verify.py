@@ -60,6 +60,7 @@ from orchestrator.verify import (
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
     _run_cmd,
+    _run_segmented,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
     _worker_death_leg_note,
@@ -68,7 +69,7 @@ from orchestrator.verify import (
     run_verification,
 )
 from orchestrator.verify_classify import classify_failure
-from orchestrator.verify_cmd import ToolKind, render
+from orchestrator.verify_cmd import ToolKind, render, split_and_chain_segments
 
 
 class TestKillCgroupScope:
@@ -4283,13 +4284,45 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
 
 
 _SESSION_START = ' test session starts '.center(80, '=') + '\n'
+_SESSION_ABORTED_HEADING = '## Session Aborted After Worker Death'
+_PASSING_SESSION = (
+    _SESSION_START
+    + '.' * 72 + ' [100%]\n'
+    + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+)
+_STOPPED_PROGRESS_ONLY_OUTPUT = ''.join(
+    line
+    for line in XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT.splitlines(keepends=True)
+    if XDIST_RESTART_DISABLED_MESSAGE not in line
+)
+
+
+async def _segmented_chain_output(*segments: tuple[int, str]) -> str:
+    """The aggregated output ``_run_segmented`` builds when each segment of a
+    two-subproject chain returns its ``(rc, output)`` pair, in order."""
+    chain = split_and_chain_segments(
+        'cd orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/',
+    )
+    assert chain is not None and len(chain) == len(segments), f'Unexpected split: {chain!r}'
+    results = iter(segments)
+
+    async def run_one(cmd: str, cwd: Path, timeout: float, label: str) -> tuple[int, str, bool]:
+        rc, out = next(results)
+        return rc, out, False
+
+    _, output, _, _ = await _run_segmented(
+        chain,
+        run_one=run_one,
+        worktree=Path('.'),
+        budget_secs=10_000.0,
+        now=lambda: 0.0,
+    )
+    return output
 
 
 class TestCompleteSessionIsNotLabelledAborted:
     """task 5891: a session whose every collected test reported is complete,
     whatever worker-death text appears in its output."""
-
-    HEADING = '## Session Aborted After Worker Death'
 
     @pytest.mark.parametrize(
         'output',
@@ -4303,7 +4336,7 @@ class TestCompleteSessionIsNotLabelledAborted:
             f'Unexpected summary: {result.summary!r}'
         )
         report = result.failure_report()
-        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
@@ -4314,7 +4347,7 @@ class TestCompleteSessionIsNotLabelledAborted:
             f'Unexpected summary: {result.summary!r}'
         )
         report = result.failure_report()
-        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0', (
             f'Unexpected hint: {hint!r}'
@@ -4350,14 +4383,7 @@ class TestCompleteSessionIsNotLabelledAborted:
 
     @pytest.mark.parametrize(
         'truncated_session',
-        [
-            XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
-            ''.join(
-                line
-                for line in XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT.splitlines(keepends=True)
-                if XDIST_RESTART_DISABLED_MESSAGE not in line
-            ),
-        ],
+        [XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT, _STOPPED_PROGRESS_ONLY_OUTPUT],
         ids=['with-bailout-literal', 'stopped-progress-only'],
     )
     def test_a_truncated_last_session_after_a_passing_one_is_still_labelled(
@@ -4365,12 +4391,7 @@ class TestCompleteSessionIsNotLabelledAborted:
     ):
         """GUARD: a session header must not hide the progress that follows it,
         and an earlier session's [100%] must not veto the last session."""
-        passing_session = (
-            _SESSION_START
-            + '.' * 72 + ' [100%]\n'
-            + ' 300 passed in 5.00s '.center(80, '=') + '\n'
-        )
-        output = passing_session + _SESSION_START + truncated_session
+        output = _PASSING_SESSION + _SESSION_START + truncated_session
         hint = _extract_cause_hint(output)
         assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
         summary = _test_leg_result(output).summary
@@ -4393,7 +4414,61 @@ class TestCompleteSessionIsNotLabelledAborted:
             f'Unexpected summary: {result.summary!r}'
         )
         report = result.failure_report()
-        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+
+
+class TestATruncatedSessionIsLabelledWhereverItSits:
+    """task 5891 review: each pytest session is judged alone, because the
+    segmented fallback runs every segment, so a truncated session need not be
+    last."""
+
+    @staticmethod
+    def _assert_labelled(output: str) -> None:
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in result.summary, (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            ((1, _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, _SESSION_START + _STOPPED_PROGRESS_ONLY_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, XDIST_Q_TRUNCATED_OUTPUT), (0, '.' * 72 + ' [100%]\n300 passed in 5.00s\n')),
+        ],
+        ids=[
+            'default-verbosity-bailout',
+            'default-verbosity-stopped-progress',
+            'q-segment-without-session-header',
+        ],
+    )
+    async def test_a_truncated_segment_ahead_of_a_complete_one_is_labelled(self, first, second):
+        output = await _segmented_chain_output(first, second)
+        self._assert_labelled(output)
+
+    def test_a_plain_join_of_a_truncated_session_then_a_complete_one_is_labelled(self):
+        output = _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT + _PASSING_SESSION
+        self._assert_labelled(output)
+
+    @pytest.mark.asyncio
+    async def test_a_complete_segment_ahead_of_a_passing_one_keeps_its_verdict(self):
+        """GUARD: per-session judging keeps the [100%] veto per session."""
+        output = await _segmented_chain_output(
+            (1, _SESSION_START + XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT), (0, _PASSING_SESSION),
+        )
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
 
 class TestVerifyResultCauseHint:
