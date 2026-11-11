@@ -16,9 +16,9 @@ import hashlib
 import json
 import logging
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -600,3 +600,279 @@ def _continues(step: RoutingStep, decision: _Decision) -> bool:
     )
     digests = (step.prompt_digest, decision.prompt_digest)
     return same_route and (None in digests or digests[0] == digests[1])
+
+
+@dataclass(frozen=True)
+class ConfigChange:
+    """One path a config_reload reported changing; ``applied`` False means restart-required."""
+
+    event_id: int
+    at: datetime
+    path: str
+    old: object
+    new: object
+    applied: bool
+
+
+class ConfigChanges(NamedTuple):
+    changes: tuple[ConfigChange, ...]
+    skipped: int
+
+
+_CONFIG_RELOAD_SQL = """
+SELECT id, timestamp, CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data END
+FROM events
+WHERE event_type = 'config_reload'
+ORDER BY id
+"""
+
+_RELOAD_SECTIONS = (('applied', True), ('restart_required', False))
+
+
+def read_config_changes(conn: sqlite3.Connection) -> ConfigChanges:
+    """Every changed path of every config_reload row, in event order; unreadable parts are counted."""
+    changes: list[ConfigChange] = []
+    skipped = 0
+    for event_id, timestamp, doc in conn.execute(_CONFIG_RELOAD_SQL):
+        try:
+            at = parse_utc(timestamp)
+        except (TypeError, ValueError):
+            at = None
+        if at is None or doc is None:
+            skipped += 1
+            continue
+        report = json.loads(doc)
+        for section, applied in _RELOAD_SECTIONS:
+            entries = report.get(section) or {}
+            if not isinstance(entries, dict):
+                skipped += 1
+                continue
+            for path, entry in entries.items():
+                if isinstance(entry, dict) and {'old', 'new'} <= set(entry):
+                    changes.append(ConfigChange(event_id, at, path, entry['old'], entry['new'],
+                                                applied))
+                else:
+                    skipped += 1
+    return ConfigChanges(tuple(changes), skipped)
+
+
+MIN_PERSISTING_DECISIONS = 3
+PERSISTENCE_SPAN = timedelta(hours=24)
+COLLAPSE_WINDOW = timedelta(hours=24)
+CAUSE_WINDOW = timedelta(hours=48)
+
+
+class RouteField(StrEnum):
+    """A routing step's value fields, in kind precedence order."""
+
+    MODEL = 'model'
+    EFFORT = 'effort'
+    PROMPT = 'prompt'
+    BUDGET = 'budget'
+    TURNS = 'turns'
+
+
+_ROUTE_VALUE: Mapping[RouteField, Callable[[RoutingStep], object]] = MappingProxyType({
+    RouteField.MODEL: lambda step: step.model,
+    RouteField.EFFORT: lambda step: step.effort,
+    RouteField.PROMPT: lambda step: step.prompt_digest,
+    RouteField.BUDGET: lambda step: step.budget_usd,
+    RouteField.TURNS: lambda step: step.max_turns,
+})
+
+_ROUTE_KIND: Mapping[RouteField, MarkerKind] = MappingProxyType({
+    RouteField.MODEL: MarkerKind.MODEL,
+    RouteField.EFFORT: MarkerKind.EFFORT,
+    RouteField.PROMPT: MarkerKind.PROMPT,
+    RouteField.BUDGET: MarkerKind.BUDGET,
+    RouteField.TURNS: MarkerKind.TURNS,
+})
+
+_CONFIG_SECTION: Mapping[RouteField, str] = MappingProxyType({
+    RouteField.MODEL: 'models',
+    RouteField.EFFORT: 'effort',
+    RouteField.BUDGET: 'budgets',
+    RouteField.TURNS: 'max_turns',
+})
+"""The config section that sets each field; a prompt has none."""
+
+RouteDiff = dict[RouteField, tuple[object, object]]
+
+
+def _route_diff(before: RoutingStep, after: RoutingStep) -> RouteDiff:
+    """The changed fields in precedence order; an absent prompt digest on either side is no change."""
+    diff: RouteDiff = {}
+    for field, value in _ROUTE_VALUE.items():
+        old, new = value(before), value(after)
+        if field is RouteField.PROMPT and (old is None or new is None):
+            continue
+        if old != new:
+            diff[field] = (old, new)
+    return diff
+
+
+def _config_key(role: str) -> str:
+    """Mirrors orchestrator/src/orchestrator/routing.py::_config_key: reviewer* share 'reviewer'."""
+    return 'reviewer' if role.startswith('reviewer') else role
+
+
+@dataclass(frozen=True)
+class AvailabilityFlag:
+    """A role fell back from its configured route to the role default, then returned."""
+
+    role: str
+    from_at: datetime
+    until_at: datetime
+    decisions: int
+    model: str
+
+
+def routing_markers(fold: RoutingFold, changes: Iterable[ConfigChange]) -> list[Marker]:
+    """The de-noised routing changes of *fold*'s project, sorted by (at, id)."""
+    reloads = tuple(changes)
+    markers = [
+        marker
+        for steps, _flags in _denoised(fold)
+        for marker in _role_markers(fold.project_id, steps, fold.newest_at, reloads)
+    ]
+    return sorted(markers, key=lambda marker: (marker.at, marker.marker_id))
+
+
+def availability_flags(fold: RoutingFold) -> list[AvailabilityFlag]:
+    """Every config -> role_default -> config fallback in *fold*, by start."""
+    flags = [flag for _steps, flags in _denoised(fold) for flag in flags]
+    return sorted(flags, key=lambda flag: (flag.from_at, flag.role))
+
+
+def _denoised(fold: RoutingFold) -> list[tuple[list[RoutingStep], list[AvailabilityFlag]]]:
+    by_role: dict[str, list[RoutingStep]] = {}
+    for step in fold.steps:
+        by_role.setdefault(step.role, []).append(step)
+    return [_without_fallbacks(steps) for steps in by_role.values()]
+
+
+def _without_fallbacks(
+    steps: Sequence[RoutingStep],
+) -> tuple[list[RoutingStep], list[AvailabilityFlag]]:
+    """Remove each maximal role_default run bracketed by equal config steps, merging the brackets."""
+    kept: list[RoutingStep] = []
+    flags: list[AvailabilityFlag] = []
+    index = 0
+    while index < len(steps):
+        end = _fallback_end(kept, steps, index)
+        if end is None:
+            kept.append(steps[index])
+            index += 1
+            continue
+        run, back = steps[index:end], steps[end]
+        flags.append(AvailabilityFlag(role=back.role, from_at=run[0].first_at,
+                                      until_at=back.first_at,
+                                      decisions=sum(step.decisions for step in run),
+                                      model=run[0].model))
+        kept[-1] = _merged(kept[-1], back)
+        index = end + 1
+    return kept, flags
+
+
+def _fallback_end(kept: Sequence[RoutingStep], steps: Sequence[RoutingStep], index: int) -> int | None:
+    """The index of the config step a role_default run starting at *index* returns to, else None."""
+    if not kept or kept[-1].source_layer != 'config' or steps[index].source_layer != 'role_default':
+        return None
+    end = index
+    while end < len(steps) and steps[end].source_layer == 'role_default':
+        end += 1
+    if end < len(steps) and steps[end].source_layer == 'config' and not _route_diff(kept[-1], steps[end]):
+        return end
+    return None
+
+
+def _merged(before: RoutingStep, after: RoutingStep) -> RoutingStep:
+    return replace(before, last_event_id=after.last_event_id, last_at=after.last_at,
+                   decisions=before.decisions + after.decisions,
+                   prompt_digest=before.prompt_digest or after.prompt_digest)
+
+
+def _persists(steps: Sequence[RoutingStep], index: int, newest_at: datetime | None) -> bool:
+    """A non-start step counts with >= 3 decisions and (a day's span or a next step changing another field)."""
+    step = steps[index]
+    if step.decisions < MIN_PERSISTING_DECISIONS:
+        return False
+    following = steps[index + 1] if index + 1 < len(steps) else None
+    span_end = following.first_at if following is not None else (newest_at or step.last_at)
+    if span_end - step.first_at >= PERSISTENCE_SPAN:
+        return True
+    if following is None:
+        return False
+    return bool(set(_route_diff(step, following)) - set(_route_diff(steps[index - 1], step)))
+
+
+def _counted_groups(steps: Sequence[RoutingStep], newest_at: datetime | None) -> list[list[RoutingStep]]:
+    """Counted steps, each group holding those within a day of its first."""
+    groups: list[list[RoutingStep]] = []
+    for index in range(1, len(steps)):
+        if not _persists(steps, index, newest_at):
+            continue
+        step = steps[index]
+        if groups and step.first_at - groups[-1][0].first_at < COLLAPSE_WINDOW:
+            groups[-1].append(step)
+        else:
+            groups.append([step])
+    return groups
+
+
+def _role_markers(
+    project_id: str, steps: Sequence[RoutingStep], newest_at: datetime | None,
+    changes: Sequence[ConfigChange],
+) -> list[Marker]:
+    markers: list[Marker] = []
+    if not steps:
+        return markers
+    state = steps[0]
+    for group in _counted_groups(steps, newest_at):
+        diff = _route_diff(state, group[-1])
+        state = group[-1]
+        if diff:
+            markers.append(_routing_marker(project_id, group[0], diff, changes))
+    return markers
+
+
+def _routing_marker(
+    project_id: str, first: RoutingStep, diff: RouteDiff, changes: Sequence[ConfigChange],
+) -> Marker:
+    cause = _cause(first, diff, changes)
+    return Marker(
+        marker_id=f'routing:{first.role}:{first.first_event_id}',
+        at=first.first_at if cause is None else cause.at,
+        kind=_ROUTE_KIND[next(iter(diff))],
+        scope=project_id,
+        series=None,
+        until=None,
+        label=f'{first.role}: ' + ', '.join(
+            f'{field.value} {_shown(field, old)} -> {_shown(field, new)}'
+            for field, (old, new) in diff.items()
+        ),
+        source=MarkerSource(SourceType.ROUTING, role=first.role,
+                            path=None if cause is None else cause.path),
+        ref=str(first.first_event_id),
+    )
+
+
+def _cause(first: RoutingStep, diff: RouteDiff, changes: Sequence[ConfigChange]) -> ConfigChange | None:
+    """The earliest reload of a changed field's config path in the 48 h up to the first dispatch."""
+    key = _config_key(first.role)
+    paths = {f'{_CONFIG_SECTION[field]}.{key}' for field in diff if field in _CONFIG_SECTION}
+    window_start = first.first_at - CAUSE_WINDOW
+    matches = [change for change in changes
+               if change.path in paths and window_start <= change.at <= first.first_at]
+    return min(matches, key=lambda change: (change.at, change.event_id), default=None)
+
+
+_DIGEST_SHOWN = 12
+
+
+def _shown(field: RouteField, value: object) -> str:
+    if field is RouteField.PROMPT and isinstance(value, str):
+        return value[:_DIGEST_SHOWN]
+    if isinstance(value, float):
+        return f'{value:g}'
+    return str(value)

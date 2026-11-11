@@ -112,10 +112,11 @@ def routing_decision(
 def config_reload(
     ts: datetime | str,
     *,
-    applied: Mapping[str, Mapping[str, Any]] | None = None,
-    restart_required: Mapping[str, Mapping[str, Any]] | None = None,
+    applied: Mapping[str, object] | None = None,
+    restart_required: Mapping[str, object] | None = None,
 ) -> EventRow:
-    """One ``config_reload`` report; each change maps a config path to ``{old, new}``."""
+    """One ``config_reload`` report; each change maps a config path to ``{old, new}`` (or, to
+    write a malformed report, to anything else)."""
     return (ts, None, 'config_reload', {
         'reloaded': True,
         'applied': dict(applied or {}),
