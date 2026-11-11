@@ -1828,18 +1828,39 @@ def test_a_zero_revive_min_interval_disables_the_cap_without_reading_a_clock(
 def test_liveness_revive_clock_dir_is_its_own_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ORCH_LIVENESS_RESTART_CLOCK_DIR")
-    monkeypatch.delenv("ORCH_RESTART_RATE_STATE")
+    """No other watchdog state file sits where a unit's revive clock is written (I5).
+
+    Compared at their defaults: the session redirects the deploy clocks to tmp
+    paths, which would make the comparison vacuous.
+    """
+    for var in (
+        "ORCH_LIVENESS_RESTART_CLOCK_DIR",
+        "ORCH_RESTART_RATE_STATE",
+        "ORCH_FLEET_DEPLOY_CLOCK",
+        "ORCH_FLEET_LEASE",
+        "FM_DEPLOY_CLOCK",
+        "FM_LIVENESS_RESTART_CLOCK",
+        "FM_LIVENESS_STREAK",
+    ):
+        monkeypatch.delenv(var, raising=False)
     wdog = _load_watchdog()
 
     clock_dir = wdog.ORCH_LIVENESS_RESTART_CLOCK_DIR
     assert clock_dir == os.path.join(wdog.REPO_DIR, "data", "orchestrator", "liveness-restart")
-    others = {
-        wdog.FLEET_DEPLOY_CLOCK_PATH,
-        wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
-        os.path.dirname(crash_loop.restart_rate_state_path(wdog.REPO_DIR)),
+    revive_clocks = {
+        wdog._orch_liveness_restart_clock_path(unit) for _port, unit in wdog.WATCHED
     }
-    assert clock_dir not in others
+    assert len(revive_clocks) == len(wdog.WATCHED)
+    assert revive_clocks.isdisjoint(
+        {
+            wdog.FLEET_DEPLOY_CLOCK_PATH,
+            wdog.FLEET_LEASE_PATH,
+            wdog.FM_DEPLOY_CLOCK_PATH,
+            wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
+            wdog.FM_LIVENESS_STREAK_PATH,
+            crash_loop.restart_rate_state_path(wdog.REPO_DIR),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
