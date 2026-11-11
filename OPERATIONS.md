@@ -2344,13 +2344,12 @@ fused-memory tier has no restart lease, so a staleness redeploy in flight
 restarts it again underneath you (seen 2026-09-29).
 
 For fused-memory, `scripts/restart-fused-memory.sh --rebind-socket` is the
-procedure, and runs exactly those commands. It refuses (exit 3, nothing
-changed) while `fm-staleness-redeploy.service` is active; otherwise it
-installs the committed `scripts/fused-memory.socket.template` and
-daemon-reloads, keeps the recon gate (`--now` or `--drain` compose with it),
-runs `systemctl --user stop fused-memory` then
-`systemctl --user start fused-memory.socket fused-memory`, waits for
-`/health`, and exits with `scripts/check_network_exposure.py`'s status.
+procedure: it installs the committed `scripts/fused-memory.socket.template`
+and runs that stop then start. It refuses with exit 3 while
+`fm-staleness-redeploy.service` is active, exits 1 if `/health` never
+answers, and otherwise exits with `scripts/check_network_exposure.py`'s
+status. The script's header gives the exact sequence and how the mode
+composes with `--now` and `--drain`.
 
 ### Network exposure check
 
