@@ -703,3 +703,60 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             await _lane_time_passes(run, 300)
             assert lane_state(run.lane, reqs['S1'].request_id) == 'queued'
         assert all(reqs[name].result.done() for name in ('H', 'S', 'S1'))
+
+
+async def _main_sha(scene: _Scene) -> str:
+    _, sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=scene.git_ops.project_root)
+    return sha.strip()
+
+
+class TestCAnItemBehindTheChainStacksOnTheChainTip:
+    """C: the look-ahead skips the reserved links and stacks the next item on the chain tip."""
+
+    async def test_an_item_behind_the_chain_verifies_on_a_free_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """C1: X goes to the free 'spare' host while S's tip still verifies, merged
+        onto the chain tip, so it lands right after the chain, verified once."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'F1', 'F2', 'X')
+        head_entered, release_head = asyncio.Event(), asyncio.Event()
+        s_entered, release_s = asyncio.Event(), asyncio.Event()
+        x_entered = asyncio.Event()
+        s_host = FakeRemoteRunner('s-host', release=release_s, entered=s_entered)
+        spare = FakeRemoteRunner('spare', entered=x_entered)
+        remotes = [
+            FakeRemoteRunner(_HEAD_HOST, release=release_head, entered=head_entered),
+            s_host, spare,
+        ]
+        verifier = FakeVerifier()
+        async with _running(
+            scene, verifier=verifier, remotes=remotes, speculation_depth=3,
+        ) as run:
+            run.put(reqs['H'])
+            await wait_responsive(head_entered.wait(), label='H verify under way on head-host')
+            run.put(reqs['S'], reqs['F1'], reqs['F2'])
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way on s-host")
+            (row,) = _reservations(run.lane)
+            assert (row['owner_task_id'], row['link_task_ids']) == ('S', ['F1', 'F2'])
+            assert s_host.calls == [row['tip']]
+
+            run.put(reqs['X'])
+            await wait_responsive(x_entered.wait(), label="X's verify under way on spare")
+            assert not release_s.is_set()
+            assert await _first_parent(scene, spare.calls[0]) == row['tip']
+            assert run.lane.check_frozen_prefix_invariant(await _main_sha(scene)) == []
+            assert run.lane.verify_base_divergences() == ()
+
+            release_s.set()
+            release_head.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'F1', 'F2', 'X')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
+            assert await _landed_task_files(scene) == ['H', 'S', 'F1', 'F2', 'X']
+            assert len(spare.calls) == 1
+            assert verifier.verified == []
+            _assert_no_live_permit(run.lane)
