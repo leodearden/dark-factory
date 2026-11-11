@@ -50,7 +50,7 @@ from dashboard.data.metrics import (
     downsample_metrics,
 )
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS, collect_quality
-from dashboard.data.quality_store import QUALITY_SCHEMA
+from dashboard.data.quality_store import QUALITY_SCHEMA, ensure_marker_tables
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,20 @@ class _QualityStore(AsyncSqliteBase):
     def connection(self) -> aiosqlite.Connection:
         """Public accessor for the open connection; raises RuntimeError if not opened."""
         return self._require_conn()
+
+    async def open(self) -> None:
+        """Open, then reshape a markers table older than the marker producer.
+
+        Runs before ``_quality_loop`` can write a marker, and closes the connection on failure
+        so a half-open store is never left behind.
+        """
+        await super().open()
+        try:
+            await ensure_marker_tables(self.connection)
+            await self.connection.commit()
+        except BaseException:
+            await self.close()
+            raise
 
 
 async def _sleep_to_aligned_tick(interval: int) -> None:
