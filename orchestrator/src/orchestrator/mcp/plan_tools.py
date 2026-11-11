@@ -16,7 +16,7 @@ MCP tool-call envelope markup that leaked into their prose fields when the
 harness mis-closed an argument — a trailing mis-close, or a whole sibling
 parameter absorbed into the value before it.  Every entry point that opens
 an existing plan goes through :func:`_read_plan_repaired`, which repairs
-what it can, writes the result back through ``TaskArtifacts.write_plan``,
+what it can, writes the result back through ``TaskArtifacts.write_plan_model``,
 and reports every repair and every refusal on the response's
 ``markup_repairs`` key.  EVERY plan.json write -- repair write-back and
 tool mutation alike -- goes through that one method, which owns the byte
@@ -105,7 +105,7 @@ from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator import plan_descope
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, PlanConfirmation, TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 
 logger = logging.getLogger(__name__)
@@ -636,7 +636,7 @@ def _repair_one_field(
         #   RECOVERED value. Declining here would blank the field, and
         #   because the fact still reads ``outcome: 'repaired'``,
         #   ``_read_plan_repaired`` would persist that blank through
-        #   ``TaskArtifacts.write_plan`` — authored text destroyed on
+        #   ``TaskArtifacts.write_plan_model`` — authored text destroyed on
         #   disk,
         #   unrecoverable on the next read. That is the same
         #   silent-authored-text-loss this whole surface exists to end,
@@ -965,10 +965,10 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
         return repaired, reportable
 
     try:
-        artifacts.write_plan(repaired)
+        artifacts.write_plan_model(_body_edit(repaired))
     except Exception as exc:
         # Broad on purpose: the caller must receive the repaired plan whatever
-        # went wrong on the way to disk. TaskArtifacts.write_plan can raise an
+        # went wrong on the way to disk. TaskArtifacts.write_plan_model can raise an
         # OSError family member (EACCES, ENOSPC, the ArtifactWriteError
         # dangling-symlink refusal) or a TypeError/ValueError out of its
         # json.dumps, so narrowing here would turn a persistence failure into
@@ -1025,6 +1025,16 @@ def _with_markup_repairs(
     if facts:
         response['markup_repairs'] = facts
     return response
+
+
+def _body_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* edited outside its step set: its confirmation is kept."""
+    return Plan.from_json(plan)
+
+
+def _step_set_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* after a step-set edit: its confirmation is cleared (``artifacts.py::Plan.restructured``)."""
+    return Plan.from_json(plan).restructured()
 
 
 # ---------------------------------------------------------------------------
@@ -1088,17 +1098,7 @@ def _create_plan(
     # passed the inbound guard on `record_descoped_step`. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
-    plan = {
-        'task_id': task_id,
-        'title': title,
-        'analysis': analysis,
-        'files': files,
-        'prerequisites': [],
-        'steps': [],
-        'design_decisions': [],
-        'reuse': [],
-        'dropped_files': [],
-    }
+    carried: dict[str, Any] = {}
     try:
         # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
         # (task 4597).
@@ -1129,17 +1129,17 @@ def _create_plan(
         # DROPPED rather than laundered into a present-and-zero key that would
         # contradict this key's contract that its PRESENCE is the signal.
         existing = artifacts.read_plan()
-        carried = plan_markup_stamp.normalize_block(
+        block = plan_markup_stamp.normalize_block(
             existing.get(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
             if isinstance(existing, dict) else None
         )
-        if carried is not None:
-            plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
-        plan_markup_stamp.drain_pending(plan)
+        if block is not None:
+            carried[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        plan_markup_stamp.drain_pending(carried)
         # The descope record is the one trace of a done step a revalidation
         # dropped; a wholesale overwrite must not erase it.
         if isinstance(existing, dict):
-            plan.update(plan_descope.descope_record_of(existing))
+            carried.update(plan_descope.descope_record_of(existing))
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1148,7 +1148,10 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan, mutex_held=True)
+    recreated = Plan.from_json({}).recreated(
+        task_id=task_id, title=title, analysis=analysis, files=files, carried=carried,
+    )
+    artifacts.write_plan_model(recreated, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
@@ -1187,7 +1190,7 @@ def _add_plan_step(
         'status': 'pending',
         'commit': None,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
         markup_facts,
@@ -1223,7 +1226,7 @@ def _add_prerequisite(
         'commit': None,
         'tests': [],
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
 
 
@@ -1241,7 +1244,7 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
@@ -1264,7 +1267,7 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
@@ -1302,7 +1305,7 @@ def _drop_plan_file(
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
-    # Every refusal below returns BEFORE any artifacts.write_plan call — the
+    # Every refusal below returns BEFORE any artifacts.write_plan_model call — the
     # module-wide convention that a refusal envelope always implies no write.
     if not reason or not reason.strip():
         return _with_markup_repairs(
@@ -1357,7 +1360,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1557,7 +1560,7 @@ def _record_descoped_step(
         _session_identity_in_hand(artifacts, plan) or plan_descope.RESCOPED_BY_UNKNOWN
     )
     plan[plan_descope.RESCOPED_NOTE_KEY] = note
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'commit': commit, 'descoped_steps': len(entries)},
         markup_facts,
@@ -1584,7 +1587,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1631,7 +1634,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1673,7 +1676,7 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'replaced': step_id}, markup_facts
                 )
@@ -1749,24 +1752,11 @@ def _confirm_plan(
             ),
         })
 
-    now = datetime.now(UTC).isoformat()
-    # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
-    # the architect declared the plan complete; the workflow requires it before
-    # a plan may advance to execution (workflow._plan), and salvages a plan that
-    # carries it even when the CLI run failed on a budget/turn cap.  Its ABSENCE
-    # on a plan that already has steps means a prior session was interrupted
-    # mid-build — the workflow routes that partial to a completion pass instead
-    # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
-    # checks (see workflow._can_skip_revalidation).
-    #
-    # ``_finalized_at`` dates the LAST confirm: every re-confirm, revalidation
-    # and amendment re-confirms included, overwrites it.  ``_created_at``,
-    # stamped by ``orchestrator/artifacts.py::TaskArtifacts.stamp_plan_provenance``,
-    # is a post-hoc provenance stamp and is always later.  Neither dates the
-    # moment the plan was first frozen.
-    plan['_finalized_at'] = now
-    plan['_revalidated_at'] = now
-    artifacts.write_plan(plan, mutex_held=True)
+    # What confirmation records, and what clears it: ``orchestrator/artifacts.py::Plan.confirmed``.
+    confirmed = Plan.from_json(plan).confirmed(
+        at=datetime.now(UTC).isoformat(), by=PlanConfirmation.ARCHITECT,
+    )
+    artifacts.write_plan_model(confirmed, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
