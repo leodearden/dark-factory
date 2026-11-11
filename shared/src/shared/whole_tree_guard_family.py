@@ -41,7 +41,9 @@ __all__ = [
 # module mark narrows nothing.  Coverage of the family is ENFORCED, not
 # sprinkled: orchestrator/tests/test_whole_tree_scan_timeout_guard.py
 # recomputes the census from source on every run and fails a scanner that
-# lacks the mark OR pins it below this ceiling.
+# lacks the mark OR pins it below this ceiling, and
+# shared/src/shared/testing_repo_wide_tests.py::judge_repo_wide_family fails
+# every unmarked repo-wide test module in the other packages' tests.
 #
 # MECHANISM -- what a breach here costs:
 #   * until task 6354, `[tool.pytest.ini_options].timeout_method = "thread"`
