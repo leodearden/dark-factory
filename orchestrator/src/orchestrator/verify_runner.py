@@ -3337,6 +3337,12 @@ class EnvDriftCheckResult:
     remote_probes:    The remote host's extra_probes mapping ({} when unprobed).
     escalated:        True when a NEW env-divergence escalation was submitted
                       (False when deduped against an already-open L1).
+    unavailable_reason: str() of the RunnerUnavailable that made the check
+                      INCONCLUSIVE — for a remote, ssh's own stderr via
+                      ``RemoteRunner._probe_ssh`` — so a dispatcher-side fault
+                      such as an unbindable ControlPath can be told from an
+                      unreachable host.  None on every other result, including
+                      the INCONCLUSIVE guards for a check that was not taken.
     """
     verdict: DriftVerdict
     is_faithful: bool
@@ -3344,6 +3350,7 @@ class EnvDriftCheckResult:
     local_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     remote_probes: Mapping[str, str] = dataclasses.field(default_factory=dict)
     escalated: bool = False
+    unavailable_reason: str | None = None
 
 
 class DriftDetector:
@@ -3605,7 +3612,9 @@ class DriftDetector:
         ------------
         AGREE → emit ``verify_env_parity_ok`` (None-safe).
         DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
-        INCONCLUSIVE → nothing at all: no event, no escalation, no probe.
+        INCONCLUSIVE → no event, no escalation.  When a runner raised
+        RunnerUnavailable its message is kept on ``unavailable_reason``; every
+        other INCONCLUSIVE carries None.
         INCONCLUSIVE covers every reason the check could not be TAKEN — no
         probes declared, no local runner, no eligible remote (including one
         the verdict path just quarantined), a remote that is not a
@@ -3707,7 +3716,7 @@ class DriftDetector:
                 extra_probe_specs=probe_specs,
                 include_toolchain=include_toolchain,
             )
-        except RunnerUnavailable:
+        except RunnerUnavailable as exc:
             # Invariant 5: transport failure is not divergence.  A closed or
             # flaky laptop must never raise a false env-skew alarm — the same
             # reasoning check() applies to a failed verify dispatch.
@@ -3717,7 +3726,11 @@ class DriftDetector:
             # spawn failure) into RunnerUnavailable precisely so an unreachable
             # host lands here instead of comparing '<unavailable rc=255>'
             # against real local versions and alarming on every declared tool.
-            return inconclusive
+            return EnvDriftCheckResult(
+                verdict=DriftVerdict.INCONCLUSIVE,
+                is_faithful=True,
+                unavailable_reason=str(exc),
+            )
 
         parity = compare_env_fingerprints(local_fp, remote_fp, dimensions=dimensions)
 
