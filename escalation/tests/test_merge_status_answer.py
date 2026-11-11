@@ -354,6 +354,16 @@ class TestHints:
         assert 'do not resubmit' in hint.lower()
         assert 'human' in hint.lower()
 
+    def test_never_submitted_hint_names_the_keyed_resubmit_precondition(self) -> None:
+        hint = MergeStatusAnswer.epistemic(
+            MergeState.no_record, reason=MergeReason.never_submitted,
+            request_id='mr-1',
+        ).to_response()['hint']
+
+        for token in ('task_id', 'branch', 'request_id', 'get_merge_queue'):
+            assert token in hint, f'{token!r} missing from {hint!r}'
+        assert 'Submit it with merge_request' not in hint
+
 
 class TestLastOutcome:
     def test_from_row_renders_the_labelled_projection(self) -> None:
