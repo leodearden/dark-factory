@@ -1432,7 +1432,7 @@ def create_server(
             # this server it is the only attribution that always resolves: the
             # middleware's `_identity` reads `agent_id` / `project_root` /
             # `project_id` off the call's own arguments; no escalation tool
-            # declares `agent_id` or `project_id`, and the five that accept an
+            # declares `agent_id` or `project_id`, and the tools that accept an
             # OPTIONAL `project_root` see it omitted by fleet callers, so
             # `project` below usually stays None. The record's own `task_id` is
             # the synthetic anchor, not the caller's, so without these two
@@ -3094,6 +3094,24 @@ def create_server(
             return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
         return dicts
 
+    def _task_escalation_records(
+        task_id: str,
+        *,
+        status: str | None = None,
+        level: int | None = None,
+        agent_role: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        escalations = queue.get_by_task(
+            task_id, status=status, level=level, agent_role=agent_role,
+        )
+        if compact:
+            return [
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
+                for d in (e.to_dict() for e in escalations)
+            ]
+        return [e.to_dict() for e in escalations]
+
     @mcp.tool()
     def get_task_escalations(
         task_id: str,
@@ -3101,7 +3119,8 @@ def create_server(
         level: int | None = None,
         agent_role: str | None = None,
         compact: bool = False,
-    ) -> list[dict[str, Any]]:
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """List EVERY escalation ever filed for a task — ARCHIVE-INCLUSIVE by default.
 
         This is the archive-inclusive counterpart to
@@ -3146,18 +3165,20 @@ def create_server(
         triage-relevant field subset ``get_pending_escalations(compact=True)``
         returns, so the two task-scoped lookups are shape-compatible.
 
+        *project_root* — optional. When given, it must name the project root
+        this store serves; otherwise the call returns ``{'error': ...}``
+        naming both stores (or naming the reconciliation store) instead of a
+        list. Omitted, the call is unchanged. The rule is
+        ``escalation.project_root_guard::ProjectRootGuard``'s.
+
         No connection-capability gate applies: this is a read-only lookup,
         mirroring ``get_escalation``.
         """
-        escalations = queue.get_by_task(
-            task_id, status=status, level=level, agent_role=agent_role,
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
+        return _task_escalation_records(
+            task_id, status=status, level=level, agent_role=agent_role, compact=compact,
         )
-        if compact:
-            return [
-                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
-                for d in (e.to_dict() for e in escalations)
-            ]
-        return [e.to_dict() for e in escalations]
 
     @mcp.tool()
     def get_task_escalation_history(
@@ -3177,8 +3198,8 @@ def create_server(
         escalation was resolved. That ``[]`` means "none currently OPEN",
         never "none ever filed" — do not read it as evidence of absence.
 
-        Contrast with the sibling ``get_task_escalations``: both scan the
-        same underlying store (this tool delegates to it directly), but
+        Contrast with the sibling ``get_task_escalations``: both read
+        through the same scan of the same underlying store, but
         that tool is the general FILTERABLE form — it accepts ``status``,
         ``agent_role`` and ``compact``, and returns a bare list. Reach for
         THIS tool when the question is the unfiltered ever-filed one and
@@ -3215,8 +3236,9 @@ def create_server(
         escalation was ever filed for this task" — that confusion is the
         exact failure mode this tool exists to remove.
 
-        Inherits ``queue.get_by_task``'s documented dedup and cross-tier
-        pre-scan WARNING behaviour (queue.py:396-430) via the sibling.
+        Inherits the documented dedup and cross-tier pre-scan WARNING
+        behaviour of ``escalation/queue.py::EscalationQueue.get_by_task``
+        through the scan it shares with the sibling.
 
         A task with no matching records yields an empty envelope
         (``count == 0``), not an ``{'error': ...}`` dict — deliberately
@@ -3225,7 +3247,7 @@ def create_server(
         """
         if (refusal := project_root_guard.check(project_root)) is not None:
             return refusal
-        escalations = get_task_escalations(task_id, level=level)
+        escalations = _task_escalation_records(task_id, level=level)
         return {
             'task_id': task_id,
             'count': len(escalations),
