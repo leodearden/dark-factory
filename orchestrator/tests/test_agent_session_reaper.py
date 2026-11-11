@@ -11,8 +11,11 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared import transcript_archive as transcript_archive_module
 
 from orchestrator.agent_session_reaper import (
     ReapTally,
@@ -22,6 +25,11 @@ from orchestrator.agent_session_reaper import (
     read_sidecar_claim,
     reap_verdict,
 )
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import TranscriptArchiveConfig
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.harness import Harness
+from orchestrator.lane_lifecycle import LaneLifecycle
 
 _DEAD_PID = 2**31 - 1
 _NOW = datetime(2026, 11, 11, 12, 0, 0, tzinfo=UTC)
@@ -220,4 +228,242 @@ class TestReapTally:
             'kept_status_unknown': 0,
             'unresolvable': 0,
             'status_read_error': 'boom',
+        }
+
+
+@pytest.fixture
+def harness(tmp_path: Path, mock_orch_config):
+    """A Harness with mocked internals and a REAL event store, mirroring
+    test_transcript_archive_startup_sweeper.py's fixture.
+    """
+    mock_orch_config.transcript_archive = TranscriptArchiveConfig()
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+
+    h.scheduler = MagicMock()
+    h.scheduler.get_tasks = AsyncMock(return_value=[])
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.get_task = AsyncMock(return_value={})
+    h.scheduler.get_status = AsyncMock(return_value=None)
+    h.scheduler._dispatched = set()
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+    _serve_statuses(h, {})
+
+    h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+    h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+    h.git_ops.mark_pool_storage_present()
+    h.git_ops.cleanup_worktree = AsyncMock()
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops._lane_lifecycle = LaneLifecycle(
+        h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,
+    )
+    h.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+    h.event_store = EventStore(tmp_path / 'runs.db', run_id='r1')
+    yield h
+    transcript_archive_module._reset_archival_failures()
+
+
+def _serve_statuses(
+    harness: Harness, statuses: dict[str, str], err: Exception | None = None,
+) -> AsyncMock:
+    """Answer get_statuses from *statuses*, omitting ids it does not know."""
+
+    async def _get_statuses(ids: list[str] | None = None):
+        if err is not None:
+            return {}, err
+        return {k: v for k, v in statuses.items() if ids is None or k in ids}, None
+
+    mock = AsyncMock(side_effect=_get_statuses)
+    harness.scheduler.get_statuses = mock
+    return mock
+
+
+def _seed_sidecar(
+    base: Path,
+    entry_name: str,
+    *,
+    owner_pid: object,
+    task_id: str | None = None,
+    started_at: str | None = None,
+    root: Literal['legacy', 'meta'] = 'legacy',
+) -> Path:
+    """Write a v2 sidecar for *entry_name* (v1 when *task_id* is None)."""
+    entry = base / entry_name
+    entry.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        'session_id': f'sess-{entry_name}',
+        'role': 'implementer',
+        'started_at': started_at
+        or (datetime.now(UTC) - timedelta(hours=176)).isoformat(),
+        'owner_pid': owner_pid,
+        'resume_count': 0,
+    }
+    if task_id is not None:
+        payload['task_id'] = task_id
+        payload['schema_version'] = 2
+    if root == 'legacy':
+        path = entry / '.task' / 'agent_session.json'
+    else:
+        path = TaskArtifacts.meta_root_for(base, entry_name) / 'agent_session.json'
+    return _write_json(path, payload)
+
+
+def _summary(harness: Harness) -> dict:
+    assert harness.event_store is not None
+    rows = harness.event_store.fetch_events_by_type(EventType.sidecar_reap_summary)
+    assert len(rows) == 1
+    return rows[0]['data']
+
+
+def _reaped_rows(harness: Harness) -> list[dict]:
+    assert harness.event_store is not None
+    return harness.event_store.fetch_events_by_type(EventType.sidecar_reaped)
+
+
+def _awaited_ids(mock: AsyncMock) -> list[str]:
+    call = mock.await_args
+    assert call is not None
+    return call.kwargs['ids'] if 'ids' in call.kwargs else call.args[0]
+
+
+@pytest.mark.asyncio
+class TestZombieSidecarReap:
+    async def test_dead_owner_and_pending_task_is_reaped_from_both_roots(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        legacy = _seed_sidecar(base, '61', owner_pid=_DEAD_PID, task_id='61')
+        meta = _seed_sidecar(base, '61', owner_pid=_DEAD_PID, task_id='61', root='meta')
+        _serve_statuses(harness, {'61': 'pending'})
+
+        await harness._recover_crashed_tasks()
+
+        assert not legacy.exists()
+        assert not meta.exists()
+        assert '61' not in harness._recovered_sessions
+        assert '61' not in harness._preserved_worktrees
+        harness.git_ops.cleanup_worktree.assert_any_await(base / '61', '61')
+        rows = _reaped_rows(harness)
+        assert len(rows) == 1
+        assert rows[0]['task_id'] == '61'
+        data = rows[0]['data']
+        assert set(data) == {'sidecar_path', 'task_id', 'owner_pid', 'age_secs', 'status'}
+        assert data['sidecar_path'] == str(meta)
+        assert data['task_id'] == '61'
+        assert data['owner_pid'] == _DEAD_PID
+        assert isinstance(data['age_secs'], float)
+        assert data['status'] == 'pending'
+
+    async def test_dead_owner_but_in_progress_task_is_kept(self, harness: Harness):
+        """PRD §9 B10: the second conjunct is load-bearing."""
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '62', owner_pid=_DEAD_PID, task_id='62')
+        _serve_statuses(harness, {'62': 'in-progress'})
+
+        await harness._recover_crashed_tasks()
+
+        assert sidecar.exists()
+        assert '62' in harness._recovered_sessions
+        assert _reaped_rows(harness) == []
+        assert _summary(harness)['kept_in_progress'] == 1
+
+    async def test_live_owner_is_kept_and_adopted(self, harness: Harness):
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '64', owner_pid=os.getpid(), task_id='64')
+        _serve_statuses(harness, {'64': 'pending'})
+
+        await harness._recover_crashed_tasks()
+
+        assert sidecar.exists()
+        assert '64' in harness._recovered_sessions
+        assert _summary(harness)['kept_owner_alive'] == 1
+
+    async def test_status_omitted_from_the_response_is_kept(self, harness: Harness):
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '65', owner_pid=_DEAD_PID, task_id='65')
+        _serve_statuses(harness, {})
+
+        await harness._recover_crashed_tasks()
+
+        assert sidecar.exists()
+        assert _reaped_rows(harness) == []
+        assert _summary(harness)['kept_status_unknown'] == 1
+
+    async def test_status_read_error_reaps_nothing_and_is_reported(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        sidecar = _seed_sidecar(base, '66', owner_pid=_DEAD_PID, task_id='66')
+        _serve_statuses(harness, {'66': 'pending'}, err=RuntimeError('boom'))
+
+        await harness._recover_crashed_tasks()
+
+        assert sidecar.exists()
+        assert _reaped_rows(harness) == []
+        summary = _summary(harness)
+        assert summary['reaped'] == 0
+        assert summary['kept_status_unknown'] == 1
+        assert summary['status_read_error'] is not None
+        assert 'boom' in summary['status_read_error']
+
+    async def test_lane_sidecar_reaps_by_its_own_task_id_and_v1_is_unresolvable(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        v2 = _seed_sidecar(base, '_lane-0', owner_pid=_DEAD_PID, task_id='63', root='meta')
+        v1 = _seed_sidecar(base, '_lane-1', owner_pid=_DEAD_PID, root='meta')
+        _serve_statuses(harness, {'63': 'pending'})
+
+        await harness._recover_crashed_tasks()
+
+        assert not v2.exists()
+        assert v1.exists()
+        assert [row['task_id'] for row in _reaped_rows(harness)] == ['63']
+        summary = _summary(harness)
+        assert summary['reaped'] == 1
+        assert summary['unresolvable'] == 1
+
+    async def test_mixed_boot_makes_one_bulk_read_of_the_dead_owner_ids(
+        self, harness: Harness,
+    ):
+        base = harness.git_ops.worktree_base
+        _seed_sidecar(base, '71', owner_pid=_DEAD_PID, task_id='71')
+        _seed_sidecar(base, '72', owner_pid=_DEAD_PID, task_id='72')
+        _seed_sidecar(base, '73', owner_pid=_DEAD_PID, task_id='73')
+        _seed_sidecar(base, '74', owner_pid=os.getpid(), task_id='74')
+        get_statuses = _serve_statuses(
+            harness,
+            {'71': 'pending', '72': 'done', '73': 'in-progress', '74': 'pending'},
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert get_statuses.await_count == 1
+        assert sorted(_awaited_ids(get_statuses)) == ['71', '72', '73']
+        assert _summary(harness) == {
+            'reaped': 2,
+            'kept_owner_alive': 1,
+            'kept_in_progress': 1,
+            'kept_status_unknown': 0,
+            'unresolvable': 0,
+            'status_read_error': None,
+        }
+
+    async def test_clean_boot_skips_the_read_and_still_reports_zero(
+        self, harness: Harness,
+    ):
+        get_statuses = _serve_statuses(harness, {})
+
+        await harness._recover_crashed_tasks()
+
+        get_statuses.assert_not_awaited()
+        assert _summary(harness) == {
+            'reaped': 0,
+            'kept_owner_alive': 0,
+            'kept_in_progress': 0,
+            'kept_status_unknown': 0,
+            'unresolvable': 0,
+            'status_read_error': None,
         }
