@@ -660,7 +660,7 @@ class TestProgressTimeoutResumePrompt:
         assert seen['resume_session_id'] == 'killed-sid'
         assert seen['prompt'] == PROGRESS_TIMEOUT_RESUME_PROMPT
 
-    async def test_progress_timeout_prompt_is_consumed_with_the_session(
+    async def test_dispatch_after_progress_timeout_resume_is_fresh_with_real_prompt(
         self, tmp_path: Path,
     ):
         wf = _make_workflow(tmp_path=tmp_path, max_execute_iterations=1)

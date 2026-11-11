@@ -3869,7 +3869,7 @@ class TestCapRetryResumePrompt:
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
-            pytest.raises(ValueError),
+            pytest.raises(ValueError, match='lbl resume_prompt'),
         ):
             await invoke_with_cap_retry(
                 gate, 'lbl',
