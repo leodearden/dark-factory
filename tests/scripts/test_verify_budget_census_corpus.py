@@ -338,6 +338,16 @@ class TestLoadRecordsIsTotal:
         assert corpus.records == ()
         assert [s.reason for s in corpus.skipped] == ['unreadable']
 
+    def test_a_read_torn_mid_multibyte_character_is_unreadable(self, tmp_path):
+        """Summaries are written `ensure_ascii=False`, so this is reachable."""
+        from verify_budget_census import _read_payload  # noqa: PLC0415
+
+        raw = json.dumps({'cmd': 'pytest — dash'}, ensure_ascii=False).encode('utf-8')
+        torn = tmp_path / 'attempt-1.orchestrator.summary.json'
+        torn.write_bytes(raw[:raw.find('—'.encode()) + 1])
+
+        assert _read_payload(torn) == (None, 'unreadable')
+
     def test_every_selected_file_is_accounted_for(self, tmp_path):
         """The reconciliation property, asserted directly."""
         from verify_budget_census import load_records  # noqa: PLC0415
