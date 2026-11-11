@@ -14,6 +14,7 @@ entry of orchestrator/src/orchestrator/event_store.py::EventType.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -150,6 +151,20 @@ def write_invocations(
             [
                 (model, _iso(started_at), _iso(started_at), model_id)
                 for model, model_id, started_at in rows
+            ],
+        )
+        conn.commit()
+
+
+def append_events(store: Path, events: Iterable[EventRow]) -> None:
+    """Append *events* to an existing runs.db, after every row already in it."""
+    with closing(sqlite3.connect(store)) as conn:
+        conn.executemany(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, data) VALUES (?, ?, ?, ?, ?)',
+            [
+                (_iso(timestamp), f'run-{task_id}', task_id, event_type,
+                 data if isinstance(data, str) else json.dumps(dict(data)))
+                for timestamp, task_id, event_type, data in events
             ],
         )
         conn.commit()

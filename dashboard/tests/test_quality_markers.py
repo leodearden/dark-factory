@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import yaml
+from _quality_fixture import append_events, routing_decision
+from _runs_db_fixture import EventRow, write_runs_db
 from shared.quality_series.stats import RegimeEvent
+from shared.tasks_db_readonly import connect_ro
 
 from dashboard.data import quality_markers
 from dashboard.data.quality_markers import (
@@ -18,7 +24,11 @@ from dashboard.data.quality_markers import (
     MarkerInvariantError,
     MarkerKind,
     MarkerSource,
+    RoutingFold,
+    RoutingStep,
+    RuleSpan,
     SourceType,
+    fold_routing_decisions,
     load_curated_markers,
 )
 from dashboard.data.quality_series import CATALOGUE
@@ -36,19 +46,20 @@ EXAMPLE_SOURCES = {
 }
 
 
+EFFORT_MARKER = Marker(
+    marker_id='routing:reviewer_comprehensive:42',
+    at=AT,
+    kind=MarkerKind.EFFORT,
+    scope='dark_factory',
+    series=None,
+    until=None,
+    label='reviewer_comprehensive effort high -> xhigh',
+    source=EXAMPLE_SOURCES[SourceType.ROUTING],
+)
+
+
 def _marker(**overrides: object) -> Marker:
-    fields: dict[str, object] = {
-        'marker_id': 'routing:reviewer_comprehensive:42',
-        'at': AT,
-        'kind': MarkerKind.EFFORT,
-        'scope': 'dark_factory',
-        'series': None,
-        'until': None,
-        'label': 'reviewer_comprehensive effort high -> xhigh',
-        'source': EXAMPLE_SOURCES[SourceType.ROUTING],
-    }
-    fields.update(overrides)
-    return Marker(**fields)  # type: ignore[arg-type]
+    return replace(EFFORT_MARKER, **overrides)
 
 
 def _artefact(**overrides: object) -> Marker:
@@ -396,3 +407,185 @@ class TestCommittedCuratedFile:
 
         assert named
         assert named <= metric_ids
+
+
+T0 = datetime(2026, 10, 27, 13, 0, tzinfo=UTC)
+
+
+def _t(minutes: float) -> datetime:
+    return T0 + timedelta(minutes=minutes)
+
+
+def _runs(tmp_path: Path, events: list[EventRow], name: str = 'project') -> Path:
+    return write_runs_db(tmp_path / name, events)
+
+
+def _fold(store: Path, fold: RoutingFold | None = None, *, batch: int | None = None) -> RoutingFold:
+    with closing(connect_ro(store)) as conn:
+        return fold_routing_decisions(conn, fold or RoutingFold.empty('dark_factory'), batch=batch)
+
+
+def _step(
+    role: str, first: float, last: float, decisions: int, *, first_id: int | None = None,
+    last_id: int | None = None, layer: str = 'config', model: str = 'fable', effort: str = 'high',
+    budget_usd: float = 8.0, max_turns: int = 100, digest: str | None = None,
+) -> RoutingStep:
+    """A step whose event ids equal its minutes unless given (one row per minute in the fixtures)."""
+    return RoutingStep(
+        role=role, first_event_id=int(first) if first_id is None else first_id, first_at=_t(first),
+        last_event_id=int(last) if last_id is None else last_id, last_at=_t(last),
+        decisions=decisions, source_layer=layer, model=model, effort=effort,
+        budget_usd=budget_usd, max_turns=max_turns, prompt_digest=digest,
+    )
+
+
+def _decision(
+    minutes: float, role: str, *, layer: str = 'config', model: str = 'fable',
+    effort: str = 'high', budget_usd: float = 8.0, max_turns: int = 100,
+    rule_id: str | None = None, digest: str | None = None,
+) -> EventRow:
+    return routing_decision(
+        _t(minutes), role, model=model, effort=effort, budget_usd=budget_usd,
+        max_turns=max_turns, source_layer=layer, rule_id=rule_id, prompt_digest=digest,
+    )
+
+
+class TestRoutingFold:
+    def test_an_empty_fold_has_folded_nothing(self) -> None:
+        assert RoutingFold.empty('reify') == RoutingFold(
+            project_id='reify', cursor=0, steps=(), rules=(), first_at=None, newest_at=None,
+            digest_since=None, skipped=0, complete=False,
+        )
+
+    def test_config_and_role_default_rows_run_length_encode_per_role(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'merger'),
+            _decision(2, 'reviewer_comprehensive', model='opus', budget_usd=12.0, max_turns=60),
+            _decision(3, 'merger'),
+            _decision(4, 'merger', layer='role_default', model='opus'),
+            _decision(5, 'merger'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.steps == (
+            _step('merger', 1, 3, 2),
+            _step('reviewer_comprehensive', 2, 2, 1, model='opus', budget_usd=12.0, max_turns=60),
+            _step('merger', 4, 4, 1, layer='role_default', model='opus'),
+            _step('merger', 5, 5, 1),
+        )
+        assert (fold.cursor, fold.first_at, fold.newest_at) == (5, _t(1), _t(5))
+        assert fold.complete
+        assert fold.project_id == 'dark_factory'
+
+    def test_rule_rows_feed_rule_spans_and_only_config_layers_feed_steps(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'implementer'),
+            _decision(2, 'implementer', layer='policy_rule', rule_id='large-plan-steps',
+                      model='opus'),
+            _decision(3, 'implementer'),
+            _decision(4, 'implementer', layer='metadata_override', model='sonnet'),
+            _decision(5, 'implementer', rule_id='retry-tier-up'),
+            _decision(6, 'implementer', layer='policy_rule', rule_id='large-plan-steps',
+                      model='opus'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.steps == (_step('implementer', 1, 5, 3),)
+        assert fold.rules == (
+            RuleSpan(rule_id='large-plan-steps', first_event_id=2, first_at=_t(2),
+                     last_at=_t(6), decisions=2),
+            RuleSpan(rule_id='retry-tier-up', first_event_id=5, first_at=_t(5),
+                     last_at=_t(5), decisions=1),
+        )
+        assert fold.cursor == 6
+
+    def test_an_absent_digest_never_splits_a_step_and_a_new_one_does(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'architect'),
+            _decision(2, 'architect', digest='a' * 64),
+            _decision(3, 'architect'),
+            _decision(4, 'architect', digest='b' * 64),
+            _decision(5, 'architect'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.steps == (
+            _step('architect', 1, 3, 3, digest='a' * 64),
+            _step('architect', 4, 5, 2, digest='b' * 64),
+        )
+        assert fold.digest_since == _t(2)
+
+    def test_no_digest_anywhere_leaves_digest_since_unset(self, tmp_path: Path) -> None:
+        assert _fold(_runs(tmp_path, [_decision(1, 'merger')])).digest_since is None
+
+    def test_the_events_role_column_wins_over_the_payload(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [_decision(1, 'payload_role')])
+        with closing(sqlite3.connect(store)) as conn:
+            conn.execute("UPDATE events SET role = 'merger'")
+            conn.commit()
+
+        assert [step.role for step in _fold(store).steps] == ['merger']
+
+    def test_unreadable_rows_are_skipped_and_counted(self, tmp_path: Path) -> None:
+        no_model = {'role': 'merger', 'effort': 'high', 'budget_usd': 8.0, 'max_turns': 100,
+                    'source_layer': 'config', 'rule_id': None}
+        naive = routing_decision(_t(4).replace(tzinfo=None).isoformat(), 'merger', model='fable',
+                                 effort='high', budget_usd=8.0, max_turns=100)
+        store = _runs(tmp_path, [
+            _decision(1, 'merger'),
+            (_t(2), None, 'routing_decision', '{not json'),
+            (_t(3), None, 'routing_decision', no_model),
+            naive,
+            _decision(5, 'merger'),
+            (_t(6), None, 'routing_decision', '[1, 2]'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.skipped == 4
+        assert fold.steps == (_step('merger', 1, 5, 2),)
+        assert (fold.cursor, fold.newest_at) == (6, _t(5))
+
+    def test_other_event_types_are_not_read(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [_decision(1, 'merger'), (_t(2), '7', 'merge_finalized', {})])
+
+        fold = _fold(store)
+
+        assert fold.steps == (_step('merger', 1, 1, 1),)
+        assert fold.skipped == 0
+
+    def test_folding_in_batches_until_complete_equals_one_full_fold(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'merger'), _decision(2, 'merger', digest='a' * 64),
+            _decision(3, 'architect'), (_t(4), None, 'routing_decision', '{not json'),
+            _decision(5, 'merger', rule_id='r1'), _decision(6, 'merger', model='opus'),
+            _decision(7, 'architect', layer='policy_rule', rule_id='r2'),
+        ])
+
+        fold = _fold(store, batch=3)
+        assert not fold.complete
+        partial = [fold]
+        while not fold.complete:
+            fold = _fold(store, fold, batch=3)
+            partial.append(fold)
+
+        assert fold == _fold(store)
+        assert len(partial) == 3
+
+    def test_a_fold_reads_only_rows_after_its_cursor(self, tmp_path: Path) -> None:
+        first_rows = [_decision(1, 'merger'), _decision(2, 'merger')]
+        later_rows = [_decision(3, 'merger'), _decision(4, 'merger', model='opus')]
+        store = _runs(tmp_path, first_rows)
+        before = _fold(store)
+        with closing(sqlite3.connect(store)) as conn:
+            conn.execute("UPDATE events SET data = json_set(data, '$.model', 'haiku') WHERE id = 1")
+            conn.commit()
+
+        assert _fold(store, before) == before
+
+        append_events(store, later_rows)
+
+        assert _fold(store, before) == _fold(_runs(tmp_path, first_rows + later_rows, 'fresh'))
