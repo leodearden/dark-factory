@@ -4353,7 +4353,10 @@ class Harness:
         self._sweep_orphaned_transcripts()
         # Siting is the PRD F4 rule (plans/session-resume-eligibility-seam-prd.md):
         # 2c must precede 2d's re-pend, and the sweep above reads the session first.
-        await self._reap_zombie_sidecars()
+        try:
+            await self._reap_zombie_sidecars()
+        except Exception as exc:
+            failures.record('agent-session-reaper', exc)
 
         # W11 delta: keep the durable LaneLifecycle record and the pool's
         # in-memory cache from ever drifting (PRD dec.3, I1) — every
