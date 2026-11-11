@@ -24,9 +24,10 @@ natively, so the launcher's wall clock bounds each invocation. Stage 2 (the
 A mock Anthropic-protocol model server on 127.0.0.1 scripted one tool call,
 and a FastMCP stdio server named `plan-tools` exposed a `mark_step_done` tool
 that writes a marker file. ZCode was wired to them through two files and no
-flags. The provider file, named by `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, has
-`api {type: anthropic-messages, baseUrl}`, `access {type: api-key, apiKey}`,
-`personalModelIds ['glm-5.3']` and `defaultModelSelection`. The user-scope
+flags. The provider file, named by `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, is
+`{schemaVersion: 1, config: {providerConfigRules: {providerRules: [{providerId, providerName, config: {group: 'standard-personal', access: {type: 'api-key', apiKey}, api: {type: 'anthropic-messages', baseUrl}, personalModelIds: ['glm-5.3']}}]}, modelConfigRules: {providerModelRules: [], manualProviderModelRules: []}, defaultModelSelection: {providerId, modelId: 'glm-5.3'}}}`.
+Upstream's codec (`packages/provider-node/src/provider-config-file-codec.ts`)
+parses it strictly, so any other top-level key is rejected. The user-scope
 `$HOME/.zcode/cli/config.json` is
 `{features: {mcp: true}, mcp: {servers: {plan-tools: {type: 'stdio', command, args, enabled: true}}}}`.
 
