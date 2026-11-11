@@ -13897,18 +13897,7 @@ class SpeculativeMergeWorker:
         # a wiring omission.
         self._inflight.clear()
 
-        # Drain the redispatch park: items pending re-dispatch after a cascade.
-        while self._intake.has_pending_redispatch:
-            _rd = self._intake.next_redispatch()
-            if not _rd.request.result.done():
-                _rd.request.result.set_result(shutdown)
-            # MQ-reliability kappa (task 2169): retire — parked awaiting
-            # re-dispatch, never reaches DISPATCHING again once dropped here.
-            self._retire_item(_rd.request.request_id)
-            _rd_wt = item_merge_wt(_rd)
-            if _rd_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(_rd_wt)
+        await self._drain_redispatch_park_for_shutdown(shutdown)
 
         # Send sentinels to unblock both loops
         await self._queue.put(None)  # type: ignore[arg-type]
@@ -13944,6 +13933,11 @@ class SpeculativeMergeWorker:
                     self._retire_item(item.request.request_id)
             except asyncio.QueueEmpty:
                 break
+
+        # Re-drain the redispatch park: a head the verifier loop was
+        # dispatching as its rebased commit during the awaits above parks
+        # itself and its successors after the first drain (task 8525).
+        await self._drain_redispatch_park_for_shutdown(shutdown)
 
         # Re-drain main queue: under operator halt, _dispatch_item returns
         # REQUEUED_PREDISPATCH and calls _queue.put_nowait(req) without resolving
@@ -15610,6 +15604,24 @@ class SpeculativeMergeWorker:
             )
         self._retire_item(req.request_id)
         return head
+
+    async def _drain_redispatch_park_for_shutdown(self, shutdown: MergeOutcome) -> None:
+        """Resolve every item parked for re-dispatch with *shutdown* and retire it.
+
+        stop() owns the park once requested, so no dispatch takes from it
+        concurrently; each item's owned merge worktree is cleaned.
+        """
+        while self._intake.has_pending_redispatch:
+            parked = self._intake.next_redispatch()
+            if not parked.request.result.done():
+                parked.request.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — parked awaiting
+            # re-dispatch, never reaches DISPATCHING again once dropped here.
+            self._retire_item(parked.request.request_id)
+            parked_wt = item_merge_wt(parked)
+            if parked_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(parked_wt)
 
     async def _release_parked_gate_head(self, head: InflightEntry) -> None:
         """Tear down a detached head's gate, then release its lease, speculation

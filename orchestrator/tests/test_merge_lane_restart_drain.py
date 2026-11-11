@@ -356,8 +356,8 @@ def _git(cwd: Path, *args: str) -> str:
 
 async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: Path) -> None:
     """R2: a main that moves under a head's verify costs a gate re-verify, a
-    whole new verify; its deadline is measured from ITS start, not the first
-    verify's dispatch."""
+    whole new verify dispatched as the rebased head (task 8525); its deadline
+    is measured from ITS start, not the first verify's dispatch."""
     repo = seed_repo(tmp_path / 'repo', _SEED)
     scene = _Scene(
         repo=repo, git_ops=GitOps(_GIT, repo),
@@ -389,7 +389,7 @@ async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: P
         outcome = await run.outcome(head)
 
     assert first['kind'] == 'verify'
-    assert gate['kind'] == 'gate_reverify'
+    assert gate['kind'] == 'verify'
     assert gate['started_ts'] >= first['started_ts'] + 5_000.0
     assert gate['deadline_ts'] - gate['started_ts'] == budget
     assert outcome.status == 'done', outcome
