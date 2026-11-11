@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -265,3 +266,115 @@ def test_pending_counts_against_now(settle_queue: SettleQueue, capsys: pytest.Ca
 
     assert trailing_json(under_24)['pending_over_h'] == 1
     assert trailing_json(under_48)['pending_over_h'] == 0
+
+
+REDESIGN_TEXT = 'open the joint L0 end-of-life redesign with the harness plan (S8)'
+STRANDED_BREACH = {'ratio': '1.0', 'min_stranded': '3'}
+STRANDED_BELOW_MIN_COUNT = {'ratio': '1.0', 'min_stranded': '4'}
+STRANDED_UNDER_FLOOR = {**STRANDED_BREACH, 'baseline_stranded_per_100': '50'}
+REAPER_WRONG_BREACH = {'max_reaper_wrong': '2'}
+REAPER_WRONG_UNDER = {'max_reaper_wrong': '3'}
+PENDING_BREACH = {'max_pending_hours': '24'}
+THRESHOLD_CASES = (
+    {},
+    STRANDED_BREACH,
+    STRANDED_BELOW_MIN_COUNT,
+    STRANDED_UNDER_FLOOR,
+    REAPER_WRONG_BREACH,
+    REAPER_WRONG_UNDER,
+    PENDING_BREACH,
+)
+
+
+def assert_breached(code: int, lines: Sequence[str], *rules: str) -> None:
+    payload = trailing_json(lines)
+    assert code == 1
+    assert payload['breaches'] == list(rules)
+    assert payload['follow_up'] == REDESIGN_TEXT
+    assert REDESIGN_TEXT in lines[-1]
+    assert lines[-2] == f'follow-up: {REDESIGN_TEXT}'
+    for rule in rules:
+        assert any(line.startswith(f'breach: {rule}') for line in lines)
+
+
+def assert_clean(code: int, lines: Sequence[str]) -> None:
+    payload = trailing_json(lines)
+    assert code == 0
+    assert payload['breaches'] == []
+    assert payload['follow_up'] is None
+    assert REDESIGN_TEXT not in '\n'.join(lines)
+
+
+def test_exit_0_below_every_threshold(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_clean(*run_main(capsys, settle_queue.queue_dir))
+
+
+def test_stranded_rate_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_breached(*run_main(capsys, settle_queue.queue_dir, **STRANDED_BREACH), settle.Breach.STRANDED_RATE)
+
+
+def test_stranded_rate_needs_min_count(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_clean(*run_main(capsys, settle_queue.queue_dir, **STRANDED_BELOW_MIN_COUNT))
+
+
+def test_stranded_rate_uses_baseline_floor(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    _, permissive = run_main(capsys, settle_queue.queue_dir)
+    post_rate = trailing_json(permissive)['post']['stranded_per_100']
+    pre_rate = trailing_json(permissive)['pre']['stranded_per_100']
+    assert pre_rate < post_rate < float(STRANDED_UNDER_FLOOR['baseline_stranded_per_100'])
+
+    assert_clean(*run_main(capsys, settle_queue.queue_dir, **STRANDED_UNDER_FLOOR))
+
+
+def test_reaper_wrong_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_breached(*run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_BREACH), settle.Breach.REAPER_WRONG)
+    assert_clean(*run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_UNDER))
+
+
+def test_pending_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_breached(*run_main(capsys, settle_queue.queue_dir, **PENDING_BREACH), settle.Breach.PENDING_OVER_H)
+
+
+def test_startup_and_workflow_wrong_are_never_judged(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
+) -> None:
+    build = FixtureQueue(settle_queue.queue_dir, datetime.now(UTC))
+    for n in range(5):
+        build.closed(str(60 + n), build.ago(days=2, hours=n), RESTART_DISMISSAL, late=True)
+        build.closed(str(70 + n), build.ago(days=3, hours=n), WORKFLOW_DISMISSAL, late=True)
+
+    code, lines = run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_UNDER)
+
+    post = trailing_json(lines)['post']
+    assert post['startup_wrong'] == 6
+    assert post['workflow_auto_wrong'] == 6
+    assert_clean(code, lines)
+
+
+def snapshot(root: Path) -> dict[str, tuple[bytes | None, int]]:
+    return {
+        str(path.relative_to(root)): (path.read_bytes() if path.is_file() else None, path.stat().st_mtime_ns)
+        for path in sorted(root.rglob('*'))
+    }
+
+
+def test_queue_dir_is_unchanged(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    before = snapshot(settle_queue.queue_dir)
+
+    for overrides in THRESHOLD_CASES:
+        run_main(capsys, settle_queue.queue_dir, **overrides)
+
+    assert snapshot(settle_queue.queue_dir) == before
+
+
+def test_executable_entry_point_end_to_end(settle_queue: SettleQueue) -> None:
+    completed = subprocess.run(
+        [str(SCRIPT), *argv_for(settle_queue.queue_dir, **PENDING_BREACH)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.stderr == ''
+    assert_breached(completed.returncode, completed.stdout.splitlines(), settle.Breach.PENDING_OVER_H)
