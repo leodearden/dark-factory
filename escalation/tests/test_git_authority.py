@@ -124,13 +124,15 @@ class TestGitAuthorityArm:
     def test_is_a_str_enum(self) -> None:
         assert issubclass(GitAuthorityArm, enum.StrEnum)
 
-    def test_has_exactly_two_members(self) -> None:
-        """There are two git signals and no third: the branch ref still
-        exists and its tip is an ancestor of main, or the ref is gone and a
-        merge marker was found.  A third arm must not appear without a
-        reviewer seeing this move.
+    def test_has_exactly_three_members(self) -> None:
+        """There are three git signals and no fourth: the branch ref still
+        exists and its tip is an ancestor of main; the ref is gone and a
+        merge marker was found; or the ref still exists, its tip is NOT an
+        ancestor of main, and every one of its commits is patch-equivalent
+        on main — the worker-rebased landing.  A fourth arm must not appear
+        without a reviewer seeing this move.
         """
-        assert {m.value for m in GitAuthorityArm} == {'ancestor', 'marker'}
+        assert {m.value for m in GitAuthorityArm} == {'ancestor', 'marker', 'patch_id'}
 
     def test_members_round_trip_as_their_plain_spelling(self) -> None:
         """``arm`` was a bare ``str`` before, and every existing pin compares
@@ -140,6 +142,7 @@ class TestGitAuthorityArm:
         """
         assert GitAuthorityArm.ancestor == 'ancestor'
         assert GitAuthorityArm.marker == 'marker'
+        assert GitAuthorityArm.patch_id == 'patch_id'
         assert isinstance(GitAuthorityArm.ancestor, str)
 
 
