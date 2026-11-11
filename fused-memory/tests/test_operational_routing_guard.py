@@ -17,6 +17,7 @@ import json
 import logging
 
 import pytest
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 
 
 class TestInjectOperationalRoutingMatrix:
@@ -216,6 +217,47 @@ class TestInjectOperationalRoutingMatrix:
         assert isinstance(result, dict)
         assert result['task_kind'] == 'deterministic'
         assert result['always_escalates'] is True
+
+    # -- provenance stamp: pure_gate_from names the trigger -----------------
+
+    @pytest.mark.parametrize(
+        ('metadata', 'expected'),
+        [
+            ({'execution_class': 'operational', 'operational_mode': 'gate'}, 'execution_class=operational'),
+            ({'execution_class': 'operational'}, 'execution_class=operational'),
+            ({'execution_class': 'operational', 'operational_mode': 'llm'}, 'execution_class=operational'),
+            ({'execution_class': 'decision'}, 'execution_class=decision'),
+        ],
+    )
+    def test_coercion_stamps_the_triggering_execution_class(self, metadata, expected):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        assert inject_operational_routing(metadata)[PURE_GATE_FROM_KEY] == expected
+
+    def test_stamp_keeps_sibling_keys_unchanged(self):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        result = inject_operational_routing(
+            {'execution_class': 'operational', 'files': ['a.py'], 'prd_path': 'plans/x.md', 'x_probe': 1}
+        )
+
+        assert result[PURE_GATE_FROM_KEY] == 'execution_class=operational'
+        assert result['files'] == ['a.py']
+        assert result['prd_path'] == 'plans/x.md'
+        assert result['x_probe'] == 1
+
+    def test_json_string_operational_input_is_stamped(self):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+        )
+
+        result = inject_operational_routing(json.dumps({'execution_class': 'operational'}))
+
+        assert result[PURE_GATE_FROM_KEY] == 'execution_class=operational'
 
     # -- marker constant hygiene -------------------------------------------
 

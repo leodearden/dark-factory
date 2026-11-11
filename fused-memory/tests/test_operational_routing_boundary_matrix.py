@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 
 from fused_memory.middleware.curator_types import CuratorDecision
 from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
@@ -465,6 +466,79 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
 
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
     assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta[PURE_GATE_FROM_KEY] == 'operational_ask_registry', f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Provenance stamp — every conversion records what triggered it in
+# metadata.pure_gate_from, and the stamp survives both write paths.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_operational_stamp_preserves_siblings_and_survives_update_merge(
+    _real_stack, tmp_path,
+):
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Pure-gate provenance probe: planning_mode stamp',
+            'description': 'Operational ask carrying sibling metadata keys, via planning_mode.',
+            'planning_mode': True,
+            'metadata': {
+                'execution_class': 'operational',
+                'files': ['docs/x.md'],
+                'prd_path': 'plans/x.md',
+                'x_probe_sibling': 'kept',
+            },
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+    task_id = result['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {meta!r}'
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta['files'] == ['docs/x.md'], f'got {meta!r}'
+    assert meta['prd_path'] == 'plans/x.md', f'got {meta!r}'
+    assert meta['x_probe_sibling'] == 'kept', f'got {meta!r}'
+    assert meta['human_decomposed'] is True, f'got {meta!r}'
+
+    updated = await server._tool_manager.call_tool(
+        'update_task', {'id': task_id, 'project_root': root, 'metadata': {'x_followup': 1}},
+    )
+    assert 'error' not in updated, f'update_task failed unexpectedly: {updated!r}'
+
+    after = await _get_task_meta(server, root, task_id)
+
+    assert after[PURE_GATE_FROM_KEY] == 'execution_class=operational', f'got {after!r}'
+    assert after['files'] == ['docs/x.md'], f'got {after!r}'
+    assert after['prd_path'] == 'plans/x.md', f'got {after!r}'
+    assert after['x_probe_sibling'] == 'kept', f'got {after!r}'
+    assert after['x_followup'] == 1, f'got {after!r}'
+
+
+@pytest.mark.asyncio
+async def test_normal_submit_operational_stamp_reaches_stored_task(
+    _real_stack, tmp_path, monkeypatch,
+):
+    root = str(tmp_path / 'proj')
+
+    meta = await _submit_normal_and_get(
+        _real_stack,
+        root,
+        {'execution_class': 'decision', 'files': ['docs/y.md']},
+        monkeypatch,
+    )
+
+    assert meta[PURE_GATE_FROM_KEY] == 'execution_class=decision', f'got {meta!r}'
+    assert meta['files'] == ['docs/y.md'], f'got {meta!r}'
 
 
 # ---------------------------------------------------------------------------
