@@ -11,7 +11,7 @@ import shutil
 import stat
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -313,6 +313,9 @@ _LIFECYCLE_KEYS: Mapping[str, str] = MappingProxyType({
 })
 _LIFECYCLE_DISK_KEYS = frozenset(_LIFECYCLE_KEYS.values())
 _STR_LIFECYCLE_FIELDS = tuple(name for name in _LIFECYCLE_KEYS if name not in ('confirmed_by', 'schema_version'))
+_CREATED_PLAN_KEY_ORDER = (
+    'task_id', 'title', 'analysis', 'files', 'prerequisites', 'steps', 'design_decisions', 'reuse', 'dropped_files',
+)
 
 
 def _malformed_lifecycle(name: str, value: object, requirement: str) -> ValueError:
@@ -433,8 +436,8 @@ class PlanNotConfirmed(ValueError):
         self.markers = markers
         self.action = action
         super().__init__(
-            f'cannot {action} the plan of task {task_id!r}: its state is {state.value!r}, '
-            f'not confirmed; lifecycle markers present: {list(markers)}'
+            f'cannot {action} the plan of task {task_id!r} in state {state.value!r}; '
+            f'lifecycle markers present: {list(markers)}'
         )
 
 
@@ -492,6 +495,94 @@ class Plan:
         document = {key: fresh[key] for key in self.key_order if key in fresh}
         document.update(fresh)
         return document
+
+    def recreated(
+        self, *, task_id: str, title: str, analysis: str, files: list[str], carried: Mapping[str, Any],
+    ) -> Plan:
+        """The fresh create_plan shell, carrying *carried* keys; the lifecycle is cleared."""
+        refused = sorted((_LIFECYCLE_DISK_KEYS | {'steps'}) & set(carried))
+        if refused:
+            raise ValueError(f'create_plan cannot carry lifecycle keys or steps: {refused}')
+        body = {
+            'task_id': task_id, 'title': title, 'analysis': analysis, 'files': files,
+            'prerequisites': [], 'design_decisions': [], 'reuse': [], 'dropped_files': [], **carried,
+        }
+        key_order = (*_CREATED_PLAN_KEY_ORDER, *carried)
+        return Plan(lifecycle=PlanLifecycle(), steps=(), body=_freeze_body(body), key_order=key_order)
+
+    def restructured(self, **changes: Any) -> Plan:
+        """A step-set edit: *changes* applied and confirmation cleared."""
+        return self._with_body(changes)._with_markers(confirmed_at=None, confirmed_by=None)
+
+    def confirmed(self, *, at: str, by: PlanConfirmation) -> Plan:
+        if not self.steps:
+            raise self._refusal('confirm')
+        return self._with_markers(confirmed_at=at, confirmed_by=by, revalidated_at=at)
+
+    def stamped(self, *, session_id: str, at: str, task_text_fp: str | None, base_commit: str | None) -> Plan:
+        if self.state not in (PlanState.CONFIRMED, PlanState.STAMPED):
+            raise self._refusal('stamp')
+        markers: dict[str, str] = {'session_id': session_id, 'created_at': at}
+        if task_text_fp:
+            markers['task_text_fp'] = task_text_fp
+        if base_commit:
+            markers['base_commit'] = base_commit
+        return self._with_markers(**markers)
+
+    def with_files(self, files: list[str], *, owner: str, at: str) -> Plan:
+        """A files-only edit that keeps confirmation and makes *owner* own the plan."""
+        edited = self._with_body({'files': files})
+        if self.lifecycle.owned_by(owner):
+            return edited
+        return edited._with_markers(session_id=owner, created_at=self.lifecycle.created_at or at)
+
+    def revalidated(self, *, at: str, by_session: str, base_commit: str | None) -> Plan:
+        markers: dict[str, str] = {'revalidated_at': at, 'revalidated_by_session': by_session}
+        if base_commit:
+            markers['base_commit'] = base_commit
+        return self._with_markers(**markers)
+
+    def confirmed_since(self, pre: Plan) -> bool:
+        """Whether this plan carries a confirmation *pre* did not."""
+        confirmed_at = self.lifecycle.confirmed_at
+        return confirmed_at is not None and confirmed_at != pre.lifecycle.confirmed_at
+
+    def with_lifecycle(self, lifecycle: PlanLifecycle) -> Plan:
+        return self._under(lifecycle, stripped=frozenset(lifecycle.markers_present()))
+
+    def _with_markers(self, **fields: Any) -> Plan:
+        return self._under(
+            replace(self.lifecycle, **fields), stripped=frozenset(_LIFECYCLE_KEYS[name] for name in fields),
+        )
+
+    def _under(self, lifecycle: PlanLifecycle, *, stripped: frozenset[str]) -> Plan:
+        body = MappingProxyType({key: value for key, value in self.body.items() if key not in stripped})
+        return Plan(lifecycle=lifecycle, steps=self.steps, body=body, key_order=self.key_order)
+
+    def _with_body(self, changes: Mapping[str, Any]) -> Plan:
+        refused = sorted(_LIFECYCLE_DISK_KEYS & set(changes))
+        if refused:
+            raise ValueError(f'lifecycle keys cannot change through a body edit: {refused}')
+        body = dict(self.body)
+        steps = self.steps
+        key_order = self.key_order
+        if 'steps' in changes:
+            body.pop('steps', None)
+            if _is_step_list(changes['steps']):
+                steps = _freeze_steps(changes['steps'])
+                if 'steps' not in key_order:
+                    key_order = (*key_order, 'steps')
+            else:
+                steps = ()
+                body['steps'] = changes['steps']
+        body.update((key, value) for key, value in changes.items() if key != 'steps')
+        return Plan(lifecycle=self.lifecycle, steps=steps, body=_freeze_body(body), key_order=key_order)
+
+    def _refusal(self, action: str) -> PlanNotConfirmed:
+        return PlanNotConfirmed(
+            task_id=self.body.get('task_id'), state=self.state,
+            markers=self.lifecycle.markers_present(), action=action,
+        )
 
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
