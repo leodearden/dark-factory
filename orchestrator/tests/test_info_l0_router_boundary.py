@@ -7,7 +7,9 @@ esc-4851-*) are unrecoverable, so the factories below rebuild their shapes.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _info_l0_router_fixtures import (
@@ -15,9 +17,13 @@ from _info_l0_router_fixtures import (
     DispositioningReviewer,
     LostVerdictReviewer,
     RouterRun,
+    assignment,
     reaper_harness,
     router_reaper_config,
 )
+from _merge_queue_doubles import ResolvingMergeQueue
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
+from _workflow_helpers import FakeScheduler, _build_harness
 from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
@@ -31,7 +37,10 @@ from orchestrator.escalation_router import (
     ROUTER_ID,
     read_hold,
 )
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.worker import MergeOutcome
+from orchestrator.scheduler import Scheduler
 from orchestrator.workflow import WorkflowOutcome
 
 ORPHAN_REAPER = 'harness-orphan-reaper'
@@ -41,6 +50,7 @@ AUTHOR_DETAIL = (
     'fold it into one helper in a follow-up.'
 )
 CREATED = {'status': 'created', 'task_id': '9001'}
+SUPERSEDED = MergeOutcome('superseded', superseded_by='mr-train-5050', merge_sha='5050' * 10)
 
 
 def _timestamp(seconds_ago: float) -> str:
@@ -161,6 +171,28 @@ async def _held_after_a_work_verdict(tmp_path, monkeypatch) -> tuple[RouterRun, 
     return run, note
 
 
+def _recording_steward(constructions: list[str]) -> type:
+    """A steward that records each construction and does nothing else."""
+
+    class _Steward:
+        def __init__(self, wt_path, cfg_dir):
+            constructions.append(str(wt_path))
+
+        def set_outcome_channel(self, channel) -> None:
+            pass
+
+        def set_wip_probe(self, probe) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    return _Steward
+
+
 def _assert_promoted_with_the_hint(run: RouterRun, note: Escalation, reason: str) -> None:
     (l1,) = _l1s(run.queue, agent_role=AGGREGATE_ROLE)
     assert l1.suggested_action == FALLBACK_ACTION
@@ -273,3 +305,111 @@ class TestRow17LostVerdictIsRoutedAtTheExit:
 
         assert run.current(note).resolution_class == 'converted'
         assert _trail(run, note.id)[-1] == ('converted', 'orphan-reaper', 'orphan')
+
+
+@pytest.mark.asyncio
+class TestRow05CoalesceParkHoldsTheNote:
+    """E1 (tasks 5050, 4314 run 1): the merge is absorbed by a coalesced train."""
+
+    async def test_the_merge_deferred_exit_holds_the_note_and_no_orphan_l1_follows(
+        self, tmp_path, monkeypatch, mock_orch_config,
+    ):
+        run = RouterRun(
+            tmp_path, monkeypatch, DispositioningReviewer(),
+            merge_queue=ResolvingMergeQueue(SUPERSEDED),
+        )
+        note = implementer_note(run.queue)
+
+        assert await run.run() == WorkflowOutcome.MERGE_DEFERRED
+
+        written = run.scheduler.statuses[TASK_ID]
+        assert written[-1] == 'merge-deferred'
+        assert 'done' not in written
+        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'merge_deferred')]
+        assert read_hold(run.current(note)) is not None
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+
+        assert _l1s(run.queue, agent_role=ORPHAN_REAPER) == []
+
+        run.curator.set_ticket('tkt_1', CREATED)
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+
+        assert run.current(note).resolution_class == 'converted'
+
+
+class _DoneFlipOutrunsTheTail(FakeScheduler):
+    """The first 'done' write lands, then the tail stays busy until it is cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.done_written = asyncio.Event()
+
+    async def set_task_status(self, task_id: str, status: str, **kwargs) -> None:
+        await super().set_task_status(task_id, status, **kwargs)
+        if status == 'done' and not self.done_written.is_set():
+            self.done_written.set()
+            await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+class TestRow06TerminalStatusCancelDuringTheTail:
+    """E2 (task 5131): the row flips done while the workflow is still in its
+    tail, and the terminal-status watcher soft-cancels the slot.
+
+    ``build_workflow`` is patched to hand the slot this run's workflow; the
+    stand-in binds the slot's ``cancel_event`` to it as the real factory does,
+    so the watcher's soft cancel reaches the workflow.
+    """
+
+    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    async def test_the_note_is_held_before_the_locks_are_released_and_no_steward_starts(
+        self, tmp_path, monkeypatch, mock_orch_config,
+    ):
+        constructions: list[str] = []
+        flips = _DoneFlipOutrunsTheTail()
+        run = RouterRun(
+            tmp_path, monkeypatch, DispositioningReviewer(),
+            scheduler=flips, steward_factory=_recording_steward(constructions),
+        )
+        note = implementer_note(run.queue)
+        events = run.workflow.event_store
+        assert events is not None
+        config = run.workflow.config.model_copy(update={'terminal_status_hard_cancel_polls': 3})
+        harness = _build_harness(config)
+        scheduler = Scheduler(config)
+        monkeypatch.setattr(scheduler, 'dispatch_tool', AsyncMock(return_value={}))
+        monkeypatch.setattr(scheduler, 'get_statuses', flips.get_statuses)
+        scheduler.event_store = events
+        harness.scheduler = scheduler
+        harness.event_store = events
+        assert scheduler.lock_table.try_acquire(TASK_ID, ['lib'])
+
+        def _build_this_runs_workflow(**kwargs):
+            run.workflow._cancel_event = kwargs['cancel_event']
+            return run.workflow
+
+        with patch('orchestrator.harness.build_workflow', side_effect=_build_this_runs_workflow):
+            slot = asyncio.create_task(harness._run_slot(assignment(), asyncio.Semaphore(0)))
+            await wait_responsive(flips.done_written.wait(), label='the merged row flips done')
+            assert await harness._scan_for_terminal_active_tasks() == 1
+            report = await wait_responsive(slot, label='the soft-cancelled slot unwinds')
+
+        assert report is not None and report.outcome == WorkflowOutcome.DONE
+        assert constructions == []
+        assert _trail(run, note.id) == [('convert-pending', 'workflow-finalizer', 'cancelled')]
+        assert read_hold(run.current(note)) is not None
+        (routed,) = [
+            row for row in events.fetch_events_by_type(EventType.info_l0_dispositioned)
+            if row['data']['escalation_id'] == note.id
+        ]
+        released = [
+            row for row in events.fetch_events_by_type(EventType.lock_released)
+            if row['task_id'] == TASK_ID
+        ]
+        assert released, 'the slot never released its module locks'
+        assert routed['id'] < released[0]['id']
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+
+        assert _l1s(run.queue, agent_role=ORPHAN_REAPER) == []
