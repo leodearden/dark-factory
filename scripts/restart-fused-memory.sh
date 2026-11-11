@@ -17,6 +17,13 @@ set -euo pipefail
 #   --rebind-socket    # adopt the committed fused-memory.socket template,
 #                      #   then stop and start socket and service together
 #
+# --rebind-socket composes with --now or --drain, in either order. It refuses
+# (exit 3, changing nothing) while fm-staleness-redeploy.service runs; else it
+# installs scripts/fused-memory.socket.template verbatim, daemon-reloads, runs
+# the chosen gate, stops then starts, waits for /health, and exits with
+# scripts/check_network_exposure.py's status. On a converged host it is
+# idempotent: the same unit is installed and the same endpoints come back.
+#
 # The DEFAULT path polls /health and pipes the body to recon_busy_check.py:
 # while a full reconciliation cycle is running (recon_busy non-empty) it
 # defers, up to RECON_GATE_TIMEOUT, then proceeds. An unreachable/unreadable
@@ -43,6 +50,7 @@ DRAIN_POLL_INTERVAL="${DRAIN_POLL_INTERVAL:-5}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NETWORK_EXPOSURE_CHECK="${NETWORK_EXPOSURE_CHECK:-$SCRIPT_DIR/check_network_exposure.py}"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 # scripts/orchestrator-watchdog.py::FM_STALENESS_REDEPLOY_UNIT — a transient
@@ -177,18 +185,33 @@ else
 fi
 
 # 4. Post-start /health verification (all paths).
-echo -n "Waiting for health..."
-deadline=$((SECONDS + HEALTH_TIMEOUT))
-while [[ $SECONDS -lt $deadline ]]; do
-    if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
-        echo " OK"
-        echo "fused-memory restarted successfully."
-        exit 0
-    fi
-    echo -n "."
-    sleep 1
-done
+wait_for_health() {
+    echo -n "Waiting for health..."
+    local deadline=$((SECONDS + HEALTH_TIMEOUT))
+    while [[ $SECONDS -lt $deadline ]]; do
+        if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+            echo " OK"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo " FAILED"
+    echo "ERROR: fused-memory did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    return 1
+}
 
-echo " FAILED"
-echo "ERROR: fused-memory did not become healthy within ${HEALTH_TIMEOUT}s" >&2
-exit 1
+wait_for_health || exit 1
+
+# 5. --rebind-socket post-condition: the exposure check's verdict is the
+#    script's status.
+if [[ "$rebind_socket" == 1 ]]; then
+    echo "rebind_socket: post-condition: ${NETWORK_EXPOSURE_CHECK}"
+    check_rc=0
+    python3 "$NETWORK_EXPOSURE_CHECK" || check_rc=$?
+    echo "rebind_socket: exposure check exited ${check_rc}"
+    exit "$check_rc"
+fi
+
+echo "fused-memory restarted successfully."
+exit 0
