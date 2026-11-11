@@ -25,6 +25,7 @@ import contextlib
 import dataclasses
 import functools
 import os
+import sqlite3
 import types
 from pathlib import Path
 from typing import Any
@@ -2583,6 +2584,18 @@ class TestReadOnlyGuarantee:
         )
 
         with pytest.raises(TimeoutError):
+            _run_main(monkeypatch, tmp_path, double)
+
+        assert double.closed
+
+    def test_the_store_is_closed_even_when_the_open_raises(self, monkeypatch, tmp_path):
+        double = _seeded_double()
+        monkeypatch.setattr(
+            double, 'initialize_for_reads',
+            _raising(sqlite3.Error('the planned registry db is locked')),
+        )
+
+        with pytest.raises(sqlite3.Error):
             _run_main(monkeypatch, tmp_path, double)
 
         assert double.closed

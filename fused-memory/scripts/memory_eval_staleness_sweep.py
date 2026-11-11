@@ -2333,8 +2333,8 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize_for_reads()
     try:
+        await memory.initialize_for_reads()
         outcome = await run_sweep(
             memory,
             project_ids=(args.project_id,),
