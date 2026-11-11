@@ -160,7 +160,7 @@ class TestRoundTrip:
 
     def test_a_non_mapping_is_refused_naming_its_type(self):
         with pytest.raises(TypeError, match='list'):
-            Plan.from_json([])  # type: ignore[arg-type]
+            Plan.from_json([])
 
 
 _CONFIRMED_AT = '2026-11-11T00:00:00+00:00'

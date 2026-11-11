@@ -468,7 +468,7 @@ class Plan:
         return PlanState.STAMPED
 
     @classmethod
-    def from_json(cls, data: Mapping[str, Any]) -> Plan:
+    def from_json(cls, data: object) -> Plan:
         if not isinstance(data, Mapping):
             raise TypeError(f'a plan document must be a mapping, not {type(data).__name__}')
         lifecycle, malformed = _parse_lifecycle(data)
