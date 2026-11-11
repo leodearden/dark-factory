@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import fcntl
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
+
+from shared.proc_liveness import pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ def is_orchestrator_live_for(project_root: str | Path) -> bool:
     pid = _parse_pid(text)
     if pid is None:
         return False
-    return _pid_alive(pid)
+    return pid_alive(pid)
 
 
 def is_orchestrator_lock_held(project_root: str | Path) -> bool:
@@ -148,20 +149,3 @@ def _parse_pid(content: str) -> int | None:
         return int(first.strip())
     except ValueError:
         return None
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return True iff signal 0 can be sent to ``pid``."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Process exists but we can't signal it — still counts as live.
-        return True
-    except OSError as exc:
-        logger.debug('orchestrator_detector: os.kill(%d, 0) failed: %s', pid, exc)
-        return False
-    return True

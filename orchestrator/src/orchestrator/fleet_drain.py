@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
+
+from shared import proc_liveness
 
 from orchestrator.fleet_heartbeat import is_bare_unit_name
 
@@ -190,25 +191,12 @@ def _int_or_none(value: object) -> int | None:
     return value if type(value) is int else None
 
 
-def sweep_alive(pid: int) -> bool:
-    """Whether the sweep process *pid* still exists; a process we may not signal counts."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OverflowError, ValueError):
-        return False
-    return True
-
-
 def evaluate_drain_request(
     read: DrainRequest | MalformedDrainRequest | None,
     identity: DrainIdentity,
     *,
     now: float,
-    pid_alive: Callable[[int], bool] = sweep_alive,
+    pid_alive: Callable[[int], bool] = proc_liveness.pid_alive,
 ) -> DrainVerdict | None:
     """Decide on what :func:`read_drain_request` returned; ``None`` when there is no request."""
     if read is None:
@@ -402,7 +390,7 @@ class DrainParticipant:
         identity: Callable[[], DrainIdentity],
         emit: Callable[[FleetDrainEvent], None],
         clock: Callable[[], float] = time.time,
-        pid_alive: Callable[[int], bool] = sweep_alive,
+        pid_alive: Callable[[int], bool] = proc_liveness.pid_alive,
     ) -> None:
         self._lane = lane
         self._fleet_dir = fleet_dir

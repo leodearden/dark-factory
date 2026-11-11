@@ -1202,25 +1202,11 @@ def _within_fleet_deploy_min_interval() -> bool:
 def _pid_alive(pid) -> bool:
     """Return True iff *pid* names a live process.
 
-    A deliberate COPY of
-    orchestrator/src/orchestrator/session_registry.py::_pid_alive, contract
-    preserved verbatim. The copy is FORCED, not a second opinion: this script
-    is a stdlib-only systemd oneshot that imports no first-party package — the
-    same constraint that forces the FLEET_LEASE_PATH literal above.
-
-    - Anything that is not a positive int (including bool, which IS an int in
-      Python) returns False WITHOUT reaching os.kill. That is a hazard guard,
-      not defensiveness: os.kill(0, 0) signals the CALLER'S ENTIRE process
-      group and os.kill(-N, 0) a foreign group, so a corrupt or zero pid read
-      off disk must be rejected before the syscall rather than by catching its
-      exception. session_registry.resolve_session_pid documents the same trap.
-    - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError, or
-      an OverflowError from a pid too large for the platform's C pid_t ->
-      treated as dead. The too-large case is the one input this predicate
-      lets REACH the syscall and still answers False for: unlike pid 0 or a
-      negative one, it carries no signalling hazard, and the platform's own
-      refusal is the answer.
+    A deliberate COPY of shared/src/shared/proc_liveness.py::pid_alive, with
+    parity pinned by tests/scripts/test_watchdog_pid_alive_parity.py. The copy
+    is FORCED, not a second opinion: this script is a stdlib-only systemd
+    oneshot that imports no first-party package — the same constraint that
+    forces the FLEET_LEASE_PATH literal above.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False

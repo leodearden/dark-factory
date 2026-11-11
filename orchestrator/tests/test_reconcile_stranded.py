@@ -1,4 +1,4 @@
-"""Tests for Harness._reconcile_stranded_in_progress and the _pid_alive helper."""
+"""Tests for Harness._reconcile_stranded_in_progress."""
 
 import asyncio
 import json
@@ -34,7 +34,7 @@ from orchestrator.delivered_checks import (
 )
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import CommitEffectProbe
-from orchestrator.harness import Harness, _pid_alive
+from orchestrator.harness import Harness
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.startup_steps import EntryFailures
@@ -158,69 +158,66 @@ def _vestigial_lock_dir(worktree: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# _pid_alive helper tests
-# ---------------------------------------------------------------------------
-
-class TestPidAlive:
-    def test_current_pid_is_alive(self):
-        assert _pid_alive(os.getpid()) is True
-
-    def test_impossible_pid_is_dead(self):
-        # PID well beyond the Linux kernel max (2^22 on 64-bit, 2^15 on 32-bit).
-        # 2**31-1 is always invalid on all Linux systems.
-        assert _pid_alive(2**31 - 1) is False
-
-    # ------------------------------------------------------------------
-    # Branch-mocked tests — each covers exactly one code path in _pid_alive
-    # ------------------------------------------------------------------
-
-    def test_pid_zero_returns_false_without_calling_os_kill(self, monkeypatch):
-        """pid=0 guard → returns False before os.kill is ever called."""
-        calls: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
-        assert _pid_alive(0) is False
-        assert calls == [], 'os.kill must not be called for pid=0'
-
-    def test_negative_pid_returns_false_without_calling_os_kill(self, monkeypatch):
-        """pid=-1 guard → returns False before os.kill is ever called."""
-        calls: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
-        assert _pid_alive(-1) is False
-        assert calls == [], 'os.kill must not be called for pid=-1'
-
-    def test_process_lookup_error_returns_false(self, monkeypatch):
-        """os.kill raises ProcessLookupError → process is dead → False."""
-        def _raise(pid: int, sig: int) -> None:
-            raise ProcessLookupError()
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is False
-
-    def test_permission_error_returns_true(self, monkeypatch):
-        """os.kill raises PermissionError → process exists (no permission to signal) → True."""
-        def _raise(pid: int, sig: int) -> None:
-            raise PermissionError()
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is True
-
-    def test_generic_oserror_returns_false(self, monkeypatch):
-        """os.kill raises generic OSError → treat as dead → False."""
-        def _raise(pid: int, sig: int) -> None:
-            raise OSError(5, 'io error')
-        monkeypatch.setattr(os, 'kill', _raise)
-        assert _pid_alive(12345) is False
-
-    def test_successful_signal_returns_true(self, monkeypatch):
-        """os.kill succeeds → process is alive → True."""
-        monkeypatch.setattr(os, 'kill', lambda pid, sig: None)
-        assert _pid_alive(12345) is True
-
-
-# ---------------------------------------------------------------------------
 # Harness fixture (mirrors test_crash_recovery.py)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def harness(tmp_path: Path, mock_orch_config):
+def scheduler_double() -> MagicMock:
+    """The Scheduler stand-in the `harness` fixture installs, typed as the MagicMock it is."""
+    scheduler = MagicMock()
+    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+    # harness.py now calls scheduler.is_dispatched/.is_actively_held/
+    # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
+    # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
+    # directly) so the mid-run sweep and stranded-blocked gate tests below
+    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(scheduler)
+    wire_clear_claim_then_set_status(scheduler)
+    wire_live_status_from_get_task(scheduler)
+    scheduler.get_tasks = AsyncMock(return_value=[])
+    scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    scheduler.set_task_status = AsyncMock()
+
+    # mark_done forwards to set_task_status so the existing assertions on
+    # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
+    # still cover the recovery-done path after the harness was refactored to
+    # use Scheduler.mark_done as a thin wrapper.
+    async def _fake_mark_done(tid, *, kind, sha, note=None):
+        provenance = {'kind': kind, 'commit': sha}
+        if note is not None:
+            provenance['note'] = note
+        await scheduler.set_task_status(
+            tid, 'done', done_provenance=provenance,
+        )
+    scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+
+    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
+    # whatever get_statuses() is currently configured to return for that tid
+    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
+    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
+    # `status` string the sweep loop itself reads from get_statuses(). In
+    # production both reflect the same row; the fixture keeps them
+    # consistent by construction here rather than requiring every test to
+    # duplicate the status in two places). Falls back to None (no row) when
+    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
+    # entry for tid — matching the old unconditional-None default for any
+    # test that doesn't care. Individual tests that need branch_base_sha (or
+    # any other task-row shape) override get_task explicitly and are
+    # responsible for including a matching 'status' key themselves.
+    def _default_get_task(tid: str) -> dict | None:
+        try:
+            statuses, _err = scheduler.get_statuses.return_value
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    scheduler.get_task = AsyncMock(side_effect=_default_get_task)
+
+    return scheduler
+
+
+@pytest.fixture
+def harness(tmp_path: Path, mock_orch_config, scheduler_double: MagicMock):
     """Create a Harness with mocked internals for unit testing reconciliation."""
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -241,32 +238,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.config.convert_to_blocked_enforce = False
 
     # Replace scheduler with async mocks
-    h.scheduler = MagicMock()
-    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
-    # harness.py now calls scheduler.is_dispatched/.is_actively_held/
-    # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
-    # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
-    # directly) so the mid-run sweep and stranded-blocked gate tests below
-    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
-    wire_scheduler_liveness_mock(h.scheduler)
-    wire_clear_claim_then_set_status(h.scheduler)
-    wire_live_status_from_get_task(h.scheduler)
-    h.scheduler.get_tasks = AsyncMock(return_value=[])
-    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.set_task_status = AsyncMock()
-
-    # mark_done forwards to set_task_status so the existing assertions on
-    # set_task_status.call_args_list / set_task_status.assert_awaited_once_with
-    # still cover the recovery-done path after the harness was refactored to
-    # use Scheduler.mark_done as a thin wrapper.
-    async def _fake_mark_done(tid, *, kind, sha, note=None):
-        provenance = {'kind': kind, 'commit': sha}
-        if note is not None:
-            provenance['note'] = note
-        await h.scheduler.set_task_status(
-            tid, 'done', done_provenance=provenance,
-        )
-    h.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+    h.scheduler = scheduler_double
 
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
@@ -301,28 +273,6 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.find_task_citation_commit = AsyncMock(
         return_value='deadbeef' + 'a' * 32,
     )
-
-    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
-    # whatever get_statuses() is currently configured to return for that tid
-    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
-    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
-    # `status` string the sweep loop itself reads from get_statuses(). In
-    # production both reflect the same row; the fixture keeps them
-    # consistent by construction here rather than requiring every test to
-    # duplicate the status in two places). Falls back to None (no row) when
-    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
-    # entry for tid — matching the old unconditional-None default for any
-    # test that doesn't care. Individual tests that need branch_base_sha (or
-    # any other task-row shape) override get_task explicitly and are
-    # responsible for including a matching 'status' key themselves.
-    def _default_get_task(tid: str) -> dict | None:
-        try:
-            statuses, _err = cast(AsyncMock, h.scheduler.get_statuses).return_value
-        except (TypeError, ValueError):
-            return None
-        status = statuses.get(tid) if isinstance(statuses, dict) else None
-        return None if status is None else {'status': status, 'metadata': {}}
-    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
 
     # Default: warm_lane_ref_is_degenerate returns False (task 2112 angle B) so
     # the metadata-independent fallback never fires for existing tests and the
@@ -1130,6 +1080,26 @@ class TestReconcileStrandedInProgress:
         # No revert must have been logged ('reverted task' matches the stable log format)
         assert not any('reverted task' in r.message for r in caplog.records)
 
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_reads_as_no_claimant_and_reverts(
+        self, harness: Harness, scheduler_double: MagicMock, owner_pid: object
+    ):
+        """One corrupt lock degrades to 'no plan-lock claimant'; startup step 2d survives."""
+        scheduler_double.get_statuses.return_value = ({'43': 'in-progress'}, None)
+        worktree_path = harness.git_ops.worktree_base / '43'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path, '43')
+        lock_dir.mkdir(parents=True)
+        (lock_dir / 'plan.lock').write_text(json.dumps({
+            'session_id': '43-abcd1234',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': owner_pid,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        scheduler_double.set_task_status.assert_called_once_with('43', 'pending')
+
     async def test_revert_unlinks_the_vestigial_worktree_lock(
         self, harness: Harness
     ):
@@ -1169,7 +1139,7 @@ class TestReconcileStrandedInProgress:
         assert not lock_path.exists()
 
     async def test_stale_plan_lock_but_live_db_claimant_left_alone(
-        self, harness: Harness, monkeypatch, caplog
+        self, harness: Harness, caplog
     ):
         """Task-2588 regression pin.
 
@@ -1186,11 +1156,8 @@ class TestReconcileStrandedInProgress:
         """
         harness.scheduler.get_statuses.return_value = ({'62': 'in-progress'}, None)  # type: ignore[attr-defined]
         # Dead-PID staging: plan.lock/owner_pid forensics alone would read
-        # "stale".  Patched on the RESOLVER's copy (task_ground_truth), the
-        # only one still consulted — `orchestrator.harness._pid_alive` is no
-        # longer called on this path, so patching it there pinned nothing
-        # (task 4028).
-        monkeypatch.setattr('orchestrator.task_ground_truth._pid_alive', lambda pid: False)
+        # "stale".  The owner pid below is dead by construction (2**31 - 1,
+        # beyond any real pid_max).
         # Staged where the resolver READS it (task 4028): "the db claimant
         # PRECEDES the stale plan.lock" only means something if the lock is
         # actually visible to the resolver that is supposed to skip it.
@@ -1202,7 +1169,7 @@ class TestReconcileStrandedInProgress:
         lock_path.write_text(json.dumps({
             'session_id': '62-dead0001',
             'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
 
         # But the DB row carries a fresh claimant — the live cross-process
@@ -1617,18 +1584,15 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
     async def test_stale_lock_worktree_cleaned_when_not_recovered(
-        self, harness: Harness, monkeypatch
+        self, harness: Harness
     ):
         """In-progress task with stale plan.lock (dead PID), not in _recovered_plans
         → cleanup_worktree called (removing entire worktree dir), task reverted."""
         tid = 32
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Patched on the RESOLVER's copy (task_ground_truth), the only one
-        # still consulted — `orchestrator.harness._pid_alive` is no longer
-        # called on this path, so patching it there pinned nothing (task
-        # 4028).  Belt-and-braces here: the expired locked_at below already
-        # decides staleness on its own.
-        monkeypatch.setattr('orchestrator.task_ground_truth._pid_alive', lambda pid: False)
+        # The owner pid below is dead by construction (2**31 - 1, beyond any
+        # real pid_max).  Belt-and-braces here: the expired locked_at below
+        # already decides staleness on its own.
 
         # Create the worktree, plus a plan.lock referencing a synthetic dead
         # PID where the RESOLVER reads it (task 4028) — the expired
@@ -1642,7 +1606,7 @@ class TestReconcileStrandedInProgress:
         lock_path.write_text(json.dumps({
             'session_id': f'{tid}-dead',
             'locked_at': '2026-01-01T00:00:00+00:00',
-            'owner_pid': 99999,
+            'owner_pid': 2**31 - 1,
         }))
         # _recovered_plans is empty (default)
 

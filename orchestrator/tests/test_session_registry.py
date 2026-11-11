@@ -33,6 +33,7 @@ from typing import Any
 import pytest
 from _process_identity_variants import IdentityVariant, own_identity
 from _reap_report_wait import await_reap_report
+from shared import proc_liveness
 from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
@@ -97,16 +98,9 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     return sr.SessionRecord(**fields)
 
 
-# A pid virtually guaranteed dead on any host (matches the convention already
-# established by orchestrator.harness._pid_alive's own test suite: 2**31 - 1,
-# orchestrator/tests/test_reconcile_stranded.py:34).
+# A pid virtually guaranteed dead on any host (matches the convention in
+# shared/tests/test_proc_liveness.py: 2**31 - 1).
 _DEAD_PID = 2**31 - 1
-
-# A pid that is not merely dead but UNREPRESENTABLE: larger than the platform's
-# C pid_t, so os.kill cannot even be asked about it. Sibling of _DEAD_PID and a
-# genuinely different class of input -- _DEAD_PID exercises the
-# ProcessLookupError branch, this one the OverflowError that branch never sees.
-_UNREPRESENTABLE_PID = 2**70
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
@@ -3720,7 +3714,7 @@ def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> N
 def test_claim_lease_keeps_a_quiet_watchers_lease_across_a_full_slice(tmp_path: Path) -> None:
     # The required "duplicate-through" regression (task 2796 THREAD 1): a live
     # interactive watcher holds its lease with `--pid $$` (the ephemeral
-    # Bash-tool shell, dead moments after the claim), so _pid_alive is
+    # Bash-tool shell, dead moments after the claim), so pid_alive is
     # ~always False for a watcher lease and staleness collapses to a pure
     # heartbeat-TTL check. That watcher heartbeats only once per Main Loop
     # cycle, bounded by ONE canonical watcher-rearm.sh `--timeout` slice
@@ -4666,13 +4660,13 @@ def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
         pid = sr.resolve_session_pid(env)
 
     # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
-    # THE assertion: the degraded pid must be one `_pid_alive` reports dead,
+    # THE assertion: the degraded pid must be one `pid_alive` reports dead,
     # so the lease's staleness AND-guard collapses to its heartbeat half (the
     # documented degradation) rather than to a never-reapable lease. The
     # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
     # the interactive shell, which outlives a crashed `claude`.
     assert pid == 0
-    assert sr._pid_alive(pid) is False
+    assert sr.pid_alive(pid) is False
     # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings
@@ -10794,36 +10788,6 @@ def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
 
 
 # ---------------------------------------------------------------------------
-# _pid_alive against an out-of-range pid (task 4755 review fix 1/4)
-#
-# This predicate is not only asked about pids this module itself recorded:
-# orchestrator/src/orchestrator/service_restart.py imports it to evaluate the
-# fleet-redeploy lease, whose pid is parsed out of JSON that
-# scripts/restart-all-orchestrators.sh wrote. A value no C pid_t can hold is
-# therefore ordinary untrusted input, and os.kill answers it with
-# OverflowError -- which is NOT an OSError, so the predicate's final except
-# clause does not catch it and it escapes to every caller.
-# ---------------------------------------------------------------------------
-
-
-def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
-    """A pid larger than C ``pid_t`` reads as DEAD and must not raise.
-
-    ``os.kill(2**70, 0)`` raises ``OverflowError('Python int too large to
-    convert to C long')``. "Cannot name a live process" is exactly the
-    judgment the existing ``other OSError -> treated as dead`` branch already
-    makes for every other value the syscall refuses, so answering False here
-    is this predicate's own documented contract rather than a new tolerance.
-
-    It is also the contract ``service_restart.lease_is_live`` states
-    absolutely on this predicate's behalf -- "FAIL-OPEN throughout: a missing,
-    corrupt, unreadable or nonsensical lease reads as 'no sweep in flight' and
-    never raises" -- and that promise cannot hold if the pid check can throw.
-    """
-    assert sr._pid_alive(_UNREPRESENTABLE_PID) is False
-
-
-# ---------------------------------------------------------------------------
 # DecisionRecord.closing_evidence and the close-decision verb (task 5376)
 # ---------------------------------------------------------------------------
 
@@ -12028,3 +11992,6 @@ def test_pid_alive_is_the_public_liveness_probe() -> None:
     assert sr.pid_alive(os.getpid())
     assert not sr.pid_alive(_DEAD_PID)
     assert not sr.pid_alive(0)
+    assert not sr.pid_alive(True)
+    assert not sr.pid_alive(None)
+    assert sr.pid_alive is proc_liveness.pid_alive

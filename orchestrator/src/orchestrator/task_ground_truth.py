@@ -82,7 +82,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -90,6 +89,7 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
+from shared.proc_liveness import pid_alive
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
@@ -333,33 +333,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Duplicates ``orchestrator.harness._pid_alive`` (itself mirroring
-    fused-memory's ``orchestrator_detector.py:58-72``) rather than importing
-    it, to avoid a harness->task_ground_truth->harness circular import once
-    θ2 migrates the harness's reconcile sweeps to call derive_truth/
-    recovery_for.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
-      PermissionError → alive (we can see it but lack permission to signal it);
-      other OSError → treat as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def _known_str(value: object) -> str | None:
     """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
 
@@ -374,6 +347,26 @@ def _known_str(value: object) -> str | None:
     stamp built from those same components.
     """
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _parse_owner_pid(raw: object) -> int | None:
+    """Parse a plan.lock ``owner_pid`` into an int, or ``None`` when malformed.
+
+    A bool is rejected before any int() conversion: ``int(True) == 1`` would
+    turn a JSON ``true`` into pid 1 (init), a phantom live claimant.  A str is
+    accepted, so a zero-padded ``'00123'`` parses to the int the composed
+    identity must embed.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -663,7 +656,7 @@ class TaskGroundTruth:
         #     cannot positively attribute makes a LIVE task read as
         #     unclaimed, which is the task-2588 un-claim incident class.
         #     Mis-attributing the other way only DELAYS recovery.
-        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # What bounds that delay is ``_lock_fresh`` alone, not ``pid_alive``:
         # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
         # task, so the liveness half is nearly always true. Freshness caps the
         # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
@@ -711,18 +704,12 @@ class TaskGroundTruth:
         # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
         # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
-            owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
             # same int this liveness check validated, not a re-parse of the raw
             # value (which could be e.g. the string '123', composing a
             # different byte sequence than the DB stamp's int).
-            parsed_pid: int | None = None
-            try:
-                parsed_pid = None if owner_pid is None else int(owner_pid)
-                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
-            except (TypeError, ValueError):
-                parsed_pid = None
-                owner_alive = False
+            parsed_pid = _parse_owner_pid(lock_data.get('owner_pid'))
+            owner_alive = pid_alive(parsed_pid)
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
                 # Compose ONLY when every component is known and well-formed;

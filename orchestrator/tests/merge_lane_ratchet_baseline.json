@@ -1515,7 +1515,7 @@
     "orchestrator/tests/test_rebase_verify_cost.py": {"patch_targets": [], "private_reads": 9},
     "orchestrator/tests/test_rebased_solo_landing_ladder.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_reconcile_done_step_commits.py": {"patch_targets": [], "private_reads": 28},
-    "orchestrator/tests/test_reconcile_stranded.py": {"patch_targets": [], "private_reads": 196},
+    "orchestrator/tests/test_reconcile_stranded.py": {"patch_targets": [], "private_reads": 197},
     "orchestrator/tests/test_recover_main_cli.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_recovery_emission_wiring.py": {"patch_targets": [], "private_reads": 74},
     "orchestrator/tests/test_recut_ruling_gitops.py": {"patch_targets": [], "private_reads": 0},
