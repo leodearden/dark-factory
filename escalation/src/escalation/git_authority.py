@@ -86,15 +86,22 @@ class GitAuthorityArm(enum.StrEnum):
 
     A ``StrEnum`` for the same reason :class:`GitAuthorityOutcome` is one
     (heuristic 12, structured data instead of meaningful strings): ``arm`` is
-    a closed two-member set a consumer switches on, not free text.
+    a closed three-member set a consumer switches on, not free text.
     ``ancestor`` — the branch ref still exists and its tip is an ancestor of
     main; ``marker`` — the ref is gone and a merge marker for it was found on
-    main.  The two arms carry different evidence and different guards, which
-    is why the verdict names the one it came from.
+    main; ``patch_id`` — the ref still exists, its tip is NOT an ancestor of
+    main, and
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``
+    decided the verdict (patch-id containment, behind its degeneracy and
+    empty-net-diff guards).  That last is the shape a worker-rebased solo
+    landing leaves: ``GitOps.advance_main``'s rebased path retains the ref at
+    its pre-rebase tip.  The arms carry different evidence and different
+    guards, which is why the verdict names the one it came from.
     """
 
     ancestor = 'ancestor'
     marker = 'marker'
+    patch_id = 'patch_id'
 
 
 def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
