@@ -113,6 +113,8 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
     """
     parsed = raw_metadata_dict(metadata, source='operational_routing_guard')
     execution_class = parsed.get('execution_class')
+    if not isinstance(execution_class, str):
+        return metadata
     trigger = _TRIGGER_BY_EXECUTION_CLASS.get(execution_class)
     if trigger is None:
         # code_tdd / absent / anything not operational|decision → untouched.
