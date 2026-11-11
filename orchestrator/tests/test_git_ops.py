@@ -16,7 +16,7 @@ from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
-from _git_fixtures import seed_repo
+from _git_fixtures import _git, seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
@@ -9068,86 +9068,65 @@ class TestParseDiffLineRanges:
 
 @pytest.mark.asyncio
 class TestGetChangedLineRanges:
-    """Unit tests for GitOps.get_changed_line_ranges."""
-
-    async def test_invokes_correct_git_command(self, git_config, git_repo):
-        """Verify that git diff is called with main...ref --unified=0 --no-color."""
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/123'
-
-        captured_cmds: list[list[str]] = []
-
-        async def mock_run(cmd, cwd=None, input_text=None):
-            captured_cmds.append(cmd)
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            await ops.get_changed_line_ranges(ref)
-
-        assert len(captured_cmds) == 1
-        cmd = captured_cmds[0]
-        assert 'git' in cmd
-        assert 'diff' in cmd
-        assert f'{git_config.main_branch}...{ref}' in cmd
-        assert '--unified=0' in cmd
-        assert '--no-color' in cmd
-
-    async def test_returns_parsed_ranges(self, git_config, git_repo):
-        """Verify the returned dict matches parse_diff_line_ranges output."""
-        from orchestrator.git_ops import parse_diff_line_ranges
-        ops = GitOps(git_config, git_repo)
-        ref = 'task/456'
-
-        async def mock_run(cmd, cwd=None, input_text=None):
-            return (0, CANNED_DIFF_TWO_FILES, '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges(ref)
-
-        expected = parse_diff_line_ranges(CANNED_DIFF_TWO_FILES)
-        assert result == expected
-
-    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
-        ops = GitOps(git_config, git_repo)
-
-        async def mock_run(cmd, cwd=None, input_text=None):
-            return (0, '', '')
-
-        with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await ops.get_changed_line_ranges('task/789')
-
-        assert result == {}
-
-
-@pytest.mark.asyncio
-class TestGetChangedLineRangesRealGit:
-    """PRD merge-pre-verify-screen §7 S1.3 ref: real-git, not a mocked ``_run``."""
+    """PRD merge-pre-verify-screen §7 S1.3 ref: real git, not a mocked ``_run``."""
 
     @staticmethod
-    def _git(repo: Path, *args: str) -> None:
-        subprocess.run(
-            ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
-            cwd=repo, check=True, capture_output=True,
-        )
+    def _commit_on(repo: Path, branch: str, name: str, text: str = 'changed\n') -> None:
+        _git(repo, 'checkout', '-q', '-b', branch, 'main')
+        (repo / name).write_text(text)
+        _git(repo, 'add', name)
+        _git(repo, 'commit', '-q', '-m', f'add {name}')
+        _git(repo, 'checkout', '-q', 'main')
 
-    def _commit_file_on(self, repo: Path, branch: str, name: str) -> None:
-        self._git(repo, 'checkout', '-q', '-b', branch, 'main')
-        (repo / name).write_text('changed\n')
-        self._git(repo, 'add', name)
-        self._git(repo, 'commit', '-q', '-m', f'add {name}')
-        self._git(repo, 'checkout', '-q', 'main')
+    async def test_returns_exact_old_side_ranges_whatever_the_colour_config(
+        self, git_config, git_repo,
+    ):
+        lines = [f'line {n}\n' for n in range(1, 11)]
+        (git_repo / 'lines.txt').write_text(''.join(lines))
+        _git(git_repo, 'add', 'lines.txt')
+        _git(git_repo, 'commit', '-q', '-m', 'add lines.txt')
+        lines[4] = 'line 5 changed\n'
+        self._commit_on(git_repo, 'task/31', 'lines.txt', ''.join(lines))
+        _git(git_repo, 'config', 'color.ui', 'always')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges('31')
+
+        assert result == {'lines.txt': [(5, 5)]}
+
+    async def test_branch_with_no_commits_returns_empty_dict(self, git_config, git_repo):
+        _git(git_repo, 'branch', 'task/789', 'main')
+        ops = GitOps(git_config, git_repo)
+
+        assert await ops.get_changed_line_ranges('789') == {}
 
     async def test_bare_id_diffs_the_task_branch_not_a_same_named_ref(self, git_config, git_repo):
-        self._commit_file_on(git_repo, 'task/5563', 'task_file.txt')
-        self._commit_file_on(git_repo, '5563', 'unrelated_file.txt')
+        self._commit_on(git_repo, 'task/5563', 'task_file.txt')
+        self._commit_on(git_repo, '5563', 'unrelated_file.txt')
         ops = GitOps(git_config, git_repo)
 
         result = await ops.get_changed_line_ranges('5563')
 
         assert set(result) == {'task_file.txt'}
 
+    async def test_bare_id_never_resolves_as_an_abbreviated_commit_sha(
+        self, git_config, git_repo,
+    ):
+        self._commit_on(git_repo, 'scratch', 'unrelated_file.txt')
+        abbrev = subprocess.run(
+            ['git', 'rev-parse', '--short=7', 'scratch'],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _git(git_repo, 'branch', '-q', '-D', 'scratch')
+        self._commit_on(git_repo, f'task/{abbrev}', 'task_file.txt')
+        ops = GitOps(git_config, git_repo)
+
+        result = await ops.get_changed_line_ranges(abbrev)
+
+        assert set(result) == {'task_file.txt'}
+
     async def test_prefixed_ref_still_works(self, git_config, git_repo):
-        self._commit_file_on(git_repo, 'task/77', 'task_file.txt')
+        self._commit_on(git_repo, 'task/77', 'task_file.txt')
         ops = GitOps(git_config, git_repo)
 
         result = await ops.get_changed_line_ranges('task/77')
