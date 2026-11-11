@@ -800,13 +800,6 @@ def _cluster_title(cluster: Mapping[str, Any]) -> str:
     return cluster.get("title") or "Untitled confusion cluster"
 
 
-def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
-    for item in items:
-        if item.get("id") == item_id:
-            return item
-    raise ValueError(f"{kind}: no id {item_id!r} found")
-
-
 # ---------------------------------------------------------------------------
 # render_report — dated plans/confusion-census-<date>.md markdown assembly
 # ---------------------------------------------------------------------------
@@ -1428,30 +1421,15 @@ def _payload_sighting(session: str | None, payload: Mapping[str, Any]) -> dict:
     }
 
 
-def _payload_cluster(session: str | None, payload: Mapping[str, Any]) -> dict:
-    """The verification cluster of one mined candidate *payload* from *session*."""
-    sighting = _payload_sighting(session, payload)
-    evidence_quote = payload.get("evidence_quote")
-    return _cluster_record(
-        title=payload.get("title"),
-        cause=payload.get("cause"),
-        area=payload.get("area"),
-        origin_phase=sighting["origin_phase"],
-        manifested_phase=sighting["manifested_phase"],
-        evidence=[evidence_quote] if evidence_quote else [],
-        sightings=[sighting],
-    )
-
-
 @dataclass(frozen=True)
 class _ResolvedClusters:
     """The verification cluster of every candidate a to-verify payload
     resolved to, by candidate id in first-payload order; the ids of the
-    uncatalogued ones; and how many to-verify payloads the merge skipped,
-    which are never offered."""
+    uncatalogued ones, in mining order; and how many to-verify payloads the
+    merge skipped, which are never offered."""
 
     clusters: Mapping[str, dict]
-    uncatalogued: frozenset[str]
+    uncatalogued: tuple[str, ...]
     unmerged: int
 
 
@@ -1459,11 +1437,10 @@ def _resolved_clusters(screen: prescreen.Screen, merge: codebook.MergeResult) ->
     """Group *screen*'s to-verify payloads by the candidate *merge* resolved
     each to: one cluster per candidate, its fields the first payload's, seen
     in every payload's session."""
-    resolutions = {resolution.payload: resolution for resolution in merge.resolutions}
     payloads: dict[str, list[tuple[str | None, Mapping[str, Any]]]] = {}
     unmerged = 0
     for ref in screen.to_verify:
-        resolution = resolutions.get(ref)
+        resolution = merge.resolution_at(ref)
         if resolution is None:
             unmerged += 1
             continue
@@ -1471,24 +1448,43 @@ def _resolved_clusters(screen: prescreen.Screen, merge: codebook.MergeResult) ->
         payloads.setdefault(resolution.candidate_id, []).append(
             (record.get("session"), record["candidates"][ref.candidate]),
         )
+    uncatalogued = (merge.resolution_at(ref) for ref in screen.uncatalogued)
     return _ResolvedClusters(
         clusters=MappingProxyType({
-            candidate_id: _candidate_cluster(candidate_id, sessions)
-            for candidate_id, sessions in payloads.items()
+            candidate_id: _candidate_cluster(candidate_id, session_payloads)
+            for candidate_id, session_payloads in payloads.items()
         }),
-        uncatalogued=frozenset(
-            resolutions[ref].candidate_id for ref in screen.uncatalogued if ref in resolutions
-        ),
+        uncatalogued=tuple(dict.fromkeys(
+            resolution.candidate_id for resolution in uncatalogued if resolution is not None
+        )),
         unmerged=unmerged,
     )
 
 
-def _candidate_cluster(candidate_id: str, payloads: Sequence[tuple[str | None, Mapping[str, Any]]]) -> dict:
-    first_session, first = payloads[0]
+def _candidate_cluster(
+    candidate_id: str, session_payloads: Sequence[tuple[str | None, Mapping[str, Any]]],
+) -> dict:
+    """The verification cluster of *candidate_id* from the (session, payload)
+    pairs resolved to it: the first payload's fields, one sighting per
+    distinct session."""
+    first_session, first = session_payloads[0]
     sightings: dict[str | None, dict] = {}
-    for session, payload in payloads:
+    for session, payload in session_payloads:
         sightings.setdefault(session, _payload_sighting(session, payload))
-    return {**_payload_cluster(first_session, first), "sightings": list(sightings.values()), CANDIDATE_KEY: candidate_id}
+    first_sighting = sightings[first_session]
+    evidence_quote = first.get("evidence_quote")
+    return {
+        **_cluster_record(
+            title=first.get("title"),
+            cause=first.get("cause"),
+            area=first.get("area"),
+            origin_phase=first_sighting["origin_phase"],
+            manifested_phase=first_sighting["manifested_phase"],
+            evidence=[evidence_quote] if evidence_quote else [],
+            sightings=list(sightings.values()),
+        ),
+        CANDIDATE_KEY: candidate_id,
+    }
 
 
 def _distinct_sessions(record: Mapping[str, Any]) -> int:
@@ -1699,8 +1695,11 @@ def _pending_cluster(cb: dict, queued: similarity.QueuedCluster) -> dict:
     """The verify cluster of queue cluster *queued*: its representative
     candidate's, seen in every member's sessions."""
     candidates = cb.get("candidates") or []
-    representative = _find_by_id(candidates, queued.representative.key, kind="queue representative")
-    members = [representative, *(_find_by_id(candidates, item.key, kind="queue member") for item in queued.others)]
+    representative = codebook.record_by_id(candidates, queued.representative.key, kind="queue representative")
+    members = [
+        representative,
+        *(codebook.record_by_id(candidates, item.key, kind="queue member") for item in queued.others),
+    ]
     by_session: dict[str | None, dict] = {}
     for member in members:
         for sighting in member.get("sightings") or []:
@@ -1926,13 +1925,15 @@ def _promoted_entry_id(cb: dict, candidate: Mapping[str, Any]) -> str | None:
 
 def _offered_replies(replies: Sequence[dict], offered: Sequence[Mapping[str, Any]], *, verdict: str) -> list[dict]:
     """The *replies* of one verify call that name, by CANDIDATE_KEY, a
-    candidate of the clusters it was *offered*; each other one is WARNed and
-    discarded before its verdict is read."""
-    offered_ids = {cluster[CANDIDATE_KEY] for cluster in offered}
+    candidate of the clusters it was *offered*, each carrying its offered
+    cluster's fields over whatever the reply restated, so only what the
+    verifier added (its verdict, its remediation) is the reply's; each other
+    one is WARNed and discarded before its verdict is read."""
+    offered_by_id = {cluster[CANDIDATE_KEY]: cluster for cluster in offered}
     kept = []
     for reply in replies:
-        if reply.get(CANDIDATE_KEY) in offered_ids:
-            kept.append(reply)
+        if reply.get(CANDIDATE_KEY) in offered_by_id:
+            kept.append({**reply, **offered_by_id[reply[CANDIDATE_KEY]]})
         else:
             logger.warning(
                 "census: a %s verdict for %r names no candidate this call offered (%s=%r), so it is discarded",
@@ -2858,11 +2859,11 @@ def run_census(
             )
 
     # A cap detected INSIDE verification lands here. The except must sit so
-    # the abort returns BEFORE the mass-rejection detector, the codebook merge,
-    # synthesize_fn, compute_matrix and every write -- the whole point is
-    # that nothing is persisted, so no cap-poisoned cluster is ever recorded
-    # as a verdict and last_census_at never advances past a window that was
-    # not actually adjudicated.
+    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
+    # compute_matrix and every write (the codebook merge has already run, but
+    # it is pure) -- the whole point is that nothing is persisted, so no
+    # cap-poisoned cluster is ever recorded as a verdict and last_census_at
+    # never advances past a window that was not actually adjudicated.
     try:
         verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
     except CensusHeadroomExhausted as exc:
@@ -2939,7 +2940,7 @@ def run_census(
 
     for cluster in verified:
         cand_id = cluster[CANDIDATE_KEY]
-        candidate = _find_by_id(updated_codebook["candidates"], cand_id, kind="verified candidate")
+        candidate = codebook.record_by_id(updated_codebook["candidates"], cand_id, kind="verified candidate")
         if candidate["disposition"] != "pending":
             placed.append((cluster, None))
             dropped_verdicts.append(_dropped_verdict(
@@ -2948,7 +2949,7 @@ def run_census(
             standing_entry_id = _promoted_entry_id(updated_codebook, candidate)
             holder = (
                 candidate if standing_entry_id is None
-                else _find_by_id(updated_codebook["entries"], standing_entry_id, kind="standing entry")
+                else codebook.record_by_id(updated_codebook["entries"], standing_entry_id, kind="standing entry")
             )
             files, _ = _filing_gate(cluster, _distinct_sessions(holder))
             if files:
@@ -2969,9 +2970,8 @@ def run_census(
             )
             key_attaches.append(key_attach)
             entry_id = key_attach.entry_id
-            files, held = _filing_gate(
-                cluster, _distinct_sessions(_find_by_id(updated_codebook["entries"], entry_id, kind="key attach")),
-            )
+            attached_entry = codebook.record_by_id(updated_codebook["entries"], entry_id, kind="key-attached entry")
+            files, held = _filing_gate(cluster, _distinct_sessions(attached_entry))
             if entry_id not in {adjudication.record_id for adjudication in promoted}:
                 promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
         else:
@@ -3019,7 +3019,7 @@ def run_census(
 
     for cluster in rejected:
         cand_id = cluster[CANDIDATE_KEY]
-        candidate = _find_by_id(updated_codebook["candidates"], cand_id, kind="rejected candidate")
+        candidate = codebook.record_by_id(updated_codebook["candidates"], cand_id, kind="rejected candidate")
         if candidate["disposition"] != "pending":
             dropped_verdicts.append(_dropped_verdict(
                 verdict="rejected", cluster=cluster, standing=candidate, contradicting_disposition="promoted",
@@ -3033,7 +3033,10 @@ def run_census(
 
     updated_codebook, adjudicated = similarity.adjudicate_members(updated_codebook, offered)
 
-    for entry_id in fixed_entry_ids:
+    for entry_id in dict.fromkeys(fixed_entry_ids):
+        if codebook.record_by_id(updated_codebook["entries"], entry_id, kind="fixed entry").get("status") == "retired":
+            logger.warning("census: the verifier reported entry %r fixed, but it is already retired", entry_id)
+            continue
         updated_codebook = codebook_lifecycle.retire_entry(updated_codebook, entry_id)
 
     mined_sessions = {record["session"] for record in mining_result.records if record.get("session")}

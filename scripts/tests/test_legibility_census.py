@@ -11533,6 +11533,103 @@ def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified
     assert codebook.validate(persisted) == []
 
 
+def _without_titles(fake):
+    """*fake* whose every returned cluster has lost its title."""
+    def untitled(replies):
+        return [{key: value for key, value in reply.items() if key != "title"} for reply in replies]
+
+    def verify_fn(clusters, *, model):
+        result = fake(clusters, model=model)
+        return {**result, "verified": untitled(result["verified"]), "rejected": untitled(result["rejected"])}
+
+    verify_fn.calls = fake.calls
+    return verify_fn
+
+
+@pytest.mark.parametrize("restating", [_rewording, _without_titles], ids=["reworded", "titleless"])
+def test_a_promoted_entry_carries_its_candidates_title_whatever_the_reply_restates(tmp_path, restating):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=restating(_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    candidate = _candidate_titled(persisted, _L6_NOVEL_TITLE)
+    assert candidate["disposition"] == "promoted"
+    assert _persisted_record(kwargs, candidate["promoted_to"])["title"] == _L6_NOVEL_TITLE
+
+
+def test_an_entry_reported_fixed_twice_or_already_retired_is_retired_once(tmp_path, caplog):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({**cb["entries"][0], "id": "entry-gone", "status": "retired", "sightings": []})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=_make_fake_verify_fn(
+            verified_titles={_L6_NOVEL_TITLE}, fixed_entry_ids=("entry-a", "entry-a", "entry-gone"),
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _persisted_record(kwargs, "entry-a")["status"] == "retired"
+    assert _persisted_record(kwargs, "entry-gone")["status"] == "retired"
+    assert [
+        record.getMessage() for record in caplog.records if "already retired" in record.getMessage()
+    ] == ["census: the verifier reported entry 'entry-gone' fixed, but it is already retired"]
+
+
+_NEAR_ENTRY_A_TITLES = tuple(f"Near entry a, shape {n}" for n in range(1, 7))
+
+
+def _near_entry_a_response(prompt, model):
+    if "many-near" in prompt:
+        return json.dumps({"matches": [], "candidates": [
+            {
+                "title": title,
+                "cause": "A shape entry a already names.",
+                "area": "orchestrator",
+                "origin_phase": "implement",
+                "manifested_phase": "verify",
+                "evidence_quote": f"evidence for {title}",
+            }
+            for title in _NEAR_ENTRY_A_TITLES
+        ]})
+    return _happy_invoke_response(prompt, model)
+
+
+def test_screened_novel_candidates_attach_in_mining_order(tmp_path):
+    kwargs, _ = _similarity_kwargs(
+        tmp_path,
+        {
+            _ENTRY_A_TEXT: _ENTRY_AXIS,
+            **{f"{title} — A shape entry a already names.": _NEAR for title in _NEAR_ENTRY_A_TITLES},
+        },
+        batch=[_hand_digest("many-near", "six shapes near entry a")],
+    )
+    kwargs["invoke"] = _make_fake_invoke(_near_entry_a_response)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    mined_ids = [_candidate_titled(persisted, title)["id"] for title in _NEAR_ENTRY_A_TITLES]
+    assert [row["candidate_id"] for row in _run_record(kwargs)["adjudication"]["attached"]] == mined_ids
+
+
 # ---------------------------------------------------------------------------
 # task 6750: filing pairs a cluster with a withheld entry, and counts the
 # sessions it is gated at, by the id of the record it landed on.
