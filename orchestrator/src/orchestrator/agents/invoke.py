@@ -1342,10 +1342,6 @@ def _warn_if_pi_mcp_cache_unwarmed(server_names: Iterable[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (orchestrator-local, for non-Claude backends)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # ZCode backend — its translation layer is orchestrator.agents.zcode_backend
 # ---------------------------------------------------------------------------
 
@@ -1399,6 +1395,10 @@ async def _invoke_zcode(
         ),
     )
 
+
+# ---------------------------------------------------------------------------
+# Shared helpers (orchestrator-local, for non-Claude backends)
+# ---------------------------------------------------------------------------
 
 async def _run_subprocess_local(
     cmd: list[str],
