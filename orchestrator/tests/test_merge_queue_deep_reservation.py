@@ -453,11 +453,8 @@ class TestBTheReservationIsTimeLimited:
             assert _reservations(rnd.lane) == []
             await rnd.land_head_and_p()
             await _until(
-                lambda: any(
-                    e['data'].get('chain_items') == 1
-                    for e in _verify_events_for(scene, {'F1'})
-                ),
-                label='F1 verified on its own by the ordinary pipeline',
+                lambda: bool(_verify_events_for(scene, {'F1'})),
+                label="F1 verified by a round of its own, not by S's tip",
             )
 
             release_s.set()

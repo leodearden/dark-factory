@@ -13381,7 +13381,9 @@ class SpeculativeMergeWorker:
              swallows per-path errors internally (ENOENT/OSError) so it can
              never starve the heartbeat log.
           2. Delegates the fire/rate-limit/format/emit decision to the
-             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`,
+             then hands back the links of every deep chain reservation past
+             its deadline (:meth:`_expire_chain_reservations`, task 7720).
           3. Delegates to the rate-limited, clock-injectable
              :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
              steady-state counterpart to the startup-only orphan reap — this
@@ -13405,6 +13407,7 @@ class SpeculativeMergeWorker:
             try:
                 self._touch_owned_merge_worktrees()
                 self._maybe_log_queue_heartbeat(self._clock.now())
+                self._expire_chain_reservations()
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
             try:
@@ -19331,6 +19334,21 @@ class SpeculativeMergeWorker:
         self._end_chain_reservation(
             entry.item.request.request_id, all_landed=landed == len(chain.links),
         )
+
+    def _expire_chain_reservations(self) -> None:
+        """Release every chain reservation past its deadline (the WARNING is
+        the reservation module's) and record each tip dead.
+
+        The release has already woken the merger. The tip verify keeps running;
+        a passing tip's walk lands the still-buffered prefix and stops at the
+        first link taken elsewhere.
+        """
+        for record in self._chain_reservations.expire():
+            if record.tip is not None:
+                self._record_dead_base(
+                    record.tip,
+                    killer=DeadBaseKiller(DeadBaseSite.CHAIN_RELEASED, record.owner_task_id),
+                )
 
     def _end_chain_reservation(self, owner_request_id: str, *, all_landed: bool) -> None:
         """End *owner_request_id*'s chain reservation (idempotent).
