@@ -25,7 +25,6 @@ from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
 from shared.pure_gate_provenance import PureGateTrigger
-from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
@@ -14079,6 +14078,7 @@ async def test_get_tasks_threads_statuses(interceptor, taskmaster):
 # ── task-1810 step-11/12: _extract_metadata_files WARNING on present-but-malformed ──
 
 _TI_LOGGER = 'fused_memory.middleware.task_interceptor'
+_MD_LOGGER = 'fused_memory.middleware.metadata_dict'
 
 
 class TestExtractMetadataFilesWarns:
@@ -14223,20 +14223,6 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             f'{[r.message for r in warns]!r}'
         )
 
-    def test_extract_metadata_dict_unparseable_string_warns_and_returns_none(self, caplog):
-        """RED: _extract_metadata_dict currently coerces 'garbage{{{' to None silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict('garbage{{{')
-        assert result is None
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
-
     def test_parse_metadata_curator_extras_no_warning(self, caplog):
         """Curator-internal extras are legitimate, not a discard — zero warnings."""
         meta = {
@@ -14254,43 +14240,11 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
         )
 
-    def test_extract_metadata_dict_curator_extras_no_warning(self, caplog):
-        """Curator-internal extras are legitimate, not a discard — zero warnings."""
-        meta = {
-            'files': ['a.py'], 'files_to_modify': ['b.py'],
-            'spawned_from': '42', 'spawn_context': 'auto',
-        }
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(meta)
-        assert result == meta
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
     def test_parse_metadata_valid_json_string_no_warning(self, caplog):
         """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
         meta = {'files': ['a.py'], 'spawned_from': '42'}
         with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': json.dumps(meta)})
-        assert result == meta
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'valid JSON-string metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_valid_json_string_no_warning(self, caplog):
-        """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
-        meta = {'files': ['a.py'], 'spawned_from': '42'}
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(json.dumps(meta))
         assert result == meta
         warns = [
             r for r in caplog.records
@@ -14318,47 +14272,6 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
         )
 
-    def test_extract_metadata_dict_empty_string_no_warning(self, caplog):
-        """Amendment: an empty-string metadata is benign-absent, not a discard."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict('')
-        assert result == {}
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_none_is_empty_dict_no_warning(self, caplog):
-        """Absent metadata resolves to {} under the shared wire rule, silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(None)
-        assert result == {}
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'absent metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    @pytest.mark.parametrize('raw', [['a'], 42, True, 3.5])
-    def test_extract_metadata_dict_non_str_non_dict_warns(self, raw, caplog):
-        """A present non-str non-dict value is a discard — it must reach the census."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(raw)
-        assert result is None
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'metadata={raw!r} must emit a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
-
     def test_parse_metadata_non_dict_value_warns(self, caplog):
         """A list-valued metadata collapses to {} loudly, not silently."""
         with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
@@ -14375,7 +14288,7 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
 
     def test_inject_helpers_do_not_warn_on_empty_string_metadata(self, caplog):
         """'' is absent, so the inject/attach helpers have nothing to discard."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override('', 'why')
             gated = TaskInterceptor._inject_deterministic_pure_gate(
                 '', trigger=PureGateTrigger.EXECUTION_CLASS_OPERATIONAL
@@ -14391,7 +14304,7 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         assert kwargs['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, (
             f"metadata='' must not emit a discard WARNING; got {[r.message for r in warns]!r}"
@@ -14405,7 +14318,7 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         verdict = PathGuardVerdict(
             outcome='rejection', matched_paths=('x/',), suggested_project='other'
         )
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override(raw, 'why')
             gated = TaskInterceptor._inject_deterministic_pure_gate(
                 raw, trigger=PureGateTrigger.EXECUTION_CLASS_OPERATIONAL
@@ -14424,7 +14337,7 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         assert marked['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         messages = [
             r.getMessage() for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         for site in (
             'routing-override',
@@ -14453,26 +14366,6 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             'pure_gate_from': 'execution_class=operational',
         }
         assert original == {'keep': 1}
-
-    @pytest.mark.parametrize(
-        'raw',
-        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
-    )
-    def test_extract_metadata_dict_matches_shared_wire_rule(self, raw, caplog):
-        """The interceptor reads metadata by the shared rule, warning exactly on unreadable."""
-        expected = coerce_task_metadata(raw)
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(raw)
-        assert result == expected
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-            and 'task_metadata.schema_warning' in r.message
-        ]
-        assert bool(warns) == (expected is None), (
-            f'metadata={raw!r}: census WARNING must fire exactly when the shared rule '
-            f'says unreadable; got {[r.message for r in warns]!r}'
-        )
 
 
 # ── task 2189 step-9/10: candidate_key collision → combined (create-dispatch) ──
