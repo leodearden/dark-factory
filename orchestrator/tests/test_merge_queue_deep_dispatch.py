@@ -854,9 +854,13 @@ class TestDeepChainPlacementBuild:
 
         res = await worker._deep_chain_placement(item)
 
-        assert len(walks) == 1, f'expected exactly one O(n) walk, got {len(walks)}'
-        assert built[0]['queue_snapshot'] == tuple(worker.chain_snapshot()), (
+        assert walks == [2], f'expected exactly one O(n) walk, got {walks}'
+        assert [r.task_id for r in built[0]['queue_snapshot']] == ['102', '103'], (
             'the reused snapshot is the one build_chain was handed'
+        )
+        assert worker.chain_snapshot() == (), (
+            'the built links are reserved for the tip verify (task 7720), so a '
+            'later snapshot no longer offers them'
         )
         assert res is not None
         await merge_liveness.release_chain_build_lane(

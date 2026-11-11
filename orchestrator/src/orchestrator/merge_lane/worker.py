@@ -10620,6 +10620,12 @@ class SpeculativeMergeWorker:
         ``is_lane_halted`` skip, and is the one place the twin invariant above
         needs a same-halt-state caveat.
 
+        **Requests owned by another round are excluded** too (task 7720): a
+        link another chain reserves, and a candidate of an in-flight coalesce.
+        Chaining one would duplicate a link or race a stack. That is the twin
+        invariant's second caveat: it holds item for item only while no
+        reservation and no coalesce is live.
+
         Returns the UNFROZEN suffix only (the lane buffers) — never
         frozen/in-flight items.  The frozen prefix is the immutable head that
         supplies ``head_merge_commit`` via :meth:`frozen_prefix_tip`.
@@ -10628,7 +10634,11 @@ class SpeculativeMergeWorker:
         for lane in MERGE_LANES:  # high → normal, FIFO within lane
             if self.is_lane_halted(lane):
                 continue
-            items.extend(self._intake.buffered(lane))
+            items.extend(
+                req for req in self._intake.buffered(lane)
+                if not self._chain_reservations.holds(req.request_id)
+                and req.request_id not in self._coalescing_ids
+            )
         return tuple(items)
 
     def _newest_frozen_commit(self) -> str | None:
@@ -11294,8 +11304,11 @@ class SpeculativeMergeWorker:
              intervenes between the bind and the use, so no concurrent dispatch
              can interleave and make the two reads differ.
 
-        Reads, never mutates: :meth:`chain_snapshot` is a pure reader (it must
-        never pop, transition, or resolve), and this method touches neither
+        Never mutates the lane buffers: :meth:`chain_snapshot` is a pure reader
+        (it must never pop, transition, or resolve). The chain's candidates are
+        RESERVED from the snapshot to the round's end instead (task 7720,
+        :mod:`~orchestrator.merge_lane.chain_reservation`), so no other consumer
+        takes one. This method touches neither
         ``_verifier_queue`` nor ``_inflight`` nor the halving state —
         :meth:`_note_chain_outcome` is the sole writer of the latter, and it is
         driven by the tip VERDICT, not by a dispatch decision.
@@ -11362,6 +11375,36 @@ class SpeculativeMergeWorker:
             # than assert: this is the OPTIONAL deep path, and it must never be
             # the thing that crashes a dispatch.
             return None
+        owner = item.request
+        candidates = snapshot[:d - 1]
+        self._chain_reservations.reserve_candidates(owner, candidates)
+        try:
+            result = await self._build_deep_chain(item, snapshot, base, cap=cap, d=d)
+        except BaseException:
+            self._chain_reservations.release(owner.request_id)
+            raise
+        if result is None:
+            self._chain_reservations.release(owner.request_id)
+            return None
+        chained = {task_id for task_id, _ in result.links}
+        self._chain_reservations.confirm(
+            owner.request_id,
+            link_request_ids={c.request_id for c in candidates if c.task_id in chained},
+            tip=result.tip,
+            timeout_secs=owner.config.merge_deep.chain_reservation_timeout_secs,
+        )
+        return result
+
+    async def _build_deep_chain(
+        self, item: RealMergeItem, snapshot: tuple[MergeRequest, ...], base: str,
+        *, cap: int, d: int,
+    ) -> ChainResult | None:
+        """Build *item*'s chain over *snapshot* onto *base*, bounded by the build
+        deadline; None (the adjacent verify) on overrun, error or zero links.
+
+        Its candidates are reserved for the whole call (task 7720), so no other
+        consumer of the lane buffers can take one mid-build.
+        """
         # Bound on the whole build: lane acquisition (git reset/clean, the CoW
         # re-seed of target/) plus the merges; no cargo. The 1800 s default sits
         # above reify's measured whole-process p99 (seeds, n=401 over
@@ -12848,6 +12891,8 @@ class SpeculativeMergeWorker:
             'verify_base_divergences': list(
                 map(VerifyBaseDivergence.to_wire, self.verify_base_divergences()),
             ),
+            # task 7720: the lane-buffered links each deep chain holds.
+            'chain_reservations': self._chain_reservations.snapshot(),
             # θ=1993 additive key: merger-side speculation state (from
             # self._speculation_controller.snapshot()) plus
             # inflight_speculative — the count of speculative items now owned
@@ -13720,6 +13765,7 @@ class SpeculativeMergeWorker:
         # `live` -- the same over-release-is-safe shutdown valve as before,
         # now the sole acquire/release surface for both semaphores (P-2).
         self._speculation_ledger.release_for_shutdown(self._speculation_depth + 1)
+        self._chain_reservations.clear()
         self._halt_state.release_lanes_for_shutdown()
         self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
@@ -14553,6 +14599,7 @@ class SpeculativeMergeWorker:
             and req.lane == 'normal'
             and not req.result.done()
             and not req.result.cancelled()
+            and not self._chain_reservations.holds(req.request_id)
         ]
 
         # Guard: need at least 2 candidates to form a train.
@@ -19275,6 +19322,24 @@ class SpeculativeMergeWorker:
             'deep chain walk: landed %d of %d chained link(s) on top of %s',
             landed, len(chain.links), head_sha[:8],
         )
+        self._end_chain_reservation(
+            entry.item.request.request_id, all_landed=landed == len(chain.links),
+        )
+
+    def _end_chain_reservation(self, owner_request_id: str, *, all_landed: bool) -> None:
+        """End *owner_request_id*'s chain reservation (idempotent).
+
+        A confirmed tip whose links did not all land never reaches main, so it
+        is recorded dead (INV-3): anything stacked on it is re-merged at
+        dispatch or voided at adoption by the existing machinery.
+        """
+        record = self._chain_reservations.release(owner_request_id)
+        if record is None or record.tip is None or all_landed:
+            return
+        self._record_dead_base(
+            record.tip,
+            killer=DeadBaseKiller(DeadBaseSite.CHAIN_RELEASED, record.owner_task_id),
+        )
 
     async def _finalize_landed_by_successor(
         self,
@@ -20025,6 +20090,7 @@ class SpeculativeMergeWorker:
                 # stops finding `entry` the moment a caller retires it from
                 # `_live_items` (or, for the RUNNER_UNAVAILABLE re-merge path above,
                 # once it transitions off VERIFYING/GATE_REVERIFY/FINALIZING).
+                self._end_chain_reservation(req.request_id, all_landed=False)
                 # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
                 # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
                 # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
