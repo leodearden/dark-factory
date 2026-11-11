@@ -605,6 +605,22 @@ Supersedes: none.
 ruled_by: lead
 Carried by: S6 φ 9186, S10 ρ 9237, S9 π 9164 (the triggers).
 
+## R59 — The idle-workflow slot leak fix lands before the slot-registry rewrite (2026-11-11)
+Ruling: task 5153 (a registered-but-idle workflow is invisible to all three reapers and holds its slot; high, no prerequisites) lands first, in today's code. The S8 slot-registry task 9216 depends on 5153 and folds the container 5153 adds into `SlotRegistry`. The edge 9216 depends on 5153 was wired on 2026-11-11.
+Options considered: A the fix lands first and the registry task absorbs it (ruled); B the fix waits for the registry task, as the S8 draft suggested.
+Consequence that decided it: on 2026-11-11 task 9216 had 207 unfinished transitive prerequisites, including task 5040, so option B would have left a live slot leak open behind a long refactoring chain.
+Supersedes: the S8 PRD's recommended edge "5153 depends on the slot-registry task" (a recommendation, never a ruling; never kept in the store).
+ruled_by: human (Leo, in the first lead's thread, 2026-11-11: "agreed" on "the fix lands first"; record `~/.claude/review-all/review-all-dark_factory-20261008/digests/leo-answers-via-predecessor-2026-11-11.md`)
+Carried by: task 5153; S8 α 9216 (`plans/review-all-s8-harness-composition-root-and-slot-registry-prd.md`).
+
+## R60 — Task 5040 is hand-carried once the merge-lane policy chain's last task is done (2026-11-11)
+Ruling: task 5040 (the verify-dispatch extraction; 90 declared files, a half-built branch) is carried by a dedicated session through the merge queue as soon as task 8528 is done. It is not carried ahead of the chain. A scheduled check launches the carry and stands down if one already exists.
+Options considered: A hand-carry after 8528 (ruled); B leave it to the factory and carry only after 24 hours of lock starvation; C hand-carry now, ahead of the policy chain.
+Consequence that decided it: 92 of the 162 wave-2 tasks wait on 5040 (measured 2026-11-11, R31 made it a prerequisite), and a 90-file task starved for file locks from 2026-11-04; carrying it ahead of the chain would take the merge worker file from the chain protected on 2026-11-10.
+Supersedes: none (it completes R31 and follows the precedent of R47).
+ruled_by: human (Leo, in the first lead's thread, 2026-11-11: "do", confirmed "do this"; same record file)
+Carried by: task 5040; brief `~/.claude/spawn-briefs/hand-carry-5040.md`.
+
 
 ## Shared conventions (every session)
 
@@ -680,7 +696,7 @@ optional low curator-field rename (R42). The clerk pass of 2026-11-11 (program s
 applied the decompose returns' actions on pre-existing tasks: 191 applied (cancels, among them 3566, 5612,
 6575, 6576, 6827, 5046, 4752, 6914 and 7115; amends, among them 5822, 6242, 3260, 6236 and 6719; the
 finding-key stamps on 5409, 4833 and 5697), 5 skipped (notes on done, in-progress or branch-carrying tasks
-6861, 2507, 3010, 6497 and 5040), 2 left to the lead (edge 5153 → 9216, unwired; the 4686 stamp, since
+6861, 2507, 3010, 6497 and 5040), 2 left to the lead (edge 5153 → 9216, never kept: ruled the other way by R59; the 4686 stamp, since
 applied by the lead) and 2 rejected (a placeholder note for the unfiled S9 check; a note on gate 6698).
 Lead actions still open: the eight yaml edits of R37, the three-row backfill of R42, and the unfiled
 follow-ups and dated checks above.
@@ -709,11 +725,10 @@ none has landed (S6 α 9140, S7 α1 9136/α2 9139, S10 β2 9191 deliver it).
    task on that chain is `done` or `cancelled`. By stream: all 20 of S4; 21 of S8's 22 (all but η 9212);
    18 of S5's 23 (17 of its 21 chain tasks, plus σ 9277); 17 of S9's 21 (δ 9184 onward); 8 of S6's 13
    (δ, ζ, θ, φ, κ, λ, μ, ι); S3 ε1, ε2, ζ, λ, μ; S7 γ, ε, ζ; none of S10 or S26. 5040 itself depends on
-   8528 (`pending`) under Leo's 2026-11-10 chain protection, besides 5305 (`done`). The lead recommends
-   hand-carrying it the way 4867 is being carried (R47).
-2. **Edge 5153 → 9216** (task 5153, the idle-workflow reaper, would wait on S8 α, `SlotRegistry`): NOT
-   wired — the lead's wiring script added it and the lead removed it the same hour; on 2026-11-11 task 5153
-   (`pending`, high) has no dependency at all. It delays a high task and awaits Leo's yes.
+   8528 (`pending`) under Leo's 2026-11-10 chain protection, besides 5305 (`done`). RULED 2026-11-11 (R60): it is hand-carried
+   once 8528 is done.
+2. **Task 5153 versus the slot-registry task 9216**: RULED 2026-11-11 (R59). Task 5153 lands first; 9216
+   depends on it (edge wired 2026-11-11). The reverse edge the S8 draft suggested is withdrawn.
 3. **The 9140 parking exception** (R55): S6 α 9140 is the one new worker.py task not parked behind 8528.
    Behaviour-relevant; one edge reverses it.
 

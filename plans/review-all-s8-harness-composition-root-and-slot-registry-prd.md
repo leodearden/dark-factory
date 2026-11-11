@@ -1065,8 +1065,9 @@ on S3 ζ, so on S6 μ (behind S6's chain and task 5040), S7 δ, task 5409 and S3
   green).
 - G7: INV-6 `status-matches-liveness` — one liveness definition; INV-3 — `release_workflow`'s re-check
   after `get_status` is preserved through `slots.wait_cleared` + `slots.is_active`.
-- Note for the lead: live task 5153 (idle-workflow reaper) should build on `SlotRecord.dispatched_at`
-  and a per-record last-event stamp; recommend an edge 5153 → α (needs a ruling: it delays a high task).
+- Live task 5153 (idle-workflow reaper) lands FIRST, in today's code (Leo, 2026-11-11, program doc R59): α
+  (task 9216) depends on 5153 and folds the container 5153 adds into `SlotRegistry`, so the reaper then reads
+  `SlotRecord.dispatched_at` and a per-record last-event stamp. The draft's reverse edge (5153 → α) is withdrawn.
 
 **β0 — `make_scheduler` test factory and `passthrough_gates()`; the `_workflow_cancel_at` shim goes**
 (`task_kind=normal`, priority medium, ~1,200 LOC, mechanical codemod)
@@ -1552,7 +1553,7 @@ never a second task. Statuses read with `get_statuses` on 2026-11-10.
 | 3566 rename `steward_lifetime_budget` | pending, low | S8-1 = A: subsumed by θ | cancel, reason names θ and the 2026-11-10 ruling |
 | 5822 steward-mode gate | pending (deterministic, waits on 5393, 5820) | its "re-derive `steward_lifetime_budget`" item is superseded (S8-1) | amend: that item becomes a read-only report of durable per-task spend against the $25 cap; the main question is unchanged |
 | 5819 steward fresh session per L0 | pending, high | same file as θ | `add_dependency(θ, 5819)` |
-| 5153 registered-but-idle workflow reaper | pending, high | should build on C1 | recommended `add_dependency(5153, α)` — needs a ruling (not on the sitting's list) |
+| 5153 registered-but-idle workflow reaper | pending, high | lands first; α absorbs its container into C1 | `add_dependency(9216, 5153)` wired 2026-11-11 (Leo's ruling, program doc R59); the reverse edge is withdrawn |
 | 4686 PauseClass | done | closes `fk-b01dac97e6e9` | none (disposition `fixed:730794ca3b`) |
 | 2168 / 2175 transition table + enforcement | done | the legality half of `fk-5cad48d24b6f` predates the run (`stale`) | none |
 | 7332 already-landed gate branch-exists arm cost | done (`5e61becdf7`, 2026-11-06; was deferred on 2026-11-02) | out of scope (β only wires the gate) | none |
@@ -1619,8 +1620,8 @@ text is part of each changed ruling), `digests/wave2-leo-answers-2026-11-10.md` 
 
 None. No ruling raised a new design question, and the lead's sequencing rulings of 2026-11-10 settled
 the one sequencing point the ruling fold left open (S3 ε1/ε2/ζ sit between ε2b and ε3 on `harness.py`).
-Task 5153 → α is a recommendation that still needs a ruling (it delays a high task; not on the
-sitting's list).
+Task 5153 versus α was ruled by Leo on 2026-11-11 (program doc R59): 5153 lands first and α (task 9216)
+depends on it.
 
 Tactical (decide in the leaf): the batch interval of ι (the loop-thread drain bound follows from it); whether
 `SlotRecord.dispatched_at` is monotonic or wall-clock (5153 will want wall-clock for its L1 text); the
