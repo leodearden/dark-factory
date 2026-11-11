@@ -344,6 +344,16 @@ class TestHints:
         hints = [hint_for(reason) for reason in MergeReason]
         assert len(set(hints)) == len(hints)
 
+    def test_prior_run_terminal_hint_leaves_a_resubmit_to_a_human(self) -> None:
+        hint = MergeStatusAnswer.epistemic(
+            MergeState.stale_record, reason=MergeReason.prior_run_terminal,
+            request_id='mr-1',
+        ).to_response()['hint']
+
+        assert 'last_outcome' in hint
+        assert 'do not resubmit' in hint.lower()
+        assert 'human' in hint.lower()
+
 
 class TestLastOutcome:
     def test_from_row_renders_the_labelled_projection(self) -> None:
