@@ -18575,6 +18575,12 @@ class SpeculativeMergeWorker:
             # returning the lane to the pool while a verify subprocess is still
             # running inside it would let the next chain build check the lane
             # out from under it.
+            #
+            # task 7720: a round that will not adopt (tip fail, raise, abort,
+            # defer, cancel) gives its reserved links back, synchronously and
+            # before the await, so a cancel cannot separate the two releases.
+            if chain is not None and not _chain_adopting:
+                self._end_chain_reservation(req.request_id, all_landed=False)
             await _release_chain_lane()
 
             # ── task 3186 (PRD δ): the chain item's EPHEMERAL worktree ──────

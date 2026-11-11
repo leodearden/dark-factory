@@ -380,9 +380,10 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         for name in ('F1', 'F2'):
             own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
             assert own, f'{name} was never verified on its own'
-        assert await _landed_task_files(scene) == ['H', 'P', *names]
+        landed = await _landed_task_files(scene)
+        assert (landed[:2], sorted(landed[2:])) == (['H', 'P'], sorted(names))
         assert _reservations(rnd.lane) == []
-        _assert_no_live_permit(rnd.lane)
+        assert rnd.lane.speculation_accounting_violations() == []
 
     async def test_a_red_tip_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

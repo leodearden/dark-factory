@@ -1983,10 +1983,11 @@ class _DeepScene:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
         Returns the recorded ``_run_inflight_verify`` kwargs for the round
-        (plus ``'result'``).  Releases the host lease and any worktree the
-        ordinary (non-chain) arm hands back, so the next round starts from the
-        same resource state — which is what makes the ROUND SEQUENCE, and not
-        a slowly-leaking fixture, the thing under test.
+        (plus ``'result'``).  Releases the host lease, any worktree the
+        ordinary (non-chain) arm hands back, and the chain reservation a
+        passing tip hands to finalize (task 7720), so the next round starts
+        from the same resource state — which is what makes the ROUND SEQUENCE,
+        and not a slowly-leaking fixture, the thing under test.
         """
         self._round_no += 1
         worker = self.worker
@@ -2004,6 +2005,7 @@ class _DeepScene:
         rec['round'] = self._round_no
         if entry.lease is not None:
             await worker._host_allocator.release(entry.lease)
+        worker._chain_reservations.release(item.request.request_id)
         vr = rec['result']
         if vr.merge_wt is not None:
             # The ordinary arm hands its verified worktree to _finalize_inflight;
