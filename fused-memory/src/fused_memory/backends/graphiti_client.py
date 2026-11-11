@@ -89,11 +89,11 @@ from fused_memory.backends.paged_read import (
     INCOMPLETE_STRUCTURAL_REFUSAL as INCOMPLETE_STRUCTURAL_REFUSAL,  # re-export; home is paged_read
 )
 from fused_memory.backends.paged_read import (
-    MAX_READ_PAGES as _MAX_READ_PAGES,  # noqa: F401 - re-export; home is paged_read
+    MAX_READ_PAGES as _MAX_READ_PAGES,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
 )
 from fused_memory.backends.paged_read import RESULTSET_SIZE as _RESULTSET_SIZE
 from fused_memory.backends.paged_read import (
-    census_count as _census_count,  # noqa: F401 - re-export; home is paged_read
+    census_count as _census_count,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
 )
 from fused_memory.backends.paged_read import paged_ro_query as _paged_ro_query
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
