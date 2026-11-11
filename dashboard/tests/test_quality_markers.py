@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
+import yaml
 from shared.quality_series.stats import RegimeEvent
 
+from dashboard.data import quality_markers
 from dashboard.data.quality_markers import (
+    CuratedMarkers,
     Marker,
     MarkerInvariant,
     MarkerInvariantError,
     MarkerKind,
     MarkerSource,
     SourceType,
+    load_curated_markers,
 )
+from dashboard.data.quality_series import CATALOGUE
 
 AT = datetime(2026, 11, 1, 8, 58, 42, tzinfo=UTC)
 
@@ -209,3 +216,183 @@ class TestRegimeEvent:
     @pytest.mark.parametrize('kind', [MarkerKind.DEPLOY, MarkerKind.INSTRUMENT])
     def test_deploy_and_instrument_are_not_landing_axis_events(self, kind: MarkerKind) -> None:
         assert _marker(kind=kind).regime_event() is None
+
+
+END_OF_DAY = (23, 59, 59, 999999)
+
+VALID_FIRST = """\
+- date: 2026-07-15
+  label: first
+  tasks: [1]
+"""
+VALID_LAST = """\
+- date: 2026-07-16
+  label: last
+"""
+
+
+def _curated(tmp_path: Path, text: str, name: str = 'markers.yaml') -> Path:
+    path = tmp_path / name
+    path.write_text(text)
+    return path
+
+
+class TestCuratedReader:
+    def test_a_missing_file_is_no_markers_and_no_failure(self, tmp_path: Path) -> None:
+        assert load_curated_markers(tmp_path / 'absent.yaml') == CuratedMarkers((), 0)
+
+    @pytest.mark.parametrize('text', ['date: [unclosed', 'date: 2026-07-15\nlabel: x\n', 'just text\n'])
+    def test_an_unreadable_file_is_no_markers_and_one_failure(self, tmp_path: Path, text: str) -> None:
+        assert load_curated_markers(_curated(tmp_path, text)) == CuratedMarkers((), 1)
+
+    def test_an_old_shape_entry_is_a_fleet_regime_marker_for_every_series(self, tmp_path: Path) -> None:
+        path = _curated(tmp_path, '- date: 2026-07-15\n  label: Verify-scope flip\n  tasks: [2593, "x1"]\n')
+
+        (marker,), failures = load_curated_markers(path)
+
+        assert failures == 0
+        assert marker.kind is MarkerKind.REGIME
+        assert marker.scope is None
+        assert marker.series is None
+        assert marker.until is None
+        assert marker.at == datetime(2026, 7, 15, tzinfo=UTC)
+        assert marker.label == 'Verify-scope flip'
+        assert marker.tasks == (2593, 'x1')
+        assert marker.source == MarkerSource(SourceType.CURATED, file='markers.yaml')
+        assert marker.marker_id.startswith('curated:')
+
+    def test_unknown_keys_are_ignored(self, tmp_path: Path) -> None:
+        path = _curated(tmp_path, '- date: 2026-07-15\n  label: x\n  colour: red\n')
+
+        markers, failures = load_curated_markers(path)
+
+        assert failures == 0
+        assert [marker.label for marker in markers] == ['x']
+
+    def test_quoted_iso_strings_and_aware_yaml_timestamps_parse(self, tmp_path: Path) -> None:
+        path = _curated(tmp_path, (
+            '- {date: "2026-10-16", label: quoted date}\n'
+            '- {date: "2026-10-16T12:00:00+02:00", label: quoted instant}\n'
+            '- {date: 2026-10-16T12:00:00Z, label: yaml instant}\n'
+            '- {date: 2026-10-16, until: "2026-10-17T06:00:00Z", kind: artefact, label: quoted until}\n'
+        ))
+
+        markers, failures = load_curated_markers(path)
+
+        assert failures == 0
+        assert [marker.at for marker in markers] == [
+            datetime(2026, 10, 16, tzinfo=UTC),
+            datetime(2026, 10, 16, 10, tzinfo=UTC),
+            datetime(2026, 10, 16, 12, tzinfo=UTC),
+            datetime(2026, 10, 16, tzinfo=UTC),
+        ]
+        assert markers[3].until == datetime(2026, 10, 17, 6, tzinfo=UTC)
+
+    def test_a_date_only_until_ends_at_the_end_of_that_utc_day(self, tmp_path: Path) -> None:
+        path = _curated(tmp_path, (
+            '- date: 2026-10-16\n  until: 2026-10-16\n  kind: artefact\n'
+            '  project: dark_factory\n  series: [flakes_confirmed]\n  label: disk full\n'
+        ))
+
+        (marker,), failures = load_curated_markers(path)
+
+        assert failures == 0
+        assert marker.until == datetime(2026, 10, 16, *END_OF_DAY, tzinfo=UTC)
+        assert marker.scope == 'dark_factory'
+        assert marker.series == ('flakes_confirmed',)
+        assert marker.kind is MarkerKind.ARTEFACT
+
+    def test_every_marker_kind_is_accepted(self, tmp_path: Path) -> None:
+        entries = ''.join(
+            f'- {{date: 2026-07-15, kind: {kind.value}, label: {kind.value}'
+            + (', until: 2026-07-15' if kind is MarkerKind.ARTEFACT else '') + '}\n'
+            for kind in MarkerKind
+        )
+
+        markers, failures = load_curated_markers(_curated(tmp_path, entries))
+
+        assert failures == 0
+        assert [marker.kind for marker in markers] == list(MarkerKind)
+
+    @pytest.mark.parametrize('bad_entry', [
+        '- just a string\n',
+        '- date: 2026-07-15\n',
+        '- {date: 2026-07-15, label: ""}\n',
+        '- {date: 2026-07-15, label: 42}\n',
+        '- {label: no date}\n',
+        '- {date: 2026-07-15T12:00:00, label: naive yaml instant}\n',
+        '- {date: "2026-07-15T12:00:00", label: naive quoted instant}\n',
+        '- {date: not-a-date, label: unparseable date}\n',
+        '- {date: 2026-07-15, kind: weather, label: unknown kind}\n',
+        '- {date: 2026-07-15, kind: artefact, label: artefact without until}\n',
+        '- {date: 2026-07-15, until: 2026-07-16, label: until on a regime entry}\n',
+        '- {date: 2026-07-15, until: 2026-07-14, kind: artefact, label: until before date}\n',
+        '- {date: 2026-07-15, series: flakes_confirmed, label: series not a list}\n',
+        '- {date: 2026-07-15, series: [], label: empty series}\n',
+        '- {date: 2026-07-15, series: [flakes_confirmed, ""], label: empty series id}\n',
+        '- {date: 2026-07-15, series: [3], label: non-string series id}\n',
+        '- {date: 2026-07-15, tasks: 2631, label: tasks not a list}\n',
+        '- {date: 2026-07-15, project: [df], label: project not a string}\n',
+        VALID_FIRST,
+    ])
+    def test_a_bad_entry_is_counted_once_and_logged_while_siblings_load(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, bad_entry: str,
+    ) -> None:
+        path = _curated(tmp_path, VALID_FIRST + bad_entry + VALID_LAST)
+
+        with caplog.at_level(logging.WARNING, logger=quality_markers.__name__):
+            markers, failures = load_curated_markers(path)
+
+        assert failures == 1
+        assert [marker.label for marker in markers] == ['first', 'last']
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    def test_every_bad_entry_counts(self, tmp_path: Path) -> None:
+        path = _curated(tmp_path, VALID_FIRST + '- 1\n- 2\n- {label: x}\n' + VALID_LAST)
+
+        assert load_curated_markers(path).parse_failures == 3
+
+    def test_ids_are_stable_across_a_reorder(self, tmp_path: Path) -> None:
+        forward = load_curated_markers(_curated(tmp_path, VALID_FIRST + VALID_LAST, 'a.yaml'))
+        backward = load_curated_markers(_curated(tmp_path, VALID_LAST + VALID_FIRST, 'b.yaml'))
+
+        def ids(markers: tuple[Marker, ...]) -> dict[str, str]:
+            return {marker.label: marker.marker_id for marker in markers}
+
+        assert ids(forward.markers) == ids(backward.markers)
+        assert len(set(ids(forward.markers).values())) == 2
+
+    def test_no_path_reads_the_module_path_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', _curated(tmp_path, VALID_LAST))
+
+        assert [marker.label for marker in load_curated_markers().markers] == ['last']
+
+
+class TestCommittedCuratedFile:
+    def test_it_holds_the_legacy_regime_markers_and_the_disk_full_artefact(self) -> None:
+        markers, failures = load_curated_markers()
+
+        assert failures == 0
+        regimes = [marker for marker in markers if marker.kind is MarkerKind.REGIME]
+        assert [(marker.at, marker.label, marker.tasks) for marker in regimes] == [
+            (datetime(2026, 7, 15, tzinfo=UTC), 'Starvation threshold raised to 72h', (2631,)),
+            (datetime(2026, 7, 15, tzinfo=UTC), 'Auto-watcher benign closes', (2630,)),
+            (datetime(2026, 7, 15, tzinfo=UTC), 'Verify-scope flip', (2593,)),
+        ]
+        (artefact,) = [marker for marker in markers if marker.kind is MarkerKind.ARTEFACT]
+        assert artefact.scope == 'dark_factory'
+        assert artefact.at == datetime(2026, 10, 16, tzinfo=UTC)
+        assert artefact.until == datetime(2026, 10, 16, *END_OF_DAY, tzinfo=UTC)
+        assert artefact.series == ('flakes_confirmed', 'flakes_real_red')
+        assert len(markers) == 4
+
+    def test_every_series_it_names_is_a_served_metric(self) -> None:
+        metric_ids = {spec.metric_id for spec in CATALOGUE}
+        entries = yaml.safe_load(quality_markers.CURATED_MARKERS_PATH.read_text())
+
+        named = {series for entry in entries for series in entry.get('series') or ()}
+
+        assert named
+        assert named <= metric_ids
