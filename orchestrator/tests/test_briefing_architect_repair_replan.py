@@ -22,6 +22,7 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _prompt_action_items import action_items
 from _roles_helpers import tool_is_granted
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -120,16 +121,10 @@ class TestReplanPrompt:
 
     @pytest.mark.asyncio
     async def test_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
-        items = _action_items(await briefing.build_replan_prompt(_TASK, 'FEEDBACK', context=''))
+        items = action_items(await briefing.build_replan_prompt(_TASK, 'FEEDBACK', context=''))
         confirming = [i for i, item in enumerate(items) if 'confirm_plan()' in item]
         assert confirming == [len(items) - 1], items
         assert 'FINAL' in items[-1]
-
-
-def _action_items(prompt: str) -> list[str]:
-    """The numbered items of the prompt's ``## Action`` section, continuation lines included."""
-    section = prompt.split('## Action', 1)[1].split('\n#', 1)[0]
-    return [item for item in re.split(r'\n(?=\d+\. )', section.strip()) if re.match(r'\d+\. ', item)]
 
 
 async def _repair_prompt(briefing: BriefingAssembler) -> str:

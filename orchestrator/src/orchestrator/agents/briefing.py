@@ -173,14 +173,15 @@ _TEXT_DRIFT_NOTICES = {
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
         'plan was authored. Re-read them and change the plan to cover the '
-        'amended scope; call confirm_plan() only if it already does.'
+        'amended scope, then call confirm_plan(); if it already covers it, '
+        'confirm it unchanged.'
     ),
     TaskTextDrift.UNSTAMPED: (
         '## The Task Text May Have Changed\n\n'
         'This plan carries no record of the task text it was authored against, '
         'so the description or details under # Task may have been amended '
-        'since. Re-read them and change the plan if its scope has moved; call '
-        'confirm_plan() only if it already covers it.'
+        'since. Re-read them and change the plan if its scope has moved, then '
+        'call confirm_plan(); if it already covers it, confirm it unchanged.'
     ),
 }
 
