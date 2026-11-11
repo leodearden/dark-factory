@@ -1761,12 +1761,13 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
 
 
 def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
-    """The excepted branch reads the ONE census record, not a local copy of it.
+    """The ruled table's entry IS the record the fleet table reads, not a re-literalised copy.
 
     Task 6172. ``verify_budget_census_records.py::RULED_BUDGET_CENSUS`` and
     ``test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`` both consume
-    task 3353's orchestrator census. Asserted by IDENTITY rather than equality:
-    a re-introduced local copy carrying equal values today is exactly the drift
+    task 3353's orchestrator census through ``ORCHESTRATOR_BUDGET_CENSUS``.
+    Asserted by IDENTITY rather than equality: a second ``BudgetCensus(...)``
+    literal inside the table, carrying equal values today, is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
     ruled = census_records.RULED_BUDGET_CENSUS['orchestrator']
