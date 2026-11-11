@@ -1778,11 +1778,31 @@ def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
     a re-introduced local copy carrying equal values today is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
-    assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
-        "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
+    ruled = census_records.RULED_BUDGET_CENSUS['orchestrator']
+    assert ruled is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+        "tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS"
+        "['orchestrator'] is not the record at "
         'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
         '(task 6172). That record is the single home the fleet table also reads; '
-        'import it, never copy it'
+        'reference it, never copy it'
+    )
+
+
+def test_the_ruled_census_table_and_the_ruled_exceptions_name_the_same_modules() -> None:
+    """The census report and this gate pick the D17 modules from one key set.
+
+    Task 7929.
+    """
+    census_keys = set(census_records.RULED_BUDGET_CENSUS)
+    exception_keys = set(RULED_INTERIM_BUDGET_EXCEPTIONS)
+    assert census_keys == exception_keys, (
+        'tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS and '
+        'tests/scripts/test_module_verify_budgets.py::RULED_INTERIM_BUDGET_EXCEPTIONS '
+        f'name different modules: {sorted(census_keys ^ exception_keys)} (task 7929). '
+        'scripts/verify_budget_census.py decides which modules get the D17 census '
+        'floor from RULED_BUDGET_CENSUS, while this gate branches on '
+        'RULED_INTERIM_BUDGET_EXCEPTIONS, so the census report would state one '
+        'floor while the gate enforces another'
     )
 
 
