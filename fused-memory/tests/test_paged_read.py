@@ -35,19 +35,33 @@ def test_the_paged_read_module_loads_no_graphiti_and_no_falkordb():
         ('_paged_ro_query', 'paged_ro_query'),
         ('_DEFAULT_READ_PAGE_SIZE', 'DEFAULT_READ_PAGE_SIZE'),
         ('_RESULTSET_SIZE', 'RESULTSET_SIZE'),
+        ('INCOMPLETE_STRUCTURAL_KINDS', 'INCOMPLETE_STRUCTURAL_KINDS'),
+        ('INCOMPLETE_KINDS', 'INCOMPLETE_KINDS'),
+    ],
+)
+def test_the_names_graphiti_client_reads_with_are_the_paged_read_objects(
+    graphiti_client_name, paged_read_name
+):
+    assert getattr(graphiti_client, graphiti_client_name) is getattr(
+        paged_read, paged_read_name
+    )
+
+
+@pytest.mark.parametrize(
+    ('graphiti_client_name', 'paged_read_name'),
+    [
         ('_MAX_READ_PAGES', 'MAX_READ_PAGES'),
         ('_census_count', 'census_count'),
         ('INCOMPLETE_STRUCTURAL_REFUSAL', 'INCOMPLETE_STRUCTURAL_REFUSAL'),
         ('INCOMPLETE_PAGE_CAP', 'INCOMPLETE_PAGE_CAP'),
         ('INCOMPLETE_CENSUS_UNAVAILABLE', 'INCOMPLETE_CENSUS_UNAVAILABLE'),
         ('INCOMPLETE_SHORT_READ', 'INCOMPLETE_SHORT_READ'),
-        ('INCOMPLETE_STRUCTURAL_KINDS', 'INCOMPLETE_STRUCTURAL_KINDS'),
-        ('INCOMPLETE_KINDS', 'INCOMPLETE_KINDS'),
     ],
 )
-def test_graphiti_client_spellings_are_the_paged_read_objects(
+def test_graphiti_client_re_exports_only_the_paged_read_objects(
     graphiti_client_name, paged_read_name
 ):
+    """These names exist in graphiti_client only for old importers; each row goes when its re-export does (task 9363)."""
     assert getattr(graphiti_client, graphiti_client_name) is getattr(
         paged_read, paged_read_name
     )

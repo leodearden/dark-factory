@@ -23,10 +23,12 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / 'src'
 
+_REPORT_SENTINEL = 'IMPORT-CLOSURE-REPORT: '
+
 _PROBE = """\
 import importlib, json, sys
 module = importlib.import_module({module!r})
-print(json.dumps({{
+print({sentinel!r} + json.dumps({{
     'file': module.__file__,
     'loaded': [name for name in {candidates!r} if name in sys.modules],
 }}))
@@ -43,7 +45,9 @@ def modules_loaded_by_importing(module: str, candidates: Sequence[str]) -> Impor
     result = subprocess.run(
         [
             sys.executable, '-E', '-s', '-c',
-            _PROBE.format(module=module, candidates=list(candidates)),
+            _PROBE.format(
+                module=module, candidates=list(candidates), sentinel=_REPORT_SENTINEL
+            ),
         ],
         cwd=SRC,
         capture_output=True,
@@ -55,5 +59,21 @@ def modules_loaded_by_importing(module: str, candidates: Sequence[str]) -> Impor
             f'importing {module} in a fresh interpreter failed '
             f'(exit {result.returncode}):\n{result.stderr}'
         )
-    report = json.loads(result.stdout)
+    report = _parse_report(module, result)
     return ImportProbe(file=report['file'], loaded=tuple(report['loaded']))
+
+
+def _parse_report(module: str, result: subprocess.CompletedProcess[str]) -> dict:
+    """The probe's own report line, found by its sentinel so import-time stdout cannot corrupt it."""
+    reports = [
+        line.removeprefix(_REPORT_SENTINEL)
+        for line in result.stdout.splitlines()
+        if line.startswith(_REPORT_SENTINEL)
+    ]
+    try:
+        return json.loads(reports[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise AssertionError(
+            f'probing {module} printed no readable report ({error!r}):\n'
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+        ) from error
