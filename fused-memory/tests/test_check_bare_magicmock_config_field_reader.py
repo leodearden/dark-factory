@@ -55,7 +55,9 @@ def test_reads_exactly_the_fields_dataclasses_fields_reports(tmp_path):
     )
     ns: dict[str, object] = {'__name__': 'verdict_fixture'}
     exec(compile(path.read_text(encoding='utf-8'), str(path), 'exec'), ns)
-    oracle = {f.name for f in dataclasses.fields(ns['Verdict'])}
+    verdict = ns['Verdict']
+    assert dataclasses.is_dataclass(verdict)
+    oracle = {f.name for f in dataclasses.fields(verdict)}
 
     names = _checker.dataclass_field_names(path, 'Verdict')
 

@@ -814,7 +814,9 @@ class TestDataclassShapeRegistry:
     def test_registry_reads_the_file_defining_the_fingerprinted_verify_result(self):
         """The registry's source file is where the fingerprinted VerifyResult lives."""
         shape = _checker._DATACLASS_SHAPES[0]
-        fingerprinted = Path(inspect.getsourcefile(_fingerprinted_class(shape.name))).resolve()
+        source_file = inspect.getsourcefile(_fingerprinted_class(shape.name))
+        assert source_file is not None, f'{shape.name} has no Python source file'
+        fingerprinted = Path(source_file).resolve()
         registered = (_REPO_ROOT / shape.source).resolve()
         assert fingerprinted == registered, (
             f'the Rule B registry reads {registered} but the wire fingerprint hashes the '
