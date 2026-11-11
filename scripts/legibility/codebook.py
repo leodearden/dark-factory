@@ -738,13 +738,63 @@ class SkippedRecord:
 
 
 @dataclass(frozen=True)
+class PayloadRef:
+    """A candidate payload of a merge batch: its record's batch index, as
+    `SkippedRecord.index` numbers it, and its index in that record's
+    ``candidates``."""
+
+    record: int
+    candidate: int
+
+
+@dataclass(frozen=True)
+class NewPending:
+    """The payload's title was unseen, so the merge minted this candidate."""
+
+    payload: PayloadRef
+    candidate_id: str
+
+
+@dataclass(frozen=True)
+class PendingAbsorbed:
+    """A pending candidate of the payload's title took its sighting."""
+
+    payload: PayloadRef
+    candidate_id: str
+
+
+@dataclass(frozen=True)
+class RoutedToEntry:
+    """Every candidate of the payload's title is adjudicated, and this promoted
+    one's entry took the sighting."""
+
+    payload: PayloadRef
+    candidate_id: str
+    entry_id: str
+
+
+@dataclass(frozen=True)
+class RoutedToCandidate:
+    """Every candidate of the payload's title is adjudicated and none has a
+    live entry, so this one took the sighting under its standing verdict."""
+
+    payload: PayloadRef
+    candidate_id: str
+    disposition: str
+
+
+Resolution = NewPending | PendingAbsorbed | RoutedToEntry | RoutedToCandidate
+
+
+@dataclass(frozen=True)
 class MergeResult:
     """One batch merged by `apply_coding_records`.
 
     `merged_records` are the records that went through the merge, in batch
     order, an already-absorbed re-apply included; `skipped_deletions` and
     `invalid_records` are the ones left out; `counts` and `invariant_slugs` sum
-    over the merged ones.
+    over the merged ones, and `resolutions` holds one per candidate payload of
+    the merged ones, in batch order.
     """
 
     codebook: dict
@@ -753,10 +803,16 @@ class MergeResult:
     skipped_deletions: tuple[SkippedRecord, ...] = ()
     invalid_records: tuple[SkippedRecord, ...] = ()
     invariant_slugs: SlugTally = SlugTally()
+    resolutions: tuple[Resolution, ...] = ()
 
     @property
     def mutated(self) -> bool:
         return self.counts.mutations > 0
+
+    def resolution_at(self, ref: PayloadRef) -> Resolution | None:
+        """The candidate payload *ref* resolved to, or None when the merge
+        skipped its record or *ref* names no payload of it."""
+        return next((resolution for resolution in self.resolutions if resolution.payload == ref), None)
 
     def summary(self) -> str:
         values = {f.name: getattr(self.counts, f.name) for f in fields(self.counts)}
@@ -844,6 +900,7 @@ def apply_coding_records(
     merged = copy.deepcopy(codebook)
     counts, slugs = MergeCounts(), SlugTally()
     merged_records: list[dict] = []
+    resolutions: list[Resolution] = []
     skipped_deletions: list[SkippedRecord] = []
     invalid_records: list[SkippedRecord] = []
     for index, record in enumerate(records):
@@ -855,10 +912,11 @@ def apply_coding_records(
         if errors:
             invalid_records.append(SkippedRecord.of(index, record, "; ".join(errors)))
             continue
-        record_counts, record_slugs = _apply_coding_record(
-            merged, record, invariant_slugs=invariant_slugs
+        applied = _apply_coding_record(
+            merged, record, index=index, invariant_slugs=invariant_slugs
         )
-        counts, slugs = counts.plus(record_counts), slugs.plus(record_slugs)
+        counts, slugs = counts.plus(applied.counts), slugs.plus(applied.slugs)
+        resolutions.extend(applied.resolutions)
         merged_records.append(record)
     assert_no_deletion(codebook, merged)
     return MergeResult(
@@ -868,12 +926,44 @@ def apply_coding_records(
         skipped_deletions=tuple(skipped_deletions),
         invalid_records=tuple(invalid_records),
         invariant_slugs=slugs,
+        resolutions=tuple(resolutions),
     )
 
 
+@dataclass(frozen=True)
+class _AppliedRecord:
+    counts: MergeCounts
+    slugs: SlugTally
+    resolutions: tuple[Resolution, ...]
+
+
+def _resolve(
+    ref: PayloadRef, same_title: list[dict], entries_by_id: Mapping[str, dict]
+) -> tuple[Resolution, dict] | None:
+    """The merge's routing precedence for a candidate payload whose title the
+    candidates *same_title* carry: its Resolution and the record its sighting
+    goes on, or None for an unseen title."""
+    pending = next((c for c in same_title if c.get("disposition") == "pending"), None)
+    if pending is not None:
+        return PendingAbsorbed(payload=ref, candidate_id=pending["id"]), pending
+    for candidate in reversed(same_title):
+        if candidate.get("disposition") == "promoted":
+            entry = entries_by_id.get(candidate.get("promoted_to"))
+            if entry is not None:
+                return RoutedToEntry(
+                    payload=ref, candidate_id=candidate["id"], entry_id=entry["id"]
+                ), entry
+    if not same_title:
+        return None
+    standing = same_title[-1]
+    return RoutedToCandidate(
+        payload=ref, candidate_id=standing["id"], disposition=standing["disposition"]
+    ), standing
+
+
 def _apply_coding_record(
-    codebook: dict, record: dict, *, invariant_slugs: Collection[str]
-) -> tuple[MergeCounts, SlugTally]:
+    codebook: dict, record: dict, *, index: int, invariant_slugs: Collection[str]
+) -> _AppliedRecord:
     """Apply one §7.3 coding record to a v2 codebook, in place. Sole-writer
     merge. Preconditions: *codebook* is the batch's own copy, and *record* is
     valid and not deletion-shaped; the batch, `apply_coding_records`, ensures
@@ -885,7 +975,8 @@ def _apply_coding_record(
     the order corrections → matches → candidates (see the correction-handling
     paragraph for why corrections go first).
 
-    Returns what each op did and the record's `SlugTally`.
+    Returns what each op did, the record's `SlugTally`, and one Resolution per
+    candidate payload, *index* being the record's batch index.
 
     The record is first screened by `screen_invariant_slugs()` against
     *invariant_slugs*, the observed project's declared vocabulary: an
@@ -1048,71 +1139,22 @@ def _apply_coding_record(
     candidates = codebook.setdefault("candidates", [])
     date_prefix = f"cand-{date.replace('-', '')}-"
 
-    for candidate_payload in record.get("candidates", []) or []:
+    resolutions: list[Resolution] = []
+    for payload_index, candidate_payload in enumerate(record.get("candidates", []) or []):
+        ref = PayloadRef(record=index, candidate=payload_index)
         title = candidate_payload.get("title")
         same_title = [c for c in candidates if c.get("title") == title]
-
-        already_seen = any(
-            session in {s.get("session") for s in c.get("sightings", [])}
-            for c in same_title
-        )
-        if already_seen:
-            continue
-
         sighting = _build_sighting(candidate_payload, session=session, date=date, project=project)
-        pending_match = next(
-            (c for c in same_title if c.get("disposition") == "pending"), None
-        )
-        if pending_match is not None:
-            pending_match.setdefault("sightings", []).append(sighting)
-            candidates_applied += 1
-        elif same_title:
-            # Every same-title candidate is already adjudicated (rejected/
-            # promoted). Fabricating a fresh pending twin here would silently
-            # undo that verdict (this is exactly how rejected
-            # cand-20260722-28 came back as pending cand-20260724-2 in the
-            # live codebook). So: never touch `disposition` -- promote/reject
-            # transitions are census-owned (census.py promote_candidate/
-            # reject_candidate) -- and route the recurrence sighting to
-            # wherever it will actually be READ.
-            promoted_entry = None
-            for c in reversed(same_title):
-                if c.get("disposition") == "promoted":
-                    promoted_entry = entries_by_id.get(c.get("promoted_to"))
-                    if promoted_entry is not None:
-                        break
-            if promoted_entry is not None:
-                # The census already turned this title into a real entry.
-                # promote_candidate deep-copies the candidate's `sightings`
-                # into the entry ONCE and never again, and the entry is what
-                # the census files from: census.py::_entry_cluster rebuilds a
-                # withheld entry's task, evidence included, from ENTRY
-                # sightings alone. Filing the recurrence on the candidate
-                # would leave it out of that task -- so it goes on the entry,
-                # deduped by session and counted exactly as the match path
-                # above counts its own appends.
-                entry_sightings = promoted_entry.setdefault("sightings", [])
-                if session not in {s.get("session") for s in entry_sightings}:
-                    entry_sightings.append(sighting)
-                    matched += 1
-            else:
-                # Rejected, or promoted with a `promoted_to` that names no
-                # existing entry (hand-edited/pre-promote_candidate record).
-                # The merger never fabricates an entry -- only the census
-                # does -- so the sighting lands on the candidate so the
-                # signal is not lost, and the conflict is surfaced via
-                # counts. `same_title[-1]` (last in list order = most recently
-                # added) is the deterministic tie-break when more than one
-                # adjudicated record shares a title.
-                same_title[-1].setdefault("sightings", []).append(sighting)
-                candidate_disposition_conflicts += 1
-        else:
+
+        resolved = _resolve(ref, same_title, entries_by_id)
+        if resolved is None:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
             )
+            minted_id = f"{date_prefix}{n}"
             candidates.append(
                 {
-                    "id": f"{date_prefix}{n}",
+                    "id": minted_id,
                     "title": title,
                     "cause": candidate_payload.get("cause"),
                     "area": candidate_payload.get("area"),
@@ -1122,15 +1164,44 @@ def _apply_coding_record(
                 }
             )
             candidates_applied += 1
+            resolutions.append(NewPending(payload=ref, candidate_id=minted_id))
+            continue
 
-    return MergeCounts(
-        matched=matched,
-        candidates_applied=candidates_applied,
-        candidate_disposition_conflicts=candidate_disposition_conflicts,
-        corrections_applied=corrections_applied,
-        correction_skipped=correction_skipped,
-        skipped_unknown_entry=skipped_unknown_entry,
-    ), slugs
+        resolution, holder = resolved
+        resolutions.append(resolution)
+        already_seen = any(session in sessions_of(c) for c in same_title)
+        if already_seen:
+            continue
+        holder_sightings = holder.setdefault("sightings", [])
+        match resolution:
+            case PendingAbsorbed():
+                holder_sightings.append(sighting)
+                candidates_applied += 1
+            case RoutedToEntry():
+                # A promoted candidate's own sightings are dead: the entry is
+                # what the census reads and files from, so the recurrence goes
+                # there, deduped by session like a match.
+                if session not in sessions_of(holder):
+                    holder_sightings.append(sighting)
+                    matched += 1
+            case RoutedToCandidate():
+                # No pending twin is fabricated beside an adjudicated title
+                # (task 4144), so the standing candidate keeps the signal.
+                holder_sightings.append(sighting)
+                candidate_disposition_conflicts += 1
+
+    return _AppliedRecord(
+        counts=MergeCounts(
+            matched=matched,
+            candidates_applied=candidates_applied,
+            candidate_disposition_conflicts=candidate_disposition_conflicts,
+            corrections_applied=corrections_applied,
+            correction_skipped=correction_skipped,
+            skipped_unknown_entry=skipped_unknown_entry,
+        ),
+        slugs=slugs,
+        resolutions=tuple(resolutions),
+    )
 
 
 def validate_coding_record(record: dict) -> list[str]:
