@@ -41,6 +41,7 @@ FOLLOWER_WINDOW: Final = timedelta(hours=24)
 FOLLOWER_LEVELS: Final = frozenset({0, 1})
 REDESIGN_FOLLOW_UP: Final = 'open the joint L0 end-of-life redesign with the harness plan (S8)'
 RATE_DIGITS: Final = 2
+UNREADABLE_EXIT: Final = 2
 UNBOUNDED: Final = datetime.max.replace(tzinfo=UTC)
 
 
@@ -128,9 +129,9 @@ def _moment(raw: Mapping[str, Any], key: str, path: Path) -> datetime:
     value = _text(raw, key, path)
     try:
         moment = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise UnreadableQueue(path, f'{key} {value!r} is not an ISO timestamp') from exc
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+        return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    except (ValueError, OverflowError) as exc:
+        raise UnreadableQueue(path, f'{key} {value!r} is not a usable ISO timestamp') from exc
 
 
 def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
@@ -363,6 +364,14 @@ def resolve_exit_code(breaches: Sequence[Breach]) -> int:
     return 1 if breaches else 0
 
 
+def measure_queue(queue_dir: Path, *, now: datetime, window_days: int, max_pending_hours: float) -> Report:
+    """measure() over queue_dir, refusing a post window with nothing filed: no producer wrote, so nothing to judge."""
+    report = measure(load_records(queue_dir), now=now, window_days=window_days, max_pending_hours=max_pending_hours)
+    if report.post.filed == 0:
+        raise UnreadableQueue(queue_dir, f'no blocking L0 filed in the last {window_days} days: nothing to judge')
+    return report
+
+
 def _shown_rate(rate: float | None) -> str:
     return 'n/a' if rate is None else f'{rate:.{RATE_DIGITS}f}/100'
 
@@ -441,10 +450,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_reaper_wrong=args.max_reaper_wrong,
         max_pending_hours=args.max_pending_hours,
     )
-    records = load_records(args.queue_dir)
-    report = measure(
-        records, now=datetime.now(UTC), window_days=args.window_days, max_pending_hours=thresholds.max_pending_hours,
-    )
+    try:
+        report = measure_queue(
+            args.queue_dir,
+            now=datetime.now(UTC),
+            window_days=args.window_days,
+            max_pending_hours=thresholds.max_pending_hours,
+        )
+    except UnreadableQueue as exc:
+        print(f'unreadable queue directory: {exc.path} ({exc.reason})')
+        return UNREADABLE_EXIT
     breaches = judge(report, thresholds)
     lines = [*render(report), *(breach_line(breach, report, thresholds) for breach in breaches)]
     if breaches:
