@@ -892,7 +892,7 @@ dependency gate as every other task (§3).
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
   env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
-  cwd: "<project_root>",            # default: project_root
+  cwd: "<project_root>",            # str|None; default project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
   kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"

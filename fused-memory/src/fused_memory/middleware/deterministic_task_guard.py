@@ -21,11 +21,11 @@ these invariants is violated:
    ``script`` required string that resolves UNDER ``project_root`` — or, when
    ``script_root='factory'``, under the dark-factory root
    (``shared.repo_paths.resolve_dark_factory_root``) — exists, and is
-   executable (``os.access X_OK``); ``timeout_secs`` required positive int;
-   ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``;
-   ``script_root`` (when present) must be one of ``{'project', 'factory'}``,
-   and ``'factory'`` requires ``kind='predicate'``. An unresolvable
-   dark-factory root is a rejection.
+   executable (``os.access X_OK``); ``cwd`` (when present) must be a string;
+   ``timeout_secs`` required positive int; ``kind`` (when present) must be
+   one of ``{'deploy', 'predicate'}``; ``script_root`` (when present) must
+   be one of ``{'project', 'factory'}``, and ``'factory'`` requires
+   ``kind='predicate'``. An unresolvable dark-factory root is a rejection.
 4b. ``before_done``'s key set is closed to ``BeforeDone``'s declared fields.
    An unknown key is refused with ``error_type='UnsupportedTaskMetadata'``,
    naming the running capabilities, so a client meeting an older server
@@ -80,7 +80,13 @@ from pathlib import Path
 from typing import Any, assert_never, get_args
 
 from pydantic import ValidationError
-from shared.before_done_paths import ScriptRootRefused, resolve_script_base
+from shared.before_done_paths import (
+    CwdRefused,
+    ScriptRootRefused,
+    before_done_cwd,
+    resolve_before_done_paths,
+    resolve_script_base,
+)
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     RECHECK_SECS_MIN,
@@ -635,6 +641,17 @@ def _validate_before_done(
         )
 
     try:
+        before_done_cwd(before_done)
+    except CwdRefused as exc:
+        return _validation_error(
+            str(exc),
+            hint=(
+                "Omit 'cwd' to run the script from project_root, or set it to a "
+                'directory path; a relative cwd joins project_root.'
+            ),
+        )
+
+    try:
         base = resolve_script_base(before_done, Path(project_root), factory_root_resolver)
     except ScriptRootRefused as exc:
         return _validation_error(
@@ -654,7 +671,11 @@ def _validate_before_done(
             ),
         )
     where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
-    err = _validate_script_under(script, base.resolve(), where)
+    script_base = base.resolve()
+    script_path = resolve_before_done_paths(
+        before_done, Path(project_root).resolve(), script_base=script_base,
+    ).script
+    err = _validate_script_under(script, script_path, script_base, where)
     if err is not None:
         return err
 
@@ -695,12 +716,14 @@ def _validate_before_done(
     return None
 
 
-def _validate_script_under(script: str, base: Path, where: str) -> dict[str, Any] | None:
-    """Containment, existence and executable checks for *script* under *base*.
+def _validate_script_under(
+    script: str, script_path: Path, base: Path, where: str,
+) -> dict[str, Any] | None:
+    """Containment, existence and executable checks for the resolved *script_path* under *base*.
 
-    *where* names *base* in the diagnostics.
+    *script* is the submitted value the diagnostics quote; *where* names *base*.
     """
-    resolved_script = (base / script).resolve()
+    resolved_script = script_path.resolve()
 
     # Path containment: reject ../ escapes
     try:
