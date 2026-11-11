@@ -134,6 +134,13 @@ def test_local_gate_identity_pairs_the_sha_with_this_process_fingerprint():
     assert identity == GateIdentity('1' * 40, wire_fingerprint(wire_classes()))
 
 
+def _component_types(tp: object) -> list[object]:
+    """*tp*'s origin and arguments, with a Callable's parameter list flattened."""
+    origin = typing.get_origin(tp)
+    args = [a for arg in typing.get_args(tp) for a in (arg if isinstance(arg, list) else [arg])]
+    return args if origin is None else [origin, *args]
+
+
 def _nested_dataclasses(cls: type) -> dict[str, frozenset[type]]:
     hints = typing.get_type_hints(cls)
     nested: dict[str, frozenset[type]] = {}
@@ -145,7 +152,7 @@ def _nested_dataclasses(cls: type) -> dict[str, frozenset[type]]:
             if isinstance(tp, type) and dataclasses.is_dataclass(tp):
                 found.add(tp)
             else:
-                stack.extend(typing.get_args(tp))
+                stack.extend(_component_types(tp))
         if found:
             nested[f.name] = frozenset(found)
     return nested
@@ -161,6 +168,24 @@ def test_nested_dataclass_walk_sees_through_optional_tuple_and_mapping():
         ('plain', str),
     )
     assert _nested_dataclasses(outer) == {'maybe': {inner}, 'many': {inner}, 'by_id': {inner}}
+
+
+_T = typing.TypeVar('_T')
+
+
+@dataclass
+class _Box(typing.Generic[_T]):
+    x: _T
+
+
+def test_nested_dataclass_walk_sees_a_generic_dataclass_and_a_callable_parameter():
+    inner = _one_class('Inner', ('x', int))
+    outer = _one_class(
+        'Outer',
+        ('parameterised', _Box[int]),
+        ('hook', Callable[[inner], None]),
+    )
+    assert _nested_dataclasses(outer) == {'parameterised': {_Box}, 'hook': {inner}}
 
 
 def test_every_dataclass_nested_in_a_wire_class_is_a_wire_class():

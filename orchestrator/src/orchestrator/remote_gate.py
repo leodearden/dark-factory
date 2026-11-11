@@ -143,7 +143,7 @@ def wire_classes() -> tuple[type, ...]:
     """The dataclasses whose shape crosses the dispatcher/remote boundary.
 
     Every dataclass nested in a listed class's fields is listed too, pinned by
-    tests/test_remote_gate.py::test_every_dataclass_nested_in_a_wire_class_is_a_wire_class.
+    orchestrator/tests/test_remote_gate.py::test_every_dataclass_nested_in_a_wire_class_is_a_wire_class.
     """
     from orchestrator.flake_ledger import FailureEvidence, FlakeSuppression
     from orchestrator.task_verify_spec import TaskVerifySpec
