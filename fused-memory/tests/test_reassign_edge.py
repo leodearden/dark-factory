@@ -3,7 +3,8 @@
 reassign_edge re-points ONE existing RELATES_TO edge's endpoint (source or
 target) to a different Entity node, LOSSLESSLY — preserving the edge uuid,
 fact text, fact_embedding, valid_at/invalid_at/expired_at, created_at,
-group_id, and episode links — then refreshes the two affected node summaries.
+group_id, episode links and any superseded_edge_uuid merge stamp — then
+refreshes the two affected node summaries.
 It is the single-edge, uuid-targeted sibling of redirect_node_edges (the
 bulk merge-time endpoint mover).
 
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _falkor_plans import anchors_on_a_labelled_node, match_pattern
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _fm_helpers import (
     extract_cypher,
@@ -148,7 +150,7 @@ class TestReassignEdgeBackendMove:
 
     _COPIED_PROPS = (
         'name', 'fact', 'fact_embedding', 'valid_at', 'invalid_at',
-        'expired_at', 'created_at', 'group_id', 'episodes',
+        'expired_at', 'created_at', 'group_id', 'episodes', 'superseded_edge_uuid',
     )
 
     @staticmethod
@@ -203,8 +205,10 @@ class TestReassignEdgeBackendMove:
         # UNCHANGED endpoint pinned from TOPOLOGY node, NOT the old property.
         assert 'new.target_node_uuid = target.uuid' in cypher
         assert 'old.target_node_uuid' not in cypher
-        # Audit trail + old edge removed.
-        assert 'new.reassigned_from_node_uuid' in cypher
+        # An existing merge stamp is carried, never re-stamped with the kept uuid.
+        assert 'new.superseded_edge_uuid = old.uuid' not in cypher
+        # Audit trail records the last hop + old edge removed.
+        assert 'new.reassigned_from_node_uuid = $old_endpoint_uuid' in cypher
         assert 'DELETE old' in cypher
         # Params carry the edge, the new endpoint, and the audit source.
         assert params.get('edge_uuid') == 'edge-uuid'
@@ -240,7 +244,8 @@ class TestReassignEdgeBackendMove:
         assert 'new.target_node_uuid = $new_endpoint_uuid' in cypher
         assert 'new.source_node_uuid = source.uuid' in cypher
         assert 'old.source_node_uuid' not in cypher
-        assert 'new.reassigned_from_node_uuid' in cypher
+        assert 'new.superseded_edge_uuid = old.uuid' not in cypher
+        assert 'new.reassigned_from_node_uuid = $old_endpoint_uuid' in cypher
         assert 'DELETE old' in cypher
         assert params.get('old_endpoint_uuid') == 'tgt-uuid'
         assert params.get('new_endpoint_uuid') == 'new-tgt-uuid'
@@ -378,6 +383,31 @@ class TestReassignEdgePostMove:
         assert 'new-src-uuid' in result['refreshed_nodes']
 
 
+class TestReassignEdgeEndpointRead:
+    """The topology read seeks the edge by its uuid index and binds both
+    endpoints from it, rather than scanning a node label first."""
+
+    @pytest.mark.asyncio
+    async def test_seeks_the_edge_index_with_no_labelled_anchor(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire_topology_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        await backend.reassign_edge(
+            'edge-uuid', 'new-src-uuid', which_end='source', group_id='test',
+        )
+
+        (read,) = [c for c in graph.ro_query.call_args_list if 'RELATES_TO' in extract_cypher(c)]
+        cypher = extract_cypher(read)
+        pattern = match_pattern(cypher)
+        assert '[e:RELATES_TO {uuid: $edge_uuid}]' in pattern
+        assert not anchors_on_a_labelled_node(pattern), cypher
+        assert extract_params(read) == {'edge_uuid': 'edge-uuid'}
+
+
 # ---------------------------------------------------------------------------
 # Live-FalkorDB integration harness (mirrors test_merge_entities.py's
 # merge_entities_live_graph fixture)
@@ -429,17 +459,18 @@ class TestReassignEdgeLiveFalkorDB:
         await graph.query(f'CREATE {parts}')
 
     @staticmethod
-    async def _seed_edge(graph, src, dst, edge_uuid):
+    async def _seed_edge(graph, src, dst, edge_uuid, *, superseded_edge_uuid: str | None = None):
+        stamp = ', e.superseded_edge_uuid = $superseded_edge_uuid' if superseded_edge_uuid else ''
         await graph.query(
             'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
             'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact, '
             'valid_at: $valid_at, invalid_at: $invalid_at, episodes: $episodes}]->(b) '
-            'SET e.fact_embedding = vecf32($embedding)',
+            f'SET e.fact_embedding = vecf32($embedding){stamp}',
             {
                 'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel',
                 'fact': 'A relates to B', 'valid_at': '2026-01-01T00:00:00Z',
                 'invalid_at': '2026-06-01T00:00:00Z', 'episodes': ['ep1', 'ep2'],
-                'embedding': [1.0, 2.0, 3.0],
+                'embedding': [1.0, 2.0, 3.0], 'superseded_edge_uuid': superseded_edge_uuid,
             },
         )
 
@@ -449,7 +480,7 @@ class TestReassignEdgeLiveFalkorDB:
     ):
         graph_name, graph = reassign_edge_live_graph
         await self._seed_nodes(graph, ['A', 'B', 'C'])
-        await self._seed_edge(graph, 'A', 'B', 'e1')
+        await self._seed_edge(graph, 'A', 'B', 'e1', superseded_edge_uuid='pre-merge-edge')
 
         backend = GraphitiBackend(mock_config)
         backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
@@ -461,16 +492,19 @@ class TestReassignEdgeLiveFalkorDB:
             moved = await graph.query(
                 "MATCH (c:Entity {uuid: 'C'})-[e:RELATES_TO {uuid: 'e1'}]->(b:Entity {uuid: 'B'}) "
                 'RETURN e.fact, e.valid_at, e.invalid_at, e.episodes, e.fact_embedding, '
-                'e.reassigned_from_node_uuid'
+                'e.reassigned_from_node_uuid, e.superseded_edge_uuid'
             )
             assert len(moved.result_set) == 1
-            fact, valid_at, invalid_at, episodes, embedding, reassigned_from = moved.result_set[0]
+            (
+                fact, valid_at, invalid_at, episodes, embedding, reassigned_from, stamp,
+            ) = moved.result_set[0]
             assert fact == 'A relates to B'
             assert valid_at == '2026-01-01T00:00:00Z'
             assert invalid_at == '2026-06-01T00:00:00Z'
             assert list(episodes) == ['ep1', 'ep2']
             assert list(embedding) == pytest.approx([1.0, 2.0, 3.0])
             assert reassigned_from == 'A'  # audit trail
+            assert stamp == 'pre-merge-edge'  # merge lineage carried
 
             # A no longer connected via e1.
             a_gone = await graph.query(
@@ -492,7 +526,7 @@ class TestReassignEdgeLiveFalkorDB:
     ):
         graph_name, graph = reassign_edge_live_graph
         await self._seed_nodes(graph, ['A', 'B', 'C'])
-        await self._seed_edge(graph, 'A', 'B', 'e2')
+        await self._seed_edge(graph, 'A', 'B', 'e2', superseded_edge_uuid='pre-merge-edge')
 
         backend = GraphitiBackend(mock_config)
         backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
@@ -504,16 +538,19 @@ class TestReassignEdgeLiveFalkorDB:
             moved = await graph.query(
                 "MATCH (a:Entity {uuid: 'A'})-[e:RELATES_TO {uuid: 'e2'}]->(c:Entity {uuid: 'C'}) "
                 'RETURN e.fact, e.valid_at, e.invalid_at, e.episodes, e.fact_embedding, '
-                'e.reassigned_from_node_uuid'
+                'e.reassigned_from_node_uuid, e.superseded_edge_uuid'
             )
             assert len(moved.result_set) == 1
-            fact, valid_at, invalid_at, episodes, embedding, reassigned_from = moved.result_set[0]
+            (
+                fact, valid_at, invalid_at, episodes, embedding, reassigned_from, stamp,
+            ) = moved.result_set[0]
             assert fact == 'A relates to B'
             assert valid_at == '2026-01-01T00:00:00Z'
             assert invalid_at == '2026-06-01T00:00:00Z'
             assert list(episodes) == ['ep1', 'ep2']
             assert list(embedding) == pytest.approx([1.0, 2.0, 3.0])
             assert reassigned_from == 'B'  # audit trail (old target)
+            assert stamp == 'pre-merge-edge'  # merge lineage carried
 
             # B no longer the target via e2.
             b_gone = await graph.query(
@@ -526,6 +563,94 @@ class TestReassignEdgeLiveFalkorDB:
                 "MATCH ()-[e:RELATES_TO {uuid: 'e2'}]->() RETURN count(e)"
             )
             assert dup.result_set[0][0] == 1
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_successive_moves_carry_stamp_and_record_last_hop(
+        self, mock_config, reassign_edge_live_graph,
+    ):
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['A', 'B', 'C', 'D'])
+        await self._seed_edge(graph, 'A', 'B', 'e3', superseded_edge_uuid='pre-merge-edge')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            await backend.reassign_edge('e3', 'C', which_end='source', group_id=graph_name)
+            await backend.reassign_edge('e3', 'D', which_end='source', group_id=graph_name)
+
+            moved = await graph.query(
+                "MATCH (d:Entity {uuid: 'D'})-[e:RELATES_TO {uuid: 'e3'}]->(b:Entity {uuid: 'B'}) "
+                'RETURN e.reassigned_from_node_uuid, e.superseded_edge_uuid'
+            )
+            assert moved.result_set == [['C', 'pre-merge-edge']]
+
+            dup = await graph.query(
+                "MATCH ()-[e:RELATES_TO {uuid: 'e3'}]->() RETURN count(e)"
+            )
+            assert dup.result_set[0][0] == 1
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_unstamped_edge_stays_unstamped(
+        self, mock_config, reassign_edge_live_graph,
+    ):
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['A', 'B', 'C'])
+        await self._seed_edge(graph, 'A', 'B', 'e4')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            await backend.reassign_edge('e4', 'C', which_end='source', group_id=graph_name)
+
+            moved = await graph.query(
+                "MATCH (c:Entity {uuid: 'C'})-[e:RELATES_TO {uuid: 'e4'}]->(b:Entity {uuid: 'B'}) "
+                'RETURN e.superseded_edge_uuid'
+            )
+            assert moved.result_set == [[None]]
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('src', 'dst', 'entity_end'),
+        [
+            pytest.param('X', 'B', 'target', id='off-label-start'),
+            pytest.param('A', 'X', 'source', id='off-label-end'),
+        ],
+    )
+    async def test_off_label_endpoint_edge_is_not_found(
+        self, mock_config, reassign_edge_live_graph, src, dst, entity_end,
+    ):
+        """Both endpoints must be :Entity, as before the read stopped anchoring on them.
+
+        X is the off-label endpoint; the move targets the :Entity end, so only
+        the off-label side can hide the edge.
+        """
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['A', 'B', 'C'])
+        await graph.query("CREATE (:CanaryEndpoint {uuid: 'X'})")
+        await graph.query(
+            'MATCH (s {uuid: $src}), (t {uuid: $dst}) '
+            "CREATE (s)-[:RELATES_TO {uuid: 'e-off', name: 'rel', fact: 'off-label'}]->(t)",
+            {'src': src, 'dst': dst},
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with pytest.raises(EdgeNotFoundError):
+                await backend.reassign_edge(
+                    'e-off', 'C', which_end=entity_end, group_id=graph_name,
+                )
+
+            untouched = await graph.query(
+                "MATCH (s)-[e:RELATES_TO {uuid: 'e-off'}]->(t) RETURN s.uuid, t.uuid"
+            )
+            assert untouched.result_set == [[src, dst]]
         finally:
             await backend.close()
 
