@@ -71,6 +71,7 @@ class Closure(enum.StrEnum):
     OPEN = 'open'
     STEWARD_OR_OTHER = 'steward_or_other'
     REAPER_PROMOTION = 'reaper_promotion'
+    OTHER_PROMOTION = 'other_promotion'
     REAPER_DISMISSAL = 'reaper_dismissal'
     STARTUP_STRAND = 'startup_strand'
     STARTUP_DISMISSAL = 'startup_dismissal'
@@ -89,6 +90,8 @@ def classify_closure(
         return Closure.REAPER_PROMOTION if text.startswith(PROMOTION_PREFIX) else Closure.REAPER_DISMISSAL
     if resolved_by == AUTO_DISMISS_RESOLVER:
         return Closure.STARTUP_DISMISSAL if text.startswith(RESTART_PREFIX) else Closure.WORKFLOW_AUTO_DISMISSAL
+    if text.startswith(PROMOTION_PREFIX):
+        return Closure.OTHER_PROMOTION
     return Closure.STEWARD_OR_OTHER
 
 
@@ -275,6 +278,7 @@ class WindowCounts:
     filed: int
     reaper_promotions: int
     stale_strands: int
+    other_promotions: int
     reaper_dismissals: int
     reaper_wrong: int
     startup_dismissals: int
@@ -299,9 +303,8 @@ class WindowCounts:
         }
 
 
-def count_window(records: Sequence[Record], *, start: datetime, end: datetime) -> WindowCounts:
-    """Counted blocking L0s filed in [start, end); followers are looked up across every record."""
-    followers = index_followers(records)
+def count_window(records: Sequence[Record], followers: FollowerIndex, *, start: datetime, end: datetime) -> WindowCounts:
+    """Counted blocking L0s filed in [start, end); followers index every record, not just this window's."""
     counted = [record for record in records if record.is_counted_l0 and start <= record.filed_at < end]
 
     def closed_as(*closures: Closure) -> list[Record]:
@@ -317,6 +320,7 @@ def count_window(records: Sequence[Record], *, start: datetime, end: datetime) -
         filed=len(counted),
         reaper_promotions=len(closed_as(Closure.REAPER_PROMOTION)),
         stale_strands=len(closed_as(Closure.STARTUP_STRAND)),
+        other_promotions=len(closed_as(Closure.OTHER_PROMOTION)),
         reaper_dismissals=len(reaper_dismissals),
         reaper_wrong=wrong(reaper_dismissals),
         startup_dismissals=len(startup_dismissals),
@@ -349,11 +353,12 @@ def measure(records: Sequence[Record], *, now: datetime, window_days: int, max_p
     post_start = now - timedelta(days=window_days)
     pre_start = post_start - timedelta(days=window_days)
     max_pending_age = timedelta(hours=max_pending_hours)
+    followers = index_followers(records)
     return Report(
         window_days=window_days,
         max_pending_hours=max_pending_hours,
-        pre=count_window(records, start=pre_start, end=post_start),
-        post=count_window(records, start=post_start, end=UNBOUNDED),
+        pre=count_window(records, followers, start=pre_start, end=post_start),
+        post=count_window(records, followers, start=post_start, end=UNBOUNDED),
         pending_over_h=sum(
             1
             for record in records
@@ -374,7 +379,6 @@ class Thresholds:
     ratio: float
     min_stranded: int
     max_reaper_wrong: int
-    max_pending_hours: float
 
 
 def stranded_bar_per_100(report: Report, thresholds: Thresholds) -> float:
@@ -420,6 +424,7 @@ def _window_lines(label: str, counts: WindowCounts) -> list[str]:
         f'({counts.reaper_promotions} reaper promotions + {counts.stale_strands} stale-strand) '
         f'= {_shown_rate(counts.stranded_per_100)}',
         f'  reaper dismissals {counts.reaper_dismissals}, wrong {counts.reaper_wrong}',
+        f'  promotions by other resolvers {counts.other_promotions} (reported, not judged)',
         f'  startup dismissals {counts.startup_dismissals}, wrong {counts.startup_wrong} (reported, not judged)',
         f'  workflow auto-dismissals {counts.workflow_auto_dismissals}, '
         f'wrong {counts.workflow_auto_wrong} (reported, not judged)',
@@ -450,7 +455,7 @@ def breach_line(breach: Breach, report: Report, thresholds: Thresholds) -> str:
         case Breach.REAPER_WRONG:
             measured = f'post reaper_wrong {post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
         case Breach.PENDING_OVER_H:
-            measured = f'{report.pending_over_h} blocking L0s pending longer than {thresholds.max_pending_hours:g}h'
+            measured = f'{report.pending_over_h} blocking L0s pending longer than {report.max_pending_hours:g}h'
     return f'breach: {breach}: {measured}'
 
 
@@ -486,14 +491,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ratio=args.ratio,
         min_stranded=args.min_stranded,
         max_reaper_wrong=args.max_reaper_wrong,
-        max_pending_hours=args.max_pending_hours,
     )
     try:
         report = measure_queue(
             args.queue_dir,
             now=datetime.now(UTC),
             window_days=args.window_days,
-            max_pending_hours=thresholds.max_pending_hours,
+            max_pending_hours=args.max_pending_hours,
         )
     except CannotJudge as exc:
         print(f'{exc.headline}: {exc.path} ({exc.reason})')

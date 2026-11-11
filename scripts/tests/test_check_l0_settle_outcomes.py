@@ -46,6 +46,12 @@ REAPER_DISMISSAL = (
     '(task_id={task_id}, category=design_concern, covering=esc-{task_id}-90)',
     None,
 )
+ARCHITECT_PROMOTION = (
+    'dismissed',
+    'orchestrator-workflow',
+    'Auto-promoted to level 1 as esc-{task_id}-91 — architect filed it in lieu of a plan',
+    None,
+)
 WORKFLOW_DISMISSAL = (
     'dismissed',
     'auto-dismissed',
@@ -182,6 +188,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
         build.closed('20', build.ago(days=11), WORKFLOW_DISMISSAL, late=True),
         build.pending('21', build.ago(hours=30)),
         build.closed('22', dismissed_then_l2, REAPER_DISMISSAL),
+        build.closed('24', build.ago(days=13), ARCHITECT_PROMOTION),
     ]
     excluded += [
         build.closed('30', build.ago(days=3), PROMOTION, severity='info'),
@@ -231,6 +238,7 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'filed': post_filed,
         'reaper_promotions': 2,
         'stale_strands': 1,
+        'other_promotions': 1,
         'stranded': 3,
         'stranded_per_100': rate(3, post_filed),
         'reaper_dismissals': 5,
@@ -244,6 +252,7 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'filed': pre_filed,
         'reaper_promotions': 1,
         'stale_strands': 0,
+        'other_promotions': 0,
         'stranded': 1,
         'stranded_per_100': rate(1, pre_filed),
         'reaper_dismissals': 0,
