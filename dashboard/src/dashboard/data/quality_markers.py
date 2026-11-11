@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -26,8 +27,11 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import yaml
+from shared.project_id import fold_project_token
 from shared.quality_series.landings import parse_utc
 from shared.quality_series.stats import RegimeEvent
+
+from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +85,7 @@ markers annotate the snapshot series, not landings."""
 
 class MarkerInvariant(StrEnum):
     NON_EMPTY_ID = 'non_empty_id'
+    PROMPT_COVERAGE = 'prompt_coverage'
     AWARE_INSTANT = 'aware_instant'
     ARTEFACT_RANGE = 'artefact_range'
     UNTIL_ONLY_ON_ARTEFACT = 'until_only_on_artefact'
@@ -727,6 +732,11 @@ class AvailabilityFlag:
     decisions: int
     model: str
 
+    def to_wire(self) -> dict[str, object]:
+        return {'role': self.role, 'from_at': _iso_utc(self.from_at),
+                'until_at': _iso_utc(self.until_at), 'decisions': self.decisions,
+                'model': self.model}
+
 
 def routing_markers(fold: RoutingFold, changes: Iterable[ConfigChange]) -> list[Marker]:
     """The de-noised routing changes of *fold*'s project, sorted by (at, id)."""
@@ -1056,3 +1066,180 @@ def derived_markers(
     """The full derivation from nothing: one complete fold of *runs_db*, then :func:`derive`."""
     fold = fold_routing_decisions(runs_db, RoutingFold.empty(project_id), batch=None)
     return list(derive(fold, runs_db, snapshots).markers)
+
+
+class AxisLanding(NamedTuple):
+    ordinal: int
+    landed_at: datetime
+
+
+def resolve_ordinals(markers: Iterable[Marker], axis: Sequence[AxisLanding]) -> list[Marker]:
+    """Each marker placed on *axis* (landings in ordinal order), as new markers.
+
+    ``ordinal`` is the first landing at or after ``at`` (None past the newest); an artefact's
+    ``until_ordinal`` is the last landing at or before ``until``, None when no landing falls in
+    its range. The placement is shared/src/shared/quality_series/stats.py::regime_segments's,
+    so a served range covers exactly the landings the statistics exclude.
+    """
+    landed_at = [landing.landed_at for landing in axis]
+    placed = []
+    for marker in markers:
+        start = bisect_left(landed_at, marker.at)
+        end = start if marker.until is None else bisect_right(landed_at, marker.until)
+        placed.append(replace(
+            marker,
+            ordinal=axis[start].ordinal if start < len(axis) else None,
+            until_ordinal=axis[end - 1].ordinal if end > start else None,
+        ))
+    return placed
+
+
+def in_scope(marker: Marker, project_id: str) -> bool:
+    """A fleet marker, or one whose project folds to *project_id* in any spelling."""
+    return marker.scope is None or fold_project_token(marker.scope) == fold_project_token(project_id)
+
+
+class CoverageState(StrEnum):
+    WRITTEN = 'written'
+    NOT_YET_WRITTEN = 'not_yet_written'
+
+
+@dataclass(frozen=True)
+class PromptCoverage:
+    """Whether prompt changes are derivable yet (decision 10), and how stale the curated ones are.
+
+    Written: ``digest_since`` is the first routing decision carrying a prompt digest. Not yet
+    written: ``roles_py_landings`` is the count of roles.py landings since ``counted_since`` (the
+    last curated prompt marker, else the first routing decision), or ``reason`` says why there
+    is no count.
+    """
+
+    digest_since: datetime | None
+    roles_py_landings: int | None
+    counted_since: datetime | None
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        _require(self._consistent(), MarkerInvariant.PROMPT_COVERAGE,
+                 digest_since=self.digest_since, roles_py_landings=self.roles_py_landings,
+                 counted_since=self.counted_since, reason=self.reason)
+
+    def _consistent(self) -> bool:
+        counted = self.roles_py_landings is not None
+        if self.digest_since is not None:
+            return not counted and self.counted_since is None and self.reason is None
+        if counted:
+            return (self.roles_py_landings is not None and self.roles_py_landings >= 0
+                    and self.counted_since is not None and self.reason is None)
+        return self.counted_since is None and bool(self.reason)
+
+    @property
+    def state(self) -> CoverageState:
+        return CoverageState.WRITTEN if self.digest_since is not None else CoverageState.NOT_YET_WRITTEN
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'state': self.state.value,
+            'since': None if self.digest_since is None else _iso_utc(self.digest_since),
+            'roles_py_landings': self.roles_py_landings,
+            'counted_since': None if self.counted_since is None else _iso_utc(self.counted_since),
+            'reason': self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class DerivedState:
+    """One project's stored derivation: its routing fold and what was derived from it, and when."""
+
+    fold: RoutingFold
+    markers: tuple[Marker, ...]
+    skipped: int
+    prompt_coverage: PromptCoverage
+    refreshed_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredMarkerState:
+    """The newest good derivation, if any, and the newest attempt; ``failure`` set when it failed."""
+
+    derived: DerivedState | None
+    attempted_at: datetime | None
+    failure: str | None
+
+
+@dataclass(frozen=True)
+class MarkerStream:
+    """What QUALITY_MARKERS serves for one project."""
+
+    project_id: str
+    markers: tuple[Marker, ...]
+    availability: tuple[AvailabilityFlag, ...]
+    prompt_coverage: PromptCoverage
+    curated_parse_failures: int
+    skipped_records: int
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'markers': [marker.to_wire() for marker in self.markers],
+            'availability': [flag.to_wire() for flag in self.availability],
+            'prompt_coverage': self.prompt_coverage.to_wire(),
+            'curated_parse_failures': self.curated_parse_failures,
+            'skipped_records': self.skipped_records,
+        }
+
+    def regime_events(self) -> tuple[RegimeEvent, ...]:
+        """The markers the landing-axis statistics read: boundaries and exclusion ranges."""
+        return tuple(event for marker in self.markers if (event := marker.regime_event()) is not None)
+
+
+def marker_stream(
+    project_id: str, derived: DerivedState, curated: CuratedMarkers, axis: Sequence[AxisLanding],
+) -> MarkerStream:
+    """The project's derived markers plus the curated ones in its scope, placed on its axis."""
+    chosen = [*derived.markers, *(marker for marker in curated.markers if in_scope(marker, project_id))]
+    ordered = sorted(chosen, key=lambda marker: (marker.at, marker.marker_id))
+    return MarkerStream(
+        project_id=project_id,
+        markers=tuple(resolve_ordinals(ordered, axis)),
+        availability=tuple(availability_flags(derived.fold)),
+        prompt_coverage=derived.prompt_coverage,
+        curated_parse_failures=curated.parse_failures,
+        skipped_records=derived.fold.skipped + derived.skipped,
+    )
+
+
+def marker_datum(
+    project_id: str,
+    stored: StoredMarkerState | None,
+    curated: CuratedMarkers,
+    axis: Sequence[AxisLanding],
+    *,
+    now: datetime,
+    freshness_bound_seconds: int,
+) -> Datum[MarkerStream]:
+    """QUALITY_MARKERS for one project, as of its newest good derivation."""
+    derived = None if stored is None else stored.derived
+    if stored is None or derived is None:
+        failure = None if stored is None else stored.failure
+        reason = f'quality markers have not been derived for {project_id} yet'
+        if failure is not None:
+            reason += f'; the newest attempt failed: {failure}'
+        return unknown_datum(reason, freshness_bound_seconds)
+    stream = marker_stream(project_id, derived, curated, axis)
+    stale_reason = _stale_reason(stored, derived)
+    if stale_reason is not None:
+        return Datum(stream, derived.refreshed_at, DatumState.STALE, stale_reason,
+                     freshness_bound_seconds)
+    return aged_at(Datum(stream, derived.refreshed_at, DatumState.FRESH, None,
+                         freshness_bound_seconds), now)
+
+
+def _stale_reason(stored: StoredMarkerState, derived: DerivedState) -> str | None:
+    if stored.failure is not None:
+        attempted = 'unknown' if stored.attempted_at is None else _iso_utc(stored.attempted_at)
+        return (f'the newest marker refresh (at {attempted}) failed: {stored.failure}; serving '
+                f'the derivation of {_iso_utc(derived.refreshed_at)}')
+    if not derived.fold.complete:
+        return (f'the routing fold is incomplete: folded through event {derived.fold.cursor}, '
+                f'and later ticks continue it')
+    return None
