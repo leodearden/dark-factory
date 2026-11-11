@@ -3613,8 +3613,9 @@ class DriftDetector:
         AGREE → emit ``verify_env_parity_ok`` (None-safe).
         DIVERGE → emit ``verify_env_divergence`` + one deduped L1 escalation.
         INCONCLUSIVE → no event, no escalation.  When a runner raised
-        RunnerUnavailable its message is kept on ``unavailable_reason``; every
-        other INCONCLUSIVE carries None.
+        RunnerUnavailable its message is kept on ``unavailable_reason``, which
+        :meth:`check_env_safely` logs once at INFO; every other INCONCLUSIVE
+        carries None.
         INCONCLUSIVE covers every reason the check could not be TAKEN — no
         probes declared, no local runner, no eligible remote (including one
         the verdict path just quarantined), a remote that is not a
@@ -3853,18 +3854,27 @@ class DriftDetector:
         here — an ssh probe hanging up, a malformed argv, a bug in
         ``check_env``, its ValueError for a bad selection — is logged at
         WARNING with the traceback and swallowed rather than allowed to skip
-        ``check``.
+        ``check``.  An INCONCLUSIVE caused by RunnerUnavailable is logged once
+        at INFO with its ``unavailable_reason``.
         """
-        import logging
-
         try:
-            await self.check_env([(probe.key, list(probe.argv)) for probe in probes])
+            result = await self.check_env(
+                [(probe.key, list(probe.argv)) for probe in probes]
+            )
         except Exception:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 'Env drift check failed for task %s; ignoring (detective control)',
                 self._task_id,
                 exc_info=True,
             )
+        else:
+            if result.unavailable_reason is not None:
+                logger.info(
+                    'Env drift check inconclusive for task %s '
+                    '(runner unavailable, not an alarm): %s',
+                    self._task_id,
+                    result.unavailable_reason,
+                )
 
 
 def render_parity_report(report: VerdictParityReport) -> str:
