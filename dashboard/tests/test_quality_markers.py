@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -11,13 +12,16 @@ from pathlib import Path
 
 import pytest
 import yaml
-from _quality_fixture import append_events, routing_decision
+from _quality_fixture import append_events, config_reload, routing_decision
 from _runs_db_fixture import EventRow, write_runs_db
 from shared.quality_series.stats import RegimeEvent
 from shared.tasks_db_readonly import connect_ro
 
 from dashboard.data import quality_markers
 from dashboard.data.quality_markers import (
+    AvailabilityFlag,
+    ConfigChange,
+    ConfigChanges,
     CuratedMarkers,
     Marker,
     MarkerInvariant,
@@ -28,8 +32,11 @@ from dashboard.data.quality_markers import (
     RoutingStep,
     RuleSpan,
     SourceType,
+    availability_flags,
     fold_routing_decisions,
     load_curated_markers,
+    read_config_changes,
+    routing_markers,
 )
 from dashboard.data.quality_series import CATALOGUE
 
@@ -589,3 +596,279 @@ class TestRoutingFold:
         append_events(store, later_rows)
 
         assert _fold(store, before) == _fold(_runs(tmp_path, first_rows + later_rows, 'fresh'))
+
+
+def _at(text: str) -> datetime:
+    return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+class _Steps:
+    """Hand-built steps for one role, numbered in order; each lasts until the next begins."""
+
+    def __init__(self, role: str) -> None:
+        self.role = role
+        self.steps: list[RoutingStep] = []
+
+    def add(
+        self, first_at: str, decisions: int, *, layer: str = 'config', model: str = 'opus',
+        effort: str = 'high', budget_usd: float = 12.0, max_turns: int = 60,
+        digest: str | None = None,
+    ) -> _Steps:
+        event_id = 1000 * (len(self.steps) + 1) + len(self.role)
+        at = _at(first_at)
+        self.steps.append(RoutingStep(
+            role=self.role, first_event_id=event_id, first_at=at,
+            last_event_id=event_id + decisions - 1, last_at=at + timedelta(minutes=decisions),
+            decisions=decisions, source_layer=layer, model=model, effort=effort,
+            budget_usd=budget_usd, max_turns=max_turns, prompt_digest=digest,
+        ))
+        return self
+
+
+def _routing_fold(*roles: _Steps, newest_at: str, project_id: str = 'dark_factory') -> RoutingFold:
+    steps = tuple(sorted((step for role in roles for step in role.steps),
+                         key=lambda step: step.first_event_id))
+    return RoutingFold(
+        project_id=project_id, cursor=max(step.last_event_id for step in steps), steps=steps,
+        rules=(), first_at=min(step.first_at for step in steps), newest_at=_at(newest_at),
+        digest_since=None, skipped=0, complete=True,
+    )
+
+
+A = 'a' * 64
+LATER = '2026-10-05T00:00:00'
+
+
+def _reviewer_flip(first_xhigh: str) -> _Steps:
+    return (_Steps('reviewer_comprehensive')
+            .add('2026-08-17T13:24:00', 4588)
+            .add(first_xhigh, 121, effort='xhigh', max_turns=90))
+
+
+def _change(at: str, path: str, *, applied: bool = True, event_id: int = 1) -> ConfigChange:
+    return ConfigChange(event_id=event_id, at=_at(at), path=path, old='high', new='xhigh',
+                        applied=applied)
+
+
+class TestRoutingMarkers:
+    def test_row_7_the_reviewer_flip_is_one_effort_marker_at_its_first_dispatch(self) -> None:
+        fold = _routing_fold(_reviewer_flip('2026-11-01T08:58:42'), newest_at='2026-11-03T00:00:00')
+
+        (marker,) = routing_markers(fold, ())
+
+        assert marker.kind is MarkerKind.EFFORT
+        assert marker.at == _at('2026-11-01T08:58:42')
+        assert marker.source == MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive')
+        assert 'effort high -> xhigh' in marker.label
+        assert 'turns 60 -> 90' in marker.label
+        assert marker.label.startswith('reviewer_comprehensive')
+        assert marker.scope == 'dark_factory'
+        assert marker.series is None
+        assert marker.marker_id == f'routing:reviewer_comprehensive:{fold.steps[1].first_event_id}'
+        assert marker.ref == str(fold.steps[1].first_event_id)
+
+    def test_row_7_each_project_dates_its_own_flip(self) -> None:
+        fold = _routing_fold(_reviewer_flip('2026-11-01T10:37:33'),
+                             newest_at='2026-11-03T00:00:00', project_id='reify')
+
+        assert [(m.at, m.scope) for m in routing_markers(fold, ())] == [
+            (_at('2026-11-01T10:37:33'), 'reify'),
+        ]
+
+    def test_row_8_a_one_dispatch_fallback_is_an_availability_flag_not_a_change(self) -> None:
+        merger = (_Steps('merger')
+                  .add('2026-07-17T08:32:00', 31, effort='max', budget_usd=5.0, max_turns=50)
+                  .add('2026-09-12T00:14:00', 1, effort='max', budget_usd=8.0, max_turns=100)
+                  .add('2026-09-12T08:52:00', 15, model='fable', effort='max', budget_usd=8.0,
+                       max_turns=100)
+                  .add('2026-09-25T06:13:00', 37, model='fable', budget_usd=8.0, max_turns=100)
+                  .add('2026-10-27T13:46:00', 1, layer='role_default', budget_usd=8.0,
+                       max_turns=100)
+                  .add('2026-10-27T20:12:00', 6, model='fable', budget_usd=8.0, max_turns=100))
+        fold = _routing_fold(merger, newest_at='2026-11-01T00:00:00')
+
+        markers = routing_markers(fold, ())
+
+        assert [(m.at, m.kind) for m in markers] == [
+            (_at('2026-09-12T08:52:00'), MarkerKind.MODEL),
+            (_at('2026-09-25T06:13:00'), MarkerKind.EFFORT),
+        ]
+        assert availability_flags(fold) == [AvailabilityFlag(
+            role='merger', from_at=_at('2026-10-27T13:46:00'), until_at=_at('2026-10-27T20:12:00'),
+            decisions=1, model='opus',
+        )]
+
+    def test_an_unreturned_role_default_run_is_no_availability_flag(self) -> None:
+        merger = (_Steps('merger').add('2026-10-01T00:00:00', 30, model='fable')
+                  .add('2026-10-27T13:46:00', 1, layer='role_default'))
+
+        assert availability_flags(_routing_fold(merger, newest_at='2026-10-28T00:00:00')) == []
+
+    def test_the_reify_architect_flap_is_one_marker_at_the_settling_step(self) -> None:
+        architect = (_Steps('architect')
+                     .add('2026-07-16T15:08:00', 1067, effort='max', budget_usd=15.0, max_turns=120)
+                     .add('2026-08-19T11:03:00', 1465, effort='max', budget_usd=25.0, max_turns=180)
+                     .add('2026-09-24T07:32:00', 1, effort='xhigh', budget_usd=25.0, max_turns=180)
+                     .add('2026-09-24T07:44:00', 2, effort='max', budget_usd=25.0, max_turns=180)
+                     .add('2026-09-24T08:34:00', 1095, effort='xhigh', budget_usd=25.0,
+                          max_turns=180))
+        fold = _routing_fold(architect, newest_at='2026-11-01T00:00:00')
+
+        assert [(m.at, m.kind, m.label) for m in routing_markers(fold, ())] == [
+            (_at('2026-08-19T11:03:00'), MarkerKind.BUDGET,
+             'architect: budget 15 -> 25, turns 120 -> 180'),
+            (_at('2026-09-24T08:34:00'), MarkerKind.EFFORT, 'architect: effort max -> xhigh'),
+        ]
+
+    def test_a_step_of_fewer_than_three_decisions_is_dropped(self) -> None:
+        role = _Steps('merger').add('2026-10-01T00:00:00', 40).add('2026-10-02T00:00:00', 2,
+                                                                     effort='xhigh')
+
+        assert routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ()) == []
+
+    def test_a_short_step_followed_by_a_change_of_the_same_field_is_dropped(self) -> None:
+        role = (_Steps('debugger').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-02T00:00:00', 5, effort='xhigh')
+                .add('2026-10-02T02:00:00', 50, effort='max'))
+
+        assert [(m.at, m.label) for m in routing_markers(
+            _routing_fold(role, newest_at='2026-10-10T00:00:00'), ())] == [
+            (_at('2026-10-02T02:00:00'), 'debugger: effort high -> max'),
+        ]
+
+    def test_a_short_step_followed_by_another_fields_change_collapses_into_one_marker(self) -> None:
+        role = (_Steps('debugger').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-02T00:00:00', 3, effort='xhigh')
+                .add('2026-10-02T02:00:00', 50, effort='xhigh', max_turns=90))
+
+        assert [(m.at, m.kind, m.label) for m in routing_markers(
+            _routing_fold(role, newest_at='2026-10-10T00:00:00'), ())] == [
+            (_at('2026-10-02T00:00:00'), MarkerKind.EFFORT,
+             'debugger: effort high -> xhigh, turns 60 -> 90'),
+        ]
+
+    def test_counted_steps_within_a_day_of_the_first_collapse(self) -> None:
+        role = (_Steps('implementer').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-02T00:00:00', 3, effort='xhigh')
+                .add('2026-10-02T03:00:00', 3, effort='xhigh', max_turns=90)
+                .add('2026-10-02T06:00:00', 30, effort='xhigh', max_turns=90, budget_usd=20.0))
+
+        (marker,) = routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ())
+
+        assert marker.at == _at('2026-10-02T00:00:00')
+        assert marker.label == 'implementer: effort high -> xhigh, budget 12 -> 20, turns 60 -> 90'
+
+    def test_an_empty_diff_against_the_previous_counted_state_is_no_marker(self) -> None:
+        role = (_Steps('merger').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-05T00:00:00', 40, layer='role_default'))
+
+        assert routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ()) == []
+
+    @pytest.mark.parametrize(('second_step', 'kind'), [
+        (lambda role: role.add(LATER, 40, digest=A, model='fable', effort='xhigh'), MarkerKind.MODEL),
+        (lambda role: role.add(LATER, 40, digest='b' * 64, effort='xhigh'), MarkerKind.EFFORT),
+        (lambda role: role.add(LATER, 40, digest='b' * 64, budget_usd=20.0), MarkerKind.PROMPT),
+        (lambda role: role.add(LATER, 40, digest=A, budget_usd=20.0, max_turns=90),
+         MarkerKind.BUDGET),
+        (lambda role: role.add(LATER, 40, digest=A, max_turns=90), MarkerKind.TURNS),
+    ])
+    def test_kind_is_the_first_changed_field_by_precedence(
+        self, second_step: Callable[[_Steps], _Steps], kind: MarkerKind,
+    ) -> None:
+        role = second_step(_Steps('architect').add('2026-10-01T00:00:00', 40, digest=A))
+
+        (marker,) = routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ())
+
+        assert marker.kind is kind
+
+    def test_a_digest_first_written_is_no_prompt_marker(self) -> None:
+        role = (_Steps('architect').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-05T00:00:00', 40, digest='a' * 64))
+
+        assert routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ()) == []
+
+    def test_a_digest_change_folded_from_rows_is_a_prompt_marker(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            *(_decision(minute, 'architect') for minute in range(1, 4)),
+            *(_decision(minute, 'architect', digest='a' * 64) for minute in range(4, 7)),
+            *(_decision(minute, 'architect', digest='b' * 64) for minute in range(7, 10)),
+            _decision(60 * 30, 'merger'),
+        ])
+
+        (marker,) = routing_markers(_fold(store), ())
+
+        assert (marker.kind, marker.at) == (MarkerKind.PROMPT, _t(7))
+
+    def test_a_role_with_one_step_has_no_marker(self) -> None:
+        fold = _routing_fold(_Steps('merger').add('2026-10-01T00:00:00', 400),
+                             newest_at='2026-10-10T00:00:00')
+
+        assert routing_markers(fold, ()) == []
+
+
+class TestRoutingCause:
+    FIRST = '2026-11-01T08:58:42'
+
+    def _markers(self, *changes: ConfigChange) -> list[Marker]:
+        fold = _routing_fold(_reviewer_flip(self.FIRST), newest_at='2026-11-03T00:00:00')
+        return routing_markers(fold, changes)
+
+    def test_a_reload_of_a_changed_fields_path_within_48h_before_dates_the_marker(self) -> None:
+        (marker,) = self._markers(_change('2026-10-31T09:00:00', 'effort.reviewer'))
+
+        assert marker.at == _at('2026-10-31T09:00:00')
+        assert marker.source == MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive',
+                                             path='effort.reviewer')
+
+    def test_the_earliest_matching_change_wins_and_restart_required_counts(self) -> None:
+        (marker,) = self._markers(
+            _change('2026-11-01T07:00:00', 'effort.reviewer', event_id=2),
+            _change('2026-10-31T12:00:00', 'max_turns.reviewer', applied=False, event_id=1),
+        )
+
+        assert (marker.at, marker.source.path) == (_at('2026-10-31T12:00:00'), 'max_turns.reviewer')
+
+    @pytest.mark.parametrize('change', [
+        _change('2026-11-01T09:00:00', 'effort.reviewer'),
+        _change('2026-10-30T08:58:00', 'effort.reviewer'),
+        _change('2026-11-01T08:00:00', 'effort.architect'),
+        _change('2026-11-01T08:00:00', 'effort.reviewer_comprehensive'),
+        _change('2026-11-01T08:00:00', 'budgets.reviewer'),
+    ])
+    def test_a_late_early_or_unrelated_change_does_not_date_the_marker(
+        self, change: ConfigChange,
+    ) -> None:
+        (marker,) = self._markers(change)
+
+        assert marker.at == _at(self.FIRST)
+        assert marker.source.path is None
+
+    def test_a_non_reviewer_role_matches_its_own_config_key(self) -> None:
+        role = (_Steps('architect').add('2026-10-01T00:00:00', 40)
+                .add('2026-10-05T00:00:00', 40, model='fable'))
+        fold = _routing_fold(role, newest_at='2026-10-10T00:00:00')
+
+        (marker,) = routing_markers(fold, (_change('2026-10-04T23:00:00', 'models.architect'),))
+
+        assert marker.at == _at('2026-10-04T23:00:00')
+
+
+class TestConfigChanges:
+    def test_applied_and_restart_required_entries_become_changes(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            config_reload(_t(1), applied={'effort.reviewer': {'old': 'high', 'new': 'xhigh'}},
+                          restart_required={'max_concurrent_tasks': {'old': 4, 'new': 6}}),
+            (_t(2), None, 'config_reload', '{not json'),
+            config_reload(_t(3), applied={'review.reviewer_briefing': 'not a change'}),
+            _decision(4, 'merger'),
+        ])
+
+        with closing(connect_ro(store)) as conn:
+            changes = read_config_changes(conn)
+
+        assert changes == ConfigChanges(changes=(
+            ConfigChange(event_id=1, at=_t(1), path='effort.reviewer', old='high', new='xhigh',
+                         applied=True),
+            ConfigChange(event_id=1, at=_t(1), path='max_concurrent_tasks', old=4, new=6,
+                         applied=False),
+        ), skipped=2)
