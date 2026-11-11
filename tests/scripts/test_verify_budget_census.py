@@ -680,20 +680,23 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
         assert floor_line.split()[2] == '0', floor_line
         assert '<none>' not in floor_line
 
-    @pytest.mark.parametrize('module', sorted(module_budget_family.published_pairs()))
-    def test_a_sibling_guarded_module_cites_its_own_publisher(self, tmp_path, capsys, module):
-        """These modules' W lives in their own sibling guard, not in the gate's table.
-
-        Built without write_corpus, whose record name would nest on the slash
-        in 'tests/scripts'.
-        """
+    @staticmethod
+    def _write_sibling_corpus(tmp_path, module, worst):
+        """Built without write_corpus, whose record name would nest on the slash
+        in 'tests/scripts'."""
         write_module_yaml(tmp_path, module)
         record = write_worktree_record(
             tmp_path, '3353', f'attempt-1.{verify_budget_census.sanitise_prefix(module)}.summary.json',
         )
         record.write_text(
-            json.dumps(summary_payload(command_entry(duration_secs=500.0))), encoding='utf-8',
+            json.dumps(summary_payload(command_entry(duration_secs=worst))), encoding='utf-8',
         )
+
+    @pytest.mark.parametrize('module', sorted(module_budget_family.published_pairs()))
+    def test_a_sibling_guarded_module_cites_its_own_publisher(self, tmp_path, capsys, module):
+        """These modules' W lives in their own sibling guard, not in the gate's table."""
+        worst = 500.0
+        self._write_sibling_corpus(tmp_path, module, worst)
 
         _rc, out, _err = run_main(capsys, '--root', str(tmp_path), '--module', module, '--json')
         report = json.loads(out)
@@ -702,12 +705,24 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
         check = report['budget_check']
         feeds = check['feeds']
         assert check['rule'] == 'min_budget'
+        assert check['derived_floor'] == module_budget_family.min_budget(worst)
+        assert check['derived_floor'] != module_budget_family.census_budget_floor(worst)
         assert check['refusal_ceiling'] is None
         publisher = module_budget_family.published_pairs()[module]
         assert (REPO_ROOT / feeds['path']).resolve() == publisher.path.resolve()
         assert feeds['symbol'] == module_budget_family.WORST_NAME
         assert feeds['key'] is None
         assert 'MEASURED_MODULE_SUITE_WORST_SECS' not in self._section(tmp_path, capsys, module)
+
+    @pytest.mark.parametrize('module', sorted(module_budget_family.published_pairs()))
+    def test_a_sibling_guarded_floor_is_whatever_min_budget_returns(
+        self, tmp_path, capsys, monkeypatch, module,
+    ):
+        monkeypatch.setattr(module_budget_family, 'min_budget', lambda _worst: 4343)
+        self._write_sibling_corpus(tmp_path, module, 500.0)
+
+        assert self._check(tmp_path, capsys, module)['derived_floor'] == 4343
+        assert '4343' in self._section(tmp_path, capsys, module)
 
     def test_an_unreadable_ruled_table_derives_nothing_rather_than_guessing(
         self, tmp_path, capsys, monkeypatch,
