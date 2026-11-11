@@ -378,3 +378,86 @@ def test_executable_entry_point_end_to_end(settle_queue: SettleQueue) -> None:
 
     assert completed.stderr == ''
     assert_breached(completed.returncode, completed.stdout.splitlines(), settle.Breach.PENDING_OVER_H)
+
+
+def assert_unreadable(code: int, lines: Sequence[str], path: Path) -> None:
+    assert code == 2
+    assert str(path) in lines[-1]
+    assert REDESIGN_TEXT not in '\n'.join(lines)
+
+
+def test_missing_queue_dir_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    absent = tmp_path / 'absent'
+
+    assert_unreadable(*run_main(capsys, absent), absent)
+
+
+def test_queue_dir_is_a_file_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    not_a_dir = tmp_path / 'escalations'
+    not_a_dir.write_text('')
+
+    assert_unreadable(*run_main(capsys, not_a_dir), not_a_dir)
+
+
+def test_missing_archive_dir_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    build = FixtureQueue(tmp_path / 'escalations', datetime.now(UTC))
+    build.pending('21', build.ago(hours=2))
+
+    assert_unreadable(*run_main(capsys, build.queue_dir), build.queue_dir / 'archive')
+
+
+def test_corrupt_record_exits_2(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    corrupt = archive_dir_for_date(settle_queue.queue_dir, iso(datetime.now(UTC))) / 'esc-1-9.json'
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text('{not json')
+
+    assert_unreadable(*run_main(capsys, settle_queue.queue_dir), corrupt)
+
+
+def test_record_missing_required_key_exits_2(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    build = FixtureQueue(settle_queue.queue_dir, datetime.now(UTC))
+    keyless = build.closed('61', build.ago(days=2), STEWARD)
+    record = json.loads(keyless.read_text())
+    del record['timestamp']
+    keyless.write_text(json.dumps(record))
+
+    assert_unreadable(*run_main(capsys, settle_queue.queue_dir), keyless)
+
+
+def test_empty_post_window_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    build = FixtureQueue(tmp_path / 'escalations', datetime.now(UTC))
+    for n in range(3):
+        build.closed(str(40 + n), build.ago(days=15 + n), PROMOTION)
+
+    code, lines = run_main(capsys, build.queue_dir)
+
+    assert_unreadable(code, lines, build.queue_dir)
+    assert 'no blocking L0 filed in the last 14 days' in lines[-1]
+
+
+def test_non_record_files_are_ignored(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    queue_dir = settle_queue.queue_dir
+    _, before = run_main(capsys, queue_dir)
+    unreadable_if_read = '{not json'
+    (queue_dir / 'b3-state.json').write_text(unreadable_if_read)
+    (queue_dir / 'esc-1.seq').write_text('7')
+    (queue_dir / 'esc-1-1.json.lock').write_text('')
+    (queue_dir / 'archive' / 'esc-508-96.json').write_text(unreadable_if_read)
+    (queue_dir / 'archive' / 'not-a-date').mkdir()
+    (queue_dir / 'archive' / 'not-a-date' / 'x.json').write_text(unreadable_if_read)
+    write_record(
+        queue_dir,
+        id='esc-reconciliation-backlog-dark_factory-2026-11-10T225816_4098180000',
+        task_id=None,
+        agent_role='fused-memory',
+        severity='blocking',
+        category='infra_issue',
+        status='pending',
+        level=1,
+        timestamp=iso(datetime.now(UTC) - timedelta(days=1)),
+    )
+
+    code, after = run_main(capsys, queue_dir)
+
+    assert code == 0
+    assert trailing_json(after) == trailing_json(before)
