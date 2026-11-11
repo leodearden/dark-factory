@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 import aiosqlite
 from shared.project_id import project_id_for_root
@@ -37,7 +38,10 @@ __all__ = [
     'QUALITY_REV_LIST_TIMEOUT_SECONDS',
     'QUALITY_SAMPLE_INTERVAL_SECONDS',
     'collect_quality',
+    'describe_root_failure',
     'describe_unreadable',
+    'git_checkouts',
+    'run_in_root_threads',
 ]
 
 logger = logging.getLogger(__name__)
@@ -76,27 +80,36 @@ def _measure_root(
     return _RootMeasurement(tuple(rows), batch.git_check, len(batch.landings) - len(rows))
 
 
-async def _measure_all(
-    checkouts: Sequence[Path],
-    project_ids: Sequence[str],
-    resume: Sequence[str | None],
-    git_budget_s: float,
-    per_root_budget_s: float,
-) -> list[_RootMeasurement | BaseException]:
-    """Measure every root at once on threads of their own, so git never holds a request's thread.
+def git_checkouts(roots: Iterable[Path]) -> list[Path]:
+    """The roots that are git checkouts, in order: the only roots a quality tick reads."""
+    return [root for root in roots if (root / '.git').exists()]
 
-    A root that overruns *per_root_budget_s* is abandoned to finish on its own thread.
+
+_Result = TypeVar('_Result')
+
+
+async def run_in_root_threads(
+    work: Callable[..., _Result],
+    per_root_args: Sequence[tuple[object, ...]],
+    per_root_budget_s: float,
+    *,
+    thread_name_prefix: str,
+) -> list[_Result | BaseException]:
+    """``work(*args)`` for every root's args at once, each on a thread of its own, in order.
+
+    Neither git nor a runs.db scan ever holds a request's thread. A root that raises gets its
+    exception; one that overruns *per_root_budget_s* gets a TimeoutError and is abandoned to
+    finish on its own thread.
     """
+    if not per_root_args:
+        return []
     loop = asyncio.get_running_loop()
-    pool = ThreadPoolExecutor(max_workers=max(1, len(checkouts)), thread_name_prefix='quality')
+    pool = ThreadPoolExecutor(max_workers=len(per_root_args), thread_name_prefix=thread_name_prefix)
     try:
         return await asyncio.gather(
             *(
-                asyncio.wait_for(
-                    loop.run_in_executor(pool, _measure_root, root, pid, cursor, git_budget_s),
-                    timeout=per_root_budget_s,
-                )
-                for root, pid, cursor in zip(checkouts, project_ids, resume, strict=True)
+                asyncio.wait_for(loop.run_in_executor(pool, work, *args), timeout=per_root_budget_s)
+                for args in per_root_args
             ),
             return_exceptions=True,
         )
@@ -109,9 +122,10 @@ def describe_unreadable(exc: TaskDbUnreadable) -> str:
     return f'{type(exc).__name__}: {exc.path}: {exc.reason.value}'
 
 
-def _failure_reason(exc: BaseException, per_root_budget_s: float) -> str:
+def describe_root_failure(exc: BaseException, work: str, per_root_budget_s: float) -> str:
+    """Why one root's *work* produced nothing, for a run_in_root_threads failure."""
     if isinstance(exc, TimeoutError):
-        return f'quality sampling exceeded the {per_root_budget_s}s per-root budget'
+        return f'{work} exceeded the {per_root_budget_s}s per-root budget'
     if isinstance(exc, TaskDbUnreadable):
         return describe_unreadable(exc)
     return f'{type(exc).__name__}: {exc}'
@@ -127,7 +141,7 @@ async def _write_sample(
 ) -> None:
     if isinstance(result, BaseException):
         logger.warning('Quality sampling failed for %s', root, exc_info=result)
-        reason = _failure_reason(result, per_root_budget_s)
+        reason = describe_root_failure(result, 'quality sampling', per_root_budget_s)
         await insert_sample(conn, QualitySample.gap(project_id, now, reason))
         return
     await upsert_landing_rows(conn, result.rows, sampled_at=now)
@@ -174,13 +188,17 @@ async def collect_quality(
     """
     try:
         now_dt = resolve_now(now)
-        checkouts = [root for root in roots if (root / '.git').exists()]
+        checkouts = git_checkouts(roots)
         project_ids = [project_id_for_root(root) for root in checkouts]
         settled_by = now_dt - timedelta(seconds=DISPATCH_ROW_SETTLE_SECONDS)
         resume = [await stored_cursor(conn, pid, landed_by=settled_by) for pid in project_ids]
 
-        results = await _measure_all(
-            checkouts, project_ids, resume, git_budget_s, per_root_budget_s,
+        results: list[_RootMeasurement | BaseException] = await run_in_root_threads(
+            _measure_root,
+            [(root, pid, cursor, git_budget_s)
+             for root, pid, cursor in zip(checkouts, project_ids, resume, strict=True)],
+            per_root_budget_s,
+            thread_name_prefix='quality',
         )
 
         for root, pid, result in zip(checkouts, project_ids, results, strict=True):

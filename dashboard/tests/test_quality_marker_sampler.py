@@ -15,12 +15,18 @@ import aiosqlite
 import pytest
 from _quality_fixture import GitRepo, append_events, build_quality_project, routing_decision
 from _runs_db_fixture import EventRow, write_runs_db
-from dashboard.data.quality_marker_sampler import FACTORY_REPO, ROLES_PY, refresh_markers
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.config import DashboardConfig
+from dashboard.data.quality_marker_sampler import (
+    FACTORY_REPO,
+    MARKER_GIT_TIMEOUT_SECONDS,
+    MARKER_PER_ROOT_BUDGET_SECONDS,
+    ROLES_PY,
+    refresh_markers,
+)
 from dashboard.data.quality_markers import (
     CoverageState,
     DerivedState,
@@ -31,6 +37,10 @@ from dashboard.data.quality_markers import (
     StoredMarkerState,
     derived_markers,
     fold_routing_decisions,
+)
+from dashboard.data.quality_sampler import (
+    QUALITY_PER_ROOT_BUDGET_SECONDS,
+    QUALITY_SAMPLE_INTERVAL_SECONDS,
 )
 from dashboard.data.quality_store import read_marker_state
 from dashboard.loops import _quality_loop, _QualityStore
@@ -134,6 +144,12 @@ def test_the_factory_repo_is_this_checkout_and_carries_roles_py() -> None:
     assert ROLES_PY == ROLES
     assert (FACTORY_REPO / ROLES_PY).is_file()
     assert (FACTORY_REPO / '.git').exists()
+
+
+def test_the_marker_tick_fits_after_the_sample_tick_in_half_the_interval() -> None:
+    assert MARKER_GIT_TIMEOUT_SECONDS < MARKER_PER_ROOT_BUDGET_SECONDS
+    assert (QUALITY_PER_ROOT_BUDGET_SECONDS + MARKER_PER_ROOT_BUDGET_SECONDS
+            <= QUALITY_SAMPLE_INTERVAL_SECONDS / 2)
 
 
 async def test_the_first_tick_stores_the_fold_and_the_row_7_effort_marker(
