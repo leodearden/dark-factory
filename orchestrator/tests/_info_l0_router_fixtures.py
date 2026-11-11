@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from _curator_fake import FakeCurator
+from _merge_lane_fakes import lane_scene_config
 from _workflow_helpers import (
     AgentStub,
     FakeBriefing,
@@ -57,8 +58,12 @@ PASSED = VerifyResult(
 def run_config(
     project_root: Path, *, briefing: ReviewBriefing, router_enabled: bool,
 ) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=project_root,
+    return lane_scene_config(
+        project_root,
+        GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
         max_concurrent_tasks=1,
         max_execute_iterations=5,
         max_verify_attempts=3,
@@ -71,10 +76,6 @@ def run_config(
         unblock_auto=UnblockAutoConfig(enabled=False),
         info_l0_router_enabled=router_enabled,
         review=ReviewConfig(reviewer_briefing=briefing),
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/', remote='origin',
-            worktree_dir='.worktrees',
-        ),
         sandbox=SandboxConfig(enabled=False),
     )
 
