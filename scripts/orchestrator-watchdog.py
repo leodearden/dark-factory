@@ -11,14 +11,15 @@ covers BOTH failure modes:
   * **Wedged** (alive-but-hung): the unit is active but the port stopped
     answering — systemd Restart= won't fire. The watchdog forces a restart.
   * **Dead-but-enabled** (e.g. a boot-race dependency-cancel that systemd
-    never retries, or a unit that gave up after exhausting StartLimitBurst):
-    the unit is inactive. Pre-socket-activation this always meant the port
+    never retries): the unit is inactive. Pre-socket-activation this always meant the port
     wasn't listening either; under socket activation each unit's escalation
     port is held by a systemd ``.socket`` unit independent of the service, so
     a dead-but-enabled unit's port can still read LISTEN — see
     ``UNIT_DEAD_ACTIVE_STATES`` / ``_unit_active_state()``. Either way
     ``reset-failed`` + ``restart --no-block`` revives it. This is what
-    self-heals the 2026-05-27 powercut failure mode.
+    self-heals the 2026-05-27 powercut failure mode. A unit that exhausted
+    StartLimitBurst (Result=start-limit-hit) is instead left down and paged
+    (task 8270; OPERATIONS.md §8).
 
 restart_unit() deliberately never calls ``systemctl stop``: each socket-
 activated unit's ``ExecStopPost`` hook closes its socket only when the unit
@@ -62,7 +63,12 @@ from types import ModuleType
 
 # Flat siblings in scripts/, found because a directly executed script puts its
 # own directory at sys.path[0]; never run this file via `python -m` or `-I`.
-from _watchdog_crash_loop import UNKNOWN_RESTART_STATUS, UnitRestartStatus, crash_loop_pass
+from _watchdog_crash_loop import (
+    CRASH_LOOP_SENTINEL_PREFIX,
+    UNKNOWN_RESTART_STATUS,
+    UnitRestartStatus,
+    crash_loop_pass,
+)
 from _watchdog_dashboard_parity import print_unit_parity, unit_parity_pass
 from _watchdog_state import (
     atomic_write_json,
@@ -747,7 +753,9 @@ def restart_unit(unit: str) -> None:
       matters, against a unit that is not currently failed — it resets the
       start-rate-limit counter regardless of current state. A project whose
       *unit* has no matching ``.socket`` unit just makes that half of the
-      call exit non-zero (``check=False``), which is fine.
+      call exit non-zero (``check=False``), which is fine. main() never
+      reaches this for an orchestrator unit in start-limit-hit: it leaves that
+      unit down for a human (task 8270). fused_memory_liveness_pass still does.
     - ``restart --no-block`` re-launches *unit* without waiting for it to
       finish starting. A blocking ``restart`` on a ``Type=notify`` unit can
       take 45s+ to return, which is most of this oneshot watchdog's own 60s
@@ -1880,6 +1888,9 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
     One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
     sweep is currently restarting is skipped, because a unit mid-restart is
     indistinguishable from a dead one to either probe.
+
+    A unit whose *status* is start-limit-hit is never revived (task 8270):
+    systemd gave up on it, and crash_loop_pass has paged it for a human.
     """
     if not is_unit_enabled(unit):
         # Disabled (or unknown) — respect operator intent, skip silently.
@@ -1915,6 +1926,14 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
         # escalating to code=killed status=9/KILL.
         reason = f"escalation port {port} not listening"
 
+    if status.start_limit_hit:
+        log(
+            f"{unit} {reason}, but systemd reports Result=start-limit-hit; leaving "
+            f"it down for a human (crash-loop page {CRASH_LOOP_SENTINEL_PREFIX}{unit}); "
+            "not running reset-failed or restart"
+        )
+        return
+
     # The lease read is LAZY — it happens only HERE, after a dead
     # signal has already fired, so an all-healthy tick (the
     # overwhelmingly common case) costs zero extra I/O, and the
@@ -1933,9 +1952,9 @@ def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
             "is restarting this unit; skipping the liveness restart"
         )
         return
-    # Covers wedged-active, dead-enabled (boot-race cancelled, or
-    # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
-    # reset-failed + restart --no-block sequence revives every case.
+    # Covers wedged-active, dead-enabled (boot-race cancelled), and
+    # dead-but-socket-held: restart_unit's reset-failed + restart --no-block
+    # sequence revives every case.
     log(f"{unit} {reason}; restarting")
     restart_unit(unit)
     log(f"{unit} restart issued")
