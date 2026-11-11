@@ -604,7 +604,7 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
     """Task 7929: the section states the floor the budget gate enforces for --module.
 
     Only the modules in ``verify_budget_census_records.RULED_BUDGET_CENSUS`` are
-    held to D17's census floor. The gate holds every other module to
+    held to D17's census floor. The budget guards hold every other module to
     ``min_budget(W)``, so the section must derive that floor and cite where W lives.
     """
 
@@ -723,6 +723,20 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
 
         assert self._check(tmp_path, capsys, module)['derived_floor'] == 4343
         assert '4343' in self._section(tmp_path, capsys, module)
+
+    def test_only_the_unverified_gate_row_citation_says_it_is_unchecked(self, tmp_path, capsys):
+        """The ruled and sibling citations are resolved from what the census
+        imports; the gate-table row is not, so a module outside every table
+        (here an unregistered one with measured runs) cites a row that does not exist."""
+        write_corpus(tmp_path, command_entry(duration_secs=900.0), prefix='unregistered')
+        write_corpus(tmp_path, command_entry(duration_secs=4626.166946739017))
+        self._write_sibling_corpus(tmp_path, 'scripts', 500.0)
+
+        unregistered = self._check(tmp_path, capsys, 'unregistered')
+        assert unregistered['feeds']['key'] == 'unregistered'
+        assert 'not check' in unregistered['note']
+        for module in ('orchestrator', 'scripts'):
+            assert 'not check' not in self._check(tmp_path, capsys, module)['note'], module
 
     def test_an_unreadable_ruled_table_derives_nothing_rather_than_guessing(
         self, tmp_path, capsys, monkeypatch,

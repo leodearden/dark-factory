@@ -43,6 +43,7 @@ so.
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib
 import inspect
 import json
@@ -129,12 +130,13 @@ class Citation:
 
 @dataclass(frozen=True)
 class GateFloorRule:
-    """The floor rule the budget gate applies to one module."""
+    """The floor rule the budget guards apply to one module, and the report's note on it."""
 
     rule: FloorRule
     derive: Callable[[float], int]
     refusal_ceiling: int | None
     feeds: Citation
+    note_for: Callable[[int], str]
 
 
 @dataclass(frozen=True)
@@ -1425,10 +1427,16 @@ def _checkout_relative(path: Path) -> str:
 
 
 def gate_floor_rule(module: str) -> GateFloorRule | None:
-    """The floor rule tests/scripts/test_module_verify_budgets.py applies to *module*.
+    """The floor rule the budget guards hold *module* to.
 
-    ``None`` when either tests/scripts module cannot be imported: without both,
-    the rule is unknowable, so none is assumed.
+    tests/scripts/test_module_verify_budgets.py holds the ruled modules and the
+    rest of its table; each ``published_pairs()`` module is held by its own
+    sibling publisher, which ``feeds`` names.
+
+    ``None`` only when either tests/scripts module cannot be imported, as from a
+    partial checkout: without both, the rule is unknowable, so none is assumed.
+    A module that imports but no longer publishes a name read here is a code
+    defect, not a partial checkout, and raises.
     """
     family = _import_from_family_dir(_FAMILY_MODULE)
     records = _import_from_family_dir(_RECORDS_MODULE)
@@ -1440,6 +1448,7 @@ def gate_floor_rule(module: str) -> GateFloorRule | None:
             derive=family.census_budget_floor,
             refusal_ceiling=REFUSAL_CEILING,
             feeds=Citation(_checkout_relative(Path(inspect.getfile(records))), RULED_TABLE, module),
+            note_for=functools.partial(_refusal_ceiling_note, ceiling=REFUSAL_CEILING),
         )
     publisher = family.published_pairs().get(module)
     if publisher is not None:
@@ -1448,12 +1457,14 @@ def gate_floor_rule(module: str) -> GateFloorRule | None:
             derive=family.min_budget,
             refusal_ceiling=None,
             feeds=Citation(_checkout_relative(publisher.path), family.WORST_NAME, None),
+            note_for=lambda _floor: _MIN_BUDGET_NOTE,
         )
     return GateFloorRule(
         rule=FloorRule.MIN_BUDGET,
         derive=family.min_budget,
         refusal_ceiling=None,
         feeds=Citation(_checkout_relative(family.FAMILY_READER_PATH), GATE_WORST_TABLE, module),
+        note_for=lambda _floor: _MIN_BUDGET_NOTE + _UNCHECKED_GATE_ROW_NOTE,
     )
 
 
@@ -1476,11 +1487,18 @@ def _refusal_ceiling_note(floor: int, ceiling: int) -> str:
 
 
 _MIN_BUDGET_NOTE = (
-    'The budget gate holds this module to min_budget(W), ~2x its worst '
+    'The budget guards hold this module to min_budget(W), ~2x its worst '
     'measured run rounded down to 100s, and to a budget strictly below the '
     'repo-root fleet ceiling. W is the figure cited under feeds; its '
     'provenance is the verify-budget comment block of the yaml named under '
     'provenance. No escalation cap applies beyond that fleet ceiling.'
+)
+
+_UNCHECKED_GATE_ROW_NOTE = (
+    ' This census does not check that the cited row exists. The gate\'s '
+    'coverage guard places every module config it discovers in one of its '
+    'tables, so a --module outside them, such as a typo, cites a row that is '
+    'not there.'
 )
 
 
@@ -1500,9 +1518,7 @@ def _budget_note(
             f'recomputed locally — a second spelling would agree today and '
             f'drift later. Run this from a full checkout to get the floor.'
         )
-    if gate_rule.refusal_ceiling is None:
-        return _MIN_BUDGET_NOTE
-    return _refusal_ceiling_note(floor, gate_rule.refusal_ceiling)
+    return gate_rule.note_for(floor)
 
 
 def budget_check(module: str, overall: dict[str, Any]) -> dict[str, Any]:
