@@ -1,8 +1,6 @@
-"""Tests for scripts/verify_budget_census.py — the READ-ONLY verify-budget census.
-
-Ruling D17 (task 3353) deliverable 2. Deliverable 1 stamps host load on every
-verify command; this censuses the resulting corpus so a module's verify budget
-is DERIVED from a dated distribution instead of estimated.
+"""scripts/verify_budget_census.py's main(argv, now) and the one report dict both
+renderings read, including its provenance and the budget floor it derives
+through module_budget_family.census_budget_floor.
 
 The synthetic-corpus norm lives in tests/scripts/verify_budget_census_fixture.py.
 """
