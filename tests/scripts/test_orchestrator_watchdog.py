@@ -1505,6 +1505,120 @@ def test_main_pages_a_restart_burst_once_per_window(
 
 
 # ---------------------------------------------------------------------------
+# start-limit-hit is honoured (task 8270)
+#
+# A unit systemd gave up on (Result=start-limit-hit) is left down for a human
+# with its crash-loop page open: main() runs neither reset-failed nor restart
+# on it, whichever dead signal fired. Every other Result still revives.
+# ---------------------------------------------------------------------------
+
+_MUTATING_SYSTEMCTL_VERBS = frozenset({"reset-failed", "restart", "start", "stop"})
+
+
+def _wire_start_limit(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    *,
+    result: str,
+    port_up: bool,
+    active_state: str = "active",
+) -> tuple[list[list[str]], list[str], str]:
+    """Drive main() for the df unit alone through a recording subprocess.run.
+
+    Returns (every argv run, every log line, the uv path the page runs).
+    restart_unit is left REAL, so a revive shows up as systemctl argv.
+    """
+    uv = str(tmp_path / "fake-uv")
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", uv)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        stdout = ""
+        if _SHOW_RESTARTS_ARGV_TAIL in argv:
+            stdout = f"Result={result}\nNRestarts=10\n"
+        elif "ActiveState" in argv:
+            stdout = f"{active_state}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "WATCHED", [(_DF_PORT, _DF_UNIT)])
+    monkeypatch.setattr(wdog.subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "probe_port", lambda _p: port_up)
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return calls, logged, uv
+
+
+def _systemctl_mutations(calls: list[list[str]]) -> list[list[str]]:
+    return [
+        argv
+        for argv in calls
+        if argv[:1] == ["systemctl"] and _MUTATING_SYSTEMCTL_VERBS & set(argv)
+    ]
+
+
+def _pages(calls: list[list[str]], uv: str) -> list[list[str]]:
+    return [argv for argv in calls if argv[:1] == [uv]]
+
+
+def test_main_leaves_a_start_limit_hit_unit_down_and_pages_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    calls, logged, uv = _wire_start_limit(
+        wdog, monkeypatch, tmp_path, result="start-limit-hit", port_up=False
+    )
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    pages = _pages(calls, uv)
+    assert len(pages) == 1
+    assert _argv_flag(pages[0], "--task") == f"orchestrator-crash-loop-{_DF_UNIT}"
+    assert any(_DF_UNIT in m and "start-limit-hit" in m for m in logged), logged
+
+    wdog.main()
+
+    assert _systemctl_mutations(calls) == []
+    assert len(_pages(calls, uv)) == 1
+
+
+def test_main_does_not_revive_a_start_limit_hit_unit_whose_socket_still_listens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        result="start-limit-hit",
+        port_up=True,
+        active_state="failed",
+    )
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda _u: pytest.fail("start-limit-hit must hold the revive")
+    )
+
+    wdog.main()
+
+
+def test_main_still_revives_a_unit_that_failed_with_any_other_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    _wire_start_limit(wdog, monkeypatch, tmp_path, result="exit-code", port_up=False)
+    restarted: list[str] = []
+    monkeypatch.setattr(wdog, "restart_unit", restarted.append)
+
+    wdog.main()
+
+    assert restarted == [_DF_UNIT]
+
+
+# ---------------------------------------------------------------------------
 # _enumerate_running_units tests
 # ---------------------------------------------------------------------------
 
