@@ -888,11 +888,11 @@ def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def _probe_repo(repo: Path, tid: str) -> GitAuthorityVerdict:
     """Probe *tid*'s branch in the real repo at *repo*, metadata read healthy and empty."""
-    from orchestrator.config import GitConfig  # type: ignore[reportMissingImports]
-    from orchestrator.git_ops import GitOps  # type: ignore[reportMissingImports]
+    from orchestrator.git_ops import GitOps
+    config = _config(repo)
     return await probe_landing(
-        GitOps(GitConfig(main_branch='main', branch_prefix='task/'), repo), tid,
-        orch_config=_config(repo), harness=_harness(read=TaskFound({'metadata': {}})),
+        GitOps(config.git, repo), tid,
+        orch_config=config, harness=_harness(read=TaskFound({'metadata': {}})),
     )
 
 
