@@ -2412,7 +2412,10 @@ class TestBuildMergeVerifySpec:
     @pytest.mark.parametrize('override', [False, True])
     def test_collapsed_per_module_scope_cargo_ships_scope_cargo_false(self, override):
         """A per-module scope_cargo cannot ride the spec, so the spec ships False,
-        which on the remote can only widen cargo scope."""
+        which on the remote can only widen cargo scope.
+
+        The spec is also built for LOCAL merges, so a collapse must never raise.
+        """
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(
             self._make_config(scope_cargo=True), self._collapsing_modules(override), None,
@@ -2427,14 +2430,6 @@ class TestBuildMergeVerifySpec:
             None,
         )
         assert spec.scope_cargo is True
-
-    def test_build_does_not_raise_on_a_collapsed_override(self):
-        """The spec is also built for LOCAL merges, so a collapse must never raise."""
-        from orchestrator.verify_runner import build_merge_verify_spec
-        spec = build_merge_verify_spec(
-            self._make_config(scope_cargo=True), self._collapsing_modules(False), None,
-        )
-        assert isinstance(spec, MergeVerifySpec)
 
 
 # ---------------------------------------------------------------------------
@@ -3164,31 +3159,37 @@ class TestRunMergeVerifyOnWorktree:
 
     _CONFIG_ONLY_GLOB = 'dark-factory-orchestrator.yaml'
 
-    async def test_spec_scope_cargo_overrides_host_scope_cargo(self):
-        caller_config = self._host_config(scope_cargo=True)
-        spec = dataclasses.replace(self._preprovision_spec(''), scope_cargo=False)
+    @pytest.mark.parametrize(('host_scope_cargo', 'spec_scope_cargo'), [(True, False), (False, True)])
+    async def test_spec_scope_cargo_overrides_host_scope_cargo(
+        self, host_scope_cargo, spec_scope_cargo,
+    ):
+        caller_config = self._host_config(scope_cargo=host_scope_cargo)
+        spec = dataclasses.replace(self._preprovision_spec(''), scope_cargo=spec_scope_cargo)
 
         effective_config = await self._effective_config(caller_config, spec)
 
-        assert effective_config.scope_cargo is False
-        assert caller_config.scope_cargo is True
+        assert effective_config.scope_cargo is spec_scope_cargo
+        assert caller_config.scope_cargo is host_scope_cargo
 
-    async def test_spec_config_only_globs_override_host_globs(self):
+    @pytest.mark.parametrize(('host_globs', 'spec_globs'), [
+        pytest.param([], (_CONFIG_ONLY_GLOB,), id='carried_glob_fills_an_empty_host'),
+        pytest.param(['host.yaml'], (), id='carried_empty_wipes_the_host'),
+    ])
+    async def test_spec_config_only_globs_override_host_globs(self, host_globs, spec_globs):
         caller_config = self._host_config(
-            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=[]),
+            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=host_globs),
         )
         caller_git = caller_config.git
         spec = dataclasses.replace(
-            self._preprovision_spec(''),
-            merge_config_only_full_gate_globs=(self._CONFIG_ONLY_GLOB,),
+            self._preprovision_spec(''), merge_config_only_full_gate_globs=spec_globs,
         )
 
         effective_config = await self._effective_config(caller_config, spec)
 
-        assert effective_config.git.merge_config_only_full_gate_globs == [self._CONFIG_ONLY_GLOB]
+        assert effective_config.git.merge_config_only_full_gate_globs == list(spec_globs)
         assert effective_config.git.main_branch == 'trunk'
         assert caller_config.git is caller_git
-        assert caller_config.git.merge_config_only_full_gate_globs == []
+        assert caller_config.git.merge_config_only_full_gate_globs == host_globs
 
     async def test_legacy_spec_keeps_host_scope_cargo_and_globs(self):
         config = self._host_config(
@@ -3206,30 +3207,6 @@ class TestRunMergeVerifyOnWorktree:
 
         assert effective_config.scope_cargo is True
         assert effective_config.git.merge_config_only_full_gate_globs == ['host.yaml']
-
-    @pytest.mark.parametrize('module_configs', [
-        pytest.param([], id='zero_module'),
-        pytest.param([ModuleConfig(prefix='src/a', test_command='true')], id='one_module'),
-    ])
-    async def test_remote_host_adopts_dispatcher_scope_cargo_and_globs_through_the_wire(
-        self, module_configs,
-    ):
-        from orchestrator.verify_runner import build_merge_verify_spec
-        dispatcher = OrchestratorConfig(
-            scope_cargo=False,
-            git=GitConfig(merge_config_only_full_gate_globs=[self._CONFIG_ONLY_GLOB]),
-        )
-        host = self._host_config(
-            scope_cargo=True, git=GitConfig(merge_config_only_full_gate_globs=[]),
-        )
-        spec = spec_from_json(spec_to_json(
-            build_merge_verify_spec(dispatcher, module_configs, (self._CONFIG_ONLY_GLOB,)),
-        ))
-
-        effective_config = await self._effective_config(host, spec)
-
-        assert effective_config.scope_cargo is False
-        assert effective_config.git.merge_config_only_full_gate_globs == [self._CONFIG_ONLY_GLOB]
 
     async def test_collapsed_per_module_scope_cargo_reaches_the_remote_as_false(self):
         from orchestrator.verify_runner import build_merge_verify_spec
