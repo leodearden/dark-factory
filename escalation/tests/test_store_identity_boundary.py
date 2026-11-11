@@ -27,8 +27,8 @@ from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
 TASK = '5534'
-READS = ('get_pending_escalations', 'get_escalation', 'get_task_escalation_history')
-WRITES = ('escalate_info', 'escalate_blocker')
+READS = stores.GUARDED_READS
+WRITES = stores.GUARDED_WRITES
 GUARDED = READS + WRITES
 _FILING = {
     'task_id': TASK,
