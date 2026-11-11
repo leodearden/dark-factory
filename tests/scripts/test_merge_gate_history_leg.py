@@ -89,6 +89,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_warm_lane_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_info_l0_router_boundary.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_landlock.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_chain_unstack.py': 'GitOps over a tmp_path repo',
     'orchestrator/tests/test_merge_gate_already_on_main.py': _SEEDS_ITS_OWN_REPO,
