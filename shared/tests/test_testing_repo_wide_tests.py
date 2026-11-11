@@ -15,6 +15,9 @@ from shared.testing_repo_wide_tests import (
     judge_repo_wide_family,
     repo_wide_signals,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _NO_FLOORS = RepoWideFloors(test_files=0, repo_wide_modules=0)
 

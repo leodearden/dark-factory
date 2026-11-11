@@ -10,6 +10,9 @@ from typing import Any, cast
 import pytest
 
 from shared.git_read_rules import GIT_FILE_WRITING_FLAGS, GitReadRules, git_read_rules
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REVISION_ARGS = {
     'log': ['-1'],
