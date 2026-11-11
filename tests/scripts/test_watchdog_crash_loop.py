@@ -61,6 +61,18 @@ def _observe(
     )
 
 
+def _observe_and_land(
+    history: UnitRestartHistory, status: UnitRestartStatus, now: int
+) -> crash_loop.Observation:
+    """Observe, then treat any page the observation decided on as filed successfully."""
+    obs = _observe(history, status, now)
+    if obs.alarm is None:
+        return obs
+    return dataclasses.replace(
+        obs, history=crash_loop.mark_page_landed(obs.history, obs.alarm)
+    )
+
+
 # ---------------------------------------------------------------------------
 # UnitRestartStatus
 # ---------------------------------------------------------------------------
@@ -181,40 +193,89 @@ def test_one_page_per_window_per_unit() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_start_limit_hit_page_stamps_the_epoch_but_leaves_the_episode_open() -> None:
+    """The episode is closed by mark_page_landed after a submit succeeds, not on attempt."""
+    obs = _observe(UnitRestartHistory(), _status(10, "start-limit-hit"), T)
+
+    assert obs.alarm is not None
+    assert obs.alarm.kind is AlarmKind.START_LIMIT_HIT
+    assert obs.history.last_escalation_epoch == T
+    assert obs.history.start_limit_paged is False
+
+
 def test_start_limit_hit_pages_once_per_episode() -> None:
-    first = _observe(UnitRestartHistory(), _status(2, "start-limit-hit"), T)
+    first = _observe_and_land(UnitRestartHistory(), _status(2, "start-limit-hit"), T)
     assert first.alarm is not None
     assert first.alarm.kind is AlarmKind.START_LIMIT_HIT
     assert first.history.start_limit_paged is True
 
-    still_stuck = _observe(first.history, _status(2, "start-limit-hit"), T + WINDOW + 60)
+    still_stuck = _observe_and_land(
+        first.history, _status(2, "start-limit-hit"), T + WINDOW + 60
+    )
     assert still_stuck.alarm is None
     assert still_stuck.history.start_limit_paged is True
 
-    recovered = _observe(still_stuck.history, _status(0, "success"), T + WINDOW + 120)
+    recovered = _observe_and_land(
+        still_stuck.history, _status(0, "success"), T + WINDOW + 120
+    )
     assert recovered.alarm is None
     assert recovered.history.start_limit_paged is False
 
-    relapse = _observe(recovered.history, _status(1, "start-limit-hit"), T + 2 * WINDOW + 60)
+    relapse = _observe_and_land(
+        recovered.history, _status(1, "start-limit-hit"), T + 2 * WINDOW + 60
+    )
     assert relapse.alarm is not None
     assert relapse.alarm.kind is AlarmKind.START_LIMIT_HIT
 
 
 def test_start_limit_hit_inside_a_rate_pages_window_is_held_then_pages() -> None:
     history = UnitRestartHistory(samples=((T - 600, 0),), sampling_since=T - 600)
-    rate = _observe(history, _status(5), T)
+    rate = _observe_and_land(history, _status(5), T)
     assert rate.alarm is not None and rate.alarm.kind is AlarmKind.RESTART_RATE
 
-    held = _observe(rate.history, _status(5, "start-limit-hit"), T + 60)
+    held = _observe_and_land(rate.history, _status(5, "start-limit-hit"), T + 60)
     assert held.alarm is None
     assert held.held is not None
     assert held.held.kind is AlarmKind.START_LIMIT_HIT
     assert held.history.start_limit_paged is False
 
-    paged = _observe(held.history, _status(5, "start-limit-hit"), T + WINDOW)
+    paged = _observe_and_land(held.history, _status(5, "start-limit-hit"), T + WINDOW)
     assert paged.alarm is not None
     assert paged.alarm.kind is AlarmKind.START_LIMIT_HIT
     assert paged.history.start_limit_paged is True
+
+
+def test_mark_page_landed_marks_only_a_start_limit_episode() -> None:
+    history = UnitRestartHistory(
+        samples=((T - 60, 2), (T, 10)), sampling_since=T - 600, last_escalation_epoch=T
+    )
+    before = dataclasses.replace(history)
+    start_limit = crash_loop.CrashLoopAlarm(UNIT, AlarmKind.START_LIMIT_HIT, 8, WINDOW)
+    rate = crash_loop.CrashLoopAlarm(UNIT, AlarmKind.RESTART_RATE, 8, WINDOW)
+
+    landed = crash_loop.mark_page_landed(history, start_limit)
+    assert landed == dataclasses.replace(history, start_limit_paged=True)
+
+    assert crash_loop.mark_page_landed(history, rate) == history
+    assert history == before
+
+
+def test_unlanded_start_limit_page_retries_at_window_cadence() -> None:
+    stuck = _status(10, "start-limit-hit")
+
+    first = _observe(UnitRestartHistory(), stuck, T)
+    assert first.alarm is not None
+    assert first.alarm.kind is AlarmKind.START_LIMIT_HIT
+
+    held = _observe(first.history, stuck, T + 60)
+    assert held.alarm is None
+    assert held.held is not None
+    assert held.held.kind is AlarmKind.START_LIMIT_HIT
+
+    retry = _observe(held.history, stuck, T + WINDOW)
+    assert retry.alarm is not None
+    assert retry.alarm.kind is AlarmKind.START_LIMIT_HIT
+    assert retry.history.last_escalation_epoch == T + WINDOW
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +725,36 @@ def test_pass_pages_start_limit_hit_once(
 
     _tick(tmp_path, {UNIT: _status(2, "start-limit-hit")}, T + 2000)
     assert len(_recorded(record)) == 1
+
+
+def test_pass_retries_a_start_limit_hit_page_that_failed_to_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A broken submit must not mark the episode paged: the unit stays down meanwhile."""
+    uv, record = _fake_uv(tmp_path, exit_code=3)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    stuck = {UNIT: _status(10, "start-limit-hit")}
+
+    _tick(tmp_path, stuck, T)
+    assert len(_recorded(record)) == 1
+    assert _state(tmp_path)[UNIT]["start_limit_paged"] is False
+
+    logged: list[str] = []
+    _tick(tmp_path, stuck, T + 60, logged)
+    assert len(_recorded(record)) == 1
+    assert any("not re-filing" in m and "attempt" in m for m in logged), logged
+
+    _tick(tmp_path, stuck, T + WINDOW)
+    assert len(_recorded(record)) == 2
+
+    _fake_uv(tmp_path, exit_code=0)
+
+    _tick(tmp_path, stuck, T + 2 * WINDOW)
+    assert len(_recorded(record)) == 3
+    assert _state(tmp_path)[UNIT]["start_limit_paged"] is True
+
+    _tick(tmp_path, stuck, T + 3 * WINDOW)
+    assert len(_recorded(record)) == 3
 
 
 def test_pass_returns_every_status_and_one_unit_cannot_blind_the_rest(
