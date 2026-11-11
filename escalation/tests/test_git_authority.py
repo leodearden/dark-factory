@@ -492,6 +492,25 @@ class TestProbeLanding:
             'commit_citation_pattern opt-out weakened merge_sha'
         )
 
+    @pytest.mark.parametrize('arm', ['marker', 'ancestor'])
+    @pytest.mark.parametrize('key', ['801', 'task/801'], ids=['bare', 'prefixed'])
+    async def test_metadata_is_read_by_the_bare_task_id_for_either_key_shape(
+        self, tmp_path: Path, key: str, arm: str,
+    ) -> None:
+        """probe_landing derives the task id it reads metadata by from either key shape."""
+        git_ops = {
+            'marker': lambda: _marker_git_ops(marker='d' * 40),
+            'ancestor': lambda: _ancestor_git_ops(tip='a' * 40, citation='c' * 40),
+        }[arm]()
+        harness = _harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}}))
+
+        verdict = await probe_landing(
+            git_ops, key, orch_config=_config(tmp_path), harness=harness,
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        harness.scheduler.read_task.assert_awaited_once_with('801')
+
     async def test_citation_gate_opt_out_arm(self, tmp_path: Path) -> None:
         """``commit_citation_pattern == ''`` — the ONLY path that answers
         ``found_on_main`` with a sha that is not a commit discovered on main.
