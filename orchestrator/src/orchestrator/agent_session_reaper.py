@@ -11,8 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from shared.proc_liveness import pid_alive
-
-IN_PROGRESS = 'in-progress'
+from shared.task_statuses import TaskStatus
 
 
 class ReapVerdict(StrEnum):
@@ -28,7 +27,7 @@ def reap_verdict(*, owner_alive: bool, status: str | None) -> ReapVerdict:
         return ReapVerdict.KEEP_OWNER_ALIVE
     if status is None:
         return ReapVerdict.KEEP_STATUS_UNKNOWN
-    if status == IN_PROGRESS:
+    if status == TaskStatus.IN_PROGRESS:
         return ReapVerdict.KEEP_IN_PROGRESS
     return ReapVerdict.REAP
 
