@@ -582,10 +582,18 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
 #     match.
+_PYTEST_TALLY_DECORATION = r'^(?:=+[ \t]+)?'
+_PYTEST_TALLY_TAIL = r'(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$'
 _PYTEST_FAILURE_SUMMARY_RE = re.compile(
-    r'^(?:=+[ \t]+)?\d+ failed\b(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$',
+    rf'{_PYTEST_TALLY_DECORATION}\d+ failed\b{_PYTEST_TALLY_TAIL}',
     re.MULTILINE,
 )
+# Any outcome's stats line, the line that ends a pytest session's report.
+_PYTEST_STATS_LINE_RE = re.compile(
+    rf'{_PYTEST_TALLY_DECORATION}(?:\d+ \w+|no tests ran){_PYTEST_TALLY_TAIL}',
+)
+_PYTEST_SESSION_START_RE = re.compile(r'^=+ test session starts =+$')
+_PYTEST_SECTION_HEADER_RE = re.compile(r'^=+ .+ =+$')
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_STATUS_CHAR_CLASS = r'[.FsxXEPp]'
 _PYTEST_PERCENT_FIELD = r'\[ *(\d+)%\]'
@@ -665,16 +673,47 @@ _XDIST_CHANNEL_COLLAPSE_RE = re.compile(
 )
 
 
+def _last_session_own_stream(output: str) -> str:
+    """Return the last pytest session's own output, minus its report sections.
+
+    Report-section bodies (FAILURES, ERRORS, captured output, warnings) carry
+    test-controlled text: a nested run's progress, a quoted crash notice. A
+    body opens at a ``=``-barred header and closes at the session's stats
+    line, so the ``-q`` per-module join in ``_aggregate_results``, which has
+    no session headers, keeps last-module semantics. A ``test session
+    starts`` header restarts the stream.
+
+    Known limitations: a nested run's own stats line inside a body closes it
+    early, and a nested default-verbosity session header restarts the stream.
+    """
+    kept: list[str] = []
+    in_body = False
+    for line in output.splitlines():
+        if _PYTEST_SESSION_START_RE.match(line):
+            kept = []
+            in_body = False
+        elif _PYTEST_STATS_LINE_RE.match(line):
+            in_body = False
+        elif in_body:
+            continue
+        elif _PYTEST_SECTION_HEADER_RE.match(line):
+            in_body = True
+        kept.append(line)
+    return '\n'.join(kept)
+
+
 def _final_progress_line(text: str) -> re.Match[str] | None:
     """Return *text*'s last pytest percentage progress line, or ``None``."""
     progress_lines = list(_PYTEST_PROGRESS_PERCENT_RE.finditer(text))
     return progress_lines[-1] if progress_lines else None
 
 
-def _crashed_session_stop_percent(output: str) -> int | None:
+def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
-    The ``-q``-robust truncation witness. All three facts must hold:
+    The ``-q``-robust truncation witness. All three facts must hold, each
+    read from *stream*, the last session's own stream
+    (``_last_session_own_stream``):
 
     * An xdist crash signature (``_XDIST_WORKER_CRASH_RE``): progress below
       100% alone also describes ``-x``/``--maxfail`` stops and killed runs.
@@ -687,7 +726,7 @@ def _crashed_session_stop_percent(output: str) -> int | None:
     * A pytest failure tally AFTER that line: pytest ended its own run loop and
       printed its summary, rather than being killed mid-run.
 
-    Returns ``None`` when any fact is missing, including when *output* has no
+    Returns ``None`` when any fact is missing, including when *stream* has no
     percentage progress line at all (``-v``, or the ``count``/``times``
     console styles): the bailout literal is then the only witness.
 
@@ -697,14 +736,14 @@ def _crashed_session_stop_percent(output: str) -> int | None:
     named cause is imprecise (``VerifyResult.failure_report`` says the cap
     was exceeded).
     """
-    if not _XDIST_WORKER_CRASH_RE.search(output):
+    if not _XDIST_WORKER_CRASH_RE.search(stream):
         return None
-    final_line = _final_progress_line(output)
+    final_line = _final_progress_line(stream)
     if final_line is None:
         return None
     stop_percent = int(final_line.group(1))
     pytest_ended_its_own_loop = (
-        _PYTEST_FAILURE_SUMMARY_RE.search(output, final_line.end()) is not None
+        _PYTEST_FAILURE_SUMMARY_RE.search(stream, final_line.end()) is not None
     )
     return stop_percent if stop_percent < 100 and pytest_ended_its_own_loop else None
 
@@ -717,19 +756,21 @@ def _worker_death_truncation_evidence(output: str) -> str | None:
     Returns ``None`` when truncation is unproven. The literal is checked
     first, so every output it fires on keeps its evidence byte-for-byte.
 
-    A final progress line reading ``[100%]`` disproves truncation for both
-    witnesses, even when the literal printed: every collected test reported
-    (see ``_crashed_session_stop_percent`` for why that reading is exact).
+    A final progress line reading ``[100%]`` in the last session's own stream
+    disproves truncation for both witnesses, even when the literal printed:
+    every collected test reported (see ``_crashed_session_stop_percent`` for
+    why that reading is exact).
     """
     if not output:
         return None
-    final_line = _final_progress_line(output)
+    stream = _last_session_own_stream(output)
+    final_line = _final_progress_line(stream)
     if final_line is not None and int(final_line.group(1)) == 100:
         return None
     bailout = _XDIST_SESSION_ABORTED_RE.search(output)
     if bailout is not None:
         return bailout.group(0)
-    stop_percent = _crashed_session_stop_percent(output)
+    stop_percent = _crashed_session_stop_percent(stream)
     if stop_percent is None:
         return None
     return f'run stopped at {stop_percent}% of collected tests'
