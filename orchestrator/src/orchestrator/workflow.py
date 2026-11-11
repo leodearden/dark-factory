@@ -12871,7 +12871,8 @@ class TaskWorkflow:
         """Block a task whose verify failure is inherited from main.
 
         Ensures the break's fix-main task (task 5471) and names it on the
-        cross-task-folded L0 the task's steward reads.
+        cross-task-folded L0 the task's steward reads, which asks the steward
+        to re-run the failures in isolation before deferring to that owner.
         """
         owner = await self._ensure_main_fix_owner(info['main_break'])
         return await self._mark_blocked(
@@ -12879,7 +12880,7 @@ class TaskWorkflow:
             detail=owner.escalation_detail(info['detail']),
             category=info['category'],
             dedupe_fingerprint=info['fingerprint'],
-            suggested_action=owner.next_action(MainHealthNextAction.NO_FIX_OWNER),
+            suggested_action=MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION,
         )
 
     async def _auto_heal_main_health(
