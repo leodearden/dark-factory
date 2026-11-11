@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import re
 import shutil
 import subprocess
@@ -685,16 +686,26 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
+def _fingerprinted_class(name: str) -> type:
+    """The class named *name* among those the gate-identity wire fingerprint hashes.
+
+    Imported here, not at module top, so an import-time break in orchestrator
+    fails only the tests that read it rather than collection of this whole suite.
+    """
+    from orchestrator.remote_gate import wire_classes
+
+    matches = [cls for cls in wire_classes() if cls.__qualname__ == name]
+    assert len(matches) == 1, (
+        f'orchestrator/src/orchestrator/remote_gate.py::wire_classes must hold exactly '
+        f'one class named {name!r}; got {matches}'
+    )
+    return matches[0]
+
+
 @pytest.fixture
 def verify_result_field_names() -> frozenset[str]:
-    """VerifyResult's real field names, read at runtime from orchestrator.verify.
-
-    Imported here, not at module top, so an import-time break in orchestrator.verify
-    fails only the drift tests that read it rather than collection of this whole suite.
-    """
-    from orchestrator.verify import VerifyResult
-
-    return frozenset(f.name for f in dataclasses.fields(VerifyResult))
+    """VerifyResult's real field names, read from the class the wire fingerprint hashes."""
+    return frozenset(f.name for f in dataclasses.fields(_fingerprinted_class('VerifyResult')))
 
 
 class TestDataclassShapeRegistry:
@@ -719,16 +730,18 @@ class TestDataclassShapeRegistry:
     def test_registry_names_no_stale_verify_result_field(self, verify_result_field_names):
         """Every registered field is one VerifyResult really has, read at runtime.
 
-        The script must stay stdlib-only, so it carries a literal copy.  This test owns
-        the STALE direction; the MISSING direction is owned by
+        The script must stay stdlib-only, so the registry derives its fields from
+        ``shape.source`` with ``dataclass_field_names``; a stale name means that reader
+        disagrees with ``dataclasses.fields``.  This test owns the STALE direction; the
+        MISSING direction is owned by
         test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
         """
         shape = _checker._DATACLASS_SHAPES[0]
         stale = sorted(shape.fields - verify_result_field_names)
         assert stale == [], (
-            'remove these names from `_DATACLASS_SHAPES[0].fields` in '
-            'fused-memory/scripts/check_bare_magicmock_config.py; '
-            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}'
+            'the registry reader disagrees with dataclasses.fields: '
+            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}; '
+            'fix fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
         )
         assert isinstance(shape.fields, frozenset), (
             f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
@@ -746,8 +759,9 @@ class TestDataclassShapeRegistry:
 
         The behavioural consequence of the registry: a field VerifyResult has but the
         registry lacks would not count toward ``min_field_matches``, so a double built
-        from it would slip through.  The field list is read at runtime, so a future
-        field landing unregistered turns this red too.
+        from it would slip through.  The registry derives its fields from
+        ``shape.source`` with ``dataclass_field_names``, so a missing name means that
+        reader disagrees with ``dataclasses.fields``.
         """
         unflagged = []
         for name in sorted(verify_result_field_names):
@@ -758,9 +772,9 @@ class TestDataclassShapeRegistry:
             if len(violations) != 1 or 'bare-dataclass-double' not in violations[0].message:
                 unflagged.append(name)
         assert unflagged == [], (
-            'these VerifyResult fields do not count toward Rule B\'s overlap floor; add '
-            'them to `_DATACLASS_SHAPES[0].fields` in '
-            f'fused-memory/scripts/check_bare_magicmock_config.py: {unflagged}'
+            'these VerifyResult fields do not count toward Rule B\'s overlap floor, so '
+            f'the registry reader disagrees with dataclasses.fields: {unflagged}; fix '
+            'fused-memory/scripts/check_bare_magicmock_config.py::dataclass_field_names'
         )
 
     def test_verify_result_min_field_matches_is_two(self):
@@ -784,18 +798,30 @@ class TestDataclassShapeRegistry:
                 f'stray anchors={sorted(shape.anchors - shape.fields)}'
             )
 
-    def test_every_shape_names_its_module_and_factory_remedy(self):
+    def test_every_shape_names_its_source_and_factory_remedy(self):
         """Each shape carries the provenance the violation message is built from."""
         for shape in _checker._DATACLASS_SHAPES:
-            assert shape.module, f'{shape.name}: module must be set (message provenance)'
+            assert shape.source, f'{shape.name}: source must be set (message provenance)'
             assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
             assert shape.factory_home, (
                 f'{shape.name}: factory_home must name the file defining {shape.factory}'
             )
         verify_result = _checker._DATACLASS_SHAPES[0]
-        assert verify_result.module == 'orchestrator.verify'
+        assert verify_result.source == 'orchestrator/src/orchestrator/verify.py'
         assert verify_result.factory == 'fake_verify_result'
         assert verify_result.factory_home == 'orchestrator/tests/_verify_result_doubles.py'
+
+    def test_registry_reads_the_file_defining_the_fingerprinted_verify_result(self):
+        """The registry's source file is where the fingerprinted VerifyResult lives."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        fingerprinted = Path(inspect.getsourcefile(_fingerprinted_class(shape.name))).resolve()
+        registered = (_REPO_ROOT / shape.source).resolve()
+        assert fingerprinted == registered, (
+            f'the Rule B registry reads {registered} but the wire fingerprint hashes the '
+            f'{shape.name} defined in {fingerprinted}; the registry and '
+            'orchestrator/src/orchestrator/remote_gate.py::wire_classes must read one '
+            'class definition'
+        )
 
     def test_the_registered_factory_is_defined_at_its_registered_home(self):
         """The printed remedy names a helper that really exists where it says.
@@ -1029,6 +1055,7 @@ class TestDataclassDoubleMessage:
         message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
         for needle in (
             'VerifyResult',
+            'orchestrator/src/orchestrator/verify.py::VerifyResult',
             'fake_verify_result',
             'orchestrator/tests/_verify_result_doubles.py',
             'spec=VerifyResult',
