@@ -319,7 +319,7 @@ class TestPageBoundSubstitution:
     """
 
     def test_literal_cypher_braces_survive_substitution(self):
-        from fused_memory.backends.graphiti_client import _render_page_bounds
+        from fused_memory.backends.paged_read import _render_page_bounds
 
         template = (
             'MATCH (n:Entity {name: $name}) RETURN n.uuid '
@@ -355,7 +355,7 @@ class TestPageBoundSubstitution:
         server truncation, which is the one diagnosis this module exists to
         make trustworthy.
         """
-        from fused_memory.backends.graphiti_client import _render_page_bounds
+        from fused_memory.backends.paged_read import _render_page_bounds
 
         template = (
             'MATCH (n:Entity) RETURN n.uuid ORDER BY n.uuid '
