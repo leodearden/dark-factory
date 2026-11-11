@@ -29,6 +29,10 @@ Pause-detector trip facts (default None; task 4686):
               EwaRateTripFacts / ParkStopTripFacts carried by the escalation
               a non-halting pause detector files instead of halting
 
+Human-gate payload (default None; task 6390):
+  review_due: ReviewDueState of a `review_due` record, the trigger chain's
+              human gate (PRD completion-driven-triggers C4)
+
 Cancel-with-children facts (default None; task 8142):
   cancel_children / children / superseded_by:
               child rows, the disposition map and the superseders, as the
@@ -142,7 +146,10 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from shared.task_metadata import TriggerChainSkill
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +214,26 @@ class IndexHealthState(TypedDict):
     missing: list[list[str]]       # expected-but-absent specs, sorted
     unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
     expected_total: int            # size of the expected set this was diffed against
+
+
+class ReviewDueState(TypedDict):
+    """The human gate of a trigger chain, as filed (PRD
+    plans/completion-driven-triggers-prd.md C4).
+
+    `skill` is the BARE skill name; renderers add the slash. `launched_from`
+    is this record's own id. `verdict` is the completion gate's
+    predicate_verdict, None in the interim form or when the read failed.
+    """
+
+    skill: TriggerChainSkill
+    project_id: str
+    project_root: str
+    run_id: str
+    human_gate_task_id: str
+    completion_gate_task_id: str | None
+    verdict: dict[str, object] | None
+    fired_at: str
+    launched_from: str
 
 
 class EwaRateTripFacts(TypedDict):
@@ -616,6 +643,9 @@ class Escalation:
     # from_dict __dataclass_fields__ filter — zero migration, same pattern as
     # train_state / index_health above.
     delivered_check_owner: DeliveredCheckOwner | None = None
+    # Born-at-L2 human-gate payload, filed only by orchestrator/src/orchestrator/
+    # deterministic_runner.py::build_gate_escalation_fields; zero migration via the from_dict filter.
+    review_due: ReviewDueState | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
