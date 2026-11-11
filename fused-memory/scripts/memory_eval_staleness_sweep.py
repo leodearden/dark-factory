@@ -2103,7 +2103,9 @@ def write_report_text(path: str | Path, text: str) -> None:
 # The read-only run band
 #
 # D8's runner pattern minus every mutation: CONFIG_PATH from --config,
-# FusedMemoryConfig(), MemoryService(), initialize(), try/finally close().
+# FusedMemoryConfig(), MemoryService(), initialize_for_reads(), try/finally
+# close(); the full initialize() starts the durable write queue and runs
+# Graphiti startup maintenance, which repairs edges.
 #
 # There is no --apply band and no write call anywhere below. The guarantee is
 # asserted as BEHAVIOUR: the tests drive this band against a service double
@@ -2331,8 +2333,8 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize()
     try:
+        await memory.initialize_for_reads()
         outcome = await run_sweep(
             memory,
             project_ids=(args.project_id,),
