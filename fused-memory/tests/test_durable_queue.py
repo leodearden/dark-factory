@@ -3009,17 +3009,17 @@ class TestTypedRowBoundary:
             events.append(event)
 
         execute = AsyncMock(return_value=None)
+        writer = self._queue(tmp_path, execute)
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            tmp_path / 'queue' / 'write_queue.db', group_id='proj1',
+            operation=operation, payload_text=payload_text, callback_type=callback_type,
+        )
         q = self._queue(tmp_path, execute, on_dead_letter=on_dead_letter)
-        await q.initialize()
         try:
-            await insert_raw_row(
-                tmp_path / 'queue' / 'write_queue.db', group_id='proj1',
-                operation=operation, payload_text=payload_text, callback_type=callback_type,
-            )
             with caplog.at_level(logging.WARNING, logger='fused_memory.services.durable_queue'):
-                # The row predates the workers, so a worker starts only on a signal.
-                q._ensure_workers('proj1')
-                q._signal_group('proj1')
+                await q.initialize()
                 await poll_until_dead(q, group_id='proj1', expected_dead=1)
                 await poll_until(lambda: events, timeout=20.0)
             dead = await q.get_dead_items()

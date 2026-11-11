@@ -15,7 +15,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
 from shared.storm_counter import KeyedStormCounters
@@ -2782,16 +2782,15 @@ class MemoryService:
 
     async def _execute_durable_write(self, value: QueuedWrite) -> Any:
         """Route a decoded queued write to its backend executor."""
-        executors: dict[type, Callable[[Any], Awaitable[Any]]] = {
-            QueuedEpisodeWrite: self._execute_graphiti_write,
-            QueuedGraphitiMemoryWrite: self._execute_graphiti_write,
-            QueuedMem0Fact: self._execute_mem0_classify_and_add,
-            QueuedMem0Add: self._execute_mem0_write,
-        }
-        executor = executors.get(type(value))
-        if executor is None:
-            raise TypeError(f'no durable-write executor for {type(value).__name__}')
-        return await executor(value)
+        match value:
+            case QueuedEpisodeWrite() | QueuedGraphitiMemoryWrite():
+                return await self._execute_graphiti_write(value)
+            case QueuedMem0Fact():
+                return await self._execute_mem0_classify_and_add(value)
+            case QueuedMem0Add():
+                return await self._execute_mem0_write(value)
+            case _:
+                assert_never(value)
 
     # ------------------------------------------------------------------
     # Dedup: remove duplicate edges created by a single add_episode call

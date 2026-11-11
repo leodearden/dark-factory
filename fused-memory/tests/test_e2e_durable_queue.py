@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1218,16 +1219,13 @@ class TestUndecodableRowIsRefusedNotExecuted:
 
     @pytest.mark.asyncio
     async def test_a_typo_operation_dead_letters_unexecuted_and_alarms_with_its_raw_body(
-        self, integrated_service, tmp_path, monkeypatch,
+        self, mock_config, tmp_path, monkeypatch,
     ):
-        svc = integrated_service
-        queue = svc.durable_queue
         filed: list[dict] = []
         monkeypatch.setattr(
             dead_letter_escalator, 'emit_dead_letter_escalation',
             lambda *args, **kwargs: filed.append(kwargs),
         )
-        svc.set_known_projects({'main': str(tmp_path)})
         body = json.dumps({
             'content': 'looks exactly like an add_episode body',
             'group_id': 'main',
@@ -1236,19 +1234,31 @@ class TestUndecodableRowIsRefusedNotExecuted:
             'source_description': 'hand inserted',
         })
 
+        # The row is written by another build: it is already in the store
+        # when this service starts, and startup recovery picks it up.
+        writer = _mock_backends(MemoryService(mock_config))
+        await writer.initialize()
+        await writer.close()
         await insert_raw_row(
-            queue._data_dir / 'write_queue.db',
+            Path(mock_config.queue.data_dir) / 'write_queue.db',
             group_id='main', operation='typo_op', payload_text=body,
         )
-        queue._ensure_workers('main')
-        queue._signal_group('main')
 
-        async def _dead():
-            items = await queue.get_dead_items()
-            return items or None
+        svc = _mock_backends(MemoryService(mock_config))
+        svc.set_known_projects({'main': str(tmp_path)})
+        await svc.initialize()
+        try:
+            queue = svc.durable_queue
+            assert queue is not None
 
-        dead = await poll_until(_dead, timeout=20.0, interval=0.05)
-        await poll_until(lambda: filed or None, timeout=20.0, interval=0.05)
+            async def _dead():
+                items = await queue.get_dead_items()
+                return items or None
+
+            dead = await poll_until(_dead, timeout=20.0, interval=0.05)
+            await poll_until(lambda: filed or None, timeout=20.0, interval=0.05)
+        finally:
+            await svc.close()
 
         assert len(dead) == 1
         assert dead[0]['operation'] == 'typo_op'

@@ -1025,14 +1025,15 @@ class TestDurableWriteDispatcher:
         service._execute_mem0_classify_and_add.assert_awaited_once_with(fact)
 
     @pytest.mark.asyncio
-    async def test_unregistered_type_raises_naming_the_type(self, service):
-        class UnregisteredEpisodeWrite(QueuedEpisodeWrite):
-            pass
+    async def test_a_value_outside_the_union_raises_at_dispatch(self, service):
+        class NotAQueuedWrite:
+            def __repr__(self) -> str:
+                return 'NotAQueuedWrite()'
 
-        stranger = UnregisteredEpisodeWrite(envelope=envelope(), content='x')
-        with pytest.raises(TypeError, match='UnregisteredEpisodeWrite'):
-            await service._execute_durable_write(stranger)
+        with pytest.raises(AssertionError, match='NotAQueuedWrite'):
+            await service._execute_durable_write(NotAQueuedWrite())
         service.graphiti.add_episode.assert_not_called()
+        service.mem0.add.assert_not_called()
 
 
 def _enqueued_facts(enqueue_mock: AsyncMock) -> list[QueuedMem0Fact]:

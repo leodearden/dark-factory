@@ -135,10 +135,9 @@ class TestImportsCleanlyOnItsOwn:
         assert proc.returncode == 0, f'stderr:\n{proc.stderr}'
         assert 'ok' in proc.stdout
 
-    def test_deferred_import_still_strips_the_prefix_at_call_time(self):
-        """The deferral must not cost the behaviour it exists to preserve:
-        `_error_class` still reaches the real constant when actually called,
-        escalator-imported-first."""
+    def test_the_escalator_first_still_strips_the_prefix(self):
+        """With the escalator imported first, `_error_class` strips the real
+        POST_EXECUTE_DEAD_PREFIX."""
         proc = self._run(
             'from fused_memory.middleware.dead_letter_escalator import _error_class\n'
             'from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX\n'
