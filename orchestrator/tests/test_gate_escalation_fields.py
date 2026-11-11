@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from escalation.queue import EscalationQueue
 from shared.task_read import TaskAbsent, TaskFound, TaskRead, TaskReadFailed
-from test_deterministic_runner import _make_assignment
+from test_deterministic_runner import _make_assignment, _seed_escalation
 
 from orchestrator.deterministic_runner import (
     MILESTONE_GATE_CATEGORY,
@@ -324,3 +324,64 @@ class TestRunnerFilesTheHumanGate:
         assert esc.category == 'milestone_gate'
         assert esc.review_due is None
         scheduler.read_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestResumeCitesTheGatesOwnCategory:
+    """Row 3's resume-to-done half: a gate cites its own category's newest record."""
+
+    async def test_human_gate_cites_its_review_due_over_a_newer_milestone_gate(
+        self, tmp_path: Path,
+    ):
+        task = _human_gate_task()
+        task['metadata']['gate_escalated_at'] = FIXED_NOW.isoformat()
+        queue = EscalationQueue(tmp_path)
+        review = _seed_escalation(
+            queue, '42', 'orchestrator-deterministic', category='review_due',
+        )
+        queue.resolve(
+            review.id, 'ran as review-dark_factory-20261012',
+            resolved_by='interactive', resolution_action='resume',
+        )
+        newer = _seed_escalation(
+            queue, '42', 'orchestrator-deterministic', resolved=True, category='milestone_gate',
+        )
+        assert newer.timestamp >= review.timestamp, (
+            'setup precondition: the milestone_gate must be the newer record'
+        )
+        scheduler = _chain_scheduler(task, {})
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '42', 'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+                'escalation_id': review.id,
+            },
+        )
+
+    async def test_plain_gate_cites_its_milestone_gate_over_a_newer_review_due(
+        self, tmp_path: Path,
+    ):
+        task = _plain_gate()
+        task['metadata']['gate_escalated_at'] = FIXED_NOW.isoformat()
+        queue = EscalationQueue(tmp_path)
+        gate = _seed_escalation(
+            queue, '42', 'orchestrator-deterministic', resolved=True, category='milestone_gate',
+        )
+        newer = _seed_escalation(
+            queue, '42', 'orchestrator-deterministic', resolved=True, category='review_due',
+        )
+        assert newer.timestamp >= gate.timestamp
+        scheduler = _chain_scheduler(task, {})
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        provenance = scheduler.set_task_status.await_args.kwargs['done_provenance']
+        assert provenance['escalation_id'] == gate.id
