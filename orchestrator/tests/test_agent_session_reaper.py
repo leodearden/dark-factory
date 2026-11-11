@@ -337,6 +337,8 @@ class TestZombieSidecarReap:
         legacy = _seed_sidecar(base, '61', owner_pid=_DEAD_PID, task_id='61')
         meta = _seed_sidecar(base, '61', owner_pid=_DEAD_PID, task_id='61', root='meta')
         _serve_statuses(harness, {'61': 'pending'})
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
 
         await harness._recover_crashed_tasks()
 
@@ -344,7 +346,7 @@ class TestZombieSidecarReap:
         assert not meta.exists()
         assert '61' not in harness._recovered_sessions
         assert '61' not in harness._preserved_worktrees
-        harness.git_ops.cleanup_worktree.assert_any_await(base / '61', '61')
+        cleanup.assert_any_await(base / '61', '61')
         rows = _reaped_rows(harness)
         assert len(rows) == 1
         assert rows[0]['task_id'] == '61'

@@ -95,6 +95,11 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler.get_task = AsyncMock(return_value={})
     # None status → transient/None → fall through to restore (never terminal-release).
     h.scheduler.get_status = AsyncMock(return_value=None)
+    # These tests model a task still in-progress at crash time, which the
+    # sidecar reaper must keep (plans/session-resume-eligibility-seam-prd.md D7's second conjunct).
+    h.scheduler.get_statuses = AsyncMock(
+        side_effect=lambda ids=None: ({i: 'in-progress' for i in (ids or [])}, None),
+    )
     h.scheduler._dispatched = set()
     # is_deterministic is a sync @staticmethod predicate at the top of _run_slot.
     h.scheduler.is_deterministic = MagicMock(return_value=False)
