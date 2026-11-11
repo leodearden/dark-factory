@@ -61,6 +61,17 @@ async def drive_verify_and_advance(
     flat drive path never manages the speculation semaphore — direct-call
     tests that care about speculation exercise the full loop instead.
     """
+    entry = await _launch_local_verify(worker, item)
+    if entry is None:
+        return False
+    return await finalize_through_gate(worker, entry)
+
+
+async def _launch_local_verify(
+    worker: SpeculativeMergeWorker, item: RealMergeItem,
+) -> InflightEntry | None:
+    """Launch *item*'s verify on a LOCAL lease; None when no slot can be had,
+    with the request resolved blocked."""
     req = item.request
     allocator = worker._ensure_host_allocator(req.config)
 
@@ -91,13 +102,13 @@ async def drive_verify_and_advance(
             req.result.set_result(_mq.MergeOutcome(
                 'blocked', reason='No verify host available (harness path)',
             ))
-        return False
+        return None
 
     verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
         worker._run_inflight_verify(item, lease)
     )
 
-    entry = _mq.InflightEntry(
+    return _mq.InflightEntry(
         item=item,
         lease=lease,
         verify_task=verify_task,
@@ -105,8 +116,6 @@ async def drive_verify_and_advance(
         was_speculative=False,  # harness does not manage the speculation slot
         started_at=time.time(),
     )
-
-    return await finalize_through_gate(worker, entry)
 
 
 async def finalize_through_gate(
@@ -120,7 +129,7 @@ async def finalize_through_gate(
     re-verify became a dispatch (task 8525).  Returns True iff main was advanced.
 
     *on_park* runs each time the entry parks, before its gate has started,
-    and once more before a dispatched rebased head is followed.
+    and each time a dispatched rebased head starts verifying.
     """
     while True:
         advanced = await worker._finalize_inflight(entry)
@@ -130,8 +139,15 @@ async def finalize_through_gate(
     head = None if advanced else _take_rebased_head(worker, entry)
     if head is None:
         return advanced
+    head_entry = await _launch_local_verify(worker, head)
+    if head_entry is None:
+        return False
+    worker._note_transition(
+        head.request.request_id, _mq.ItemLifecycleState.DISPATCHING,
+        _mq.ItemLifecycleState.VERIFYING, live_obj=head_entry,
+    )
     on_park()
-    return await drive_verify_and_advance(worker, head)
+    return await finalize_through_gate(worker, head_entry, on_park=on_park)
 
 
 def _take_rebased_head(
@@ -156,5 +172,4 @@ def _take_rebased_head(
     worker._note_transition(
         request_id, states.REDISPATCH_PARKED, states.DISPATCHING, live_obj=head,
     )
-    worker._note_transition(request_id, states.DISPATCHING, states.VERIFYING)
     return head

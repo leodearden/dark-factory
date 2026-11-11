@@ -2636,8 +2636,9 @@ class TestAdoptedHeadLandsWithThePostVerifyWorktree:
     async def test_a_gated_adopted_head_still_heads_the_frozen_prefix(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """An adopted head has no verify task, and while it waits on its gate
-        re-verify it must still head the frozen prefix (task 6155).
+        """An adopted head has no verify task, and while it waits on its gate,
+        and then while its rebased commit re-verifies as a dispatch, it must
+        still head the frozen prefix (tasks 6155, 8525).
 
         Read off the verify task alone, the prefix drops it there: a follower
         then reads as the head, and dispatch reads no verify in flight.

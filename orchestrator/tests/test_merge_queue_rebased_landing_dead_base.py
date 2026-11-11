@@ -17,9 +17,10 @@ before B's verdict is spent or adopted:
   (task 8525);
 * a head that lands by a plain advance supersedes nothing, so a successor on
   its merge commit is never voided, even after main moves on past it;
-* a depth-2 follower C stacked on B, with no host free when B's verdict is
-  voided at adoption, is re-merged onto real main at dispatch, because the
-  void records B's own merge commit dead too (task 7352).
+* a depth-2 follower C stacked on B, with no host free when A's gate
+  re-verify becomes a dispatch, is re-merged onto real main at its dispatch,
+  because tearing B down records B's own merge commit dead too (tasks 7352,
+  8525).
 
 Each scene runs a real lane over a real tmp repo and observes only request
 outcomes, the injected verifier and the injected event store.
@@ -410,9 +411,9 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
-class TestAdoptionVoidRecordsTheVoidedCommitDead:
+class TestTornDownSuccessorRecordsItsCommitDead:
 
-    async def test_follower_with_no_host_when_its_base_is_voided_is_remerged_at_dispatch(
+    async def test_follower_with_no_host_when_its_base_is_torn_down_is_remerged_at_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         head_gate = asyncio.Event()
@@ -431,47 +432,50 @@ class TestAdoptionVoidRecordsTheVoidedCommitDead:
                 lane, remote, allocator_cls=_LocalSlotTakenOnceFreed,
             )
             assert isinstance(allocator, _LocalSlotTakenOnceFreed)
-            req_a = await _submitted(git_ops, config, 'fv-a')
-            req_b = await _submitted(git_ops, config, 'fv-b')
-            req_c = await _submitted(git_ops, config, 'fv-c')
-            await queue.put(req_a)
-            await queue.put(req_b)
-            await queue.put(req_c)
-            await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
-            await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
-            a_pre = await _stacked_base(store, 'fv-b')
-            b_pre = await _stacked_base(store, 'fv-c')
+            try:
+                req_a = await _submitted(git_ops, config, 'fv-a')
+                req_b = await _submitted(git_ops, config, 'fv-b')
+                req_c = await _submitted(git_ops, config, 'fv-c')
+                await queue.put(req_a)
+                await queue.put(req_b)
+                await queue.put(req_c)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
+                a_pre = await _stacked_base(store, 'fv-b')
+                b_pre = await _stacked_base(store, 'fv-c')
+                assert remote.run_merge_verify.await_count == 1, (
+                    'precondition: only B has verified, so C is not dispatched'
+                )
 
-            await _land_foreign_commit(git_repo)
-            head_gate.set()
-            await _assert_landed_rebased(store, req_a, a_pre)
-            await _until(
-                lambda: allocator.held_local is not None,
-                what='the concurrent acquirer to take the slot A freed',
-            )
-            assert allocator.free_host_count() == 0, 'precondition: C has no host'
-            assert remote.run_merge_verify.await_count == 1, (
-                'precondition: only B has verified, so C is not dispatched'
-            )
+                await _land_foreign_commit(git_repo)
+                head_gate.set()
+                await _assert_landed_rebased(store, req_a, a_pre)
+                assert allocator.held_local is not None, (
+                    'precondition: the concurrent acquirer took the slot A freed, '
+                    'so B and C each wait for the remote'
+                )
 
-            b_release.set()
-            outcome_b = await wait_responsive(req_b.result, label='fv-b outcome')
-            assert outcome_b.status == 'done', outcome_b
+                outcome_b = await wait_responsive(req_b.result, label='fv-b outcome')
+                outcome_c = await wait_responsive(req_c.result, label='fv-c outcome')
+            finally:
+                b_release.set()
+
+            assert (outcome_b.status, outcome_c.status) == ('done', 'done'), (outcome_b, outcome_c)
+            b_cancels = _events(store, EventType.merge_verify_cancelled, 'fv-b')
+            assert [c['cause'] for c in b_cancels] == ['gate_reanchor']
+            # A's rebased head landed before B had a host, so B fell to main.
             b_voids = _events(store, EventType.verdict_voided, 'fv-b')
             assert [
                 (v['point'], v['reason'], v['dead_link'], v['item_commit'], v['killer'])
                 for v in b_voids
             ] == [
-                ('adoption', 'chain_dead', a_pre, b_pre,
+                ('dispatch', 'chain_dead', a_pre, b_pre,
                  {'site': 'gate_rebased', 'task_id': 'fv-a'}),
-            ], 'precondition: B is voided at adoption'
-
-            outcome_c = await wait_responsive(req_c.result, label='fv-c outcome')
-            assert outcome_c.status == 'done', outcome_c
+            ]
             c_voids = _events(store, EventType.verdict_voided, 'fv-c')
-            # C's killer names B's void: the void-chain provenance.
+            # C's killer names B's teardown: the void-chain provenance.
             assert [(v['point'], v['reason'], v['dead_link'], v['killer']) for v in c_voids] == [
-                ('dispatch', 'chain_dead', b_pre, {'site': 'adoption_void', 'task_id': 'fv-b'}),
+                ('dispatch', 'chain_dead', b_pre, {'site': 'gate_reanchor', 'task_id': 'fv-b'}),
             ]
             assert c_voids[0]['item_commit'] and c_voids[0]['item_commit'] != b_pre
             assert _gate_retries(store, 'fv-c') == []

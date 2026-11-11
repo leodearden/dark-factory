@@ -843,17 +843,20 @@ class TestScenario8CasRetryTipCarry:
         advance_calls: list[str] = []
 
         async def _fake_advance(sha: str, worktree: Path, **kwargs: Any) -> AdvanceOutcome:
-            # Call 1 forces the replace-only rebuild; call 2 lands. The
-            # fabricated advanced_sha is deliberate: it is not a real git
+            # Call 1 forces the replace-only rebuild, here of the rebased
+            # head the gate dispatches (task 8525); call 2 lands. The rebased
+            # commit is main itself: a real commit the dispatch can build a
+            # worktree on, already based on main, so it is not re-merged. The
+            # fabricated landed sha is deliberate: it is not a real git
             # object, so the equivalence gate's own tip resolution fails open
             # and cannot mask a dropped merged_branch_tip.
             advance_calls.append(sha)
             if len(advance_calls) == 1:
                 return AdvanceOutcome(
                     'rebased_pending_reverify',
-                    advanced_sha='f' * 40,
-                    rebased_from=base_sha,
-                    rebased_onto='e' * 40,
+                    advanced_sha=base_sha,
+                    rebased_from='e' * 40,
+                    rebased_onto=base_sha,
                 )
             return AdvanceOutcome('advanced', advanced_sha='a' * 40)
 
