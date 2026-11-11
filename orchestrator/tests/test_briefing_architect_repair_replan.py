@@ -118,6 +118,19 @@ class TestReplanPrompt:
             prompt = await briefing.build_replan_prompt(_TASK, 'FEEDBACK')
         _assert_recalled_under_architect_identity(prompt, mcp)
 
+    @pytest.mark.asyncio
+    async def test_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
+        items = _action_items(await briefing.build_replan_prompt(_TASK, 'FEEDBACK', context=''))
+        confirming = [i for i, item in enumerate(items) if 'confirm_plan()' in item]
+        assert confirming == [len(items) - 1], items
+        assert 'FINAL' in items[-1]
+
+
+def _action_items(prompt: str) -> list[str]:
+    """The numbered items of the prompt's ``## Action`` section, continuation lines included."""
+    section = prompt.split('## Action', 1)[1].split('\n#', 1)[0]
+    return [item for item in re.split(r'\n(?=\d+\. )', section.strip()) if re.match(r'\d+\. ', item)]
+
 
 async def _repair_prompt(briefing: BriefingAssembler) -> str:
     return await briefing.build_plan_schema_repair_prompt(_TASK, context='')

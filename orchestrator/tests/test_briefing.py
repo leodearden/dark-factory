@@ -846,6 +846,29 @@ class TestRevalidationPriorProposal:
 
 
 @pytest.mark.asyncio
+class TestRevalidationConfirms:
+    """Every step-set prompt ends in confirm_plan (S9 Q-C1 (a)): a step-set edit clears confirmation."""
+
+    async def test_revalidation_prompt_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
+        prompt = await briefing.build_revalidation_prompt(
+            {'id': '9170', 'title': 'T', 'description': 'd'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        section = prompt.split('## Action', 1)[1]
+        items = [item for item in re.split(r'\n(?=\d+\. )', section.strip()) if re.match(r'\d+\. ', item)]
+        options = next(i for i, item in enumerate(items) if 'create_plan(' in item)
+        final = items[-1]
+        assert options < len(items) - 1
+        assert 'confirm_plan()' in final
+        assert 'FINAL' in final
+        for path in ('(a)', '(b)', '(c)', 'create_plan'):
+            assert path in final, path
+
+
+@pytest.mark.asyncio
 class TestRevalidationTextDriftNotice:
     """Task 4031: a revalidating architect is told when the task text moved."""
 
