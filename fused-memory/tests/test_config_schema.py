@@ -392,7 +392,7 @@ class TestFusedMemoryConfigDefaults:
         # Verify unmentioned config sections retain their defaults (not clobbered to null/empty)
         assert config.embedder.provider == 'openai'
         assert config.embedder.model == 'text-embedding-3-small'
-        assert config.server.host == '0.0.0.0'
+        assert config.server.host == '127.0.0.1'
         assert config.graphiti.provider == 'falkordb'
         assert config.mem0.qdrant_url == 'http://localhost:6333'
         assert config.routing.confidence_threshold == 0.7
