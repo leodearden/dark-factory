@@ -13,6 +13,7 @@ from typing import Any
 
 import module_budget_family
 import pytest
+import verify_budget_census
 import verify_budget_census_records
 from verify_budget_census_fixture import (
     FULL_SUITE,
@@ -20,6 +21,7 @@ from verify_budget_census_fixture import (
     run_main,
     summary_payload,
     write_corpus,
+    write_module_yaml,
     write_worktree_record,
 )
 
@@ -677,6 +679,35 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
         )
         assert floor_line.split()[2] == '0', floor_line
         assert '<none>' not in floor_line
+
+    @pytest.mark.parametrize('module', sorted(module_budget_family.published_pairs()))
+    def test_a_sibling_guarded_module_cites_its_own_publisher(self, tmp_path, capsys, module):
+        """These modules' W lives in their own sibling guard, not in the gate's table.
+
+        Built without write_corpus, whose record name would nest on the slash
+        in 'tests/scripts'.
+        """
+        write_module_yaml(tmp_path, module)
+        record = write_worktree_record(
+            tmp_path, '3353', f'attempt-1.{verify_budget_census.sanitise_prefix(module)}.summary.json',
+        )
+        record.write_text(
+            json.dumps(summary_payload(command_entry(duration_secs=500.0))), encoding='utf-8',
+        )
+
+        _rc, out, _err = run_main(capsys, '--root', str(tmp_path), '--module', module, '--json')
+        report = json.loads(out)
+
+        assert report['overall']['durations']['n'] == 1
+        check = report['budget_check']
+        feeds = check['feeds']
+        assert check['rule'] == 'min_budget'
+        assert check['refusal_ceiling'] is None
+        publisher = module_budget_family.published_pairs()[module]
+        assert (REPO_ROOT / feeds['path']).resolve() == publisher.path.resolve()
+        assert feeds['symbol'] == module_budget_family.WORST_NAME
+        assert feeds['key'] is None
+        assert 'MEASURED_MODULE_SUITE_WORST_SECS' not in self._section(tmp_path, capsys, module)
 
     def test_an_unreadable_ruled_table_derives_nothing_rather_than_guessing(
         self, tmp_path, capsys, monkeypatch,
