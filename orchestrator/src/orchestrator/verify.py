@@ -593,6 +593,8 @@ _PYTEST_STATS_LINE_RE = re.compile(
     rf'{_PYTEST_TALLY_DECORATION}(?:\d+ \w+|no tests ran){_PYTEST_TALLY_TAIL}',
 )
 _PYTEST_SESSION_START_RE = re.compile(r'^=+ test session starts =+$')
+_SEGMENT_BLOCK_HEADER_LEAD = '===== segment '
+_SEGMENT_BLOCK_HEADER_RE = re.compile(rf'^{re.escape(_SEGMENT_BLOCK_HEADER_LEAD)}\d+/\d+ ')
 _PYTEST_SECTION_HEADER_RE = re.compile(r'^=+ .+ =+$')
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_STATUS_CHAR_CLASS = r'[.FsxXEPp]'
@@ -653,7 +655,7 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # xdist prints the message bare on its own line through `report_line`, and
 # again as ``=== xdist: <msg> ===`` in its terminal summary:
 # _XDIST_BAILOUT_LINE_RE matches exactly those two whole lines, and truncation
-# evidence searches it over the last session's own stream only, because
+# evidence searches it over each session's own stream only, because
 # assertion text, captured output and INTERNALERROR lines can quote the
 # literal (task 5891). The unanchored _XDIST_SESSION_ABORTED_RE serves only
 # _shows_xdist_worker_death, which is deliberately wider.
@@ -683,24 +685,26 @@ _XDIST_CHANNEL_COLLAPSE_RE = re.compile(
 )
 
 
-def _last_session_own_stream(output: str) -> str:
-    """Return the last pytest session's own output, minus its report sections.
+def _pytest_session_own_streams(output: str) -> list[str]:
+    """Return one own stream per pytest session in *output*, minus report sections.
 
     Report-section bodies (FAILURES, ERRORS, captured output, warnings) carry
     test-controlled text: a nested run's progress, a quoted crash notice. A
     body opens at a ``=``-barred header and closes at the session's stats
-    line, so the ``-q`` per-module join in ``_aggregate_results``, which has
-    no session headers, keeps last-module semantics. A ``test session
-    starts`` header restarts the stream.
+    line. A session starts at pytest's ``test session starts`` header or at a
+    ``_run_segmented`` block header, because each segment is its own pytest
+    process. Header-less text, such as the ``-q`` per-module join in
+    ``_aggregate_results``, stays ONE stream, where a stats line closing a
+    body keeps last-module semantics.
 
     Known limitations: a nested run's own stats line inside a body closes it
-    early, and a nested default-verbosity session header restarts the stream.
+    early, and a nested default-verbosity session header starts a new session.
     """
-    kept: list[str] = []
+    streams: list[list[str]] = [[]]
     in_body = False
     for line in output.splitlines():
-        if _PYTEST_SESSION_START_RE.match(line):
-            kept = []
+        if _PYTEST_SESSION_START_RE.match(line) or _SEGMENT_BLOCK_HEADER_RE.match(line):
+            streams.append([])
             in_body = False
         elif _PYTEST_STATS_LINE_RE.match(line):
             in_body = False
@@ -708,8 +712,8 @@ def _last_session_own_stream(output: str) -> str:
             continue
         elif _PYTEST_SECTION_HEADER_RE.match(line):
             in_body = True
-        kept.append(line)
-    return '\n'.join(kept)
+        streams[-1].append(line)
+    return ['\n'.join(stream) for stream in streams]
 
 
 def _final_progress_line(text: str) -> re.Match[str] | None:
@@ -722,8 +726,8 @@ def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
     The ``-q``-robust truncation witness. All three facts must hold, each
-    read from *stream*, the last session's own stream
-    (``_last_session_own_stream``):
+    read from *stream*, one session's own stream
+    (``_pytest_session_own_streams``):
 
     * An xdist crash signature (``_XDIST_WORKER_CRASH_RE``): progress below
       100% alone also describes ``-x``/``--maxfail`` stops and killed runs.
@@ -766,14 +770,26 @@ def _worker_death_truncation_evidence(output: str) -> str | None:
     Returns ``None`` when truncation is unproven. The literal is checked
     first, so every output it fires on keeps its evidence byte-for-byte.
 
-    A final progress line reading ``[100%]`` in the last session's own stream
+    Each pytest session is judged alone, and the first one with evidence
+    wins: the segmented fallback (``_run_segmented``) runs every segment, so
+    a truncated session need not be the last.
+
+    A final progress line reading ``[100%]`` in that session's own stream
     disproves truncation for both witnesses, even when the literal printed:
     every collected test reported (see ``_crashed_session_stop_percent`` for
     why that reading is exact).
     """
     if not output:
         return None
-    stream = _last_session_own_stream(output)
+    for stream in _pytest_session_own_streams(output):
+        evidence = _session_truncation_evidence(stream)
+        if evidence is not None:
+            return evidence
+    return None
+
+
+def _session_truncation_evidence(stream: str) -> str | None:
+    """Return one session's truncation evidence, read from its own *stream*."""
     final_line = _final_progress_line(stream)
     if final_line is not None and int(final_line.group(1)) == 100:
         return None
@@ -6587,7 +6603,7 @@ def _segment_output_block(entry: dict, total: int, out: str) -> str:
     failing segment's hint.
     """
     header = (
-        f'===== segment {entry["index"]}/{total} [{entry["label"]}] '
+        f'{_SEGMENT_BLOCK_HEADER_LEAD}{entry["index"]}/{total} [{entry["label"]}] '
         f'cwd={entry["cwd"]} rc={entry["rc"]} status={entry["status"]} '
         f'({entry["duration_secs"]:.1f}s) ====='
     )
