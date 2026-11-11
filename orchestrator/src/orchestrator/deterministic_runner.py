@@ -40,7 +40,9 @@ from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
     DoneProvenance,
+    TriggerChain,
 )
+from shared.task_read import TaskFound, TaskReadFailed
 
 from orchestrator import systemd_inspect
 from orchestrator.before_done_script import (
@@ -79,9 +81,11 @@ from orchestrator.proc_supervision import (
 )
 from orchestrator.review_due import (
     REVIEW_DUE_CATEGORY,
+    CompletionGateUnread,
     HumanGateFacts,
     InvalidTriggerChain,
     human_gate_chain,
+    is_completion_gate,
     review_due,
 )
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -326,6 +330,21 @@ def _snippet_project_root(scheduler) -> str:
     """The configured project_root for the runbook snippet, else a visible placeholder."""
     root = _configured_project_root(scheduler)
     return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
+
+
+_PROJECT_ID_PLACEHOLDER: str = '<project_id>'
+
+
+def _configured_project_id(scheduler) -> str | None:
+    """The scheduler's configured fused-memory project_id, or None if unusable.
+
+    Never raises, for the reason ``_configured_project_root`` gives.
+    """
+    fused_memory = getattr(getattr(scheduler, 'config', None), 'fused_memory', None)
+    project_id = getattr(fused_memory, 'project_id', None)
+    if isinstance(project_id, str) and project_id.strip():
+        return project_id.strip()
+    return None
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
@@ -737,6 +756,42 @@ def build_gate_escalation_fields(
     )
 
 
+async def read_human_gate_facts(
+    scheduler, task: dict | None, metadata: dict,
+) -> HumanGateFacts | None:
+    """The facts a human gate's escalation needs; ``None``, unread, for any other gate.
+
+    Both producers call it before :func:`build_gate_escalation_fields`, so
+    they cannot read the project or the completion gate differently.
+    """
+    if not isinstance(human_gate_chain(metadata), TriggerChain):
+        return None
+    return HumanGateFacts(
+        project_id=_configured_project_id(scheduler) or _PROJECT_ID_PLACEHOLDER,
+        project_root=_snippet_project_root(scheduler),
+        completion_gate=await _read_completion_gate(scheduler, task or {}),
+    )
+
+
+async def _read_completion_gate(scheduler, task: dict) -> dict | CompletionGateUnread | None:
+    """The first dependency that is a completion gate; else the first failed read; else None."""
+    first_unread: CompletionGateUnread | None = None
+    for dep_id in _dependency_ids(task):
+        try:
+            read = await scheduler.read_task(dep_id)
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s dependency %s read raised %s: %s',
+                task.get('id'), dep_id, type(exc).__name__, exc,
+            )
+            read = TaskReadFailed(f'{type(exc).__name__}: {exc}')
+        if isinstance(read, TaskFound) and is_completion_gate(read.task):
+            return read.task
+        if isinstance(read, TaskReadFailed) and first_unread is None:
+            first_unread = CompletionGateUnread(task_id=dep_id, reason=read.reason)
+    return first_unread
+
+
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
 
@@ -796,8 +851,10 @@ class DeterministicRunner:
             ``deterministic.predicate_recheck_stall_cap``; the default is
             ``orchestrator.config.PREDICATE_RECHECK_STALL_CAP``.
         clock: Optional callable ``() -> datetime`` (aware, UTC) timing a
-            predicate check: the re-arm, its streak record and the verdict
-            filer's ``gate_escalated_at``.  Defaults to ``datetime.now(UTC)``.
+            predicate check (the re-arm, its streak record and the verdict
+            filer's ``gate_escalated_at``) and a pure gate's filing (its
+            ``gate_escalated_at`` and ``review_due.fired_at``).  Defaults to
+            ``datetime.now(UTC)``.
             Injected in tests for exact ``milestone.at`` assertions.
     """
 
@@ -1925,9 +1982,10 @@ class DeterministicRunner:
             )
         else:
             # The shared builder, so strand recovery re-files the same gate.
+            human_gate = await read_human_gate_facts(self.scheduler, task, metadata)
             esc_id = self.escalation_queue.make_id(task_id)
             fields = build_gate_escalation_fields(
-                task, metadata, None, escalation_id=esc_id, fired_at=now_iso,
+                task, metadata, human_gate, escalation_id=esc_id, fired_at=now_iso,
             )
             esc = Escalation(
                 id=esc_id,

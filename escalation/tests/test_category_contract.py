@@ -27,7 +27,6 @@ from escalation.server import create_server
 
 _REGISTERED_AHEAD_OF_ANY_PRODUCER = (
     'milestone_check_stalled',
-    'review_due',
 )
 
 _AGENT_INSTRUCTED = (
