@@ -13,11 +13,11 @@ import ast
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from escalation.classify import INFO_L0_MECHANICAL_ROLES
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # rglob()s and ast.parse()s every *.py under the orchestrator src tree, so this
-# module belongs to the whole-tree-scanner family (_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+# module belongs to the whole-tree-scanner family (shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ORCH_SRC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'orchestrator'

@@ -65,7 +65,7 @@ from _merge_lane_ratchet_fixtures import (
     source_measures,
     synthetic_report,
 )
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (8 CLUSTER_PATHS entries, one
 # of them a glob), plus every *.py under orchestrator/tests/ (one pass,
@@ -92,8 +92,8 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # The 60s ini default would be a coin flip, and pytest-timeout's thread method
 # enforces it by os._exit()ing the xdist worker -- which with
 # --max-worker-restart=0 truncates the whole session and reports against an
-# innocent test (esc-3980-1). See WHOLE_TREE_SCAN_TEST_TIMEOUT in
-# _orch_helpers.py. That mark is PER ITEM and the slowest single item has always
+# innocent test (esc-3980-1). See
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT. That mark is PER ITEM and the slowest single item has always
 # sat far below it, so it was never the thing at risk here.
 #
 # NOTE this mark is deliberate and NOT compelled by the family guard

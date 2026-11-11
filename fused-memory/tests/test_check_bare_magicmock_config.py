@@ -1255,7 +1255,7 @@ class TestRuleBIsUnconditional:
 
 
 # Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
-# whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# whole minute. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
 
 # Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
@@ -1279,7 +1279,7 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     """The scan classes' items resolve the repo-scan ceiling; this module's unit tests do not.
 
     Reads get_closest_marker on the collected items, which is what pytest-timeout
-    reads. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    reads. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
     """
     scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
     scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]

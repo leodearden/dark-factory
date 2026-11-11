@@ -327,12 +327,12 @@ def reexport_names_in_tree(tree: ast.Module) -> list[str]:
 # instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
 # roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
 # the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
-# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
+# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), and
 # exceeding it does not merely fail the test: pytest-timeout's thread method
 # os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
 # ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
-# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
-# WHOLE_TREE_SCAN_TEST_TIMEOUT).
+# / esc-3787-1 mode documented at
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
 #
 # The tuples are the source of truth; the human-readable specifier is derived
 # from them, so the message and the check can never disagree. The same string

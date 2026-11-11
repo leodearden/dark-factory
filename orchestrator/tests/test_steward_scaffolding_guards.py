@@ -59,15 +59,15 @@ from unittest.mock import MagicMock
 import pytest
 from _orch_helpers import (
     MOCK_WORKFLOW_PROJECT_ROOT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
     assert_sandboxed_project_root,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Both AST guards below rglob() every *.py under orchestrator/tests/ and
 # ast.parse() each one, which is the family the pyproject default 60s timeout is
 # too tight for under `-n auto`. WHY the ceiling is a shared constant rather than
 # a hand-picked literal, and the guard that ENFORCES this mark: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

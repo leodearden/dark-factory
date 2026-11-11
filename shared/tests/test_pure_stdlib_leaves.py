@@ -113,6 +113,7 @@ PURE_STDLIB_LEAVES = (
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'whole_tree_guard_family',
 )
 
 # Child program: snapshot sys.modules, import argv[1], report the top-level
