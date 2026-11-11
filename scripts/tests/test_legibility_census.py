@@ -11531,3 +11531,133 @@ def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified
     persisted = codebook.load(kwargs["codebook_path"])
     assert _persisted_record(kwargs, "cand-20260701-1")["disposition"] == "promoted"
     assert codebook.validate(persisted) == []
+
+
+# ---------------------------------------------------------------------------
+# task 6750: filing pairs a cluster with a withheld entry, and counts the
+# sessions it is gated at, by the id of the record it landed on.
+# ---------------------------------------------------------------------------
+
+_PAIRING_TITLE = "A withheld cause and a fresh one share a title"
+
+
+def _pairing_response(prompt, model):
+    if "fresh-twin" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _PAIRING_TITLE,
+            "cause": "A fresh cause under an old title.",
+            "area": "orchestrator",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "evidence_quote": "the fresh shape",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def _withheld_entry(entry_id: str, title: str, sessions: tuple[str, ...]) -> dict:
+    return {
+        **_promoted_entry(),
+        "id": entry_id,
+        "title": title,
+        codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
+        "sightings": [_earlier_sighting(session) for session in sessions],
+    }
+
+
+def _fixed_twin_entry(title: str) -> dict:
+    """A fixed entry of *title*, so a re-mined cluster of it is surfaced and verified."""
+    return {**_promoted_entry(), "id": "entry-fixed-twin", "title": title, "status": "fixed"}
+
+
+def _pairing_kwargs(tmp_path, cb, *, verify_fn, batch=("fresh-twin",)):
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_pairing_response),
+        batch_source=[[_hand_digest(session, "a mined shape") for session in batch]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=cb,
+    )
+
+
+def test_a_cluster_promoted_to_its_own_entry_leaves_a_same_title_withheld_entry_withheld(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"] += [_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)), _fixed_twin_entry(_PAIRING_TITLE)]
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    fresh = _candidate_titled(persisted, _PAIRING_TITLE)
+    assert fresh["disposition"] == "promoted"
+    entries = {entry["id"]: entry for entry in persisted["entries"]}
+    assert [row["ticket"] for row in entries[fresh["promoted_to"]]["filed_tickets"]] == ["tkt_1"]
+    withheld = entries["entry-withheld"]
+    assert withheld[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    assert "filed_tickets" not in withheld
+    assert outcome.released_entry_ids == ()
+    assert codebook.validate(persisted) == []
+
+
+def test_a_dropped_verdict_on_a_withheld_entrys_own_candidate_releases_that_entry(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"] += [_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)), _fixed_twin_entry(_PAIRING_TITLE)]
+    cb["candidates"].append({
+        "id": "cand-20260701-1", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+        "disposition": "promoted", "promoted_to": "entry-withheld", "sightings": [_earlier_sighting("s-withheld")],
+    })
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert _one_dropped(outcome).standing_id == "cand-20260701-1"
+    assert outcome.released_entry_ids == ("entry-withheld",)
+    persisted = _persisted_record(kwargs, "entry-withheld")
+    assert persisted[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+    assert [row["ticket"] for row in persisted["filed_tickets"]] == ["tkt_1"]
+
+
+def _rejected_twin(session: str) -> dict:
+    return {
+        "id": "cand-20260701-2", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+        "disposition": "rejected", "sightings": [_earlier_sighting(session)],
+    }
+
+
+def test_a_same_title_rejected_twins_session_does_not_file_a_fresh_singleton(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append(_fixed_twin_entry(_PAIRING_TITLE))
+    cb["candidates"] += [
+        {"id": "cand-20260701-1", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+         "disposition": "pending", "sightings": []},
+        _rejected_twin("s-extra"),
+    ]
+    kwargs = _pairing_kwargs(
+        tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}, remediation=None),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    promoted = _persisted_record(kwargs, "cand-20260701-1")
+    assert promoted["disposition"] == "promoted"
+    entry = _persisted_record(kwargs, promoted["promoted_to"])
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+
+
+def test_a_same_title_rejected_twins_session_does_not_release_a_withheld_entry(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append(_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)))
+    cb["candidates"].append(_rejected_twin("s-extra"))
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(), batch=("dup-1",))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.released_entry_ids == ()
+    assert kwargs["submit_fn"].calls == []
+    withheld = _persisted_record(kwargs, "entry-withheld")
+    assert withheld[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
