@@ -3394,31 +3394,38 @@ class TestSeededStalenessSweep:
     async def test_a_superseded_pair_and_a_dangling_pointer_are_both_reported(
         self, sweep_config, sweep_project_id, clean_sweep_collection, tmp_path,
     ):
+        """Seeded through the full open, swept through the read open the CLI takes."""
         from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
 
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         m = _mod()
-        memory = MemoryService(sweep_config)
-        await memory.initialize()
+        seeder = MemoryService(sweep_config)
+        await seeder.initialize()
         try:
-            predecessor = await memory.add_memory(
+            predecessor = await seeder.add_memory(
                 SEED_PREDECESSOR, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
             )
             predecessor_id = predecessor.memory_ids[0]
-            successor = await memory.add_memory(
+            successor = await seeder.add_memory(
                 SEED_SUCCESSOR, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
                 metadata={'supersedes': [predecessor_id]},
             )
             successor_id = successor.memory_ids[0]
-            await memory.add_memory(
+            dangling = await seeder.add_memory(
                 SEED_DANGLING_SOURCE, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
                 metadata={'corrects': [NEVER_WRITTEN_UUID]},
             )
+            assert dangling.memory_ids
+        finally:
+            await seeder.close()
 
+        memory = MemoryService(sweep_config)
+        try:
+            await memory.initialize_for_reads()
             outcome = await m.run_sweep(
                 memory,
                 project_ids=(sweep_project_id,),
