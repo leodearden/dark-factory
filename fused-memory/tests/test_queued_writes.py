@@ -12,6 +12,7 @@ import dataclasses
 import json
 import pathlib
 import sys
+from collections.abc import MutableMapping
 from datetime import UTC, datetime
 from typing import TypeVar
 
@@ -181,19 +182,18 @@ class TestFrozenRoundTrip:
             with pytest.raises(dataclasses.FrozenInstanceError):
                 setattr(value, field.name, None)
 
-    def test_the_envelope_and_referents_are_frozen(self):
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            ENVELOPE.write_op_id = 'other'  # type: ignore[misc]
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            REFERENTS.source = 'none'  # type: ignore[misc]
+    @pytest.mark.parametrize('frozen', [ENVELOPE, REFERENTS], ids=['envelope', 'referents'])
+    def test_the_envelope_and_referents_are_frozen(self, frozen):
+        for field in dataclasses.fields(frozen):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(frozen, field.name, None)
 
     def test_mem0_add_metadata_cannot_be_mutated_through_the_value(self):
         source = {'category': 'procedural_knowledge'}
         value = _mem0_add(metadata=source)
         source['category'] = 'changed'
         assert value.metadata['category'] == 'procedural_knowledge'
-        with pytest.raises(TypeError):
-            value.metadata['category'] = 'changed'  # type: ignore[index]
+        assert not isinstance(value.metadata, MutableMapping)
 
 
 class TestWireKeys:
