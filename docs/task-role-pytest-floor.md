@@ -18,9 +18,10 @@ The gate's evidence was all from `orchestrator`, and it had three parts:
 At task role the floor runs the diff's touched collectable tests plus the owning
 module's **whole-tree guard family**, as one FILE_SCOPED run. That family is
 every test module whose module-level `pytestmark` is
-`pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`, and
-`orchestrator/src/orchestrator/pytest_markers.py::is_whole_tree_guard_module`
-decides membership.
+`pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`. The family's single home
+is `shared/src/shared/whole_tree_guard_family.py`:
+`::is_whole_tree_guard_module` decides membership, and
+`::WHOLE_TREE_SCAN_TEST_TIMEOUT` is the ceiling the mark spells.
 
 The full-suite floor survives as the fallback in two cases:
 
@@ -28,6 +29,10 @@ The full-suite floor survives as the fallback in two cases:
 - the module's own `-m` deselects the entire narrowed selection.
 
 Its reason then ends ` — not narrowed: <why>`.
+
+Known gap: a module's family is enumerated from `<prefix>/tests` only, so the
+scripts leg's family is scripts/tests alone, and the marked tests/scripts guards
+do not run at task role (ticket tkt_0RWM5TWWA72QYKZSZVSF3RCZDY).
 
 Merge role is unchanged. Under `merge_verify_breadth: full` the merge gate still
 runs the full suite.
@@ -38,11 +43,19 @@ runs the full suite.
   cross-consumer red is caught. It does not change whether the red is caught.
 - **The only measured task-role catch was a guard test**, and the guard family
   still runs.
-- **Scanners ⊆ family is enforced.**
+- **Scanners ⊆ family is enforced**, by two mechanisms. For orchestrator,
   `orchestrator/tests/test_whole_tree_scan_timeout_guard.py` turns red on any
   detected `rglob`/`glob('*.py')` scanner that `is_whole_tree_guard_module`
-  does not admit. Without that check a new scanner would silently drop out of
-  task-role verify.
+  does not admit. For fused-memory, shared, scripts/tests and tests/scripts,
+  each tree's `test_repo_wide_guard_family.py` instance of
+  `shared/src/shared/testing_repo_wide_tests.py::judge_repo_wide_family` turns
+  red on any repo-wide test module outside the family. Without these checks a
+  new scanner would silently drop out of task-role verify.
+- **Each leg narrows on the real tree.**
+  `tests/scripts/test_task_role_floor_narrows_every_leg.py` derives the
+  task-role plan of the orchestrator, shared, fused-memory and scripts legs
+  from the real module configs, and pins that none of them falls back to the
+  full suite.
 - **Coverage stays monotone in the diff.** A co-committed test only adds a
   target. That is the property task 3294 restored.
 
