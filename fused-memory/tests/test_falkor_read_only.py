@@ -400,7 +400,7 @@ class TestOpening:
             and (getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)) == 'FalkorDriver'
         ]
         assert calls == []
-        assert _driver_loading_imports(source, package=falkor_read_only.__package__) == []
+        assert _driver_loading_imports(source, package=falkor_read_only.__name__.rpartition('.')[0]) == []
 
     @pytest.mark.parametrize(
         'source',
