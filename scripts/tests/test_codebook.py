@@ -604,7 +604,7 @@ def test_merge_different_candidate_same_day_increments_id():
 
 def _codebook_with_adjudicated_candidate(disposition: str) -> dict:
     """A v2 codebook carrying exactly one already-adjudicated candidate —
-    the shape `census.reject_candidate`/`promote_candidate` leave behind."""
+    the shape `codebook_lifecycle.reject_candidate`/`promote_candidate` leave behind."""
     codebook = _codebook_with_entry_a()
     codebook["candidates"] = [
         {
@@ -670,7 +670,7 @@ def test_merge_does_not_duplicate_promoted_candidate():
 
 def test_merge_routes_promoted_recurrence_to_its_entry():
     """A promoted candidate's `sightings` list is a DEAD field for new
-    signal: `census.promote_candidate` deep-copies it into the new entry
+    signal: `codebook_lifecycle.promote_candidate` deep-copies it into the new entry
     once, at promotion time, and nothing re-reads it afterwards (the matrix
     path and the codebook index both read ENTRY sightings). So a recurrence
     of a promoted title must land on the entry named by `promoted_to` and

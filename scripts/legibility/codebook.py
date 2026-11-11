@@ -1022,7 +1022,8 @@ def _apply_coding_record(
     - `promoted` with a `promoted_to` naming an existing entry → the
       sighting is appended to THAT ENTRY (session-deduped, counted in
       `matched`, exactly like the match path). A promoted candidate's own
-      `sightings` list is a dead field: census.promote_candidate deep-copies
+      `sightings` list is a dead field:
+      `scripts/legibility/codebook_lifecycle.py::promote_candidate` deep-copies
       it into the new entry once at promotion time and nothing re-reads it
       afterwards, so filing a recurrence there would lose the signal while
       reporting it preserved.
@@ -1063,18 +1064,15 @@ def _apply_coding_record(
     WARNING names the entry and session — distinguishing it from the silent,
     correct no-op of re-applying an already-merged record.
 
-    `status` remains census-owned for lifecycle transitions
-    (`scripts/legibility/census.py::retire_entry`); a correction writing it
-    is an operator adjudication CARRIED BY the record, not a
-    merger-initiated transition.
+    Machine lifecycle transitions of `status` and `disposition` go through
+    the legal-transition table, `scripts/legibility/codebook_lifecycle.py::TABLE`.
+    A `corrections` status write is outside it: an operator adjudication
+    CARRIED BY the record, not a merger-initiated transition.
 
-    Never-resurrect: the merger must never re-open a census verdict. Only
-    the census writes `disposition` (census.py promote_candidate/
-    reject_candidate), so an adjudicated-title collision leaves that field
-    untouched and surfaces itself via `candidate_disposition_conflicts`
-    rather than by manufacturing a byte-identical-title pending record —
-    which is precisely how rejected `cand-20260722-28` reappeared as
-    pending `cand-20260724-2` in the live registry.
+    Never-resurrect: the merger never writes `disposition`, so an
+    adjudicated-title collision leaves it untouched and surfaces via
+    `candidate_disposition_conflicts` rather than a byte-identical-title
+    pending twin (task 4144).
     """
     matched = candidates_applied = candidate_disposition_conflicts = 0
     corrections_applied = correction_skipped = skipped_unknown_entry = 0

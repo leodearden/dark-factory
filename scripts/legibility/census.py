@@ -2031,22 +2031,13 @@ def _dropped_verdict_message(record: DroppedVerdict) -> str:
 def _report_dropped_verdicts(
     records: list[DroppedVerdict], *, disposition_conflicts: int = 0,
 ) -> None:
-    """Announce the run's dropped verdicts: one WARNING per record, then ONE
-    run-summary line sizing the total.
+    """Announce the run's dropped verdicts: one WARNING per record, naming its
+    standing candidate, then ONE run-summary line sizing the total, emitted
+    only when either count is non-zero.
 
-    Emitted only when there is something to say -- silence on a clean run
-    keeps the summary informative rather than skimmable. The per-record lines
-    say WHICH titles; the summary says how much of the run went nowhere.
-
-    *disposition_conflicts* is the run's accumulated
-    ``candidate_disposition_conflicts`` from ``codebook.apply_coding_records``
-    -- the MERGER's view of the same underlying situation the dropped verdicts
-    are this loop's view of. It rides the same line rather than a second one
-    because an operator reading a journal wants the two numbers side by side:
-    they are computed by different code over the same run, and a disagreement
-    between them is itself the signal. The line is emitted when EITHER tally is
-    non-zero, so a conflict the adjudication loops never reached is not
-    silently dropped in turn."""
+    *disposition_conflicts* is the merge's ``candidate_disposition_conflicts``,
+    its count of payloads routed to a standing candidate; it rides the same
+    line so the two counts read side by side."""
     for record in records:
         logger.warning("census: %s", _dropped_verdict_message(record))
     if not records and not disposition_conflicts:
@@ -2506,14 +2497,14 @@ def run_census(
     re-mined by the next run. The outcome's ``deferred_stage``/``unverified_clusters`` tell the two
     apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
-    split records into duplicates vs novel clusters -> the pre-screen
-    (``prescreen.screen``: a title or session already catalogued is not
-    verified) -> ``verify_fn``
+    the pre-screen (``prescreen.screen``: a title or session already
+    catalogued is not verified) -> merge the routed batch via
+    ``codebook.apply_coding_records``, purely, and group the payloads left to
+    verify by the candidate id each resolved to -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
-    diagnoses -- lesson guards-assert-unverified-diagnoses) ->
-    merge every mining record via ``codebook.apply_coding_records`` -> apply
-    ``promote_candidate``/``reject_candidate`` for verified/rejected
-    clusters (resolved to the merge's real candidate ids by title; a
+    diagnoses -- lesson guards-assert-unverified-diagnoses) -> apply
+    ``codebook_lifecycle.promote_candidate``/``reject_candidate`` to the
+    candidate each reply names by ``CANDIDATE_KEY`` (a
     promoted entry takes the cluster Verdict's severity and severity_reason,
     and a verified cluster *verify_fn* returned without a Verdict gets the
     verdict parser's defaults) and ``retire_entry`` for any entry ids
@@ -2630,13 +2621,11 @@ def run_census(
     (``--max-verify-clusters``) to the first N novel clusters the pre-screen
     leaves, in mining order; the similarity queue and then the re-verifies
     take only what the novel clusters leave of it. Selection is a plain
-    ``[:N]`` slice of ``_novel_clusters``'s own first-occurrence-wins
-    ordering -- deterministic given the run, with no invented "most important first" heuristic (any such ranking
+    ``[:N]`` slice in first-payload order -- deterministic given the run,
+    with no invented "most important first" heuristic (any such ranking
     would need a signal the census does not have pre-verification). The
-    deferred remainder is NOT dropped: the codebook merge below consumes
-    every mining record (``prescreen.screen``'s routed batch), not the verified clusters, so a
-    deferred cluster still lands as a ``pending`` candidate that
-    ``codebook.py::pending_titled`` can resolve later. That later pickup is
+    deferred remainder is NOT dropped: the merge already holds each deferred
+    cluster's candidate as ``pending``. A later pickup is
     CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
     so a deferred cluster is re-adjudicated only if the same confusion
     RECURS. What a deferred cluster
