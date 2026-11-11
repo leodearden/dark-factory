@@ -160,7 +160,7 @@ class RouterRun:
         self, tmp_path: Path, monkeypatch, reviewer: DispositioningReviewer, *,
         briefing: ReviewBriefing = ReviewBriefing.DIFF_ONLY, router_enabled: bool = True,
         queue: EscalationQueue | None = None, scheduler: FakeScheduler | None = None,
-        merge_queue: object | None = None, steward_factory: type | None = None,
+        merge_queue: asyncio.Queue | None = None, steward_factory: type | None = None,
     ) -> None:
         repo = tmp_path / 'repo'
         repo.mkdir(parents=True)
