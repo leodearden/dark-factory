@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -12,9 +13,10 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 from shared import safe_io
 from shared.plan_deviation import DeviationRecord
@@ -35,21 +37,6 @@ PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
 ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
 """The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
-
-
-def _plan_stamp(plan: Mapping[str, object], key: str) -> str | None:
-    stamped = plan.get(key)
-    return stamped if isinstance(stamped, str) and stamped else None
-
-
-def plan_base_commit(plan: Mapping[str, object]) -> str | None:
-    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
-    return _plan_stamp(plan, PLAN_BASE_COMMIT_KEY)
-
-
-def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
-    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
-    return _plan_stamp(plan, PLAN_TASK_TEXT_FP_KEY)
 
 
 def iteration_entry_written_by_orchestrator(entry: object) -> bool:
@@ -299,6 +286,212 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
             modified = True
 
     return plan, modified
+
+
+class PlanState(StrEnum):
+    SHELL = 'shell'
+    PARTIAL = 'partial'
+    CONFIRMED = 'confirmed'
+    STAMPED = 'stamped'
+
+
+class PlanConfirmation(StrEnum):
+    ARCHITECT = 'architect'
+    INJECTED = 'injected'
+
+
+_LIFECYCLE_KEYS: Mapping[str, str] = MappingProxyType({
+    'session_id': '_session_id',
+    'created_at': '_created_at',
+    'confirmed_at': '_finalized_at',
+    'confirmed_by': '_confirmed_by',
+    'revalidated_at': '_revalidated_at',
+    'revalidated_by_session': '_revalidated_by_session',
+    'task_text_fp': PLAN_TASK_TEXT_FP_KEY,
+    'base_commit': PLAN_BASE_COMMIT_KEY,
+    'schema_version': '_schema_version',
+})
+_LIFECYCLE_DISK_KEYS = frozenset(_LIFECYCLE_KEYS.values())
+_STR_LIFECYCLE_FIELDS = tuple(name for name in _LIFECYCLE_KEYS if name not in ('confirmed_by', 'schema_version'))
+
+
+def _malformed_lifecycle(name: str, value: object, requirement: str) -> ValueError:
+    return ValueError(f'PlanLifecycle.{name} {requirement}; got {value!r}')
+
+
+@dataclass(frozen=True)
+class PlanLifecycle:
+    """The typed lifecycle markers of a plan document; a field is None when absent on disk."""
+
+    session_id: str | None = None
+    created_at: str | None = None
+    confirmed_at: str | None = None
+    confirmed_by: PlanConfirmation | None = None
+    revalidated_at: str | None = None
+    revalidated_by_session: str | None = None
+    task_text_fp: str | None = None
+    base_commit: str | None = None
+    schema_version: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in _STR_LIFECYCLE_FIELDS:
+            value = getattr(self, name)
+            if value is not None and not (isinstance(value, str) and value):
+                raise _malformed_lifecycle(name, value, 'must be a non-empty str or None')
+        if self.confirmed_by is not None:
+            if not isinstance(self.confirmed_by, PlanConfirmation):
+                raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'must be a PlanConfirmation or None')
+            if self.confirmed_at is None:
+                raise _malformed_lifecycle('confirmed_by', self.confirmed_by, 'is set without confirmed_at')
+        version = self.schema_version
+        if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
+            raise _malformed_lifecycle('schema_version', version, 'must be an int (not a bool) or None')
+
+    @property
+    def confirmation(self) -> PlanConfirmation | None:
+        """Who confirmed the plan; a legacy marker with no confirmer reads as the architect."""
+        if self.confirmed_at is None:
+            return None
+        return self.confirmed_by or PlanConfirmation.ARCHITECT
+
+    def owned_by(self, session_id: str) -> bool:
+        """Whether *session_id* planned this plan or last revalidated it."""
+        return session_id in (self.session_id, self.revalidated_by_session)
+
+    def markers_present(self) -> tuple[str, ...]:
+        """The on-disk keys of the fields that are set, sorted."""
+        return tuple(sorted(key for name, key in _LIFECYCLE_KEYS.items() if getattr(self, name) is not None))
+
+
+def _parse_marker(name: str, value: object) -> object:
+    if name == 'schema_version':
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if not (isinstance(value, str) and value):
+        return None
+    if name == 'confirmed_by':
+        try:
+            return PlanConfirmation(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _parse_lifecycle(data: Mapping[str, object]) -> tuple[PlanLifecycle, frozenset[str]]:
+    """The typed lifecycle of *data*, and the lifecycle-named keys whose values are malformed."""
+    fields: dict[str, Any] = {}
+    malformed: set[str] = set()
+    for name, key in _LIFECYCLE_KEYS.items():
+        if key not in data:
+            continue
+        value = _parse_marker(name, data[key])
+        if value is None:
+            malformed.add(key)
+        else:
+            fields[name] = value
+    if 'confirmed_by' in fields and 'confirmed_at' not in fields:
+        del fields['confirmed_by']
+        malformed.add(_LIFECYCLE_KEYS['confirmed_by'])
+    return PlanLifecycle(**fields), frozenset(malformed)
+
+
+def plan_base_commit(plan: Mapping[str, object]) -> str | None:
+    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
+    return _parse_lifecycle(plan)[0].base_commit
+
+
+def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
+    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
+    return _parse_lifecycle(plan)[0].task_text_fp
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _is_step_list(value: object) -> bool:
+    return isinstance(value, (list, tuple)) and all(isinstance(step, Mapping) for step in value)
+
+
+def _freeze_steps(steps: list | tuple) -> tuple[Mapping[str, Any], ...]:
+    return tuple(MappingProxyType(_plain(step)) for step in steps)
+
+
+def _freeze_body(body: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _plain(value) for key, value in body.items()})
+
+
+class PlanNotConfirmed(ValueError):
+    """A lifecycle move that needs a confirmed plan met a plan in another state."""
+
+    def __init__(self, *, task_id: object, state: PlanState, markers: tuple[str, ...], action: str) -> None:
+        self.task_id = task_id
+        self.state = state
+        self.markers = markers
+        self.action = action
+        super().__init__(
+            f'cannot {action} the plan of task {task_id!r}: its state is {state.value!r}, '
+            f'not confirmed; lifecycle markers present: {list(markers)}'
+        )
+
+
+@dataclass(frozen=True)
+class Plan:
+    """One plan.json document: the typed lifecycle, the steps, and every other key verbatim."""
+
+    lifecycle: PlanLifecycle
+    steps: tuple[Mapping[str, Any], ...]
+    body: Mapping[str, Any]
+    key_order: tuple[str, ...] = field(default=(), compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        shadowed = sorted(set(self.lifecycle.markers_present()) & set(self.body))
+        if shadowed:
+            raise ValueError(f'Plan body repeats lifecycle keys its lifecycle sets: {shadowed}')
+        if 'steps' in self.body and (self.steps or _is_step_list(self.body['steps'])):
+            raise ValueError("Plan body holds 'steps' that belong in the steps tuple")
+
+    @property
+    def state(self) -> PlanState:
+        if not self.steps:
+            return PlanState.SHELL
+        if self.lifecycle.confirmed_at is None:
+            return PlanState.PARTIAL
+        if self.lifecycle.session_id is None:
+            return PlanState.CONFIRMED
+        return PlanState.STAMPED
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> Plan:
+        if not isinstance(data, Mapping):
+            raise TypeError(f'a plan document must be a mapping, not {type(data).__name__}')
+        lifecycle, malformed = _parse_lifecycle(data)
+        typed_steps = _is_step_list(data.get('steps'))
+        body = {
+            key: value for key, value in data.items()
+            if (key not in _LIFECYCLE_DISK_KEYS or key in malformed) and not (key == 'steps' and typed_steps)
+        }
+        return cls(
+            lifecycle=lifecycle,
+            steps=_freeze_steps(data['steps']) if typed_steps else (),
+            body=_freeze_body(body),
+            key_order=tuple(data),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        fresh = {key: _plain(value) for key, value in self.body.items()}
+        if 'steps' not in fresh and (self.steps or 'steps' in self.key_order):
+            fresh['steps'] = [_plain(step) for step in self.steps]
+        for name, key in _LIFECYCLE_KEYS.items():
+            value = getattr(self.lifecycle, name)
+            if value is not None:
+                fresh[key] = value.value if isinstance(value, PlanConfirmation) else value
+        document = {key: fresh[key] for key in self.key_order if key in fresh}
+        document.update(fresh)
+        return document
 
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
