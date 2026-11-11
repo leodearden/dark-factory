@@ -717,9 +717,9 @@ class TestTheFloorSectionFollowsTheRuleTheGateApplies:
         A min_budget guess would print 9200 for orchestrator; a D17 guess would
         reproduce task 7929's defect for every other module.
         """
-        import sys  # noqa: PLC0415
+        import sys
 
-        import verify_budget_census as mod  # noqa: PLC0415
+        import verify_budget_census as mod
 
         no_records = tmp_path / 'no-records'
         no_records.mkdir()
