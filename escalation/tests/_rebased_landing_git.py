@@ -141,3 +141,41 @@ def add_unlanded_branch(root: Path, task_id: str) -> str:
     git(root, 'checkout', 'main')
     commit(root, 'chore: unrelated work by another task', f'unrelated-{task_id}.txt')
     return tip
+
+
+def add_net_empty_branch(root: Path, task_id: str) -> str:
+    """Add a live ``task/<task_id>`` whose commits cancel out; return its tip.
+
+    The branch commits work and then reverts it, and main advances by one
+    unrelated commit.  The tip is neither main's tip nor an ancestor of it,
+    and its net diff from the merge base is empty.
+    """
+    branch = f'task/{task_id}'
+    git(root, 'checkout', '-b', branch, 'main')
+    work = commit(root, f'impl({task_id}): work', f'work-{task_id}.txt')
+    git(root, 'revert', '--no-edit', work)
+    tip = git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', 'main')
+    commit(root, 'chore: unrelated work by another task', f'unrelated-{task_id}.txt')
+    return tip
+
+
+def add_main_merged_branch(root: Path, task_id: str, *, earlier_citation: bool) -> str:
+    """Add a live ``task/<task_id>`` holding only a ``--no-ff`` merge of main.
+
+    Returns the branch's creation point, which a dispatched task records as
+    ``branch_base_sha``.  main advances past that point first, by a commit
+    citing the task (an earlier round's) when *earlier_citation*, then by an
+    unrelated commit.  The branch has no non-merge commit of its own, so
+    ``git cherry main task/<task_id>`` prints nothing.
+    """
+    branch = f'task/{task_id}'
+    base = git(root, 'rev-parse', 'main')
+    git(root, 'branch', branch, base)
+    if earlier_citation:
+        commit(root, f'impl({task_id}): earlier round', f'earlier-{task_id}.txt')
+    commit(root, 'chore: unrelated work by another task', f'unrelated-{task_id}.txt')
+    git(root, 'checkout', branch)
+    git(root, 'merge', '--no-ff', '-m', f'Merge main into {branch}', 'main')
+    git(root, 'checkout', 'main')
+    return base

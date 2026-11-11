@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _rebased_landing_git import (
+    add_main_merged_branch,
+    add_net_empty_branch,
     add_unlanded_branch,
     build_rebased_solo_landing,
     new_repo,
@@ -886,13 +888,19 @@ def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def _probe_repo(repo: Path, tid: str) -> GitAuthorityVerdict:
-    """Probe *tid*'s branch in the real repo at *repo*, metadata read healthy and empty."""
+async def _probe_repo(
+    repo: Path, tid: str, *, metadata: dict[str, Any] | None = None, read_raises: bool = False,
+) -> GitAuthorityVerdict:
+    """Probe *tid*'s branch in the real repo at *repo*.
+
+    The task read answers *metadata* (none by default), or raises when
+    *read_raises*.
+    """
     from orchestrator.git_ops import GitOps
     config = _config(repo)
     return await probe_landing(
-        GitOps(config.git, repo), tid,
-        orch_config=config, harness=_harness(read=TaskFound({'metadata': {}})),
+        GitOps(config.git, repo), tid, orch_config=config,
+        harness=_harness(read=TaskFound({'metadata': metadata or {}}), raises=read_raises),
     )
 
 
@@ -952,11 +960,13 @@ class TestProbeLandingPatchIdArm:
         assert verdict.reason == 'not_landed'
 
     async def test_commit_added_after_the_landing_is_no_signal(self, tmp_path: Path) -> None:
-        """The arm errs only towards under-reporting.
+        """A branch commit main lacks keeps the arm from answering found_on_main.
 
-        A branch commit main lacks reads '+' in ``git cherry``, and so does a
-        genuine landing whose context drifted (task 6936).  Either way the
-        answer is ``no_signal``, never ``found_on_main``.
+        Such a commit reads '+' in ``git cherry``, and so does a genuine
+        landing whose context drifted (task 6936).  Either way the answer is
+        ``no_signal``: here the arm under-reports.  It can also over-report,
+        when ``git cherry`` prints nothing at all; see
+        ``test_main_merged_into_branch_with_recorded_base_is_not_a_landing``.
         """
         landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
         landing_git(landing.repo, 'checkout', 'task/6978')
@@ -1017,6 +1027,96 @@ class TestProbeLandingPatchIdArm:
         assert verdict.reason == 'git_error'
         assert 'landed_reconciler' in caplog.text
         assert 'merge_status' not in caplog.text
+
+    async def test_a_metadata_fault_reaches_accept_and_reject_verdicts(
+        self, tmp_path: Path,
+    ) -> None:
+        landed = build_rebased_solo_landing(tmp_path / 'landed', '6978', cited=True)
+        unlanded = tmp_path / 'unlanded'
+        new_repo(unlanded)
+        add_unlanded_branch(unlanded, '6978')
+
+        accepted = await _probe_repo(landed.repo, '6978', read_raises=True)
+        rejected = await _probe_repo(unlanded, '6978', read_raises=True)
+
+        assert accepted.outcome is GitAuthorityOutcome.found_on_main, accepted
+        assert rejected.outcome is GitAuthorityOutcome.no_signal, rejected
+        assert accepted.arm is rejected.arm is GitAuthorityArm.patch_id
+        assert accepted.metadata_unavailable is True
+        assert rejected.metadata_unavailable is True
+
+    async def test_a_net_empty_branch_is_a_no_op_landing_and_no_signal(
+        self, tmp_path: Path,
+    ) -> None:
+        """The empty-net-diff guard stands between vacuous containment and ``done``."""
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        add_net_empty_branch(repo, '6978')
+
+        verdict = await _probe_repo(repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.reason == 'no_op_landing'
+        assert verdict.merge_sha is None
+
+    async def test_a_degenerate_branch_is_no_signal(self, tmp_path: Path) -> None:
+        """A tip still equal to the recorded ``branch_base_sha`` delivered nothing."""
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        tip = add_unlanded_branch(repo, '6978')
+
+        verdict = await _probe_repo(repo, '6978', metadata={'branch_base_sha': tip})
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.reason == 'degenerate_branch'
+
+    async def test_main_merged_into_branch_without_recorded_base_is_a_no_op_landing(
+        self, tmp_path: Path,
+    ) -> None:
+        """``git cherry`` prints nothing here, and the no-op guard catches it.
+
+        With no recorded base the guard measures from merge-base(main, tip),
+        which is main's tip, and the branch adds nothing beyond it.
+        """
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        add_main_merged_branch(repo, '6978', earlier_citation=True)
+
+        verdict = await _probe_repo(repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.reason == 'no_op_landing'
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            'branch_work_landed reads empty git cherry output as contained, and with a '
+            "recorded branch_base_sha its no-op guard measures base..tip, which holds main's "
+            'changes, so the verdict is landed at the earlier citing commit. Follow-up ticket '
+            'tkt_0RWW0SXKJP4TV6YV4GZ235YX8Q (landing_evidence.py) removes this marker.'
+        ),
+    )
+    async def test_main_merged_into_branch_with_recorded_base_is_not_a_landing(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same branch, with the creation point every dispatched task records.
+
+        None of the task's work is on main beyond an earlier round's citing
+        commit, so the right answer is no landing.  Today the producer
+        answers ``found_on_main`` at that earlier commit, reported as fully
+        guarded: an over-report, documented as residual (b) in
+        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
+        """
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        base = add_main_merged_branch(repo, '6978', earlier_citation=True)
+
+        verdict = await _probe_repo(repo, '6978', metadata={'branch_base_sha': base})
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
 
 
 class TestGitAuthorityVerdict:
