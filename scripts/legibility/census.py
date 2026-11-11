@@ -1474,19 +1474,31 @@ def _payload_cluster(session: str | None, payload: Mapping[str, Any]) -> dict:
     )
 
 
-def _screened_clusters(screen: prescreen.Screen) -> tuple[list[dict], list[dict]]:
+def _screened_clusters(
+    screen: prescreen.Screen, merge: codebook.MergeResult,
+) -> tuple[dict[str, dict], dict[str, dict]]:
     """The clusters *screen* leaves to verify and the uncatalogued ones among
-    them, one per distinct title, first occurrence first. A stand-in that keeps
-    verdicts title-resolvable until clusters are grouped by candidate id."""
-    by_ref: dict[codebook.PayloadRef, dict] = {}
+    them, one per distinct title, first occurrence first, each under the
+    candidate id *merge* resolved its payload to. A stand-in that keeps
+    verdicts title-resolvable until clusters are grouped by candidate id: a
+    payload the merge skipped is verified under a provisional id and never
+    offered to the similarity stage."""
+    to_verify: dict[str, dict] = {}
+    resolved: dict[codebook.PayloadRef, str] = {}
     seen_titles: set[str] = set()
     for ref in screen.to_verify:
         record = screen.records[ref.record]
         payload = record["candidates"][ref.candidate]
-        if payload["title"] not in seen_titles:
-            seen_titles.add(payload["title"])
-            by_ref[ref] = _payload_cluster(record.get("session"), payload)
-    return list(by_ref.values()), [by_ref[ref] for ref in screen.uncatalogued if ref in by_ref]
+        if payload["title"] in seen_titles:
+            continue
+        seen_titles.add(payload["title"])
+        resolution = merge.resolution_at(ref)
+        key = f"unmerged:{ref.record}:{ref.candidate}" if resolution is None else resolution.candidate_id
+        to_verify[key] = _payload_cluster(record.get("session"), payload)
+        if resolution is not None:
+            resolved[ref] = key
+    uncatalogued = {resolved[ref]: to_verify[resolved[ref]] for ref in screen.uncatalogued if ref in resolved}
+    return to_verify, uncatalogued
 
 
 def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
@@ -2875,14 +2887,17 @@ def run_census(
     # (prescreen.py::Screen.uncatalogued).
     catalogue = prescreen.Catalogue.of(codebook_dict)
     screen = prescreen.screen(mining_result.records, catalogue, run_id=run_id)
-    to_verify, uncatalogued = _screened_clusters(screen)
+    merge = codebook.apply_coding_records(
+        codebook_dict, screen.records, invariant_slugs=invariant_slugs,
+    )
+    to_verify, uncatalogued = _screened_clusters(screen, merge)
     session_screened = sum(1 for item in screen.screened if item.rule is prescreen.Rule.SESSION)
     view = similarity.build_view(
         codebook_dict, uncatalogued, embedder=embedder, settings=config.census.adjudication,
     )
     if view.skipped is not None:
         _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=escalate_fn)
-    novel_clusters = [cluster for cluster in to_verify if not view.screens(cluster)]
+    novel_clusters = [cluster for key, cluster in to_verify.items() if not view.screens(key)]
     if max_verify_clusters is None:
         clusters_to_verify = novel_clusters
         verify_coverage = None
@@ -2994,9 +3009,6 @@ def run_census(
     verified = [_with_finding(cluster, area_map) for cluster in verified]
     rejected = [_with_finding(cluster, area_map) for cluster in rejected]
 
-    merge = codebook.apply_coding_records(
-        codebook_dict, screen.records, invariant_slugs=invariant_slugs,
-    )
     updated_codebook = merge.codebook
     logger.info("census: merge: %s", merge.summary())
     if merge.skipped_deletions:
@@ -3007,14 +3019,7 @@ def run_census(
             "; ".join(skipped.describe() for skipped in merge.skipped_deletions),
         )
     codebook.warn_unknown_invariant_slugs(merge.invariant_slugs, invariant_slugs, run=run_id)
-    updated_codebook, attached, unattached = similarity.attach(updated_codebook, view, run_id=run_id)
-    if unattached:
-        logger.warning(
-            "census: %d similarity-screened cluster(s) had no pending candidate after the merge and "
-            "were neither attached nor verified: %s",
-            len(unattached),
-            "; ".join(repr(item.item.title) for item in unattached),
-        )
+    updated_codebook, attached = similarity.attach(updated_codebook, view, run_id=run_id)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -3167,7 +3172,7 @@ def run_census(
         screen, tuple(surfaced_by_key), tuple(key_attaches), tuple(re_observed), instrument_findings,
     )
     adjudication_report = similarity.AdjudicationReport(
-        view, attached, unattached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
+        view, attached, offered, adjudicated, queue.inconclusive, queue_mass_rejection is not None,
     )
 
     # Synthesis (plans/census-incremental-prd.md L10, C6) runs here, after the
