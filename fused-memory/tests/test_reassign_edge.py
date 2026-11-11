@@ -615,16 +615,28 @@ class TestReassignEdgeLiveFalkorDB:
             await backend.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('src', 'dst', 'entity_end'),
+        [
+            pytest.param('X', 'B', 'target', id='off-label-start'),
+            pytest.param('A', 'X', 'source', id='off-label-end'),
+        ],
+    )
     async def test_off_label_endpoint_edge_is_not_found(
-        self, mock_config, reassign_edge_live_graph,
+        self, mock_config, reassign_edge_live_graph, src, dst, entity_end,
     ):
-        """Both endpoints must be :Entity, as before the read stopped anchoring on them."""
+        """Both endpoints must be :Entity, as before the read stopped anchoring on them.
+
+        X is the off-label endpoint; the move targets the :Entity end, so only
+        the off-label side can hide the edge.
+        """
         graph_name, graph = reassign_edge_live_graph
-        await self._seed_nodes(graph, ['B', 'C'])
+        await self._seed_nodes(graph, ['A', 'B', 'C'])
+        await graph.query("CREATE (:CanaryEndpoint {uuid: 'X'})")
         await graph.query(
-            "MATCH (b:Entity {uuid: 'B'}) "
-            "CREATE (:CanaryEndpoint {uuid: 'X'})"
-            "-[:RELATES_TO {uuid: 'e-off', name: 'rel', fact: 'X relates to B'}]->(b)"
+            'MATCH (s {uuid: $src}), (t {uuid: $dst}) '
+            "CREATE (s)-[:RELATES_TO {uuid: 'e-off', name: 'rel', fact: 'off-label'}]->(t)",
+            {'src': src, 'dst': dst},
         )
 
         backend = GraphitiBackend(mock_config)
@@ -632,13 +644,13 @@ class TestReassignEdgeLiveFalkorDB:
         try:
             with pytest.raises(EdgeNotFoundError):
                 await backend.reassign_edge(
-                    'e-off', 'C', which_end='target', group_id=graph_name,
+                    'e-off', 'C', which_end=entity_end, group_id=graph_name,
                 )
 
             untouched = await graph.query(
-                "MATCH (x)-[e:RELATES_TO {uuid: 'e-off'}]->(b) RETURN x.uuid, b.uuid"
+                "MATCH (s)-[e:RELATES_TO {uuid: 'e-off'}]->(t) RETURN s.uuid, t.uuid"
             )
-            assert untouched.result_set == [['X', 'B']]
+            assert untouched.result_set == [[src, dst]]
         finally:
             await backend.close()
 
