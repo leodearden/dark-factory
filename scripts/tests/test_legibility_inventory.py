@@ -30,8 +30,11 @@ from pathlib import Path
 import pytest
 from legibility import digest
 from legibility import inventory as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import session_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Repo root from scripts/tests/ — the same parents[2] derivation
 # scripts/tests/conftest.py already uses.

@@ -17,11 +17,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Importable because scripts/tests/conftest.py appends REPO_ROOT to sys.path.
 # Functions only -- importing one of that module's FIXTURES into a test module
 # would bind a module-scoped copy that shadows the conftest's session-scoped one.
 from df_pytest_isolation import assert_synthetic_units, synthetic_unit
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "restart-orchestrator.sh"
 # SYNTHETIC (task 3950), replacing the real `orchestrator-dark-factory.service`

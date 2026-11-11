@@ -31,10 +31,14 @@ import itertools
 import json
 from typing import Any
 
+import pytest
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import embeddings, landing_gate, unlanded
 from legibility_task_store_fake import FakeTaskStore
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _DATE = "2026-08-03"
 _EMPTY_SYNTHESIS = json.dumps(

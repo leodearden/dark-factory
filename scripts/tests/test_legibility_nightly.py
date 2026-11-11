@@ -51,6 +51,9 @@ from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import resolve_claude_binary
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures

@@ -24,6 +24,9 @@ import lms_ctl
 import lms_manifest
 import lms_vram
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 LMS_DIR = SCRIPTS_DIR / 'local-model-serving'

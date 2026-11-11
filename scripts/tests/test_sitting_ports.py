@@ -4,10 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import pytest
 import yaml
 from fused_memory.config.schema import ReconciliationConfig
 from orchestrator.session_registry import normalize_escalations_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ports
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CONFIG = 'dark-factory-orchestrator.yaml'
 

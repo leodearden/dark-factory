@@ -21,6 +21,7 @@ from orchestrator.session_registry import (
     normalize_escalations_dir,
 )
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import apply as apply_mod
 from sitting import audits, brief, fleet_state, payloads
 from sitting import ledger as ledger_mod
@@ -29,6 +30,8 @@ from sitting import return_brief as mod
 from sitting import trigger_state as trigger_mod
 from sitting.inventory import AUDIT_KIND, audit_key, escalation_key, key_str, parse_key
 from sitting.payloads import AgreedMarker, PreparedMarker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
