@@ -15,8 +15,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
 from pathlib import Path
@@ -24,6 +25,7 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import yaml
+from shared.quality_series.landings import parse_utc
 from shared.quality_series.stats import RegimeEvent
 
 logger = logging.getLogger(__name__)
@@ -395,3 +397,206 @@ def _curated_id(
         'label': label,
     }, sort_keys=True)
     return 'curated:' + hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+STEP_LAYERS = frozenset({'config', 'role_default'})
+"""The routing layers whose decisions form a role's steps; policy rules and overrides do not."""
+
+
+@dataclass(frozen=True)
+class RoutingStep:
+    """A run of one role's consecutive config/role_default decisions with one route.
+
+    ``prompt_digest`` None means no decision in the run carried one yet.
+    """
+
+    role: str
+    first_event_id: int
+    first_at: datetime
+    last_event_id: int
+    last_at: datetime
+    decisions: int
+    source_layer: str
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+    prompt_digest: str | None
+
+
+@dataclass(frozen=True)
+class RuleSpan:
+    """When a routing policy rule matched, first and last, and how many decisions it matched."""
+
+    rule_id: str
+    first_event_id: int
+    first_at: datetime
+    last_at: datetime
+    decisions: int
+
+
+@dataclass(frozen=True)
+class RoutingFold:
+    """A project's routing_decision rows folded up to ``cursor``, the newest event id read.
+
+    ``steps`` are in event order (per role, the last is that role's open step); ``first_at`` and
+    ``newest_at`` bound the folded decisions; ``digest_since`` is the first one carrying a
+    prompt digest. ``complete`` is False until a fold has read every row after its cursor.
+    """
+
+    project_id: str
+    cursor: int
+    steps: tuple[RoutingStep, ...]
+    rules: tuple[RuleSpan, ...]
+    first_at: datetime | None
+    newest_at: datetime | None
+    digest_since: datetime | None
+    skipped: int
+    complete: bool
+
+    @classmethod
+    def empty(cls, project_id: str) -> RoutingFold:
+        return cls(project_id=project_id, cursor=0, steps=(), rules=(), first_at=None,
+                   newest_at=None, digest_since=None, skipped=0, complete=False)
+
+
+_ROUTING_SQL = """
+SELECT id, timestamp, COALESCE(role, json_extract(doc, '$.role')),
+       json_extract(doc, '$.source_layer'), json_extract(doc, '$.model'),
+       json_extract(doc, '$.effort'), json_extract(doc, '$.budget_usd'),
+       json_extract(doc, '$.max_turns'), json_extract(doc, '$.rule_id'),
+       json_extract(doc, '$.prompt_digest')
+FROM (
+    SELECT id, timestamp, role,
+           CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data END AS doc
+    FROM events
+    WHERE event_type = 'routing_decision' AND id > ?
+    ORDER BY id
+    LIMIT ?
+)
+ORDER BY id
+"""
+
+
+class _Decision(NamedTuple):
+    event_id: int
+    at: datetime
+    role: str
+    source_layer: str
+    model: str
+    effort: str
+    budget_usd: float
+    max_turns: int
+    rule_id: str | None
+    prompt_digest: str | None
+
+
+def _decision(row: tuple[object, ...]) -> _Decision | None:
+    """One routing_decision row, or None when it cannot be read as one."""
+    event_id, timestamp, role, layer, model, effort, budget, turns, rule_id, digest = row
+    texts = (role, layer, model, effort)
+    if not (
+        isinstance(event_id, int) and isinstance(timestamp, str)
+        and all(isinstance(text, str) and text for text in texts)
+        and isinstance(budget, (int, float)) and isinstance(turns, int)
+        and (rule_id is None or isinstance(rule_id, str))
+        and (digest is None or isinstance(digest, str))
+    ):
+        return None
+    try:
+        at = parse_utc(timestamp)
+    except ValueError:
+        return None
+    return _Decision(event_id, at, str(role), str(layer), str(model), str(effort), float(budget),
+                     turns, rule_id, digest)
+
+
+def fold_routing_decisions(
+    conn: sqlite3.Connection, fold: RoutingFold, *, batch: int | None,
+) -> RoutingFold:
+    """*fold* advanced over at most *batch* routing_decision rows after its cursor (None: all).
+
+    Returns a new fold; the input is never mutated. Rows already folded are never re-read, so
+    folding in batches until complete equals one full fold. An unreadable row is skipped and
+    counted.
+    """
+    rows = conn.execute(_ROUTING_SQL, (fold.cursor, -1 if batch is None else batch)).fetchall()
+    builder = _FoldBuilder(fold)
+    for row in rows:
+        builder.add(row[0], _decision(row))
+    return builder.build(complete=batch is None or len(rows) < batch)
+
+
+class _FoldBuilder:
+    def __init__(self, fold: RoutingFold) -> None:
+        self._fold = fold
+        self._cursor = fold.cursor
+        self._steps = list(fold.steps)
+        self._open = {step.role: index for index, step in enumerate(self._steps)}
+        self._rules = {span.rule_id: span for span in fold.rules}
+        self._first_at = fold.first_at
+        self._newest_at = fold.newest_at
+        self._digest_since = fold.digest_since
+        self._skipped = fold.skipped
+
+    def add(self, event_id: int, decision: _Decision | None) -> None:
+        self._cursor = max(self._cursor, event_id)
+        if decision is None:
+            self._skipped += 1
+            return
+        self._first_at = decision.at if self._first_at is None else self._first_at
+        self._newest_at = decision.at if self._newest_at is None else max(self._newest_at, decision.at)
+        if decision.prompt_digest is not None and self._digest_since is None:
+            self._digest_since = decision.at
+        if decision.rule_id is not None:
+            self._add_rule(decision.rule_id, decision)
+        if decision.source_layer in STEP_LAYERS:
+            self._add_step(decision)
+
+    def _add_rule(self, rule_id: str, decision: _Decision) -> None:
+        span = self._rules.get(rule_id)
+        self._rules[rule_id] = (
+            RuleSpan(rule_id, decision.event_id, decision.at, decision.at, 1) if span is None
+            else replace(span, last_at=decision.at, decisions=span.decisions + 1)
+        )
+
+    def _add_step(self, decision: _Decision) -> None:
+        index = self._open.get(decision.role)
+        if index is not None and _continues(step := self._steps[index], decision):
+            self._steps[index] = replace(
+                step, last_event_id=decision.event_id, last_at=decision.at,
+                decisions=step.decisions + 1,
+                prompt_digest=step.prompt_digest or decision.prompt_digest,
+            )
+            return
+        self._open[decision.role] = len(self._steps)
+        self._steps.append(RoutingStep(
+            role=decision.role, first_event_id=decision.event_id, first_at=decision.at,
+            last_event_id=decision.event_id, last_at=decision.at, decisions=1,
+            source_layer=decision.source_layer, model=decision.model, effort=decision.effort,
+            budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+            prompt_digest=decision.prompt_digest,
+        ))
+
+    def build(self, *, complete: bool) -> RoutingFold:
+        return RoutingFold(
+            project_id=self._fold.project_id,
+            cursor=self._cursor,
+            steps=tuple(self._steps),
+            rules=tuple(sorted(self._rules.values(), key=lambda span: span.first_event_id)),
+            first_at=self._first_at,
+            newest_at=self._newest_at,
+            digest_since=self._digest_since,
+            skipped=self._skipped,
+            complete=complete,
+        )
+
+
+def _continues(step: RoutingStep, decision: _Decision) -> bool:
+    """Same route, and no two different known prompt digests: an absent digest never splits."""
+    same_route = (step.source_layer, step.model, step.effort, step.budget_usd, step.max_turns) == (
+        decision.source_layer, decision.model, decision.effort, decision.budget_usd,
+        decision.max_turns,
+    )
+    digests = (step.prompt_digest, decision.prompt_digest)
+    return same_route and (None in digests or digests[0] == digests[1])
