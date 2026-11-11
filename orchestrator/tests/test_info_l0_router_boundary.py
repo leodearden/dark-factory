@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -35,6 +36,7 @@ from _workflow_helpers import (
     _derive_meta_root_like_production as _derive_meta_root_like_production,
 )
 from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
+from escalation.disposition import ReviewerDisposition
 from escalation.models import Escalation
 from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
@@ -46,12 +48,16 @@ from orchestrator.escalation_router import (
     OVERFLOW_SENTINEL,
     REVIEWER_LEG_ID,
     ROUTER_ID,
+    Outcome,
+    RouterPorts,
+    apply_reviewer_disposition,
     read_hold,
     status_info_sentinel,
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import MergeOutcome
+from orchestrator.review_payload import NoteDisposition
 from orchestrator.scheduler import Scheduler
 from orchestrator.workflow import WorkflowOutcome
 
@@ -858,3 +864,116 @@ class TestRow19ConversionCapOverflows:
 
         assert len(site.curator.calls_named('submit_task')) == 4
         assert all(read_hold(site.current(n)) is not None for n in fresh)
+
+
+def _exit_done_without_driving(run: RouterRun) -> None:
+    """Replace ``_drive`` with one that writes 'done' and returns DONE; the exit finalizer stays real."""
+
+    async def _drive() -> WorkflowOutcome:
+        await run.scheduler.set_task_status(TASK_ID, 'done')
+        return WorkflowOutcome.DONE
+
+    run.workflow._drive = _drive
+
+
+@pytest.mark.asyncio
+class TestRow18DeliberateHoldIsUnaffected:
+    """A parked L2 and a separate L2 are holds, so every router path leaves them alone.
+
+    Both holds are blocking: pins.py link 1 makes a parked INFO record non-pinning.
+    """
+
+    async def test_every_router_path_leaves_both_holds_byte_identical(
+        self, tmp_path, monkeypatch, mock_orch_config,
+    ):
+        run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer())
+        queue = run.queue
+        to_park = Escalation(
+            id=queue.make_id(TASK_ID), task_id=TASK_ID, agent_role='steward', severity='blocking',
+            category='design_concern', summary='needs a human ruling', level=1,
+        )
+        queue.submit(to_park)
+        parked = queue.park(to_park.id, 'parked for a human', resolved_by='escalation-watcher-auto')
+        assert parked is not None
+        assert (parked.status, parked.level, parked.resolution_action) == ('pending', 2, 'park')
+        separate = watcher_l2(queue, [], severity='blocking')
+        note = implementer_note(queue)
+        held_bytes = {hold.id: _file_bytes(queue, hold) for hold in (parked, separate)}
+        events = run.workflow.event_store
+        assert events is not None
+
+        def _assert_the_holds_are_untouched() -> None:
+            assert {hold_id: (queue.queue_dir / f'{hold_id}.json').read_bytes() for hold_id in held_bytes} == held_bytes
+            rows = [row['data'] for row in events.fetch_events_by_type(EventType.info_l0_dispositioned)]
+            assert {r['class'] for r in rows if r['escalation_id'] in held_bytes} <= {'rejected_disposition'}
+            assert {r['escalation_id'] for r in rows if r['class'] != 'rejected_disposition'} == {note.id}
+            assert run.scheduler.statuses[TASK_ID] == ['done']
+            pins = classify_pins(TASK_ID, queue.get_by_task(TASK_ID, status='pending'), live_claimant=False)
+            assert pins.pins
+            assert set(pins.queue_handoff) == set(held_bytes)
+
+        _exit_done_without_driving(run)
+        assert await run.run() == WorkflowOutcome.DONE
+        assert read_hold(run.current(note)) is not None
+        _assert_the_holds_are_untouched()
+
+        ports = RouterPorts(
+            queue=queue, event_store=events, dispatch_tool=run.curator,
+            project_root=str(run.workflow.config.project_root), filing_claimant_run_id=None,
+        )
+        for hold_id in held_bytes:
+            applied = apply_reviewer_disposition(
+                NoteDisposition(hold_id, ReviewerDisposition.ADDRESSED, 'looks done'), ports,
+                task_id=TASK_ID, enabled=True,
+            )
+            assert applied.outcome is Outcome.REJECTED
+        _assert_the_holds_are_untouched()
+
+        await _reap(run, mock_orch_config, orphan_timeout_secs=0.0)
+        _assert_the_holds_are_untouched()
+
+        await _harness_after(run, mock_orch_config)._dismiss_stale_escalations()
+        _assert_the_holds_are_untouched()
+
+
+class _FailsOneClose(EscalationQueue):
+    """A queue whose close of the armed record fails once; every other write lands."""
+
+    def __init__(self, queue_dir: Path) -> None:
+        super().__init__(queue_dir)
+        self.armed: str | None = None
+
+    def resolve(self, escalation_id: str, resolution: str, dismiss: bool = False, **kwargs) -> Escalation | None:
+        if escalation_id == self.armed and kwargs.get('resolution_class') is not None:
+            self.armed = None
+            raise OSError('No space left on device')
+        return super().resolve(escalation_id, resolution, dismiss, **kwargs)
+
+
+@pytest.mark.asyncio
+class TestRow20RouterFailureNeverChangesTheExit:
+    async def test_a_failed_close_promotes_router_error_and_the_task_still_merges(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        queue = _FailsOneClose(tmp_path / 'escalation_queue')
+        run = RouterRun(tmp_path, monkeypatch, DispositioningReviewer(), queue=queue)
+        note = implementer_note(queue, suggested_action='No action needed')
+        queue.armed = note.id
+        repo = run.workflow.config.project_root
+        main_before = _git(repo, 'rev-parse', 'main').stdout.strip()
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.escalation_router'):
+            assert await run.run() == WorkflowOutcome.DONE
+
+        assert queue.armed is None, 'the finalizer never attempted the close'
+        assert _git(repo, 'rev-parse', 'main').stdout.strip() != main_before
+        assert run.current(note).status == 'dismissed'
+        (l1,) = _l1s(queue, agent_role=AGGREGATE_ROLE)
+        assert 'router_error' in l1.detail
+        assert note.id in l1.detail
+        (row,) = run.rows(note.id)
+        assert (row['class'], row['reason'], row['by']) == ('promoted', 'router_error', 'workflow-finalizer')
+        assert [
+            (record.escalation_id, record.by, record.exit_kind) for record in caplog.records
+            if record.name == 'orchestrator.escalation_router' and record.levelno == logging.ERROR
+        ] == [(note.id, 'workflow-finalizer', 'done')]
