@@ -4,8 +4,9 @@
 ``--queue-dir DIR --window-days N --baseline-stranded-per-100 F --ratio R --min-stranded K
 --max-reaper-wrong M --max-pending-hours H`` reads DIR's live records and its dated archive, writes
 nothing, and prints human lines followed by a compact JSON object as the last line. It exits 1 when a
-threshold is breached, 0 otherwise, and 2 when the queue directory could not be read. The rules and
-thresholds are plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md §C10.
+threshold is breached, 0 otherwise, and 2 when it cannot judge: the queue directory could not be read,
+or no blocking L0 was filed in the post window. The rules and thresholds are
+plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md §C10.
 """
 
 from __future__ import annotations
@@ -15,11 +16,11 @@ import enum
 import json
 import sys
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, ClassVar, Final
 
 # orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations
 REAPER_RESOLVER: Final = 'harness-orphan-reaper'
@@ -41,15 +42,29 @@ FOLLOWER_WINDOW: Final = timedelta(hours=24)
 FOLLOWER_LEVELS: Final = frozenset({0, 1})
 REDESIGN_FOLLOW_UP: Final = 'open the joint L0 end-of-life redesign with the harness plan (S8)'
 RATE_DIGITS: Final = 2
-UNREADABLE_EXIT: Final = 2
+CANNOT_JUDGE_EXIT: Final = 2
 UNBOUNDED: Final = datetime.max.replace(tzinfo=UTC)
 
 
-class UnreadableQueue(Exception):
+class CannotJudge(Exception):
+    headline: ClassVar[str]
+
     def __init__(self, path: Path, reason: str) -> None:
         super().__init__(f'{path}: {reason}')
         self.path = path
         self.reason = reason
+
+
+class UnreadableQueue(CannotJudge):
+    headline = 'unreadable queue directory'
+
+
+class RecordVanished(UnreadableQueue):
+    """A listed record file was gone by the time it was read."""
+
+
+class NothingFiled(CannotJudge):
+    headline = 'nothing to judge'
 
 
 class Closure(enum.StrEnum):
@@ -166,6 +181,8 @@ def parse_record(raw: Mapping[str, Any], path: Path) -> Record:
 def read_record(path: Path) -> Record:
     try:
         raw = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise RecordVanished(path, 'gone since it was listed') from exc
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise UnreadableQueue(path, f'{type(exc).__name__}: {exc}') from exc
     if not isinstance(raw, dict):
@@ -181,29 +198,50 @@ def _is_archive_day(name: str) -> bool:
     return True
 
 
-def _archived_record_paths(archive_root: Path) -> Iterator[Path]:
+def _sorted_glob(directory: Path, pattern: str) -> list[Path]:
     try:
-        days = sorted(child for child in archive_root.iterdir() if child.is_dir() and _is_archive_day(child.name))
-        for day in days:
-            yield from sorted(day.glob('*.json'))
+        return sorted(directory.glob(pattern))
+    except OSError as exc:
+        raise UnreadableQueue(directory, f'{type(exc).__name__}: {exc}') from exc
+
+
+def _archive_days(archive_root: Path) -> list[Path]:
+    try:
+        children = list(archive_root.iterdir())
     except OSError as exc:
         raise UnreadableQueue(archive_root, f'{type(exc).__name__}: {exc}') from exc
+    return sorted(child for child in children if child.is_dir() and _is_archive_day(child.name))
+
+
+def _archived_record_paths(archive_root: Path) -> list[Path]:
+    return [path for day in _archive_days(archive_root) for path in _sorted_glob(day, '*.json')]
+
+
+def _read_live_record(path: Path, archive_root: Path) -> Record:
+    """A live record the queue archived after the root was listed is read from its archived copy."""
+    try:
+        return read_record(path)
+    except RecordVanished:
+        copies = [day / path.name for day in _archive_days(archive_root) if (day / path.name).is_file()]
+        if not copies:
+            raise UnreadableQueue(path, 'left the queue root without an archived copy') from None
+        return read_record(copies[-1])
 
 
 def load_records(queue_dir: Path) -> list[Record]:
-    """Every record in the dated archive and the live queue root, one per id, the root copy winning."""
+    """Every record in the dated archive and the live queue root, one per id, the root copy winning.
+
+    The root is listed only once the archive has been read, so the queue archiving a live record mid-scan
+    leaves that record readable from its archived copy.
+    """
     if not queue_dir.is_dir():
         raise UnreadableQueue(queue_dir, 'not a directory')
     archive_root = queue_dir / ARCHIVE_SUBDIR
     if not archive_root.is_dir():
         raise UnreadableQueue(archive_root, 'not a directory')
-    try:
-        live_paths = sorted(queue_dir.glob(LIVE_RECORD_GLOB))
-    except OSError as exc:
-        raise UnreadableQueue(queue_dir, f'{type(exc).__name__}: {exc}') from exc
-    by_id: dict[str, Record] = {}
-    for path in [*_archived_record_paths(archive_root), *live_paths]:
-        record = read_record(path)
+    by_id = {record.id: record for record in map(read_record, _archived_record_paths(archive_root))}
+    for path in _sorted_glob(queue_dir, LIVE_RECORD_GLOB):
+        record = _read_live_record(path, archive_root)
         by_id[record.id] = record
     return list(by_id.values())
 
@@ -368,7 +406,7 @@ def measure_queue(queue_dir: Path, *, now: datetime, window_days: int, max_pendi
     """measure() over queue_dir, refusing a post window with nothing filed: no producer wrote, so nothing to judge."""
     report = measure(load_records(queue_dir), now=now, window_days=window_days, max_pending_hours=max_pending_hours)
     if report.post.filed == 0:
-        raise UnreadableQueue(queue_dir, f'no blocking L0 filed in the last {window_days} days: nothing to judge')
+        raise NothingFiled(queue_dir, f'no blocking L0 filed in the last {window_days} days')
     return report
 
 
@@ -457,9 +495,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             window_days=args.window_days,
             max_pending_hours=thresholds.max_pending_hours,
         )
-    except UnreadableQueue as exc:
-        print(f'unreadable queue directory: {exc.path} ({exc.reason})')
-        return UNREADABLE_EXIT
+    except CannotJudge as exc:
+        print(f'{exc.headline}: {exc.path} ({exc.reason})')
+        return CANNOT_JUDGE_EXIT
     breaches = judge(report, thresholds)
     lines = [*render(report), *(breach_line(breach, report, thresholds) for breach in breaches)]
     if breaches:
