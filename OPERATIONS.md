@@ -1965,9 +1965,11 @@ deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
 - **Liveness = brokenness.** `main()`'s pass over the **`WATCHED`
-  orchestrator units** revives a dead unit immediately on either of two
-  signals — per-unit, uncapped, not gated by any fleet-wide clock, and it
-  never stamps that clock. The port-probe signal (wedged or port-down) is
+  orchestrator units** revives a dead unit on either of two signals. It is
+  capped to one revive per unit per `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS`
+  (900s), on per-unit clocks under `data/orchestrator/liveness-restart/`, and
+  the one cap covers both signals. It is not gated by any fleet-wide clock and
+  never stamps one. The port-probe signal (wedged or port-down) is
   unchanged. Under systemd socket activation each unit's escalation port is
   held by its own `.socket` unit, so it can keep reading LISTEN across a
   dead service; `main()` therefore also asks systemd's ActiveState
@@ -1979,9 +1981,14 @@ restart:
   `reset-failed` (targeting the unit AND its `.socket` sibling) then
   `restart --no-block`, so a revive never closes a socket-activated unit's
   listening socket out from under an open MCP connection. A single
-  wedged-unit revive is not a fleet deploy. Read "uncapped" as scoped to
-  those units: it does **not** describe `fused-memory.service`, which is
-  deliberately kept out of `WATCHED` and has had its own streak-gated,
+  wedged-unit revive is not a fleet deploy. A unit in
+  `Result=start-limit-hit` is **not** revived: no `reset-failed`, no restart.
+  It stays down with its crash-loop page open (see "Crash loop" below). The
+  cap is sized so a unit that dies again straight after each revive is revived
+  at most four times an hour, not once per 60s tick, while a genuinely wedged
+  unit still waits at most 15 minutes after an earlier revive. This cap and
+  the start-limit-hit hold are scoped to those units: `fused-memory.service`
+  is deliberately kept out of `WATCHED` and has had its own streak-gated,
   rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
@@ -2014,6 +2021,46 @@ restart:
   eligibility — bypassing the idle/debounce gates — but honors the same
   shared 8-hour clock. Since task 5371 it passes `--drain` too (it is still
   disabled by config until task 5020).
+
+**Crash loop (task 8270).** On every tick `main()` reads
+`systemctl --user show -p NRestarts,Result` for every `WATCHED` unit before
+the enabled and startup-grace gates, because the grace window is what hid the
+2026-10-26 loop. Disabled units are sampled too. The samples are kept in
+`data/orchestrator/watchdog-restart-rate.json`. The watchdog files one
+born-at-L2 `critical` escalation, task `orchestrator-crash-loop-<unit>`
+(agent role `orchestrator-watchdog`, category `infra_issue`), into
+dark-factory's `data/escalations` via `escalation submit` when either holds:
+
+- NRestarts grew by at least `ORCH_RESTART_RATE_ALARM_COUNT` (5) within
+  `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` (1800s);
+- systemd reports `Result=start-limit-hit`.
+
+NRestarts counts only `Restart=` restarts, and any manual start (a watchdog
+revive, a sweep) resets it to 0. The growth count therefore adds the new value
+whenever the counter drops, rather than taking a plain difference. At most one
+page per window per unit is filed, and a start-limit-hit page once per
+episode. The page epoch is stamped on attempt, so a broken submit retries at
+window cadence. To find the cause, read `journalctl --user -u <unit>`, then
+the project's runs.db `exit_reason` / `startup_completed_at` columns
+(startup-hardening task γ). Once the cause is fixed, restore the unit with
+`systemctl --user reset-failed <unit> && systemctl --user start <unit>`.
+`WATCHED` is the detector's unit set; the `--report` RESTARTS column covers
+every running orchestrator unit. Code:
+`scripts/_watchdog_crash_loop.py::crash_loop_pass`; the reader is
+`scripts/orchestrator-watchdog.py::_unit_restart_status`.
+
+Env knobs for the crash-loop detector and the orchestrator revive cap. All
+are read with a fallback, so a typo'd value cannot crash the oneshot watchdog:
+
+| var | default | meaning of `<=0` |
+|---|---|---|
+| `ORCH_RESTART_RATE_ALARM_COUNT` | `5` | **Clamped to >=1.** `0` would page every unit on zero growth. |
+| `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` | `1800` | **Clamped to >=1.** Also the one-page-per-unit dedup window. |
+| `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS` | `900` | Disables the per-unit revive cap, without even reading the clock. |
+| `ORCH_RESTART_RATE_STATE` | `data/orchestrator/watchdog-restart-rate.json` | Path override for the detector's samples (not a duration). |
+| `ORCH_CRASH_LOOP_QUEUE_DIR` | `data/escalations` | Path override for the queue pages are filed into (not a duration). |
+| `ORCH_LIVENESS_RESTART_CLOCK_DIR` | `data/orchestrator/liveness-restart` | Path override for the per-unit revive clocks (not a duration). |
+| `ORCH_WATCHDOG_UV_BIN` | `/home/leo/.local/bin/uv` | The uv that runs `escalation submit`. Absolute, because the watchdog unit sets no PATH. |
 
 **Module-removal fast path (task 7198).** A watched commit that deletes or
 renames a `.py` module under `orchestrator/src`, `escalation/src` or
@@ -2701,6 +2748,10 @@ newest-watched-commit / verdict columns, per unit:
 - **DEPLOY-AGE** — time since the last *verified* fleet deploy (the shared
   clock), fleet-wide, in hours; `unknown` if the clock has never been
   stamped.
+- **RESTARTS** — the unit's systemd `NRestarts/Result` as one token, `?`
+  where a field could not be read, placed just left of VERDICT. NRestarts
+  counts only `Restart=` restarts and resets on any manual start; see "Crash
+  loop" above for what the watchdog does with it.
 - **MERGE-IDLE** — the unit's current heartbeat classification
   (`idle` / `busy` / `stale` / `absent`) — the same classification the
   drain gate itself uses.
