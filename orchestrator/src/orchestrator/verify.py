@@ -665,6 +665,12 @@ _XDIST_CHANNEL_COLLAPSE_RE = re.compile(
 )
 
 
+def _final_progress_line(text: str) -> re.Match[str] | None:
+    """Return *text*'s last pytest percentage progress line, or ``None``."""
+    progress_lines = list(_PYTEST_PROGRESS_PERCENT_RE.finditer(text))
+    return progress_lines[-1] if progress_lines else None
+
+
 def _crashed_session_stop_percent(output: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
@@ -693,10 +699,9 @@ def _crashed_session_stop_percent(output: str) -> int | None:
     """
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return None
-    progress_lines = list(_PYTEST_PROGRESS_PERCENT_RE.finditer(output))
-    if not progress_lines:
+    final_line = _final_progress_line(output)
+    if final_line is None:
         return None
-    final_line = progress_lines[-1]
     stop_percent = int(final_line.group(1))
     pytest_ended_its_own_loop = (
         _PYTEST_FAILURE_SUMMARY_RE.search(output, final_line.end()) is not None
@@ -711,8 +716,15 @@ def _worker_death_truncation_evidence(output: str) -> str | None:
     stopped (``_crashed_session_stop_percent``, the ``-q``-robust witness).
     Returns ``None`` when truncation is unproven. The literal is checked
     first, so every output it fires on keeps its evidence byte-for-byte.
+
+    A final progress line reading ``[100%]`` disproves truncation for both
+    witnesses, even when the literal printed: every collected test reported
+    (see ``_crashed_session_stop_percent`` for why that reading is exact).
     """
     if not output:
+        return None
+    final_line = _final_progress_line(output)
+    if final_line is not None and int(final_line.group(1)) == 100:
         return None
     bailout = _XDIST_SESSION_ABORTED_RE.search(output)
     if bailout is not None:
