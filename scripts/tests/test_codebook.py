@@ -1787,6 +1787,172 @@ def test_the_summary_is_one_line_naming_every_report_field():
 
 
 # ---------------------------------------------------------------------------
+# task 6750: the merge names the candidate each candidate payload resolved to
+# ---------------------------------------------------------------------------
+
+def _ref(record: int, candidate: int = 0):
+    return mod.PayloadRef(record=record, candidate=candidate)
+
+
+def _two_payload_record(session: str = "sess-1") -> dict:
+    record = _candidate_record(title="novel shape", session=session)
+    record["candidates"].append({**record["candidates"][0], "title": "a different shape"})
+    return record
+
+
+def _codebook_with_pending_candidate() -> dict:
+    codebook = _codebook_with_adjudicated_candidate("pending")
+    codebook["candidates"][0]["id"] = "cand-20260701-3"
+    return codebook
+
+
+def _codebook_with_promoted_then_rejected_twin(*, promoted_to: str) -> dict:
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = promoted_to
+    codebook["candidates"].append({
+        "id": "cand-20260724-2",
+        "title": "novel shape",
+        "first_seen": "2026-07-24",
+        "disposition": "rejected",
+        "sightings": [],
+    })
+    return codebook
+
+
+def test_an_unseen_title_resolves_to_the_candidate_the_merge_mints():
+    merge = _merge_one(_codebook_with_entry_a(), _candidate_record())
+
+    assert merge.resolutions == (mod.NewPending(payload=_ref(0), candidate_id="cand-20260714-1"),)
+    assert merge.resolution_at(_ref(0)) == merge.resolutions[0]
+
+
+def test_resolutions_follow_batch_order_one_per_candidate_payload():
+    batch = [_two_payload_record("sess-1"), _match_record(session="sess-2"), _candidate_record(session="sess-3")]
+
+    merge = mod.apply_coding_records(_codebook_with_entry_a(), batch, invariant_slugs=_NO_SLUGS)
+
+    assert merge.resolutions == (
+        mod.NewPending(payload=_ref(0, 0), candidate_id="cand-20260714-1"),
+        mod.NewPending(payload=_ref(0, 1), candidate_id="cand-20260714-2"),
+        mod.PendingAbsorbed(payload=_ref(2, 0), candidate_id="cand-20260714-1"),
+    )
+    assert merge.resolution_at(_ref(0, 1)).candidate_id == "cand-20260714-2"
+    assert merge.resolution_at(_ref(0, 2)) is None
+    assert merge.resolution_at(_ref(1)) is None
+
+
+def test_a_title_a_pending_candidate_carries_resolves_to_that_candidate():
+    merge = _merge_one(_codebook_with_pending_candidate(), _candidate_record(session="sess-new"))
+
+    assert merge.resolutions == (mod.PendingAbsorbed(payload=_ref(0), candidate_id="cand-20260701-3"),)
+
+
+def test_a_promoted_candidate_with_a_live_entry_outranks_a_later_rejected_twin():
+    """The task-4144 shape, in the order the live codebook carries it: the
+    recurrence goes to the promoted candidate's entry, not to the list-order
+    last same-title record."""
+    codebook = _codebook_with_promoted_then_rejected_twin(promoted_to="entry-a")
+
+    merge = _merge_one(codebook, _candidate_record(session="sess-new", date="2026-07-25"))
+
+    assert merge.resolutions == (
+        mod.RoutedToEntry(payload=_ref(0), candidate_id="cand-20260722-28", entry_id="entry-a"),
+    )
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+
+
+def test_a_rejected_only_title_resolves_to_the_rejected_candidate():
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+
+    merge = _merge_one(codebook, _candidate_record(session="sess-new", date="2026-07-24"))
+
+    assert merge.resolutions == (
+        mod.RoutedToCandidate(payload=_ref(0), candidate_id="cand-20260722-28", disposition="rejected"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("build_codebook", "expected"),
+    [
+        pytest.param(
+            lambda: _codebook_with_adjudicated_candidate("promoted"),
+            ("cand-20260722-28", "promoted"),
+            id="lone-promoted",
+        ),
+        pytest.param(
+            lambda: _codebook_with_promoted_then_rejected_twin(promoted_to="entry-never-created"),
+            ("cand-20260724-2", "rejected"),
+            id="promoted-then-rejected",
+        ),
+    ],
+)
+def test_a_promoted_candidate_whose_entry_dangles_falls_back_to_the_last_same_title_record(
+    build_codebook, expected
+):
+    merge = _merge_one(build_codebook(), _candidate_record(session="sess-new", date="2026-07-25"))
+
+    candidate_id, disposition = expected
+    assert merge.resolutions == (
+        mod.RoutedToCandidate(payload=_ref(0), candidate_id=candidate_id, disposition=disposition),
+    )
+
+
+@pytest.mark.parametrize(
+    "build_codebook",
+    [
+        pytest.param(_codebook_with_pending_candidate, id="pending-absorbed"),
+        pytest.param(
+            lambda: _codebook_with_promoted_then_rejected_twin(promoted_to="entry-a"),
+            id="routed-to-entry",
+        ),
+        pytest.param(lambda: _codebook_with_adjudicated_candidate("rejected"), id="routed-to-candidate"),
+    ],
+)
+def test_re_applying_a_merged_record_resolves_it_again_and_writes_nothing(build_codebook):
+    record = _candidate_record(session="sess-new", date="2026-07-25")
+    first = _merge_one(build_codebook(), record)
+
+    again = _merge_one(first.codebook, record)
+
+    assert again.resolutions == first.resolutions
+    assert again.codebook == first.codebook
+    assert again.mutated is False
+
+
+def test_re_applying_a_minting_record_names_the_candidate_it_minted():
+    record = _candidate_record()
+    first = _merge_one(_codebook_with_entry_a(), record)
+
+    again = _merge_one(first.codebook, record)
+
+    assert again.resolutions == (mod.PendingAbsorbed(payload=_ref(0), candidate_id="cand-20260714-1"),)
+    assert again.codebook == first.codebook
+
+
+def test_a_skipped_record_resolves_no_payload():
+    deletion = _candidate_record(session="sess-del")
+    deletion["drop"] = True
+    invalid = _candidate_record(session="sess-bad")
+    del invalid["agent_class"]
+    batch = [deletion, _candidate_record(session="sess-good"), invalid]
+
+    merge = mod.apply_coding_records(_codebook_with_entry_a(), batch, invariant_slugs=_NO_SLUGS)
+
+    assert merge.resolutions == (mod.NewPending(payload=_ref(1), candidate_id="cand-20260714-1"),)
+    assert merge.resolution_at(_ref(0)) is None
+    assert merge.resolution_at(_ref(2)) is None
+
+
+def test_a_record_without_candidate_payloads_resolves_nothing():
+    merge = mod.apply_coding_records(
+        _codebook_with_entry_a(), [_match_record(), _correction_record()], invariant_slugs=_NO_SLUGS
+    )
+
+    assert merge.resolutions == ()
+
+
+# ---------------------------------------------------------------------------
 # step-15: RED — main(argv) CLI end-to-end (tmp_path/capsys)
 # ---------------------------------------------------------------------------
 
