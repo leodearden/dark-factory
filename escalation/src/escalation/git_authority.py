@@ -130,10 +130,11 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     it.  So ``merge_sha`` is safe to record as provenance as-is on every
     path — EXCEPT in the two cases below, which
     :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` answers as one
-    question.  Neither exception reaches the patch-id path: its producer
-    never reads ``git.commit_citation_pattern`` (it searches with the
-    default citation pattern, then for the patch-id twin) and never
-    consults the delivered checks.  (Before task 3103 the
+    question, and the two patch-id residuals after them, which it does NOT
+    answer.  Neither exception applies to the patch-id path, but for
+    different reasons: it never consults the delivered checks, and it
+    ignores the project's citation configuration altogether, which is
+    residual (a) rather than a strength.  (Before task 3103 the
     live-branch path returned the *branch tip*, which for a ``--no-ff``
     merge is a distinct commit that is not
     on main's first-parent chain — callers were told to prefer the
@@ -176,6 +177,29 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     covers both exceptions — or from
     :attr:`GitAuthorityVerdict.rescued_by_delivered_checks` for this one
     specifically, rather than by inspecting task metadata or config.
+
+    **Patch-id residuals: known gaps, not guarantees.**  Both live in the
+    producer, ``branch_work_landed``, and are follow-up ticket
+    ``tkt_0RWW0SXKJP4TV6YV4GZ235YX8Q``.  ``merge_sha_fully_guarded`` is True
+    on both, so a caller cannot detect either from the verdict.
+
+    (a) The producer never reads ``git.commit_citation_pattern``.  It
+    attributes by ``DEFAULT_COMMIT_CITATION_PATTERN``, whose bare
+    ``(#<id>)`` arm also matches GitHub-style ``Fix x (#123)`` squash
+    subjects.  On a project that opts out (``''``) or sets its own
+    pattern, an accept can name an unrelated commit that only matches the
+    default.  The ancestor arm honours the project's pattern, so the arms
+    apply different citation policies to one project.
+
+    (b) Containment is ``patch_content_contained``, which reads EMPTY
+    ``git cherry`` output as contained.  git cherry skips merge commits,
+    so a branch whose only commit is a ``--no-ff`` merge of main counts as
+    contained.  With a recorded ``branch_base_sha`` the empty-net-diff
+    guard measures base..tip, which holds main's changes, so it does not
+    fire.  The verdict is then ``landed_unconfirmed``, or ``found_on_main``
+    at any earlier citing commit on main: an over-report.  The shell
+    ladder's check (c) in ``skills/_shared/deriving-landed-sha.md``
+    refuses empty output for this reason.
     """
     return {
         'state': MergeState.done,
@@ -364,7 +388,8 @@ class GitAuthorityVerdict:
         A ``patch_id``-arm ``found_on_main`` is fully guarded: that path is
         checked by containment rather than effect survival, which is
         ``docs/prds/landed-not-done-recovery.md`` D1's contract and not a
-        weakening.
+        weakening.  Its two residuals are NOT reflected here: see
+        :func:`found_on_main_response`.
         """
         return (
             self.outcome is GitAuthorityOutcome.found_on_main
@@ -386,9 +411,9 @@ async def _evidence_verdict(
 ) -> GitAuthorityVerdict:
     """Run the landing-evidence gate for one arm and render its verdict.
 
-    The ancestor and marker arms of :func:`probe_landing` end identically once
-    their own guard has passed — validate, then accept or report the landing as unconfirmed
-    — so that sequence lives here ONCE (heuristic 11) and the arms differ
+    :func:`_ancestor_arm` and :func:`_marker_arm` end identically once their
+    own guard has passed — validate, then accept or report the landing as
+    unconfirmed — so that sequence lives here ONCE (heuristic 11) and the arms differ
     only in the ``arm`` they label and the evidence keywords they pass.
     ``candidate_sha=None`` selects ``validate_landing_evidence``'s DISCOVERY
     mode, where a commit on main must positively cite the task (FIX 2) AND
@@ -478,7 +503,86 @@ async def _evidence_verdict(
     )
 
 
-async def _patch_id_verdict(
+async def _marker_arm(
+    git_ops: Any,
+    tid: str,
+    full_branch: str,
+    fetch: TaskMetadataResult,
+    *,
+    marker: str,
+) -> GitAuthorityVerdict:
+    """Judge a merge marker found on main for a deleted branch ref.
+
+    Predates-this-incarnation veto (task 3103, mirroring the harness marker
+    arm): when the branch was deleted and recreated under the SAME task id, a
+    marker older than this incarnation's ``branch_base_sha`` is a previous
+    run's merge, so it establishes nothing about this one.  Otherwise the
+    marker is the candidate :func:`_evidence_verdict` checks.
+    """
+    from orchestrator.merge_lane.landing_evidence import is_valid_sha_40
+    branch_base_sha = fetch.metadata.get('branch_base_sha')
+    # Validity is checked first so a missing or malformed base never reaches
+    # is_ancestor as an argument.
+    if is_valid_sha_40(branch_base_sha) and await git_ops.is_ancestor(
+        marker, branch_base_sha,
+    ):
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.no_signal, metadata_unavailable=fetch.unavailable,
+        )
+    return await _evidence_verdict(
+        git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
+        branch_tip_sha=None, candidate_sha=marker,
+    )
+
+
+async def _ancestor_arm(
+    git_ops: Any,
+    tid: str,
+    full_branch: str,
+    fetch: TaskMetadataResult,
+    *,
+    branch_tip_sha: str,
+    pattern: str | None,
+) -> GitAuthorityVerdict:
+    """Judge a live branch whose tip is an ancestor of main but not main's tip.
+
+    The degeneracy guard (task 3103) runs FIRST and independently of the
+    citation gate.  A tip still equal to the recorded ``branch_base_sha``
+    means no commit was ever pushed past the creation point: the branch is
+    parked at an OLD main commit, which passes both dispatch checks, and a
+    citing commit on main would otherwise stamp a confident ``done`` against
+    a commit holding none of the task's work (reify 5493).  It judges the
+    SAME tip the dispatch's ``is_ancestor`` ran on (task 3103 review #2), so a
+    warm-lane reseed cannot split the two observations.
+
+    *pattern* is ``git.commit_citation_pattern``.  ``''`` is the documented
+    per-project opt-out: ``find_task_citation_commit`` then returns None for
+    everything, so running the gate would reject unconditionally and turn
+    this arm into dead code.  The opt-out instead returns the raw BRANCH TIP
+    with ``citation_gate_skipped`` set (see :func:`found_on_main_response`,
+    Exception 1).  ``None`` means "use the built-in default pattern" and is
+    NOT the opt-out.
+    """
+    from orchestrator.merge_lane.landing_evidence import branch_is_degenerate
+    if await branch_is_degenerate(
+        git_ops, full_branch, fetch.metadata, branch_tip_sha=branch_tip_sha,
+    ):
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.no_signal, metadata_unavailable=fetch.unavailable,
+        )
+    if pattern == '':
+        return GitAuthorityVerdict(
+            outcome=GitAuthorityOutcome.found_on_main, merge_sha=branch_tip_sha,
+            arm=GitAuthorityArm.ancestor, citation_gate_skipped=True,
+            metadata_unavailable=fetch.unavailable,
+        )
+    return await _evidence_verdict(
+        git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
+        branch_tip_sha=branch_tip_sha, pattern_template=pattern,
+    )
+
+
+async def _patch_id_arm(
     git_ops: Any,
     tid: str,
     full_branch: str,
@@ -548,11 +652,14 @@ async def probe_landing(
     :func:`found_on_main_response` removed it from this body entirely.
 
     Three arms, one per :class:`GitAuthorityArm`: a gone ref goes to the
-    marker search; a live ref not at main's tip goes to the ancestor arm when
-    its tip is an ancestor of main, and otherwise to the patch-id arm, whose
-    guards (degeneracy, empty net diff) and containment check all belong to
+    marker search (:func:`_marker_arm`); a live ref not at main's tip goes to
+    :func:`_ancestor_arm` when its tip is an ancestor of main, and otherwise
+    to :func:`_patch_id_arm`, whose guards (degeneracy, empty net diff) and
+    containment check all belong to
     ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``.
-    A ref sitting at exactly main's tip is ``no_signal``.
+    A ref sitting at exactly main's tip is ``no_signal``.  Every arm that
+    reads task metadata is handed it already fetched, so the fetch's
+    ``unavailable`` flag reaches the verdict even when the arm then raises.
 
     ``orch_config`` and ``harness`` are KEYWORD-ONLY because all three
     collaborators are typed ``Any`` and are therefore interchangeable to a
@@ -567,8 +674,8 @@ async def probe_landing(
     invoked).  ``merge_status`` takes the default; every other consumer —
     leaf η's periodic writer first — passes its own.
 
-    FIRE-SAFE: every failure — including an ImportError from the runtime
-    reverse import below — degrades to ``probe_failed`` and is logged; this
+    FIRE-SAFE: every failure — including an ImportError from an arm's
+    runtime reverse import — degrades to ``probe_failed`` and is logged; this
     never raises.  The wrapper lives HERE rather than at the call site so
     every consumer inherits the fire-safety instead of re-adding it.  A
     clean miss is ``no_signal``, never ``probe_failed``.
@@ -581,110 +688,38 @@ async def probe_landing(
         )
 
     try:
-        prefix = orch_config.git.branch_prefix
-        full_branch = canonical_queued_branch_name(key, prefix)
+        git_config = orch_config.git
+        full_branch = canonical_queued_branch_name(key, git_config.branch_prefix)
         tip = await git_ops.resolve_branch_sha(full_branch)
-        main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
-        tid = full_branch.removeprefix(prefix)
-        # Runtime-only reverse import: orchestrator depends on escalation,
-        # not vice versa, so this lazy import deliberately avoids a static
-        # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
-        # at runtime because the escalation server is hosted inside the
-        # orchestrator process.  An ImportError is an Exception and therefore
-        # already degrades to probe_failed via the wrapper below.
-        from orchestrator.merge_lane.landing_evidence import (
-            branch_is_degenerate,
-            is_valid_sha_40,
-        )
+        main_tip = await git_ops.resolve_branch_sha(git_config.main_branch)
+        tid = full_branch.removeprefix(git_config.branch_prefix)
         if tip is None:
             # Branch ref gone — the canonical 4352 deleted-branch shape.
-            # find_merge_marker internally gates on branch existence so it only
-            # fires when the ref is gone.
+            # find_merge_marker gates on branch existence internally.
             marker = await git_ops.find_merge_marker(full_branch)
-            if marker is not None:
-                fetch = await task_metadata(harness, tid, site=site)
-                metadata_unavailable = fetch.unavailable
-                branch_base_sha = fetch.metadata.get('branch_base_sha')
-                # Predates-this-incarnation veto (task 3103, mirroring
-                # the harness marker arm): the branch was deleted and
-                # recreated under the SAME task id, so a marker older
-                # than this incarnation's base attributes a previous
-                # run's merge to the current task.  is_valid_sha_40 sits
-                # on the LEFT of the `and` so a missing or malformed
-                # base never reaches is_ancestor with a bad argument.
-                if not (
-                    is_valid_sha_40(branch_base_sha)
-                    and await git_ops.is_ancestor(marker, branch_base_sha)
-                ):
-                    return await _evidence_verdict(
-                        git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
-                        branch_tip_sha=None, candidate_sha=marker,
-                    )
-        elif tip != main_tip:
-            if not await git_ops.is_ancestor(tip, orch_config.git.main_branch):
-                # Live branch that is NOT an ancestor of main — the shape a
-                # worker-rebased solo landing leaves (GitOps.advance_main's
-                # rebased path retains the ref at its pre-rebase tip).
-                fetch = await task_metadata(harness, tid, site=site)
-                metadata_unavailable = fetch.unavailable
-                return await _patch_id_verdict(
-                    git_ops, tid, full_branch, fetch, branch_tip_sha=tip, site=site,
-                )
-            # Live branch is already an ancestor of main (normal merged case).
-            # tip != main_tip guards against the no-op case: a branch sitting at
-            # exactly main's HEAD satisfies is_ancestor trivially (a commit is
-            # its own ancestor) but nothing has been merged.
-            # Degeneracy guard (task 3103): a tip still equal to the
-            # recorded branch_base_sha proves ZERO commits were ever
-            # pushed beyond the creation point.  Such a branch is parked
-            # at an OLD main commit, which makes it an ancestor of main
-            # AND distinct from main_tip — both checks above pass — so
-            # without this guard the tier stamps a confident `done`
-            # against a commit containing none of the task's work.  A
-            # degenerate branch falls through to no_signal.  Runs FIRST
-            # and independently of the citation gate:
-            # a degenerate branch whose task DOES have a citing commit on
-            # main (reify 5493) is caught only by this ordering.
-            # branch_tip_sha=tip: the probe judges degeneracy against the
-            # SAME tip the is_ancestor check above just ran on, instead of
-            # re-reading the ref (review #2) — one subprocess fewer, and no
-            # window for a warm-lane reseed to split the two observations.
+            if marker is None:
+                return _verdict(GitAuthorityOutcome.no_signal)
             fetch = await task_metadata(harness, tid, site=site)
             metadata_unavailable = fetch.unavailable
-            if not await branch_is_degenerate(
-                git_ops, full_branch, fetch.metadata, branch_tip_sha=tip,
-            ):
-                # Citation gate.  Read the pattern off orch_config.git for
-                # consistency with the adjacent .main_branch / .branch_prefix
-                # reads (same object as git_ops.config in production).
-                pattern = orch_config.git.commit_citation_pattern
-                if pattern == '':
-                    # Documented per-project opt-out (config.py
-                    # commit_citation_pattern): '' disables the citation
-                    # check entirely for projects without citation
-                    # conventions, and find_task_citation_commit honours it
-                    # by returning None for EVERYTHING.  Running the gate
-                    # here would therefore reject unconditionally and turn
-                    # Tier 3.5 into dead code rather than merely un-gated —
-                    # a silent capability loss for an explicit opt-in.
-                    # Note: None means "use the built-in
-                    # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
-                    # opt-out.  The degeneracy guard above still applies.
-                    # merge_sha is therefore the raw BRANCH TIP, and
-                    # citation_gate_skipped is what tells a caller so —
-                    # see GitAuthorityVerdict and found_on_main_response.
-                    return _verdict(
-                        GitAuthorityOutcome.found_on_main, merge_sha=tip,
-                        arm=GitAuthorityArm.ancestor, citation_gate_skipped=True,
-                    )
-                return await _evidence_verdict(
-                    git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
-                    branch_tip_sha=tip, pattern_template=pattern,
-                )
+            return await _marker_arm(git_ops, tid, full_branch, fetch, marker=marker)
+        if tip == main_tip:
+            # A commit is its own ancestor, so a branch at exactly main's HEAD
+            # passes is_ancestor while nothing has been merged.
+            return _verdict(GitAuthorityOutcome.no_signal)
+        tip_is_ancestor = await git_ops.is_ancestor(tip, git_config.main_branch)
+        fetch = await task_metadata(harness, tid, site=site)
+        metadata_unavailable = fetch.unavailable
+        if tip_is_ancestor:
+            return await _ancestor_arm(
+                git_ops, tid, full_branch, fetch,
+                branch_tip_sha=tip, pattern=git_config.commit_citation_pattern,
+            )
+        return await _patch_id_arm(
+            git_ops, tid, full_branch, fetch, branch_tip_sha=tip, site=site,
+        )
     except Exception:
         logger.warning(
             '%s: git-authority probe failed for %s — returning probe_failed',
             site, key, exc_info=True,
         )
         return _verdict(GitAuthorityOutcome.probe_failed)
-    return _verdict(GitAuthorityOutcome.no_signal)
