@@ -1355,6 +1355,7 @@
     "orchestrator/tests/test_harness_wip_step_detection.py": {"patch_targets": [], "private_reads": 14},
     "orchestrator/tests/test_hermetic_disk_usage.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_inflight_verify_merge_lease.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_info_l0_router_boundary.py": {"patch_targets": [], "private_reads": 10},
     "orchestrator/tests/test_interactive_warm_worktree_integration_gate.py": {"patch_targets": [], "private_reads": 6},
     "orchestrator/tests/test_interactive_worktree.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_interactive_worktree_reaper.py": {"patch_targets": [], "private_reads": 9},
