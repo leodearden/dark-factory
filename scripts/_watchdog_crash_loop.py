@@ -24,7 +24,7 @@ import subprocess
 import time
 from collections.abc import Callable
 
-from _watchdog_state import LogSink, atomic_write_json, read_json_state
+from _watchdog_state import LogSink, atomic_write_json, read_json_state, within_min_interval
 
 START_LIMIT_HIT_RESULT = "start-limit-hit"
 
@@ -197,7 +197,7 @@ def observe_unit(
     if candidate is None:
         return Observation(history, alarm=None, held=None)
     last = history.last_escalation_epoch
-    if last is not None and now - last < window_secs:
+    if within_min_interval(window_secs, lambda: last, now=now):
         return Observation(history, alarm=None, held=candidate)
     attempted = dataclasses.replace(history, last_escalation_epoch=int(now))
     return Observation(attempted, alarm=candidate, held=None)

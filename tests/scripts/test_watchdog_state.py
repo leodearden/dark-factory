@@ -382,6 +382,17 @@ def test_within_min_interval_is_remaining_secs_above_zero(
     )
 
 
+def test_an_injected_now_replaces_the_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that owns its *now* (the crash-loop page dedup) shares this rule too."""
+    monkeypatch.setattr(time, "time", lambda: pytest.fail("an injected now reads no wall clock"))
+
+    assert state.min_interval_remaining_secs(
+        900, lambda: _NOW - 100, now=_NOW
+    ) == pytest.approx(800.0)
+    assert state.within_min_interval(900, lambda: _NOW - 899, now=_NOW) is True
+    assert state.within_min_interval(900, lambda: _NOW - 900, now=_NOW) is False
+
+
 # ---------------------------------------------------------------------------
 # task 4823: the clock stamp carries its own provenance
 #
