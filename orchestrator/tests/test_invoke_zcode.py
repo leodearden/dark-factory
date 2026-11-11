@@ -46,6 +46,7 @@ FAKE_ZCODE = '''#!/usr/bin/env python3
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,26 @@ def snapshot(path):
     return {'text': path.read_text(), 'mode': stat.S_IMODE(path.stat().st_mode)}
 
 
+def git(repo, *args):
+    return subprocess.run(['git', *args], cwd=repo, capture_output=True, text=True)
+
+
+def git_probe():
+    repo = Path(os.environ['TMPDIR'], 'probe-repo')
+    repo.mkdir()
+    (repo / 'kept.txt').write_text('kept\\n')
+    (repo / 'dropped.operator-ignored').write_text('dropped\\n')
+    git(repo, 'init', '-q')
+    git(repo, 'add', '-A')
+    commit = git(repo, 'commit', '-q', '-m', 'probe')
+    return {
+        'commit_rc': commit.returncode,
+        'commit_stderr': commit.stderr,
+        'author_email': git(repo, 'log', '-1', '--format=%ae').stdout.strip(),
+        'tracked': git(repo, 'ls-files').stdout.splitlines(),
+    }
+
+
 home = os.environ.get('HOME', '')
 capture = {
     'argv': sys.argv[1:],
@@ -67,6 +88,8 @@ capture = {
     'cli_config': snapshot(Path(home, '.zcode', 'cli', 'config.json')),
     'agents_md': snapshot(Path(home, '.zcode', 'AGENTS.md')),
 }
+if os.environ.get('ZCODE_FAKE_GIT_PROBE'):
+    capture['git_probe'] = git_probe()
 Path(os.environ['ZCODE_FAKE_CAPTURE']).write_text(json.dumps(capture))
 time.sleep(float(os.environ.get('ZCODE_FAKE_SLEEP') or 0))
 sys.stdout.write(MEASURED_JSON)
@@ -92,6 +115,27 @@ def fake_zcode(tmp_path, monkeypatch) -> FakeZCode:
     capture_path = tmp_path / 'capture.json'
     monkeypatch.setenv('ZCODE_FAKE_CAPTURE', str(capture_path))
     return FakeZCode(capture_path=capture_path)
+
+
+OPERATOR_TOOL_VARS = (
+    'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+    'CARGO_HOME', 'RUSTUP_HOME', 'GIT_CONFIG_GLOBAL',
+)
+
+
+@pytest.fixture
+def operator_home(tmp_path, monkeypatch) -> Path:
+    op = tmp_path / 'operator'
+    op.mkdir()
+    (op / '.gitconfig').write_text('[user]\n\tname = Op Erator\n\temail = op@example.test\n')
+    ignore = op / '.config' / 'git' / 'ignore'
+    ignore.parent.mkdir(parents=True)
+    ignore.write_text('*.operator-ignored\n')
+    monkeypatch.setenv('HOME', str(op))
+    monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
+    for name in OPERATOR_TOOL_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return op
 
 
 @pytest.fixture
@@ -224,3 +268,18 @@ class TestInvokeZCode:
         assert '/x' in call['extras']
         assert fake_zcode.capture()['home'] in call['extras']
 
+    async def test_the_agent_commands_commit_with_the_operator_git_and_tool_homes(
+        self, fake_zcode, worktree, operator_home, monkeypatch,
+    ):
+        monkeypatch.setenv('ZCODE_FAKE_GIT_PROBE', '1')
+        await _invoke(worktree)
+        capture = fake_zcode.capture()
+        probe = capture['git_probe']
+        assert probe['commit_rc'] == 0, probe['commit_stderr']
+        assert probe['author_email'] == 'op@example.test'
+        assert probe['tracked'] == ['kept.txt']
+        environ = capture['environ']
+        assert environ['CARGO_HOME'] == str(operator_home / '.cargo')
+        assert environ['RUSTUP_HOME'] == str(operator_home / '.rustup')
+        assert environ['XDG_CACHE_HOME'] == str(operator_home / '.cache')
+        assert environ['HOME'] == capture['home']

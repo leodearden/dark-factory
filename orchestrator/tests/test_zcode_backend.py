@@ -8,7 +8,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from orchestrator.agents.zcode_backend import (
     parse_zcode_output,
     zcode_argv,
     zcode_cli_config,
+    zcode_operator_home,
     zcode_provider_config,
     zcode_run_home,
     zcode_spawn_env,
@@ -330,11 +333,25 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def _run_home(system_prompt: str = 'SYS PROMPT'):
+OPERATOR_HOME = Path('/home/operator')
+
+
+def _run_home(system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_HOME):
     return zcode_run_home(
         system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
-        mcp_config=PLAN_TOOLS_MCP,
+        mcp_config=PLAN_TOOLS_MCP, operator_home=operator_home,
     )
+
+
+class TestZCodeOperatorHome:
+
+    def test_the_operator_home_is_the_inherited_home(self):
+        assert zcode_operator_home({'HOME': '/home/operator', 'PATH': '/bin'}) == OPERATOR_HOME
+
+    @pytest.mark.parametrize('base_env', [{}, {'HOME': ''}, {'HOME': '   '}])
+    def test_a_missing_or_blank_home_is_refused_by_name(self, base_env):
+        with pytest.raises(ValueError, match='HOME'):
+            zcode_operator_home(base_env)
 
 
 class TestZCodeRunHome:
@@ -354,6 +371,10 @@ class TestZCodeRunHome:
             assert json.loads(cli_config.read_text()) == zcode_cli_config(PLAN_TOOLS_MCP)
             assert (home.root / '.zcode' / 'AGENTS.md').read_text() == 'SYS PROMPT'
             assert (home.root / 'tmp').is_dir()
+
+    def test_the_home_carries_the_operator_home(self, tmp_path):
+        with _run_home(operator_home=tmp_path / 'op') as home:
+            assert home.operator_home == tmp_path / 'op'
 
     def test_each_invocation_gets_a_fresh_home(self):
         with _run_home() as first, _run_home() as second:
@@ -401,3 +422,85 @@ class TestZCodeSpawnEnv:
                      'CLAUDE_CODE_OAUTH_TOKEN'):
             assert name not in env
         assert TOKEN not in env.values()
+
+    def test_the_operator_tool_homes_default_under_the_operator_home(self):
+        with _run_home() as home:
+            env = zcode_spawn_env({'PATH': '/usr/bin', 'HOME': '/home/operator'}, home)
+            assert env['HOME'] == str(home.root)
+        assert env['XDG_CONFIG_HOME'] == '/home/operator/.config'
+        assert env['XDG_CACHE_HOME'] == '/home/operator/.cache'
+        assert env['XDG_DATA_HOME'] == '/home/operator/.local/share'
+        assert env['XDG_STATE_HOME'] == '/home/operator/.local/state'
+        assert env['CARGO_HOME'] == '/home/operator/.cargo'
+        assert env['RUSTUP_HOME'] == '/home/operator/.rustup'
+
+    def test_an_inherited_tool_home_wins_verbatim(self):
+        base_env = {'HOME': '/home/operator', 'CARGO_HOME': '/opt/cargo',
+                    'XDG_CACHE_HOME': '/var/cache/op'}
+        with _run_home() as home:
+            env = zcode_spawn_env(base_env, home)
+        assert env['CARGO_HOME'] == '/opt/cargo'
+        assert env['XDG_CACHE_HOME'] == '/var/cache/op'
+        assert env['RUSTUP_HOME'] == '/home/operator/.rustup'
+
+    def test_a_blank_inherited_tool_home_falls_back_to_the_operator_default(self):
+        base_env = {'HOME': '/home/operator', 'CARGO_HOME': '', 'XDG_CONFIG_HOME': ''}
+        with _run_home() as home:
+            env = zcode_spawn_env(base_env, home)
+        assert env['CARGO_HOME'] == '/home/operator/.cargo'
+        assert env['XDG_CONFIG_HOME'] == '/home/operator/.config'
+
+
+def _git(repo: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['git', *args], cwd=repo, env=env, capture_output=True, text=True, check=False,
+    )
+
+
+def _operator_home(root: Path, *, with_gitconfig: bool = True) -> Path:
+    root.mkdir()
+    if with_gitconfig:
+        (root / '.gitconfig').write_text(
+            '[user]\n\tname = Op Erator\n\temail = op@example.test\n',
+        )
+    ignore = root / '.config' / 'git' / 'ignore'
+    ignore.parent.mkdir(parents=True)
+    ignore.write_text('*.operator-ignored\n')
+    return root
+
+
+def _repo(root: Path) -> Path:
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q', str(root)], check=True, env={
+        'PATH': os.environ['PATH'], 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1',
+    })
+    (root / 'kept.txt').write_text('kept\n')
+    (root / 'dropped.operator-ignored').write_text('dropped\n')
+    return root
+
+
+def _operator_env(operator_home: Path) -> dict[str, str]:
+    return {'PATH': os.environ['PATH'], 'HOME': str(operator_home), 'GIT_CONFIG_NOSYSTEM': '1'}
+
+
+class TestZCodeSpawnEnvGit:
+
+    def test_git_sees_the_operator_identity_and_excludes(self, tmp_path):
+        op = _operator_home(tmp_path / 'operator')
+        repo = _repo(tmp_path / 'repo')
+        with _run_home(operator_home=op) as home:
+            env = zcode_spawn_env(_operator_env(op), home)
+            ident = _git(repo, env, 'var', 'GIT_AUTHOR_IDENT')
+            staged = _git(repo, env, 'add', '-A', '--dry-run')
+        assert ident.returncode == 0, ident.stderr
+        assert 'op@example.test' in ident.stdout
+        assert staged.returncode == 0, staged.stderr
+        assert 'kept.txt' in staged.stdout
+        assert 'dropped.operator-ignored' not in staged.stdout
+
+    def test_an_operator_home_without_a_gitconfig_is_not_an_error(self, tmp_path):
+        op = _operator_home(tmp_path / 'operator', with_gitconfig=False)
+        repo = _repo(tmp_path / 'repo')
+        with _run_home(operator_home=op) as home:
+            status = _git(repo, zcode_spawn_env(_operator_env(op), home), 'status')
+        assert status.returncode == 0, status.stderr
