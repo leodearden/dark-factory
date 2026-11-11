@@ -29,6 +29,7 @@ UNIT = "fused-memory"
 STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 STALENESS_PROBE = ["is-active", STALENESS_REDEPLOY_UNIT]
 STOP_THEN_START = [["stop", UNIT], ["start", "fused-memory.socket", UNIT]]
+_FAKE_CHECK_NAME = "fake_check_network_exposure.py"
 
 # The drained marker the script greps journalctl for (task 2702's converging
 # drain). The fake journalctl emits this exact literal, so the test pins the
@@ -235,6 +236,29 @@ if __name__ == "__main__":
 '''
 
 
+_FAKE_CHECK_NETWORK_EXPOSURE_SRC = '''#!/usr/bin/env python3
+"""Fake scripts/check_network_exposure.py: record when it ran (the systemctl
+call count and the post-start health successes so far), print one tagged
+line, exit `check_rc`."""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_STATE_PATH"]
+
+with open(STATE_PATH) as f:
+    state = json.load(f)
+state.setdefault("check_calls", []).append({
+    "systemctl_calls": len(state["systemctl_calls"]),
+    "health_success_count": state.get("health_success_count", 0),
+})
+with open(STATE_PATH, "w") as f:
+    json.dump(state, f)
+print("[network_exposure] [fake] check ran")
+sys.exit(state["check_rc"])
+'''
+
+
 def _state_path(tmp_path):
     return tmp_path / "fake_state.json"
 
@@ -250,6 +274,7 @@ def _write_fakes(
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
     unit_states=None,
+    check_rc=0,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -257,6 +282,7 @@ def _write_fakes(
         ("systemctl", _FAKE_SYSTEMCTL_SRC),
         ("curl", _FAKE_CURL_SRC),
         ("journalctl", _FAKE_JOURNALCTL_SRC),
+        (_FAKE_CHECK_NAME, _FAKE_CHECK_NETWORK_EXPOSURE_SRC),
     ):
         fake = bin_dir / name
         fake.write_text(src)
@@ -275,6 +301,8 @@ def _write_fakes(
         "journalctl_marker_after": journalctl_marker_after,
         "journalctl_marker_padding_bytes": journalctl_marker_padding_bytes,
         "unit_states": unit_states or {},
+        "check_rc": check_rc,
+        "check_calls": [],
     }))
     return bin_dir, state_path
 
@@ -299,6 +327,7 @@ def _run_script(
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
     unit_states=None,
+    check_rc=0,
 ):
     bin_dir, state_path = _write_fakes(
         tmp_path,
@@ -310,6 +339,7 @@ def _run_script(
         journalctl_marker_after=journalctl_marker_after,
         journalctl_marker_padding_bytes=journalctl_marker_padding_bytes,
         unit_states=unit_states,
+        check_rc=check_rc,
     )
     _socket_unit_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "home").mkdir(exist_ok=True)
@@ -323,6 +353,7 @@ def _run_script(
     full_env.setdefault("DRAIN_POLL_INTERVAL", "0")
     full_env.setdefault("HEALTH_TIMEOUT", "3")
     full_env.setdefault("CURL_MAX_TIME", "2")
+    full_env["NETWORK_EXPOSURE_CHECK"] = str(bin_dir / _FAKE_CHECK_NAME)
     if env:
         full_env.update(env)
     # Unconditional, after `env`: no run may install into the live
@@ -684,3 +715,68 @@ def test_plain_modes_leave_the_socket_unit_alone(tmp_path, args):
     assert not [c for c in calls if c[0] in socket_verbs], f"calls={calls!r}"
     assert not _socket_unit_path(tmp_path).exists()
     assert ["restart", UNIT] in calls, f"calls={calls!r}"
+
+
+# ---------------------------------------------------------------------------
+# (i) --rebind-socket's post-condition: once /health answers, the exposure
+# check runs last and its status is the script's
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("check_rc", [0, 1])
+def test_rebind_exits_with_the_exposure_check_status(tmp_path, check_rc):
+    result = _run_script(tmp_path, "--rebind-socket", "--now", check_rc=check_rc)
+    assert result.returncode == check_rc, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert len(state["check_calls"]) == 1, f"state={state!r}"
+    check_call = state["check_calls"][0]
+    assert check_call["health_success_count"] >= 1, f"state={state!r}"
+    assert check_call["systemctl_calls"] == len(state["systemctl_calls"]), f"state={state!r}"
+    assert "[network_exposure]" in result.stdout, f"stdout={result.stdout!r}"
+
+
+def test_rebind_does_not_run_the_check_when_health_never_comes_up(tmp_path):
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        health_fail_remaining=100_000,
+        env={"HEALTH_TIMEOUT": "1"},
+    )
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), f"expected a diagnostic on stderr; got {result.stderr!r}"
+    state = _state(tmp_path)
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+    assert state["check_calls"] == [], f"state={state!r}"
+
+
+def test_rebind_runs_the_committed_exposure_check_by_default(tmp_path):
+    """The fake systemctl prints nothing for `list-sockets -o json`, so the
+    REAL scripts/check_network_exposure.py reports that source and exits 1 on
+    any host; the fake `ip` lists no address, so it connects only to
+    127.0.0.1."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_ip = bin_dir / "ip"
+    fake_ip.write_text("#!/bin/sh\necho '[]'\n")
+    fake_ip.chmod(0o755)
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        env={"NETWORK_EXPOSURE_CHECK": ""},
+    )
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert (
+        "[network_exposure] [source-error] systemctl --user list-sockets -o json"
+        in result.stdout
+    ), f"stdout={result.stdout!r}"
+
+
+def test_plain_modes_never_run_the_exposure_check(tmp_path):
+    result = _run_script(tmp_path, "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["check_calls"] == []
