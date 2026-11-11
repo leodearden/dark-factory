@@ -2050,7 +2050,7 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
 ):
     """Unparseable candidate metadata is treated as ungated, never raised on.
 
-    Matches _extract_metadata_dict's degrade contract: the shape warning is
+    Matches extract_metadata_dict's degrade contract: the shape warning is
     emitted there, and the guard falls back to the permissive answer rather
     than turning a malformed blob into a hard failure of the combine path.
     """
@@ -14198,9 +14198,10 @@ class TestExtractMetadataFilesWarns:
         assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
 
 
-# ── task 2166 step-5: _parse_metadata / _extract_metadata_dict discard WARN ──
+# ── task 2166 step-5: _parse_metadata discard WARN ──
 #
-# Both helpers delegate their malformed-input policy to
+# (The None-preserving twin, now ``metadata_dict.py::extract_metadata_dict``,
+# is tested in test_metadata_dict.py.) Both delegate their malformed-input policy to
 # shared.task_metadata.parse_metadata(direction='read') and must emit a
 # task_metadata.schema_warning WARNING on a genuine whole-metadata discard
 # (unparseable JSON / non-object) while staying silent for legitimate
