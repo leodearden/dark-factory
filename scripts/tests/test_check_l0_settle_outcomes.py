@@ -14,6 +14,8 @@ from typing import Any
 import check_l0_settle_outcomes as settle
 import pytest
 from escalation.archive import archive_dir_for_date
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 SCRIPT = Path(settle.__file__).resolve()
 CATEGORY = 'design_concern'
@@ -461,3 +463,48 @@ def test_non_record_files_are_ignored(settle_queue: SettleQueue, capsys: pytest.
 
     assert code == 0
     assert trailing_json(after) == trailing_json(before)
+
+
+def file_escalation(queue: EscalationQueue, task_id: str, summary: str, *, level: int = 0, filed_at: datetime) -> str:
+    escalation_id = queue.make_id(task_id)
+    queue.submit(
+        Escalation(
+            id=escalation_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category=CATEGORY,
+            summary=summary,
+            level=level,
+            timestamp=iso(filed_at),
+        )
+    )
+    return escalation_id
+
+
+def test_counts_records_written_by_the_real_queue(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    queue_dir = tmp_path / 'q'
+    queue = EscalationQueue(queue_dir)
+    now = datetime.now(UTC)
+
+    file_escalation(queue, '101', 'stranded across a restart', filed_at=now - timedelta(minutes=20))
+    queue.dismiss_all_pending('Auto-dismissed: orchestrator restarted — stale from prior run', strand_age_secs=600)
+
+    file_escalation(queue, '102', 'open L1 for the task', level=1, filed_at=now - timedelta(minutes=10))
+    covered_id = file_escalation(queue, '102', 'L0 the reaper sees as covered', filed_at=now - timedelta(minutes=5))
+    covered = queue.get(covered_id)
+    assert covered is not None
+    assert queue.dismiss_if_covered(covered, resolver='harness-orphan-reaper')
+    queue.resolve(covered_id, 'steward finding after the sweep', resolved_by='steward')
+
+    resolved_id = file_escalation(queue, '103', 'ordinary steward work', filed_at=now - timedelta(minutes=2))
+    queue.resolve(resolved_id, 'steward fixed it', resolved_by='steward')
+
+    code, lines = run_main(capsys, queue_dir)
+
+    post = trailing_json(lines)['post']
+    assert code == 0
+    assert (post['stale_strands'], post['stranded']) == (1, 1)
+    assert (post['reaper_dismissals'], post['reaper_wrong']) == (1, 1)
+    assert post['startup_dismissals'] == 1
+    assert post['filed'] == 3
