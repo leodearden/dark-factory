@@ -1245,6 +1245,8 @@ class TestUndecodableRowIsRefusedNotExecuted:
         )
 
         svc = _mock_backends(MemoryService(mock_config))
+        graphiti_add_episode = AsyncMock(return_value=None)
+        svc.graphiti.add_episode = graphiti_add_episode
         svc.set_known_projects({'main': str(tmp_path)})
         await svc.initialize()
         try:
@@ -1264,5 +1266,5 @@ class TestUndecodableRowIsRefusedNotExecuted:
         assert dead[0]['operation'] == 'typo_op'
         assert dead[0]['attempts'] == 1
         assert dead[0]['error'].startswith('UnknownQueueOperation: '), dead[0]['error']
-        svc.graphiti.add_episode.assert_not_awaited()
+        graphiti_add_episode.assert_not_awaited()
         assert [call['content_preview'] for call in filed] == [body]
