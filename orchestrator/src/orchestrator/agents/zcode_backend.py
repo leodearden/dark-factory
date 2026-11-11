@@ -28,6 +28,15 @@ AUTH_TOKEN_VAR = 'ANTHROPIC_AUTH_TOKEN'
 PROVIDER_ID = 'dark-factory'
 INTERACTIVE_TOOLS = ('AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode')
 MAX_ARG_STRLEN = 131072
+# HOME-derived tool locations the agent's commands keep at the operator's values; see plans/zcode-harness-probe-2026-11.md.
+OPERATOR_TOOL_HOMES: tuple[tuple[str, str], ...] = (
+    ('XDG_CONFIG_HOME', '.config'),
+    ('XDG_CACHE_HOME', '.cache'),
+    ('XDG_DATA_HOME', '.local/share'),
+    ('XDG_STATE_HOME', '.local/state'),
+    ('CARGO_HOME', '.cargo'),
+    ('RUSTUP_HOME', '.rustup'),
+)
 
 _PLAIN_TOOL_NAME = re.compile(r'[A-Za-z0-9_-]+')
 
@@ -105,10 +114,21 @@ def _zcode_mcp_server(name: str, server: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def zcode_operator_home(base_env: Mapping[str, str]) -> Path:
+    home = (base_env.get('HOME') or '').strip()
+    if not home:
+        raise ValueError(
+            'the zcode backend needs HOME in its environment: without the operator home it '
+            "cannot reproduce its control's tool environment under the redirected run home",
+        )
+    return Path(home)
+
+
 @dataclass(frozen=True)
 class ZCodeRunHome:
     root: Path
     provider_config_path: Path
+    operator_home: Path
 
 
 @contextmanager
@@ -118,6 +138,7 @@ def zcode_run_home(
     model: str,
     endpoint: ZCodeEndpoint,
     mcp_config: Mapping[str, Any] | None,
+    operator_home: Path,
 ) -> Iterator[ZCodeRunHome]:
     """A private home for one invocation, holding the only copy of the endpoint key; removed on exit."""
     root = Path(tempfile.mkdtemp(prefix='zcode-home-'))
@@ -129,10 +150,18 @@ def zcode_run_home(
         cli_config_path.parent.mkdir(parents=True)
         cli_config_path.write_text(json.dumps(zcode_cli_config(mcp_config)))
         (zcode_dir / 'AGENTS.md').write_text(system_prompt)
+        (root / '.gitconfig').write_text(_git_include(operator_home / '.gitconfig'))
         (root / 'tmp').mkdir()
-        yield ZCodeRunHome(root=root, provider_config_path=provider_config_path)
+        yield ZCodeRunHome(
+            root=root, provider_config_path=provider_config_path, operator_home=operator_home,
+        )
     finally:
         _remove_run_home(root)
+
+
+def _git_include(path: Path) -> str:
+    quoted = str(path).replace('\\', '\\\\').replace('"', '\\"')
+    return f'[include]\n\tpath = "{quoted}"\n'
 
 
 def _write_owner_only_json(path: Path, document: Mapping[str, Any]) -> None:
@@ -159,12 +188,21 @@ def zcode_spawn_env(base_env: Mapping[str, str], home: ZCodeRunHome) -> dict[str
     }
     return {
         **inherited,
+        **_operator_tool_homes(base_env, home.operator_home),
         'HOME': root,
         'USERPROFILE': root,
         'ZCODE_DATA_BASE_DIR': root,
         'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE': str(home.provider_config_path),
         'TMPDIR': str(home.root / 'tmp'),
     }
+
+
+def _operator_tool_homes(base_env: Mapping[str, str], operator_home: Path) -> dict[str, str]:
+    overlay: dict[str, str] = {}
+    for name, default in OPERATOR_TOOL_HOMES:
+        inherited = base_env.get(name, '')
+        overlay[name] = inherited if inherited.strip() else str(operator_home / default)
+    return overlay
 
 
 def zcode_argv(prompt: str, cwd: Path, disallowed_tools: Iterable[str] | None) -> list[str]:

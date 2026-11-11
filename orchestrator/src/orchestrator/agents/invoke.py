@@ -46,6 +46,7 @@ from orchestrator.agents.zcode_backend import (
     ZCodeEndpoint,
     parse_zcode_output,
     zcode_argv,
+    zcode_operator_home,
     zcode_run_home,
     zcode_spawn_env,
 )
@@ -1377,12 +1378,15 @@ async def _invoke_zcode(
         'enforced or expressible by zcode; only the wall clock (timeout_seconds=%r) bounds it',
         max_turns, max_budget_usd, effort, allowed_tools, timeout_seconds,
     )
+    base_env = {**os.environ, **(env_overrides or {})}
+    operator_home = zcode_operator_home(base_env)
     with zcode_run_home(
         system_prompt=system_prompt, model=model, endpoint=endpoint, mcp_config=mcp_config,
+        operator_home=operator_home,
     ) as home:
         cmd, env = _sandbox_spawn(
             zcode_argv(prompt, cwd, disallowed_tools),
-            zcode_spawn_env({**os.environ, **(env_overrides or {})}, home),
+            zcode_spawn_env(base_env, home),
             cwd, sandbox_modules, [*(sandbox_extras or []), str(home.root)],
         )
         result = await _run_subprocess_local(
