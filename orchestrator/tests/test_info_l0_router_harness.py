@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_fake import FakeCurator
+from _info_l0_router_fixtures import reaper_harness, router_reaper_config
 from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -38,27 +39,12 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     """A real Harness over a real queue and event store; only the reaper and
     the amnesty are driven, so ``Harness.start()`` is bypassed and the
     scheduler is a mock whose ``dispatch_tool`` is the curator double."""
-    mock_orch_config.orphan_l0_reaper_enabled = True
-    mock_orch_config.orphan_l0_timeout_secs = 60.0
-    mock_orch_config.orphan_l0_check_interval_secs = 1.0
-    mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
-    mock_orch_config.info_l0_router_enabled = True
-    mock_orch_config.info_l0_router_ticket_timeout_secs = TICKET_TIMEOUT_SECS
-    mock_orch_config.info_l0_router_max_conversions_per_sweep = 20
-
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        h = Harness(mock_orch_config)
-
-    h.scheduler.is_actively_held = MagicMock(return_value=False)
-    h.scheduler.get_task = AsyncMock(return_value={'status': 'in-progress', 'metadata': {}})
-    h.scheduler.dispatch_tool = FakeCurator()
-    h.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
-    h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
-    return h
+    return reaper_harness(
+        router_reaper_config(mock_orch_config, ticket_timeout_secs=TICKET_TIMEOUT_SECS),
+        EscalationQueue(tmp_path / 'escalations'),
+        curator=FakeCurator(),
+        event_store=EventStore(tmp_path / 'runs.db', run_id='run-test'),
+    )
 
 
 def _queue(harness: Harness) -> EscalationQueue:

@@ -12,10 +12,11 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
+from _info_l0_router_fixtures import reaper_harness, router_reaper_config
 from _orch_helpers import wait_responsive
 from _workflow_helpers import (
     AgentStub,
@@ -30,7 +31,6 @@ from test_workflow_escalated_steward_stall import _wire_resolve_callback
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
 from orchestrator.escalation_router import ROUTER_ID, hold_note, read_hold
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import (
@@ -403,22 +403,11 @@ def _unrouted_info_notes(queue: EscalationQueue) -> list[Escalation]:
 async def _reaper_l1s_after_aging(config: MagicMock, queue: EscalationQueue) -> list[Escalation]:
     """One orphan-reaper pass over *queue*'s directory with every note past a
     zero-second orphan timeout; returns the verbatim promotions it filed."""
-    config.orphan_l0_timeout_secs = 0.0
-    config.orphan_l0_dispatch_freshness_secs = 120.0
-    config.info_l0_router_enabled = True
-    config.info_l0_router_ticket_timeout_secs = 900.0
-    config.info_l0_router_max_conversions_per_sweep = 20
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        harness = Harness(config)
-    harness.scheduler.is_actively_held = MagicMock(return_value=False)
-    harness.scheduler.get_task = AsyncMock(return_value={'status': 'done', 'metadata': {}})
-    harness.scheduler.dispatch_tool = FakeCurator()
     reaper_queue = EscalationQueue(queue.queue_dir)
-    harness._escalation_queue = reaper_queue
+    harness = reaper_harness(
+        router_reaper_config(config, orphan_timeout_secs=0.0), reaper_queue,
+        curator=FakeCurator(), task_row={'status': 'done', 'metadata': {}},
+    )
     await harness._reap_orphan_l0_escalations()
     return [
         e for e in reaper_queue.get_pending()
