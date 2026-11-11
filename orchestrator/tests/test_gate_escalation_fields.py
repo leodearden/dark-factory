@@ -8,6 +8,7 @@ gate files ``review_due`` with a typed payload; every other pure gate files
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,7 +215,7 @@ class TestHumanGate:
 FIXED_NOW = datetime(2026, 10, 5, 12, 30, tzinfo=UTC)
 
 
-def _chain_scheduler(task: dict, reads: dict[str, TaskRead | BaseException]) -> MagicMock:
+def _chain_scheduler(task: dict, reads: Mapping[str, TaskRead | BaseException]) -> MagicMock:
     """A scheduler whose ``read_task`` answers each dependency id from *reads*."""
 
     async def read_task(task_id: str) -> TaskRead:
@@ -235,7 +236,7 @@ def _chain_scheduler(task: dict, reads: dict[str, TaskRead | BaseException]) -> 
 
 
 async def _fire(
-    tmp_path: Path, task: dict, reads: dict[str, TaskRead | BaseException],
+    tmp_path: Path, task: dict, reads: Mapping[str, TaskRead | BaseException],
 ) -> tuple[WorkflowOutcome, EscalationQueue, MagicMock]:
     queue = EscalationQueue(tmp_path)
     scheduler = _chain_scheduler(task, reads)
