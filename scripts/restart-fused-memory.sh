@@ -3,13 +3,19 @@ set -euo pipefail
 
 # Cycle-aware restart of fused-memory (task 2703 δ).
 #
-# Usage:
-#   restart-fused-memory.sh            # DEFAULT: defer while a full recon
-#                                      #   cycle is in flight, restart between
-#                                      #   cycles (or after the ~35-min cap)
-#   restart-fused-memory.sh --now      # bypass the gate, restart immediately
-#   restart-fused-memory.sh --drain    # signal SIGUSR1 to drain recon first,
-#                                      #   wait for the drained marker, restart
+# Usage: restart-fused-memory.sh [--now|--drain] [--rebind-socket]
+#
+# Two independent choices. WHEN to restart (the gate, at most one flag):
+#   (no gate flag)     # DEFAULT: defer while a full recon cycle is in
+#                      #   flight, restart between cycles (or after the
+#                      #   ~35-min cap)
+#   --now              # bypass the gate, restart immediately
+#   --drain            # signal SIGUSR1 to drain recon first, wait for the
+#                      #   drained marker, restart
+# HOW to restart:
+#   (no flag)          # `systemctl --user restart fused-memory`
+#   --rebind-socket    # adopt the committed fused-memory.socket template,
+#                      #   then stop and start socket and service together
 #
 # The DEFAULT path polls /health and pipes the body to recon_busy_check.py:
 # while a full reconciliation cycle is running (recon_busy non-empty) it
@@ -38,20 +44,33 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-mode="default"
-case "${1:-}" in
-    "")       mode="default" ;;
-    --now)    mode="now" ;;
-    --drain)  mode="drain" ;;
-    *)
-        echo "ERROR: unknown argument: ${1}" >&2
-        echo "Usage: restart-fused-memory.sh [--now|--drain]" >&2
-        exit 2
-        ;;
-esac
+usage_error() {
+    echo "ERROR: $1" >&2
+    echo "Usage: restart-fused-memory.sh [--now|--drain] [--rebind-socket]" >&2
+    exit 2
+}
+
+gate="recon"
+rebind_socket=0
+
+set_gate() {
+    if [[ "$gate" != "recon" && "$gate" != "$1" ]]; then
+        usage_error "--${gate} and --$1 are mutually exclusive"
+    fi
+    gate="$1"
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --now)           set_gate now ;;
+        --drain)         set_gate drain ;;
+        --rebind-socket) rebind_socket=1 ;;
+        *)               usage_error "unknown argument: ${arg}" ;;
+    esac
+done
 
 # 1. DEFAULT: defer while a full recon cycle is in flight.
-if [[ "$mode" == "default" ]]; then
+if [[ "$gate" == "recon" ]]; then
     echo "recon_gate: polling ${HEALTH_URL} for in-flight reconciliation cycles (cap ${RECON_GATE_TIMEOUT}s)"
     gate_start=$SECONDS
     while true; do
@@ -89,7 +108,7 @@ fi
 
 # 2. --drain: signal the harness to stop new cycles and finish current ones,
 #    then wait for the drained marker before restarting.
-if [[ "$mode" == "drain" ]]; then
+if [[ "$gate" == "drain" ]]; then
     echo "Draining fused-memory recon (SIGUSR1 via systemctl kill)..."
     systemctl --user kill --kill-who=main --signal=SIGUSR1 "$SERVICE" \
         || echo "WARNING: failed to signal ${SERVICE}; proceeding to drain wait anyway." >&2
