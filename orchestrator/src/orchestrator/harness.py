@@ -101,7 +101,7 @@ from orchestrator.deployed_sha import DeployedSha
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     DeterministicRunner,
-    build_milestone_gate_escalation_fields,
+    build_gate_escalation_fields,
 )
 from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, read_hold, router_owns
@@ -16319,12 +16319,10 @@ class Harness:
         or a queue_dir storage/scoping divergence (the failure mode named in
         ``EscalationQueue.submit``'s docstring).  RE-FILES the born-at-L2 gate
         mirroring what the runner itself would have filed (same agent_role,
-        level, severity, category, and summary/detail/options — the latter three
-        built through the SHARED ``build_milestone_gate_escalation_fields`` seam
-        the runner uses, so even the operational-LLM token prefix (task 2803 γ)
-        on an operational-mode gate is reproduced verbatim rather than dropped
-        and misrouted) so the runner's section-1 resume quiescence/resolve-to-
-        done machinery — which scopes its scans on ``DETERMINISTIC_AGENT_ROLE``
+        level and severity; category, summary, detail, options and the
+        ``review_due`` payload come from the runner's own
+        ``build_gate_escalation_fields``) so the runner's section-1 resume
+        quiescence/resolve-to-done machinery — which scopes its scans on ``DETERMINISTIC_AGENT_ROLE``
         — integrates cleanly: a human resolving the re-filed gate drives the
         task to done exactly as designed.
 
@@ -16342,27 +16340,27 @@ class Harness:
 
         from escalation.models import Escalation  # noqa: PLC0415
 
-        # Task 2954 amendment: build summary/detail/options via the SAME
-        # `build_milestone_gate_escalation_fields` seam the runner's own
-        # `_file_milestone_gate_and_block` uses, so the re-filed gate is
-        # byte-identical to what the runner would have filed — including the
-        # operational-LLM token prefix (task 2803 γ) that a hand-rolled
-        # re-build here would otherwise drop and misroute.
-        summary, detail, options = build_milestone_gate_escalation_fields(
-            task, metadata,
+        # The stamp is the original fire time, so a recovered review_due
+        # carries the runner's fired_at.
+        stamp = metadata.get('gate_escalated_at')
+        fired_at = stamp if isinstance(stamp, str) and stamp else datetime.now(UTC).isoformat()
+        esc_id = self._escalation_queue.make_id(tid)
+        fields = build_gate_escalation_fields(
+            task, metadata, None, escalation_id=esc_id, fired_at=fired_at,
         )
 
         esc = Escalation(
-            id=self._escalation_queue.make_id(tid),
+            id=esc_id,
             task_id=tid,
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
-            category='milestone_gate',
-            summary=summary,
-            detail=detail,
-            options=options,
+            category=fields.category,
+            summary=fields.summary,
+            detail=fields.detail,
+            options=list(fields.options),
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
+            review_due=fields.review_due,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -16371,7 +16369,7 @@ class Harness:
                 task_id=tid,
                 data={
                     'escalation_id': esc.id,
-                    'category': 'milestone_gate',
+                    'category': fields.category,
                     'severity': 'critical',
                     'level': 2,
                     'reason': 'deterministic-recon-sweep-gate-strand-recovery',
@@ -16380,8 +16378,8 @@ class Harness:
         logger.warning(
             'Deterministic-recon-sweep: task %s pure-gate strand '
             '(gate_escalated_at stamped, no escalation record) — re-filed L2 '
-            'milestone_gate %s (agent_role=%s, no status change)',
-            tid, esc.id, DETERMINISTIC_AGENT_ROLE,
+            '%s %s (agent_role=%s, no status change)',
+            tid, fields.category, esc.id, DETERMINISTIC_AGENT_ROLE,
         )
 
     async def _revalidate_open_deterministic_escalation(

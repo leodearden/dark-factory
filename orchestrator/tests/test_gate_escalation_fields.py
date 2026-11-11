@@ -144,6 +144,7 @@ class TestHumanGate:
             'fired_at': FIRED_AT,
             'launched_from': ESC_ID,
         }
+        assert fields.review_due is not None
         assert not fields.review_due['skill'].startswith('/')
         assert fields.detail == _plain_detail(task)
         assert fields.options == ('A: ship', 'B: hold')

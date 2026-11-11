@@ -23,11 +23,12 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from escalation.models import Escalation
+from escalation.models import Escalation, ReviewDueState
 from shared.before_done_paths import (
     BeforeDonePaths,
     resolve_before_done_paths,
@@ -75,6 +76,13 @@ from orchestrator.proc_supervision import (
     FreshPidVerify,
     RestartDisposition,
     RestartPlan,
+)
+from orchestrator.review_due import (
+    REVIEW_DUE_CATEGORY,
+    HumanGateFacts,
+    InvalidTriggerChain,
+    human_gate_chain,
+    review_due,
 )
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import (
@@ -247,7 +255,8 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # stamp; `milestone_gate` is the gate itself; `milestone_check_failed` is a
 # failed predicate check; `milestone_check_stalled` is a re-arming predicate
 # still "not yet" at `deterministic.predicate_recheck_stall_cap` (PRD
-# plans/completion-driven-triggers-prd.md C1).
+# plans/completion-driven-triggers-prd.md C1).  The fifth, `review_due` (C4),
+# is defined with the rest of its contract in `orchestrator.review_due`.
 CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
 MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
 MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
@@ -650,58 +659,82 @@ def file_deterministic_escalation(
     return esc.id
 
 
-def build_milestone_gate_escalation_fields(
-    task: dict | None, metadata: dict,
-) -> tuple[str, str, list]:
-    """Build ``(summary, detail, options)`` for a born-at-L2 ``milestone_gate``.
+@dataclass(frozen=True)
+class GateEscalationFields:
+    """The fields of a pure gate's born-at-L2 escalation that depend on the task."""
 
-    THE single seam both born-at-L2 pure-gate producers route through:
-      - the runner's own gate filing
-        (``DeterministicRunner._file_milestone_gate_and_block``), and
-      - the harness recon-sweep's strand recovery
-        (``Harness._recover_stranded_deterministic_gate``, task 2954).
+    category: str
+    summary: str
+    detail: str
+    options: tuple[str, ...]
+    review_due: ReviewDueState | None
 
-    Extracted (task 2954 amendment) so a re-filed gate is byte-identical to
-    what the runner would have filed.  Critically this includes the
-    operational-LLM token prefix (task 2803 γ): a naive re-build in the sweep
-    would DROP the ``OPERATIONAL_LLM_NEEDS_LANE_TOKEN`` on summary+detail and
-    misroute the human handling lane, so centralizing the construction keeps
-    the two producers in lockstep.
 
-    ``detail`` = description + a "Landed dependencies:" line when the task has
-    dependencies; ``summary`` = ``title[:200]``.  For an operational-LLM gate
-    (``_is_operational_llm_gate``) both are token-prefixed (token-first so the
-    token survives the summary's ``[:200]`` truncation and any tail-only log
-    scrape; ``detail`` itself is not truncated).  Plain gates (marker absent)
-    are byte-unchanged.  ``options`` is the task's ``gate_options`` (empty list
-    when absent).  None/empty *task* is tolerated (defensive; the sweep's task
-    dict is read back from the scheduler).
+def _dependency_ids(task: dict) -> list[str]:
+    deps = task.get('dependencies', []) or []
+    return [str(d.get('id', d) if isinstance(d, dict) else d) for d in deps]
+
+
+def build_gate_escalation_fields(
+    task: dict | None,
+    metadata: dict,
+    human_gate: HumanGateFacts | None,
+    *,
+    escalation_id: str,
+    fired_at: str,
+) -> GateEscalationFields:
+    """The one builder both pure-gate producers file through.
+
+    ``DeterministicRunner._file_milestone_gate_and_block`` and
+    ``Harness._recover_stranded_deterministic_gate`` both call it, so a
+    recovered gate matches the runner's filing. A ``trigger_chain`` human gate
+    files ``review_due`` (plans/completion-driven-triggers-prd.md C4) and
+    needs *human_gate* from :func:`read_human_gate_facts`; every other gate
+    files ``milestone_gate``. The operational-LLM token prefix applies to
+    either.
     """
     task = task or {}
-    title = task.get('title', '')
-    description = task.get('description', '')
-    deps = task.get('dependencies', []) or []
-    dep_ids = [
-        str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-    ]
-    detail_parts = [description]
+    dep_ids = _dependency_ids(task)
+    detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+    category = MILESTONE_GATE_CATEGORY
+    summary = task.get('title', '')
+    payload: ReviewDueState | None = None
+    chain = human_gate_chain(metadata)
+    if isinstance(chain, InvalidTriggerChain):
+        detail_parts.append(chain.detail_line())
+    elif chain is not None:
+        if human_gate is None:
+            raise ValueError(
+                f'task {task.get("id")!r} is a trigger_chain human gate: read its '
+                'HumanGateFacts with read_human_gate_facts before building its escalation'
+            )
+        due = review_due(
+            chain, human_gate, human_gate_task_id=str(task.get('id')),
+            escalation_id=escalation_id, fired_at=fired_at,
+        )
+        category = REVIEW_DUE_CATEGORY
+        summary = due.summary
+        payload = due.payload
+        detail_parts.extend(due.detail_lines)
     detail = '\n'.join(detail_parts)
-    summary = title[:200]
     if _is_operational_llm_gate(metadata):
-        # Task 2803 (γ): token-first prefix/build so the token survives
-        # downstream truncation (the summary's [:200] slice) and any
-        # tail-only log scrape; detail itself is not truncated. Plain
-        # gates (marker absent) are byte-unchanged.
+        # Task 2803 (γ): token-first so the token survives the summary's
+        # [:200] slice and any tail-only log scrape.
         detail = (
             f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
             'LLM-operational handling; no automated lane exists yet — resolve '
             'by hand.\n\n'
         ) + detail
-        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
-    options = list(metadata.get('gate_options') or [])
-    return summary, detail, options
+        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {summary}'
+    return GateEscalationFields(
+        category=category,
+        summary=summary[:200],
+        detail=detail,
+        options=tuple(metadata.get('gate_options') or ()),
+        review_due=payload,
+    )
 
 
 class DeterministicRunner:
@@ -1819,7 +1852,10 @@ class DeterministicRunner:
     async def _file_milestone_gate_and_block(
         self, task_id: str, task: dict, metadata: dict
     ) -> WorkflowOutcome:
-        """File a born-at-L2 ``milestone_gate`` escalation and block the task.
+        """File the gate's born-at-L2 escalation and block the task.
+
+        The record comes from :func:`build_gate_escalation_fields`:
+        ``milestone_gate``, or ``review_due`` for a ``trigger_chain`` human gate.
 
         Encapsulates section 3's gate-filing logic for reuse by:
         - The pure-gate path (section 3) in ``run()``.
@@ -1871,13 +1907,9 @@ class DeterministicRunner:
         Returns:
             ``WorkflowOutcome.BLOCKED``
         """
-        # Task 2954 amendment: summary/detail/options built via the shared
-        # `build_milestone_gate_escalation_fields` seam so the harness recon-
-        # sweep's strand recovery re-files a byte-identical gate (including the
-        # operational-LLM token prefix) and the two producers stay in lockstep.
-        summary, detail, gate_options = build_milestone_gate_escalation_fields(
-            task, metadata,
-        )
+        # One instant: the review_due payload's fired_at and the
+        # gate_escalated_at stamp, which strand recovery re-files with.
+        now_iso = self._clock().isoformat()
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
@@ -1892,21 +1924,27 @@ class DeterministicRunner:
                 task_id, len(existing_pending),
             )
         else:
+            # The shared builder, so strand recovery re-files the same gate.
+            esc_id = self.escalation_queue.make_id(task_id)
+            fields = build_gate_escalation_fields(
+                task, metadata, None, escalation_id=esc_id, fired_at=now_iso,
+            )
             esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
+                id=esc_id,
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category=MILESTONE_GATE_CATEGORY,
-                summary=summary,
-                detail=detail,
-                options=list(gate_options),
+                category=fields.category,
+                summary=fields.summary,
+                detail=fields.detail,
+                options=list(fields.options),
                 level=2,
+                review_due=fields.review_due,
             )
             self.escalation_queue.submit(esc)
             logger.info(
-                'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
-                esc.id, task_id,
+                'DeterministicRunner: filed L2 %s gate escalation %s for task %s',
+                fields.category, esc.id, task_id,
             )
 
         # Stamp gate_escalated_at AFTER successful escalation submit.  ζ: on the
@@ -1915,7 +1953,6 @@ class DeterministicRunner:
         # self-restart crash-resume re-file), this atomically advances
         # deploy_state.phase to ESCALATED too (DS-1). A pure gate
         # (before_done=None) is not a deploy and gets no deploy_state.
-        now_iso = datetime.now(UTC).isoformat()
         if metadata.get('before_done') is not None:
             # Task 4048 amendment: pre-bind so both names are defined on every
             # path into `except` below, including one raised by the
