@@ -115,6 +115,7 @@ from fused_memory.middleware.lock_charter_guard import (
 # function to break the cycle), so this does not create a circular import.
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
+    pure_gate_routing_notice,
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
@@ -4242,19 +4243,26 @@ class TaskInterceptor:
         # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
+        # The routing notice is derived here so it is right whichever layer
+        # (tools.py or this twin) converted; the curator's route_deterministic
+        # converts after this response is built, so it never carries one.
         metadata = inject_operational_routing(metadata)
+        routing_notice = pure_gate_routing_notice(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
         metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
-            return await self._submit_task_planning_mode(
+            result = await self._submit_task_planning_mode(
                 project_root=project_root,
                 project_id=project_id,
                 kwargs=kwargs,
                 metadata=metadata,
                 attribution=attribution,
             )
+            if routing_notice and interceptor_write_succeeded(result):
+                return {**result, **routing_notice}
+            return result
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -4282,7 +4290,7 @@ class TaskInterceptor:
             candidate_json=blob,
         )
         self._enqueue_ticket(project_id, ticket_id)
-        return {'ticket': ticket_id}
+        return {'ticket': ticket_id, **routing_notice}
 
     async def _submit_task_planning_mode(
         self,

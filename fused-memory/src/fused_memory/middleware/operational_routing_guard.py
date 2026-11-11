@@ -71,13 +71,14 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-from shared.pure_gate_provenance import PureGateTrigger
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger
 
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
     'OPERATIONAL_LLM_GATE_MARKER_KEY',
     'inject_operational_routing',
+    'pure_gate_routing_notice',
 ]
 
 #: Dedicated, machine-checkable marker key stamped True only for
@@ -127,3 +128,36 @@ def inject_operational_routing(metadata: str | dict[str, Any] | None) -> Any:
         # itself is ALSO preserved by the pure-gate stamp, so γ may read either.
         coerced[OPERATIONAL_LLM_GATE_MARKER_KEY] = True
     return coerced
+
+
+def pure_gate_routing_notice(metadata: object) -> dict[str, Any]:
+    """The submit-response notice for a submission converted into a pure gate, else ``{}``.
+
+    Derived from the stored stamp, so the notice and the task record cannot
+    disagree. A stamp without ``always_escalates=True`` gets no notice: it
+    would claim a human gate that does not exist.
+    """
+    if not isinstance(metadata, Mapping):
+        return {}
+    if metadata.get('always_escalates') is not True:
+        return {}
+    try:
+        trigger = PureGateTrigger(metadata.get(PURE_GATE_FROM_KEY))
+    except ValueError:
+        return {}
+    return {
+        'routing_notice': {
+            'pure_gate_from': trigger.value,
+            'detail': (
+                f'This submission was converted into a deterministic always-escalates '
+                f'pure gate because of {trigger.value}: a task created from it escalates '
+                f'to a HUMAN at dispatch, and no agent executes it.'
+            ),
+            'hint': (
+                "If an agent can execute this work (including a docs, comment or rename "
+                "edit), file it with task_kind='normal' and metadata.complexity='simple' "
+                'instead, without an operational/decision execution_class '
+                '(docs/task-authoring.md §4).'
+            ),
+        },
+    }
