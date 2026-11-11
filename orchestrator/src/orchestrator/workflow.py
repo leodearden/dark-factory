@@ -15571,7 +15571,11 @@ class TaskWorkflow:
         resolved_at_entry = await asyncio.to_thread(
             self.escalation_queue.get_by_task, self.task_id, status='resolved',
         )
-        resolved_before_round = frozenset(e.id for e in resolved_at_entry)
+        # A record still open at entry was not resolved before this round, even
+        # when a concurrent resolve lands before the scan above reads it.
+        resolved_before_round = frozenset(
+            e.id for e in resolved_at_entry if e.id not in open_ids_at_entry
+        )
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring

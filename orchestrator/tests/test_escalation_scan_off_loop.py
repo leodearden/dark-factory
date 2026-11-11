@@ -63,6 +63,20 @@ class _ThreadProbeQueue(EscalationQueue):
         return [scan.thread for scan in self.scans if scan.status != 'pending']
 
 
+class _ResolvesDuringResolvedScan(_ThreadProbeQueue):
+    """Resolves one record as a ``status='resolved'`` scan begins, as a concurrent resolver can."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.resolve_during_scan: str | None = None
+
+    def get_by_task(self, task_id, status=None, level=None, agent_role=None):
+        if status == 'resolved' and self.resolve_during_scan is not None:
+            esc_id, self.resolve_during_scan = self.resolve_during_scan, None
+            self.resolve(esc_id, 'answered mid-scan', resolved_by='steward')
+        return super().get_by_task(task_id, status, level, agent_role)
+
+
 def _assert_archive_scans_ran_off_loop(probe: _ThreadProbeQueue) -> None:
     threads = probe.archive_inclusive_threads()
     assert threads, f'no archive-inclusive get_by_task scan was recorded: {probe.scans}'
@@ -165,6 +179,28 @@ class TestWorkflowScansRunOffLoop:
         }
         assert {'resolved', None} <= off_loop_statuses, probe.scans
         _assert_archive_scans_ran_off_loop(probe)
+
+    async def test_record_pending_at_entry_but_resolved_during_the_scan_answers_this_round(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+    ):
+        queue = _ResolvesDuringResolvedScan(tmp_path / 'queue')
+        worktree = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        workflow, _ = _build_workflow(config, git_ops, task_assignment, queue, worktree)
+        earlier = _file(queue, task_assignment.task_id, category='task_failure')
+        queue.resolve(earlier.id, 'answer from an earlier round', resolved_by='steward')
+        open_at_entry = _file(queue, task_assignment.task_id, category='task_failure')
+        queue.resolve_during_scan = open_at_entry.id
+
+        carried = await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+
+        assert queue.resolve_during_scan is None, 'the entry resolved-scan never ran'
+        assert {c.escalation_id: c.answered_this_round for c in carried} == {
+            earlier.id: False, open_at_entry.id: True,
+        }
 
     async def test_review_suggestions_dedup_reads_off_loop(self, tmp_path: Path):
         probe = _ThreadProbeQueue(tmp_path / 'queue')

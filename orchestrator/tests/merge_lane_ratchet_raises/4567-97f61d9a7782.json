@@ -1,0 +1,18 @@
+{
+  "task_id": "4567",
+  "reason": "net-additive regression test for task 4567 amendment (reviewer suggestion 1): test_escalation_scan_off_loop.py pins that a record pending at _wait_for_resolution entry but resolved during the off-loop resolved-scan is attributed to this round; drives the private coroutine like its sibling test",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_escalation_scan_off_loop.py",
+      "baseline": 19,
+      "current": 20
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6472,
+      "current": 6473
+    }
+  ]
+}
