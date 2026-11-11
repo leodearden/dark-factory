@@ -5730,6 +5730,12 @@ class TaskInterceptor:
            backend floor, to leave room for the ``basis='combine'`` re-stamp that task
            8415 adds in ``_execute_combine``, which writes through the backend directly.
 
+        A call with no mutating argument raises
+        :class:`~fused_memory.backends.task_backend_errors.NoFieldsToUpdateError`
+        out of the backend. Like ``AppendUnsupportedFieldError`` it is NOT caught
+        below: it propagates raw to ``mcp_tool_errors``, which reports
+        ``error_type='NoFieldsToUpdateError'`` (task 4867).
+
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
 

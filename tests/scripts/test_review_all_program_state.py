@@ -47,6 +47,7 @@ _ALLOWED_FIRST_PARTY = {
     'shared.task_statuses',
     'shared.mcp_post',
     'shared.mcp_envelope',
+    'shared.mcp_unknown_arguments',
 }
 _LOADED_NON_STDLIB = """
 import json, sys

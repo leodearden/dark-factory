@@ -287,6 +287,19 @@ class TaskBackendProtocol(Protocol):
         with ``append`` omitted.  ``dependencies`` is also replace-only but is
         deliberately NOT covered.
 
+        **Implementations MUST reject a call that supplies none of ``prompt``,
+        ``metadata``, ``title``, ``description``, ``details``, ``priority`` or
+        ``dependencies``** by raising (``NoFieldsToUpdateError``, which keeps the
+        ``TASKMASTER_TOOL_ERROR`` code and names those parameters).  Such a call
+        can only bump ``updated_at``, and reporting it as a success hid a dropped
+        argument in esc-3147-7 and esc-3671-7 (a misnamed ``metadata`` was
+        ignored and the reply still said ``updated: True``).  ``task_id``,
+        ``project_root``, ``tag``, ``append`` and ``metadata_mode`` do not count:
+        they steer a write, they are not one.  The test is "is the argument
+        ``None``", never "would a column change": ``dependencies=[]`` (clear the
+        list) and ``metadata='{}'`` are real writes.  Refuse after the ``status``
+        and ``metadata_mode`` value refusals and before the row lookup.
+
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
         is the only sanctioned status writer — it enforces the terminal-exit,

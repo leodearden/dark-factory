@@ -66,6 +66,7 @@ from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
@@ -3185,7 +3186,7 @@ class SqliteTaskBackend:
             parsed_metadata = strip_machine_authored_metadata(
                 parsed_metadata, project_root=project_root, task_ref=task_id,
             )
-        # Third pre-connection floor, and the last one: reject an append=True
+        # Third pre-connection floor: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
         # after the two write-authority floors and BEFORE _resolve_metadata_mode
         # and ensure_connected() — so the rejection precedes existence and
@@ -3232,6 +3233,13 @@ class SqliteTaskBackend:
         resolved_mode = _resolve_metadata_mode(
             metadata_mode, append, metadata_present=metadata is not None,
         )
+
+        # Last pre-connection floor (task 4867), after every refusal of a
+        # supplied-but-wrong argument: with no mutating argument there is
+        # nothing to be wrong, and a bad ``status`` or ``metadata_mode`` is
+        # the more specific mistake to report. Before ensure_connected() so a
+        # fieldless call never reaches the row, never bumps ``updated_at``.
+        _refuse_update_with_no_mutating_field(task_id, arguments_as_received)
 
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -3421,8 +3429,9 @@ class SqliteTaskBackend:
                             candidate_key=new_candidate_key,
                         )
 
-            # updated_at always advances, even on a no-op write — matches
-            # the original behaviour and avoids surprising "stale" reads.
+            # updated_at always advances on a write that supplies a mutating
+            # field, even one whose values equal the stored ones; a call that
+            # supplies none never gets here (_refuse_update_with_no_mutating_field).
             set_columns.append('updated_at = ?')
             set_values.append(task_timestamp_now())
 
@@ -3562,9 +3571,22 @@ class SqliteTaskBackend:
         off the 12-method contract prevents other callers from treating it as
         sanctioned public surface.
         """
-        await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
+        # Same caller -> store metadata boundary as the three above, so the
+        # same sanitizer (task 3816 review remediation). Privileged and
+        # interceptor-only, so the stakes are lower than the public
+        # writers — applied anyway so the authority rule is UNIFORMLY
+        # enforced from one implementation rather than being a per-site
+        # judgement call. Emptiness is judged on the SANITISED dict (task
+        # 4867): fields that are all stripped write nothing, so refuse before
+        # the connection and the row, as update_task does.
+        sanitized_fields = strip_machine_authored_metadata(
+            fields, project_root=project_root, tag=tag, task_id=tid,
+        )
+        if not sanitized_fields:
+            raise NoFieldsToUpdateError('stamp_audit_metadata', task_id)
+        await self.ensure_connected()
         async with self._write_unit(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
@@ -3576,15 +3598,6 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            # Same caller -> store metadata boundary as the three above, so the
-            # same sanitizer (task 3816 review remediation). Privileged and
-            # interceptor-only, so the stakes are lower than the public
-            # writers — applied anyway so the authority rule is UNIFORMLY
-            # enforced from one implementation rather than being a per-site
-            # judgement call.
-            sanitized_fields = strip_machine_authored_metadata(
-                fields, project_root=project_root, tag=tag, task_id=tid,
-            )
             new_metadata = _merge_metadata(
                 row['metadata'], json.dumps(sanitized_fields),
                 mode='merge',
@@ -4128,6 +4141,29 @@ def _resolve_metadata_mode(
 
 
 _REPLACE_ONLY_FIELDS: tuple[str, ...] = ('title', 'description', 'priority')
+
+# The update_task parameters that make a call a write. ``status`` is absent
+# because it is refused unconditionally; ``task_id``, ``project_root``,
+# ``tag``, ``append`` and ``metadata_mode`` only steer how a write is applied.
+_MUTATING_UPDATE_FIELDS: tuple[str, ...] = (
+    'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+    'dependencies',
+)
+
+
+def _refuse_update_with_no_mutating_field(
+    task_id: str, arguments: Mapping[str, object],
+) -> None:
+    """Raise :class:`NoFieldsToUpdateError` when every mutating argument is ``None``.
+
+    Keyed on the supplied arguments, never on which columns the write would
+    set: ``dependencies=[]`` writes outside the column list and
+    ``metadata='{}'`` is a real write, and both are not ``None``. A name in
+    ``_MUTATING_UPDATE_FIELDS`` missing from *arguments* raises ``KeyError``,
+    so the constant and the update_task signature cannot drift apart silently.
+    """
+    if all(arguments[name] is None for name in _MUTATING_UPDATE_FIELDS):
+        raise NoFieldsToUpdateError('update_task', task_id, _MUTATING_UPDATE_FIELDS)
 
 
 def _reject_append_on_replace_only_fields(

@@ -1469,7 +1469,13 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
 
 @app.post('/api/v2/dashboard/scheduler/clear-override')
 async def api_scheduler_clear_override(request: Request) -> JSONResponse:
-    """Proxy POST /scheduler/clear-override → clear_task_priority_override MCP tool."""
+    """Proxy POST /scheduler/clear-override → clear_task_priority_override MCP tool.
+
+    Without ``fields`` the whole override row is cleared. With ``fields`` each
+    named field is cleared by its own call, because the tool clears one
+    ``field`` per call; the first response that is not a 200 is returned, else
+    the last one.
+    """
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1488,9 +1494,10 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
 
     fields = body.get('fields')
     if fields is not None:
-        if not isinstance(fields, list):
+        if not isinstance(fields, list) or not fields:
             return JSONResponse(
-                {'error': 'invalid_fields', 'detail': 'fields must be a list'}, status_code=400
+                {'error': 'invalid_fields', 'detail': 'fields must be a non-empty list'},
+                status_code=400,
             )
         invalid = [f for f in fields if f not in _VALID_CLEAR_FIELDS]
         if invalid:
@@ -1499,15 +1506,25 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-    args: dict = {'task_id': task_id, 'project_root': project_root}
-    if fields is not None:
-        # Translate 'ttl_until' → 'ttl': the dashboard boundary speaks 'ttl_until'
-        # (matching the row shape), but the MCP tool's wire format uses 'ttl'.
-        args['fields'] = ['ttl' if f == 'ttl_until' else f for f in fields]
-
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    return await _mcp_write_proxy(http_client, config, 'clear_task_priority_override', args)
+    row = {'task_id': task_id, 'project_root': project_root}
+
+    async def clear(args: dict) -> JSONResponse:
+        return await _mcp_write_proxy(http_client, config, 'clear_task_priority_override', args)
+
+    if fields is None:
+        return await clear(row)
+    for field_name in fields[:-1]:
+        response = await clear({**row, 'field': _mcp_clear_field(field_name)})
+        if response.status_code != 200:
+            return response
+    return await clear({**row, 'field': _mcp_clear_field(fields[-1])})
+
+
+def _mcp_clear_field(field_name: str) -> str:
+    """The dashboard boundary speaks 'ttl_until' (the row shape); the tool's field is 'ttl'."""
+    return 'ttl' if field_name == 'ttl_until' else field_name
 
 
 @app.post('/api/v2/dashboard/scheduler/reorder-pin-queue')
@@ -1553,7 +1570,7 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
         http_client,
         config,
         'reorder_pin_queue',
-        {'task_ids': task_ids, 'project_root': project_root},
+        {'ordered_task_ids': task_ids, 'project_root': project_root},
         treat_not_found_as_404=False,
     )
 

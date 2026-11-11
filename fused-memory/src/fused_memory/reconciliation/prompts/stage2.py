@@ -568,7 +568,9 @@ project_root=<project_root>)` to read the FULL current text, concatenate your ad
 locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
 genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
 it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
-`update_task` call.
+`update_task` call. An `update_task` that supplies no field to write is likewise \
+REJECTED with a `TASKMASTER_TOOL_ERROR` (`error_type` `NoFieldsToUpdateError`, whose \
+message lists the writable fields) and writes nothing.
 
 {render_audit_trail_rotation_section()}
 

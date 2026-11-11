@@ -10508,6 +10508,13 @@ def create_mcp_server(
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
 
+        A call that supplies none of ``prompt``, ``metadata``, ``title``,
+        ``description``, ``details``, ``priority`` or ``dependencies`` is
+        REFUSED with ``error_type='NoFieldsToUpdateError'`` and writes nothing
+        (task 4867): it used to bump ``updated_at`` and report success, hiding
+        an argument that was misnamed and dropped. ``append``, ``metadata_mode``
+        and ``tag`` alone do not make a write.
+
         Any string argument carrying raw MCP envelope markup — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
