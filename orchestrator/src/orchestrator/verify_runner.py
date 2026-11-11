@@ -600,6 +600,9 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     cascade (module→top-level→warm) exactly as a real local merge run does, instead of
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
+
+    A per-module scope_cargo is not carried; build_merge_verify_spec collapses it
+    into the spec-level value (see _carried_scope_cargo).
     """
     return module_config_from_command(
         vc,
@@ -668,17 +671,16 @@ async def run_merge_verify_on_worktree(
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
     # host's own --config can no longer narrow it; task 6127 — nor skip the
-    # dispatcher's cold-venv pre-provision.
+    # dispatcher's cold-venv pre-provision; task 7465 — nor decide cargo scope
+    # or the config-only full-gate backstop.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={
-            'merge_verify_workspace': spec.merge_verify_workspace,
-            'merge_verify_breadth': spec.merge_verify_breadth,
-        },
+        field_overrides=_spec_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
+        git_field_overrides=_spec_git_field_overrides(spec),
     )
 
     runner = LocalRunner(
@@ -691,6 +693,24 @@ async def run_merge_verify_on_worktree(
         task_id=task_id,
     )
     return await runner.run_merge_verify(merge_sha, spec)
+
+
+def _spec_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not carried."""
+    overrides: dict[str, Any] = {
+        'merge_verify_workspace': spec.merge_verify_workspace,
+        'merge_verify_breadth': spec.merge_verify_breadth,
+    }
+    if spec.scope_cargo is not None:
+        overrides['scope_cargo'] = spec.scope_cargo
+    return overrides
+
+
+def _spec_git_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The GitConfig leaves the spec decides, as fresh lists (strict validation rejects a tuple)."""
+    if spec.merge_config_only_full_gate_globs is None:
+        return {}
+    return {'merge_config_only_full_gate_globs': list(spec.merge_config_only_full_gate_globs)}
 
 
 # ---------------------------------------------------------------------------
