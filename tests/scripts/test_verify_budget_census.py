@@ -4,31 +4,7 @@ Ruling D17 (task 3353) deliverable 2. Deliverable 1 stamps host load on every
 verify command; this censuses the resulting corpus so a module's verify budget
 is DERIVED from a dated distribution instead of estimated.
 
-NO TEST HERE ASSERTS A NUMBER READ FROM THE LIVE SUMMARY CORPUS.
-This norm is inherited verbatim from the sibling suites in this directory —
-tests/scripts/test_census_tagger_debris.py's module docstring records a
-candidate count that moved 40 -> 43 -> 45 across a single task's planning
-sessions — and scripts/tests/test_merge_lane_throughput.py runs entirely on
-synthetic roots for the same reason. The corpus here is mutated continuously by
-a running fleet: worktrees are created and pruned, and each attempt OVERWRITES
-the previous summary, so it is both non-deterministic and survivorship-biased.
-A test pinning "the corpus yields n=14, max 3753" is a guessed threshold that
-goes red the moment any task verifies.
-
-D17 does name numbers the census "must reproduce". Those are discharged as a
-recorded reproduction run in the iteration log plus a provenance-stamped
-constant beside `MEASURED_MODULE_SUITE_WORST_SECS` — which is what that
-constant's own provenance block already demands ("RE-MEASURE BY REPEATING THAT
-CENSUS, so the next figure is a repeat rather than a re-derivation") — never as
-an assertion here. Every assertion below runs against a synthetic `tmp_path`
-corpus whose contents the test controls exactly and whose expected numbers are
-computed by hand.
-
-THE PATH IS THE ONLY SOURCE OF TWO FACTS, AND THE FALLBACK FOR A THIRD. A
-summary.json carries no task id and no module prefix, so both come from where
-the file sits. Since task 5671 it carries its role; a record written before
-that falls back to the role its path implies. That makes path parsing
-load-bearing rather than incidental, and is why it gets its own section here.
+The synthetic-corpus norm lives in tests/scripts/verify_budget_census_fixture.py.
 """
 from __future__ import annotations
 
@@ -37,87 +13,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
-# Both archive stamp spellings seen in the wild. The microsecond-bearing form
-# dominates; the second-resolution form is what older records carry.
-_STAMP_US = '20260914T123016_283575Z'
-_STAMP_SEC = '20260816T080255Z'
-
-
-def _worktree_record(root: Path, lane: str, name: str) -> Path:
-    path = root / '.worktrees' / lane / '.task' / 'verify' / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'commands': []}), encoding='utf-8')
-    return path
-
-
-def _archive_record(root: Path, task_id: str, name: str) -> Path:
-    path = root / 'data' / 'verify-logs' / task_id / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'commands': []}), encoding='utf-8')
-    return path
-
-
-# The orchestrator module's declared test_command, as of this writing. Used
-# ONLY to shape the synthetic fixtures below — never as the value under test.
-# The census reads the real one out of `<root>/<prefix>/orchestrator.yaml`,
-# which is what `TestTheExpectedCommandHasOneHome` pins.
-_FULL_SUITE = (
-    'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'
+from verify_budget_census_fixture import (
+    FULL_SUITE,
+    STAMP_US,
+    command_entry,
+    run_main,
+    summary_payload,
+    write_archive_record,
+    write_corpus,
+    write_module_yaml,
+    write_worktree_record,
 )
-
-
-def _summary(*commands, **top):
-    """A summary.json payload. Top-level fields default to a LOUD lint leg.
-
-    Defaulting the top level to something LOUD and SHORT is deliberate: it is
-    the shape that catches a census reading the wrong place. See
-    `TestTheSelectorReadsTheCommandsArray`.
-    """
-    payload = {
-        'category': 'lint_error',
-        'cause_hint': '',
-        'rc': -9,
-        'timed_out': False,
-        'cmd': 'uv run --directory orchestrator ruff check src/',
-        'started_at': '2026-09-13T04:00:00+00:00',
-        'duration_secs': 4.5,
-        'commands': list(commands),
-    }
-    payload.update(top)
-    return payload
-
-
-def _leg(label: str = 'test', cmd: str | None = _FULL_SUITE, **overrides):
-    entry = {
-        'label': label,
-        'cmd': cmd,
-        'rc': 0,
-        'timed_out': False,
-        'started_at': '2026-09-13T04:00:00+00:00',
-        'duration_secs': 3300.0,
-        'segments': None,
-        'load': None,
-    }
-    entry.update(overrides)
-    return entry
-
-
-def _module_yaml(root: Path, prefix: str = 'orchestrator') -> Path:
-    """The `<root>/<prefix>/orchestrator.yaml` the selector reads its command from."""
-    path = root / prefix / 'orchestrator.yaml'
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'test_command: "{_FULL_SUITE}"\n', encoding='utf-8')
-    return path
-
-
-def _corpus_with(tmp_path, *commands, prefix='orchestrator', lane='3353', **top):
-    """A one-record synthetic root, plus the module yaml the selector reads."""
-    _module_yaml(tmp_path, prefix)
-
-    path = _worktree_record(tmp_path, lane, f'attempt-1.{prefix}.summary.json')
-    path.write_text(json.dumps(_summary(*commands, **top)), encoding='utf-8')
-    return path
 
 
 class TestTheSelectorReadsTheCommandsArray:
@@ -140,10 +46,10 @@ class TestTheSelectorReadsTheCommandsArray:
     def test_the_test_legs_duration_is_reported_not_the_top_levels(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert [leg.duration_secs for leg in selection.legs] == [3300.0]
@@ -152,10 +58,10 @@ class TestTheSelectorReadsTheCommandsArray:
         """The top level says rc=-9; the selected leg says rc=0. Both are true."""
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, _leg(rc=0))
+        write_corpus(tmp_path, command_entry(rc=0))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert [leg.rc for leg in selection.legs] == [0]
@@ -167,13 +73,13 @@ class TestTheFullSuiteShapeFilter:
     def _select(self, tmp_path, *commands):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, *commands)
+        write_corpus(tmp_path, *commands)
         return select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
     def test_the_verbatim_declared_command_is_selected(self, tmp_path):
-        selection = self._select(tmp_path, _leg())
+        selection = self._select(tmp_path, command_entry())
 
         assert len(selection.legs) == 1
         assert selection.rejected_entries == {}
@@ -181,8 +87,8 @@ class TestTheFullSuiteShapeFilter:
 
     def test_whitespace_only_differences_are_tolerated(self, tmp_path):
         """A re-rendered command may differ in spacing and still be the suite."""
-        spaced = _FULL_SUITE.replace(' pytest ', '  pytest   ')
-        selection = self._select(tmp_path, _leg(cmd=spaced))
+        spaced = FULL_SUITE.replace(' pytest ', '  pytest   ')
+        selection = self._select(tmp_path, command_entry(cmd=spaced))
 
         assert len(selection.legs) == 1
 
@@ -205,7 +111,7 @@ class TestTheFullSuiteShapeFilter:
     def test_a_narrowed_run_is_rejected_with_a_reason(self, tmp_path, cmd, note):
         """Their durations are not comparable to a full-suite run's — that is the
         entire reason this filter exists."""
-        selection = self._select(tmp_path, _leg(cmd=cmd))
+        selection = self._select(tmp_path, command_entry(cmd=cmd))
 
         assert selection.legs == (), f'{note} run was admitted'
         assert selection.rejected_entries == {'command_mismatch': 1}
@@ -215,7 +121,7 @@ class TestTheFullSuiteShapeFilter:
         chain, so it is excluded — and counted separately from a plain command
         mismatch, because it is a different fact about the corpus."""
         selection = self._select(
-            tmp_path, _leg(segments=[{'index': 1, 'label': 'a'}]),
+            tmp_path, command_entry(segments=[{'index': 1, 'label': 'a'}]),
         )
 
         assert selection.legs == ()
@@ -224,8 +130,8 @@ class TestTheFullSuiteShapeFilter:
     def test_a_non_test_leg_is_rejected(self, tmp_path):
         selection = self._select(
             tmp_path,
-            _leg(label='lint', cmd='uv run --directory orchestrator ruff check src/'),
-            _leg(label='type', cmd='uv run --directory orchestrator pyright src/'),
+            command_entry(label='lint', cmd='uv run --directory orchestrator ruff check src/'),
+            command_entry(label='type', cmd='uv run --directory orchestrator pyright src/'),
         )
 
         assert selection.legs == ()
@@ -233,7 +139,7 @@ class TestTheFullSuiteShapeFilter:
 
     def test_a_null_cmd_is_rejected_rather_than_compared(self, tmp_path):
         """A skipped leg ran nothing, so there is no duration to census."""
-        selection = self._select(tmp_path, _leg(cmd=None, duration_secs=0.0))
+        selection = self._select(tmp_path, command_entry(cmd=None, duration_secs=0.0))
 
         assert selection.legs == ()
         assert selection.rejected_entries == {'no_cmd': 1}
@@ -255,19 +161,19 @@ class TestTheFullSuiteShapeFilter:
         """
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(
+        write_corpus(
             tmp_path,
-            _leg(),
-            _leg(label='lint', cmd='uv run ruff check src/'),
-            _leg(cmd='uv run --directory orchestrator pytest tests/test_foo.py'),
+            command_entry(),
+            command_entry(label='lint', cmd='uv run ruff check src/'),
+            command_entry(cmd='uv run --directory orchestrator pytest tests/test_foo.py'),
         )
-        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other = write_worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
         other.write_text(
-            json.dumps(_summary(_leg(), _leg(), _leg())), encoding='utf-8',
+            json.dumps(summary_payload(command_entry(), command_entry(), command_entry())), encoding='utf-8',
         )
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         # Entries: only the matching record's three were ever READ.
@@ -279,12 +185,12 @@ class TestTheFullSuiteShapeFilter:
     def test_another_modules_record_is_rejected_on_prefix(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, _leg())
-        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
-        other.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+        write_corpus(tmp_path, command_entry())
+        other = write_worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other.write_text(json.dumps(summary_payload(command_entry())), encoding='utf-8')
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert len(selection.legs) == 1
@@ -294,14 +200,14 @@ class TestTheFullSuiteShapeFilter:
     def test_a_role_filter_excludes_other_lanes(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, _leg())
-        merge = _worktree_record(
+        write_corpus(tmp_path, command_entry())
+        merge = write_worktree_record(
             tmp_path, '_merge-abc123', 'attempt-1.orchestrator.summary.json',
         )
-        merge.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+        merge.write_text(json.dumps(summary_payload(command_entry())), encoding='utf-8')
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator', role='task',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator', role='task',
         )
 
         assert len(selection.legs) == 1
@@ -328,22 +234,22 @@ class TestTheStampedRoleWinsOverThePath:
 
     @staticmethod
     def _write(path, **top):
-        path.write_text(json.dumps(_summary(_leg(), **top)), encoding='utf-8')
+        path.write_text(json.dumps(summary_payload(command_entry(), **top)), encoding='utf-8')
         return path
 
     def test_an_archive_record_stamped_merge_is_a_merge_record(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
         self._write(
-            _archive_record(
-                tmp_path, '5422', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+            write_archive_record(
+                tmp_path, '5422', f'attempt-1.orchestrator.summary-{STAMP_US}.json',
             ),
             role='merge',
         )
 
         assert self._only_record(tmp_path).role == 'merge'
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
             role='merge',
         )
         assert len(selection.legs) == 1
@@ -351,7 +257,7 @@ class TestTheStampedRoleWinsOverThePath:
 
     def test_the_stamp_wins_over_the_lane_the_record_sits_in(self, tmp_path):
         self._write(
-            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+            write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
             role='background',
         )
 
@@ -359,15 +265,15 @@ class TestTheStampedRoleWinsOverThePath:
 
     def test_an_unstamped_worktree_record_keeps_its_lane_role(self, tmp_path):
         self._write(
-            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+            write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
         )
 
         assert self._only_record(tmp_path).role == 'task'
 
     def test_an_unstamped_archive_record_stays_unknown(self, tmp_path):
         self._write(
-            _archive_record(
-                tmp_path, '5422', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+            write_archive_record(
+                tmp_path, '5422', f'attempt-1.orchestrator.summary-{STAMP_US}.json',
             ),
         )
 
@@ -378,13 +284,13 @@ class TestTheStampedRoleWinsOverThePath:
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
         self._write(
-            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+            write_worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
             role=stamp,
         )
 
         assert self._only_record(tmp_path).role == 'task'
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
             role='task',
         )
         assert len(selection.legs) == 1
@@ -418,12 +324,12 @@ class TestTheExpectedCommandHasOneHome:
         what asserts it; calling the selector with a hand-passed ``expected``
         would assert only that the selector compares strings.
         """
-        _corpus_with(tmp_path, _leg(cmd='pytest tests/ --brand-new-flag'))
+        write_corpus(tmp_path, command_entry(cmd='pytest tests/ --brand-new-flag'))
         (tmp_path / 'orchestrator' / 'orchestrator.yaml').write_text(
             'test_command: "pytest tests/ --brand-new-flag"\n', encoding='utf-8',
         )
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
         report = json.loads(out)
@@ -522,9 +428,9 @@ class TestTimedOutAndFailedAreCountedApart:
     def _legs(self, tmp_path, *entries):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         return select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
 
     def test_a_timed_out_leg_is_counted_and_excluded(self, tmp_path):
@@ -532,8 +438,8 @@ class TestTimedOutAndFailedAreCountedApart:
 
         legs = self._legs(
             tmp_path,
-            _leg(duration_secs=3300.0),
-            _leg(duration_secs=7200.0, timed_out=True, rc=-9),
+            command_entry(duration_secs=3300.0),
+            command_entry(duration_secs=7200.0, timed_out=True, rc=-9),
         )
 
         summary = summarise_legs(legs)
@@ -549,7 +455,7 @@ class TestTimedOutAndFailedAreCountedApart:
         from verify_budget_census import summarise_legs  # noqa: PLC0415
 
         legs = self._legs(
-            tmp_path, _leg(duration_secs=3300.0), _leg(duration_secs=120.0, rc=1),
+            tmp_path, command_entry(duration_secs=3300.0), command_entry(duration_secs=120.0, rc=1),
         )
 
         summary = summarise_legs(legs)
@@ -563,7 +469,7 @@ class TestTimedOutAndFailedAreCountedApart:
         both claim it — n would stop reconciling."""
         from verify_budget_census import summarise_legs  # noqa: PLC0415
 
-        legs = self._legs(tmp_path, _leg(duration_secs=7200.0, timed_out=True, rc=-9))
+        legs = self._legs(tmp_path, command_entry(duration_secs=7200.0, timed_out=True, rc=-9))
 
         summary = summarise_legs(legs)
 
@@ -574,10 +480,10 @@ class TestTimedOutAndFailedAreCountedApart:
 
         legs = self._legs(
             tmp_path,
-            _leg(duration_secs=3300.0),
-            _leg(duration_secs=3400.0),
-            _leg(duration_secs=7200.0, timed_out=True, rc=-9),
-            _leg(duration_secs=120.0, rc=1),
+            command_entry(duration_secs=3300.0),
+            command_entry(duration_secs=3400.0),
+            command_entry(duration_secs=7200.0, timed_out=True, rc=-9),
+            command_entry(duration_secs=120.0, rc=1),
         )
 
         summary = summarise_legs(legs)
@@ -699,13 +605,13 @@ class TestLegsAreFilteredToTheResolvedWindow:
             within_window,
         )
 
-        _corpus_with(
+        write_corpus(
             tmp_path,
-            _leg(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
-            _leg(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
+            command_entry(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
+            command_entry(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
         )
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
 
         window = (
@@ -726,9 +632,9 @@ class TestLegsAreFilteredToTheResolvedWindow:
             within_window,
         )
 
-        _corpus_with(tmp_path, _leg(started_at='', duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(started_at='', duration_secs=3300.0))
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
 
         window = (
@@ -786,17 +692,17 @@ class TestPsiBanding:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         return by_load_band(legs)
 
     def test_a_quiet_and_a_busy_run_land_in_different_bands(self, tmp_path):
         bands = self._banded(
             tmp_path,
-            _leg(duration_secs=3000.0, load=_load_record(cpu=1.0)),
-            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0)),
+            command_entry(duration_secs=3000.0, load=_load_record(cpu=1.0)),
+            command_entry(duration_secs=4600.0, load=_load_record(cpu=75.0)),
         )
 
         assert bands['unstamped']['durations']['n'] == 0
@@ -847,14 +753,14 @@ class TestUnstampedIsItsOwnRow:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         return by_load_band(legs)
 
     def test_a_record_predating_the_stamp_is_unstamped(self, tmp_path):
-        bands = self._banded(tmp_path, _leg(duration_secs=4991.0, load=None))
+        bands = self._banded(tmp_path, command_entry(duration_secs=4991.0, load=None))
 
         assert bands['unstamped']['durations'] == {
             'n': 1, 'p50': 4991.0, 'p90': 4991.0, 'max': 4991.0,
@@ -863,7 +769,7 @@ class TestUnstampedIsItsOwnRow:
     def test_a_degraded_psi_read_is_unstamped_not_zero_pressure(self, tmp_path):
         """A null cpu_some10 means "not knowable", never "the host was idle"."""
         bands = self._banded(
-            tmp_path, _leg(duration_secs=4991.0, load=_load_record(cpu=None)),
+            tmp_path, command_entry(duration_secs=4991.0, load=_load_record(cpu=None)),
         )
 
         assert bands['unstamped']['durations']['n'] == 1
@@ -872,7 +778,7 @@ class TestUnstampedIsItsOwnRow:
     def test_a_genuinely_idle_host_is_banded_not_unstamped(self, tmp_path):
         """The complement — 0.0 is a real reading and must not read as missing."""
         bands = self._banded(
-            tmp_path, _leg(duration_secs=3000.0, load=_load_record(cpu=0.0)),
+            tmp_path, command_entry(duration_secs=3000.0, load=_load_record(cpu=0.0)),
         )
 
         assert bands['unstamped']['durations']['n'] == 0
@@ -882,10 +788,10 @@ class TestUnstampedIsItsOwnRow:
         """Never silently dropped: banded + unstamped accounts for every leg."""
         bands = self._banded(
             tmp_path,
-            _leg(duration_secs=3000.0, load=_load_record(cpu=0.0)),
-            _leg(duration_secs=3100.0, load=_load_record(cpu=40.0)),
-            _leg(duration_secs=4991.0, load=None),
-            _leg(duration_secs=7200.0, load=None, timed_out=True, rc=-9),
+            command_entry(duration_secs=3000.0, load=_load_record(cpu=0.0)),
+            command_entry(duration_secs=3100.0, load=_load_record(cpu=40.0)),
+            command_entry(duration_secs=4991.0, load=None),
+            command_entry(duration_secs=7200.0, load=None, timed_out=True, rc=-9),
         )
 
         accounted = sum(
@@ -926,9 +832,9 @@ class TestTheBandStatisticSpansTheRun:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         return by_load_band(legs)
 
@@ -936,7 +842,7 @@ class TestTheBandStatisticSpansTheRun:
         """The case start-banding got wrong: an hour of contention filed as idle."""
         bands = self._banded(
             tmp_path,
-            _leg(duration_secs=4600.0, load=_load_record(cpu=1.0, end_cpu=75.0)),
+            command_entry(duration_secs=4600.0, load=_load_record(cpu=1.0, end_cpu=75.0)),
         )
 
         assert bands[_idle_band_name()]['durations']['n'] == 0
@@ -946,7 +852,7 @@ class TestTheBandStatisticSpansTheRun:
         """A run that started busy and ended quiet is not a quiet run either."""
         bands = self._banded(
             tmp_path,
-            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=1.0)),
+            command_entry(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=1.0)),
         )
 
         assert bands[_idle_band_name()]['durations']['n'] == 0
@@ -960,7 +866,7 @@ class TestTheBandStatisticSpansTheRun:
         the silent-fail-soft shape `unstamped` exists to avoid in reverse."""
         bands = self._banded(
             tmp_path,
-            _leg(duration_secs=4600.0, load=_load_record(cpu=start, end_cpu=end)),
+            command_entry(duration_secs=4600.0, load=_load_record(cpu=start, end_cpu=end)),
         )
 
         assert bands['unstamped']['durations']['n'] == 0
@@ -1006,15 +912,15 @@ class TestHostMovementIsReported:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         return load_movement(legs)
 
     def test_a_rise_across_bands_is_counted_as_a_rise(self, tmp_path):
         movement = self._movement(
-            tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=75.0)),
+            tmp_path, command_entry(load=_load_record(cpu=1.0, end_cpu=75.0)),
         )
 
         assert movement['rose'] == 1
@@ -1022,7 +928,7 @@ class TestHostMovementIsReported:
 
     def test_a_fall_across_bands_is_counted_as_a_fall(self, tmp_path):
         movement = self._movement(
-            tmp_path, _leg(load=_load_record(cpu=75.0, end_cpu=1.0)),
+            tmp_path, command_entry(load=_load_record(cpu=75.0, end_cpu=1.0)),
         )
 
         assert movement['fell'] == 1
@@ -1032,7 +938,7 @@ class TestHostMovementIsReported:
         """Counted in BANDS, because a 3-point rise inside one band is not a fact
         anyone would act on."""
         movement = self._movement(
-            tmp_path, _leg(load=_load_record(cpu=60.0, end_cpu=63.0)),
+            tmp_path, command_entry(load=_load_record(cpu=60.0, end_cpu=63.0)),
         )
 
         assert movement['held'] == 1
@@ -1048,12 +954,12 @@ class TestHostMovementIsReported:
             select_full_suite_legs,
         )
 
-        _corpus_with(
+        write_corpus(
             tmp_path,
-            _leg(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=None)),
+            command_entry(duration_secs=4600.0, load=_load_record(cpu=75.0, end_cpu=None)),
         )
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
 
         assert load_movement(legs)['not_knowable'] == 1
@@ -1064,8 +970,8 @@ class TestHostMovementIsReported:
         the run itself rather than an instant before or after it."""
         movement = self._movement(
             tmp_path,
-            _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=40.0)),
-            _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=60.0)),
+            command_entry(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=40.0)),
+            command_entry(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=60.0)),
         )
 
         assert movement['end_cpu_some60']['n'] == 2
@@ -1073,7 +979,7 @@ class TestHostMovementIsReported:
 
     def test_a_degraded_smoothed_reading_is_absent_not_zero(self, tmp_path):
         movement = self._movement(
-            tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=None)),
+            tmp_path, command_entry(load=_load_record(cpu=1.0, end_cpu=70.0, end_cpu60=None)),
         )
 
         assert movement['end_cpu_some60'] == {
@@ -1081,14 +987,14 @@ class TestHostMovementIsReported:
         }
 
     def test_it_rides_in_the_report_and_prints(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(load=_load_record(cpu=1.0, end_cpu=75.0)))
+        write_corpus(tmp_path, command_entry(load=_load_record(cpu=1.0, end_cpu=75.0)))
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
         assert json.loads(out)['load_movement']['rose'] == 1
 
-        _rc, text, _err = _main(
+        _rc, text, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
         assert 'HOST MOVEMENT DURING THE RUN' in text
@@ -1166,7 +1072,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
         # `<worktree>/.task/verify/` on its own.
         worktree = tmp_path / '.worktrees' / '3353'
         (worktree / '.task').mkdir(parents=True, exist_ok=True)
-        _module_yaml(tmp_path)
+        write_module_yaml(tmp_path)
 
         with patch.object(verify, '_run_cmd', side_effect=fake_run_cmd), \
              patch.object(
@@ -1179,7 +1085,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
                     OrchestratorConfig(
                         project_root=tmp_path, verify_admission_enabled=False,
                     ),
-                    ModuleConfig(prefix='orchestrator', test_command=_FULL_SUITE),
+                    ModuleConfig(prefix='orchestrator', test_command=FULL_SUITE),
                     attempt_id=1,
                     task_id='3353',
                     max_retries=0,
@@ -1187,7 +1093,7 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
             )
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
         assert len(selection.legs) == 1, (
             f'the real producer wrote nothing the census selects: '
@@ -1247,14 +1153,14 @@ class TestColdSeparabilityIsReportedNotInferred:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, *entries)
+        write_corpus(tmp_path, *entries)
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         return cold_separability(legs)
 
     def test_the_finding_says_not_separable(self, tmp_path):
-        finding = self._finding(tmp_path, _leg())
+        finding = self._finding(tmp_path, command_entry())
 
         assert finding['cold_separable'] is False
         assert finding['basis'], 'the finding must state WHY it cannot separate'
@@ -1267,12 +1173,12 @@ class TestColdSeparabilityIsReportedNotInferred:
             select_full_suite_legs,
         )
 
-        _corpus_with(tmp_path, _leg(), lane='100')
-        second = _worktree_record(tmp_path, '200', 'attempt-3.orchestrator.summary.json')
-        second.write_text(json.dumps(_summary(_leg())), encoding='utf-8')
+        write_corpus(tmp_path, command_entry(), lane='100')
+        second = write_worktree_record(tmp_path, '200', 'attempt-3.orchestrator.summary.json')
+        second.write_text(json.dumps(summary_payload(command_entry())), encoding='utf-8')
 
         legs = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         ).legs
         finding = cold_separability(legs)
 
@@ -1281,7 +1187,7 @@ class TestColdSeparabilityIsReportedNotInferred:
 
     def test_no_series_is_labelled_cold(self, tmp_path):
         """The assertion that stops a guess becoming a measurement."""
-        finding = self._finding(tmp_path, _leg())
+        finding = self._finding(tmp_path, command_entry())
 
         assert 'cold' not in {k.lower() for k in finding} - {'cold_separable'}
         assert not any(
@@ -1345,23 +1251,6 @@ class TestTheMergeGateBudgetIsReported:
         assert 'census changes nothing' in readout['note'].lower()
 
 
-# A frozen clock, injected into every main() call below, so the trailing-window
-# boundary is deterministic. The sibling suites do the same; a window resolved
-# against the real clock makes a test's own fixtures age out of it.
-_NOW = '2026-09-14T12:00:00+00:00'
-
-
-def _main(capsys, *argv):
-    """Drive `main()` and return `(rc, stdout, stderr)` — the sibling's idiom."""
-    from datetime import datetime  # noqa: PLC0415
-
-    import verify_budget_census as mod  # noqa: PLC0415
-
-    code = mod.main(list(argv), now=datetime.fromisoformat(_NOW))
-    captured = capsys.readouterr()
-    return code, captured.out, captured.err
-
-
 class TestTheCliContract:
     """`main(argv, now=None)` over the same report dict the text renderer reads.
 
@@ -1371,9 +1260,9 @@ class TestTheCliContract:
     """
 
     def test_a_synthetic_corpus_reports_its_own_numbers(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
-        rc, out, _err = _main(
+        rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1381,9 +1270,9 @@ class TestTheCliContract:
         assert '3300' in out
 
     def test_json_switches_the_whole_output_to_one_document(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
-        rc, out, _err = _main(
+        rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
@@ -1398,12 +1287,12 @@ class TestTheCliContract:
         Asserted by driving both and checking the text carries the figure the
         JSON reports, so the two cannot describe different runs.
         """
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
-        _rc, text, _err = _main(
+        _rc, text, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
-        _rc, raw, _err = _main(
+        _rc, raw, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
@@ -1411,9 +1300,9 @@ class TestTheCliContract:
         assert str(int(reported_max)) in text
 
     def test_the_window_is_resolved_against_the_injected_clock(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
             '--window', '14d', '--json',
         )
@@ -1423,13 +1312,13 @@ class TestTheCliContract:
         assert lo.startswith('2026-08-31T12:00:00')
 
     def test_the_dated_window_is_honoured(self, tmp_path, capsys):
-        _corpus_with(
+        write_corpus(
             tmp_path,
-            _leg(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
-            _leg(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
+            command_entry(started_at='2026-09-13T04:00:00+00:00', duration_secs=3300.0),
+            command_entry(started_at='2026-08-25T04:00:00+00:00', duration_secs=4991.0),
         )
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
             '--window', '2026-09-12T08:00:00+00:00..2026-09-14T12:00:00+00:00',
         )
@@ -1437,15 +1326,15 @@ class TestTheCliContract:
         assert json.loads(out)['overall']['durations']['max'] == 3300.0
 
     def test_the_role_filter_reaches_the_selector(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
-        merge = _worktree_record(
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
+        merge = write_worktree_record(
             tmp_path, '_merge-abc123', 'attempt-1.orchestrator.summary.json',
         )
         merge.write_text(
-            json.dumps(_summary(_leg(duration_secs=9999.0))), encoding='utf-8',
+            json.dumps(summary_payload(command_entry(duration_secs=9999.0))), encoding='utf-8',
         )
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
             '--role', 'task', '--json',
         )
@@ -1453,9 +1342,9 @@ class TestTheCliContract:
         assert json.loads(out)['overall']['durations']['max'] == 3300.0
 
     def test_the_label_filter_reaches_the_selector(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(label='lint', cmd=_FULL_SUITE))
+        write_corpus(tmp_path, command_entry(label='lint', cmd=FULL_SUITE))
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
             '--label', 'lint', '--json',
         )
@@ -1464,10 +1353,10 @@ class TestTheCliContract:
 
     def test_roots_are_repeatable(self, tmp_path, capsys):
         one, two = tmp_path / 'one', tmp_path / 'two'
-        _corpus_with(one, _leg(duration_secs=3300.0), lane='1')
-        _corpus_with(two, _leg(duration_secs=3400.0), lane='2')
+        write_corpus(one, command_entry(duration_secs=3300.0), lane='1')
+        write_corpus(two, command_entry(duration_secs=3400.0), lane='2')
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(one), '--root', str(two),
             '--module', 'orchestrator', '--json',
         )
@@ -1479,7 +1368,7 @@ class TestTheCliContract:
     ):
         """The command is resolved across ALL roots, and the selection uses it.
 
-        `_corpus_with` writes the module yaml into EVERY root it builds, which
+        `write_corpus` writes the module yaml into EVERY root it builds, which
         is why `test_roots_are_repeatable` above cannot reach this: the two
         resolutions agree whenever every root declares. Here only the SECOND
         root declares, which is an ordinary shape — `--root` is repeatable
@@ -1495,17 +1384,17 @@ class TestTheCliContract:
         compared against a command it had never used.
         """
         bare, declaring = tmp_path / 'bare', tmp_path / 'declaring'
-        _corpus_with(declaring, _leg(duration_secs=3300.0), lane='2')
-        _corpus_with(bare, _leg(duration_secs=3400.0), lane='1')
+        write_corpus(declaring, command_entry(duration_secs=3300.0), lane='2')
+        write_corpus(bare, command_entry(duration_secs=3400.0), lane='1')
         (bare / 'orchestrator' / 'orchestrator.yaml').unlink()
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(bare), '--root', str(declaring),
             '--module', 'orchestrator', '--json',
         )
         report = json.loads(out)
 
-        assert report['expected_command'] == _FULL_SUITE
+        assert report['expected_command'] == FULL_SUITE
         assert 'no_declared_command' not in report['rejected_entries']
         assert report['overall']['durations']['n'] == 2, (
             'the legs were rejected against a command the report still printed'
@@ -1523,10 +1412,10 @@ class TestTheCliContract:
         distinction is the whole reason `read_module_test_command` returns None
         instead of guessing a default.
         """
-        _corpus_with(tmp_path, _leg(duration_secs=3300.0))
+        write_corpus(tmp_path, command_entry(duration_secs=3300.0))
         (tmp_path / 'orchestrator' / 'orchestrator.yaml').unlink()
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
         report = json.loads(out)
@@ -1535,7 +1424,7 @@ class TestTheCliContract:
         assert report['rejected_entries']['no_declared_command'] == 1
         assert report['overall']['durations']['n'] == 0
 
-        _rc, text, _err = _main(
+        _rc, text, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1546,9 +1435,9 @@ class TestTheExitCodeVocabulary:
     """0 / 1 / 2, as `merge_lane_throughput.main` documents."""
 
     def test_success_is_zero(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        rc, _out, _err = _main(
+        rc, _out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1559,9 +1448,9 @@ class TestTheExitCodeVocabulary:
     ):
         """Partial failure is reported on stderr, not turned into a crash."""
         good = tmp_path / 'good'
-        _corpus_with(good, _leg(duration_secs=3300.0))
+        write_corpus(good, command_entry(duration_secs=3300.0))
 
-        rc, out, err = _main(
+        rc, out, err = run_main(
             capsys, '--root', str(good), '--root', str(tmp_path / 'absent'),
             '--module', 'orchestrator', '--json',
         )
@@ -1571,7 +1460,7 @@ class TestTheExitCodeVocabulary:
         assert json.loads(out)['overall']['durations']['max'] == 3300.0
 
     def test_a_malformed_window_is_two_with_nothing_on_stdout(self, tmp_path, capsys):
-        rc, out, err = _main(
+        rc, out, err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
             '--window', 'fortnight',
         )
@@ -1590,7 +1479,7 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
     """
 
     def test_a_root_with_neither_corpus_exits_zero(self, tmp_path, capsys):
-        rc, out, _err = _main(
+        rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1598,7 +1487,7 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
         assert out
 
     def test_the_empty_report_carries_nulls_not_zeros(self, tmp_path, capsys):
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
@@ -1606,7 +1495,7 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
         assert durations == {'n': 0, 'p50': None, 'p90': None, 'max': None}
 
     def test_the_text_report_says_it_found_nothing(self, tmp_path, capsys):
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1617,9 +1506,9 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
     ):
         """Zero SELECTED is a different fact from zero RECORDS, and both are
         reported — the rejection counts are what tell them apart."""
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'shared', '--json',
         )
 
@@ -1638,15 +1527,15 @@ class TestAnEmptyCorpusIsReportedNotFabricated:
         when it was not. So each line names its own unit, and the reasons are
         asserted to land on the right one rather than merely to appear.
         """
-        _corpus_with(
+        write_corpus(
             tmp_path,
-            _leg(),
-            _leg(label='lint', cmd='uv run ruff check src/'),
+            command_entry(),
+            command_entry(label='lint', cmd='uv run ruff check src/'),
         )
-        other = _worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
-        other.write_text(json.dumps(_summary(_leg(), _leg())), encoding='utf-8')
+        other = write_worktree_record(tmp_path, '4242', 'attempt-1.shared.summary.json')
+        other.write_text(json.dumps(summary_payload(command_entry(), command_entry())), encoding='utf-8')
 
-        _rc, text, _err = _main(
+        _rc, text, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1669,9 +1558,9 @@ class TestTheReportCarriesItsOwnProvenance:
     def test_the_report_names_its_window_module_label_and_role(
         self, tmp_path, capsys,
     ):
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
             '--role', 'task', '--json',
         )
@@ -1684,19 +1573,19 @@ class TestTheReportCarriesItsOwnProvenance:
 
     def test_the_report_names_the_command_it_compared_against(self, tmp_path, capsys):
         """So a reader can see WHICH command's distribution this is."""
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
-        assert json.loads(out)['expected_command'] == _FULL_SUITE
+        assert json.loads(out)['expected_command'] == FULL_SUITE
 
     def test_the_report_carries_the_skip_and_rejection_counts(self, tmp_path, capsys):
         """The reconciliation trail, in the artifact itself."""
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
@@ -1706,9 +1595,9 @@ class TestTheReportCarriesItsOwnProvenance:
         assert 'rejected_records' in report
 
     def test_the_findings_ride_in_the_report(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg())
+        write_corpus(tmp_path, command_entry())
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
 
@@ -1744,8 +1633,8 @@ class TestTheCensusAndTheGuardShareOneDerivation:
     """
 
     def _report(self, tmp_path, capsys, *entries):
-        _corpus_with(tmp_path, *entries)
-        _rc, out, _err = _main(
+        write_corpus(tmp_path, *entries)
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator', '--json',
         )
         return json.loads(out)
@@ -1753,7 +1642,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
     def test_the_printed_floor_equals_the_familys_expression(self, tmp_path, capsys):
         from module_budget_family import census_budget_floor  # noqa: PLC0415
 
-        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.166946739017))
 
         assert report['budget_check']['derived_floor'] == census_budget_floor(
             4626.166946739017,
@@ -1765,7 +1654,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         matter it is the shared expression."""
         from module_budget_family import census_budget_floor  # noqa: PLC0415
 
-        report = self._report(tmp_path, capsys, _leg(duration_secs=worst))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=worst))
 
         assert report['budget_check']['derived_floor'] == census_budget_floor(worst)
 
@@ -1778,7 +1667,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         """
         import verify_budget_census_records
 
-        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.0))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.0))
 
         path, sep, name = report['budget_check']['feeds'].partition('::')
         assert sep == '::', (
@@ -1806,7 +1695,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
     ):
         """A derived floor above the ceiling is a FINDING, and the report must
         not let an operator discover that only from a red gate."""
-        report = self._report(tmp_path, capsys, _leg(duration_secs=4991.13326132996))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=4991.13326132996))
 
         check = report['budget_check']
         assert check['refusal_ceiling'] == 7200
@@ -1814,21 +1703,21 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         assert 'escalate' in check['note'].lower()
 
     def test_a_floor_under_the_ceiling_says_so(self, tmp_path, capsys):
-        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.166946739017))
 
         assert report['budget_check']['exceeds_refusal_ceiling'] is False
 
     def test_an_empty_selection_derives_no_floor(self, tmp_path, capsys):
         """No max means no floor — never a 0 that reads as a derived answer."""
-        report = self._report(tmp_path, capsys, _leg(cmd='pytest tests/test_foo.py'))
+        report = self._report(tmp_path, capsys, command_entry(cmd='pytest tests/test_foo.py'))
 
         assert report['budget_check']['derived_floor'] is None
         assert report['budget_check']['exceeds_refusal_ceiling'] is False
 
     def test_the_text_report_prints_the_floor(self, tmp_path, capsys):
-        _corpus_with(tmp_path, _leg(duration_secs=4626.166946739017))
+        write_corpus(tmp_path, command_entry(duration_secs=4626.166946739017))
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1859,7 +1748,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
             lambda _worst: _SENTINEL_FLOOR,
         )
 
-        report = self._report(tmp_path, capsys, _leg(duration_secs=4626.166946739017))
+        report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.166946739017))
 
         assert report['budget_check']['derived_floor'] == _SENTINEL_FLOOR
 
@@ -1876,9 +1765,9 @@ class TestTheCensusAndTheGuardShareOneDerivation:
             'census_budget_floor',
             lambda _worst: _SENTINEL_FLOOR,
         )
-        _corpus_with(tmp_path, _leg(duration_secs=4626.166946739017))
+        write_corpus(tmp_path, command_entry(duration_secs=4626.166946739017))
 
-        _rc, out, _err = _main(
+        _rc, out, _err = run_main(
             capsys, '--root', str(tmp_path), '--module', 'orchestrator',
         )
 
@@ -1913,7 +1802,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         monkeypatch.delitem(sys.modules, 'module_budget_family', raising=False)
 
         check = self._report(
-            tmp_path, capsys, _leg(duration_secs=4626.166946739017),
+            tmp_path, capsys, command_entry(duration_secs=4626.166946739017),
         )['budget_check']
 
         assert check['derived_floor'] is None
@@ -1952,12 +1841,12 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
     def test_an_entry_without_rc_is_rejected_not_indexed(self, tmp_path):
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        entry = _leg()
+        entry = command_entry()
         del entry['rc']
-        _corpus_with(tmp_path, entry)
+        write_corpus(tmp_path, entry)
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert selection.legs == ()
@@ -1976,10 +1865,10 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
             summarise_legs,
         )
 
-        _corpus_with(tmp_path, _leg(rc=None))
+        write_corpus(tmp_path, command_entry(rc=None))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert selection.rejected_entries['no_rc'] == 1
@@ -1989,10 +1878,10 @@ class TestATornOrMalformedRecordIsCountedNotFatal:
         """`bool` subclasses `int`, so `True` was admitted as a 1.0s suite."""
         from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
 
-        _corpus_with(tmp_path, _leg(duration_secs=True))
+        write_corpus(tmp_path, command_entry(duration_secs=True))
 
         selection = select_full_suite_legs(
-            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            load_records([tmp_path]), expected=FULL_SUITE, prefix='orchestrator',
         )
 
         assert selection.legs == ()
