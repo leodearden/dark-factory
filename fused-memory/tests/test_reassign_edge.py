@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _falkor_plans import anchors_on_a_labelled_node, match_pattern
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _fm_helpers import (
     extract_cypher,
@@ -382,6 +383,31 @@ class TestReassignEdgePostMove:
         assert 'new-src-uuid' in result['refreshed_nodes']
 
 
+class TestReassignEdgeEndpointRead:
+    """The topology read seeks the edge by its uuid index and binds both
+    endpoints from it, rather than scanning a node label first."""
+
+    @pytest.mark.asyncio
+    async def test_seeks_the_edge_index_with_no_labelled_anchor(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire_topology_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        await backend.reassign_edge(
+            'edge-uuid', 'new-src-uuid', which_end='source', group_id='test',
+        )
+
+        (read,) = [c for c in graph.ro_query.call_args_list if 'RELATES_TO' in extract_cypher(c)]
+        cypher = extract_cypher(read)
+        pattern = match_pattern(cypher)
+        assert '[e:RELATES_TO {uuid: $edge_uuid}]' in pattern
+        assert not anchors_on_a_labelled_node(pattern), cypher
+        assert extract_params(read) == {'edge_uuid': 'edge-uuid'}
+
+
 # ---------------------------------------------------------------------------
 # Live-FalkorDB integration harness (mirrors test_merge_entities.py's
 # merge_entities_live_graph fixture)
@@ -585,6 +611,34 @@ class TestReassignEdgeLiveFalkorDB:
                 'RETURN e.superseded_edge_uuid'
             )
             assert moved.result_set == [[None]]
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_off_label_endpoint_edge_is_not_found(
+        self, mock_config, reassign_edge_live_graph,
+    ):
+        """Both endpoints must be :Entity, as before the read stopped anchoring on them."""
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['B', 'C'])
+        await graph.query(
+            "MATCH (b:Entity {uuid: 'B'}) "
+            "CREATE (:CanaryEndpoint {uuid: 'X'})"
+            "-[:RELATES_TO {uuid: 'e-off', name: 'rel', fact: 'X relates to B'}]->(b)"
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with pytest.raises(EdgeNotFoundError):
+                await backend.reassign_edge(
+                    'e-off', 'C', which_end='target', group_id=graph_name,
+                )
+
+            untouched = await graph.query(
+                "MATCH (x)-[e:RELATES_TO {uuid: 'e-off'}]->(b) RETURN x.uuid, b.uuid"
+            )
+            assert untouched.result_set == [['X', 'B']]
         finally:
             await backend.close()
 
