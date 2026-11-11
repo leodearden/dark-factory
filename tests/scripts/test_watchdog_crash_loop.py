@@ -579,3 +579,134 @@ def test_file_escalation_survives_a_missing_uv(
 
     assert filed is False
     assert logged
+
+
+# ---------------------------------------------------------------------------
+# crash_loop_pass: one tick over every unit
+# ---------------------------------------------------------------------------
+
+OTHER = synthetic_unit("reify")
+
+
+def _reader(answers: dict[str, UnitRestartStatus]):
+    def read_status(unit: str) -> UnitRestartStatus:
+        return answers[unit]
+
+    return read_status
+
+
+def _tick(
+    tmp_path: pathlib.Path,
+    answers: dict[str, UnitRestartStatus],
+    now: int,
+    log: list[str] | None = None,
+) -> dict[str, UnitRestartStatus]:
+    return crash_loop.crash_loop_pass(
+        list(answers),
+        _reader(answers),
+        repo_dir=str(tmp_path),
+        log=(log if log is not None else []).append,
+        now=now,
+        alarm_count=COUNT,
+        window_secs=WINDOW,
+    )
+
+
+def _state(tmp_path: pathlib.Path) -> dict:
+    return json.loads(
+        pathlib.Path(crash_loop.restart_rate_state_path(str(tmp_path))).read_text()
+    )
+
+
+def _flag(argv: list[str], name: str) -> str:
+    return argv[argv.index(name) + 1]
+
+
+def test_pass_pages_once_for_a_restart_burst(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    uv, record = _fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+
+    _tick(tmp_path, {UNIT: _status(0)}, T)
+    _tick(tmp_path, {UNIT: _status(5)}, T + 600)
+
+    calls = _recorded(record)
+    assert len(calls) == 1
+    argv = calls[0]
+    assert _flag(argv, "--task") == f"orchestrator-crash-loop-{UNIT}"
+    assert _flag(argv, "--severity") == "critical"
+    assert _flag(argv, "--category") == "infra_issue"
+    assert _flag(argv, "--agent-role").startswith("orchestrator-")
+    assert _flag(argv, "--queue-dir") == str(tmp_path / "data" / "escalations")
+
+    logged: list[str] = []
+    _tick(tmp_path, {UNIT: _status(6)}, T + 660, logged)
+
+    assert len(_recorded(record)) == 1
+    unit_state = _state(tmp_path)[UNIT]
+    assert unit_state["samples"] == [[T, 0], [T + 600, 5], [T + 660, 6]]
+    assert unit_state["last_escalation_epoch"] == T + 600
+    assert any("not re-filing" in m and UNIT in m for m in logged), logged
+
+
+def test_pass_pages_start_limit_hit_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    uv, record = _fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+
+    _tick(tmp_path, {UNIT: _status(2, "start-limit-hit")}, T)
+    assert len(_recorded(record)) == 1
+
+    _tick(tmp_path, {UNIT: _status(2, "start-limit-hit")}, T + 2000)
+    assert len(_recorded(record)) == 1
+
+
+def test_pass_returns_every_status_and_one_unit_cannot_blind_the_rest(
+    tmp_path: pathlib.Path,
+) -> None:
+    def read_status(unit: str) -> UnitRestartStatus:
+        if unit == UNIT:
+            raise RuntimeError("systemd went away")
+        return _status(1)
+
+    logged: list[str] = []
+    statuses = crash_loop.crash_loop_pass(
+        [UNIT, OTHER],
+        read_status,
+        repo_dir=str(tmp_path),
+        log=logged.append,
+        now=T,
+        alarm_count=COUNT,
+        window_secs=WINDOW,
+    )
+
+    assert statuses == {OTHER: _status(1)}
+    assert _state(tmp_path)[OTHER]["samples"] == [[T, 1]]
+    assert any(UNIT in m and "systemd went away" in m for m in logged), logged
+
+
+def test_pass_returns_statuses_when_the_state_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("ORCH_RESTART_RATE_STATE", str(blocker / "restart-rate.json"))
+    answers = {UNIT: _status(0), OTHER: _status(2, "exit-code")}
+
+    assert _tick(tmp_path, answers, T) == answers
+
+
+def test_pass_with_every_status_unknown_files_nothing_but_saves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    uv, record = _fake_uv(tmp_path)
+    monkeypatch.setenv("ORCH_WATCHDOG_UV_BIN", str(uv))
+    unknown = crash_loop.UNKNOWN_RESTART_STATUS
+
+    statuses = _tick(tmp_path, {UNIT: unknown, OTHER: unknown}, T)
+
+    assert statuses == {UNIT: unknown, OTHER: unknown}
+    assert _recorded(record) == []
+    assert set(_state(tmp_path)) == {UNIT, OTHER}
