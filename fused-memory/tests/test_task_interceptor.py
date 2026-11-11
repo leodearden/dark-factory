@@ -24,7 +24,6 @@ from _fm_helpers import make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
-from shared.pure_gate_provenance import PureGateTrigger
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
@@ -14291,17 +14290,9 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         """'' is absent, so the inject/attach helpers have nothing to discard."""
         with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override('', 'why')
-            gated = TaskInterceptor._inject_deterministic_pure_gate(
-                '', trigger=PureGateTrigger.EXECUTION_CLASS_OPERATIONAL
-            )
             kwargs: dict[str, Any] = {'metadata': ''}
             TaskInterceptor._attach_cross_repo_marker(kwargs, 'other')
         assert routed == {'routing_override_reason': 'why'}
-        assert gated == {
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            'pure_gate_from': 'execution_class=operational',
-        }
         assert kwargs['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         warns = [
             r for r in caplog.records
@@ -14321,19 +14312,11 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         )
         with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override(raw, 'why')
-            gated = TaskInterceptor._inject_deterministic_pure_gate(
-                raw, trigger=PureGateTrigger.EXECUTION_CLASS_OPERATIONAL
-            )
             scoped: dict[str, Any] = {'metadata': raw}
             TaskInterceptor._attach_possible_scope_mismatch(scoped, verdict)
             marked: dict[str, Any] = {'metadata': raw}
             TaskInterceptor._attach_cross_repo_marker(marked, 'other')
         assert routed == {'routing_override_reason': 'why'}
-        assert gated == {
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            'pure_gate_from': 'execution_class=operational',
-        }
         assert list(scoped['metadata']) == ['possible_scope_mismatch']
         assert marked['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         messages = [
@@ -14342,7 +14325,6 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         ]
         for site in (
             'routing-override',
-            'deterministic-pure-gate',
             'scope-mismatch-advisory',
             'cross-repo-marker',
         ):
@@ -14350,22 +14332,13 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
                 f'{site} must name itself in the discard WARNING; got {messages!r}'
             )
         census = [m for m in messages if 'task_metadata.schema_warning' in m]
-        assert len(census) == 4, f'one census line per helper call; got {messages!r}'
+        assert len(census) == 3, f'one census line per helper call; got {messages!r}'
 
     def test_inject_helpers_copy_rather_than_mutate_a_dict_input(self):
         """A readable dict input is shallow-copied, never stamped in place."""
         original = {'keep': 1}
         routed = TaskInterceptor._inject_routing_override(original, 'why')
-        gated = TaskInterceptor._inject_deterministic_pure_gate(
-            original, trigger=PureGateTrigger.EXECUTION_CLASS_OPERATIONAL
-        )
         assert routed == {'keep': 1, 'routing_override_reason': 'why'}
-        assert gated == {
-            'keep': 1,
-            'task_kind': 'deterministic',
-            'always_escalates': True,
-            'pure_gate_from': 'execution_class=operational',
-        }
         assert original == {'keep': 1}
 
 

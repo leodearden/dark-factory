@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 
 import pytest
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
@@ -430,3 +432,24 @@ class TestUnreadableMetadataIsDiscardedLoudly:
         with caplog.at_level(logging.WARNING):
             assert inject_operational_routing(metadata) is metadata
         assert _discard_lines(caplog) == []
+
+
+def test_coercion_runs_without_loading_the_interceptor():
+    """The guard sits below the interceptor, so coercing must not import it.
+
+    Probed in a FRESH interpreter: this test process has already imported the
+    interceptor transitively, so an in-process ``sys.modules`` check would
+    pass vacuously. The ``task_kind`` check keeps the probe from silently
+    no-opping if the call ever stops coercing.
+    """
+    probe = (
+        'import sys; '
+        'from fused_memory.middleware.operational_routing_guard import inject_operational_routing; '
+        "result = inject_operational_routing({'execution_class': 'operational'}); "
+        "assert result['task_kind'] == 'deterministic', result; "
+        "assert 'fused_memory.middleware.task_interceptor' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
