@@ -175,6 +175,14 @@ class TestCrossLayerIdentityLockstep:
 
         assert MILESTONE_CHECK_STALLED_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
 
+    def test_runner_review_due_category_is_registered_and_denied(self) -> None:
+        """The trigger chain's human gate stays denied (PRD C4), and the
+        literal the runner files is the registered category, not a copy."""
+        from orchestrator.deterministic_runner import REVIEW_DUE_CATEGORY
+
+        assert REVIEW_DUE_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert REVIEW_DUE_CATEGORY in set(EscalationCategory)
+
 
 class TestPromoteSentinelBoundRoles:
     """``PROMOTE_SENTINEL_BOUND_ROLES``: member roles whose clusters must be minted under a sentinel id.
