@@ -11734,3 +11734,260 @@ def test_run_census_makes_no_synthesis_call_when_nothing_is_new_or_re_observed(t
     assert record["method"]["cost"]["synthesis_calls"] == 0
     assert "synthesis=0" in record["cost_note"]
     assert (record["synthesis"]["outcome"], record["synthesis"]["calls"]) == ("skipped", 0)
+
+
+# ---------------------------------------------------------------------------
+# task 6750 (Legibility S21 η): every verdict resolves to the candidate id the
+# merge minted for the payloads it was offered, never by title.
+# ---------------------------------------------------------------------------
+
+_SHARED_TITLE = "Two causes share one novel title"
+
+
+def _shared_title_response(prompt, model):
+    if "twin-one" in prompt or "twin-two" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _SHARED_TITLE,
+            "cause": "Two sessions mined the same shape.",
+            "area": "orchestrator",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "evidence_quote": "the same shape again",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def _offered_ids(verify_fn) -> list[list[str | None]]:
+    return [[cluster.get(mod.CANDIDATE_KEY) for cluster in call["clusters"]] for call in verify_fn.calls]
+
+
+def _candidate_titled(cb: dict, title: str) -> dict:
+    [candidate] = [candidate for candidate in cb["candidates"] if candidate["title"] == title]
+    return candidate
+
+
+def _rewording(fake):
+    """*fake* whose every returned cluster carries a rewritten title, as an
+    LLM rewrite or a between-runs correction gives it."""
+    def verify_fn(clusters, *, model):
+        result = fake(clusters, model=model)
+        return {
+            **result,
+            "verified": [{**c, "title": f"Reworded: {c['title']}"} for c in result["verified"]],
+            "rejected": [{**c, "title": f"Reworded: {c['title']}"} for c in result["rejected"]],
+        }
+
+    verify_fn.calls = fake.calls
+    return verify_fn
+
+
+def test_two_sessions_mining_one_novel_title_are_one_cluster_named_by_its_candidate_id(tmp_path):
+    verify_fn = _make_fake_verify_fn(verified_titles={_SHARED_TITLE})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_shared_title_response),
+        batch_source=[[_hand_digest("twin-one", "first sighting"), _hand_digest("twin-two", "second sighting")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    candidate = _candidate_titled(persisted, _SHARED_TITLE)
+    [call] = verify_fn.calls
+    [cluster] = call["clusters"]
+    assert cluster[mod.CANDIDATE_KEY] == candidate["id"]
+    assert sorted(sighting["session"] for sighting in cluster["sightings"]) == ["twin-one", "twin-two"]
+    assert candidate["disposition"] == "promoted"
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["verify_calls"] == len({cid for ids in _offered_ids(verify_fn) for cid in ids}) == 1
+    assert outcome.dropped_verdicts == ()
+    assert record["dropped_verdicts"] == []
+    assert codebook.validate(persisted) == []
+
+
+def test_a_reworded_reply_still_promotes_and_rejects_its_candidates_by_id(tmp_path):
+    verify_fn = _rewording(_make_fake_verify_fn(
+        verified_titles={_L6_NOVEL_TITLE}, rejected_titles={_REJECTED_TITLE},
+    ))
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    verified = _candidate_titled(persisted, _L6_NOVEL_TITLE)
+    rejected = _candidate_titled(persisted, _REJECTED_TITLE)
+    assert _offered_ids(verify_fn) == [[verified["id"], rejected["id"]]]
+    assert verified["disposition"] == "promoted"
+    assert rejected["disposition"] == "rejected"
+    assert outcome.dropped_verdicts == ()
+    assert _run_record(kwargs)["dropped_verdicts"] == []
+    assert codebook.validate(persisted) == []
+
+
+def test_a_capped_candidate_is_adjudicated_from_the_next_runs_queue_under_a_reworded_reply(tmp_path):
+    first = _run_census_kwargs(
+        tmp_path / "first",
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+        verify_fn=_rewording(_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        max_verify_clusters=1,
+    )
+    assert mod.run_census(**first).status == "done"
+    carried = codebook.load(first["codebook_path"])
+    left = _candidate_titled(carried, _REJECTED_TITLE)
+    assert left["disposition"] == "pending"
+
+    verify_fn = _rewording(_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}))
+    second = _run_census_kwargs(
+        tmp_path / "second",
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=carried,
+        config=_census_config(tmp_path / "second", max_clusters_per_run=10),
+    )
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert [left["id"]] in _offered_ids(verify_fn)
+    persisted = codebook.load(second["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == "rejected"
+    assert outcome.dropped_verdicts == ()
+    assert codebook.validate(persisted) == []
+
+
+def _surfaced_standing_codebook(disposition: str) -> dict:
+    """A FIXED entry carrying `_REJECTED_TITLE`, so its re-mined cluster is
+    surfaced and verified, and a standing candidate of that exact title the
+    merge routes the payload to: promoted to that entry, or rejected."""
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({**_promoted_entry(), "status": "fixed"})
+    candidate = {
+        "id": "cand-20260701-7",
+        "title": _REJECTED_TITLE,
+        "first_seen": "2026-07-01",
+        "disposition": disposition,
+        "sightings": [],
+    }
+    if disposition == "promoted":
+        candidate["promoted_to"] = "entry-spurious"
+    cb["candidates"].append(candidate)
+    return cb
+
+
+@pytest.mark.parametrize(("verdict_titles", "standing", "expected_kind"), [
+    ({"verified_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_CONTRADICTION),
+    ({"verified_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_AGREEMENT),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_CONTRADICTION),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_AGREEMENT),
+], ids=["verify-vs-rejected", "verify-vs-promoted", "reject-vs-promoted", "reject-vs-rejected"])
+def test_a_surfaced_verdict_on_a_standing_candidate_is_dropped_naming_that_candidate(
+    tmp_path, caplog, verdict_titles, standing, expected_kind,
+):
+    verify_fn = _make_fake_verify_fn(**verdict_titles)
+    kwargs = _rejected_run_kwargs(tmp_path, _surfaced_standing_codebook(standing), verify_fn=verify_fn)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_ids(verify_fn) == [["cand-20260701-7"]]
+    record = _one_dropped(outcome)
+    assert record.verdict == ("verified" if "verified_titles" in verdict_titles else "rejected")
+    assert record.kind == expected_kind
+    assert (record.standing_id, record.standing_disposition, record.standing_first_seen) == (
+        "cand-20260701-7", standing, "2026-07-01",
+    )
+    assert len(_dropped_verdict_warnings(caplog)) == 1
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == standing
+    assert codebook.validate(persisted) == []
+
+
+def test_a_reply_naming_no_offered_candidate_is_discarded_with_a_warning(tmp_path, caplog):
+    ghost, foreign = "A title the merge never saw", "A cluster under a foreign id"
+
+    def verify_fn(clusters, *, model):
+        return {
+            "verified": [{"title": ghost, "sightings": []}],
+            "rejected": [{"title": foreign, mod.CANDIDATE_KEY: "cand-20990101-1", "sightings": []}],
+            "fixed": [],
+        }
+
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook(), verify_fn=verify_fn)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.dropped_verdicts == ()
+    for title in (ghost, foreign):
+        naming = [r for r in caplog.records if r.levelno == logging.WARNING and title in r.getMessage()]
+        assert len(naming) == 1, naming
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == "pending"
+    assert [entry["id"] for entry in persisted["entries"]] == ["entry-a"]
+    assert codebook.validate(persisted) == []
+
+
+_SURFACED_PENDING = "A pending shape a fixed entry also carries"
+_QUEUE_NEIGHBOUR = "Its queue neighbour"
+
+
+def _surfaced_pending_response(prompt, model):
+    if "surfaced-twin" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _SURFACED_PENDING,
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified_once(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({**_promoted_entry(), "id": "entry-fixed", "title": _SURFACED_PENDING, "status": "fixed"})
+    cb["candidates"] = [
+        _backlog_candidate("cand-20260701-1", _SURFACED_PENDING, "s-backlog-1"),
+        _backlog_candidate("cand-20260705-1", _QUEUE_NEIGHBOUR, "s-backlog-2", first_seen="2026-07-05"),
+    ]
+    kwargs, _ = _similarity_kwargs(
+        tmp_path,
+        {_SURFACED_PENDING: [0.0, 1.0, 0.0], _QUEUE_NEIGHBOUR: [0.0, 0.99, math.sqrt(1 - 0.99 ** 2)]},
+        codebook_dict=cb,
+        batch=[_hand_digest("surfaced-twin", "the fixed shape is back")],
+    )
+    verify_fn = _make_fake_verify_fn(verified_titles={_SURFACED_PENDING, _QUEUE_NEIGHBOUR})
+    kwargs.update(invoke=_make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    offered = [cid for ids in _offered_ids(verify_fn) for cid in ids]
+    assert offered.count("cand-20260701-1") == 1
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _persisted_record(kwargs, "cand-20260701-1")["disposition"] == "promoted"
+    assert codebook.validate(persisted) == []
