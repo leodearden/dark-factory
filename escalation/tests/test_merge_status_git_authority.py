@@ -25,6 +25,8 @@ from unittest.mock import call as mock_call
 
 import pytest
 from _merge_tool_calls import call_merge_request, call_merge_status
+from _rebased_landing_git import add_unlanded_branch, build_rebased_solo_landing, new_repo
+from _rebased_landing_git import git as landing_git
 from shared.merge_state import MergeReason
 from shared.task_read import TaskFound, TaskReadFailed
 
@@ -238,6 +240,20 @@ def orch_config(git_repo: Path) -> OrchestratorConfig:  # type: ignore[reportInv
 @pytest.fixture
 def git_ops(orch_config: OrchestratorConfig) -> GitOps:  # type: ignore[reportInvalidTypeForm]
     return GitOps(orch_config.git, orch_config.project_root)
+
+
+@pytest.fixture
+def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Charge the real ``branch_work_landed``'s verdicts to a throwaway tally.
+
+    The patch-id arm runs the producer for real, and it charges the
+    process-lifetime ``orchestrator.merge_lane.landing_evidence.LANDING_TALLY``
+    on every verdict; that attribute's own comment says tests replace it.
+    """
+    from orchestrator.merge_lane.landing_evidence import LandingTally
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.landing_evidence.LANDING_TALLY', LandingTally(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1525,73 @@ class TestMergeStatusGitAuthorityIntegration:
         assert result.get('merge_sha') == merge_result.merge_commit, (
             f'Expected merge_sha={merge_result.merge_commit!r}, got: {result}'
         )
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_rebased_solo_landing_with_retained_ref_returns_done(
+        self, tmp_path: Path,
+    ) -> None:
+        """The worker-rebased solo landing answers ``done`` with no record anywhere.
+
+        ``GitOps.advance_main``'s rebased path rewrites every branch commit
+        onto main, writes no merge marker and retains ``task/<id>`` at its
+        pre-rebase tip, so neither the ancestor arm nor the marker arm can
+        see it.  The patch-id arm answers on every poll key that names the
+        branch, and its merge_sha is the rebased citing commit on main.
+        """
+        tid = '6978'
+        branch = f'task/{tid}'
+        landing = build_rebased_solo_landing(tmp_path / 'repo', tid, cited=True)
+        repo = landing.repo
+
+        rc, _, _ = await _run(['git', 'merge-base', '--is-ancestor', branch, 'main'], cwd=repo)
+        assert rc == 1, 'precondition: the retained tip is not an ancestor of main'
+        assert landing_git(
+            repo, 'log', 'main', '--fixed-strings', f'--grep=Merge {branch} into main',
+            '--format=%H',
+        ) == '', 'precondition: a rebased fast-forward writes no merge marker'
+        assert landing_git(repo, 'rev-parse', '--verify', branch) == landing.branch_tip, (
+            'precondition: the ref is retained at its pre-rebase tip'
+        )
+
+        config = _make_config(repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, repo)), orch_config=config,
+        )
+
+        for poll in ({'task_id': tid}, {'branch': tid}, {'branch': branch}):
+            result = await call_merge_status(server, **poll)
+
+            assert result.get('state') == 'done', f'{poll}: {result}'
+            assert result.get('kind') == 'found_on_main', f'{poll}: {result}'
+            assert result.get('source') == 'git', f'{poll}: {result}'
+            assert result.get('merge_sha') == landing.citing_sha, f'{poll}: {result}'
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', result['merge_sha'], 'main'], cwd=repo,
+            )
+            assert rc == 0, f'{poll}: merge_sha must be a commit on main'
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_live_unlanded_branch_is_not_done(self, tmp_path: Path) -> None:
+        """A non-ancestor live branch whose work is absent stays a plain miss.
+
+        Never ``done``, and never ``unknown`` either: the patch-id arm's
+        ``not_landed`` is a clean negative, not a probe that could not look.
+        """
+        tid = '6979'
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        add_unlanded_branch(repo, tid)
+        config = _make_config(repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, repo)), orch_config=config,
+        )
+
+        result = await call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'no_record', f'got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
 
 
 # ---------------------------------------------------------------------------

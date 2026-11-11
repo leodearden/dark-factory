@@ -24,6 +24,9 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _rebased_landing_git import add_unlanded_branch, build_rebased_solo_landing, new_repo
+from _rebased_landing_git import commit as landing_commit
+from _rebased_landing_git import git as landing_git
 from shared.merge_state import MergeState
 from shared.task_read import TaskAbsent, TaskFound, TaskReadFailed
 
@@ -864,6 +867,104 @@ class TestProbeLanding:
         assert faulted.metadata_unavailable is True
 
 
+@pytest.fixture
+def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Charge the real producer's verdicts to a throwaway tally.
+
+    ``branch_work_landed`` charges the process-lifetime
+    ``orchestrator.merge_lane.landing_evidence.LANDING_TALLY`` on every
+    verdict; that attribute's own comment says tests replace it for isolation.
+    """
+    from orchestrator.merge_lane.landing_evidence import LandingTally
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.landing_evidence.LANDING_TALLY', LandingTally(),
+    )
+
+
+async def _probe_repo(repo: Path, tid: str) -> GitAuthorityVerdict:
+    """Probe *tid*'s branch in the real repo at *repo*, metadata read healthy and empty."""
+    from orchestrator.config import GitConfig  # type: ignore[reportMissingImports]
+    from orchestrator.git_ops import GitOps  # type: ignore[reportMissingImports]
+    return await probe_landing(
+        GitOps(GitConfig(main_branch='main', branch_prefix='task/'), repo), tid,
+        orch_config=_config(repo), harness=_harness(read=TaskFound({'metadata': {}})),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('fresh_landing_tally')
+class TestProbeLandingPatchIdArm:
+    """A live ref that is NOT an ancestor of main, decided in real git.
+
+    ``GitOps.advance_main``'s rebased path leaves exactly this: every branch
+    commit rewritten onto main, the ref retained at its pre-rebase tip.  The
+    arm delegates the decision to the real ``branch_work_landed``, so these
+    run real git rather than stubs.
+    """
+
+    async def test_cited_rebased_landing_is_found_on_main_at_the_citing_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
+
+        verdict = await _probe_repo(landing.repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.merge_sha == verdict.evidence_sha == landing.citing_sha, (
+            'merge_sha is the rebased CITING commit on main, never the retained '
+            'pre-rebase tip and never main HEAD'
+        )
+        assert verdict.reason == 'landed'
+        assert verdict.citation_gate_skipped is False
+        assert verdict.rescued_by_delivered_checks is False
+        assert verdict.merge_sha_fully_guarded is True
+
+    async def test_uncited_rebased_landing_is_found_on_main_at_the_tips_patch_id_twin(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=False)
+
+        verdict = await _probe_repo(landing.repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.merge_sha == landing.main_tip, (
+            "with no citing commit, merge_sha is the branch tip's patch-id twin on main"
+        )
+        assert verdict.merge_sha != landing.branch_tip
+
+    async def test_unlanded_live_branch_is_no_signal(self, tmp_path: Path) -> None:
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        add_unlanded_branch(repo, '6978')
+
+        verdict = await _probe_repo(repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.merge_sha is None
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.reason == 'not_landed'
+
+    async def test_commit_added_after_the_landing_is_no_signal(self, tmp_path: Path) -> None:
+        """The arm errs only towards under-reporting.
+
+        A branch commit main lacks reads '+' in ``git cherry``, and so does a
+        genuine landing whose context drifted (task 6936).  Either way the
+        answer is ``no_signal``, never ``found_on_main``.
+        """
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
+        landing_git(landing.repo, 'checkout', 'task/6978')
+        landing_commit(landing.repo, 'amend: after the landing', 'after.txt')
+        landing_git(landing.repo, 'checkout', 'main')
+
+        verdict = await _probe_repo(landing.repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.merge_sha is None
+        assert verdict.reason == 'not_landed'
+
+
 class TestGitAuthorityVerdict:
     def test_is_frozen(self) -> None:
         verdict = GitAuthorityVerdict(outcome=GitAuthorityOutcome.no_signal)
@@ -881,6 +982,15 @@ class TestGitAuthorityVerdict:
                 ),
                 True,
                 'found_on_main with neither weakening — the only stampable case',
+            ),
+            (
+                GitAuthorityVerdict(
+                    outcome=GitAuthorityOutcome.found_on_main,
+                    merge_sha='c' * 40, arm=GitAuthorityArm.patch_id,
+                ),
+                True,
+                'patch-id path: the PRD D1 contract checks containment and '
+                'deliberately not effect survival — not a weakening',
             ),
             (
                 GitAuthorityVerdict(
@@ -929,7 +1039,7 @@ class TestGitAuthorityVerdict:
             ),
         ],
         ids=[
-            'fully_guarded', 'citation_gate_skipped', 'rescued',
+            'fully_guarded', 'patch_id_arm', 'citation_gate_skipped', 'rescued',
             'both_weakenings', 'landed_unconfirmed', 'no_signal', 'probe_failed',
         ],
     )
