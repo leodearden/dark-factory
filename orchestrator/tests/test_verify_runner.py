@@ -23,7 +23,7 @@ from _gate_fixtures import (
 )
 from _orch_helpers import pydantic_spec, wait_responsive
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
@@ -2157,17 +2157,24 @@ class TestRetryScopeEventFields:
 class TestBuildMergeVerifySpec:
     """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
 
-    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+    def _make_module_config(
+        self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None, scope_cargo=None,
+    ):
         mc = MagicMock()
         mc.prefix = prefix
         mc.test_command = test_cmd
         mc.lint_command = lint_cmd
         mc.type_check_command = type_check_cmd
+        # Task 7465: collapsed_module_overrides reads these; a bare MagicMock
+        # attr is non-None and truthy, so it would flag every mock module.
+        mc.scope_cargo = scope_cargo
+        mc.verify_env = None
         return mc
 
     def _make_config(
         self, *, verify_env=None, cold_timeout=None,
         test_cmd=None, lint_cmd=None, type_check_cmd=None,
+        scope_cargo=True, config_only_globs=(),
     ):
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
@@ -2188,6 +2195,9 @@ class TestBuildMergeVerifySpec:
         config.type_check_command = type_check_cmd
         # Task 6127: projected onto the spec, so it needs a real (JSON-native) value.
         config.verify_cold_preprovision_command = ''
+        # Task 7465: both projected onto the spec, so they need real values.
+        config.scope_cargo = scope_cargo
+        config.git = GitConfig(merge_config_only_full_gate_globs=list(config_only_globs))
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -2374,6 +2384,57 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(OrchestratorConfig(), [], None)
         assert spec.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    @pytest.mark.parametrize('scope_cargo', [True, False])
+    def test_scope_cargo_projected_from_config(self, scope_cargo):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(scope_cargo=scope_cargo), [], None)
+        assert spec.scope_cargo is scope_cargo
+
+    def test_config_only_globs_projected_from_config_git(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(config_only_globs=('dark-factory-orchestrator.yaml',))
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+        config.git.merge_config_only_full_gate_globs.append('later.yaml')
+
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+    def _collapsing_modules(self, override):
+        return [
+            ModuleConfig(prefix='crates/a', test_command='cargo test --workspace', scope_cargo=override),
+            ModuleConfig(prefix='crates/b', test_command='cargo test --workspace'),
+        ]
+
+    @pytest.mark.parametrize('override', [False, True])
+    def test_collapsed_per_module_scope_cargo_ships_scope_cargo_false(self, override):
+        """A per-module scope_cargo cannot ride the spec, so the spec ships False,
+        which on the remote can only widen cargo scope."""
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True), self._collapsing_modules(override), None,
+        )
+        assert spec.scope_cargo is False
+
+    def test_per_module_verify_env_alone_leaves_scope_cargo_carried(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True),
+            [ModuleConfig(prefix='m', verify_env={'X': '1'})],
+            None,
+        )
+        assert spec.scope_cargo is True
+
+    def test_build_does_not_raise_on_a_collapsed_override(self):
+        """The spec is also built for LOCAL merges, so a collapse must never raise."""
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True), self._collapsing_modules(False), None,
+        )
+        assert isinstance(spec, MergeVerifySpec)
 
 
 # ---------------------------------------------------------------------------
