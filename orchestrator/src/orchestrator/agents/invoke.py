@@ -1,4 +1,4 @@
-"""Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs.
+"""Multi-backend agent invocation: Claude Code, Codex, Gemini, pi and ZCode CLIs.
 
 Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
 other subsystems (e.g. fused-memory reconciliation) can reuse it without
