@@ -2038,11 +2038,16 @@ dark-factory's `data/escalations` via `escalation submit` when either holds:
 NRestarts counts only `Restart=` restarts, and any manual start (a watchdog
 revive, a sweep) resets it to 0. The growth count therefore adds the new value
 whenever the counter drops, rather than taking a plain difference. At most one
-page per window per unit is filed, and a start-limit-hit page once per
-episode. The page epoch is stamped on attempt, so a broken submit retries at
-window cadence. To find the cause, read `journalctl --user -u <unit>`, then
-the project's runs.db `exit_reason` / `startup_completed_at` columns
-(startup-hardening task γ). Once the cause is fixed, restore the unit with
+page attempt is made per window per unit, whichever kind. A start-limit-hit
+episode counts as paged only once `escalation submit` has succeeded, so a
+failed submit of either kind retries at window cadence until it lands. This
+matters because one fault can do both at once: an import error under
+`escalation/` or a broken workspace venv can crash-loop the orchestrators and
+break the submit. The unit stays down meanwhile, so the retry is the only
+path to a page. Once a start-limit-hit page has landed, no further one is
+filed until the unit leaves start-limit-hit. To find the cause, read
+`journalctl --user -u <unit>`, then the project's runs.db `exit_reason` /
+`startup_completed_at` columns (startup-hardening task γ). Once the cause is fixed, restore the unit with
 `systemctl --user reset-failed <unit> && systemctl --user start <unit>`.
 `WATCHED` is the detector's unit set; the `--report` RESTARTS column covers
 every running orchestrator unit. Code:
