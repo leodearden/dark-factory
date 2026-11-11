@@ -1837,7 +1837,7 @@ def test_resolutions_follow_batch_order_one_per_candidate_payload():
         mod.NewPending(payload=_ref(0, 1), candidate_id="cand-20260714-2"),
         mod.PendingAbsorbed(payload=_ref(2, 0), candidate_id="cand-20260714-1"),
     )
-    assert merge.resolution_at(_ref(0, 1)).candidate_id == "cand-20260714-2"
+    assert merge.resolution_at(_ref(0, 1)) == merge.resolutions[1]
     assert merge.resolution_at(_ref(0, 2)) is None
     assert merge.resolution_at(_ref(1)) is None
 

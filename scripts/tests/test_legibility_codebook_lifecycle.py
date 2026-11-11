@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+from typing import Any
 
 import pytest
 from legibility import census_findings, codebook, codebook_lifecycle, verdict
@@ -56,8 +57,9 @@ def test_the_table_states_every_transition_once():
 
 
 def test_the_table_is_read_only():
+    table: Any = codebook_lifecycle.TABLE
     with pytest.raises(TypeError):
-        codebook_lifecycle.TABLE[T.PROMOTE] = codebook_lifecycle.TABLE[T.REJECT]  # type: ignore[index]
+        table[T.PROMOTE] = table[T.REJECT]
 
 
 def test_every_target_is_of_its_fields_vocabulary():

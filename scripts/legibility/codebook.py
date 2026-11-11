@@ -967,8 +967,9 @@ def _resolve(
     if pending is not None:
         return PendingAbsorbed(payload=ref, candidate_id=pending["id"]), pending
     for candidate in reversed(same_title):
-        if candidate.get("disposition") == "promoted":
-            entry = entries_by_id.get(candidate.get("promoted_to"))
+        promoted_to = candidate.get("promoted_to")
+        if candidate.get("disposition") == "promoted" and isinstance(promoted_to, str):
+            entry = entries_by_id.get(promoted_to)
             if entry is not None:
                 return RoutedToEntry(
                     payload=ref, candidate_id=candidate["id"], entry_id=entry["id"]
