@@ -271,6 +271,70 @@ class TestInjectOperationalRoutingMatrix:
         assert OPERATIONAL_LLM_GATE_MARKER_KEY.startswith('x_')
 
 
+
+class TestPureGateRoutingNotice:
+    """pure_gate_routing_notice(metadata): the submit-response notice for a converted submission."""
+
+    @pytest.mark.parametrize(
+        ('execution_class', 'expected'),
+        [('operational', 'execution_class=operational'), ('decision', 'execution_class=decision')],
+    )
+    def test_converted_submission_yields_one_structured_notice(self, execution_class, expected):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+            pure_gate_routing_notice,
+        )
+
+        notice = pure_gate_routing_notice(inject_operational_routing({'execution_class': execution_class}))
+
+        assert list(notice) == ['routing_notice']
+        body = notice['routing_notice']
+        assert set(body) == {'pure_gate_from', 'detail', 'hint'}
+        assert body['pure_gate_from'] == expected
+        assert isinstance(body['detail'], str) and body['detail']
+        assert isinstance(body['hint'], str) and body['hint']
+        assert "task_kind='normal'" in body['hint']
+        assert "complexity='simple'" in body['hint']
+
+    def test_notice_is_informational_never_an_error(self):
+        from fused_memory.middleware.operational_routing_guard import (
+            inject_operational_routing,
+            pure_gate_routing_notice,
+        )
+
+        notice = pure_gate_routing_notice(inject_operational_routing({'execution_class': 'operational'}))
+
+        assert 'error' not in notice and 'error_type' not in notice
+        assert 'error' not in notice['routing_notice']
+        assert 'error_type' not in notice['routing_notice']
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            None,
+            '{"execution_class": "operational"}',
+            {'execution_class': 'code_tdd'},
+            {'task_kind': 'deterministic', 'always_escalates': True},
+            {'pure_gate_from': 'execution_class=operational', 'task_kind': 'normal'},
+            {'pure_gate_from': 'bogus', 'always_escalates': True},
+        ],
+        ids=[
+            'none',
+            'str',
+            'code_tdd',
+            'hand_authored_gate_without_stamp',
+            'stamp_on_non_gate',
+            'unknown_stamp_value',
+        ],
+    )
+    def test_no_notice_without_a_valid_stamp_on_a_gate(self, metadata):
+        from fused_memory.middleware.operational_routing_guard import (
+            pure_gate_routing_notice,
+        )
+
+        assert pure_gate_routing_notice(metadata) == {}
+
+
 _SCHEMA_WARNING = 'task_metadata.schema_warning'
 _SOURCE = 'source=operational_routing_guard'
 
