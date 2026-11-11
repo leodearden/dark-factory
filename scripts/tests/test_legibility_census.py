@@ -42,6 +42,7 @@ from legibility import (
     census_window,
     check_census_report,
     codebook,
+    codebook_lifecycle,
     coder,
     disposition,
     embeddings,
@@ -1059,146 +1060,6 @@ def test_novel_clusters_distinct_titles_each_get_their_own_cluster():
     clusters = mod._novel_clusters(records)
 
     assert {c["title"] for c in clusters} == {"Cause A", "Cause B"}
-
-
-# ---------------------------------------------------------------------------
-# step-11: RED — promote_candidate() / reject_candidate() / retire_entry()
-# in-place codebook lifecycle transforms (never-delete, PRD decision 3)
-# ---------------------------------------------------------------------------
-
-def _codebook_with_candidate():
-    """Mirrors test_codebook.py's _minimal_v2() base shape, plus one
-    pending candidate carrying a real sighting -- the fixture promote/
-    reject tests build on."""
-    cb = _minimal_v2_codebook()
-    cb["candidates"] = [
-        {
-            "id": "cand-20260714-1",
-            "title": "A novel confusion shape",
-            "first_seen": "2026-07-14",
-            "disposition": "pending",
-            "sightings": [
-                {
-                    "date": "2026-07-14",
-                    "project": "dark_factory",
-                    "session": "sess-1",
-                    "origin_phase": "implement",
-                    "manifested_phase": "verify",
-                },
-            ],
-        }
-    ]
-    return cb
-
-
-def test_promote_candidate_appends_entry_and_stamps_disposition():
-    before = _codebook_with_candidate()
-    entry_fields = {
-        "id": "new-entry-a",
-        "title": "A novel confusion shape",
-        "severity": "medium",
-        "status": "open",
-        "origin_phase": "implement",
-        "manifested_phase": "verify",
-    }
-
-    result = mod.promote_candidate(before, "cand-20260714-1", entry_fields)
-
-    new_entry = next(e for e in result["entries"] if e["id"] == "new-entry-a")
-    assert new_entry["sightings"] == before["candidates"][0]["sightings"]
-
-    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
-    assert candidate["disposition"] == "promoted"
-    assert candidate.get("promoted_to") == "new-entry-a", "must name the new entry id"
-    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)  # must not raise
-
-    # never mutates the input codebook
-    assert before["candidates"][0]["disposition"] == "pending"
-    assert len(before["entries"]) == 1
-
-
-_PROMOTION_ENTRY_FIELDS = {
-    "id": "new-entry-a",
-    "title": "A novel confusion shape",
-    "severity": "medium",
-    "status": "open",
-    "origin_phase": "implement",
-    "manifested_phase": "verify",
-}
-
-
-def _promotion_identity(anchor: str, primary_tag: str = "h13") -> census_findings.FindingIdentity:
-    return census_findings.FindingIdentity.mint("orchestrator", anchor, (primary_tag, verdict.KIND_TAG))
-
-
-def _promoted_pair(cb: dict, finding: census_findings.FindingIdentity) -> tuple[dict, dict]:
-    result = mod.promote_candidate(cb, "cand-20260714-1", dict(_PROMOTION_ENTRY_FIELDS), finding=finding)
-    assert codebook.validate(result) == []
-    return result["candidates"][0], next(e for e in result["entries"] if e["id"] == "new-entry-a")
-
-
-def _identity_and_supersedes(record: dict) -> dict:
-    return {field: record[field] for field in (*codebook.FINDING_IDENTITY_FIELDS, "supersedes")}
-
-
-def test_a_promoted_entry_carries_its_unkeyed_candidates_new_identity():
-    finding = _promotion_identity("orchestrator/x.py::f")
-    candidate, entry = _promoted_pair(_codebook_with_candidate(), finding)
-    assert _identity_and_supersedes(entry) == {**finding.to_fields(), "supersedes": []}
-    assert candidate["finding_key"] == entry["finding_key"]
-
-
-def test_a_promoted_entry_keeps_the_key_its_candidate_already_stands_on():
-    cb = _codebook_with_candidate()
-    standing = _promotion_identity("orchestrator/x.py::f", primary_tag="h13")
-    cb["candidates"][0].update(standing.to_fields())
-    candidate, entry = _promoted_pair(cb, _promotion_identity("orchestrator/x.py::f", primary_tag="h4"))
-    assert entry["finding_key"] == candidate["finding_key"] == standing.key
-    assert _identity_and_supersedes(entry) == _identity_and_supersedes({**candidate, "supersedes": []})
-
-
-def test_a_promoted_entry_carries_the_supersedes_chain_its_moved_candidate_records():
-    cb = _codebook_with_candidate()
-    prior = finding_key("orchestrator", "orchestrator/x.py::older", "h13")
-    standing = _promotion_identity("orchestrator/x.py::old_name")
-    cb["candidates"][0].update({**standing.to_fields(), "supersedes": [prior]})
-    moved = _promotion_identity("orchestrator/x.py::new_name")
-    candidate, entry = _promoted_pair(cb, moved)
-    assert entry["finding_key"] == candidate["finding_key"] == moved.key
-    assert entry["supersedes"] == candidate["supersedes"] == [prior, standing.key]
-
-
-def test_reject_candidate_stamps_disposition_retained():
-    before = _codebook_with_candidate()
-
-    result = mod.reject_candidate(before, "cand-20260714-1")
-
-    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
-    assert candidate["disposition"] == "rejected"
-    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["candidates"][0]["disposition"] == "pending"
-
-
-def test_retire_entry_sets_status_retained():
-    before = _minimal_v2_codebook()
-
-    result = mod.retire_entry(before, "entry-a")
-
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
-    assert entry["status"] == "retired"
-    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["entries"][0]["status"] == "open"
 
 
 # ---------------------------------------------------------------------------
@@ -8935,32 +8796,9 @@ def _codebook_with_withheld_entry():
     return cb
 
 
-def test_mark_entry_filed_flips_the_marker_retained():
-    before = _codebook_with_withheld_entry()
-
-    result = mod.mark_entry_filed(before, "entry-withheld")
-
-    entry = next(e for e in result["entries"] if e["id"] == "entry-withheld")
-    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
-    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
-    assert next(e for e in result["entries"] if e["id"] == "entry-a") == before["entries"][0]
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["entries"][1][codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD, (
-        "the input is never mutated"
-    )
-
-
-def test_mark_entry_filed_rejects_an_unknown_entry_id():
-    with pytest.raises(ValueError, match="entry-nope"):
-        mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-nope")
-
-
 def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     path = tmp_path / "confusion-codebook.yaml"
-    marked = mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")
+    marked = codebook_lifecycle.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")
 
     codebook.dump(marked, path)
     first_bytes = path.read_bytes()

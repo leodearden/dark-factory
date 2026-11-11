@@ -47,12 +47,12 @@ Fable ONLY for synthesis, read from ``config.Models``
 
 Codebook handling (PRD decision 1 -- sole writer, never delete): new
 mining sightings/candidates merge through the EXISTING
-``codebook.apply_coding_records``. Census-only lifecycle transitions
-(promote/reject/retire) are deterministic in-memory transforms in this
-module, persisted via ``codebook.dump()`` after ``codebook.validate()``
-and ``codebook.assert_no_deletion()`` confirm the write is safe. The
-contract finding fields those transforms stamp (finding identity, run
-history) are defined in ``codebook.py``'s schema and minted by
+``codebook.apply_coding_records``. The census's lifecycle transitions
+(promote/reject/retire/file) are ``codebook_lifecycle``'s transforms over
+its legal-transition table, persisted via ``codebook.dump()`` after
+``codebook.validate()`` and ``codebook.assert_no_deletion()`` confirm the
+write is safe. The contract finding fields those transforms stamp (finding
+identity, run history) are defined in ``codebook.py``'s schema and minted by
 ``census_findings.py``.
 """
 from __future__ import annotations
@@ -113,6 +113,7 @@ from legibility import (  # noqa: E402
     census_trigger,
     census_window,
     codebook,
+    codebook_lifecycle,
     coder,
     config,
     digest,
@@ -798,97 +799,11 @@ def _cluster_title(cluster: Mapping[str, Any]) -> str:
     return cluster.get("title") or "Untitled confusion cluster"
 
 
-# ---------------------------------------------------------------------------
-# promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
-# census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
-# reuse gamma's validator + never-delete assertion + sole-writer dump)
-# ---------------------------------------------------------------------------
-
 def _find_by_id(items: list[dict], item_id: str, *, kind: str) -> dict:
     for item in items:
         if item.get("id") == item_id:
             return item
     raise ValueError(f"{kind}: no id {item_id!r} found")
-
-
-def promote_candidate(
-    cb: dict, cand_id: str, entry_fields: dict, *,
-    finding: census_findings.FindingIdentity | None = None,
-    supersedes: Sequence[str] = (),
-) -> dict:
-    """Promote candidate *cand_id* in *cb* to a new codebook entry.
-
-    Returns a NEW codebook (a ``copy.deepcopy`` of *cb*, never mutated in
-    place). Appends an entry built from *entry_fields* (expected to carry
-    ``id``/``title``/``severity``/``status``/``origin_phase``/
-    ``manifested_phase`` -- everything ``codebook.py``'s v2 entry schema
-    requires except ``sightings``) with ``sightings`` set to the
-    candidate's OWN sightings (the candidate is the source of truth for
-    what was actually observed, not *entry_fields*). The candidate itself
-    is stamped ``disposition="promoted"`` and ``promoted_to`` naming the
-    new entry id -- RETAINED, never removed (PRD decision 3). A *finding*
-    identity is stamped on the candidate (``census_findings.stamped``), then
-    *supersedes* (another instrument's chain for an adopted key) is merged
-    into the candidate's chain, and the entry carries the stamped candidate's
-    identity and supersedes chain (``census_findings.carried_identity``).
-    ``codebook.assert_no_deletion`` is run against the pre-transform *cb*
-    before returning, as a construction-independent safety net.
-    """
-    result = copy.deepcopy(cb)
-    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="promote_candidate")
-    if finding is not None:
-        candidate.update(census_findings.stamped(candidate, finding))
-    if supersedes:
-        candidate["supersedes"] = list(dict.fromkeys([*candidate.get("supersedes", []), *supersedes]))
-
-    new_entry_id = entry_fields["id"]
-    entry = {**entry_fields, **census_findings.carried_identity(candidate)}
-    entry["sightings"] = copy.deepcopy(candidate.get("sightings") or [])
-    result.setdefault("entries", []).append(entry)
-
-    candidate["disposition"] = "promoted"
-    candidate["promoted_to"] = new_entry_id
-
-    codebook.assert_no_deletion(cb, result)
-    return result
-
-
-def reject_candidate(
-    cb: dict, cand_id: str, *, finding: census_findings.FindingIdentity | None = None,
-) -> dict:
-    """Reject candidate *cand_id* in *cb*: stamps ``disposition="rejected"``
-    (and a *finding* identity, when given) in place on a deep copy, RETAINED
-    (never removed). Returns a NEW codebook; *cb* is never mutated."""
-    result = copy.deepcopy(cb)
-    candidate = _find_by_id(result.get("candidates") or [], cand_id, kind="reject_candidate")
-    if finding is not None:
-        candidate.update(census_findings.stamped(candidate, finding))
-    candidate["disposition"] = "rejected"
-
-    codebook.assert_no_deletion(cb, result)
-    return result
-
-
-def retire_entry(cb: dict, entry_id: str) -> dict:
-    """Retire entry *entry_id* in *cb*: stamps ``status="retired"`` in
-    place on a deep copy, RETAINED (never removed). Returns a NEW
-    codebook; *cb* is never mutated."""
-    result = copy.deepcopy(cb)
-    entry = _find_by_id(result.get("entries") or [], entry_id, kind="retire_entry")
-    entry["status"] = "retired"
-
-    codebook.assert_no_deletion(cb, result)
-    return result
-
-
-def mark_entry_filed(cb: dict, entry_id: str) -> dict:
-    """Mark entry *entry_id* withheld -> filed on a deep copy, RETAINED."""
-    result = copy.deepcopy(cb)
-    entry = _find_by_id(result.get("entries") or [], entry_id, kind="mark_entry_filed")
-    entry[codebook.ENTRY_FILING_KEY] = codebook.ENTRY_FILING_FILED
-
-    codebook.assert_no_deletion(cb, result)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3173,11 +3088,10 @@ def run_census(
                 "manifested_phase": cluster.get("manifested_phase") or "unknown",
                 **census_findings.first_sighting_fields(run_id),
                 "first_seen_run": placement.first_seen_run(run_id),
-                **({codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD} if held is not None else {}),
             }
-            updated_codebook = promote_candidate(
+            updated_codebook = codebook_lifecycle.promote_candidate(
                 updated_codebook, cand_id, entry_fields, finding=placement.identity,
-                supersedes=placement.supersedes,
+                supersedes=placement.supersedes, withheld=held is not None,
             )
             promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
         placed.append((cluster, entry_id))
@@ -3219,7 +3133,7 @@ def run_census(
                 contradicting_disposition="promoted",
             ))
             continue
-        updated_codebook = reject_candidate(
+        updated_codebook = codebook_lifecycle.reject_candidate(
             updated_codebook, cand_id, finding=cluster.get("finding"),
         )
         if cluster.get("finding") is not None:
@@ -3228,7 +3142,7 @@ def run_census(
     updated_codebook, adjudicated = similarity.adjudicate_members(updated_codebook, offered)
 
     for entry_id in fixed_entry_ids:
-        updated_codebook = retire_entry(updated_codebook, entry_id)
+        updated_codebook = codebook_lifecycle.retire_entry(updated_codebook, entry_id)
 
     mined_sessions = {record["session"] for record in mining_result.records if record.get("session")}
     updated_codebook, sighted = census_findings.mark_seen(updated_codebook, run_id=run_id, sessions=mined_sessions)
@@ -3341,7 +3255,7 @@ def run_census(
         if decision.routed and decision.filing.entry_id in withheld_entry_ids
     ))
     for entry_id in released_entry_ids:
-        updated_codebook = mark_entry_filed(updated_codebook, entry_id)
+        updated_codebook = codebook_lifecycle.mark_entry_filed(updated_codebook, entry_id)
     if released_entry_ids:
         logger.info(
             "census: %d withheld codebook entr(ies) recurred and were routed: %s",
