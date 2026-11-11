@@ -3457,3 +3457,74 @@ def test_validate_coding_record_rejects_a_malformed_payload_attach(op, attached_
 def test_validate_coding_record_accepts_a_well_formed_payload_attach(op):
     record = _match_record() if op == "matches" else _candidate_record()
     assert mod.validate_coding_record(_attached(record, op)) == []
+
+
+# ---------------------------------------------------------------------------
+# task 6750: validate cross-references a promoted candidate's entry and holds
+# an entry's filing marker to its vocabulary
+# ---------------------------------------------------------------------------
+
+def _codebook_with_promoted_candidate(**promotion: Any) -> dict:
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0].update(promotion)
+    return codebook
+
+
+def _errors_naming(codebook: dict, *fragments: str) -> list[str]:
+    return [error for error in mod.validate(codebook) if all(fragment in error for fragment in fragments)]
+
+
+@pytest.mark.parametrize(
+    ("promotion", "offending"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param({"promoted_to": "entry-never-created"}, "entry-never-created", id="dangling"),
+    ],
+)
+def test_validate_rejects_a_promoted_candidate_whose_entry_does_not_resolve(promotion, offending):
+    codebook = _codebook_with_promoted_candidate(**promotion)
+
+    assert _errors_naming(codebook, "cand-20260722-28", repr(offending))
+
+
+def test_validate_accepts_a_promoted_candidate_whose_entry_resolves():
+    assert mod.validate(_codebook_with_promoted_candidate(promoted_to="entry-a")) == []
+
+
+def test_the_filing_vocabulary_is_the_codebooks():
+    assert (mod.ENTRY_FILING_KEY, mod.ENTRY_FILING_WITHHELD, mod.ENTRY_FILING_FILED) == (
+        "filing",
+        "withheld",
+        "filed",
+    )
+
+
+@pytest.mark.parametrize("filing", ["withheld", "filed"])
+def test_validate_accepts_an_entry_filing_marker_of_the_vocabulary(filing):
+    codebook = _minimal_v2()
+    codebook["entries"][0][mod.ENTRY_FILING_KEY] = filing
+
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize("filing", ["held", True])
+def test_validate_rejects_an_entry_filing_marker_outside_the_vocabulary(filing):
+    codebook = _minimal_v2()
+    codebook["entries"][0][mod.ENTRY_FILING_KEY] = filing
+
+    assert _errors_naming(codebook, "entries/0/filing", repr(filing))
+
+
+def test_validate_accepts_an_entry_without_a_filing_marker():
+    codebook = _minimal_v2()
+
+    assert mod.ENTRY_FILING_KEY not in codebook["entries"][0]
+    assert mod.validate(codebook) == []
+
+
+def test_validate_cli_fails_on_a_dangling_promoted_to(tmp_path, capsys):
+    path = tmp_path / "codebook.yaml"
+    mod.dump(_codebook_with_promoted_candidate(promoted_to="entry-never-created"), path)
+
+    assert mod.main(["validate", str(path)]) != 0
+    assert "entry-never-created" in capsys.readouterr().err
