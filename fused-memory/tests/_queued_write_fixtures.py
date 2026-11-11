@@ -27,6 +27,14 @@ from fused_memory.services.queued_writes import (
     decode_queued_write,
 )
 
+#: The flat keys an ``add_episode`` row carries today (PRD S26 boundary row 1).
+EPISODE_WIRE_KEYS = frozenset({
+    'name', 'content', 'correlation_id', 'source', 'group_id',
+    'source_description', 'project_id', 'agent_id', 'session_id',
+    '_causation_id', '_write_op_id', 'temporal_context', 'unverified_claim',
+    'reference_time', 'referents',
+})
+
 
 def queued(operation: str, payload: Mapping[str, Any], *, group_id: str | None = None) -> QueuedWrite:
     """*payload* decoded as a row of *operation* would be; the group defaults to the payload's own."""

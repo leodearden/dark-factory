@@ -15,18 +15,20 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, ClassVar, Self, get_args
+from typing import Any, ClassVar, Self, TypeGuard, get_args
 
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     ReferentSet,
+    ReferentSource,
 )
 from fused_memory.utils.validation import _safe_repr
 
@@ -76,9 +78,14 @@ def _optional_str(body: Mapping[str, Any], key: str) -> str | None:
     return value
 
 
-def _str_or_default(body: Mapping[str, Any], key: str, default: str) -> str:
-    value = _optional_str(body, key)
-    return default if value is None else value
+def _present_strs(body: Mapping[str, Any], *keys: str) -> dict[str, str]:
+    """The string *keys* *body* carries; an absent or null key is left to the field's default."""
+    return {key: value for key in keys if (value := _optional_str(body, key)) is not None}
+
+
+def _present_flag(body: Mapping[str, Any], key: str) -> dict[str, bool]:
+    value = body.get(key)
+    return {} if value is None else {key: bool(value)}
 
 
 def _load_body(text: str) -> dict[str, Any]:
@@ -162,11 +169,11 @@ class DecodedReferents:
     """
 
     refs: ReferentSet
-    source: str
+    source: ReferentSource
     ambiguous: ReferentSet | None
 
     def __post_init__(self) -> None:
-        if self.source not in REFERENT_SOURCES:
+        if not _is_referent_source(self.source):
             raise ValueError(
                 f'referent source {self.source!r} is not one of {list(REFERENT_SOURCES)}'
             )
@@ -207,7 +214,7 @@ class DecodedReferents:
         if not isinstance(blob, dict):
             raise _UnreadableReferents(f'expected a dict, got {type(blob).__name__}')
         source = blob.get('source')
-        if not isinstance(source, str) or source not in REFERENT_SOURCES:
+        if not _is_referent_source(source):
             raise _UnreadableReferents(
                 f'source {source!r} is not one of {list(REFERENT_SOURCES)}'
             )
@@ -216,6 +223,10 @@ class DecodedReferents:
         if raw_ambiguous is _ABSENT:
             return cls(refs, source, None)
         return cls(refs, source, _decode_referent_list('ambiguous', raw_ambiguous))
+
+
+def _is_referent_source(value: object) -> TypeGuard[ReferentSource]:
+    return value in REFERENT_SOURCES
 
 
 class _UnreadableReferents(Exception):
@@ -280,6 +291,20 @@ def _ignore_legacy_uuid(body: Mapping[str, Any], operation: QueueOperation, grou
         )
 
 
+def _graphiti_fields(
+    body: Mapping[str, Any], operation: QueueOperation, group_id: str,
+) -> dict[str, Any]:
+    """The fields both Graphiti writes decode alike; an absent optional key takes the field's default."""
+    _ignore_legacy_uuid(body, operation, group_id)
+    return {
+        'envelope': WriteEnvelope.from_wire(body, group_id=group_id, project_id_default=group_id),
+        'content': _required_str(body, 'content'),
+        'referents': DecodedReferents.from_wire(body.get('referents')),
+        **_present_strs(body, 'name', 'source', 'source_description'),
+        **_present_flag(body, 'unverified_claim'),
+    }
+
+
 @dataclass(frozen=True, kw_only=True)
 class QueuedEpisodeWrite:
     operation: ClassVar[QueueOperation] = QueueOperation.ADD_EPISODE
@@ -317,18 +342,11 @@ class QueuedEpisodeWrite:
     @classmethod
     def from_json(cls, text: str, *, group_id: str) -> Self:
         body = _load_body(text)
-        _ignore_legacy_uuid(body, cls.operation, group_id)
         return cls(
-            envelope=WriteEnvelope.from_wire(body, group_id=group_id, project_id_default=group_id),
-            content=_required_str(body, 'content'),
-            name=_str_or_default(body, 'name', ''),
-            source=_str_or_default(body, 'source', 'text'),
-            source_description=_str_or_default(body, 'source_description', ''),
+            **_graphiti_fields(body, cls.operation, group_id),
             correlation_id=_optional_str(body, 'correlation_id'),
             temporal_context=_optional_str(body, 'temporal_context'),
-            unverified_claim=bool(body.get('unverified_claim', False)),
             reference_time=_decode_reference_time(body.get('reference_time')),
-            referents=DecodedReferents.from_wire(body.get('referents')),
         )
 
 
@@ -365,16 +383,9 @@ class QueuedGraphitiMemoryWrite:
     @classmethod
     def from_json(cls, text: str, *, group_id: str) -> Self:
         body = _load_body(text)
-        _ignore_legacy_uuid(body, cls.operation, group_id)
         return cls(
-            envelope=WriteEnvelope.from_wire(body, group_id=group_id, project_id_default=group_id),
-            content=_required_str(body, 'content'),
-            name=_str_or_default(body, 'name', ''),
-            source=_str_or_default(body, 'source', 'text'),
-            source_description=_str_or_default(body, 'source_description', ''),
+            **_graphiti_fields(body, cls.operation, group_id),
             memory_category=_optional_str(body, 'memory_category'),
-            referents=DecodedReferents.from_wire(body.get('referents')),
-            unverified_claim=bool(body.get('unverified_claim', False)),
         )
 
 
@@ -407,7 +418,7 @@ class QueuedMem0Fact:
             envelope=WriteEnvelope.from_wire(body, group_id=group_id, project_id_default='main'),
             fact_text=_required_str(body, 'fact_text'),
             temporal_context=_optional_str(body, 'temporal_context'),
-            unverified_claim=bool(body.get('unverified_claim', False)),
+            **_present_flag(body, 'unverified_claim'),
         )
 
 
@@ -447,9 +458,43 @@ class QueuedMem0Add:
 
 QueuedWrite = QueuedEpisodeWrite | QueuedGraphitiMemoryWrite | QueuedMem0Fact | QueuedMem0Add
 
-_VALUE_TYPES: Mapping[QueueOperation, type[QueuedWrite]] = MappingProxyType(
-    {value_type.operation: value_type for value_type in get_args(QueuedWrite)}
-)
+
+def _value_types_by_operation() -> Mapping[QueueOperation, type[QueuedWrite]]:
+    value_types: tuple[type[QueuedWrite], ...] = get_args(QueuedWrite)
+    claims = Counter(value_type.operation for value_type in value_types)
+    unclaimed = sorted(set(QueueOperation) - set(claims))
+    shared = sorted(operation for operation, count in claims.items() if count > 1)
+    if unclaimed or shared:
+        raise TypeError(
+            'every QueueOperation needs exactly one QueuedWrite value type; '
+            f'none for {unclaimed}, several for {shared}'
+        )
+    return MappingProxyType({value_type.operation: value_type for value_type in value_types})
+
+
+_VALUE_TYPES = _value_types_by_operation()
+
+#: The value types each callback can be handed: the callback runs after the
+#: backend write lands, so a pairing it cannot take is refused before execution.
+_CALLBACK_TAKES: Mapping[QueueCallback, tuple[type[QueuedWrite], ...]] = MappingProxyType({
+    QueueCallback.DUAL_WRITE_EPISODE: (QueuedEpisodeWrite,),
+    QueueCallback.REFRESH_ENTITY_SUMMARIES: (QueuedEpisodeWrite, QueuedGraphitiMemoryWrite),
+})
+if set(_CALLBACK_TAKES) != set(QueueCallback):
+    raise TypeError(
+        f'callbacks without a pairing: {sorted(set(QueueCallback) - set(_CALLBACK_TAKES))}'
+    )
+
+
+def check_callback_pairing(value: QueuedWrite, callback: QueueCallback) -> None:
+    """Raise :class:`TypeError` unless *callback* can be handed *value*."""
+    takes = _CALLBACK_TAKES[callback]
+    if not isinstance(value, takes):
+        raise TypeError(
+            f'queue callback {callback.value!r} takes '
+            f'{sorted(value_type.operation.value for value_type in takes)}, '
+            f'not {value.operation.value!r}'
+        )
 
 
 def decode_queued_write(operation: str, payload: str, *, group_id: str, row_id: int) -> QueuedWrite:
@@ -470,15 +515,23 @@ def decode_queued_write(operation: str, payload: str, *, group_id: str, row_id: 
 
 
 def decode_queue_callback(
-    callback_type: str | None, *, operation: str, row_id: int, raw_payload: str,
+    callback_type: str | None, value: QueuedWrite, *, row_id: int, raw_payload: str,
 ) -> QueueCallback | None:
-    """The callback a queue row names, ``None`` for none, or :class:`QueueDecodeError`."""
+    """The callback a row names for its decoded *value*, ``None`` for none, or :class:`QueueDecodeError`."""
     if callback_type is None:
         return None
+    operation = value.operation.value
     try:
-        return QueueCallback(callback_type)
+        callback = QueueCallback(callback_type)
     except ValueError:
         raise QueueDecodeError(
             f'unknown queue callback {callback_type!r}',
             operation=operation, row_id=row_id, raw_payload=raw_payload,
         ) from None
+    try:
+        check_callback_pairing(value, callback)
+    except TypeError as exc:
+        raise QueueDecodeError(
+            str(exc), operation=operation, row_id=row_id, raw_payload=raw_payload,
+        ) from None
+    return callback

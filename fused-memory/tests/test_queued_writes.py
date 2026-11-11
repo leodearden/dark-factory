@@ -7,17 +7,17 @@ names, legacy rows that still decode, and one error type for a row that cannot
 
 from __future__ import annotations
 
-import ast
 import dataclasses
 import json
 import pathlib
-import sys
 from collections.abc import MutableMapping
 from datetime import UTC, datetime
 from typing import TypeVar
 
 import pytest
 from _ast_guard import parse_python_module
+from _leaf_import_guard import imported_modules, stdlib_or_allowed
+from _queued_write_fixtures import EPISODE_WIRE_KEYS
 
 from fused_memory.services.queued_writes import (
     NO_REFERENTS,
@@ -31,6 +31,7 @@ from fused_memory.services.queued_writes import (
     QueueOperation,
     UnknownQueueOperation,
     WriteEnvelope,
+    check_callback_pairing,
     decode_queue_callback,
     decode_queued_write,
 )
@@ -162,6 +163,12 @@ class TestVocabulary:
     def test_each_value_type_names_its_operation(self, value_type, operation):
         assert value_type.operation is operation
 
+    @pytest.mark.parametrize('operation', list(QueueOperation))
+    def test_every_operation_has_a_decoder(self, operation):
+        with pytest.raises(QueueDecodeError) as excinfo:
+            decode_queued_write(operation.value, '{}', group_id='dark_factory', row_id=1)
+        assert not isinstance(excinfo.value, UnknownQueueOperation)
+
 
 class TestFrozenRoundTrip:
     @pytest.mark.parametrize('value', ALL_VALUES)
@@ -198,12 +205,7 @@ class TestFrozenRoundTrip:
 
 class TestWireKeys:
     def test_episode_keys_are_exactly_todays(self):
-        assert set(json.loads(_episode().to_json())) == {
-            'name', 'content', 'correlation_id', 'source', 'group_id',
-            'source_description', 'project_id', 'agent_id', 'session_id',
-            '_causation_id', '_write_op_id', 'temporal_context', 'unverified_claim',
-            'reference_time', 'referents',
-        }
+        assert set(json.loads(_episode().to_json())) == EPISODE_WIRE_KEYS
 
     def test_graphiti_memory_keys_cover_todays(self):
         assert set(json.loads(_graphiti_memory().to_json())) >= {
@@ -376,6 +378,27 @@ class TestLegacyRowsDecode:
         assert value.envelope.project_id == 'dark_factory'
         assert dict(value.metadata) == {'category': 'x'}
 
+    @pytest.mark.parametrize('absent', [{}, dict.fromkeys(
+        ('name', 'source', 'source_description', 'correlation_id', 'temporal_context',
+         'unverified_claim', 'reference_time', 'referents', 'memory_category'),
+    )], ids=['absent', 'null'])
+    @pytest.mark.parametrize(
+        ('value_type', 'required', 'group_id'),
+        [
+            (QueuedEpisodeWrite, {'content': 'c'}, 'dark_factory'),
+            (QueuedGraphitiMemoryWrite, {'content': 'c'}, 'dark_factory'),
+            (QueuedMem0Fact, {'fact_text': 'c', 'project_id': 'dark_factory'}, 'mem0_dark_factory'),
+        ],
+    )
+    def test_an_absent_or_null_optional_key_takes_the_constructor_default(
+        self, value_type, required, group_id, absent,
+    ):
+        expected = value_type(
+            envelope=WriteEnvelope(project_id='dark_factory', group_id=group_id),
+            **{key: value for key, value in required.items() if key != 'project_id'},
+        )
+        assert _decode(value_type, required | absent, group_id=group_id) == expected
+
 
 class TestDecodeErrors:
     def test_an_unknown_operation(self):
@@ -444,20 +467,35 @@ class TestDecodeErrors:
         assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
+#: Every pairing a producer makes, and the only ones a row may name.
+_PAIRINGS = [
+    pytest.param(QueueCallback.DUAL_WRITE_EPISODE, _episode(), id='dual-write-episode'),
+    pytest.param(QueueCallback.REFRESH_ENTITY_SUMMARIES, _episode(), id='refresh-episode'),
+    pytest.param(
+        QueueCallback.REFRESH_ENTITY_SUMMARIES, _graphiti_memory(), id='refresh-graphiti-memory',
+    ),
+]
+
+_MISPAIRINGS = [
+    pytest.param(QueueCallback.DUAL_WRITE_EPISODE, _graphiti_memory(), id='dual-write-graphiti-memory'),
+    pytest.param(QueueCallback.DUAL_WRITE_EPISODE, _mem0_fact(), id='dual-write-mem0-fact'),
+    pytest.param(QueueCallback.REFRESH_ENTITY_SUMMARIES, _mem0_fact(), id='refresh-mem0-fact'),
+    pytest.param(QueueCallback.REFRESH_ENTITY_SUMMARIES, _mem0_add(), id='refresh-mem0-add'),
+]
+
+
 class TestDecodeQueueCallback:
     def test_none_is_no_callback(self):
-        assert decode_queue_callback(None, operation='add_episode', row_id=1, raw_payload='{}') is None
+        assert decode_queue_callback(None, _episode(), row_id=1, raw_payload='{}') is None
 
-    @pytest.mark.parametrize('callback', list(QueueCallback))
-    def test_a_known_callback(self, callback):
-        decoded = decode_queue_callback(
-            callback.value, operation='add_episode', row_id=1, raw_payload='{}',
-        )
+    @pytest.mark.parametrize(('callback', 'value'), _PAIRINGS)
+    def test_a_known_callback_for_a_value_it_takes(self, callback, value):
+        decoded = decode_queue_callback(callback.value, value, row_id=1, raw_payload='{}')
         assert decoded is callback
 
     def test_an_unknown_callback(self):
         with pytest.raises(QueueDecodeError) as excinfo:
-            decode_queue_callback('typo_cb', operation='add_episode', row_id=3, raw_payload='{}')
+            decode_queue_callback('typo_cb', _episode(), row_id=3, raw_payload='{}')
 
         exc = excinfo.value
         assert not isinstance(exc, UnknownQueueOperation)
@@ -465,6 +503,28 @@ class TestDecodeQueueCallback:
         assert exc.row_id == 3
         assert exc.raw_payload == '{}'
         assert 'typo_cb' in str(exc)
+
+    @pytest.mark.parametrize(('callback', 'value'), _MISPAIRINGS)
+    def test_a_callback_named_for_a_value_it_cannot_take(self, callback, value):
+        with pytest.raises(QueueDecodeError) as excinfo:
+            decode_queue_callback(callback.value, value, row_id=4, raw_payload='{}')
+
+        exc = excinfo.value
+        assert exc.operation == value.operation.value
+        assert exc.row_id == 4
+        assert callback.value in str(exc)
+        assert value.operation.value in str(exc)
+
+
+class TestCheckCallbackPairing:
+    @pytest.mark.parametrize(('callback', 'value'), _PAIRINGS)
+    def test_a_pairing_a_producer_makes_passes(self, callback, value):
+        check_callback_pairing(value, callback)
+
+    @pytest.mark.parametrize(('callback', 'value'), _MISPAIRINGS)
+    def test_any_other_pairing_is_a_type_error(self, callback, value):
+        with pytest.raises(TypeError, match=callback.value):
+            check_callback_pairing(value, callback)
 
 
 class TestWrittenText:
@@ -577,7 +637,7 @@ class TestReferentWireCodec:
 
     def test_a_source_outside_the_vocabulary_is_refused_at_construction(self):
         with pytest.raises(ValueError, match='declared_v2'):
-            DecodedReferents((), 'declared_v2', None)
+            dataclasses.replace(NO_REFERENTS, source='declared_v2')
 
 
 #: Every way a present referent blob can be unreadable. Each must decode to
@@ -775,29 +835,12 @@ ALLOWED_FIRST_PARTY = frozenset({
 })
 
 
-def _imported_modules(tree: ast.Module) -> set[str]:
-    modules: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            modules.add(node.module)
-    return modules
-
-
-def _is_allowed(module: str) -> bool:
-    top_level = module.partition('.')[0]
-    return (
-        top_level in sys.stdlib_module_names
-        or top_level == '__future__'
-        or module in ALLOWED_FIRST_PARTY
-    )
-
-
 def test_queued_writes_imports_only_the_stdlib_and_three_utils_modules():
-    imported = _imported_modules(parse_python_module(QUEUED_WRITES))
+    imported = imported_modules(parse_python_module(QUEUED_WRITES))
     assert imported, 'no import scanned; this guard has lost its subject.'
-    disallowed = sorted(module for module in imported if not _is_allowed(module))
+    disallowed = sorted(
+        module for module in imported if not stdlib_or_allowed(module, ALLOWED_FIRST_PARTY)
+    )
     assert not disallowed, (
         f'queued_writes.py imports {disallowed}; the leaf may import only the '
         f'stdlib and {sorted(ALLOWED_FIRST_PARTY)}.'

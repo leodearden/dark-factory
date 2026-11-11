@@ -16,7 +16,15 @@ import pytest_asyncio
 from _fm_held_writes import HeldWrites
 from _fm_helpers import make_retry_budget_queue
 from _fm_polling import poll_until, poll_until_dead
-from _queued_write_fixtures import envelope, episode_write, insert_raw_row, queued
+from _queued_write_fixtures import (
+    EPISODE_WIRE_KEYS,
+    envelope,
+    episode_write,
+    graphiti_memory_write,
+    insert_raw_row,
+    mem0_fact,
+    queued,
+)
 from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
@@ -2895,13 +2903,6 @@ class TestTypedRowBoundary:
     executor and the callback the same frozen value, and dead-letters a row it
     cannot decode on the first attempt without executing it."""
 
-    EPISODE_WIRE_KEYS = frozenset({
-        'name', 'content', 'correlation_id', 'source', 'group_id',
-        'source_description', 'project_id', 'agent_id', 'session_id',
-        '_causation_id', '_write_op_id', 'temporal_context', 'unverified_claim',
-        'reference_time', 'referents',
-    })
-
     @staticmethod
     def _queue(tmp_path, execute_write, **kwargs):
         options = {
@@ -2959,7 +2960,7 @@ class TestTypedRowBoundary:
         operation, payload, status, _, _ = rows[0]
         assert operation == 'add_episode'
         assert status == 'completed'
-        assert set(json.loads(payload)) == self.EPISODE_WIRE_KEYS
+        assert set(json.loads(payload)) == EPISODE_WIRE_KEYS
 
     @pytest.mark.asyncio
     async def test_a_completed_row_reports_its_write_op_id_to_on_terminal(self, tmp_path):
@@ -2993,8 +2994,8 @@ class TestTypedRowBoundary:
             'add_episode', '{not json', None, 'QueueDecodeError: ', id='non-json',
         ),
         pytest.param(
-            'add_episode', json.dumps({'content': 'fine', 'group_id': 'proj1'}),
-            'typo_cb', 'QueueDecodeError: ', id='unknown-callback',
+            'typo_op', json.dumps({'content': 'fine', 'group_id': 'proj1'}),
+            'typo_cb', 'UnknownQueueOperation: ', id='unknown-operation-and-callback',
         ),
     ]
 
@@ -3044,6 +3045,90 @@ class TestTypedRowBoundary:
         assert listed['operation'] == operation
         if payload_text == '{not json':
             assert listed['payload'] == payload_text
+
+    BAD_CALLBACK_ROWS = [
+        pytest.param('add_episode', 'typo_cb', 'typo_cb', id='unknown-callback'),
+        pytest.param(
+            'add_memory_graphiti', 'dual_write_episode', 'dual_write_episode',
+            id='callback-cannot-take-the-operation',
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('operation', 'callback_type', 'named'), BAD_CALLBACK_ROWS)
+    async def test_a_row_whose_callback_alone_is_bad_closes_its_journal_row(
+        self, tmp_path, operation, callback_type, named,
+    ):
+        outcomes: list = []
+        events: list = []
+
+        async def on_terminal(write_op_id, status, error):
+            outcomes.append((write_op_id, status, error))
+
+        async def on_dead_letter(event):
+            events.append(event)
+
+        execute = AsyncMock(return_value=None)
+        writer = self._queue(tmp_path, execute)
+        await writer.initialize()
+        await writer.close()
+        await insert_raw_row(
+            tmp_path / 'queue' / 'write_queue.db', group_id='proj1', operation=operation,
+            payload_text=json.dumps({'content': 'fine', 'group_id': 'proj1', '_write_op_id': 'W-cb'}),
+            callback_type=callback_type,
+        )
+        q = self._queue(
+            tmp_path, execute, on_terminal=on_terminal, on_dead_letter=on_dead_letter,
+        )
+        try:
+            await q.initialize()
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
+            await poll_until(lambda: events, timeout=20.0)
+        finally:
+            await q.close()
+
+        execute.assert_not_awaited()
+        [(_, _, status, attempts, error)] = await self._rows(tmp_path)
+        assert (status, attempts) == ('dead', 1)
+        assert error.startswith('QueueDecodeError: '), error
+        assert named in error
+        [(write_op_id, terminal_status, _)] = outcomes
+        assert (write_op_id, terminal_status) == ('W-cb', 'dead')
+        [event] = events
+        assert event.write_op_id == 'W-cb'
+        assert event.value is not None
+        assert event.value.operation == operation
+
+    MISPAIRED = [
+        pytest.param(
+            graphiti_memory_write(envelope=envelope(project_id='proj1', group_id='proj1')),
+            QueueCallback.DUAL_WRITE_EPISODE, id='dual-write-graphiti-memory',
+        ),
+        pytest.param(
+            mem0_fact(envelope=envelope(project_id='proj1', group_id='mem0_proj1')),
+            QueueCallback.REFRESH_ENTITY_SUMMARIES, id='refresh-mem0-fact',
+        ),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('value', 'callback'), MISPAIRED)
+    async def test_enqueue_refuses_a_callback_that_cannot_take_the_value(
+        self, tmp_path, value, callback,
+    ):
+        q = self._queue(tmp_path, AsyncMock(return_value=None))
+        await q.initialize()
+        try:
+            with pytest.raises(TypeError, match=callback.value):
+                await q.enqueue(value, callback=callback)
+            with pytest.raises(TypeError, match=callback.value):
+                await q.enqueue_batch([
+                    (episode_write(envelope=envelope(project_id='proj1', group_id='proj1')), None),
+                    (value, callback),
+                ])
+        finally:
+            await q.close()
+
+        assert await self._rows(tmp_path) == []
 
     @pytest.mark.asyncio
     async def test_a_decode_error_raised_by_the_executor_is_permanent(self, tmp_path):

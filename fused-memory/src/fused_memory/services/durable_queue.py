@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from fused_memory.services.queued_writes import (
     QueueCallback,
     QueueDecodeError,
     QueuedWrite,
+    check_callback_pairing,
     decode_queue_callback,
     decode_queued_write,
 )
@@ -148,6 +150,14 @@ class QueueItem:
 
 # -- Queue --------------------------------------------------------------------
 
+class FailureClass(StrEnum):
+    """Which retry budget a failed attempt draws on; logged as ``[<value>]``."""
+
+    PERMANENT = 'permanent'
+    TRANSIENT = 'transient'
+    NORMAL = 'normal'
+
+
 # (value, backend result) -> None. Receives the same value object the executor did.
 CallbackFn = Callable[[QueuedWrite, Any], Coroutine[Any, Any, None]]
 
@@ -183,8 +193,8 @@ class DeadLetterEvent:
 
     ``operation`` is the row's raw string, which an undecodable row may not
     hold as a ``QueueOperation``. ``value`` is the decoded write, or ``None``
-    when the row could not be decoded; ``raw_payload`` is the row's payload
-    text either way, and the only content an undecodable row has.
+    when the row's payload could not be decoded; ``raw_payload`` is the row's
+    payload text either way, and the only content such a row has.
     """
 
     item_id: int
@@ -333,7 +343,12 @@ class DurableWriteQueue:
     async def enqueue(
         self, value: QueuedWrite, *, callback: QueueCallback | None = None,
     ) -> int:
-        """Persist *value* under its envelope's group and signal workers. Returns item id."""
+        """Persist *value* under its envelope's group and signal workers. Returns item id.
+
+        Raises :class:`TypeError`, persisting nothing, when *callback* cannot take *value*.
+        """
+        if callback is not None:
+            check_callback_pairing(value, callback)
         group_id = value.envelope.group_id
         now = time.time()
         async with self._require_access().write() as db:
@@ -357,6 +372,9 @@ class DurableWriteQueue:
         self, values: Sequence[tuple[QueuedWrite, QueueCallback | None]]
     ) -> list[int]:
         """Bulk insert ``(value, callback)`` pairs in ONE write unit: a failure anywhere persists no row."""
+        for value, callback in values:
+            if callback is not None:
+                check_callback_pairing(value, callback)
         now = time.time()
         ids: list[int] = []
         groups_seen: set[str] = set()
@@ -464,15 +482,15 @@ class DurableWriteQueue:
         async with self._semaphore:
             try:
                 # Inside the try, so an undecodable row reaches _handle_failure
-                # as a QueueDecodeError with value and write_op_id still None.
-                callback = decode_queue_callback(
-                    item.callback_type, operation=item.operation, row_id=item.id,
-                    raw_payload=item.payload,
-                )
+                # as a QueueDecodeError. The payload first: a row whose callback
+                # alone is bad still hands its write_op_id to _notify_terminal.
                 value = decode_queued_write(
                     item.operation, item.payload, group_id=item.group_id, row_id=item.id,
                 )
                 write_op_id = value.envelope.write_op_id
+                callback = decode_queue_callback(
+                    item.callback_type, value, row_id=item.id, raw_payload=item.payload,
+                )
                 with self._executing(item):
                     result = await asyncio.wait_for(
                         self._execute_write(value),
@@ -657,19 +675,18 @@ class DurableWriteQueue:
         """
         return any(c.__name__ in self._transient_error_names for c in type(exc).__mro__)
 
-    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[str, int]:
+    def _classify_failure(self, item: QueueItem, exc: BaseException) -> tuple[FailureClass, int]:
         """Return (classification, attempts_limit) for *exc* on *item*.
 
-        A row that cannot be decoded gets ``('permanent', 1)``, decided by the
-        exception's type; a transient error gets
-        ``('transient', transient_max_attempts)``; anything else gets
-        ``('normal', item.max_attempts)``.
+        A row that cannot be decoded is PERMANENT with a limit of 1, decided by
+        the exception's type; a transient error gets ``transient_max_attempts``;
+        anything else is NORMAL with ``item.max_attempts``.
         """
         if isinstance(exc, QueueDecodeError):
-            return ('permanent', 1)
+            return (FailureClass.PERMANENT, 1)
         if self._is_transient(exc):
-            return ('transient', self._transient_max_attempts)
-        return ('normal', item.max_attempts)
+            return (FailureClass.TRANSIENT, self._transient_max_attempts)
+        return (FailureClass.NORMAL, item.max_attempts)
 
     async def _handle_failure(
         self, item: QueueItem, exc: Exception, *, executed: bool
@@ -699,8 +716,7 @@ class DurableWriteQueue:
                 # operation / group_id / classification are what a triager needs
                 # first, and the log line is all that survives once the queue row is
                 # deleted — after that, get_dead_items can no longer supply them.
-                # The classification names which retry budget, transient or
-                # normal, the item exhausted.
+                # The classification names which retry budget the item exhausted.
                 logger.warning(
                     'Item %d (%s, group_id=%s) dead-lettered after %d attempts [%s]: %s',
                     item.id, item.operation, item.group_id, new_attempts,
