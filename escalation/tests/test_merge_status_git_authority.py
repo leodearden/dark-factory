@@ -25,7 +25,12 @@ from unittest.mock import call as mock_call
 
 import pytest
 from _merge_tool_calls import call_merge_request, call_merge_status
-from _rebased_landing_git import add_unlanded_branch, build_rebased_solo_landing, new_repo
+from _rebased_landing_git import (
+    add_unlanded_branch,
+    build_rebased_solo_landing,
+    new_repo,
+    reapply_tip_on_main,
+)
 from _rebased_landing_git import git as landing_git
 from shared.merge_state import MergeReason
 from shared.task_read import TaskFound, TaskReadFailed
@@ -408,6 +413,30 @@ class TestMergeStatusGitAuthority:
         assert result.get('reason') == MergeReason.probe_failed, f'Expected probe_failed: {result}'
         assert result.get('source') == 'git', f'Expected source=git: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_patch_id_arm_git_error_returns_unknown(self, tmp_path: Path) -> None:
+        """A patch-id arm that could not look answers unknown, never a miss.
+
+        The stub answers only the dispatch's two calls (a live tip that is
+        neither main's tip nor an ancestor of it), so the real
+        ``branch_work_landed`` hits a missing primitive and reports
+        ``git_error``.
+        """
+        tip = 'a' * 40
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b.startswith('task/') else 'm' * 40,
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+        )
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await call_merge_status(server, task_id='T')
+
+        assert result.get('state') == 'unknown', f'got: {result}'
+        assert result.get('reason') == MergeReason.probe_failed, f'got: {result}'
+        assert result.get('source') == 'git', f'got: {result}'
 
     async def test_genuine_miss_branch_present_not_on_main_returns_no_record(
         self, tmp_path: Path
@@ -1592,6 +1621,31 @@ class TestMergeStatusGitAuthorityIntegration:
 
         assert result.get('state') == 'no_record', f'got: {result}'
         assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_contained_but_unattributable_rebased_landing_answers_landing_unattributable(
+        self, tmp_path: Path,
+    ) -> None:
+        """Every branch commit is on main but no single sha carries the tip's patch.
+
+        The tip was reverted and re-applied on main, so two commits share its
+        patch-id and subject.  git proved the landing; only attribution
+        failed, which is ``landing_unattributable`` (do not resubmit), never
+        ``never_submitted``.
+        """
+        tid = '6980'
+        landing = build_rebased_solo_landing(tmp_path / 'repo', tid, cited=False)
+        reapply_tip_on_main(landing)
+        config = _make_config(landing.repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, landing.repo)), orch_config=config,
+        )
+
+        result = await call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'no_record', f'got: {result}'
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
 
 # ---------------------------------------------------------------------------

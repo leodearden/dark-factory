@@ -24,7 +24,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from _rebased_landing_git import add_unlanded_branch, build_rebased_solo_landing, new_repo
+from _rebased_landing_git import (
+    add_unlanded_branch,
+    build_rebased_solo_landing,
+    new_repo,
+    reapply_tip_on_main,
+)
 from _rebased_landing_git import commit as landing_commit
 from _rebased_landing_git import git as landing_git
 from shared.merge_state import MergeState
@@ -963,6 +968,55 @@ class TestProbeLandingPatchIdArm:
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
         assert verdict.merge_sha is None
         assert verdict.reason == 'not_landed'
+
+    async def test_contained_but_unattributable_is_landed_unconfirmed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Containment proven, attribution refused: a landing, not a miss.
+
+        Main holds two commits sharing the tip's patch-id and subject, so
+        ``git cherry`` reports every branch commit contained while the twin
+        lookup refuses to guess between them.
+        """
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=False)
+        reapply_tip_on_main(landing)
+
+        verdict = await _probe_repo(landing.repo, '6978')
+
+        assert verdict.outcome is GitAuthorityOutcome.landed_unconfirmed, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.reason == 'no_attribution'
+        assert verdict.merge_sha is None
+        assert verdict.merge_sha_fully_guarded is False
+
+    async def test_a_detector_that_cannot_look_is_probe_failed_and_names_the_site(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``git_error`` is a claim about the detector, never a negative.
+
+        The stub answers the two calls the dispatch makes and nothing else,
+        so the real ``branch_work_landed`` hits a missing primitive and
+        contains it as ``git_error``.
+        """
+        git_ops = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: 'a' * 40 if b.startswith('task/') else _MAIN,
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            verdict = await probe_landing(
+                git_ops, '6978', orch_config=_config(tmp_path),
+                harness=_harness(read=TaskFound({'metadata': {}})), site='landed_reconciler',
+            )
+
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed, verdict
+        assert verdict.merge_sha is None
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.reason == 'git_error'
+        assert 'landed_reconciler' in caplog.text
+        assert 'merge_status' not in caplog.text
 
 
 class TestGitAuthorityVerdict:
