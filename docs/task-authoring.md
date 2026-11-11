@@ -876,7 +876,9 @@ or `operational_ask_registry` (vocabulary:
 curator's route for an untagged ask matching the operational-ask registry. The
 curator decides that after `submit_task` has returned, so that path gets the
 stamp and `resolve_ticket`'s `route_deterministic` reason, but no response
-notice.
+notice. Only a submission whose routing the conversion actually rewrites is
+marked: one that already declares the pure-gate shape, such as recon's
+consolidation gate, gets neither `routing_notice` nor `pure_gate_from`.
 
 ---
 
@@ -1586,9 +1588,15 @@ Three of the entries belong to the completion-driven trigger chain
 
 `pure_gate_from` is machine-written at conversion, never author-supplied:
 `TaskInterceptor._inject_deterministic_pure_gate` stamps it with a
-`shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). A
-hand-authored pure gate does not carry it, which is how watcher and retype
-workflows tell a conversion from an intended gate.
+`shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
+is written only when the conversion rewrote the submission's routing: a
+submission that already declared the pure-gate shape
+(`task_kind='deterministic'` with `always_escalates=True` and no
+`before_done`) is never stamped, whatever its `execution_class` (the rule is
+`shared/src/shared/pure_gate_provenance.py::is_pure_gate_shape`). It is history,
+not current state: `update_task`'s shallow metadata merge keeps it after a
+retype, so a watcher or retype workflow pairs it with the current
+`task_kind`/`always_escalates` before treating a task as a mis-filed conversion.
 
 `deferral` is, like `milestone`, a registered submodel
 (`shared/src/shared/task_deferral.py::DeferralRecord`) and deliberately not

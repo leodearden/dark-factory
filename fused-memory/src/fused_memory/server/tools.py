@@ -9383,8 +9383,11 @@ def create_mcp_server(
         ``metadata.execution_class`` 'operational' or 'decision' converts the
         submission into a deterministic pure gate that escalates to a HUMAN at
         dispatch; the response then carries ``routing_notice`` and the task
-        carries ``metadata.pure_gate_from``. A docs, comment or rename edit is
-        agent work: ``task_kind='normal'`` + ``metadata.complexity='simple'``.
+        carries ``metadata.pure_gate_from``, unless the metadata already
+        declares that shape (``task_kind='deterministic'`` +
+        ``always_escalates=True``), in which case nothing is rewritten and
+        neither appears. A docs, comment or rename edit is agent work:
+        ``task_kind='normal'`` + ``metadata.complexity='simple'``.
 
         Any string argument carrying a raw MCP envelope fragment — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
