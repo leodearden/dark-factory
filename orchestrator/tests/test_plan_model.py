@@ -15,6 +15,7 @@ from orchestrator.artifacts import (
     Plan,
     PlanConfirmation,
     PlanLifecycle,
+    PlanNotConfirmed,
     PlanState,
     plan_base_commit,
     plan_task_text_fp,
@@ -255,3 +256,231 @@ class TestStampReadersAgreeWithTheModel:
         document = {} if value == {} else {PLAN_TASK_TEXT_FP_KEY: value}
         assert plan_task_text_fp(document) == Plan.from_json(document).lifecycle.task_text_fp
         assert plan_task_text_fp(document) == (value if value == 'sha-or-fp' else None)
+
+
+_LATER = '2026-11-12T00:00:00+00:00'
+
+CONFIRMED_PLAN: dict[str, Any] = {**VALID_PLAN_WITH_STEPS, '_finalized_at': _CONFIRMED_AT}
+OWNED_PARTIAL_PLAN: dict[str, Any] = {**VALID_PLAN_WITH_STEPS, '_session_id': 'planner'}
+
+_CARRIED: dict[str, Any] = {
+    '_markup_rejections': LIVE_SHAPED_PLAN['_markup_rejections'],
+    '_rescoped_at': LIVE_SHAPED_PLAN['_rescoped_at'],
+    '_descoped_steps': LIVE_SHAPED_PLAN['_descoped_steps'],
+}
+
+
+def _recreate(plan: Plan, carried: dict[str, Any]) -> Plan:
+    return plan.recreated(task_id='9170', title='T', analysis='A', files=['a.py'], carried=carried)
+
+
+class TestRecreated:
+    def test_create_plan_over_a_stamped_plan_gives_a_shell_carrying_only_the_carried_keys(self):
+        plan = _recreate(Plan.from_json(LIVE_SHAPED_PLAN), _CARRIED)
+        assert plan.state is PlanState.SHELL
+        assert plan.lifecycle == PlanLifecycle()
+        expected = {
+            'task_id': '9170', 'title': 'T', 'analysis': 'A', 'files': ['a.py'],
+            'prerequisites': [], 'steps': [], 'design_decisions': [], 'reuse': [], 'dropped_files': [],
+            **_CARRIED,
+        }
+        out = plan.to_json()
+        assert list(out.items()) == list(expected.items())
+
+    @pytest.mark.parametrize('key', ['_finalized_at', '_session_id', '_schema_version', 'steps'])
+    def test_a_carried_lifecycle_key_or_steps_is_refused_naming_it(self, key: str):
+        with pytest.raises(ValueError, match=key):
+            _recreate(Plan.from_json(LIVE_SHAPED_PLAN), {**_CARRIED, key: 'x'})
+
+
+_KEPT_ON_RESTRUCTURE = ('session_id', 'created_at', 'task_text_fp', 'base_commit', 'revalidated_at')
+
+
+class TestRestructured:
+    @pytest.mark.parametrize('document', [
+        pytest.param(LIVE_SHAPED_PLAN, id='stamped'),
+        pytest.param({**CONFIRMED_PLAN, '_confirmed_by': 'architect'}, id='confirmed'),
+    ])
+    def test_a_step_set_edit_clears_confirmation_and_keeps_the_rest(self, document: dict[str, Any]):
+        before = Plan.from_json(document)
+        after = before.restructured()
+        assert after.state is PlanState.PARTIAL
+        assert after.lifecycle.confirmed_at is None
+        assert after.lifecycle.confirmed_by is None
+        for name in _KEPT_ON_RESTRUCTURE:
+            assert getattr(after.lifecycle, name) == getattr(before.lifecycle, name)
+        assert after.steps == before.steps
+        assert '_finalized_at' not in after.to_json()
+        assert '_confirmed_by' not in after.to_json()
+
+    def test_the_changes_are_applied_and_new_keys_appended(self):
+        new_steps = [dict(_STEP), {**_STEP, 'id': 'step-2'}]
+        prerequisites = [{'id': 'pre-1', 'description': 'p', 'status': 'pending'}]
+        after = Plan.from_json(CONFIRMED_PLAN).restructured(steps=new_steps, prerequisites=prerequisites)
+        assert after.state is PlanState.PARTIAL
+        out = after.to_json()
+        assert list(out) == ['task_id', 'title', 'steps', 'prerequisites']
+        assert out['steps'] == new_steps
+        assert out['prerequisites'] == prerequisites
+
+    def test_a_malformed_marker_in_the_body_is_dropped(self):
+        document = {**VALID_PLAN_WITH_STEPS, '_finalized_at': '', '_confirmed_by': 'nobody'}
+        out = Plan.from_json(document).restructured().to_json()
+        assert '_finalized_at' not in out
+        assert '_confirmed_by' not in out
+
+    @pytest.mark.parametrize('key', ['_finalized_at', '_confirmed_by', '_session_id', PLAN_BASE_COMMIT_KEY])
+    def test_a_lifecycle_named_change_is_refused_naming_it(self, key: str):
+        with pytest.raises(ValueError, match=key):
+            Plan.from_json(LIVE_SHAPED_PLAN).restructured(**{key: 'x'})
+
+
+class TestConfirmed:
+    def test_confirm_sets_the_marker_the_confirmer_and_the_revalidation_age(self):
+        plan = Plan.from_json(VALID_PLAN_WITH_STEPS).confirmed(at=_LATER, by=PlanConfirmation.ARCHITECT)
+        assert plan.lifecycle.confirmed_at == _LATER
+        assert plan.lifecycle.confirmed_by is PlanConfirmation.ARCHITECT
+        assert plan.lifecycle.revalidated_at == _LATER
+        assert plan.state is PlanState.CONFIRMED
+
+    def test_confirming_an_owned_plan_gives_stamped(self):
+        plan = Plan.from_json(OWNED_PARTIAL_PLAN).confirmed(at=_LATER, by=PlanConfirmation.INJECTED)
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmation is PlanConfirmation.INJECTED
+
+    def test_confirming_a_shell_is_refused_naming_the_task_the_state_and_the_markers(self):
+        with pytest.raises(PlanNotConfirmed) as excinfo:
+            Plan.from_json(CREATE_PLAN_SHELL).confirmed(at=_LATER, by=PlanConfirmation.ARCHITECT)
+        message = str(excinfo.value)
+        assert 'task-1' in message
+        assert 'shell' in message
+        assert '_schema_version' in message
+        assert excinfo.value.state is PlanState.SHELL
+        assert excinfo.value.action == 'confirm'
+
+
+def _stamp(plan: Plan, *, fp: str | None = None, base: str | None = None) -> Plan:
+    return plan.stamped(session_id='stamper', at=_LATER, task_text_fp=fp, base_commit=base)
+
+
+class TestStamped:
+    def test_stamping_a_confirmed_plan_gives_stamped_and_keeps_the_confirmation(self):
+        before = Plan.from_json({**CONFIRMED_PLAN, '_confirmed_by': 'injected'})
+        after = _stamp(before)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.session_id == 'stamper'
+        assert after.lifecycle.created_at == _LATER
+        assert after.lifecycle.confirmed_at == before.lifecycle.confirmed_at
+        assert after.lifecycle.confirmed_by is PlanConfirmation.INJECTED
+
+    @pytest.mark.parametrize('given', [None, ''])
+    def test_an_absent_fingerprint_or_base_keeps_the_existing_one(self, given: str | None):
+        after = _stamp(Plan.from_json(LIVE_SHAPED_PLAN), fp=given, base=given)
+        assert after.lifecycle.task_text_fp == LIVE_SHAPED_PLAN[PLAN_TASK_TEXT_FP_KEY]
+        assert after.lifecycle.base_commit == LIVE_SHAPED_PLAN[PLAN_BASE_COMMIT_KEY]
+
+    def test_a_given_fingerprint_and_base_overwrite(self):
+        after = _stamp(Plan.from_json(LIVE_SHAPED_PLAN), fp='tfp:new', base='newbase')
+        assert after.lifecycle.task_text_fp == 'tfp:new'
+        assert after.lifecycle.base_commit == 'newbase'
+
+    @pytest.mark.parametrize(('document', 'state'), [
+        pytest.param(OWNED_PARTIAL_PLAN, PlanState.PARTIAL, id='partial'),
+        pytest.param(CREATE_PLAN_SHELL, PlanState.SHELL, id='shell'),
+    ])
+    def test_stamping_an_unconfirmed_plan_is_refused(self, document: dict[str, Any], state: PlanState):
+        plan = Plan.from_json(document)
+        with pytest.raises(PlanNotConfirmed) as excinfo:
+            _stamp(plan)
+        message = str(excinfo.value)
+        assert 'task-1' in message
+        assert state.value in message
+        for marker in plan.lifecycle.markers_present():
+            assert marker in message
+        assert excinfo.value.action == 'stamp'
+
+
+class TestWithFiles:
+    def test_a_files_edit_keeps_confirmation(self):
+        after = Plan.from_json(LIVE_SHAPED_PLAN).with_files(['b.py'], owner=LIVE_SHAPED_PLAN['_session_id'], at=_LATER)
+        assert after.state is PlanState.STAMPED
+        assert after.to_json()['files'] == ['b.py']
+        assert after.lifecycle == Plan.from_json(LIVE_SHAPED_PLAN).lifecycle
+
+    def test_a_revalidating_owner_leaves_the_planner_s_provenance_alone(self):
+        before = Plan.from_json({**LIVE_SHAPED_PLAN, '_revalidated_by_session': 'reval'})
+        after = before.with_files(['b.py'], owner='reval', at=_LATER)
+        assert after.lifecycle == before.lifecycle
+
+    def test_a_new_owner_takes_ownership_and_backfills_created_at(self):
+        after = Plan.from_json(CONFIRMED_PLAN).with_files(['b.py'], owner='scope', at=_LATER)
+        assert after.state is PlanState.STAMPED
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at == _LATER
+
+    def test_a_new_owner_does_not_clobber_an_existing_created_at(self):
+        after = Plan.from_json(LIVE_SHAPED_PLAN).with_files(['b.py'], owner='scope', at=_LATER)
+        assert after.lifecycle.session_id == 'scope'
+        assert after.lifecycle.created_at == LIVE_SHAPED_PLAN['_created_at']
+
+
+class TestRevalidated:
+    def test_revalidation_records_the_session_and_keeps_confirmation_and_ownership(self):
+        before = Plan.from_json(LIVE_SHAPED_PLAN)
+        after = before.revalidated(at=_LATER, by_session='reval', base_commit='newbase')
+        assert after.lifecycle.revalidated_at == _LATER
+        assert after.lifecycle.revalidated_by_session == 'reval'
+        assert after.lifecycle.base_commit == 'newbase'
+        assert after.lifecycle.confirmed_at == before.lifecycle.confirmed_at
+        assert after.lifecycle.session_id == before.lifecycle.session_id
+        assert after.state is PlanState.STAMPED
+
+    @pytest.mark.parametrize('given', [None, ''])
+    def test_an_absent_base_keeps_the_existing_one(self, given: str | None):
+        after = Plan.from_json(LIVE_SHAPED_PLAN).revalidated(at=_LATER, by_session='reval', base_commit=given)
+        assert after.lifecycle.base_commit == LIVE_SHAPED_PLAN[PLAN_BASE_COMMIT_KEY]
+
+
+class TestConfirmedSince:
+    def test_a_fresh_confirm_counts(self):
+        pre = Plan.from_json(LIVE_SHAPED_PLAN)
+        assert pre.restructured().confirmed(at=_LATER, by=PlanConfirmation.ARCHITECT).confirmed_since(pre)
+
+    def test_no_change_does_not_count(self):
+        pre = Plan.from_json(LIVE_SHAPED_PLAN)
+        assert not Plan.from_json(LIVE_SHAPED_PLAN).confirmed_since(pre)
+
+    def test_a_cleared_marker_does_not_count(self):
+        pre = Plan.from_json(LIVE_SHAPED_PLAN)
+        assert not pre.restructured().confirmed_since(pre)
+
+
+class TestWithLifecycle:
+    def test_this_plan_s_steps_and_body_go_under_the_other_lifecycle(self):
+        mine = Plan.from_json({**VALID_PLAN_WITH_STEPS, 'analysis': 'mine', '_finalized_at': ''})
+        other = Plan.from_json(LIVE_SHAPED_PLAN)
+        joined = mine.with_lifecycle(other.lifecycle)
+        assert joined.lifecycle == other.lifecycle
+        assert joined.steps == mine.steps
+        assert '_finalized_at' not in joined.body
+        assert joined.to_json()['analysis'] == 'mine'
+        assert joined.to_json()['_finalized_at'] == LIVE_SHAPED_PLAN['_finalized_at']
+
+
+_VALUE_METHODS = [
+    pytest.param(lambda p: _recreate(p, _CARRIED), id='recreated'),
+    pytest.param(lambda p: p.restructured(steps=[dict(_STEP)], analysis='new'), id='restructured'),
+    pytest.param(lambda p: p.confirmed(at=_LATER, by=PlanConfirmation.ARCHITECT), id='confirmed'),
+    pytest.param(lambda p: _stamp(p, fp='tfp:new', base='newbase'), id='stamped'),
+    pytest.param(lambda p: p.with_files(['b.py'], owner='scope', at=_LATER), id='with_files'),
+    pytest.param(lambda p: p.revalidated(at=_LATER, by_session='reval', base_commit='newbase'), id='revalidated'),
+    pytest.param(lambda p: p.with_lifecycle(PlanLifecycle()), id='with_lifecycle'),
+]
+
+
+@pytest.mark.parametrize('method', _VALUE_METHODS)
+def test_every_value_method_leaves_its_receiver_unchanged(method: Any):
+    plan = Plan.from_json(LIVE_SHAPED_PLAN)
+    method(plan)
+    assert plan.to_json() == LIVE_SHAPED_PLAN
+    assert list(plan.to_json()) == list(LIVE_SHAPED_PLAN)
