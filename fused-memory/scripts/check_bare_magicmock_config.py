@@ -246,6 +246,46 @@ finally:
 _CONFIG_EXACT: frozenset[str] = frozenset({'config', 'cfg'})
 _CONFIG_SUFFIXES: tuple[str, ...] = ('_config', '_cfg')
 
+_DATACLASS_PSEUDO_FIELD_MARKERS: frozenset[str] = frozenset({'ClassVar', 'InitVar'})
+
+
+def _is_dataclass_pseudo_field(annotation: ast.expr) -> bool:
+    """Return True if *annotation* is ``ClassVar``/``InitVar``, bare or subscripted."""
+    marker = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+    if isinstance(marker, ast.Name):
+        return marker.id in _DATACLASS_PSEUDO_FIELD_MARKERS
+    if isinstance(marker, ast.Attribute):
+        return marker.attr in _DATACLASS_PSEUDO_FIELD_MARKERS
+    return False
+
+
+def dataclass_field_names(source: Path, class_name: str) -> frozenset[str]:
+    """Mirror ``dataclasses.fields()`` for a base-less dataclass, without importing it."""
+    tree = ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
+    matches = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f'expected exactly one top-level class {class_name!r} in {source}, '
+            f'found {len(matches)}'
+        )
+    (cls,) = matches
+    if cls.bases:
+        bases = ', '.join(ast.unparse(base) for base in cls.bases)
+        raise ValueError(
+            f'class {class_name!r} in {source} has base classes ({bases}); '
+            'inherited fields are invisible to a stdlib AST read'
+        )
+    return frozenset(
+        stmt.target.id
+        for stmt in cls.body
+        if isinstance(stmt, ast.AnnAssign)
+        and isinstance(stmt.target, ast.Name)
+        and not _is_dataclass_pseudo_field(stmt.annotation)
+    )
+
 
 class _DataclassShape(NamedTuple):
     """A dataclass whose *shape* Rule B recognises in unspecced MagicMock kwargs.
