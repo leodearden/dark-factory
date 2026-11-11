@@ -9,6 +9,7 @@ ensures that even if the dedicated-thread heartbeat is delayed, systemd gives
 the process 120s before SIGABRT (was 30s — too tight with the old on-loop design).
 """
 
+import ipaddress
 from collections.abc import Callable
 from pathlib import Path
 
@@ -237,6 +238,22 @@ class TestSocketActivation:
             f"ListenStream={config.server.host}:{config.server.port}",
             f"ListenStream={recon.escalation_host}:{recon.escalation_port}",
         ]
+
+    def test_socket_listens_on_loopback_only(self) -> None:
+        listen_streams = [
+            d for d in _parse_systemd_unit(_SOCKET_UNIT)["Socket"]
+            if d.startswith("ListenStream=")
+        ]
+        assert listen_streams, f"{_SOCKET_UNIT.name} declares no ListenStream="
+        for directive in listen_streams:
+            host = directive.split("=", 1)[1].rpartition(":")[0].strip("[]")
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = False
+            assert is_loopback, (
+                f"{_SOCKET_UNIT.name}: {directive!r} does not bind a loopback IP address"
+            )
 
     @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
     def test_service_wants_and_orders_after_the_socket(self, unit_path: Path) -> None:
