@@ -13,7 +13,10 @@ import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
     NESTED_RUN_FAILED_NODEID,
+    PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
     PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT,
+    PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
     XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
     XDIST_BAILOUT_LINE,
     XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
@@ -4372,6 +4375,25 @@ class TestCompleteSessionIsNotLabelledAborted:
         assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
         summary = _test_leg_result(output).summary
         assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'output',
+        [
+            PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+            PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
+            PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+        ],
+        ids=['assertion-quote', 'nested-run-in-captured-stdout', 'internalerror-mid-line'],
+    )
+    def test_a_quoted_bailout_literal_is_not_xdists(self, output):
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER not in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
 
 
 class TestVerifyResultCauseHint:

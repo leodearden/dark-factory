@@ -246,6 +246,55 @@ PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT = (
     + '1 failed, 40 passed in 3.00s\n'
 )
 
+# task 5891: shape B. The bailout literal QUOTED by test-controlled text rather
+# than printed by xdist, in -v sessions under xdist, whose outcome lines carry
+# no trailing percentage, so no [100%] progress line can veto the label.
+QUOTED_BAILOUT_FAILED_NODEID = 'orchestrator/tests/test_quote.py::test_quote'
+_PYTEST_V_XDIST_RUN_PREFIX = (
+    '[gw0] [ 50%] PASSED orchestrator/tests/test_a.py::test_ok\n'
+    + f'[gw1] [100%] FAILED {QUOTED_BAILOUT_FAILED_NODEID}\n'
+)
+_QUOTED_BAILOUT_FAILURES_HEAD = (
+    ' FAILURES '.center(80, '=') + '\n'
+    + ' test_quote '.center(80, '_') + '\n'
+    + '[gw1] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+)
+_QUOTED_BAILOUT_TALLY = ' 1 failed, 1 passed in 0.50s '.center(80, '=') + '\n'
+
+# An assertion diff quoting the literal mid-line.
+PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT = (
+    _PYTEST_V_XDIST_RUN_PREFIX
+    + _QUOTED_BAILOUT_FAILURES_HEAD
+    + 'orchestrator/tests/test_quote.py:7: in test_quote\n'
+    + "    assert msg == ''\n"
+    + "E   AssertionError: 'maximum crashed workers reached: 4'\n"
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {QUOTED_BAILOUT_FAILED_NODEID} - AssertionError\n'
+    + _QUOTED_BAILOUT_TALLY
+)
+
+# A nested xdist run's own whole-line literal in captured stdout, as
+# tests/scripts/test_xdist_worker_restart_policy.py prints its reproduction's
+# output.
+PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT = (
+    _PYTEST_V_XDIST_RUN_PREFIX
+    + _QUOTED_BAILOUT_FAILURES_HEAD
+    + 'E   assert 1 == 0\n'
+    + ' Captured stdout call '.center(80, '-') + '\n'
+    + 'worker gw0 crashed and worker restarting disabled\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {QUOTED_BAILOUT_FAILED_NODEID} - assert 1 == 0\n'
+    + _QUOTED_BAILOUT_TALLY
+)
+
+# An INTERNALERROR traceback quoting the literal mid-line, in the run stream
+# outside any report section.
+PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT = (
+    '[gw0] [ 50%] PASSED orchestrator/tests/test_a.py::test_ok\n'
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> AssertionError: maximum crashed workers reached: 4\n'
+)
+
 # task 5492: the multi-module join `verify.py::_aggregate_results` performs —
 # each module leg's test_output joined with '\n' — with the TRUNCATED module
 # NOT last. A completed -q module follows it, so the joined text's FINAL
