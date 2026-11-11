@@ -491,12 +491,17 @@ async def _patch_id_verdict(
 
     The producer owns the whole decision and its normative guard order
     (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``);
-    this only maps its :class:`LandingReason` onto a :class:`GitAuthorityOutcome`.
-    No escalation queue is passed: ``None`` is the producer's documented
-    supported shape, and this tier is a read-only probe.  The reverse import
-    is runtime-only for the same reason as :func:`_evidence_verdict`'s.
+    this only maps its ``LandingReason`` onto a :class:`GitAuthorityOutcome`:
+    ``no_attribution`` (containment proven, nothing attributable) is
+    ``landed_unconfirmed``; ``git_error`` (the detector could not look) is
+    ``probe_failed``, never a negative; every other reject establishes no
+    landing.  The mapping stays inside the function because a module-level
+    table keyed by ``LandingReason`` would hoist the reverse import, which is
+    runtime-only for the same reason as :func:`_evidence_verdict`'s.  No
+    escalation queue is passed: ``None`` is the producer's documented
+    supported shape, and this tier is a read-only probe.
     """
-    from orchestrator.merge_lane.landing_evidence import branch_work_landed
+    from orchestrator.merge_lane.landing_evidence import LandingReason, branch_work_landed
     verdict = await branch_work_landed(
         git_ops, tid, full_branch, branch_tip_sha=branch_tip_sha, metadata=fetch.metadata,
     )
@@ -507,8 +512,19 @@ async def _patch_id_verdict(
             merge_sha=verdict.evidence_sha, arm=GitAuthorityArm.patch_id, reason=reason,
             evidence_sha=verdict.evidence_sha, metadata_unavailable=fetch.unavailable,
         )
+    if verdict.reason == LandingReason.no_attribution:
+        outcome = GitAuthorityOutcome.landed_unconfirmed
+    elif verdict.reason == LandingReason.git_error:
+        logger.warning(
+            '%s: patch-id arm could not answer for %s (git_error at stage %s) '
+            '— returning probe_failed',
+            site, full_branch, verdict.probe.get('git_error_stage'),
+        )
+        outcome = GitAuthorityOutcome.probe_failed
+    else:
+        outcome = GitAuthorityOutcome.no_signal
     return GitAuthorityVerdict(
-        outcome=GitAuthorityOutcome.no_signal, arm=GitAuthorityArm.patch_id,
+        outcome=outcome, arm=GitAuthorityArm.patch_id,
         reason=reason, metadata_unavailable=fetch.unavailable,
     )
 
