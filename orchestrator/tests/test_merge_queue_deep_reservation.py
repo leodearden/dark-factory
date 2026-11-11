@@ -230,8 +230,13 @@ async def _outcomes(run_round: _Round, names: tuple[str, ...]) -> dict[str, Merg
 
 
 def _assert_no_live_permit(lane: MergeLane) -> None:
+    """No landed item still holds a permit. The one speculation permit that may
+    stay live is the merger's, retained for a late arrival behind the last
+    item it queued (task 1862); its next dequeue transfers or releases it."""
     census = _permit_census(lane)
-    assert (census['spec_live'], census['cap_live']) == (frozenset(), frozenset()), census
+    held_by_merger = lane.snapshot()['speculation']['held_by_merger']
+    assert (len(census['spec_live']), census['cap_live']) == (held_by_merger, frozenset()), census
+    assert lane.speculation_accounting_violations() == []
 
 
 def _verify_events_for(scene: _Scene, task_ids: set[str]) -> list[dict[str, Any]]:

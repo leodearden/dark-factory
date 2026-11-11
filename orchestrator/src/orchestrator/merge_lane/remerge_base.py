@@ -29,12 +29,20 @@ def entry_commit(entry: InflightEntry) -> str | None:
     return None
 
 
-def entry_successor_base(entry: InflightEntry) -> str | None:
-    """What a successor of *entry* stacks on: the chain tip when *entry*'s
-    dispatch chained links (task 7720), else *entry*'s own merge commit."""
+def entry_chain_tip(entry: InflightEntry) -> str | None:
+    """*entry*'s chain tip when its dispatch chained links (task 7720), else None."""
     chain = entry.chain
     if chain is not None and chain.links:
         return chain.tip.strip() or None
+    return None
+
+
+def entry_successor_base(entry: InflightEntry) -> str | None:
+    """What a successor of *entry* stacks on: its chain tip when it chained,
+    else its own merge commit."""
+    chain = entry.chain
+    if chain is not None and chain.links:
+        return entry_chain_tip(entry)
     return entry_commit(entry)
 
 

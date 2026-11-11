@@ -142,6 +142,7 @@ from orchestrator.merge_lane.liveness import (
     release_chain_build_lane,
     verify_tree_cpu_ticks,
 )
+from orchestrator.merge_lane.lookahead_hold import LookaheadHold
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
@@ -163,6 +164,7 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
+    entry_chain_tip,
     entry_commit,
     entry_successor_base,
     frontier_tip,
@@ -8563,6 +8565,9 @@ class SpeculativeMergeWorker:
         self._chain_reservations = ChainReservations(
             monotonic=lambda: self._clock.monotonic(), on_release=self._resume_signal.set,
         )
+        # Where the merger waits, before its look-ahead pop, for the chain
+        # decision on the speculative item it just queued (task 7720).
+        self._lookahead_hold = LookaheadHold()
         # The lane buffers, the redispatch park and the suffix-conflict state.
         # Every port re-reads the live worker attribute on each call.
         self._intake = MergeIntake(
@@ -13769,6 +13774,7 @@ class SpeculativeMergeWorker:
         # now the sole acquire/release surface for both semaphores (P-2).
         self._speculation_ledger.release_for_shutdown(self._speculation_depth + 1)
         self._chain_reservations.clear()
+        self._lookahead_hold.release_all()
         self._halt_state.release_lanes_for_shutdown()
         self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
@@ -15333,6 +15339,12 @@ class SpeculativeMergeWorker:
                     # ledger.live forever — same hazard as the
                     # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
+                    # The look-ahead hold is registered in this same no-await
+                    # window, so it exists before the verifier can dispatch
+                    # _real_item (task 7720).
+                    held = self._holds_lookahead(_real_item)
+                    if held:
+                        self._lookahead_hold.hold(req.request_id)
                     # This request's merge commit is now on the verifier queue
                     # and main has NOT advanced to it yet.  A train dequeued
                     # before this Future resolves would CAS against a main that
@@ -15348,48 +15360,9 @@ class SpeculativeMergeWorker:
                     # _resolve_merging_requests) now read to see that (task
                     # 2435 kappa-b: self._inflight_req field deleted).
 
-                    # ── Speculative look-ahead (depth-K cap) ──────────────────
-                    # Acquire one speculation permit before the look-ahead peek.
-                    # If an item is found and prefetched, the permit stays held;
-                    # the Verifier releases it when draining this speculative item.
-                    # If nothing is pickable (or shutdown), the permit is released
-                    # immediately — symmetric accounting keeps in-flight speculations
-                    # bounded at self._speculation_depth (K).
-                    await self._speculation_controller.acquire_for_lookahead()  # depth-K cap
-                    # Harvest any item already delivered to the persistent
-                    # getter so the look-ahead can see it via MergeIntake.pop_next_pickable.
-                    if self._pending_get is not None and self._pending_get.done():
-                        _item = self._pending_get.result()
-                        self._pending_get = None
-                        if _item is None:
-                            self._shutdown_signaled = True
-                        else:
-                            self._intake.buffer_owned_request(_item)
-                    self._drain_queue_into_lanes()
-                    next_req = self._intake.pop_next_pickable()
-                    if next_req is not None:
-                        # Permit stays held — verifier will release on drain.
-                        self._speculation_controller.on_lookahead_found(next_req, merge_commit)
-                        logger.debug(
-                            f'Task {req.task_id}: speculative look-ahead for '
-                            f'{next_req.task_id} (base={merge_commit[:8]})'
-                        )
-                    elif self._shutdown_signaled:
-                        self._speculation_controller.on_shutdown()  # return unused permit
+                    chain_tip = await self._await_chain_decision(req) if held else None
+                    if await self._look_ahead(req, chain_tip or merge_commit):
                         break  # shutdown sentinel and nothing left to speculate
-                    else:
-                        # Nothing pickable right now AND predecessor is in-flight.
-                        # RETAIN the held speculation permit so a late-arriving
-                        # successor can attach to the predecessor's merge commit
-                        # (task 1862: close the disjoint-skip semantic-conflict hole).
-                        #
-                        # • DON'T release: the permit transfers to the late arrival
-                        #   on ATTACH (or is released on FALLBACK at next dequeue).
-                        # • DON'T set spec_base: the late arrival hasn't been dequeued
-                        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
-                        # • Record predecessor's commit so the next dequeue can attach.
-                        self._speculation_controller.on_lookahead_pending(merge_commit, req)
-                        # held_by_merger stays 1 — permit retained for late arrival
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up
@@ -15515,6 +15488,82 @@ class SpeculativeMergeWorker:
             #     the None); here only one may be True, but either is sufficient.
             if not self._running or exited_via_sentinel:
                 await self._verifier_queue.put(None)
+
+    def _holds_lookahead(self, item: RealMergeItem) -> bool:
+        """Whether the merger waits for *item*'s chain decision before its
+        look-ahead pop (task 7720): only a speculative item can chain, only
+        while ``merge_deep.chain_cap`` (read live) is on, and only a live
+        verifier loop can decide."""
+        verifier = self._verifier_task
+        return (
+            item.speculative
+            and item.request.config.merge_deep.chain_cap > 0
+            and verifier is not None
+            and not verifier.done()
+        )
+
+    async def _await_chain_decision(self, req: MergeRequest) -> str | None:
+        """The chain tip *req*'s dispatch built, or None for no chain.
+
+        Races the verifier loop, so a verifier that dies undecided can never
+        wedge the merger; ``stop()`` releases every hold.
+        """
+        verifier = self._verifier_task
+        assert verifier is not None, 'a look-ahead hold needs a live verifier loop'
+        return await self._lookahead_hold.wait(req.request_id, alive=verifier)
+
+    async def _look_ahead(self, req: MergeRequest, base: str) -> bool:
+        """Pre-pick the request to merge after *req*, onto *base*.
+
+        *base* is what *req*'s successors stack on: its chain tip when its
+        dispatch built a chain, else its own merge commit
+        (:func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`).
+        Returns True when the shutdown sentinel arrived and nothing was left
+        to speculate on.
+        """
+        # ── Speculative look-ahead (depth-K cap) ──────────────────
+        # Acquire one speculation permit before the look-ahead peek.
+        # If an item is found and prefetched, the permit stays held;
+        # the Verifier releases it when draining this speculative item.
+        # If nothing is pickable (or shutdown), the permit is released
+        # immediately — symmetric accounting keeps in-flight speculations
+        # bounded at self._speculation_depth (K).
+        await self._speculation_controller.acquire_for_lookahead()  # depth-K cap
+        # Harvest any item already delivered to the persistent
+        # getter so the look-ahead can see it via MergeIntake.pop_next_pickable.
+        if self._pending_get is not None and self._pending_get.done():
+            _item = self._pending_get.result()
+            self._pending_get = None
+            if _item is None:
+                self._shutdown_signaled = True
+            else:
+                self._intake.buffer_owned_request(_item)
+        self._drain_queue_into_lanes()
+        next_req = self._intake.pop_next_pickable()
+        if next_req is not None:
+            # Permit stays held — verifier will release on drain.
+            self._speculation_controller.on_lookahead_found(next_req, base)
+            logger.debug(
+                f'Task {req.task_id}: speculative look-ahead for '
+                f'{next_req.task_id} (base={base[:8]})'
+            )
+        elif self._shutdown_signaled:
+            self._speculation_controller.on_shutdown()  # return unused permit
+            return True
+        else:
+            # Nothing pickable right now AND predecessor is in-flight.
+            # RETAIN the held speculation permit so a late-arriving
+            # successor can attach to *base* (task 1862: close the
+            # disjoint-skip semantic-conflict hole).
+            #
+            # • DON'T release: the permit transfers to the late arrival
+            #   on ATTACH (or is released on FALLBACK at next dequeue).
+            # • DON'T set spec_base: the late arrival hasn't been dequeued
+            #   yet; spec_base is set at the ATTACH/FALLBACK decision.
+            # • Record predecessor's commit so the next dequeue can attach.
+            self._speculation_controller.on_lookahead_pending(base, req)
+            # held_by_merger stays 1 — permit retained for late arrival
+        return False
 
     # ------------------------------------------------------------------
     # Verifier coroutine
@@ -15951,7 +16000,7 @@ class SpeculativeMergeWorker:
                         else ItemLifecycleState.REDISPATCH_PARKED,
                         ItemLifecycleState.DISPATCHING, live_obj=item,
                     )
-                    dispatched = await self._dispatch_item(item)
+                    dispatched = await self._dispatch_deciding(item)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -16277,7 +16326,7 @@ class SpeculativeMergeWorker:
                         item.request.request_id, ItemLifecycleState.AWAITING_VERIFY,
                         ItemLifecycleState.DISPATCHING, live_obj=item,
                     )
-                    dispatched = await self._dispatch_item(item)
+                    dispatched = await self._dispatch_deciding(item)
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -20803,6 +20852,21 @@ class SpeculativeMergeWorker:
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=item,
         )
         self._intake.request_redispatch(item, front=front)
+
+    async def _dispatch_deciding(self, item: SpeculativeItem) -> InflightEntry | NoHost:
+        """:meth:`_dispatch_item`, publishing *item*'s chain decision to a merger
+        held on it (task 7720): the chain tip when the dispatch built a chain,
+        None for any other dispatch or a raise. A :class:`NoHost` return
+        decides nothing, since the item dispatches again later."""
+        rid = item.request.request_id
+        try:
+            dispatched = await self._dispatch_item(item)
+        except BaseException:
+            self._lookahead_hold.decide(rid, None)
+            raise
+        if not isinstance(dispatched, NoHost):
+            self._lookahead_hold.decide(rid, entry_chain_tip(dispatched))
+        return dispatched
 
     async def _dispatch_item(
         self,

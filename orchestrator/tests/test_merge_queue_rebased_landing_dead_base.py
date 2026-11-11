@@ -55,7 +55,7 @@ from test_merge_queue_concurrent_verify import (
 )
 from test_merge_speculation import _LateArrivalFakeEventStore
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
@@ -488,6 +488,10 @@ class TestTornDownSuccessorRecordsItsCommitDead:
     async def test_follower_with_no_host_when_its_base_is_torn_down_is_remerged_at_dispatch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
+        # Deep chains off (task 7720): under the operational yaml's chain_cap
+        # fv-b's dispatch would chain the buffered fv-c, which then is never
+        # built speculatively as the host-starved follower this scene needs.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         head_gate = asyncio.Event()
         b_release = asyncio.Event()
         b_entered = asyncio.Event()

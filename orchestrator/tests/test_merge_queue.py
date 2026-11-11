@@ -49,7 +49,7 @@ from _resolution_merges import resolution_merge
 from _verify_result_doubles import fake_verify_result
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     AdvanceOutcome,
@@ -4823,6 +4823,10 @@ class TestSpeculativeMergeWorker:
           (3) N+2's verify sees BOTH N's and N+1's files (proves it merged on top
               of the advanced tree, not a stale base).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_follower.db'
         event_store = EventStore(db_path=db_path, run_id='test-follower')
 
@@ -4947,6 +4951,10 @@ class TestSpeculativeMergeWorker:
         — proving the merge gate ran before advance_main.  All outcomes 'done';
         all files land on main.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687a.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687a')
 
@@ -5060,6 +5068,10 @@ class TestSpeculativeMergeWorker:
           file_prb_n2.py is NOT on main (red tree did not advance).
           file_prb_n.py and file_prb_n1.py ARE on main (unaffected).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687b.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687b')
 
@@ -21369,6 +21381,10 @@ class TestSpeculationSlotSemaphoreDepth:
         Fails RED because _speculation_slot is still an Event (depth-1); with the Event
         the merger only builds N+1 speculatively (peak ≤ 2), so ≥ 3 assertion fails.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'k2d-n', 'k2d_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'k2d-n1', 'k2d_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'k2d-n2', 'k2d_n2.py', 'n2 = 3\n')
