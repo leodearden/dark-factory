@@ -748,9 +748,16 @@ _DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
 # should import ``escalation.canonical.canonical_root_cause`` — it is exported
 # publicly for exactly that — rather than reimplementing the transform; and
 # because the server now folds near-duplicates itself, a rebuild sees ONE row
-# where it used to see two.  A rebuild that keeps comparing raw strings is
-# strictly MORE conservative than the server (it re-promotes a near-duplicate,
-# the server folds it and answers ``status:'updated'``), so it stays correct.
+# where it used to see two.  A rebuild that compares raw strings creates no
+# duplicate L2 (it re-promotes a near-duplicate, the server folds it and answers
+# ``status:'updated'``), but a fold is "no duplicate created", NOT "nothing
+# happened": ``EscalationQueue.add_members_to_l2`` records the new spelling as an
+# amendment and a ``root_cause_variants`` entry and bumps ``updated_at``, so any
+# triage-ack on that L2 goes stale (updated_at > triaged_at) and is re-triaged
+# under the stamp-then-skip protocol, and each new spelling advances the count
+# against ``_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD``, which can trigger
+# ``_report_root_cause_overfold``.  Canonical comparison is therefore the
+# EXPECTED client behaviour, not an optional refinement.
 #
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
@@ -2970,8 +2977,10 @@ def create_server(
         ``amendments``.  ``detail`` is the unbounded free-text field compact mode
         exists to keep out of a long-running watcher's context.
 
-        Two L2-cluster fields ARE returned, because they are bounded by
-        construction and load-bearing for triage (task 3997): ``root_cause``,
+        Two L2-cluster fields ARE returned, because they are load-bearing for
+        triage (task 3997) and short in practice — though NOT bounded in
+        principle; see the comment above :data:`_COMPACT_ESCALATION_FIELDS`:
+        ``root_cause``,
         the one-line dedup key ``promote_to_l2`` folds on, and ``member_ids``,
         the PROJECTION of the record's ``members`` list under a contract name
         (the raw ``members`` key stays dropped).  Together they make a drain
@@ -2982,9 +2991,13 @@ def create_server(
         promoted.  Since task 3998 the SERVER matches root causes on their
         CANONICAL form, so a client-side rebuild should compare
         ``escalation.canonical.canonical_root_cause(row['root_cause'])`` rather
-        than raw strings; comparing raw is still safe, just more conservative
-        (it re-promotes a near-duplicate and the server folds it, answering
-        ``status:'updated'`` without creating anything).
+        than raw strings.  Comparing raw creates no duplicate L2 (the server
+        folds a re-promoted near-duplicate, answering ``status:'updated'``) but
+        it is NOT free: the fold records the new spelling as an amendment and
+        ``root_cause_variants`` entry and bumps ``updated_at``, which
+        invalidates triage-acks on that L2 (updated_at > triaged_at) and
+        advances the over-fold variant count that can trigger an over-fold
+        report.
 
         Use this from a long-running watcher to keep context small as the
         pending pile grows; fetch the full record for a specific id via
