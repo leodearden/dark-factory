@@ -312,6 +312,88 @@ def test_within_min_interval_absent_clock_is_outside_the_window() -> None:
 
 
 # ---------------------------------------------------------------------------
+# min_interval_remaining_secs: the window arithmetic's one home (task 8270)
+#
+# within_min_interval is re-expressed on it, so a cap that must say HOW LONG
+# it still holds (the per-unit liveness revive cap in
+# scripts/orchestrator-watchdog.py) reads the clock once and shares the
+# fail directions above rather than carrying a second copy of them.
+# ---------------------------------------------------------------------------
+
+_NOW = 1_000_000.0
+
+
+def _never_read() -> float:
+    pytest.fail("a disabled min-interval must not read its clock")
+
+
+@pytest.fixture
+def _frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(time, "time", lambda: _NOW)
+
+
+@pytest.mark.usefixtures("_frozen_now")
+def test_min_interval_remaining_secs_counts_down_from_the_stamp() -> None:
+    assert state.min_interval_remaining_secs(900, lambda: _NOW - 100) == pytest.approx(
+        800.0
+    )
+
+
+@pytest.mark.usefixtures("_frozen_now")
+def test_min_interval_remaining_secs_is_zero_once_the_window_has_passed() -> None:
+    assert state.min_interval_remaining_secs(900, lambda: _NOW - 901) == 0.0
+
+
+def test_min_interval_remaining_secs_disabled_does_not_read_the_clock() -> None:
+    assert state.min_interval_remaining_secs(0, _never_read) == 0.0
+    assert state.min_interval_remaining_secs(-5, _never_read) == 0.0
+
+
+def test_min_interval_remaining_secs_absent_clock_is_outside_the_window() -> None:
+    assert state.min_interval_remaining_secs(900, lambda: None) == 0.0
+
+
+@pytest.mark.usefixtures("_frozen_now")
+def test_min_interval_remaining_secs_future_dated_clock_holds_longer_than_secs() -> None:
+    """A clock stamped in the future (a skewed host, a test that patched time)
+    holds the cap for more than *secs*, exactly as within_min_interval always did.
+    """
+    assert state.min_interval_remaining_secs(900, lambda: _NOW + 100) > 900
+
+
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize(
+    ("secs", "epoch"),
+    [
+        (900, _NOW - 100),
+        (900, _NOW - 901),
+        (900, _NOW - 900),
+        (0, _NOW - 100),
+        (-5, _NOW - 100),
+        (900, None),
+        (900, _NOW + 100),
+    ],
+)
+def test_within_min_interval_is_remaining_secs_above_zero(
+    secs: int, epoch: float | None
+) -> None:
+    assert state.within_min_interval(secs, lambda: epoch) == (
+        state.min_interval_remaining_secs(secs, lambda: epoch) > 0
+    )
+
+
+def test_an_injected_now_replaces_the_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that owns its *now* (the crash-loop page dedup) shares this rule too."""
+    monkeypatch.setattr(time, "time", lambda: pytest.fail("an injected now reads no wall clock"))
+
+    assert state.min_interval_remaining_secs(
+        900, lambda: _NOW - 100, now=_NOW
+    ) == pytest.approx(800.0)
+    assert state.within_min_interval(900, lambda: _NOW - 899, now=_NOW) is True
+    assert state.within_min_interval(900, lambda: _NOW - 900, now=_NOW) is False
+
+
+# ---------------------------------------------------------------------------
 # task 4823: the clock stamp carries its own provenance
 #
 # The watchdog is the SECOND of the two clock writers (restart-all-orchestrators.sh
