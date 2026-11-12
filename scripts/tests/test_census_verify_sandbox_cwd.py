@@ -29,7 +29,14 @@ from pathlib import Path
 
 import census as mod
 import pytest
-from legibility import account_pool, census_trigger, session_runner, synthesis
+from legibility import (
+    account_pool,
+    census_trigger,
+    disposition,
+    landing_gate,
+    session_runner,
+    synthesis,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import config as config_mod
@@ -86,12 +93,18 @@ def _make_seam_driving_run_census():
 
     def fake_run_census(**kwargs):
         calls.append(kwargs)
-        kwargs["invoke"]("ping", "haiku")
-        kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
-        kwargs["synthesize_fn"](_EMPTY_BRIEF, model="fable")
-        return mod.CensusOutcome(
-            status="done", report_path="plans/confusion-census-2026-08-03.md",
-            filed_ticket_ids=[], stop_reason="exhausted",
+        kwargs["effects"].invoke("ping", "haiku")
+        kwargs["effects"].verify_fn([{"title": "x"}], model="sonnet")
+        kwargs["effects"].synthesize_fn(_EMPTY_BRIEF, model="fable")
+        return mod.Done(
+            report_path="plans/confusion-census-2026-08-03.md",
+            record_path="plans/confusion-census-2026-08-03.json",
+            run_id="census-dark_factory-20260803",
+            stop_reason="exhausted",
+            gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls

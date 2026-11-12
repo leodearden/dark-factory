@@ -20,77 +20,43 @@ import logging
 import sqlite3
 from bisect import bisect_left
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import yaml
 from escalation.classify import classify_resolver_tier, effective_benign
 from escalation.models import RESOLUTION_CLASSES, Escalation
 
 from dashboard.data.datum import Datum
 from dashboard.data.escalation_corpus import EscalationCorpus, views_over
+from dashboard.data.quality_markers import MarkerKind, load_curated_markers
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
 
-# Module-relative default: dashboard/regime-markers.yaml (the top-level
-# `dashboard/` package dir — three levels up from
-# dashboard/src/dashboard/data/escalation_analytics.py).
-_DEFAULT_REGIME_MARKERS_PATH = Path(__file__).resolve().parents[3] / 'regime-markers.yaml'
-
 
 def load_regime_markers(path: Path | None = None) -> tuple[list[dict], int]:
-    """Load hand-curated regime markers from a committed YAML file.
+    """The curated regime markers as ``{date, label, tasks}``, and the file's rejected-entry count.
 
-    Args:
-        path: Path to the YAML file. Defaults to the committed
-            ``dashboard/regime-markers.yaml``.
-
-    Returns:
-        ``(markers, parse_failures_delta)``. Never raises:
-
-        - Missing file -> ``([], 0)`` (absent is not a failure).
-        - Unparseable YAML or a non-list top level -> ``([], 1)`` + WARNING
-          (row 9 substrate: the endpoint must never 500 on a broken markers
-          file — it degrades to an empty list and counts the failure).
-
-        Each returned marker is normalized to ``{date, label, tasks}``
-        (``tasks`` defaults to ``[]``). ``date`` is coerced to ``str`` when
-        YAML parses an unquoted ``YYYY-MM-DD`` scalar as a ``datetime.date``
-        object — otherwise the payload would fail JSON serialization at the
-        route layer.
+    A delegate of :func:`dashboard.data.quality_markers.load_curated_markers`, the one reader of
+    ``dashboard/regime-markers.yaml`` (``path`` None reads its ``CURATED_MARKERS_PATH``). Only
+    ``kind: regime`` entries are escalation regime markers; the quality markers the same file
+    holds are not. Never raises: a missing file is ``([], 0)``; an unreadable file, or one whose
+    top level is not a list, counts one failure; and each rejected entry counts one while its
+    valid siblings still load (INV-4), so the endpoint degrades instead of answering 500.
+    ``date`` is the marker's UTC day as ``YYYY-MM-DD`` text.
     """
-    p = path if path is not None else _DEFAULT_REGIME_MARKERS_PATH
-    if not p.exists():
-        return [], 0
-
-    try:
-        with p.open() as f:
-            data = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning('load_regime_markers: failed to read/parse %s: %s', p, exc)
-        return [], 1
-
-    if not isinstance(data, list):
-        logger.warning(
-            'load_regime_markers: %s top level is not a list (got %s)',
-            p, type(data).__name__,
-        )
-        return [], 1
-
-    markers: list[dict] = []
-    for item in data:
-        if not isinstance(item, dict):
-            logger.warning('load_regime_markers: skipping non-mapping entry in %s: %r', p, item)
-            continue
-        raw_date = item.get('date')
-        markers.append({
-            'date': raw_date.isoformat() if isinstance(raw_date, date) else raw_date,
-            'label': item.get('label'),
-            'tasks': item.get('tasks') or [],
-        })
-    return markers, 0
+    curated = load_curated_markers(path)
+    markers = [
+        {
+            'date': marker.at.astimezone(UTC).date().isoformat(),
+            'label': marker.label,
+            'tasks': list(marker.tasks),
+        }
+        for marker in curated.markers
+        if marker.kind is MarkerKind.REGIME
+    ]
+    return markers, curated.parse_failures
 
 
 # ---------------------------------------------------------------------------

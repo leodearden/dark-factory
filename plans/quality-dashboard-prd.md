@@ -550,6 +550,72 @@ to `markers_derived` by the loop with a per-(project, role) last-seen key); `loa
 `kind='regime'`, `scope='fleet'`, `series=None`; `resolve_ordinals(markers, axis)` sets `ordinal` to the
 first landing at or after `at`.
 
+**Correction (δ, 2026-11-11).** What shipped, and where each part is homed. Symbols prefixed `::`
+are in `dashboard/src/dashboard/data/quality_markers.py`.
+- `QUALITY_MARKERS` is `Datum[MarkerStream]`, not a bare marker list. Its value is `{markers,
+  availability, prompt_coverage, curated_parse_failures, skipped_records}` (`::MarkerStream.to_wire`).
+  `availability` holds the role-default fallbacks, served apart from the markers
+  (`::AvailabilityFlag`: role, from_at, until_at, decisions, model). `prompt_coverage` is
+  `{state: written | not_yet_written, since, roles_py_landings, counted_since, reason}`
+  (`::PromptCoverage`). It is written from the first routing decision that carries a prompt digest.
+  Until then it counts the first-parent `main` merges touching
+  `orchestrator/src/orchestrator/agents/roles.py` in the factory checkout since the newest in-scope
+  curated `prompt` entry, else since the project's first routing decision. If git cannot give a
+  count, it gives the reason instead. The datum is unknown until the marker tick has derived the
+  project once. It is stale while the routing fold is incomplete or the newest refresh failed
+  (`::marker_datum`).
+- `Marker` adds `until_ordinal` (the last landing at or before an artefact's `until`) and `tasks`.
+  `scope` is the project id or `fleet`. `source` is `{type, ...the details that type carries}`
+  (`::MarkerSource`). Ordinals are resolved at serve time against the project's full stored landing
+  axis and never stored (`::resolve_ordinals`). The placement is
+  `shared/src/shared/quality_series/stats.py::regime_segments`'s.
+- Kind alone sets the regime role (`::REGIME_ROLE`). model, effort, budget, turns, prompt,
+  reviewer_policy, routing_rule, cli and regime are boundaries. artefact is an exclusion range.
+  deploy and instrument are not landing-axis events. Derived markers carry `series = null`, so each
+  is a regime event for every series. The route passes the stream's `regime_events()` to
+  `read_quality_series` (`dashboard/src/dashboard/api/quality.py::api_quality`). Before the
+  project's first derivation, when `QUALITY_MARKERS` is unknown, it passes the curated markers in
+  the project's scope instead, so a curated artefact is excluded from the start
+  (`dashboard/src/dashboard/api/quality.py::_regime_events`).
+- Steps (`::fold_routing_decisions`): a role's steps are run-length encoded from its decisions
+  with `source_layer ∈ {config, role_default}` that no policy rule matched (`rule_id` null).
+  `orchestrator/src/orchestrator/routing.py::resolve_route` applies a matched rule's effort,
+  budget and turns even when it refuses the rule's model, which leaves the layer `config` or
+  `role_default`. Such a row feeds only its rule's span. A row naming a layer outside
+  `::SourceLayer` is skipped and counted.
+- Persistence (decision 11, in `::_persists` and `::_counted_groups`): a non-start step counts iff
+  it has ≥3 decisions and either spans ≥24 h, or the next step changes a field it did not. The span
+  runs to the next step's first dispatch, or for the open step to the fold's newest decision.
+  Role-default runs bracketed by equal config steps are removed first and served as availability
+  flags. Kind is the first changed field by precedence model > effort > prompt > budget > turns,
+  and the label lists every changed field. An absent prompt digest never splits a step.
+- Dating (`::_cause`): a routing marker is dated at the earliest `config_reload` in the same
+  project's runs.db that names a changed field's config path, within 48 h before the first
+  dispatch. With no such reload it is dated at the first dispatch. A git commit is never a dating
+  source. Only an applied `review.reviewer_briefing` change is a standalone marker
+  (`reviewer_policy`). A policy rule's disappearance is a marker once the rule has not fired for
+  `::RULE_QUIET_DAYS` (7) at the fold's newest decision.
+- Store: the "per-(project, role) last-seen key" is the stored routing fold. quality.db holds it in
+  `routing_steps`, `routing_rules` and `marker_state`. `marker_state` carries the cursor, the fold
+  bounds, digest_since, completeness, the skip counts, the prompt coverage and
+  refreshed/attempted/failure. `markers_derived` is reshaped to `(project_id, marker_id, kind, at,
+  label, source, ref)` with no ordinal column. `_QualityStore.open()` drops and recreates the β
+  table (`dashboard/src/dashboard/data/quality_store.py::ensure_marker_tables`).
+- Tick: `dashboard/src/dashboard/data/quality_marker_sampler.py::refresh_markers` runs after
+  `collect_quality` in `dashboard/src/dashboard/loops.py::_quality_loop`. Each tick folds at most
+  `MARKER_ROUTING_BATCH` (500,000) routing rows per root and re-derives every marker from the fold
+  plus the small sources. Measured 2026-11-12, df's 27,152 routing rows fold in 0.32 s, so a cold
+  start completes in one tick. The tick resumes from the stored fold alone
+  (`dashboard/src/dashboard/data/quality_store.py::read_routing_fold`). A stored fold that no
+  longer decodes is folded again from the start, and that root's write replaces it. Both quality
+  ticks share their per-root machinery (`dashboard/src/dashboard/data/quality_root_tick.py`).
+- `load_curated_markers(path)` returns `CuratedMarkers(markers, parse_failures)`. `kind` takes the
+  whole marker vocabulary. `until` (artefact only) is the inclusive end of its UTC day. Every
+  rejected entry is counted. `derived_markers(runs_db, project_id, snapshots)` is the stateless full
+  derivation, equal to folding in batches.
+- The instrument rule (f) takes `SnapshotIdentity` values (`::instrument_markers`). The loop passes
+  none until ι supplies a snapshot reader.
+
 ### Orchestrator fields
 
 - `task_results.charter_class TEXT NULL` (additive column with `CREATE TABLE IF NOT EXISTS` + `ALTER`

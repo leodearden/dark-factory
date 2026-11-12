@@ -16,7 +16,7 @@ import subprocess
 
 import pytest
 from legibility import census as mod
-from legibility import census_trigger, filing_policy, session_runner
+from legibility import census_trigger, disposition, filing_policy, landing_gate, session_runner
 from legibility import config as config_mod
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -47,9 +47,15 @@ def _make_fake_main_run_census():
 
     def fake_run_census(**kwargs):
         calls.append(kwargs)
-        return mod.CensusOutcome(
-            status="done", report_path="plans/confusion-census-2026-09-27.md",
-            filed_ticket_ids=[], stop_reason="exhausted",
+        return mod.Done(
+            report_path="plans/confusion-census-2026-09-27.md",
+            record_path="plans/confusion-census-2026-09-27.json",
+            run_id="census-dark_factory-20260927",
+            stop_reason="exhausted",
+            gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls

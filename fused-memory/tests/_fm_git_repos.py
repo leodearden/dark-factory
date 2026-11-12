@@ -1,12 +1,16 @@
-"""Throwaway real-git repos (signing off, hooks disabled) for tests whose
-verdict is git semantics.
+"""Real-git fixtures for tests whose verdict is git semantics: throwaway repos
+(signing off, hooks disabled) plus a runner that scripts chosen git
+subcommands over them.
 
 Lives outside conftest.py, imported by name, under the convention stated in
 _fm_helpers' module docstring.
 """
 
 import subprocess
-from typing import TypedDict
+from collections.abc import Mapping, Sequence
+from typing import NamedTuple, TypedDict
+
+from shared.git_async import GitResult, run_git
 
 # ---------------------------------------------------------------------------
 # Real-git repo builders
@@ -151,3 +155,57 @@ def init_merge_history_repo(path) -> MergeHistoryShas:
     conflict_merge = git_stdout(path, 'rev-parse', 'HEAD')
 
     return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
+
+
+# ---------------------------------------------------------------------------
+# Scripted git runner
+# ---------------------------------------------------------------------------
+
+
+_GIT_OPTIONS_TAKING_A_VALUE = frozenset({'-C', '-c'})
+
+
+class GitCall(NamedTuple):
+    """One call a :class:`ScriptedGitRunner` received."""
+
+    argv: tuple[str, ...]
+    timeout: float | None
+
+    @property
+    def subcommand(self) -> str | None:
+        """The git subcommand: the first token after ``git`` and its global
+        options (``-C <path>``, ``-c <key=value>``, bare flags)."""
+        tokens = iter(self.argv[1:])
+        for token in tokens:
+            if token in _GIT_OPTIONS_TAKING_A_VALUE:
+                next(tokens, None)
+            elif not token.startswith('-'):
+                return token
+        return None
+
+
+class ScriptedGitRunner:
+    """A ``shared.git_async.run_git`` stand-in that scripts chosen subcommands.
+
+    *script* maps a git subcommand (``'merge-base'``, ``'rev-parse'``,
+    ``'show'``) to the ``GitResult`` it returns or the exception it raises. A
+    key matches only the call's :attr:`GitCall.subcommand`, never a path, ref
+    or other argument. A call whose subcommand is not scripted goes to the
+    real ``run_git``, so a test faking ``merge-base`` still resolves its SHA
+    for real against :func:`_init_git_repo`'s repo. Every call is recorded in
+    ``calls``.
+    """
+
+    def __init__(self, script: Mapping[str, GitResult | Exception]):
+        self._script = dict(script)
+        self.calls: list[GitCall] = []
+
+    async def __call__(self, cmd: Sequence[str], *, timeout: float | None = None) -> GitResult:
+        call = GitCall(tuple(cmd), timeout)
+        self.calls.append(call)
+        outcome = self._script.get(call.subcommand) if call.subcommand else None
+        if outcome is None:
+            return await run_git(cmd, timeout=timeout)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome

@@ -36,7 +36,7 @@ from _boundary_payloads import (
     prd_tree,
     prd_view_family,
 )
-from _canned_mcp import CannedMCP
+from _canned_mcp import CannedMCP, is_metadata_projection
 from _prd_lanes_tree import prd_key
 from _prd_tree import PRD_A
 from fastapi.testclient import TestClient
@@ -174,7 +174,7 @@ def _tighten(monkeypatch: pytest.MonkeyPatch, **bounds: float) -> None:
 def test_a_root_past_its_share_is_unknown_while_the_other_renders(client, tmp_path, monkeypatch):
     _tighten(monkeypatch, per_project=2.0)
     slow = prd_tree()
-    slow.projection_delay = 4.0
+    slow.metadata_projection_delay = 4.0
     with canned_prd_roots(client, tmp_path, {ROOT: prd_tree(), SLOW: slow}) as render:
         views = render(T0)['PRD_VIEW']
     assert views[SLOW]['state'] == 'unknown'
@@ -224,8 +224,8 @@ _PROJECTION_DELAY = 2.0
 _SETTLE_DEADLINE = 15.0
 
 
-def _projected_reads(substrate: CannedMCP) -> list[dict]:
-    return [call for call in substrate.calls_to('get_tasks') if call['args'].get('fields') is not None]
+def _lineage_reads(substrate: CannedMCP) -> list[dict]:
+    return [call for call in substrate.calls_to('get_tasks') if is_metadata_projection(call['args'])]
 
 
 def _render_until_fresh(render: Callable[[datetime], dict[str, Any]], at: datetime) -> dict[str, Any]:
@@ -240,7 +240,7 @@ def _render_until_fresh(render: Callable[[datetime], dict[str, Any]], at: dateti
 def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkeypatch):
     monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', 0.05)
     slow = prd_tree()
-    slow.projection_delay = _PROJECTION_DELAY
+    slow.metadata_projection_delay = _PROJECTION_DELAY
     with canned_prd_roots(client, tmp_path, {ROOT: slow}) as render:
         first = render(T0)['PRD_VIEW'][ROOT]
         later = _render_until_fresh(render, T0 + timedelta(seconds=20))
@@ -249,7 +249,7 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
     assert first['reason'].startswith('lineage: ')
     assert later['state'] == 'fresh'
     assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
-    assert len(_projected_reads(slow)) == 1
+    assert len(_lineage_reads(slow)) == 1
 
 
 # --- the request-wide reads are bounded and guarded -------------------------

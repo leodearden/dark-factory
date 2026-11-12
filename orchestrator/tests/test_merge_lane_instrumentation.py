@@ -148,7 +148,7 @@ class TestOrdinaryDispatchFacts:
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestGateReverifyDispatchFacts:
 
-    async def test_a_rebased_head_gates_on_its_own_local_host_against_main(
+    async def test_a_rebased_head_is_dispatched_by_the_host_policy_against_main(
         self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
     ) -> None:
         config = lane_scene_config(
@@ -172,8 +172,9 @@ class TestGateReverifyDispatchFacts:
         assert outcome.status == 'done', outcome
         verified, gated = [row['merge_sha'] for row in _rows(store, EventType.merge_verify, 'gt-a')]
         assert verified != gated == outcome.merge_sha, 'precondition: A lands rebased'
+        # The gate re-verify is a dispatch of the rebased head (task 8525).
         assert _dispatch_facts(store, 'gt-a') == [
-            ('prefer_local_free', 'main'), ('gate_on_head_host', 'main'),
+            ('prefer_local_free', 'main'), ('prefer_local_free', 'main'),
         ]
 
 

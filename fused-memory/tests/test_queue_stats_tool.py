@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_polling import poll_until_dead
+from _queued_write_fixtures import queued
 from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,
@@ -102,14 +103,8 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
         await q.initialize()
         try:
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
-            await q.enqueue(
-                group_id='proj_b', operation='add_episode',
-                payload={'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'},
-            )
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
+            await q.enqueue(queued('add_episode', {'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'}, group_id='proj_b'))
             await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
@@ -232,14 +227,8 @@ class TestGetQueueStatsDeadByOperation:
         await q.initialize()
         try:
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
-            await q.enqueue(
-                group_id='proj_b', operation='add_memory_graphiti',
-                payload={'content': 'b0', 'group_id': 'proj_b'},
-            )
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
+            await q.enqueue(queued('add_memory_graphiti', {'content': 'b0', 'group_id': 'proj_b'}, group_id='proj_b'))
             await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _fm_helpers import make_retry_budget_queue
 from _fm_polling import poll_until_dead
+from _queued_write_fixtures import queued
 
 
 @pytest.mark.asyncio
@@ -40,10 +41,7 @@ async def test_one_dead_letter_warning_carries_every_triage_field(
         with caplog.at_level(
             logging.WARNING, logger='fused_memory.services.durable_queue'
         ):
-            await q.enqueue(
-                group_id='proj-alpha', operation='add_episode',
-                payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
-            )
+            await q.enqueue(queued('add_episode', {'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'}, group_id='proj-alpha'))
             await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
         dead_letter_lines = [

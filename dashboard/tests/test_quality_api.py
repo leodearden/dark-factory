@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator
+from bisect import bisect_left
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _dt_helpers import fixed_clock, installed_clock
-from _quality_rows import history, write_landing_events, write_quality_db
+from _quality_fixture import GitRepo, config_reload, routing_decision
+from _quality_rows import NO_OUTCOMES, history, write_landing_events, write_quality_db
 from _runs_db_fixture import EventRow
 from shared.quality_series.landings import GitCrossCheck
+from shared.quality_series.rows import LandingRow, Outcomes
 
 from dashboard.api.window import (
     ServedLandingWindow,
@@ -25,7 +29,11 @@ from dashboard.api.window import (
     with_window,
 )
 from dashboard.config import DashboardConfig
-from dashboard.data.quality_store import QualitySample
+from dashboard.data import quality_markers
+from dashboard.data.quality_marker_sampler import refresh_markers
+from dashboard.data.quality_markers import DerivedState, PromptCoverage, RoutingFold
+from dashboard.data.quality_store import QualitySample, write_marker_state
+from dashboard.loops import _QualityStore
 
 LANDINGS: dict[str, int | None] = {'100': 100, '300': 300, 'all': None}
 """A landing vocabulary for the parser alone; the route's own is driven through the route."""
@@ -73,15 +81,22 @@ DATUM_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
 STORED = 120
 
 
+STORED_START = NOW - timedelta(days=1) - timedelta(hours=2 * (STORED - 1))
+
+
 @contextmanager
-def _seeded(client: Any, tmp_path: Path, extra_events: Iterable[EventRow] = ()) -> Iterator[Any]:
+def _seeded(
+    client: Any, tmp_path: Path, extra_events: Iterable[EventRow] = (),
+    outcome: Callable[[int], Outcomes] = lambda ordinal: NO_OUTCOMES,
+) -> Iterator[Any]:
     """The app over a root named 'dark_factory' holding STORED sampled landings, beside an
-    unsampled 'other-proj', serving at NOW; runs.db also holds *extra_events* verbatim."""
+    unsampled 'other-proj', serving at NOW; runs.db also holds *extra_events* verbatim, and
+    *outcome* gives each landing's outcomes by ordinal."""
     root, other = tmp_path / 'dark_factory', tmp_path / 'other-proj'
     root.mkdir()
     other.mkdir()
     config = DashboardConfig(project_root=root, known_project_roots=[other])
-    rows = history(STORED, start=NOW - timedelta(days=1) - timedelta(hours=2 * (STORED - 1)))
+    rows = history(STORED, start=STORED_START, outcome=outcome)
     write_landing_events(root, rows, extra_events)
     sample = QualitySample.value(
         'dark_factory', NOW - timedelta(minutes=5), cursor_sha=rows[-1].landing.merge_sha,
@@ -126,16 +141,262 @@ def test_the_route_serves_every_window_its_chip_offers(
     assert len(body['QUALITY']['value']['axis']) == STORED
 
 
-def test_markers_and_snapshots_are_unknown_until_their_producers_land(quality_client) -> None:
-    body = _get(quality_client, 'project=dark_factory&window=100')
+def test_snapshots_are_unknown_until_their_producer_lands(quality_client) -> None:
+    snapshots = _get(quality_client, 'project=dark_factory&window=100')['QUALITY_SNAPSHOTS']
 
-    markers, snapshots = body['QUALITY_MARKERS'], body['QUALITY_SNAPSHOTS']
-    for datum in (markers, snapshots):
-        assert set(datum) == DATUM_KEYS
-        assert (datum['state'], datum['value'], datum['as_of']) == ('unknown', None, None)
-        assert datum['reason'].startswith('no producer has written here')
-    assert 'marker' in markers['reason']
+    assert set(snapshots) == DATUM_KEYS
+    assert (snapshots['state'], snapshots['value'], snapshots['as_of']) == ('unknown', None, None)
+    assert snapshots['reason'].startswith('no producer has written here')
     assert 'snapshot' in snapshots['reason']
+
+
+def test_markers_never_derived_for_a_project_are_unknown_saying_so(quality_client) -> None:
+    markers = _get(quality_client, 'project=dark_factory&window=100')['QUALITY_MARKERS']
+
+    assert set(markers) == DATUM_KEYS
+    assert (markers['state'], markers['value'], markers['as_of']) == ('unknown', None, None)
+    assert 'markers have not been derived for dark_factory' in markers['reason']
+
+
+def test_markers_for_a_token_naming_no_root_are_unknown_naming_it(quality_client) -> None:
+    markers = _get(quality_client, 'project=nowhere')['QUALITY_MARKERS']
+
+    assert (markers['state'], markers['value']) == ('unknown', None)
+    assert 'nowhere' in markers['reason']
+
+
+# --- the marker stream through the route (PRD sketch rows 6-8) ------------------------------
+
+FLIP_START = datetime(2026, 10, 31, 0, 0, tzinfo=UTC)
+DF_RELOAD = datetime(2026, 11, 1, 8, 50, tzinfo=UTC)
+DF_FLIP = datetime(2026, 11, 1, 8, 58, 42, tzinfo=UTC)
+REIFY_FLIP = datetime(2026, 11, 1, 10, 37, 33, tzinfo=UTC)
+FALLBACK = datetime(2026, 10, 27, 13, 46, tzinfo=UTC)
+RETURNED = datetime(2026, 10, 27, 20, 12, tzinfo=UTC)
+
+
+def _reviewer(at: datetime, *, effort: str, max_turns: int) -> EventRow:
+    return routing_decision(at, 'reviewer_comprehensive', model='opus', effort=effort,
+                            budget_usd=12.0, max_turns=max_turns)
+
+
+def _merger(at: datetime, *, layer: str = 'config', model: str = 'fable') -> EventRow:
+    return routing_decision(at, 'merger', model=model, effort='high', budget_usd=8.0,
+                            max_turns=100, source_layer=layer)
+
+
+def _reviewer_flip(first_xhigh: datetime) -> list[EventRow]:
+    """Sketch row 7: high/60 dispatches, then a persisting xhigh/90 step from *first_xhigh*."""
+    before = datetime(2026, 10, 28, 9, 0, tzinfo=UTC)
+    return [
+        *(_reviewer(before + timedelta(hours=h), effort='high', max_turns=60) for h in range(4)),
+        *(_reviewer(first_xhigh + timedelta(hours=h), effort='xhigh', max_turns=90)
+          for h in (0, 1, 2, 40)),
+    ]
+
+
+MERGER_FALLBACK: list[EventRow] = [
+    *(_merger(datetime(2026, 10, 26, 10, tzinfo=UTC) + timedelta(hours=h)) for h in range(5)),
+    _merger(FALLBACK, layer='role_default', model='opus'),
+    *(_merger(RETURNED + timedelta(hours=h)) for h in range(6)),
+]
+"""Sketch row 8: one role_default dispatch between two equal config steps."""
+
+DF_EVENTS: list[EventRow] = [
+    *MERGER_FALLBACK,
+    *_reviewer_flip(DF_FLIP)[:4],
+    config_reload(DF_RELOAD, applied={'effort.reviewer': {'old': 'high', 'new': 'xhigh'}}),
+    *_reviewer_flip(DF_FLIP)[4:],
+]
+REIFY_EVENTS: list[EventRow] = _reviewer_flip(REIFY_FLIP)
+
+
+FLIP_LANDINGS = 48
+
+
+def _every_third_flaky(ordinal: int) -> Outcomes:
+    return replace(NO_OUTCOMES, flake_confirmed=ordinal % 3 == 0, flake_real_red=False,
+                   flake_rows=1)
+
+
+def _project(root: Path, project_id: str, events: list[EventRow]) -> list[LandingRow]:
+    """A git checkout whose runs.db records 48 landings across 2026-11-01 and *events*; every
+    landing has a flake verdict, every third one confirmed."""
+    GitRepo(root).init()
+    rows = history(FLIP_LANDINGS, start=FLIP_START, project_id=project_id,
+                   outcome=_every_third_flaky)
+    write_landing_events(root, rows, events)
+    return rows
+
+
+async def _refresh(config: DashboardConfig, at: datetime, factory: Path, curated: Path) -> None:
+    async with _QualityStore(config.quality_db) as store:
+        await refresh_markers(store.connection, config.all_project_roots, now=at,
+                              curated_path=curated, factory_repo=factory)
+
+
+@pytest.fixture
+def derived_client(client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """df and reify, each with stored landings and its own runs.db, after one marker tick; df's
+    landings also have a value sample."""
+    no_curated = tmp_path / 'no-curated-markers.yaml'
+    monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', no_curated)
+    df = _project(tmp_path / 'dark_factory', 'dark_factory', DF_EVENTS)
+    reify = _project(tmp_path / 'reify', 'reify', REIFY_EVENTS)
+    config = DashboardConfig(project_root=tmp_path / 'dark_factory',
+                             known_project_roots=[tmp_path / 'reify'])
+    df_sample = QualitySample.value(
+        'dark_factory', NOW - timedelta(minutes=5), cursor_sha=df[-1].landing.merge_sha,
+        landings_sampled=len(df), landings_deferred=0, git_check=GitCrossCheck(0, 0, 0),
+    )
+    asyncio.run(write_quality_db(config.quality_db, [*df, *reify], [df_sample]))
+    asyncio.run(_refresh(config, NOW - timedelta(minutes=5), tmp_path / 'not-a-repo', no_curated))
+    client.app.state.config = config
+    with installed_clock(client.app, fixed_clock(NOW)):
+        yield client
+
+
+def _first_landing_at_or_after(at: datetime) -> int:
+    landed_at = [row.landing.landed_at for row in history(FLIP_LANDINGS, start=FLIP_START)]
+    return bisect_left(landed_at, at)
+
+
+def _routing(markers: dict[str, Any]) -> list[dict[str, Any]]:
+    return [marker for marker in markers['value']['markers']
+            if marker['source']['type'] == 'routing']
+
+
+def test_row_7_each_project_serves_its_own_flip_dated_from_its_own_runs_db(
+    derived_client,
+) -> None:
+    df = _get(derived_client, 'project=dark_factory')['QUALITY_MARKERS']
+    reify = _get(derived_client, 'project=reify')['QUALITY_MARKERS']
+
+    assert (df['state'], reify['state']) == ('fresh', 'fresh')
+    [df_flip] = _routing(df)
+    [reify_flip] = _routing(reify)
+    assert (df_flip['kind'], df_flip['at'], df_flip['scope']) == (
+        'effort', DF_RELOAD.isoformat(), 'dark_factory')
+    assert df_flip['source'] == {'type': 'routing', 'role': 'reviewer_comprehensive',
+                                 'path': 'effort.reviewer'}
+    assert df_flip['ordinal'] == _first_landing_at_or_after(DF_RELOAD)
+    assert (reify_flip['kind'], reify_flip['at'], reify_flip['scope']) == (
+        'effort', REIFY_FLIP.isoformat(), 'reify')
+    assert reify_flip['source'] == {'type': 'routing', 'role': 'reviewer_comprehensive'}
+    assert reify_flip['ordinal'] == _first_landing_at_or_after(REIFY_FLIP)
+
+
+def test_a_derived_routing_marker_splits_the_quality_series_at_its_landing(
+    derived_client,
+) -> None:
+    body = _get(derived_client, 'project=dark_factory&window=all')
+
+    [flip] = _routing(body['QUALITY_MARKERS'])
+    boundaries = [marker['id'] for marker in body['QUALITY_MARKERS']['value']['markers']
+                  if marker['kind'] not in {'deploy', 'instrument', 'artefact'}]
+    assert boundaries == [flip['id']]
+    assert flip['id'].startswith('routing:reviewer_comprehensive:')
+    [comparison] = [comparison for comparison in body['QUALITY']['value']['before_after']
+                    if comparison['metric'] == 'flakes_confirmed']
+    assert comparison['marker_id'] == flip['id']
+    assert (comparison['n_before'], comparison['n_after']) == (
+        flip['ordinal'], FLIP_LANDINGS - flip['ordinal'])
+
+
+def test_row_8_a_one_dispatch_fallback_is_availability_not_a_marker(derived_client) -> None:
+    value = _get(derived_client, 'project=dark_factory')['QUALITY_MARKERS']['value']
+
+    assert [m for m in value['markers'] if m['source'].get('role') == 'merger'] == []
+    assert value['availability'] == [{
+        'role': 'merger', 'from_at': FALLBACK.isoformat(), 'until_at': RETURNED.isoformat(),
+        'decisions': 1, 'model': 'opus',
+    }]
+
+
+def test_the_marker_value_carries_prompt_coverage_and_the_curated_failures(
+    derived_client,
+) -> None:
+    value = _get(derived_client, 'project=dark_factory')['QUALITY_MARKERS']['value']
+
+    assert set(value) == {'markers', 'availability', 'prompt_coverage',
+                          'curated_parse_failures', 'skipped_records'}
+    assert value['prompt_coverage']['state'] == 'not_yet_written'
+    assert value['prompt_coverage']['reason'].startswith('GitUnavailable: ')
+    assert (value['curated_parse_failures'], value['skipped_records']) == (0, 0)
+
+
+ARTEFACT_DAY = (STORED_START + timedelta(days=5)).date()
+ARTEFACT_ORDINALS = frozenset(
+    ordinal for ordinal in range(STORED)
+    if (STORED_START + timedelta(hours=2 * ordinal)).date() == ARTEFACT_DAY
+)
+CURATED_ARTEFACT = f"""\
+- date: {ARTEFACT_DAY.isoformat()}
+  until: {ARTEFACT_DAY.isoformat()}
+  kind: artefact
+  project: dark_factory
+  series: [flakes_confirmed]
+  label: "fixture: a disk-full day of unconfirmable flakes"
+"""
+
+
+def _flaky(ordinal: int) -> Outcomes:
+    confirmed = ordinal in ARTEFACT_ORDINALS or ordinal % 10 == 0
+    return replace(NO_OUTCOMES, flake_confirmed=confirmed, flake_real_red=False, flake_rows=1)
+
+
+def _rate_outside_the_artefact() -> float:
+    outside = [row.outcomes.flake_confirmed is True
+               for row in history(STORED, start=STORED_START, outcome=_flaky)
+               if row.landing.ordinal not in ARTEFACT_ORDINALS]
+    return sum(outside) / len(outside)
+
+
+@pytest.fixture
+def curated_artefact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    curated = tmp_path / 'regime-markers.yaml'
+    curated.write_text(CURATED_ARTEFACT)
+    monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', curated)
+
+
+def _store_an_empty_derivation(config: DashboardConfig) -> None:
+    async def write() -> None:
+        async with _QualityStore(config.quality_db) as store:
+            await write_marker_state(store.connection, DerivedState(
+                fold=replace(RoutingFold.empty('dark_factory'), complete=True), markers=(),
+                skipped=0, prompt_coverage=PromptCoverage(
+                    digest_since=None, roles_py_landings=None, counted_since=None,
+                    reason='no routing decision is folded yet'),
+                refreshed_at=NOW - timedelta(minutes=5)))
+            await store.connection.commit()
+    asyncio.run(write())
+
+
+def test_row_6_a_curated_artefact_is_excluded_from_the_baseline_and_served_as_a_range(
+    client, tmp_path: Path, curated_artefact: None,
+) -> None:
+    with _seeded(client, tmp_path, outcome=_flaky) as seeded:
+        _store_an_empty_derivation(seeded.app.state.config)
+        body = _get(seeded, 'project=dark_factory&window=all')
+
+    assert len(ARTEFACT_ORDINALS) == 12
+    baseline = body['QUALITY']['value']['metrics']['flakes_confirmed']['baseline']
+    assert baseline['p0'] == pytest.approx(_rate_outside_the_artefact())
+    [artefact] = body['QUALITY_MARKERS']['value']['markers']
+    assert artefact['kind'] == 'artefact'
+    assert (artefact['ordinal'], artefact['until_ordinal']) == (
+        min(ARTEFACT_ORDINALS), max(ARTEFACT_ORDINALS))
+
+
+def test_before_the_first_derivation_a_curated_artefact_is_still_excluded(
+    client, tmp_path: Path, curated_artefact: None,
+) -> None:
+    with _seeded(client, tmp_path, outcome=_flaky) as seeded:
+        body = _get(seeded, 'project=dark_factory&window=all')
+
+    assert body['QUALITY_MARKERS']['state'] == 'unknown'
+    baseline = body['QUALITY']['value']['metrics']['flakes_confirmed']['baseline']
+    assert baseline['p0'] == pytest.approx(_rate_outside_the_artefact())
 
 
 def test_a_label_and_a_project_id_spelling_resolve_to_the_same_root(quality_client) -> None:
@@ -228,9 +489,11 @@ def test_a_quality_db_that_is_not_a_database_is_served_unknown_naming_the_error(
     with _seeded(client, tmp_path) as seeded:
         seeded.app.state.config.quality_db.write_bytes(b'not a sqlite database' * 64)
         with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
-            quality = _get(seeded, 'project=dark_factory&window=100')['QUALITY']
+            body = _get(seeded, 'project=dark_factory&window=100')
 
-    assert (quality['state'], quality['value']) == ('unknown', None)
-    assert quality['reason'].startswith('quality.db unreadable: DatabaseError')
-    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
-    assert record.exc_info is not None
+    for key in ('QUALITY', 'QUALITY_MARKERS'):
+        assert (body[key]['state'], body[key]['value']) == ('unknown', None)
+        assert body[key]['reason'].startswith('quality.db unreadable: DatabaseError')
+    records = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert len(records) == 2, 'one WARNING per datum that read quality.db'
+    assert all(record.exc_info is not None for record in records)

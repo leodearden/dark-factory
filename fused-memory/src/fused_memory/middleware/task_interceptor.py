@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypedDict, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
@@ -30,6 +30,7 @@ from shared.followup_items import (
     task_items,
     with_derived_bundle_keys,
 )
+from shared.git_async import GitResult, run_git
 from shared.mcp_envelope import write_failure_reason
 from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
 from shared.task_metadata import DoneProvenance
@@ -614,8 +615,11 @@ class TaskInterceptor:
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
         curator: TaskCurator | None = None,
         proc_root: Path = process_identity.PROC_ROOT,
+        git_runner: 'GitProbeRunner' = run_git,
     ):
         self.taskmaster = taskmaster
+        # Runs the done-provenance git probes (see _git_probe).
+        self._git_runner = git_runner
         # Where the deferral gate reads a held_by_session holder's /proc entries.
         self._proc_root = proc_root
         self.reconciler = targeted_reconciler
@@ -1697,6 +1701,7 @@ class TaskInterceptor:
                         is_recon_stage=is_recon_stage_write,
                         agent_id=agent_id,
                         config=self._config,
+                        git_runner=self._git_runner,
                     )
                     # This seam had NO journal row at all before 5241: a
                     # repair of an already-`done` task was invisible to the
@@ -1818,6 +1823,7 @@ class TaskInterceptor:
                     is_recon_stage=is_recon_stage_write,
                     agent_id=agent_id,
                     config=self._config,
+                    git_runner=self._git_runner,
                 )
                 if validation_err is not None:
                     # Task 5241: the done-provenance VERDICT is journaled with
@@ -1858,6 +1864,7 @@ class TaskInterceptor:
                     agent_id,
                     is_recon_stage_write,
                     self._reject_stale_done_evidence_mode(),
+                    git_runner=self._git_runner,
                 )
                 if _reopen_freshness_err is not None:
                     return _reopen_freshness_err
@@ -6504,6 +6511,24 @@ _KIND_REQUIRED_REASON = (
 # NamedTuple whose leading field names that distinction, so the semantics
 # travel with the value instead of living in a call-site variable name.
 # The authoritative branch-by-branch contract is each probe's docstring.
+# The never-completed outcome is itself a carrier, _ProbeUnavailable,
+# produced in one place (_git_probe); each probe maps it onto its own
+# honest not-yet-confirmed arm.
+
+
+_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+class GitProbeRunner(Protocol):
+    """Runs one git argv for the done-provenance probes; production passes ``shared.git_async.run_git``."""
+
+    async def __call__(self, cmd: Sequence[str], *, timeout: float | None = None) -> GitResult: ...
+
+
+class _ProbeUnavailable(NamedTuple):
+    """A git probe never rendered a verdict. See _git_probe."""
+
+    detail: str
 
 
 class _CommitResolutionFailure(NamedTuple):
@@ -6518,6 +6543,34 @@ class _AncestorCheckFailure(NamedTuple):
 
     confirmed_off_main: bool
     detail: str
+
+
+async def _git_probe(
+    git_runner: GitProbeRunner, project_root: str, *args: str,
+) -> GitResult | _ProbeUnavailable:
+    """Run ``git -C <project_root> <args>`` within the probe timeout.
+
+    Returns git's answer, whatever its exit code, or a
+    :class:`_ProbeUnavailable` when git never answered: a missing binary, a
+    timeout, or any other exception from the runner. The catch is broad on
+    purpose: ``args`` can carry caller-supplied text, and an embedded NUL
+    makes the spawn raise ``ValueError``.
+    """
+    try:
+        result = await git_runner(
+            ['git', '-C', project_root, *args], timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return _ProbeUnavailable('git binary not found')
+    except Exception as exc:
+        logger.warning(
+            'git %s probe in %s raised; reporting the check as unavailable',
+            args[0], project_root, exc_info=True,
+        )
+        return _ProbeUnavailable(f'{type(exc).__name__}: {exc}')
+    if result.timed_out:
+        return _ProbeUnavailable(f'git {args[0]} timed out')
+    return result
 
 
 def _provenance_kind(raw: object) -> str | None:
@@ -6630,6 +6683,7 @@ async def _validate_done_provenance(
     is_recon_stage: bool = False,
     agent_id: str | None = None,
     config: Any = None,
+    git_runner: GitProbeRunner,
 ) -> tuple[dict | None, dict | None]:
     """Authorize, parse and resolve done_provenance for set_task_status(done).
 
@@ -6730,7 +6784,7 @@ async def _validate_done_provenance(
     resolved = provenance.recorded_evidence()
     commit_input = provenance.commit
     if commit_input is not None:
-        sha_or_err = await _resolve_commit_sha(project_root, commit_input)
+        sha_or_err = await _resolve_commit_sha(project_root, commit_input, git_runner=git_runner)
         if isinstance(sha_or_err, _CommitResolutionFailure):
             # Only a git-issued rejection is a "not found" verdict; see
             # _resolve_commit_sha for the branch-by-branch contract.
@@ -6744,7 +6798,9 @@ async def _validate_done_provenance(
             resolved['commit_input'] = commit_input
         # The ancestor backstop applies to every kind that cites a commit,
         # not only the kinds that require one.
-        ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
+        ancestor_result = await _verify_commit_on_main(
+            project_root, sha_or_err, git_runner=git_runner,
+        )
         if ancestor_result is not None:
             # rc=1 is the only confirmed off-main verdict; every other
             # failure is NOT-YET-CONFIRMED and carries the opposite remedy.
@@ -6803,7 +6859,9 @@ async def _validate_done_provenance(
     return None, resolved
 
 
-async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckFailure | None:
+async def _verify_commit_on_main(
+    project_root: str, sha: str, *, git_runner: GitProbeRunner,
+) -> _AncestorCheckFailure | None:
     """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
 
     Returns None on success (commit is on main). On failure, returns an
@@ -6826,41 +6884,24 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckF
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'merge-base',
-            '--is-ancestor',
-            sha,
-            'main',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _AncestorCheckFailure(False, 'git merge-base timed out')
-    except FileNotFoundError:
-        return _AncestorCheckFailure(False, 'git binary not found')
-    except Exception as e:
-        return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
+    result = await _git_probe(git_runner, project_root, 'merge-base', '--is-ancestor', sha, 'main')
+    if isinstance(result, _ProbeUnavailable):
+        return _AncestorCheckFailure(False, result.detail)
 
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
     #   1 — sha is NOT reachable from main
     #   other — git error (e.g. unknown ref `main`)
-    if proc.returncode == 0:
+    if result.returncode == 0:
         return None
-    if proc.returncode == 1:
+    if result.returncode == 1:
         return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
-    msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return _AncestorCheckFailure(False, msg)
+    return _AncestorCheckFailure(False, result.stderr or 'merge-base failed')
 
 
-async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
+async def _resolve_commit_sha(
+    project_root: str, commit: str, *, git_runner: GitProbeRunner,
+) -> str | _CommitResolutionFailure:
     """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
 
     Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
@@ -6880,34 +6921,14 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'rev-parse',
-            '--verify',
-            f'{commit}^{{commit}}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _CommitResolutionFailure(False, 'git rev-parse timed out')
-    except FileNotFoundError:
-        return _CommitResolutionFailure(False, 'git binary not found')
-    except Exception as e:
-        return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
-
-    if proc.returncode != 0:
-        msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return _CommitResolutionFailure(True, msg)
-    sha = stdout.decode('utf-8', errors='replace').strip()
-    if not sha or len(sha) < 7:
+    result = await _git_probe(git_runner, project_root, 'rev-parse', '--verify', f'{commit}^{{commit}}')
+    if isinstance(result, _ProbeUnavailable):
+        return _CommitResolutionFailure(False, result.detail)
+    if result.returncode != 0:
+        return _CommitResolutionFailure(True, result.stderr or 'no such ref')
+    if len(result.stdout) < 7:
         return _CommitResolutionFailure(False, 'empty rev-parse output')
-    return sha
+    return result.stdout
 
 
 # ── Reopen-freshness gate (task 2674, PRD task alpha) ───────────────────
@@ -6919,54 +6940,20 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
 # (task 2649 stamps this atomically on every terminal-exit reopen).
 
 
-async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | None:
+async def _resolve_commit_committed_at(
+    project_root: str, sha: str, *, git_runner: GitProbeRunner,
+) -> str | None:
     """Resolve a commit's committer date via ``git show -s --format=%cI``.
 
     Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
     success, or None on any failure (git binary missing, non-zero exit,
-    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
-    subprocess/timeout/error-handling shape for consistent semantics.
+    timeout, empty output). Runs through :func:`_git_probe`, like the other
+    done-provenance probes, so it shares their timeout and error handling.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'show',
-            '-s',
-            '--format=%cI',
-            sha,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            # Reap the killed child promptly rather than leaving it as a
-            # transient zombie until GC finalizes the Process object.
-            await proc.wait()
-            return None
-    except FileNotFoundError:
+    result = await _git_probe(git_runner, project_root, 'show', '-s', '--format=%cI', sha)
+    if isinstance(result, _ProbeUnavailable) or not result.ok:
         return None
-    except Exception:
-        # Loud fail-safe (silent-fallthrough gate, sig-b): an unexpected error
-        # in this best-effort committer-date probe must surface in the log
-        # rather than vanish. Behaviour is unchanged (still returns None); the
-        # WARN just makes the swallow observable, matching the "loud over
-        # silent" directive the gate enforces.
-        logger.warning(
-            '_resolve_commit_committed_at: unexpected error resolving committer '
-            'date for %s; returning None',
-            sha,
-            exc_info=True,
-        )
-        return None
-
-    if proc.returncode != 0:
-        return None
-    committed_at = stdout.decode('utf-8', errors='replace').strip()
-    return committed_at or None
+    return result.stdout or None
 
 
 def _extract_reopen_at(before: Any) -> str | None:
@@ -7079,6 +7066,8 @@ async def _check_reopen_freshness(
     agent_id: str | None,
     is_recon_stage: bool,
     mode: str,
+    *,
+    git_runner: GitProbeRunner,
 ) -> dict | None:
     """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
 
@@ -7153,7 +7142,9 @@ async def _check_reopen_freshness(
     if not reopen_at:
         return None
 
-    evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
+    evidence_committed_at = await _resolve_commit_committed_at(
+        project_root, evidence_commit, git_runner=git_runner,
+    )
     if evidence_committed_at is None:
         # Distinguishable from a genuine date-based staleness verdict: this
         # fires whenever `git show` itself failed (binary missing, timeout,
@@ -7216,6 +7207,7 @@ async def _repair_done_provenance_same_status(
     is_recon_stage: bool = False,
     agent_id: str | None = None,
     config: Any = None,
+    git_runner: GitProbeRunner,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -7258,6 +7250,7 @@ async def _repair_done_provenance_same_status(
         is_recon_stage=is_recon_stage,
         agent_id=agent_id,
         config=config,
+        git_runner=git_runner,
     )
     if validation_err is not None:
         return validation_err

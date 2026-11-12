@@ -218,10 +218,11 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
 
     # ``timeout`` is accepted-and-ignored: the unit threads
     # task_snapshot.PER_CALL_TIMEOUT into both reads, so a stub missing the
-    # keyword raises TypeError instead of shaping rows.
+    # keyword raises TypeError instead of shaping rows. ``fields`` is ignored
+    # too: *fetch* answers rows that are already shaped.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, timeout=None,
+        statuses=None, fields=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
