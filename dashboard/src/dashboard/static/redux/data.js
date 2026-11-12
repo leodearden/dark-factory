@@ -136,6 +136,12 @@ const ON_DEMAND_KEYS = {
   },
 };
 
+// A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
+// active_tasks.py::task_uid, which builds the uid every served row carries.
+function taskUid(project, id) {
+  return `${project}/T-${id}`;
+}
+
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
 // in place rather than reassigning, so cached references stay valid.
 const STABLE_ARRAY_KEYS = new Set(['PROJECTS', 'AGENTS']);
@@ -672,6 +678,27 @@ function onDemandDatum(name, param, outcome) {
   return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
 }
 
+// The on-demand protocol for a component, built over the caller's React as
+// task_snapshot.js::createTerminalWindowHooks is, since data.js also loads
+// under node without one. useOnDemand(name, param) requests the row's value
+// whenever `param` changes and ignores the answer to a request a newer param
+// superseded. It returns { view, value }: onDemandView's answer and the value
+// now in DF_DATA, so a caller only chooses what each view looks like.
+function createOnDemandHook({ useState, useEffect }) {
+  function useOnDemand(name, param) {
+    const [outcome, setOutcome] = useState(null);
+    useEffect(() => {
+      let current = true;
+      setOutcome(null);
+      requestOnDemand(name, param).then(settled => { if (current) setOutcome(settled); });
+      return () => { current = false; };
+    }, [name, param]);
+    const value = window.DF_DATA[onDemandRow(name).key(param)];
+    return { view: onDemandView(value, outcome), value };
+  }
+  return { useOnDemand };
+}
+
 // `stateKey` names the flow-control, staleness and receipt entry this request
 // owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
 // and every existing direct caller keeps working. An on-demand request passes
@@ -1102,11 +1129,13 @@ const DF_DATA_LOADER_API = {
   pollKey,
   datumFor,
   ON_DEMAND_KEYS,
+  taskUid,
   requestOnDemand,
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
   onDemandDatum,
+  createOnDemandHook,
   pollSetFor,
   scopePollingToTab,
 };

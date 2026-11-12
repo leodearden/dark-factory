@@ -13,6 +13,7 @@ const { useState: uS, useEffect: uE } = React;
 const { ProjectGroup, Pip, DatumReading, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const DF_LOADER_ESC = window.DF_DATA_LOADER;
+const { useOnDemand } = DF_LOADER_ESC.createOnDemandHook(React);
 const C = window.DF_CHARTS;
 const { pinningSummary } = window.DF_PINS_RECOVERY;
 // The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
@@ -687,18 +688,11 @@ function CheckOwnerSection({ panel }) {
 
 // ── LinkedTaskProse — the linked task's description, read on demand ──
 // Task rows carry no prose; this is the Task Detail pane's taskProse read
-// (tab_tasks.jsx::TaskProse), addressed by the same `<project>/T-<id>` uid.
+// (tab_tasks.jsx::TaskProse), addressed by the same task uid.
 
 function LinkedTaskProse({ uid }) {
-  const [outcome, setOutcome] = uS(null);
-  uE(() => {
-    let current = true;
-    setOutcome(null);
-    DF_LOADER_ESC.requestOnDemand('taskProse', uid).then(o => { if (current) setOutcome(o); });
-    return () => { current = false; };
-  }, [uid]);
-  const prose = DF[DF_LOADER_ESC.ON_DEMAND_KEYS.taskProse.key(uid)];
-  switch (DF_LOADER_ESC.onDemandView(prose, outcome)) {
+  const { view, value: prose } = useOnDemand('taskProse', uid);
+  switch (view) {
     case DF_LOADER_ESC.ON_DEMAND_VIEWS.ready:
       return prose.description ? (
         <div style={{ fontSize: 11, color: 'var(--fg-2)', whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
@@ -708,7 +702,7 @@ function LinkedTaskProse({ uid }) {
     case DF_LOADER_ESC.ON_DEMAND_VIEWS.loading:
       return <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>loading…</div>;
     default:
-      return <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>The description of this task could not be fetched.</div>;
+      return <div style={{ fontSize: 11, color: 'var(--warn)' }}>The description of this task could not be fetched.</div>;
   }
 }
 
@@ -806,7 +800,7 @@ function EscalationSidebar({ row, onClose }) {
                 {card.age && <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>{card.age}</span>}
               </div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--fg-0)', marginBottom: 4 }}>{task.title || '—'}</div>
-              <LinkedTaskProse uid={`${row.project}/T-${task.id}`} />
+              <LinkedTaskProse uid={DF_LOADER_ESC.taskUid(row.project, task.id)} />
             </div>
           )}
         </div>
