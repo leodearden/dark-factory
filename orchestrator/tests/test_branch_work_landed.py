@@ -393,6 +393,32 @@ def build_unlanded_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
     return sc
 
 
+def build_main_merged_only_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
+    """A branch whose only commit beyond main is a ``--no-ff`` merge OF main.
+
+    Main advances past the creation point first, by an earlier round's commit
+    citing the task and then by an unrelated one, and the branch then pulls
+    main in.  ``git cherry`` skips merge commits, so it prints nothing at all:
+    the branch has no non-merge commit whose containment could be proven.
+    """
+    base = repo.sha('main')
+    repo.git('branch', branch, base)
+    repo.commit(f'impl({TASK_ID}): earlier round', {'pkg/earlier.py': _numbered('earlier', 12)})
+    repo.commit('chore: unrelated work by another task', {'CHANGELOG.md': _numbered('log', 5)})
+    repo.git('checkout', branch)
+    repo.git('merge', '--no-ff', 'main', '-m', f'Merge main into {branch}')
+    repo.git('checkout', 'main')
+
+    sc = Scenario(
+        repo=repo, branch=branch, branch_base_sha=base, landed_sha=None,
+        metadata={'branch_base_sha': base},
+    )
+    sc.refresh()
+    assert repo.git('cherry', 'main', sc.branch_tip_sha) == ''
+    assert repo.git_rc('merge-base', '--is-ancestor', sc.branch_tip_sha, 'main')[0] != 0
+    return sc
+
+
 def advance_main_touching_same_paths(
     sc: Scenario, count: int, *, rewrite: bool = False, start: int = 0,
 ) -> list[str]:
@@ -1254,7 +1280,7 @@ class TestB2SyncMergeTip:
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
         assert verdict.reason is not LandingReason.no_op_landing, verdict.probe
-        assert verdict.probe.get('patch_id_contained') is True, (
+        assert verdict.probe.get('patch_id_containment') == 'contained', (
             'the patch-id arm must actually have run and answered'
         )
 
@@ -1356,6 +1382,7 @@ class TestB2SyncMergeTip:
             build_no_op_landing,
             build_unlanded_branch,
             build_degenerate_branch,
+            build_main_merged_only_branch,
         ],
     )
     async def test_neither_decaying_predicate_is_ever_awaited(
@@ -1387,6 +1414,53 @@ class TestB2SyncMergeTip:
         assert branch_content == [], 'branch_content_in_main (git_ops.py) must never be reached'
         assert effect_present == [], 'commit_effect_present_in_main must never be reached'
         assert describe_effect == [], 'describe_commit_effect_in_main must never be reached'
+
+
+@pytest.mark.asyncio
+class TestEmptyContainmentIsRefused:
+    """Empty ``git cherry`` output carries no content proof, so it is not a landing.
+
+    The rule is ``skills/_shared/deriving-landed-sha.md`` check (c)'s: a branch
+    with no non-merge commit beyond main has nothing whose containment could
+    be proven, however its merge history reads.
+    """
+
+    async def test_a_branch_holding_only_a_merge_of_main_is_not_landed(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_main_merged_only_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.not_landed
+        assert verdict.evidence_sha is None
+        assert verdict.probe['patch_id_containment'] == 'vacuous'
+
+    async def test_without_a_recorded_base_the_no_op_guard_still_answers_first(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_main_merged_only_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.reason is LandingReason.no_op_landing, verdict.probe
+
+    @pytest.mark.parametrize(
+        ('build', 'containment'),
+        [(build_rebased_landing, 'contained'), (build_unlanded_branch, 'not_contained')],
+    )
+    async def test_containment_is_recorded_as_a_structured_fact(
+        self, git_ops: GitOps, repo: _Repo, build, containment: str,
+    ) -> None:
+        sc = build(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.probe['patch_id_containment'] == containment
 
 
 # --------------------------------------------------------------------------

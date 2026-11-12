@@ -987,9 +987,7 @@ class TestProbeLandingPatchIdArm:
 
         Such a commit reads '+' in ``git cherry``, and so does a genuine
         landing whose context drifted (task 6936).  Either way the answer is
-        ``no_signal``: here the arm under-reports.  It can also over-report,
-        when ``git cherry`` prints nothing at all; see
-        ``test_main_merged_into_branch_with_recorded_base_is_not_a_landing``.
+        ``no_signal``: here the arm under-reports.
         """
         landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
         landing_git(landing.repo, 'checkout', 'task/6978')
@@ -1112,26 +1110,14 @@ class TestProbeLandingPatchIdArm:
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
         assert verdict.reason == 'no_op_landing'
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            'branch_work_landed reads empty git cherry output as contained, and with a '
-            "recorded branch_base_sha its no-op guard measures base..tip, which holds main's "
-            'changes, so the verdict is landed at the earlier citing commit. Follow-up ticket '
-            'tkt_0RWW0SXKJP4TV6YV4GZ235YX8Q (landing_evidence.py) removes this marker.'
-        ),
-    )
     async def test_main_merged_into_branch_with_recorded_base_is_not_a_landing(
         self, tmp_path: Path,
     ) -> None:
         """The same branch, with the creation point every dispatched task records.
 
-        None of the task's work is on main beyond an earlier round's citing
-        commit, so the right answer is no landing.  Today the producer
-        answers ``found_on_main`` at that earlier commit, reported as fully
-        guarded: an over-report, documented as residual (b) in
-        ``escalation/src/escalation/git_authority.py::found_on_main_response``.
+        Empty ``git cherry`` output carries no content proof: the branch has
+        no non-merge commit beyond main, so nothing of its own is shown to be
+        on main and it is not a landing, whatever an earlier round cited.
         """
         repo = tmp_path / 'repo'
         new_repo(repo)
@@ -1140,6 +1126,8 @@ class TestProbeLandingPatchIdArm:
         verdict = await _probe_repo(repo, '6978', metadata={'branch_base_sha': base})
 
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
+        assert verdict.reason == 'not_landed'
+        assert verdict.merge_sha is None
 
 
 class TestGitAuthorityVerdict:
