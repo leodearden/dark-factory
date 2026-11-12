@@ -15,20 +15,19 @@ import itertools
 import json
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 import pytest
+from _task_store_shapes import CREATED_AT_COLUMNS, store_without_created_at
 from shared.project_layout import tasks_db
 from shared.task_created_at import CreatedAtSource
-from shared.task_store_schema import TASK_STORE_DDL
 
 from fused_memory.backends import sqlite_task_backend
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 
-_CREATED_AT_COLUMNS = ('created_at', 'created_at_source')
 _TASK_STORE_TIMESTAMP_FORM = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z')
 
 
@@ -41,28 +40,6 @@ def _row(task_id: int, **columns: object) -> dict[str, object]:
         'updated_at': '2026-01-01T00:00:00.000Z',
         **columns,
     }
-
-
-def _store_without_created_at(
-    db_path: Path, *, user_version: int, rows: Sequence[Mapping[str, object]]
-) -> None:
-    """The real store shape minus the two created_at columns, stamped *user_version*."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(TASK_STORE_DDL)
-        for column in _CREATED_AT_COLUMNS:
-            conn.execute(f'ALTER TABLE tasks DROP COLUMN {column}')
-        for row in rows:
-            columns = ', '.join(row)
-            placeholders = ', '.join('?' for _ in row)
-            conn.execute(
-                f'INSERT INTO tasks ({columns}) VALUES ({placeholders})', tuple(row.values())
-            )
-        conn.execute(f'PRAGMA user_version = {user_version}')
-        conn.commit()
-    finally:
-        conn.close()
 
 
 @contextlib.contextmanager
@@ -86,7 +63,7 @@ def _created_at_column_shapes(db_path: Path) -> dict[str, tuple[str, int]]:
             for _cid, name, declared_type, notnull, _default, _pk in conn.execute(
                 'PRAGMA table_info(tasks)'
             )
-            if name in _CREATED_AT_COLUMNS
+            if name in CREATED_AT_COLUMNS
         }
 
 
@@ -112,7 +89,7 @@ def _store_held_at_v3(db_path: Path) -> None:
         'metadata': json.dumps({'files': ['x.py']}),
         'candidate_key': compute_candidate_key('Ambiguous task', ['x.py']),
     }
-    _store_without_created_at(
+    store_without_created_at(
         db_path,
         user_version=3,
         rows=[_row(1, status='done', **ambiguous), _row(2, status='pending', **ambiguous)],
@@ -121,7 +98,7 @@ def _store_held_at_v3(db_path: Path) -> None:
 
 def _created_at_pair(task: Mapping[str, object]) -> dict[str, object]:
     """The created_at keys a wire task carries; an absent key stays absent."""
-    return {key: task[key] for key in _CREATED_AT_COLUMNS if key in task}
+    return {key: task[key] for key in CREATED_AT_COLUMNS if key in task}
 
 
 @contextlib.asynccontextmanager
@@ -145,7 +122,7 @@ async def _backend(
 async def test_a_v5_store_migrates_to_v6_and_the_open_invents_no_value(tmp_path):
     project_root = tmp_path / 'proj'
     db_path = tasks_db(project_root)
-    _store_without_created_at(db_path, user_version=5, rows=[_row(1)])
+    store_without_created_at(db_path, user_version=5, rows=[_row(1)])
 
     async with _backend(tmp_path) as backend:
         await backend.get_tasks(project_root=str(project_root))
@@ -175,7 +152,7 @@ async def test_a_store_held_at_v3_by_the_candidate_key_self_gate_still_gains_bot
     )
     assert len(flagged_groups) == 1, flagged_groups
     assert _user_version(db_path) == 3
-    assert set(_created_at_column_shapes(db_path)) == set(_CREATED_AT_COLUMNS)
+    assert set(_created_at_column_shapes(db_path)) == set(CREATED_AT_COLUMNS)
 
 
 @pytest.mark.asyncio
@@ -229,7 +206,7 @@ async def test_a_deferred_insert_is_stamped_and_no_later_write_rewrites_its_fili
 @pytest.mark.asyncio
 async def test_a_migrated_row_not_yet_backfilled_is_served_with_both_keys_null(tmp_path):
     project_root = tmp_path / 'proj'
-    _store_without_created_at(tasks_db(project_root), user_version=5, rows=[_row(1)])
+    store_without_created_at(tasks_db(project_root), user_version=5, rows=[_row(1)])
 
     async with _backend(tmp_path) as backend:
         rows = (await backend.get_tasks(project_root=str(project_root)))['tasks']
@@ -257,7 +234,7 @@ async def test_a_store_held_at_v3_accepts_add_task_and_stamps_the_new_row(tmp_pa
 @pytest.mark.asyncio
 async def test_a_store_whose_columns_never_landed_is_served_without_the_keys(tmp_path):
     project_root = tmp_path / 'proj'
-    _store_without_created_at(tasks_db(project_root), user_version=6, rows=[_row(1)])
+    store_without_created_at(tasks_db(project_root), user_version=6, rows=[_row(1)])
 
     async with _backend(tmp_path) as backend:
         rows = (await backend.get_tasks(project_root=str(project_root)))['tasks']

@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+from _task_store_shapes import store_without_created_at
 from shared.project_layout import tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
 
@@ -72,16 +73,7 @@ async def test_a_v5_store_the_backend_migrates_ends_with_exactly_the_columns_tas
 ):
     project_root = tmp_path / 'proj'
     db_path = tasks_db(project_root)
-    db_path.parent.mkdir(parents=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(TASK_STORE_DDL)
-        conn.execute('ALTER TABLE tasks DROP COLUMN created_at')
-        conn.execute('ALTER TABLE tasks DROP COLUMN created_at_source')
-        conn.execute('PRAGMA user_version = 5')
-        conn.commit()
-    finally:
-        conn.close()
+    store_without_created_at(db_path, user_version=5)
 
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
     await backend.start()
