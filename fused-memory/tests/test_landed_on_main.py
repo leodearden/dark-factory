@@ -432,6 +432,23 @@ async def test_feat_prefix_merge_into_trunk_is_landed(trunk_repo: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_feat_50_landing_into_trunk_does_not_land_feat_5(trunk_repo: Path) -> None:
+    _git(
+        trunk_repo, 'commit', '-q', '--allow-empty',
+        '-m', format_merge_subject('feat/50', 'trunk'),
+        when=T0,
+    )
+
+    verdicts = await probe_landing(
+        str(trunk_repo), [LandingQuery('5'), LandingQuery('50')],
+        branch_prefix='feat/', main_branch='trunk',
+    )
+
+    assert verdicts['5'] == LandingVerdict.not_landed()
+    assert verdicts['50'].landed is True
+
+
+@pytest.mark.asyncio
 async def test_revert_subject_for_an_unlanded_task_is_not_a_landing(trunk_repo: Path) -> None:
     _git(
         trunk_repo, 'commit', '-q', '--allow-empty',

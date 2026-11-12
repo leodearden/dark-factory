@@ -99,6 +99,11 @@ class TestWriterAndMergeMarker:
         assert await git_ops.find_merge_marker('feat/51', gate_on_existing_ref=False) is None
         assert await git_ops.find_merge_marker_checked('feat/51') is None
 
+    async def test_feat_50s_landing_is_not_feat_5s_marker(self, feat_trunk: FeatTrunk) -> None:
+        git_ops = feat_trunk.git_ops
+        assert await git_ops.find_merge_marker('feat/5', gate_on_existing_ref=False) is None
+        assert await git_ops.find_merge_marker_checked('feat/5') is None
+
 
 _TEMPLATES = [
     pytest.param(DEFAULT_COMMIT_CITATION_PATTERN, id='default'),
@@ -176,6 +181,11 @@ class TestEvalMinersFollowTheConfiguredSubject:
     def test_mining_resolves_only_the_landing(self, feat_trunk: FeatTrunk) -> None:
         assert _resolve_feat_trunk('50', feat_trunk.repo) == feat_trunk.merge_sha
         assert _resolve_feat_trunk('51', feat_trunk.repo) is None
+
+    def test_mining_does_not_resolve_an_id_the_landing_merely_starts_with(
+        self, feat_trunk: FeatTrunk,
+    ) -> None:
+        assert _resolve_feat_trunk('5', feat_trunk.repo) is None
 
     def test_mining_reads_the_subject_not_a_body_line(self, feat_trunk: FeatTrunk) -> None:
         repo = feat_trunk.repo
