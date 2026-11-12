@@ -46,6 +46,7 @@ from shared.testing_streams import (
 )
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphProxy, open_graph
+from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -1040,25 +1041,34 @@ class TestReaderRejectsUnusableContent:
         assert 'NoneType' in str(exc.value)
 
 
-class TestReaderDefaultsToTheConfiguredStore:
-    """With no host/port the reader reads the store the config names: the production corpus.
+class TestTheCliReadsTheConfiguredStore:
+    """The CLI reads the store the config names: the production corpus.
 
     FALKOR_HOST/FALKOR_PORT aim the test suite at the scratch FalkorDB, so they
     must never move this read: the corpus exists only on production.
     """
 
-    def test_the_reader_follows_falkordb_uri_not_the_test_knobs(self, monkeypatch):
+    @pytest.fixture
+    def corpus_elsewhere(self, monkeypatch):
         monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
         monkeypatch.setenv('FALKOR_HOST', '127.0.0.1')
         monkeypatch.setenv('FALKOR_PORT', '16380')
 
-        reader = _mod.EpisodeReader(graph_name='g')
+    def test_the_corpus_source_follows_falkordb_uri_not_the_test_knobs(self, corpus_elsewhere):
+        assert _mod.configured_corpus_source() == FalkorEndpoint('corpus.invalid', 7001)
 
-        assert (reader.host, reader.port) == ('corpus.invalid', 7001)
+    def test_the_build_reads_from_the_corpus_source(self, corpus_elsewhere, monkeypatch, tmp_path):
+        _, factory = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--dry-run')
 
-    def test_explicit_arguments_win_over_the_config(self, monkeypatch):
-        monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
-        reader = _mod.EpisodeReader(graph=_FalkorDouble([]), host='other', port=1234)
+        assert [(call['host'], call['port']) for call in factory.calls] == [('corpus.invalid', 7001)]
+
+    def test_a_reader_with_neither_a_graph_nor_an_address_is_refused(self):
+        with pytest.raises(ValueError, match='graph handle or a host and port'):
+            _mod.EpisodeReader(graph_name='g')
+
+    def test_a_reader_keeps_the_address_it_is_given(self):
+        reader = _mod.EpisodeReader(graph_name='g', host='other', port=1234)
+
         assert (reader.host, reader.port) == ('other', 1234)
 
 
@@ -2202,6 +2212,10 @@ class _StubReaderFactory:
         self.calls.append(dict(kwargs))
         return _REAL_READER(graph=self.double, **kwargs)
 
+    @property
+    def graph_names(self) -> list[str]:
+        return [call['graph_name'] for call in self.calls]
+
 
 def _cli_rows(population=None) -> list[list[object]]:
     """Result-set rows for a population, in PROJECTED_FIELDS order."""
@@ -2349,7 +2363,7 @@ class TestCliBuildMode:
             monkeypatch, '--n', '20', '--seed', 's', '--graph', 'other_graph',
             '--out', str(out),
         )
-        assert factory.calls == [{'graph_name': 'other_graph'}]
+        assert factory.graph_names == ['other_graph']
 
     def test_build_prints_the_stratification_report(self, monkeypatch, tmp_path, capsys):
         out = tmp_path / 'corpus_manifest.json'
@@ -2579,7 +2593,7 @@ class TestCliVerifyMode:
         _, factory = _run_cli(
             monkeypatch, '--verify', '--out', str(out), '--graph', 'other_graph'
         )
-        assert factory.calls == [{'graph_name': 'dark_factory'}]
+        assert factory.graph_names == ['dark_factory']
 
     def test_the_graph_flag_is_the_fallback_for_a_manifest_recording_none(
         self, monkeypatch, tmp_path
@@ -2592,7 +2606,7 @@ class TestCliVerifyMode:
         _, factory = _run_cli(
             monkeypatch, '--verify', '--out', str(out), '--graph', 'other_graph'
         )
-        assert factory.calls == [{'graph_name': 'other_graph'}]
+        assert factory.graph_names == ['other_graph']
 
     def test_n_and_seed_flags_are_ignored_under_verify(self, monkeypatch, tmp_path):
         """Verification re-derives from the RECORDED criteria, never the flags.

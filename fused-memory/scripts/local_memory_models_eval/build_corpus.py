@@ -463,7 +463,7 @@ def require_known_payload_kinds(population: list[EpisodeRecord]) -> None:
     )
 
 
-ALLOCATION_RULE ='min-1-floor + largest-remainder proportional, capped at cell size'
+ALLOCATION_RULE = 'min-1-floor + largest-remainder proportional, capped at cell size'
 """Recorded verbatim in the manifest's criteria so a reviewer can re-derive.
 
 The string is the contract; :func:`allocate` is its implementation. A manifest
@@ -786,9 +786,8 @@ class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with host/port, which default to the FalkorDB
-    ``FusedMemoryConfig()`` names (``FALKORDB_URI``), where the corpus lives.
-    Either way it reads through
+    double) or with the host/port of the FalkorDB to read (the CLI passes
+    :func:`configured_corpus_source`). Either way it reads through
     ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
     owns the read-only guard and opens the ``falkordb.asyncio`` client lazily,
     on the first read, without ever constructing graphiti's ``FalkorDriver``.
@@ -802,10 +801,11 @@ class EpisodeReader:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
-        if host is None or port is None:
-            configured = FalkorEndpoint.from_uri(FusedMemoryConfig().graphiti.falkordb.uri)
-            host = configured.host if host is None else host
-            port = configured.port if port is None else port
+        if graph is None and (host is None or port is None):
+            raise ValueError(
+                f'EpisodeReader needs a graph handle or a host and port, got host={host!r} '
+                f'port={port!r}'
+            )
         self.graph_name = graph_name
         self.host = host
         self.port = port
@@ -1633,6 +1633,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configured_corpus_source() -> FalkorEndpoint:
+    """The FalkorDB ``FusedMemoryConfig()`` names (``FALKORDB_URI``): where the corpus lives."""
+    return FalkorEndpoint.from_uri(FusedMemoryConfig().graphiti.falkordb.uri)
+
+
 def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     """Read the whole ``Episodic`` population from *graph_name*.
 
@@ -1654,8 +1659,10 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     the first read, so a failure from there is genuinely a store-connectivity
     condition too.
     """
+    source = configured_corpus_source()
+    reader = EpisodeReader(graph_name=graph_name, host=source.host, port=source.port)
     try:
-        return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+        return asyncio.run(reader.fetch_population())
     except _store_error_types() as exc:
         raise CorpusBuildError(
             f'the store could not be read ({type(exc).__name__}): {exc}'
