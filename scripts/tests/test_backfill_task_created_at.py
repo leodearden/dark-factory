@@ -1,10 +1,9 @@
 """Tests for scripts/backfill_task_created_at.py (task 8558).
 
 PRD ``plans/instruments-honesty-prd.md`` decision 3 and boundary row 7: the
-backfill fills only rows whose ``created_at`` is NULL, with the earliest usable
-of the task's first runs.db event, its un-back-filled ``metadata.pending_since``
-and its ``updated_at`` (each is an upper bound on the filing time; an exact tie
-goes to that order); it prints per-source counts and a second run writes nothing.
+backfill fills only rows whose ``created_at`` is NULL, each by the rule of
+``scripts/backfill_task_created_at.py::choose_created_at``; it prints per-source
+counts and a second run writes nothing.
 
 Each test builds a project root holding a real-shape tasks.db (from
 ``shared.task_store_schema.TASK_STORE_DDL``) and a runs.db (from conftest's

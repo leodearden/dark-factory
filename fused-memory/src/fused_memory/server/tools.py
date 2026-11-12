@@ -8704,7 +8704,8 @@ def create_mcp_server(
                 ``field`` and ``allowed``.  Composes with ``statuses`` and ``page_size``.
                 The row keys are ``backends/task_projection.py::TASK_ROW_KEYS``; among
                 them ``created_at`` is the filing time and ``created_at_source`` its
-                provenance (stamped | first_event | pending_since | updated_at).
+                provenance, a ``shared/src/shared/task_created_at.py::CreatedAtSource``
+                value.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
