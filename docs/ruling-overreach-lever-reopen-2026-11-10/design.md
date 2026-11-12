@@ -434,6 +434,32 @@ code, because O6 is an arm: `ARMS['o6']`, the control's instructions on
 4. `score`. Its `comparison.o6` is the §2.4 decision against the control
    from that same run and sitting.
 
+**O6 measured, 2026-11-12, task 9065.** §7's temperature residual came true.
+gpt-6.1-sol refuses temperature with HTTP 400, and with temperature omitted
+it runs at the API's default effort. Under ruling esc-9065-2 the single arm
+`o6` therefore became two declared arms, `o6-low` and `o6-medium`. Each
+sends no temperature and an explicit `reasoning.effort`, and each was scored
+against the same-run control under §6.2's unchanged checks.
+
+* **Cost.** Measured tokens replace this section's estimate:
+  * o6-low: 5,337.8 input and 1,681.8 output tokens per episode,
+    $0.02749/episode, $18.42/day;
+  * o6-medium: 2,586.5 output tokens per episode, $0.03654/episode,
+    $24.48/day;
+  * that is 23.1× and 30.7× the two calls on gpt-4o-mini, and 1.65× and 2.19×
+    the $0.01669/episode estimated above.
+* **Decision.** Both arms pass all three §6.2 checks with zero adjudicated
+  overreach (0 of 905 and 0 of 1,057 minted, against control's 48 of 328),
+  so the R→R+O6 trigger fires at effort low.
+* **Routing must inherit the client.** Any routing follow-up must inherit
+  the omit-temperature and explicit-effort handling of
+  `fused-memory/scripts/replay_overreach_extraction.py::ExplicitEffortOpenAIClient`.
+  graphiti_core 0.28.2 sends temperature to, and withholds reasoning from,
+  any model it does not recognise as a reasoning model.
+
+The measurement, its residuals and the routing task are in
+`docs/ruling-overreach-o6-replay-2026-11-12/`.
+
 ## 6. W4: the lever
 
 ### 6.1 The table, updated

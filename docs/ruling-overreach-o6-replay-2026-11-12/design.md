@@ -195,3 +195,195 @@ As 9040 §2.2, cited:
   on a parameter, an unsupported effort, or the same episode exhausting its
   output length again after a resume.
 * **No arm is re-run or re-tuned after a result**, whichever way it falls.
+
+---
+
+*§3 onward were written after adjudication and scoring. Every measured number
+is cited from this directory's `report.json` by key path, abbreviated `r.`;
+token and cost arithmetic is shown in §6. Run provenance is in
+`provenance.json`.*
+
+## 3. Run
+
+* **One replay invocation, no resume.** `replay --arm control --arm o6-low
+  --arm o6-medium` ran 2026-11-12T15:13:30Z → 16:03:44Z and exited 0. It made
+  288 `POST /v1/responses` calls, all HTTP 200, with no retry.
+* **144 records, 0 failure lines**: 48 per arm (`r.arms.<arm>.episodes`).
+  Every record names its arm's model and effort: control (gpt-4o-mini,
+  `reasoning_effort` null), o6-low (gpt-6.1-sol, low), o6-medium
+  (gpt-6.1-sol, medium) (`r.arms.<arm>.model`,
+  `r.arms.<arm>.reasoning_effort`).
+* **No deterministic failure.** No HTTP 400, no unsupported effort and no
+  output-length exhaustion, so §2.6 never fired. The largest single call
+  output was 4,459 tokens: `extract_edges` on o6-medium, 27% of graphiti's
+  16,384. The largest `extract_nodes` output was 735 tokens, 18% of 4,096
+  (`replay.jsonl`, per-record `tokens`).
+* **Minted** (`r.arms.<arm>.minted`):
+
+  | arm | minted | per episode |
+  |---|---|---|
+  | control | 328 | 6.8 |
+  | o6-low | 905 | 18.9 |
+  | o6-medium | 1,057 | 22.0 |
+
+  The worksheet held all 2,290. Every one was adjudicated, and `score`
+  accepted `verdicts.json` on its first invocation (`r.verdicts` 2290).
+* **graphiti dropped 5 edges** whose endpoint was not among the extracted
+  nodes (1 source, 4 target). Every episode read exactly 10 previous
+  episodes, identically across arms.
+
+## 4. Stability reading (not part of the decision)
+
+| | this run's `r.arms.control` | 9040 `r.arms.control` |
+|---|---|---|
+| overreach per minted, population-weighted | 0.1613 [0.1219, 0.2105] | 0.1355 [0.0977, 0.1849] |
+| overreach / day | 17.1 | 12.7 |
+| holdings / day | 43.4 | 34.9 |
+| minted (unweighted) | 328 | 292 |
+
+* The two control readings' intervals overlap.
+* `r.fidelity` holds: the 4716 production baseline is 0.1238
+  [0.0876, 0.1721], against this control's 0.1613, and
+  `r.fidelity.intervals_overlap` is true.
+* gpt-4o-mini at temperature 0.0 did not mint the same edges twice: 328 here
+  against 292 in 9040, on the same 48 episodes and the same previous-episode
+  reads. That repeat variance is why §6.2 compares against the same-run
+  control rather than against 9040's numbers.
+
+## 5. Results: each o6 arm against the same-run control
+
+| `r.comparison.<arm>` | o6-low | o6-medium | bar |
+|---|---|---|---|
+| `overreach_ratio_minted` | 0.0 | 0.0 | ≤ 0.5 |
+| `overreach_ratio_per_day` | 0.0 | 0.0 | ≤ 0.5 |
+| Wilson upper bound, per minted (`r.arms.<arm>.population_weighted.overreach_rate_minted.ci[1]`) | 0.0052 | 0.0045 | < control point 0.1613 |
+| `holding_retention` | 2.4224 | 2.6895 | ≥ 0.8 |
+| `checks` | all four true | all four true | |
+| `passes` | **true** | **true** | |
+
+* **Overreach.** Both o6 arms minted no overreach edge in the sitting:
+  0 of 905 for o6-low and 0 of 1,057 for o6-medium
+  (`r.arms.<arm>.rates.all.label_counts`). Every one of the 48 overreach
+  verdicts, and every one of the 7 misbound verdicts, landed on a control
+  edge. Control's 48 split as 42 class (ii), 4 class (iii) and 2 class (iv),
+  read from the rationales after scoring. They hit 24 of the 48 episodes
+  (`r.arms.control.rates.all.episode_hit_rate` 0.5). Both o6 arms have an
+  episode hit rate of 0.0 [0, 0.0741].
+* **Holdings/day** is 105.2 on o6-low and 116.8 on o6-medium, against
+  control's 43.4 (`r.arms.<arm>.population_weighted.holdings_per_day`). The
+  retention ratio far exceeds the bar, but it is inflated by paraphrase
+  multiplicity: the o6 arms state each holding several ways (§8). The
+  holding SHARE is slightly lower than control's, 0.3558 and 0.3357 against
+  0.4094 (`r.arms.<arm>.population_weighted.holding_share.rate`).
+* **Entities.** Each o6 arm extracted about 21.6 entities per episode against
+  control's 13.4. Per episode, a mean 60% (low) and 55% (medium) of control's
+  entity names recur by exact normalised name in the o6 arm's set
+  (`r.arms.<arm>.entities.mean_share_of_control`). The o6 arms name entities
+  more descriptively, so exact-name overlap understates shared referents.
+* **Unweighted label counts** (`r.arms.<arm>.rates.all.label_counts`):
+
+  | arm | holding | context | bookkeeping | overreach | misbound | unjudgeable |
+  |---|---|---|---|---|---|---|
+  | control | 145 | 113 | 15 | 48 | 7 | 0 |
+  | o6-low | 360 | 456 | 89 | 0 | 0 | 0 |
+  | o6-medium | 402 | 555 | 100 | 0 | 0 | 0 |
+
+* **Low against medium.** The verdict cannot separate them: both reached
+  zero. Medium costs about a third more (§6) and mints about 17% more edges,
+  for 11% more holdings/day.
+
+## 6. Cost
+
+Tokens are `r.arms.<arm>.tokens`, summed over `extract_nodes` and
+`extract_edges`. On the Responses API, output tokens include reasoning
+tokens. The prices are `score_write_triage_pairs.py::LIST_PRICES` as of
+2026-09-30, at list price with no cached-input discount: gpt-4o-mini 0.15 /
+0.60 and gpt-6.1-sol 2.00 / 10.00 USD per Mtok.
+
+| arm | input tok / episode | output tok / episode | USD / episode | USD / day (670 episodes) | USD / 30 days | × control |
+|---|---|---|---|---|---|---|
+| control | 5,190.4 | 684.7 | $0.001189 | $0.80 | $24 | 1.0 |
+| o6-low | 5,337.8 | 1,681.8 | $0.02749 | $18.42 | $553 | 23.1 |
+| o6-medium | 5,338.4 | 2,586.5 | $0.03654 | $24.48 | $734 | 30.7 |
+
+* **Arithmetic.**
+  * Control: 249,140 input and 32,865 output tokens cost $0.05709 over 48
+    episodes.
+  * o6-low: 256,216 input and 80,724 output cost $1.3197.
+  * o6-medium: 256,242 input and 124,151 output cost $1.7540.
+  * USD/day multiplies USD/episode by 670, the 2026-10-01 §10.2 measured class
+    volume.
+* **Increment over today**: +$17.62/day at low and +$23.69/day at medium.
+* **Against 9040 §5's estimate** of $0.01669/episode ($11.18/day), which
+  assumed gpt-6.1-sol emits gpt-4o-mini's output tokens. The measured cost is
+  1.65× that at low and 2.19× at medium. Output per episode is 2.46× control's
+  at low and 3.78× at medium, part reasoning tokens and part the larger number
+  of edges written out. These measured figures replace that estimate.
+* **Scope.** This prices the two extraction calls only. The other graphiti
+  calls per write stay on gpt-4o-mini. But they include per-edge resolution,
+  which scales with minted edges, and the o6 arms mint 2.8× and 3.2× the
+  edges. Their cost was not measured (§8).
+
+## 7. Trigger
+
+The pre-registered mapping (§2.4), applied:
+
+* `r.comparison.o6-low.passes` is **true**, and
+  `r.comparison.o6-medium.passes` is **true**.
+* **The 9040 §6.2 R→R+O6 trigger FIRES.** Both arms pass, so the routing
+  effort is **low**, the cheaper effort at an equal verdict.
+* One routing task is filed, `task_kind` deterministic and
+  `always_escalates`. It carries both arms' results and the §6 cost to Leo
+  for a spend ruling before anything is routed. Nothing is routed by this
+  task.
+
+## 8. Residuals
+
+* **Single adjudicator, and a style leak.** One agent labelled all 2,290
+  edges, so no inter-rater agreement exists. The worksheet named no arm, but
+  the arms wrote in visibly different styles. Some edges used terse entity
+  names ("task 4723", "Leo"). Others used expanded descriptive ones
+  ("Product requirements document session #7882", spelled-out acronyms).
+  So same-arm edges were recognisable as a group, and the stronger model's
+  style was guessable.
+  * Every overreach and misbound verdict landed on control. That perfect
+    separation cannot rule out adjudicator expectation as a contributor.
+  * Each such verdict quotes the span it contradicts and names the garble,
+    so each is checkable on its own.
+  * A second, independent rater on a sample of o6 edges is the cheap check
+    if the spend ruling wants one.
+* **What was seen before or during labelling** (`provenance.json`
+  `adjudication.blinding_residuals`):
+  * per-arm record counts and each arm's (model, effort);
+  * the five dropped-edge warnings, by type only;
+  * the worksheet's 2,290 total;
+  * a running label tally over the union of arms after each episode.
+
+  `replay.jsonl` and `report.json` were not opened until labelling ended.
+* **One run per arm.** gpt-6.1-sol's run-to-run variance is unmeasured. §4
+  shows the control's own repeat variance.
+* **Replay is not production dedupe.** The replay applies only graphiti's
+  in-batch exact-fact dedupe and resolves nothing against the live graph.
+  * The o6 arms' 2.8–3.2× minted volume is largely near-paraphrase.
+    Production resolution would merge some of it.
+  * That merge would cost the per-edge resolution calls §6 does not price.
+  * It also makes `holding_retention` an overstatement of distinct holdings
+    retained. The decision-bearing quantity is the overreach ratio, which is
+    0 either way.
+* **Previous episodes as read today.** Every episode read 10 previous
+  episodes from the live graphs on 2026-11-12, not as they stood when the
+  episode was written. All arms share this.
+* **No verbosity sent.** graphiti's reasoning-model branch sends
+  `text.verbosity` low. The effort client sends none, so the o6 arms ran at
+  the API default verbosity. A routing task that adds verbosity changes the
+  measured configuration.
+* **max_tokens as production.** No call exceeded 27% of its cap, so the
+  production caps hold for this population. This is no evidence about longer
+  episodes.
+* **The effort client lives in a script.** `ExplicitEffortOpenAIClient` is
+  replay-only. graphiti_core 0.28.2 sends temperature to, and withholds
+  reasoning from, any model it does not recognise as a reasoning model, so
+  routing must inherit this handling (§7's task names it).
+* **Population.** The 48 episodes are from two graphs (dark_factory, reify)
+  in the frozen 2026-08-25..10-01 window. The live class volume of about 670
+  episodes/day spans ten graphs.
