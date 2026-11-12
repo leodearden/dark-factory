@@ -120,8 +120,10 @@ _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
 _FORCE_EXIT_BUDGET = 75.0
 
 # A repeat stop signal this soon after the first is the same stop delivered
-# twice: over 40 restarts (2026-11-09..12) the latest repeat landed 1.542 s
-# after the first. Must stay far below the drain.
+# twice; the measurement behind the value is in the module docstring of
+# fused-memory/tests/test_server_shutdown.py. Must stay below the drain, or a
+# deliberate second signal could not force exit during it. Enforced by
+# TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
 _OPERATOR_STOP_REPEAT_WINDOW_SECS = 3.0
 
 # Mirrors TimeoutStopSec=90 in the committed systemd unit template

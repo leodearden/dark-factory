@@ -31,7 +31,7 @@ The drain stays 10 s because 10 s + _FORCE_EXIT_BUDGET 75 s must stay under
 TimeoutStopSec=90 (TestShutdownBudgetArithmetic); the review-all shutdown-sequence
 work (plans/review-all-dark_factory-20261008.md) lengthens it once it frees room.
 Over 40 restarts (2026-11-09..12) a repeat SIGTERM landed at most 1.542 s after
-the first, against the 3.0 s
+the first; that sizes
 fused-memory/src/fused_memory/server/main.py::_OPERATOR_STOP_REPEAT_WINDOW_SECS.
 """
 
@@ -874,6 +874,15 @@ class TestShutdownBudgetArithmetic:
 
         default_timeout = ServerConfig().graceful_shutdown_timeout
         assert default_timeout + main_mod._FORCE_EXIT_BUDGET < main_mod._SYSTEMD_TIMEOUT_STOP_SECS
+
+    def test_repeat_stop_window_stays_below_the_drain(self):
+        """A window reaching the drain would ignore a deliberate second signal
+        for the whole drain, removing the force-exit escape hatch."""
+        import fused_memory.server.main as main_mod
+        from fused_memory.config.schema import ServerConfig
+
+        default_timeout = ServerConfig().graceful_shutdown_timeout
+        assert default_timeout > main_mod._OPERATOR_STOP_REPEAT_WINDOW_SECS
 
     def test_schema_mirror_constants_match_main(self):
         """ServerConfig._validate_graceful_shutdown_timeout_budget duplicates

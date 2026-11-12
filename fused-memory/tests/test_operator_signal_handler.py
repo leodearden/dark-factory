@@ -164,7 +164,7 @@ class TestInstallOperatorStopHandlerIntegration:
             _install_operator_stop_handler(_counting_stop)
             os.kill(os.getpid(), signal.SIGTERM)
             os.kill(os.getpid(), signal.SIGTERM)
-            # noqa: wall-clock-deadline — hang guard on self-delivered signals  # debt: task 6274
+            # noqa: wall-clock-deadline — hang guard on self-delivered signals  # debt: ticket tkt_0RWXHMRTEJ3RQZ46X2R1VMP7HS
             await asyncio.wait_for(second_received.wait(), timeout=2.0)
 
         with asyncio.Runner() as runner:
@@ -260,15 +260,23 @@ class _FakeClock:
 
 class TestOperatorStopCallbackForceExit:
     """The first stop signal drains; a repeat inside the window is the same stop
-    delivered twice (task 9493: a systemd restart under the default
-    KillMode=control-group delivered 2-4 SIGTERMs, the latest 1.542 s after the
-    first); a later second signal still forces exit, which is uvicorn's
-    deliberate-second-Ctrl-C escape hatch, lost otherwise because
+    delivered twice (task 9493); a later second signal still forces exit, which
+    is uvicorn's deliberate-second-Ctrl-C escape hatch, lost otherwise because
     ``install_signal_handlers`` is neutered.
+
+    The policy tests pass an explicit window, so they pin the behaviour rather
+    than the production value; the ``default`` tests pin that value.
     """
+
+    _WINDOW = 1.0
 
     def _make_fake_server(self) -> SimpleNamespace:
         return SimpleNamespace(should_exit=False, force_exit=False)
+
+    def _stop_callback(self, *servers: SimpleNamespace, clock: _FakeClock):
+        return _make_operator_stop_callback(
+            *servers, clock=clock, repeat_window_secs=self._WINDOW,
+        )
 
     def _signal_at(self, clock: _FakeClock, cb, *times: float) -> None:
         for t in times:
@@ -278,7 +286,7 @@ class TestOperatorStopCallbackForceExit:
     def test_first_call_sets_should_exit_but_not_force_exit(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
-        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+        cb = self._stop_callback(s1, s2, clock=clock)
 
         self._signal_at(clock, cb, 0.0)
 
@@ -287,12 +295,11 @@ class TestOperatorStopCallbackForceExit:
         assert s1.force_exit is False
         assert s2.force_exit is False
 
-    @pytest.mark.parametrize('repeat_at', [0.005, 1.5, 1.542])
+    @pytest.mark.parametrize('repeat_at', [0.005, 0.999])
     def test_repeat_inside_the_window_still_drains(self, repeat_at):
-        """1.542 s is the latest repeat measured over 40 live restarts."""
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
-        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+        cb = self._stop_callback(s1, s2, clock=clock)
 
         self._signal_at(clock, cb, 0.0, repeat_at)
 
@@ -304,9 +311,9 @@ class TestOperatorStopCallbackForceExit:
     def test_later_second_signal_forces_exit(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
-        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+        cb = self._stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 3.5)
+        self._signal_at(clock, cb, 0.0, 1.5)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
@@ -317,27 +324,41 @@ class TestOperatorStopCallbackForceExit:
         """Repeats must not postpone force-exit indefinitely."""
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
-        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+        cb = self._stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 2.0)
+        self._signal_at(clock, cb, 0.0, 0.6)
         assert s1.force_exit is False
         assert s2.force_exit is False
 
-        self._signal_at(clock, cb, 3.2)
+        self._signal_at(clock, cb, 1.2)
         assert s1.force_exit is True
         assert s2.force_exit is True
 
     def test_signal_after_forcing_keeps_force_exit(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
-        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+        cb = self._stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 3.5, 4.0)
+        self._signal_at(clock, cb, 0.0, 1.5, 2.0)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
         assert s1.force_exit is True
         assert s2.force_exit is True
+
+    def test_default_window_absorbs_the_latest_measured_repeat(self):
+        """The measurement is in fused-memory/tests/test_server_shutdown.py's
+        module docstring."""
+        s1, s2 = self._make_fake_server(), self._make_fake_server()
+        clock = _FakeClock()
+        cb = _make_operator_stop_callback(s1, s2, clock=clock)
+
+        self._signal_at(clock, cb, 0.0, 1.542)
+
+        assert s1.should_exit is True
+        assert s2.should_exit is True
+        assert s1.force_exit is False
+        assert s2.force_exit is False
 
     def test_default_clock_and_window_do_not_force_on_back_to_back_calls(self):
         s1, s2 = self._make_fake_server(), self._make_fake_server()
