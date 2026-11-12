@@ -29,6 +29,7 @@ from _trigger_chain_doc_shapes import (
     submit_calls,
 )
 from _trigger_chain_rig import Chain, TriggerChainRig, open_rig, review_due
+from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES
 from escalation.models import Escalation
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -38,6 +39,7 @@ from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, parse_metadata
 
 from orchestrator.event_store import EventType
+from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.workflow import WorkflowOutcome
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
@@ -202,7 +204,9 @@ class _FirstCheck:
     first_at: datetime
 
 
-async def _first_check_not_yet(rig: TriggerChainRig) -> _FirstCheck:
+async def _first_check_not_yet(
+    rig: TriggerChainRig, runner: DeterministicRunner | None = None
+) -> _FirstCheck:
     """Run R = (high open, medium done, low done) behind a final-form chain, checked once at its `at`."""
     findings = await rig.seed_run(RUN, ('high', OPEN), ('medium', 'done'), ('low', 'done'))
     chain = await rig.file_final_chain(RUN)
@@ -210,7 +214,7 @@ async def _first_check_not_yet(rig: TriggerChainRig) -> _FirstCheck:
 
     assert await rig.dispatch() == (None, None)
     rig.clock.set(first_at)
-    assignment, outcome = await rig.dispatch()
+    assignment, outcome = await rig.dispatch(runner=runner)
 
     assert assignment is not None and assignment.task_id == chain.completion_id
     assert outcome == WorkflowOutcome.REQUEUED
@@ -384,3 +388,89 @@ class TestHumanGateFires:
         assert 'trigger_chain' in _metadata(await rig.task(human_id))
         assert review_due(escalation)['completion_gate_task_id'] is None
         assert review_due(escalation)['verdict'] is None
+
+
+def _recheck(task: dict) -> dict:
+    return _metadata(task)['predicate_recheck']
+
+
+@dataclass(frozen=True)
+class _Stalled:
+    first: _FirstCheck
+    escalation: Escalation
+
+
+async def _stalled_at_cap_two(rig: TriggerChainRig) -> _Stalled:
+    """Two consecutive 75s against a cap-2 runner: the second files the stall."""
+    runner = rig.runner(stall_cap=2)
+    first = await _first_check_not_yet(rig, runner)
+    rig.clock.set(_at(await rig.task(first.chain.completion_id)))
+
+    _, outcome = await rig.dispatch(runner=runner)
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    (escalation,) = rig.own_escalations(first.chain.completion_id, status='pending')
+    return _Stalled(first, escalation)
+
+
+async def _resumed_after_stall(rig: TriggerChainRig) -> _Stalled:
+    stalled = await _stalled_at_cap_two(rig)
+    await rig.resolve(stalled.escalation, 'resume', 'keep waiting')
+    assert (await rig.task(stalled.first.chain.completion_id))['status'] == 'pending'
+
+    _, outcome = await rig.dispatch(runner=rig.runner(stall_cap=2))
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    return stalled
+
+
+@pytest.mark.asyncio
+class TestStall:
+    async def test_the_cap_files_one_stalled_l2(self, rig: TriggerChainRig) -> None:
+        stalled = await _stalled_at_cap_two(rig)
+        gate_id = stalled.first.chain.completion_id
+
+        escalation = stalled.escalation
+        assert (escalation.category, escalation.level, escalation.severity) == (
+            'milestone_check_stalled',
+            2,
+            'critical',
+        )
+        assert escalation.agent_role == 'orchestrator-deterministic'
+        assert escalation.category in L2_AUTO_CLOSE_DENY_CATEGORIES
+        gate = await rig.task(gate_id)
+        assert gate['status'] == 'blocked'
+        assert _recheck(gate)['consecutive'] == 0
+        assert datetime.fromisoformat(_recheck(gate)['first_rearmed_at']) == stalled.first.first_at
+        assert _metadata(gate).get('gate_escalated_at')
+        (event,) = [
+            e for e in rig.events(EventType.predicate_recheck_stalled) if e['task_id'] == gate_id
+        ]
+        assert (event['data']['consecutive'], event['data']['stall_cap']) == (2, 2)
+
+    async def test_resume_after_a_stall_re_arms_with_a_fresh_streak(
+        self, rig: TriggerChainRig
+    ) -> None:
+        stalled = await _resumed_after_stall(rig)
+        gate_id = stalled.first.chain.completion_id
+
+        recheck = _recheck(await rig.task(gate_id))
+        assert recheck['consecutive'] == 1
+        assert datetime.fromisoformat(recheck['first_rearmed_at']) == stalled.first.first_at
+        assert [e.status for e in rig.own_escalations(gate_id)] == ['resolved']
+
+    async def test_a_stale_gate_escalated_at_re_runs_and_re_arms(
+        self, rig: TriggerChainRig
+    ) -> None:
+        stalled = await _resumed_after_stall(rig)
+        gate_id = stalled.first.chain.completion_id
+        rig.clock.set(_at(await rig.task(gate_id)))
+
+        _, outcome = await rig.dispatch(runner=rig.runner(stall_cap=30))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        gate = await rig.task(gate_id)
+        assert _metadata(gate).get('gate_escalated_at')
+        assert _recheck(gate)['consecutive'] == 2
+        assert datetime.fromisoformat(_recheck(gate)['last_checked_at']) == rig.clock()
+        assert rig.own_escalations(gate_id, status='pending') == []
