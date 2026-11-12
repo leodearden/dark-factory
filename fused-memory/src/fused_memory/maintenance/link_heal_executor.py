@@ -107,6 +107,7 @@ MISFILE_SHARE_ANCHOR = 'link-heal-misfile-share'
 CORRECTS_SHARE_ANCHOR = 'link-heal-corrects-share'
 ADJUDICATOR_ANCHOR = 'link-heal-adjudicator'
 CALIBRATION_ANCHOR = 'link-heal-calibration'
+RUN_REPORT_ANCHOR = 'link-heal-run-report'
 
 #: A share ceiling judges only a run with at least this many adjudicated pairs.
 SHARE_ESCAPE_MIN_PAIRS = 20
@@ -270,6 +271,16 @@ def adjudicator_storm_escape(
     )
 
 
+def run_report_escape(summary: Mapping[str, Any], report_path: Path) -> Escape:
+    """The info record that surfaces one sweep run's report; *summary* is the run's
+    headline facts, carried as the detail beside the report's path."""
+    return Escape(
+        anchor=RUN_REPORT_ANCHOR,
+        summary=f'link-heal sweep report: {report_path}',
+        detail={**summary, 'report': str(report_path)},
+    )
+
+
 def render_escape_detail(detail: Mapping[str, Any]) -> str:
     """Sorted ``key: value`` lines; a non-string value renders as JSON."""
     return '\n'.join(
@@ -280,8 +291,13 @@ def render_escape_detail(detail: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _EscapeRoute:
+    """Where an anchor's escapes land. ``dedupe`` folds a filing into the anchor's open
+    record; a route whose every filing carries its own payload must not fold."""
+
     category: str
     suggested_action: str
+    severity: str = 'blocking'
+    dedupe: bool = True
 
 
 _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
@@ -338,6 +354,17 @@ _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
             'of the exact model and prompt passes.'
         ),
     ),
+    RUN_REPORT_ANCHOR: _EscapeRoute(
+        category='link_heal_run_report',
+        suggested_action=(
+            'Read the sweep report the detail names (Markdown, with the JSON beside it): '
+            'counts by project, decision, verdict and action, and the escapes. To take back '
+            'every heal the run applied, run `fused-memory/scripts/link_heal.py undo '
+            '<undo_run_id>` with the undo id the report gives.'
+        ),
+        severity='info',
+        dedupe=False,
+    ),
 })
 
 
@@ -360,13 +387,14 @@ class FoldedEscapeFiler:
             anchor_task_id=escape.anchor,
             agent_role=self.AGENT_ROLE,
             category=route.category,
-            severity='blocking',
+            severity=route.severity,
             summary=escape.summary,
             detail=render_escape_detail(escape.detail),
             suggested_action=route.suggested_action,
             logger=self._log,
             log_label='link_heal',
             level=1,
+            dedupe=route.dedupe,
         )
 
 

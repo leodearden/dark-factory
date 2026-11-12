@@ -55,9 +55,23 @@ _EXTERNAL_PRODUCERS = (
 )
 
 
+# Categories an in-tree producer files through a value the census cannot
+# resolve, such as a route table's dataclass field. Each entry names its producer.
+_UNRESOLVED_IN_TREE_PRODUCERS = (
+    pytest.param(
+        'link_heal_run_report',
+        id='fused-memory/src/fused_memory/maintenance/link_heal_executor.py::_ESCAPE_ROUTES',
+    ),
+)
+
+
 class TestRegistry:
     @pytest.mark.parametrize('value', _EXTERNAL_PRODUCERS)
     def test_external_producer_categories_stay_registered(self, value: str):
+        assert value in EscalationCategory
+
+    @pytest.mark.parametrize('value', _UNRESOLVED_IN_TREE_PRODUCERS)
+    def test_unresolved_in_tree_producer_categories_stay_registered(self, value: str):
         assert value in EscalationCategory
 
     @pytest.mark.parametrize('value', _REGISTERED_AHEAD_OF_ANY_PRODUCER)
