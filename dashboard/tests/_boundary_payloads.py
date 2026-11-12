@@ -893,6 +893,9 @@ QUALITY_SOURCE_EPOCH = datetime(2026, 10, 21, tzinfo=UTC)
 QUALITY_PENDING_TRAIN = ('7001', '7002', '7003')
 """A train runs.db records after the main-ahead scenario's last tick, which quality.db lacks."""
 QUALITY_TICK = timedelta(seconds=QUALITY_SAMPLE_INTERVAL_SECONDS)
+QUALITY_MODULE = 'dashboard'
+QUALITY_MODULE_ORDINALS = tuple(range(0, QUALITY_STORED, 3))
+"""The module the drill-down scenario is read for, and the stored landings touching it."""
 _NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
 
 

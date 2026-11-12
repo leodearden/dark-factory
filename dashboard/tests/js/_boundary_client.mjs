@@ -40,20 +40,40 @@ export function loadClient() {
   return { window: win, loader: win.DF_DATA_LOADER };
 }
 
+function requireLive(client) {
+  if (globalThis.window !== client.window) {
+    throw new Error('a later loadClient() replaced this client\'s window; data.js would write into that one');
+  }
+}
+
+// A fetch answering every request with `body`, at the instant `receivedAt`.
+function servingDeps(body, receivedAt) {
+  return {
+    fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }),
+    now: () => receivedAt,
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  };
+}
+
 // Lands `body` as the response to `path` through data.js's real refreshOne, at
 // the instant `receivedAt`, and resolves to its REFRESH_OUTCOMES value. `path`
 // is the endpointsFor(win) key, so a windowed endpoint carries its
 // `?window=` and names the same `win`.
 export function applyServed(client, path, body, { receivedAt = Date.now(), win = '24h', url = path } = {}) {
-  if (globalThis.window !== client.window) {
-    throw new Error('a later loadClient() replaced this client\'s window; data.js would write into that one');
-  }
+  requireLive(client);
   const keySpecs = client.loader.endpointsFor(win)[path];
   if (keySpecs === undefined) throw new Error(`data.js registers no endpoint ${path} at window ${win}`);
-  return client.loader.refreshOne(url, keySpecs, client.loader.createPollState(), {
-    fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }),
-    now: () => receivedAt,
-    setTimeoutImpl: () => 0,
-    clearTimeoutImpl: () => {},
+  return client.loader.refreshOne(url, keySpecs, client.loader.createPollState(), servingDeps(body, receivedAt));
+}
+
+// Lands `body` as the answer to the on-demand row `name` for `param` through
+// data.js's real requestOnDemand, at the instant `receivedAt`, and resolves to
+// its REFRESH_OUTCOMES value.
+export function applyOnDemand(client, name, param, body, { receivedAt = Date.now() } = {}) {
+  requireLive(client);
+  return client.loader.requestOnDemand(name, param, {
+    state: client.loader.createPollState(),
+    deps: servingDeps(body, receivedAt),
   });
 }
