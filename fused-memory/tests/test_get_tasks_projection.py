@@ -49,6 +49,8 @@ _FULL_ROW: dict[str, Any] = {
     'claimant_run_id': None,
     'heartbeat_at': None,
     'candidate_key': None,
+    'created_at': '2026-10-22T00:00:00.000Z',
+    'created_at_source': 'stamped',
 }
 
 
@@ -78,6 +80,12 @@ def test_requested_metadata_keys_present_on_the_task_are_kept_and_absent_ones_om
 def test_id_is_always_returned():
     assert _project(['status']) == {'id': '7', 'status': 'pending'}
     assert _project([]) == {'id': '7'}
+
+
+def test_a_requested_row_key_the_row_lacks_is_omitted():
+    unmigrated = {key: value for key, value in _FULL_ROW.items() if key != 'created_at'}
+
+    assert _project(['created_at'], unmigrated) == {'id': '7'}
 
 
 def test_no_metadata_entry_means_no_metadata_key():
