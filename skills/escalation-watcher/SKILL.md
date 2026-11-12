@@ -2091,7 +2091,8 @@ serves them all, so close each against the ruling.
 
 Filed by `orchestrator-deterministic` when a completion-driven chain's completion gate passes
 (`plans/completion-driven-triggers-prd.md` C4/C5). Read the typed `review_due` payload (`skill`,
-`project_root`, `launched_from`, `verdict`), never the summary text. Never stamp it or auto-close
+`project_root`, `launched_from`, `verdict`), never the summary text; an interim `milestone_gate`
+has no payload, so its fields come from the interim bullet below. Never stamp it or auto-close
 it: it lands in `deterministic_runner_filing`, a human-forever gate. For the brief line,
 `scripts/check_run_completion.py --pending` gives the live share.
 
@@ -2106,8 +2107,16 @@ it: it lands in `deterministic_runner_filing`, a human-forever gate. For the bri
   Leave it pending until the spawn reports back.
 - **Decline (C5 step 6).** "Not now": leave it pending, a standing brief item that re-files
   nothing. "End the cadence": `resolve_issue(action='abandon')` on the human gate.
-- **Interim gate.** A `milestone_gate` whose task carries `trigger_chain.role='human_gate'` (filed
-  before ζ deployed) is handled identically.
+- **Interim gate.** A `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
+  (filed before ζ deployed) and whose detail lacks the withheld line is handled like `review_due`:
+  attended spawn, AFK digest, never resolve on spawn, decline. Its spawn fields come from three
+  places, never the summary: `skill` from the task's `metadata.trigger_chain.skill`, read with
+  `mcp__fused-memory__get_task` (stored bare; add the slash); `project_root` is this watcher's own
+  `<project_root>`, since an escalation record has no project_root field
+  (`escalation/src/escalation/models.py::Escalation`); `launched_from` is the record's own
+  escalation id. A withheld gate, whose detail carries "This human gate files milestone_gate
+  rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
+  is asked like any other milestone gate, per "Always ask".
 - **`milestone_check_stalled`** (the completion gate's predicate re-armed to its cap; see the PRD's
   C1). Three resolutions: `resume` keeps waiting (streak restarted); `abandon` on the completion
   gate fires the human gate now; `abandon` on the human gate first, then on the completion gate,
