@@ -34,6 +34,7 @@ from typing import Any
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import embeddings, landing_gate, unlanded
+from legibility_census_scaffold import narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
@@ -74,6 +75,10 @@ def _never_roll_back(**kwargs):
     raise AssertionError("roll_back must not run on a landed commit")
 
 
+_done = narrowing(mod.Done)
+_deferred = narrowing(mod.Deferred)
+
+
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """Every ``run_census`` seam, wired to trivial inline fakes, with the
     four output paths under directories that do NOT exist in *root*.
@@ -85,23 +90,27 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     zoo: ``batch_source=[]`` mines nothing, so the only LLM call any test
     here makes is the headroom probe.
     """
-    kwargs: dict[str, Any] = dict(
+    effects = mod.CensusEffects(
         batch_source=[],
         selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
         synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
-        submit_fn=lambda payload: {"task_id": "t1"},
-        task_store=FakeTaskStore(),
-        escalate_fn=lambda **kw: None,
-        status_fetcher=lambda: {"statuses": {}},
-        gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
-        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
-        roll_back=_never_roll_back,
-        codebook_dict=_minimal_v2_codebook(),
         embedder=embeddings.Embedder(
             embed_fn=_distinct_one_hot_embed, cache_path=root / "embeddings.sqlite",
         ),
+        submit_fn=lambda payload: {"task_id": "t1"},
+        task_store=FakeTaskStore(),
+        status_fetcher=lambda: {"statuses": {}},
+        escalate_fn=lambda **kw: None,
+        gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
+        roll_back=_never_roll_back,
+    )
+    effects, overrides = with_seams(effects, overrides)
+    kwargs: dict[str, Any] = dict(
+        effects=effects,
+        codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
             project_id="target_project",
             project_root=str(root),
@@ -132,7 +141,7 @@ def test_run_census_creates_missing_report_parent_dir(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert kwargs["report_path"].exists()
 
 
@@ -146,7 +155,7 @@ def test_run_census_creates_missing_dry_run_payloads_parent_dir(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert payloads_path.exists()
     # An empty list is the honest content for a run with no novel clusters.
     assert json.loads(payloads_path.read_text(encoding="utf-8")) == []
@@ -165,7 +174,7 @@ def test_run_census_creates_missing_codebook_and_state_parent_dirs(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert kwargs["codebook_path"].exists()
     assert kwargs["census_state_path"].exists()
 
@@ -191,7 +200,7 @@ def test_run_census_creates_output_dirs_before_mining_begins(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert observed == [True], (
         "output parents must be created BEFORE mining pulls its first batch"
     )
@@ -209,6 +218,6 @@ def test_run_census_deferred_at_headroom_creates_no_output_dirs(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "deferred"
+    outcome = _deferred(outcome)
     assert not (tmp_path / "plans").exists()
     assert not (tmp_path / "docs" / "legibility").exists()
