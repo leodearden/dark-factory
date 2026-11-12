@@ -1884,7 +1884,7 @@ class TestRecoverCrashedTasksWarmLane:
         # then the durable transition), never cleaned up (that's the
         # terminal-task release branch, a different cell).
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane_path, 'task/42', 'recovery-record-divergence',
+            lane_path, '42', 'recovery-record-divergence',
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         record = harness.git_ops._lane_lifecycle.read(lane_path)
@@ -2362,7 +2362,7 @@ class TestRecordDrivenRecovery:
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._recover_crashed_tasks()
 
-        quarantine.assert_called_once_with(lane, 'task/42', 'recovery-record-divergence')
+        quarantine.assert_called_once_with(lane, '42', 'recovery-record-divergence')
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
         record = lifecycle.read(lane)
@@ -2422,11 +2422,7 @@ class TestRecordDrivenRecovery:
 
         await harness._recover_crashed_tasks()
 
-        quarantine.assert_awaited_once()
-        await_args = quarantine.await_args
-        assert await_args is not None
-        assert await_args.args[0] == lane
-        assert await_args.args[2] == 'recovery-identity-mismatch'
+        quarantine.assert_awaited_once_with(lane, '42', 'recovery-identity-mismatch')
         assert _quarantine_emits(events) == [
             {'task_id': '42', 'data': outcome.event_data('recovery-identity-mismatch')},
         ]
@@ -2533,7 +2529,7 @@ class TestRecordDrivenRecovery:
         await harness._recover_crashed_tasks()
 
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
+            lane, '42', 'recovery-record-divergence',
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 

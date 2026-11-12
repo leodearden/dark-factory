@@ -7348,6 +7348,22 @@ class TestColdReattachIdentityGuard:
         )
 
 
+async def _drop_admin_entry(git_ops: GitOps, worktree: Path) -> None:
+    """Delete *worktree*'s ``.git/worktrees/<name>`` admin entry: the 2097 orphaned-registration state."""
+    rc, admin_dir, err = await _run(['git', 'rev-parse', '--absolute-git-dir'], cwd=worktree)
+    assert rc == 0, err
+    shutil.rmtree(admin_dir.strip())
+    rc, listing, err = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root)
+    assert rc == 0, err
+    assert f'worktree {worktree}' not in listing.splitlines()
+
+
+async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
+    rc, branches, err = await _run(['git', 'branch', '--list', pattern], cwd=git_ops.project_root)
+    assert rc == 0, err
+    return branches.strip()
+
+
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
@@ -7429,6 +7445,53 @@ class TestOrphanWorktreeHelpers:
 
         assert await git_ops.commits_beyond_main('task/q-beyond') == 1
         assert await git_ops.commits_beyond_main('task/no-such-branch') is None
+
+    async def test_quarantine_accepts_a_full_ref(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-full')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'task/q-full', 'unit-test')
+
+        dest = outcome.dest
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert dest.name.startswith('q-full-')
+        assert not (git_ops.quarantine_base / 'task').exists()
+        assert outcome.branch == f'task/{dest.name}'
+        assert await git_ops.resolve_branch_sha(outcome.branch) is not None
+        assert await _branches_matching(git_ops, 'task/q-full') == ''
+        assert await _branches_matching(git_ops, 'task/task/*') == ''
+        assert not info.path.exists()
+
+    async def test_quarantine_relocates_an_unregistered_worktree(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-orphan')
+        (info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(info.path, 'committed work')
+        await _drop_admin_entry(git_ops, info.path)
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-orphan', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert (outcome.dest / 'work.py').read_text() == 'x = 1\n'
+        assert outcome.branch is not None
+        assert await git_ops.resolve_branch_sha(outcome.branch) is not None
+        assert outcome.unique_commit_count == 1
+        assert await git_ops.resolve_branch_sha('task/q-orphan') is None
+
+    async def test_quarantine_unregistered_dir_without_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-nobranch')
+        await _drop_admin_entry(git_ops, info.path)
+        rc, _, err = await _run(['git', 'branch', '-D', 'task/q-nobranch'], cwd=git_ops.project_root)
+        assert rc == 0, err
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-nobranch', 'unit-test')
+
+        assert not info.path.exists()
+        assert outcome.dest is not None
+        assert outcome.dest.is_dir()
+        assert outcome.branch is None
 
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')
