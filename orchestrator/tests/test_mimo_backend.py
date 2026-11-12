@@ -483,6 +483,22 @@ class TestMimoSpawnEnv:
                      'MIMOCODE_DISABLE_SHARE'):
             assert env[flag] == '1'
 
+    def test_no_inherited_mimocode_variable_reaches_mimo(self):
+        base_env = {
+            'HOME': '/home/operator',
+            'MIMOCODE_CONFIG_CONTENT': '{"mcp": {"extra": {"type": "remote", "url": "x"}}}',
+            'MIMOCODE_PERMISSION': '{"bash": "allow"}',
+            'MIMOCODE_DISABLE_CLAUDE_CODE_MCP': '0',
+            'MIMOCODE_HOME': '/home/operator/.mimocode',
+        }
+        with _run_home() as home:
+            env = mimo_spawn_env(base_env, home)
+            assert env['MIMOCODE_HOME'] == str(home.root)
+        assert {name for name in env if name.startswith('MIMOCODE_')} == {
+            'MIMOCODE_HOME', *mimo_backend.MIMOCODE_FLAGS,
+        }
+        assert env['MIMOCODE_DISABLE_CLAUDE_CODE_MCP'] == '1'
+
     def test_the_operator_tool_homes_are_kept(self):
         with _run_home() as home:
             env = mimo_spawn_env({'HOME': '/home/operator'}, home)

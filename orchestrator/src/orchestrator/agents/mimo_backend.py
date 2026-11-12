@@ -33,6 +33,7 @@ MODEL_LIMITS = {'context': 1048576, 'output': 131072}
 TITLE = 'dark-factory'
 MIMO_VARIANTS = ('low', 'medium', 'high')
 FALLBACK_VARIANT = 'high'
+MIMOCODE_ENV_PREFIX = 'MIMOCODE_'
 MIMOCODE_FLAGS = {
     'MIMOCODE_ENABLE_ANALYSIS': 'false',
     'MIMOCODE_DISABLE_CLAUDE_CODE_MCP': '1',
@@ -185,8 +186,10 @@ def mimo_run_home(
 
 
 def mimo_spawn_env(base_env: Mapping[str, str], home: MimoRunHome) -> dict[str, str]:
+    """The child env; no inherited MIMOCODE_* variable reaches mimo, so none can add MCP servers or relax a deny."""
+    redirected = redirected_home_env(base_env, root=home.root, operator_home=home.operator_home)
     return {
-        **redirected_home_env(base_env, root=home.root, operator_home=home.operator_home),
+        **{name: value for name, value in redirected.items() if not name.startswith(MIMOCODE_ENV_PREFIX)},
         'MIMOCODE_HOME': str(home.root),
         **MIMOCODE_FLAGS,
     }

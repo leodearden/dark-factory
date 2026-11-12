@@ -109,7 +109,11 @@ an invocation without a wall-clock timeout.
   state.
 
 The child env the arm sets, over the inherited env with every secret-named
-variable removed (`shared/src/shared/secret_env.py::is_secret_env_name`):
+variable removed (`shared/src/shared/secret_env.py::is_secret_env_name`). Every
+inherited `MIMOCODE_*` variable is removed too. MiMo Code is an OpenCode fork,
+and OpenCode honours `OPENCODE_CONFIG_CONTENT`- and `OPENCODE_PERMISSION`-style
+overrides. A MiMo equivalent left on the host for interactive use could
+otherwise add MCP servers or relax a deny.
 
 | variable | value |
 |---|---|
