@@ -372,12 +372,14 @@ WantedBy=default.target
 """
 
 
-def test_fix_unit_text_adds_missing_directive():
-    """fix_unit_text inserts Environment=MEM0_TELEMETRY=false into [Service]."""
+def test_fix_unit_text_adds_every_missing_required_directive():
+    """fix_unit_text appends each REQUIRED_SERVICE_DIRECTIVES entry [Service] lacks,
+    so a newly required directive is covered without a test of its own."""
     mod = _load_checker()
     fixed = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
-    sections = mod.parse_unit_sections(fixed)
-    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+    service = mod.parse_unit_sections(fixed)["Service"]
+    still_missing = [d for d in mod.REQUIRED_SERVICE_DIRECTIVES if d not in service]
+    assert still_missing == []
 
 
 def test_fix_unit_text_preserves_host_specific_line():
@@ -396,18 +398,6 @@ def test_fix_unit_text_is_idempotent():
     once = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
     twice = mod.fix_unit_text(once)
     assert once == twice
-
-
-def test_fix_unit_text_appends_kill_mode_mixed():
-    """--fix installs KillMode=mixed without touching the host-local project roots."""
-    mod = _load_checker()
-    fixed = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
-    service = mod.parse_unit_sections(fixed)["Service"]
-    assert "KillMode=mixed" in service
-    assert (
-        "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other"
-        in service
-    )
 
 
 # ---------------------------------------------------------------------------
