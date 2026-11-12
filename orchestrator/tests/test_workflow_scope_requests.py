@@ -612,6 +612,42 @@ class TestAmendmentPassScopeRequest:
             ScopeRequest(_REQUESTED, 'the fix lives here'),
         )
 
+    async def test_a_zero_output_amendment_pass_does_not_consume_the_brief(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+        assert wf.artifacts is not None
+        artifacts = wf.artifacts
+        passes = iter([
+            lambda: artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'the fix lives here')),
+            None,
+            lambda: None,
+        ])
+
+        async def agent(**_kwargs) -> AgentResult:
+            files_request = next(passes)
+            if files_request is None:
+                return _timed_out(transcript_turns=0)
+            files_request()
+            return _success()
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            for amendment_round in (1, 2, 3):
+                assert await wf._amend(_SUGGESTIONS, amendment_round) is True
+
+        first, wedged, after_the_wedge = _scope_drift_kwargs(rig.amender_prompt)
+        assert first is None
+        assert wedged is not None
+        assert after_the_wedge is not None
+        assert after_the_wedge.contested == ((_REQUESTED, _HOLDER),)
+
 
 @pytest.mark.asyncio
 async def test_a_contested_debugger_request_before_a_green_verify_is_followed_up_and_reverified(

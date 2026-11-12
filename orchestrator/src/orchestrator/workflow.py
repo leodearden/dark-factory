@@ -5015,7 +5015,7 @@ class TaskWorkflow:
         return reconciled
 
     async def _apply_scope_requests(
-        self, *, role: str, iteration: int, delivered: bool = True,
+        self, *, role: str, iteration: int, delivered: bool,
     ) -> None:
         """Lock and declare the paths a writer reported missing from plan.files.
 
@@ -12108,7 +12108,7 @@ class TaskWorkflow:
             )
 
         pre_head = await self._get_head_commit()
-        await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
+        result = await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
 
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -12136,6 +12136,7 @@ class TaskWorkflow:
 
         await self._apply_scope_requests(
             role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+            delivered=not is_zero_output_timeout(result),
         )
         return True
 
