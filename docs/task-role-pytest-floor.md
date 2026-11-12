@@ -21,7 +21,11 @@ every test module whose module-level `pytestmark` is
 `pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`. The family's single home
 is `shared/src/shared/whole_tree_guard_family.py`:
 `::is_whole_tree_guard_module` decides membership, and
-`::WHOLE_TREE_SCAN_TEST_TIMEOUT` is the ceiling the mark spells.
+`::WHOLE_TREE_SCAN_TEST_TIMEOUT` is the ceiling the mark spells. Every leg
+that runs a member must budget at least `::min_leg_budget_for_family(W)`, W
+being its recorded worst green run, so the ceiling fires before verify kills
+the leg; `tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling`
+gates it.
 
 The full-suite floor survives as the fallback in two cases:
 
