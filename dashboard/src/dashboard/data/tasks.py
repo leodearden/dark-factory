@@ -222,10 +222,9 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
-    ``description`` stays because ``redux_api.shape_escalations`` embeds this
-    whole dict as each escalation row's ``task`` and the Escalations drawer
-    renders it; ``details`` is dropped because only the Task Detail pane
-    renders it, and that pane reads it through :func:`fetch_task_prose`.
+    Rows carry no prose: ``description`` and ``details`` are dropped, and the
+    Task Detail pane and the Escalations drawer read them through
+    :func:`fetch_task_prose`.
 
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
@@ -263,7 +262,6 @@ def _shape_task(task: dict) -> dict | None:
     return {
         'id': tid,
         'title': task.get('title') or '',
-        'description': task.get('description') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,

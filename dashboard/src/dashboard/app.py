@@ -101,7 +101,7 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.task_snapshot import ROW_READ_STATUSES
+from dashboard.data.task_snapshot import ROW_READ_FIELDS, ROW_READ_STATUSES
 from dashboard.data.tasks import fetch_task_page
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
@@ -690,6 +690,7 @@ async def _fanout_probe_completion(
     await fetch_task_page(
         client, config, config.project_root,
         statuses=sorted(ROW_READ_STATUSES), page_size=1, offset=0,
+        fields=ROW_READ_FIELDS,
     )
     return asyncio.get_running_loop().time()
 
