@@ -1397,6 +1397,17 @@ def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, s
     return degraded
 
 
+def _describe_unpinning_records(rows: Sequence[Any]) -> str:
+    """Name the open records a stranded-blocked flip went past; the caller
+    has already decided that none of them pins."""
+    if not rows:
+        return 'no open escalation'
+    return 'open escalation(s) that do not pin: ' + ', '.join(
+        f'{e.id} (severity={e.severity}, level={e.level}, category={e.category})'
+        for e in rows
+    )
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -6399,7 +6410,8 @@ class Scheduler:
         QUEUE_HANDOFF (L1/L2, or an L0 whose filer is still live) pins; a
         DEAD_L0 does not, because its handoff has no consumer left; an
         ``info`` record never pins at any level; and a record set consisting
-        ENTIRELY of merge-remediable categories does not pin, because those
+        ENTIRELY of merge-remediable categories does not pin, unless one of
+        them needs a human (``escalation.pins.needs_human``), because those
         records ASK for the remediation this sweep performs.  The precedence
         chain itself is documented once, in ``escalation/pins.py``.
 
@@ -6550,7 +6562,11 @@ class Scheduler:
                 # provably dead.  Every escape hatch against a redispatch loop
                 # is untouched above: the kill switch, the `_dispatched`
                 # membership gate, `workflow_cancel_recent`, the requeue
-                # cooldown, `_deps_satisfied`, and the reblock guard.
+                # cooldown and `_deps_satisfied`.  The reblock guard is not
+                # one: `Harness._check_reblock_guard` counts only
+                # escalation-resolution flips, never this one, so it is the
+                # predicate's needs-a-human exemption that keeps a merge-entry
+                # gate from re-pending here (task 6145).
                 #
                 # `live_claimant=False` is EXACT, not an assumption:
                 # `is_stranded_blocked(task, ...)` returned True immediately
@@ -6576,8 +6592,9 @@ class Scheduler:
                     continue
                 logger.warning(
                     'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
-                    'pending (no live claimant, deps satisfied, no open escalation)',
+                    'pending (no live claimant, deps satisfied, %s)',
                     tid,
+                    _describe_unpinning_records(rows),
                 )
                 await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:
