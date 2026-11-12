@@ -82,10 +82,21 @@ def test_id_is_always_returned():
     assert _project([]) == {'id': '7'}
 
 
-def test_a_requested_row_key_the_row_lacks_is_omitted():
-    unmigrated = {key: value for key, value in _FULL_ROW.items() if key != 'created_at'}
+def test_a_requested_created_at_key_a_store_without_the_columns_lacks_is_omitted():
+    unmigrated = {
+        key: value
+        for key, value in _FULL_ROW.items()
+        if key not in ('created_at', 'created_at_source')
+    }
 
-    assert _project(['created_at'], unmigrated) == {'id': '7'}
+    assert _project(['created_at', 'created_at_source'], unmigrated) == {'id': '7'}
+
+
+def test_a_requested_core_row_key_the_row_lacks_fails_loudly_rather_than_vanishing():
+    broken = {key: value for key, value in _FULL_ROW.items() if key != 'status'}
+
+    with pytest.raises(KeyError, match='status'):
+        _project(['status'], broken)
 
 
 def test_no_metadata_entry_means_no_metadata_key():

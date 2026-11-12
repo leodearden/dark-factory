@@ -86,7 +86,10 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
-from fused_memory.backends.task_projection import parse_task_projection
+from fused_memory.backends.task_projection import (
+    SCHEMA_OPTIONAL_ROW_KEYS,
+    parse_task_projection,
+)
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -1475,9 +1478,9 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
     }
     # Omitted, not None, on a connection whose v6 ALTER never landed: None is
     # reserved for a migrated row the backfill has not reached yet.
-    if 'created_at' in row_keys:
-        task['created_at'] = row['created_at']
-        task['created_at_source'] = row['created_at_source']
+    for key in SCHEMA_OPTIONAL_ROW_KEYS:
+        if key in row_keys:
+            task[key] = row[key]
     return task
 
 
