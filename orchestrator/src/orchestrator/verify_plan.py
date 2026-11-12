@@ -17,11 +17,12 @@ from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
+from shared.whole_tree_guard_family import is_whole_tree_guard_module
+
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     addopts_tokens,
     deselecting_expression_for_targets,
-    is_whole_tree_guard_module,
     locate_pytest_config,
 )
 from orchestrator.verify_cmd import (

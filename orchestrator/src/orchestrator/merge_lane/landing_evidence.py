@@ -223,6 +223,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger('orchestrator.merge_lane')
 
 
+class PatchContainment(enum.StrEnum):
+    """What ``git cherry <upstream> <head>`` says about *head*'s commits."""
+
+    #: Output is non-empty and every line is ``-``: each commit is in upstream.
+    contained = 'contained'
+    #: rc 0 and no output: *head* has no non-merge commit outside upstream.
+    #: Either it is already ON upstream, or (git cherry skips merges) every
+    #: commit it has beyond upstream is a merge.
+    vacuous = 'vacuous'
+    #: Some ``+`` line: at least one commit is absent from upstream.
+    not_contained = 'not_contained'
+    #: rc != 0: git could not answer.
+    unreadable = 'unreadable'
+
+
+async def _classify_patch_containment(
+    head: str, upstream: str, git_ops: GitOps,
+) -> PatchContainment:
+    rc, out, _ = await _run(
+        ['git', 'cherry', upstream, head],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        return PatchContainment.unreadable
+    if not out.strip():
+        return PatchContainment.vacuous
+    if any(line.startswith('+') for line in out.splitlines()):
+        return PatchContainment.not_contained
+    return PatchContainment.contained
+
+
 async def patch_content_contained(
     head: str,
     upstream: str,
@@ -232,7 +263,9 @@ async def patch_content_contained(
 
     Uses ``git cherry upstream head``: lines without a leading ``+`` are
     commits already applied; ``+`` lines are commits NOT yet in *upstream*.
-    An empty ``+``-line set → fully contained → True.
+    An empty ``+``-line set → fully contained → True.  That includes EMPTY
+    output, which this helper still reads as contained, unlike
+    :func:`branch_work_landed`.
 
     Fail-open: returns False on any git error (``rc != 0``) so that the
     caller falls through to a full merge attempt rather than incorrectly
@@ -244,13 +277,9 @@ async def patch_content_contained(
     fast-path was wired in task 1629; the patch-id extension (this helper)
     for escalation/server.py is not yet scheduled as a separate task.
     """
-    rc, out, _ = await _run(
-        ['git', 'cherry', upstream, head],
-        cwd=git_ops.project_root,
+    return await _classify_patch_containment(head, upstream, git_ops) in (
+        PatchContainment.contained, PatchContainment.vacuous,
     )
-    if rc != 0:
-        return False  # fail-open
-    return not any(line.startswith('+') for line in out.splitlines())
 
 __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
@@ -262,6 +291,7 @@ __all__ = [
     'LandingReason',
     'LandingTally',
     'LandingVerdict',
+    'PatchContainment',
     'branch_is_degenerate',
     'branch_work_landed',
     'file_landing_git_error_storm_escalation',
@@ -1042,6 +1072,7 @@ async def _delivered_checks_differential(
 
 async def _resolve_main_reachable_evidence(
     git_ops: GitOps, task_id: str, head: str, probe: dict[str, Any],
+    *, pattern_template: str | None,
 ) -> str | None:
     """Resolve a MAIN-REACHABLE commit carrying *task_id*'s work, or None.
 
@@ -1049,7 +1080,8 @@ async def _resolve_main_reachable_evidence(
     anchors provenance on must be a commit reachable from main that carries
     this task's work.  Two tiers, tried in order, and NO third tier:
 
-    1. **Citation** — ``find_task_citation_commit`` walks
+    1. **Citation** — ``find_task_citation_commit``, by the project's
+       *pattern_template* (none on a ``''`` opt-out), walks
        ``config.main_branch``'s own history, so anything it returns is
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
@@ -1074,7 +1106,9 @@ async def _resolve_main_reachable_evidence(
     reader of the escalation can see WHICH tier answered, or which one
     declined.
     """
-    citation = await git_ops.find_task_citation_commit(task_id)
+    citation = await git_ops.find_task_citation_commit(
+        task_id, pattern_template=pattern_template,
+    )
     if citation:
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
@@ -1119,11 +1153,9 @@ async def _patch_id_equivalent_on_main(
 async def _unresolvable_endpoints(git_ops: GitOps, *refs: str) -> list[str]:
     """Which of *refs* do NOT resolve to a commit in this repo right now.
 
-    The health re-probe behind the fail-open disambiguation in
-    :func:`branch_work_landed`.  ``merge_queue.patch_content_contained``
-    returns ``False`` both for "the work is genuinely not there" and for
-    "``git cherry`` failed", so the only way to tell them apart at the call
-    site is to ask git a question whose failure is unambiguous.
+    The health re-probe behind :func:`branch_work_landed`'s ``not_contained``
+    arm: before a ``+`` line is believed as "this task never landed", git is
+    asked a question whose failure is unambiguous.
 
     Implemented as ``is_ancestor(ref, ref)``: ``git merge-base --is-ancestor
     X X`` succeeds for every commit (a commit is its own ancestor) and fails
@@ -1349,6 +1381,49 @@ def _reject_verdict(
     )
 
 
+async def _containment_rejection(
+    git_ops: GitOps, head: str, upstream: str, probe: dict[str, Any],
+) -> LandingReason | None:
+    """The containment arm of :func:`branch_work_landed`: None when contained."""
+    containment = await _classify_patch_containment(head, upstream, git_ops)
+    probe['patch_id_containment'] = containment
+    if containment is PatchContainment.contained:
+        return None
+    if containment is PatchContainment.vacuous:
+        return await _vacuous_containment_rejection(git_ops, head, upstream, probe)
+    if containment is PatchContainment.unreadable:
+        probe['git_error_stage'] = 'patch_id_containment'
+        return LandingReason.git_error
+    # A not_contained answer means "this task never landed", the verdict that
+    # re-dispatches, so it is re-probed before it is believed: both endpoints
+    # were resolved before the call, so if either fails to re-resolve NOW the
+    # repo changed under the call and the answer is not about the task.
+    unresolvable = await _unresolvable_endpoints(git_ops, head, upstream)
+    probe['containment_unresolvable'] = unresolvable
+    probe['containment_recheck'] = 'unhealthy' if unresolvable else 'healthy'
+    if unresolvable:
+        probe['git_error_stage'] = 'patch_id_containment'
+        return LandingReason.git_error
+    return LandingReason.not_landed
+
+
+async def _vacuous_containment_rejection(
+    git_ops: GitOps, head: str, upstream: str, probe: dict[str, Any],
+) -> LandingReason | None:
+    """Empty ``git cherry`` output is containment only when *head* is ON *upstream*.
+
+    There git cherry has nothing to list for a genuine landing.  Elsewhere the
+    branch has no non-merge commit beyond *upstream*, so nothing of its own is
+    proven present.
+    """
+    on_upstream = await git_ops.is_ancestor_checked(head, upstream)
+    probe['containment_by_ancestry'] = on_upstream
+    if on_upstream is None:
+        probe['git_error_stage'] = 'patch_id_containment'
+        return LandingReason.git_error
+    return None if on_upstream else LandingReason.not_landed
+
+
 async def branch_work_landed(
     git_ops: GitOps,
     task_id: str,
@@ -1356,6 +1431,7 @@ async def branch_work_landed(
     *,
     branch_tip_sha: str | None,
     metadata: dict[str, Any] | None = None,
+    pattern_template: str | None,
     escalation_queue: EscalationQueue | None = None,
     recovery_emission: RecoveryEmissionConfig | None = None,
 ) -> LandingVerdict:
@@ -1376,21 +1452,16 @@ async def branch_work_landed(
     instead "is an equivalent patch anywhere in main's history?", which no
     later commit can un-answer.
 
-    **Attribution is by ``git cherry``**, via the EXISTING production helper
-    ``merge_queue.patch_content_contained`` rather than a second local
-    implementation — two patch-id authorities in one repo is precisely the
-    lockstep duplication this task exists to remove.  The import is
-    FUNCTION-SCOPED because ``merge_queue.py`` imports from THIS module at
-    module level, so a top-level reverse import would be a cycle; that is the
-    same idiom this module already uses for ``orchestrator.delivered_checks``
-    and ``escalation.models``, and that ``merge_queue`` itself uses for its
-    main-health fingerprint.
+    **Containment is by ``git cherry``**, through
+    :func:`_classify_patch_containment` in this module, the one owner of that
+    call and its parse (``patch_content_contained`` derives from it), so the
+    repo keeps a single patch-id authority.
 
-    **Mind the argument order at that call**: the helper's signature is
-    ``patch_content_contained(head, upstream, git_ops)`` but it shells
-    ``git cherry <upstream> <head>``.  Passing them the way the shell command
-    reads would invert the question into "is main's history contained in the
-    branch?", which a freshly-created branch answers YES to.
+    **Mind the argument order at that call**: the classifier is called
+    ``(head, upstream)`` but shells ``git cherry <upstream> <head>``.  Passing
+    them the way the shell command reads would invert the question into "is
+    main's history contained in the branch?", which a freshly-created branch
+    answers YES to.
 
     ``git cherry`` SKIPS merge commits (measured, not assumed — see
     ``TestBoundaryFixtures.test_git_cherry_skips_merge_commits``), which is what
@@ -1398,7 +1469,13 @@ async def branch_work_landed(
     a conflict has a merge commit at its tip carrying main's own history, and
     a containment check that counted it would report a landed branch as
     unlanded.  The containment question is therefore already restricted to the
-    branch's OWN non-merge commits, with no extra filtering needed.
+    branch's OWN non-merge commits, with no extra filtering needed.  EMPTY
+    output from a tip that is NOT an ancestor of main is refused as
+    ``not_landed``: a branch with no non-merge commit beyond main has nothing
+    whose containment could be proven.  That is the same rule as check (c) in
+    ``skills/_shared/deriving-landed-sha.md``, which likewise applies only off
+    the ancestor arm; a tip already on main prints nothing for a genuine
+    landing, and ``probe['containment_by_ancestry']`` records which arm ran.
 
     **THE NON-DECAY INVARIANT — the PRD's headline, and it may not be
     waived.** Once this function has reported a branch landed, NO subsequent
@@ -1483,22 +1560,22 @@ async def branch_work_landed(
       shape", which is recorded as ``no_op_baseline == 'unavailable'`` and is
       not an error).
     - ``net_diff_is_empty`` — the tri-state primitive returned ``None``.
-    - ``patch_id_containment`` — the fail-open disambiguation below.
+    - ``patch_id_containment`` — ``git cherry`` itself failed
+      (``probe['patch_id_containment'] == 'unreadable'``), the re-probe below
+      found an endpoint unresolvable, or the ancestry answer on empty cherry
+      output was unreadable (``probe['containment_by_ancestry'] is None``).
     - ``unexpected_exception`` — with ``probe['exception']`` carrying the
       repr and a traceback logged at WARNING.
 
-    **The fail-open disambiguation.** ``patch_content_contained`` swallows
-    ``rc != 0`` into ``False`` for its own caller, which then falls through to
-    a full merge attempt and is therefore safe under a wrong ``False``.  Here
-    the same ``False`` would mean "this task never landed", so it is re-probed
-    instead of believed: both endpoints were resolved before the call, so if
-    either fails to re-resolve afterwards the answer came from a broken repo.
-    Which branch was taken is recorded in ``probe['containment_recheck']``
-    (``'healthy'`` / ``'unhealthy'``) and ``probe['containment_unresolvable']``,
-    so a reader can see a genuine negative distinguished from an unreadable
-    repo without re-running git.  Re-implementing ``git cherry`` locally would
-    have avoided the disambiguation and created a SECOND patch-id authority in
-    the same repo, which is the duplication this task exists to remove.
+    **The not-contained re-probe.** The containment classification is
+    recorded in ``probe['patch_id_containment']``.  A ``not_contained`` one
+    would mean "this task never landed", so it is re-probed instead of
+    believed: both endpoints were resolved before the call, so if either fails
+    to re-resolve afterwards the repo changed under the call.  Which branch was
+    taken is recorded in ``probe['containment_recheck']`` (``'healthy'`` /
+    ``'unhealthy'``) and ``probe['containment_unresolvable']``, so a reader can
+    see a genuine negative distinguished from an unreadable repo without
+    re-running git.
 
     Two legs remain fail-soft rather than fail-closed, recorded here so the
     residue is known rather than discovered: :func:`branch_is_degenerate`
@@ -1517,10 +1594,10 @@ async def branch_work_landed(
     state.  The caller owns the action.
 
     Args:
-        git_ops: A ``GitOps`` instance, or a duck-typed stand-in exposing
-            ``resolve_branch_sha`` / ``find_task_citation_commit`` /
-            ``merge_base_with_main`` / ``find_equivalent_commit`` and a
-            ``project_root``.
+        git_ops: A ``GitOps`` instance, or a stand-in exposing every
+            ``GitOps`` method this function and its helpers call.  A missing
+            one does not raise: it surfaces as ``git_error`` at stage
+            ``unexpected_exception``.
         task_id: Bare task id (no ``task/`` prefix).
         branch: The task's branch name (e.g. ``f'task/{task_id}'``).
         branch_tip_sha: An already-resolved tip for *branch*, or ``None`` to
@@ -1534,6 +1611,14 @@ async def branch_work_landed(
             Contract's sketched signature — boundary row B6 needs
             ``branch_base_sha``, which the sketched four-argument form cannot
             supply.  Consumed by the degenerate-branch guard.
+        pattern_template: The citation tier's pattern, with the same meaning
+            as :func:`validate_landing_evidence`'s.  ``None`` means
+            ``DEFAULT_COMMIT_CITATION_PATTERN``; ``''`` is the project's
+            opt-out, so the citation tier answers None and attribution falls
+            to the patch-id twin.  A consumer holding an OrchestratorConfig
+            passes ``config.git.commit_citation_pattern``.  REQUIRED-BY-KEYWORD
+            for the same reason as *branch_tip_sha*: a default would silently
+            apply the default pattern for a caller that forgot the project's.
         escalation_queue: The queue the ``git_error`` storm-escape L1 is filed
             on (see :func:`file_landing_git_error_storm_escalation`).
             ``None`` means "no queue available", which is a SUPPORTED shape
@@ -1618,25 +1703,13 @@ async def branch_work_landed(
             if net_empty:
                 return _reject(LandingReason.no_op_landing)
 
-        contained = await patch_content_contained(head, upstream, git_ops)
-        probe['patch_id_contained'] = contained
-        if not contained:
-            # THE FAIL-OPEN DISAMBIGUATION.  patch_content_contained deliberately
-            # swallows `rc != 0` into False for ITS caller, which falls through to
-            # a full merge attempt and is therefore safe under a wrong False.  The
-            # same False here would mean "this task never landed", so it is
-            # re-probed rather than believed: both endpoints were resolved before
-            # the call, so if either fails to re-resolve NOW the containment answer
-            # came from a broken repo and not from the task.
-            unresolvable = await _unresolvable_endpoints(git_ops, head, upstream)
-            probe['containment_unresolvable'] = unresolvable
-            probe['containment_recheck'] = 'unhealthy' if unresolvable else 'healthy'
-            if unresolvable:
-                probe['git_error_stage'] = 'patch_id_containment'
-                return _reject(LandingReason.git_error)
-            return _reject(LandingReason.not_landed)
+        rejection = await _containment_rejection(git_ops, head, upstream, probe)
+        if rejection is not None:
+            return _reject(rejection)
 
-        evidence_sha = await _resolve_main_reachable_evidence(git_ops, task_id, head, probe)
+        evidence_sha = await _resolve_main_reachable_evidence(
+            git_ops, task_id, head, probe, pattern_template=pattern_template,
+        )
         if evidence_sha is None:
             return _reject(LandingReason.no_attribution)
         return _accept(evidence_sha)

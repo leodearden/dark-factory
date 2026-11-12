@@ -240,8 +240,8 @@ class TestStartMergeWorkerK2LivenessRepro:
             f'got {smw_kwargs.get("speculation_depth")!r}'
         )
 
-        # (3) 'Speculative merge worker started' in caplog
-        assert 'Speculative merge worker started' in caplog.text, (
+        # (3) 'Speculative merge worker constructed' in caplog
+        assert 'Speculative merge worker constructed' in caplog.text, (
             f'Expected startup log in caplog; got: {caplog.text!r}'
         )
 

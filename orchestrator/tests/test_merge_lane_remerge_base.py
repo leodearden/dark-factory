@@ -15,9 +15,10 @@ from pathlib import Path
 import pytest
 from _merge_lane_fakes import GateTask, VerifyTask, VerifyTasks, lane_scene_config
 from _merge_lane_fakes import verifies as verifies
+from test_merge_queue_frozen_prefix import _make_worker, _seed_frozen
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import MergeResult
+from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_lane.dead_base_ledger import (
     DeadBaseKiller,
     DeadBaseLedger,
@@ -27,10 +28,14 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
+    entry_bases,
+    entry_commit,
+    entry_successor_base,
     frontier_tip,
 )
 from orchestrator.merge_lane.speculation_controller import PermitLedger
 from orchestrator.merge_lane.types import (
+    ChainResult,
     DecidedItem,
     InflightEntry,
     InflightStatus,
@@ -88,13 +93,18 @@ def _entry(
     verify: VerifyTask | None,
     status: InflightStatus | None = None,
     gate_task: GateTask | None = None,
+    chain: ChainResult | None = None,
 ) -> InflightEntry:
     item = _real_item(config, task_id, base=base, commit=commit)
     return InflightEntry(
         item=item, lease=None, verify_task=verify, merge_wt=item.merge_wt,
         was_speculative=item.speculative, status=status,
         gate=None if gate_task is None else _gate(item, gate_task),
+        chain=chain,
     )
+
+
+_CHAIN = ChainResult(links=[('f1', 'sha-l1'), ('f2', 'TIP')], tip='TIP')
 
 
 def _passthrough(config: OrchestratorConfig, task_id: str) -> InflightEntry:
@@ -325,6 +335,109 @@ class TestChooseRemergeBase:
         assert _choose('sha-y', frontier, dead=ledger) == RemergeBase('sha-y', RemergeReason.LIVE_TIP)
         ledger.record('sha-x', DeadBaseKiller(DeadBaseSite.ADOPTION_VOID, 'x'))
         assert _choose('sha-y', frontier, dead=ledger) == RemergeBase(None, RemergeReason.TIP_DEAD)
+
+
+@pytest.mark.asyncio
+class TestAChainedEntrysSuccessorBaseIsItsChainTip:
+    """Task 7720: an item behind a deep chain stacks on the chain tip, so every
+    reader of "what successors stack on" sees the tip, not the entry's own commit."""
+
+    async def test_the_successor_base_is_the_tip_only_when_links_chained(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        chained = _entry(
+            config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(), chain=_CHAIN,
+        )
+        plain = _entry(config, 'p', base=_MAIN, commit='sha-p', verify=verifies.pending())
+        empty = _entry(
+            config, 'e', base=_MAIN, commit='sha-e', verify=verifies.pending(),
+            chain=ChainResult(links=[], tip='sha-elsewhere'),
+        )
+        assert entry_successor_base(chained) == 'TIP'
+        assert entry_commit(chained) == 'sha-s'
+        assert entry_successor_base(plain) == entry_commit(plain) == 'sha-p'
+        assert entry_successor_base(empty) == entry_commit(empty) == 'sha-e'
+
+    async def test_a_chained_entry_stands_for_its_commit_and_its_tip(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        chained = _entry(
+            config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(), chain=_CHAIN,
+        )
+        plain = _entry(config, 'p', base=_MAIN, commit='sha-p', verify=verifies.pending())
+        built_nothing = _entry(config, 'n', base=_MAIN, commit=None, verify=verifies.pending())
+        assert entry_bases(chained) == {'sha-s', 'TIP'}
+        assert entry_bases(plain) == {'sha-p'}
+        assert entry_bases(built_nothing) == frozenset()
+
+    async def test_a_dead_chained_commit_is_tip_dead(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        frontier = [
+            _entry(
+                config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+        ]
+        chosen = _choose('TIP', frontier, dead=frozenset({'sha-s'}))
+        assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
+
+    async def test_the_frontier_tip_is_the_chain_tip(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        frontier = [
+            _entry(config, 'h', base=_MAIN, commit='sha-h', verify=verifies.pending()),
+            _entry(
+                config, 's', base='sha-h', commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+        ]
+        assert frontier_tip(frontier) == 'TIP'
+
+    async def test_a_live_chain_tip_anchors_a_remerge(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        frontier = [
+            _entry(config, 'h', base=_MAIN, commit='sha-h', verify=verifies.pending()),
+            _entry(
+                config, 's', base='sha-h', commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+        ]
+        assert _choose('TIP', frontier) == RemergeBase('TIP', RemergeReason.LIVE_TIP)
+
+    async def test_a_dead_chain_tip_is_tip_dead(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        frontier = [
+            _entry(
+                config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+        ]
+        chosen = _choose('TIP', frontier, dead=frozenset({'TIP'}))
+        assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
+
+    async def test_a_successor_on_the_chained_entrys_own_commit_breaks_the_chain(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        """The converse of the live C1 row (test_merge_queue_deep_reservation.py),
+        which stacks a successor on the tip: no live lane builds this state,
+        so it is seeded."""
+        worker = _make_worker(GitOps(config.git, config.project_root))
+        behind = _entry(config, 'x', base='sha-s', commit='sha-x', verify=verifies.pending())
+        _seed_frozen(
+            worker,
+            _entry(
+                config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+            behind,
+        )
+        violations = worker.check_frozen_prefix_invariant(_MAIN)
+        assert len(violations) == 1
+        assert 'base-chain broken' in violations[0]
+        assert behind.item.request.request_id in violations[0]
 
 
 def _ledger(depth: int) -> PermitLedger[SpecPermit]:

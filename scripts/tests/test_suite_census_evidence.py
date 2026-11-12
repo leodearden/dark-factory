@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 import suite_census_evidence as ev
 import suite_census_outcomes as oc
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from suite_census_fixtures import git_tree, junit_xml, nextest_project, pytest_project, write_gz
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PASSED, FAILED, SKIPPED = oc.Outcome.PASSED, oc.Outcome.FAILED, oc.Outcome.SKIPPED
 

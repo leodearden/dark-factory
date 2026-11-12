@@ -1019,12 +1019,12 @@ def classify_worktree_entry(name: str) -> WorktreeClass:
         * everything else                => ``'task'`` — the task-id-shaped
           namespace the sweep/reaper may act on.
 
-    WARNING — adoptable warm/spec lanes (``_lane-`` / ``_spec-``) are
-    ``_``-prefixed, so this classifier labels them ``'infra'``.  They are
-    NOT infra: they carry recoverable task work and have their own
-    adopt/release/quarantine handling.  Every caller MUST therefore check
-    ``pool.is_lane()`` (warm AND spec pools) FIRST and only consult this
-    classifier for non-lane entries.
+    WARNING — only ``_lane-`` warm lanes carry recoverable task work, yet
+    they are labelled ``'infra'``: a caller that adopts warm lanes MUST check
+    ``warm_lane_pool.is_lane()`` first.  ``_spec-`` lanes carry none, so
+    ``'infra'`` is right for them (owner: the merge worker's spec pool,
+    PROTECTED_PREFIXES ``'_spec-'``); a caller may still skip them earlier
+    through ``spec_warm_lane_pool.is_lane()``.
 
     Fail-safe direction: a mis-shaped task name is left alone / leaked
     (recoverable by an operator), never destroyed.
@@ -13810,7 +13810,7 @@ class GitOps:
         an mmap'd path falls at-or-under the ``_merge-verify`` subtree and
         reaps them (SIGTERM → bounded wait → SIGKILL) BEFORE the worker loop
         starts, hence before that first reset can run.  The Harness invokes it
-        once from :meth:`Harness._start_merge_worker`, immediately before
+        once from :meth:`Harness._launch_merge_worker_loop`, immediately before
         creating the merge-worker task.
 
         Scope + fail-open: confined to the LOCAL in-process lane

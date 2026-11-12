@@ -27,15 +27,15 @@ tasks:
           paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
           expect: present
       - name: "projection-exposes-created-at"
-        binding: "capability→producer — fused-memory/src/fused_memory/task_projection.py::TASK_ROW_KEYS gains both keys, guarded for an unmigrated read-only store"
+        binding: "capability→producer — fused-memory/src/fused_memory/backends/task_projection.py::TASK_ROW_KEYS gains both keys, omitted on a connection whose v6 ALTER never landed"
         verdict: PASS
         delivered_check:
           kind: grep
           pattern: "created_at"
-          paths: ["fused-memory/src/fused_memory/task_projection.py"]
+          paths: ["fused-memory/src/fused_memory/backends/task_projection.py"]
           expect: present
       - name: "backfill-script-exists"
-        binding: "capability→producer — scripts/backfill_task_created_at.py (new); runs.db first event, else non-backfilled pending_since, else updated_at; never overwrites a stamped row"
+        binding: "capability→producer — scripts/backfill_task_created_at.py (new); the earliest usable of the runs.db first event, a non-backfilled pending_since and updated_at; never overwrites a stamped row"
         verdict: PASS
         delivered_check:
           kind: grep

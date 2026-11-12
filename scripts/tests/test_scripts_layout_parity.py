@@ -14,14 +14,18 @@ from types import ModuleType
 
 import census_tagger_debris
 import merge_lane_throughput
+import pytest
 import suite_census_evidence
 import sweep_toolcall_markup
 import task_event_timeline
 from orchestrator.session_registry import normalize_escalations_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import fleet_state, inventory
 from suite_census_fixtures import flake_db, git_tree
 
 from shared import project_layout
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 

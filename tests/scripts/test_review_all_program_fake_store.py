@@ -20,8 +20,11 @@ from typing import Any
 
 import pytest
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, running_fake_store
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from shared import task_statuses
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN_ID = 'review-all-fixture-20261019'
 PROJECT_ROOT = '/review-all-fixture/project'

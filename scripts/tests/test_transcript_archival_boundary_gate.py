@@ -47,6 +47,9 @@ import pytest
 from legibility import config as legibility_config
 from legibility import inventory, sampling
 from shared.transcript_archive import archive_task_transcripts
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # scripts/tests/../../ = the repo root, where docs/legibility/legibility.yaml
 # (the SHIPPED config E5 reads its roots/prefixes from) lives.

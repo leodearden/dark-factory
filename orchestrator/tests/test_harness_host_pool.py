@@ -86,6 +86,7 @@ def harness(repo: Path) -> Harness:
 @pytest_asyncio.fixture
 async def started(harness: Harness) -> AsyncIterator[Harness]:
     await harness._start_merge_worker()
+    await harness._launch_merge_worker_loop()
     try:
         yield harness
     finally:
@@ -93,8 +94,9 @@ async def started(harness: Harness) -> AsyncIterator[Harness]:
 
 
 def _laptop_row(harness: Harness) -> dict[str, Any]:
-    assert harness._merge_worker is not None
-    rows = {row['name']: row for row in harness._merge_worker.snapshot()['hosts']}
+    worker = harness._merge_worker
+    assert worker is not None
+    rows = {row['name']: row for row in worker.snapshot()['hosts']}
     return rows[_HOST]
 
 

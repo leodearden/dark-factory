@@ -12,10 +12,13 @@ import logging
 import os
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SCHEMA_WARNING = 'task_metadata.schema_warning'
 _SOURCE = 'source=deterministic_task_guard'

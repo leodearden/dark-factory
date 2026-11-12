@@ -22,6 +22,7 @@ import pytest
 import yaml
 from _fm_helpers import load_script_module
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
@@ -51,6 +52,8 @@ from fused_memory.server.write_triage import (
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
 from server.write_triage_harness import configure_triage_config, search_candidate
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _SHIPPED_CONFIG = _PACKAGE_ROOT / 'config' / 'config.yaml'

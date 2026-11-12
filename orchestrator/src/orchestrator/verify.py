@@ -57,6 +57,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.relocated_scopes import relocated_scopes
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_admission_gate import (
     AdmissionGrant,
@@ -91,6 +92,7 @@ from orchestrator.verify_classify import (
     is_interpreter_missing_workspace_packages,
     is_partially_provisioned_venv_type_failure,
     is_shell_reported_external_kill,
+    output_proves_no_finding,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -1001,7 +1003,7 @@ def _carries_pytest_failure_verdict(output: str) -> bool:
     The surfaces are one flat veto set: a ``^FAILED `` line, an ``^E   ``
     traceback line, a failure summary, an ``INTERNALERROR>`` line, or either
     ``ERROR`` short-summary form (node-id or bare-file). It is the single
-    veto set of every verdictless-exit recogniser
+    veto set of every pytest verdictless-exit recogniser
     (``_is_bare_xdist_worker_crash``, ``_pytest_session_aborted_without_verdict``).
 
     The set is flat on purpose. It used to be two branches keyed on whether
@@ -1105,6 +1107,18 @@ def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
     ):
         return False
     return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
+
+
+def _leg_aborted_without_verdict(tool: ToolKind, rc: int, output: str) -> bool:
+    """Return True when a leg was torn down before reaching any verdict.
+
+    A pytest leg answers through ``_pytest_session_aborted_without_verdict``.
+    Any other leg needs a shell-reported kill and output proving no finding
+    was reached (``verify_classify.py::output_proves_no_finding``).
+    """
+    if tool is ToolKind.PYTEST:
+        return _pytest_session_aborted_without_verdict(rc, output)
+    return is_shell_reported_external_kill(rc) and output_proves_no_finding(tool, output)
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
@@ -2754,7 +2768,7 @@ def classify_leg(
     category = classify_failure(tool, rc, output, timed_out, event_channel=event_channel)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
-    if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
+    if _leg_aborted_without_verdict(tool, rc, output):
         return FailureCategory.INFRA_ABORT
     return _red_gate_category(slot)
 
@@ -6084,18 +6098,49 @@ async def _reap_command_subtree(
     pgid: int | None,
     scope_unit: str | None,
 ) -> None:
-    """Kill a spawned verify command's whole subtree: its cgroup scope first
-    (reaps process-group escapes), then its spawn process group as the backstop.
+    """Kill a spawned verify command's whole subtree: its launch scope and every
+    scope its session moved into
+    (orchestrator/src/orchestrator/relocated_scopes.py::relocated_scopes), which
+    reaps process-group escapes, then its spawn process group as the backstop.
+
+    Discovery runs first, while the leader still proves ownership, and never
+    costs the kills: a failure finds nothing, and a cancellation during it
+    still kills the launch scope and the process group before propagating.
 
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
     if proc is None:
         return
-    if scope_unit is not None:
-        await _kill_cgroup_scope(scope_unit)
-    if pgid is not None:
-        await terminate_process_group(proc, pgid, grace_secs=5.0)
+    relocated: frozenset[str] = frozenset()
+    try:
+        relocated = await _discover_relocated_scopes(proc, scope_unit)
+    finally:
+        launched = [] if scope_unit is None else [scope_unit]
+        for unit in [*launched, *sorted(relocated)]:
+            await _kill_cgroup_scope(unit)
+        if pgid is not None:
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+
+async def _discover_relocated_scopes(
+    proc: asyncio.subprocess.Process, scope_unit: str | None
+) -> frozenset[str]:
+    try:
+        relocated = await relocated_scopes(proc, launched_in=scope_unit)
+    except Exception:
+        logger.warning(
+            'verify command pid %d: finding the scopes it moved into failed; '
+            'reaping only its launch scope and process group',
+            proc.pid, exc_info=True,
+        )
+        return frozenset()
+    if relocated:
+        logger.info(
+            'verify command pid %d moved into scopes %s; killing them too',
+            proc.pid, sorted(relocated),
+        )
+    return relocated
 
 
 async def _run_cmd(
@@ -6125,6 +6170,8 @@ async def _run_cmd(
     inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
     defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
+    A scope the command moves itself into (a nested ``systemd-run --scope``)
+    is reaped too, found by the command's session (``_reap_command_subtree``).
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
@@ -6916,9 +6963,10 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
     path, creates an *inner* ``systemd-run --user --scope --slice=...``
     scope.  The inner scope MOVES the governed workload out of the outer
-    ``df-verify`` scope into its own scope under that slice, so neither the
-    outer scope's CPUWeight nor its cgroup kill reaches that workload —
-    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``df-verify`` scope into its own scope under that slice, so the outer
+    scope's CPUWeight does not reach that workload — ``cpu-governed-exec.sh``
+    sets the workload's weight itself.  The kill still reaches it: an abnormal
+    exit kills the relocated scope too (``verify.py::_reap_command_subtree``).
     ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
     nested-scope failure degrades gracefully.
     """

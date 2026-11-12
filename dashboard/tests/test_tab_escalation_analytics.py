@@ -647,10 +647,10 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         slicing to the payload's `generated_at` — NOT the browser clock
         (`Date.now`).
     (c) A `parse_failures` warning chip, rendered only when `> 0`.
-    (d) A reusable `RegimeMarkers` (or `ChartMarkers`) overlay component fed
-        the payload's real `regime_markers` data (not just the
-        empty-defaults literal), plus a `TimeChart` wrapper that composes it
-        with a chart primitive.
+    (d) The payload's real `regime_markers` data is read (not just the
+        empty-defaults literal). That every time chart draws it through
+        charts.jsx::MarkedChart is a render test, in
+        js/jsx_render_quality.test.mjs.
     """
     body = tab_analytics_jsx_body
 
@@ -699,24 +699,11 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'add the helper that filters date-keyed daily buckets down to the active window.'
     )
 
-    # (d) Reusable regime-marker overlay, fed the real regime_markers field,
-    # plus the TimeChart wrapper every panel chart will render through.
-    assert (
-        'function RegimeMarkers(' in body or 'function ChartMarkers(' in body
-    ), (
-        'tab_escalation_analytics.jsx does not define a RegimeMarkers/ChartMarkers '
-        'overlay component — add one so time charts can render vertical regime '
-        'markers without modifying charts.jsx.'
-    )
+    # (d) The regime_markers field is read off the payload.
     assert re.search(r'\.regime_markers\b', body), (
         'tab_escalation_analytics.jsx never dot-references `.regime_markers` off the '
         'analytics payload — the marker overlay must be fed the real '
         'analytics.regime_markers data, not just the empty-defaults literal.'
-    )
-    assert 'function TimeChart(' in body, (
-        'tab_escalation_analytics.jsx does not define `function TimeChart(` — add the '
-        'wrapper that composes a chart primitive with the RegimeMarkers overlay so '
-        'every panel chart gets regime markers consistently.'
     )
 
 
@@ -1066,44 +1053,6 @@ def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: 
         f'The esc-per-done chart must be fed the windowed rows themselves, so a '
         f'day with no measurement keeps its slot and renders as a gap.'
     )
-
-
-# ---------------------------------------------------------------------------
-# amendment: pin charts.jsx's chart padding to the value RegimeMarkers assumes
-# ---------------------------------------------------------------------------
-
-
-def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: str) -> None:
-    """Pin charts.jsx's LineChart/StackedAreaChart padL/padR to the values
-    tab_escalation_analytics.jsx's RegimeMarkers overlay hardcodes as
-    `_CHART_PAD_L`/`_CHART_PAD_R` (38/12).
-
-    charts.jsx is intentionally NOT modified by the escalation-analytics tab
-    (see task 2659 design decisions: markers/ECDF are composed locally from
-    existing primitives instead of extending the shared chart primitives, to
-    avoid a broader-scope edit and contention with sibling tasks also
-    building on charts.jsx). RegimeMarkers therefore duplicates padL/padR as
-    private constants rather than importing them from charts.jsx, so that
-    duplication is invisible to any test scoped to tab_escalation_analytics.jsx
-    alone — if charts.jsx's padding ever changes, the overlay would silently
-    drift out of alignment with the chart it decorates. This test is the
-    tripwire: it fails loudly the moment the two constants diverge, without
-    requiring charts.jsx to export anything.
-    """
-    for fn_name in ('LineChart', 'StackedAreaChart'):
-        fn_body = extract_function_body(charts_jsx_body, fn_name)
-        assert re.search(r'padL\s*=\s*38\b', fn_body), (
-            f'charts.jsx {fn_name} no longer declares padL = 38 — '
-            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '
-            'RegimeMarkers overlay (see that file) and must be updated to match, '
-            'or charts.jsx should export the constant instead.'
-        )
-        assert re.search(r'padR\s*=\s*12\b', fn_body), (
-            f'charts.jsx {fn_name} no longer declares padR = 12 — '
-            'tab_escalation_analytics.jsx hardcodes _CHART_PAD_R = 12 for its '
-            'RegimeMarkers overlay (see that file) and must be updated to match, '
-            'or charts.jsx should export the constant instead.'
-        )
 
 
 # ---------------------------------------------------------------------------

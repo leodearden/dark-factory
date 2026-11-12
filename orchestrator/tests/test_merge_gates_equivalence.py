@@ -201,6 +201,26 @@ async def test_a_failed_second_parent_probe_compares_the_task_worktree_head(
 
 
 @pytest.mark.asyncio
+async def test_a_linear_landing_with_no_tip_on_record_ignores_a_drifted_worktree_head(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+) -> None:
+    """A single-parent landing with no recorded tip skips the worktree-HEAD comparison, so a worktree that moved on after landing cannot block it."""
+    base = _git(repo, 'rev-parse', 'HEAD')
+    worktree = _task_worktree(repo, tmp_path)
+    _commit(worktree, {'feature.txt': 'branch work\n'}, f'impl({TASK_ID}): branch work')
+    _git(repo, 'merge', '--squash', TASK_BRANCH)
+    _git(repo, 'commit', '-m', f'Squash-land {TASK_BRANCH}')
+    landed = _git(repo, 'rev-parse', 'HEAD')
+    assert len(_git(repo, 'show', '-s', '--format=%P', landed).split()) == 1
+    _commit(worktree, {'feature.txt': 'drifted after landing\n'}, 'drift')
+
+    outcome = await _finalize(git_ops, _request(lane_config, worktree), landed=landed, base=base)
+
+    assert outcome.status == 'done', outcome
+    assert outcome.merge_sha == landed
+
+
+@pytest.mark.asyncio
 async def test_the_triage_hint_names_a_placeholder_when_no_tip_is_on_record(
     repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
     monkeypatch: pytest.MonkeyPatch,

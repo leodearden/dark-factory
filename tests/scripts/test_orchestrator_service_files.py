@@ -53,6 +53,7 @@ import pathlib
 import re
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Shared with tests/scripts/test_know_live_installed_unit_parity.py, which had
 # hand-copied the ExecStart parsers from this module and drifted; task 3773
@@ -77,6 +78,8 @@ from systemd_unit_invariants import (
     logical_exec_start,
     parse_sections,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"

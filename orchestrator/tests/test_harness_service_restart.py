@@ -255,7 +255,6 @@ class TestStartMergeWorkerBuildsCoordinatorList:
     ):
         """_start_merge_worker must not propagate liveness-check exceptions; list still built."""
         with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
-             patch('asyncio.create_task') as mock_ct, \
              patch(
                  'orchestrator.merge_lane.liveness.check_merge_liveness_margin',
                  side_effect=RuntimeError('liveness boom'),
@@ -266,7 +265,6 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         mock_smw.assert_called_once()
         assert isinstance(harness._service_restart_coordinators, list)
         assert len(harness._service_restart_coordinators) == 3
-        mock_ct.assert_called_once()
         assert 'liveness boom' in caplog.text
 
 

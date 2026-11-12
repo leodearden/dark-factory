@@ -13,8 +13,11 @@ import os
 
 import pytest
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, BeforeDone
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 DATED = {'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00'}
 

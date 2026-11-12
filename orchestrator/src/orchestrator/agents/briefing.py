@@ -28,6 +28,7 @@ from orchestrator.agents.review_briefing import (
 from orchestrator.config import OrchestratorConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +478,37 @@ def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
             'not work — find a different root cause instead of repeating it.'
         )
     return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
+
+
+def _format_scope_drift(report: ScopeDriftReport | None) -> str:
+    """The briefing block reporting what the last writer boundary did with scope requests.
+
+    Empty for None or a report with nothing acquired or contested. The single
+    home of this briefing line; task 4371 reuses it.
+    """
+    if report is None or not (report.acquired or report.contested):
+        return ''
+    lines = [
+        '## Scope Requests',
+        '',
+        'The orchestrator applied the files reported with `report_missing_plan_file`:',
+        '',
+    ]
+    lines.extend(
+        f'- `{path}`: granted. It is now in plan.json `files`, and this task holds its lock.'
+        for path in report.acquired
+    )
+    lines.extend(
+        f'- `{path}`: contested, held by task {holder}.' for path, holder in report.contested
+    )
+    if report.contested:
+        lines.extend([
+            '',
+            'Do not edit a contested file. Revert any edit already made to it, or call '
+            "`escalate_blocker(category='scope_violation')` naming the file, the "
+            'holder and the design reason it must change.',
+        ])
+    return '\n'.join(lines) + '\n'
 
 
 @dataclass
@@ -1075,6 +1107,8 @@ suggestions-only on this exact tree — call
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the implementer agent.
 
@@ -1112,6 +1146,9 @@ Your worktree was rebased onto the latest main branch.
 
 Review any overlap with your plan steps before continuing — file contents may have changed.
 """
+
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'\n{scope_drift_block}' if scope_drift_block else ''
 
         wip_section = ''
         if wip_notice:
@@ -1162,7 +1199,7 @@ Before writing any new code, walk the pending steps in plan order:
 **Analysis:** {plan.get('analysis', 'N/A')}
 
 {rebase_section}
-{wip_section}
+{wip_section}{scope_drift_section}
 # Session Startup Protocol
 
 1. Read `.task/plan.json` to see the full plan with current status.
@@ -1194,6 +1231,8 @@ Before writing any new code, walk the pending steps in plan order:
         locked_modules: list[str],
         context: str | None = None,
         task_id: str | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
         review suggestions without re-planning.
@@ -1216,6 +1255,10 @@ Before writing any new code, walk the pending steps in plan order:
         Renders NO iteration history (task 5744), for the same reason as
         :meth:`build_implementer_prompt`: iterations.jsonl is its single home
         and the Action section below mandates reading it.
+
+        Rule 3 tells the agent not to file a scope request in this pass; one
+        filed anyway is still applied at the pass boundary
+        (``workflow.py::TaskWorkflow._amend``), so none is orphaned.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1242,13 +1285,15 @@ Before writing any new code, walk the pending steps in plan order:
                 block.append(f'**Suggested fix:** {fix}')
             suggestion_blocks.append('\n'.join(block))
         suggestions_body = '\n\n'.join(suggestion_blocks)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
 
 {identity}
 
-# Amendment Pass
+{scope_drift_section}# Amendment Pass
 
 The implementation for this task is complete and verification has passed.
 A code reviewer surfaced the suggestions below, all scoped to modules this
@@ -1277,6 +1322,9 @@ This task holds locks for the following modules:
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
+   This pass never widens the task's scope, so do NOT call
+   `report_missing_plan_file` here, whatever your role's standing scope
+   guidance says.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable
    from the main plan commits.
 
@@ -1299,6 +1347,7 @@ This task holds locks for the following modules:
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
         *, attempt_context: VerifyAttemptContext | None = None,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the debugger agent.
 
@@ -1312,6 +1361,8 @@ This task holds locks for the following modules:
 
         identity = self._agent_identity(scope.task_id, 'debugger')
         verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1323,7 +1374,7 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-{verify_attempt}# Failures
+{verify_attempt}{scope_drift_section}# Failures
 
 ```
 {failures}
@@ -1532,10 +1583,14 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
         context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1551,12 +1606,43 @@ This task was paused because an agent escalated a blocking issue.
 {resolution}
 
 {prior_proposal_section}
-## Action
+{scope_drift_section}## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
 is preserved in the worktree. Read `.task/plan.json` and
 `.task/iterations.jsonl` to understand current progress, then continue from
 where the previous agent left off.
+"""
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift: ScopeDriftReport, task_id: str | None = None,
+    ) -> str:
+        """Prompt for the one session that briefs a contested scope request no writer saw.
+
+        ``workflow.py::TaskWorkflow._brief_contested_scope_drift`` runs it when
+        the session that filed the request was the last writer session due.
+        That can be the judge's early exit with steps still pending, so the
+        prompt claims nothing about the plan's progress.
+        """
+        scope = _plan_scope(plan, task_id)
+        context = await self._get_memory_context(scope, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
+        return f"""\
+{context}
+
+{identity}
+
+# Scope Request Follow-up
+
+A file reported with `report_missing_plan_file` is locked by another task,
+and no other writer session is due to hear about it. This session exists only
+to settle it.
+
+{_format_scope_drift(scope_drift)}
+## Action
+For each contested file: revert your edits to it and commit, keeping the
+task's tests passing, or escalate as the section above says. Make no other
+change. Do not edit `.task/plan.json`.
 """
 
     async def build_steward_initial_prompt(

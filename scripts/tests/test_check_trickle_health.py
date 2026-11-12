@@ -27,6 +27,9 @@ from pathlib import Path
 import pytest
 from legibility import check_trickle_health, trickle_state
 from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / 'legibility' / 'check_trickle_health.py'
 

@@ -14,7 +14,15 @@
 # waiter-present share falls below 0.90 or landings/day fall below the W44 rate,
 # revert at the next redeploy; raise again when task 7977's remote task legs reach
 # this project. Red tier: takes effect at the next redeploy.
-max_concurrent_tasks: 18
+# 18 -> 24 (Leo, 2026-11-12, after the three-gates scheduling study): the tripwire
+# above fired. With verify_admission_task_slots at 2, a verify waiter was present in
+# 53% of the minutes in which agents could run (2026-11-09..11-12, measured per
+# minute against the 0.90 per-sample line), and task 7977 is done. Neither value has
+# a measured throughput effect: the six extra starts go into a merge lane that was
+# full in 80% of those minutes and an agent allowance that was capped for 24% of
+# them, so watch the merge-phase share of slot time after the redeploy.
+# Red tier: takes effect at the next redeploy.
+max_concurrent_tasks: 24
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -110,6 +118,22 @@ module_overrides:
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
+  # DOCUMENTATION FILES (Leo's ruling of 2026-11-12): unbounded for the same reason
+  # as the ratchet paths. OPERATIONS.md is declared by 171 pending tasks and was at
+  # capacity 99% of 2026-11-09..11-12; two edits of a prose file conflict textually,
+  # at rebase. INTERIM for task 5467, which strips docs/ and root-level Markdown
+  # from lock derivation for every project: remove these ten keys when it lands.
+  # skills/ is deliberately not listed (agent instructions; no ruling).
+  OPERATIONS.md: 99
+  ARCHITECTURE.md: 99
+  CHANGELOG.md: 99
+  CLAUDE.md: 99
+  CONTRIBUTING.md: 99
+  DESIGN.md: 99
+  README.md: 99
+  RECONCILIATION_PLAN.md: 99
+  SETUP.md: 99
+  docs/task-authoring.md: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its

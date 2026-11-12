@@ -3234,14 +3234,17 @@ missing `LoadState` detector).
 | 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 | 05:30 | Cross-project return brief (Fable prepare + render) | `return-brief.timer` |
+| 06:00 | INV-12 owner sweep | `exception-owner-sweep.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones, and
-[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
+for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones,
+[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
+[The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
+for the 06:00 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -4084,6 +4087,128 @@ so list dark-factory too.
 **The apply half is agent work, not timer work.** Leo's answers are applied
 by a watcher session, following `skills/escalation-watcher/SKILL.md`,
 "Sitting preparer (`prepare-sitting` mode)".
+
+---
+
+## 12a. INV-12 `exceptions-owned-or-ratified`: the exception register and owner sweep
+
+Every allow-list entry and inline suppression that silences a detector carries
+a disposition: a live owner (`Debt`) or an operator ruling (`Policy`). The rule
+itself is in [docs/legibility/design-invariants.md](docs/legibility/design-invariants.md).
+The accepted spellings are `shared.governed_exceptions.INLINE_MARKER_FORMS` and
+`DECLARATION_FORMS`. The `x_inv12_*` task keys are described in the Tier-C
+paragraph of [docs/task-authoring.md](docs/task-authoring.md). This section
+covers only what an operator runs and reads.
+
+### Reading exception_register.py --report
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project shared python scripts/exception_register.py --report
+# from a task worktree, read the host's stamp, not the worktree's absent one:
+uv run --project shared python scripts/exception_register.py --report \
+    --sweep-state /home/leo/src/dark-factory/data/exception-owner-sweep/state.json
+```
+
+Without `--sweep-state`, a worktree run reads its own absent
+`data/exception-owner-sweep/state.json` and prints `last sweep: never run`.
+
+| Block, in report order | Meaning |
+|---|---|
+| `grandfathered (unowned): N` | Inline suppressions the baseline holds with no disposition. The baseline only shrinks, so this number may only fall, except when a new bare marker re-uses a `baseline slack` key; `--tighten` closes that. |
+| `ratification table: …, N rows` | Rows of `docs/legibility/exception-ratifications.yaml`, the only ids a `Policy` may cite. |
+| `governed lists: N declarations` | One block per declaration: `list_id` and `path:line`, its `rule`, its `default` disposition with how many keys it `covers`, and each per-key override. |
+| `unregistered candidates (report-only)` | Allow-list-shaped symbols that no declaration governs. This is a review docket, not a failure. |
+| `inline suppressions: …` | Sites and files, `kinds`, `ownership` (class, debt, policy, unowned), the inline gate's violations, then counts by kind and code and by file. |
+| `baseline excess` | Keys the tree holds beyond the baseline. Non-zero is the merge gate's red. |
+| `baseline slack` | Keys the baseline holds that the tree no longer uses. `--tighten` removes them. |
+| `violations: N` | A `Policy` naming no table row, or a malformed disposition. Each is also printed on stderr. |
+| `last sweep: …` | The owner sweep stamp's age with `(ok)` or `(FAILED)`, and `STALE` past 48 h; or `unreadable stamp`; or `never run`. A `FAILED` stamp under 48 h old still exits 0, so read `journalctl` and the sweep's `infra_issue` escalation. |
+
+Exit codes: 0 clean; 1 violations; 2 an instrument failure, or a sweep stamp
+that is stale past 48 h or unreadable. A sweep that has never run is not a
+failure. `--json` publishes the same register as a document, and is what the
+sweep reads.
+
+The report does not check owner liveness. To list dead owners now, run
+`uv run --project shared python scripts/exception_owner_sweep.py --dry-run`. It
+reads the main checkout's task store from any checkout, but measures the
+citations in the checkout it runs from: pass `--root /home/leo/src/dark-factory`
+to measure main's. It prints one verdict and planned action per (scope, owner),
+and writes, files and escalates nothing.
+
+### The seed cutover, and what a red branch sees
+
+The merge gate is `scripts/tests/test_inline_suppression_ratchet.py`. It
+enforces only if `scripts/inline_suppression_baseline.json` exists. Task 5607
+seeded that baseline once, on main, with the merge queue halted, and committed
+it alone (2026-10-10). `inline_suppressions.py --seed` now refuses, because a
+baseline exists. `--tighten` only ever shrinks it.
+
+A branch that adds an undisposed marker goes red at verify. The failure names
+`file:line`, the kind and code, the reason and the accepted forms. A marker
+that no tool reads gets `delete this marker` instead, and no disposition
+answers for it. The fix is a disposition in the same comment, or fixing the
+code so the suppression can go. For early feedback, run
+`uv run --project shared python scripts/inline_suppressions.py --check PATH...`.
+It scans only those paths, and labels its green `partial`. A governed-list
+entry with no disposition fails test collection with `UndisposedException`.
+Rows of the ratification table are the operator's edit.
+
+### The owner sweep timer (06:00) and its age
+
+The units are `scripts/exception-owner-sweep.{sh,service,timer}`, installed by
+`scripts/install-exception-owner-sweep-timer.sh`. The service runs from the
+main checkout. It sweeps that checkout's tree against its task store, and
+writes the stamp `data/exception-owner-sweep/state.json` there.
+
+Check its age with any of:
+
+```bash
+uv run --project shared python scripts/exception_register.py --report   # the `last sweep:` line
+systemctl --user list-timers exception-owner-sweep.timer
+journalctl --user -u exception-owner-sweep.service
+cat /home/leo/src/dark-factory/data/exception-owner-sweep/state.json
+```
+
+The stamp holds `last_run`, `ok`, `failure` and the last run's counts. The
+wrapper always exits 0, for the reason every §12 job shares. A failed sweep
+sends one `infra_issue` escalation, rewrites the stamp with `ok` false, and
+leaves `last_run` unadvanced, so the stamp's age keeps growing.
+
+### The residual: a dead timer pages no one
+
+PRD D11 accepts this. If the timer stops firing, only someone who runs
+`--report` sees it: the `last sweep:` age grows, and past 48 h the report exits
+2. No watchdog and no predicate task watches the stamp.
+
+### What the sweep files
+
+Each finding has a key, and a run skips a finding whose key a live task or a
+pending escalation already carries.
+
+- **Dead owner, inline scope:** a task carrying `x_inv12_finding`. Its remedy
+  is `scripts/exception_owner_sweep.py::_DEAD_OWNER_REMEDY`: re-own each site
+  or fix the suppression, and never cite your own task.
+- **Dead owner, named list:** a `design_concern` info escalation whose
+  `task_id` is `inv12-finding:dead_owner:<list_id>:<owner>`. The decision is
+  the operator's: re-own the declaration, or rule a `Policy` row.
+- **Non-zero baseline slack:** a tighten task (run `--tighten`, then commit the
+  baseline). It recurs by design.
+- **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
+  in one run:** one roll-up escalation. The rest wait for the next run.
+- **A closed dead-owner task whose owner is still dead:** an escalation, never
+  a re-file.
+- **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
+
+**Known gap.** The sweep treats a named-list finding as already raised only
+while its escalation is pending (`scripts/exception_owner_sweep.py::decide`).
+The info-L0 router dismisses info notes within about ten minutes, so the same
+note is filed again every night until the entry is re-owned. The dead task-6201
+citation in `_WALL_CLOCK_DEADLINE_DEBT` has been escalated nightly since
+2026-10-29; task 7693 owns re-owning it. Separately, the finding bodies say to
+run `--report` to see the findings, but `--report` lists none: use `--dry-run`.
+Task 9468 owns both fixes, and updates this paragraph when either lands.
 
 ---
 

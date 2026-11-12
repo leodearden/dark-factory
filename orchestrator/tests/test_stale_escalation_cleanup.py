@@ -16,6 +16,11 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.stale_l0_strand_identity import (
+    STALE_L0_STRAND_ROLE,
+    STALE_L0_STRAND_ROOT_CAUSE,
+    STALE_L0_STRAND_SENTINEL,
+)
 
 # The origin incident (task 3172): esc-5189-7 had been pending 20h58m with a
 # workflow parked on it; esc-5685-1 had been pending ~90s.  The restart sweep
@@ -592,6 +597,23 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         agg = _aggregate_escalations(strand_harness)[0]
         assert agg.level == 1
         assert agg.status == 'pending'
+
+    async def test_aggregate_is_filed_under_the_published_strand_identity(
+        self, strand_harness: Harness
+    ):
+        """The record the Q6 rule keys on carries the published sentinel, root cause and role."""
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+
+        await strand_harness._dismiss_stale_escalations()
+
+        pending_l1s = [e for e in queue.get_pending() if e.level == 1]
+        assert len(pending_l1s) == 1, pending_l1s
+        (agg,) = pending_l1s
+        assert agg.task_id == STALE_L0_STRAND_SENTINEL
+        assert agg.root_cause == STALE_L0_STRAND_ROOT_CAUSE
+        assert agg.agent_role == STALE_L0_STRAND_ROLE
+        assert agg.id.startswith(f'esc-{STALE_L0_STRAND_SENTINEL}-')
 
     async def test_aggregate_survives_a_subsequent_restart_sweep(
         self, strand_harness: Harness

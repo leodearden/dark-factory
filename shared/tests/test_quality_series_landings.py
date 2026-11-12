@@ -21,6 +21,9 @@ from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, UnrecognisedTrainEvent, landings
 from shared.quality_series.git_lines import GitUnavailable
 from shared.quality_series.landings import LandingSource, LinesBase, recorded_landing_keys
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture(scope='module')

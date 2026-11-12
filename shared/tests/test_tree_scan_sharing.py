@@ -41,6 +41,10 @@ from silent_fallthrough_scan import (
     iter_first_party_files,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 

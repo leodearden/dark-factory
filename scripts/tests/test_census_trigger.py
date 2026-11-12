@@ -24,6 +24,9 @@ import yaml
 from legibility import census_trigger as ct
 from legibility.config import Census, LegibilityConfig, NoveltySpike, load_config
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 

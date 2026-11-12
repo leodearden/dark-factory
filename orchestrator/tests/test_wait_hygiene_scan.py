@@ -504,6 +504,43 @@ class TestNoStopCall:
             f'be reported, got {result!r}.'
         )
 
+    def test_straight_line_stop_after_poll_responsive_is_reported(self) -> None:
+        """`poll_responsive` gives up through `wait_responsive`'s
+        `pytest.fail`, a `BaseException`, so a straight-line `worker.stop()`
+        after it leaks the worker exactly as one after `wait_responsive` does.
+        """
+        source = '''
+class TestUnguardedPollTeardown:
+    async def test_it(self):
+        await poll_responsive(lambda: ready(), label='x')
+        await worker.stop()
+'''
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestUnguardedPollTeardown::test_it'], (
+            f'Expected the straight-line worker.stop() after poll_responsive '
+            f'to be reported, got {result!r}.'
+        )
+
+    def test_poll_responsive_inside_a_guarding_try_is_not_reported(self) -> None:
+        """The same poll inside a `try:` whose `finally:` calls
+        `stop_merge_worker(...)` is NOT reported.
+        """
+        source = '''
+class TestGuardedPollTeardown:
+    async def test_it(self):
+        try:
+            await poll_responsive(lambda: ready(), label='x')
+        finally:
+            await stop_merge_worker(worker, worker_task)
+'''
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == [], (
+            f'Expected a finally-guarded stop after poll_responsive to NOT '
+            f'be reported, got {result!r}.'
+        )
+
     def test_a_module_level_test_function_is_scanned(self) -> None:
         """pytest collects a module-level `test*` function as an item of its
         own, so the scan reports it under its bare name.

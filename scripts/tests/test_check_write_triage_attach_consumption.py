@@ -31,12 +31,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from write_triage_attach_fixtures import (
     JUDGE_STATIC_NEAR_MISS_VARIANTS,
     PROVIDER_REACHED_MARKER,
     write_fake_judge,
     write_fake_triage,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent

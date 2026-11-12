@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +25,9 @@ from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
 from shared.git_async import GitResult, run_git
+from shared.task_metadata import DoneProvenance
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -56,6 +58,8 @@ from fused_memory.reconciliation.consolidation_gate import (
     build_consolidation_gate_task,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture
@@ -3117,6 +3121,82 @@ async def test_done_provenance_rejects_missing_when_required(
     taskmaster.set_task_status.assert_not_called()
 
 
+def _offered_examples(text: str) -> list[dict]:
+    """Every JSON object ``text`` offers for copy-paste, decoded."""
+    decoder = json.JSONDecoder()
+    examples = []
+    start = text.find('{')
+    while start != -1:
+        example, end = decoder.raw_decode(text, start)
+        examples.append(example)
+        start = text.find('{', end)
+    return examples
+
+
+def _assert_offers_every_caller_selectable_kind(text: str) -> None:
+    """``text`` offers exactly one copy-pasteable example per kind a caller
+    may supply by hand, each a valid done write, and points at the canonical
+    per-kind table. The kind set and the per-kind rules both come from
+    shared's public DoneProvenance interface, so a new caller-selectable
+    kind, or a new required field on one, fails here until the guidance
+    follows."""
+    declared = set(get_args(DoneProvenance.model_fields['kind'].annotation))
+    caller_selectable = sorted(declared - DETERMINISTIC_PROVENANCE_KINDS)
+    examples = _offered_examples(text)
+    assert sorted(example['kind'] for example in examples) == caller_selectable, text
+    for example in examples:
+        DoneProvenance.parse_for_write(example)
+    assert 'docs/task-authoring.md' in text, text
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_required_hint_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """The require=True refusal's hint is the first thing a blocked caller reads."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'done_provenance_required'
+    _assert_offers_every_caller_selectable_kind(result['hint'])
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_missing_warning_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer, caplog
+):
+    """The require=False warning names the same kinds as the strict refusal."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        await interceptor.set_task_status('1', 'done', '/project')
+
+    [warning] = [
+        record.getMessage()
+        for record in caplog.records
+        if 'without done_provenance' in record.getMessage()
+    ]
+    _assert_offers_every_caller_selectable_kind(warning)
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_kind_required_reason_offers_every_caller_selectable_kind(
+    taskmaster, reconciler, event_buffer
+):
+    """A payload with no kind is refused at parse with the same guidance."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance={'note': 'x'},
+    )
+
+    assert result['error'] == 'done_provenance_invalid'
+    _assert_offers_every_caller_selectable_kind(result['reason'])
+
+
 @pytest.mark.asyncio
 async def test_done_provenance_rejects_empty_payload(
     taskmaster, reconciler, event_buffer, config_with_strict_provenance
@@ -5571,6 +5651,56 @@ async def test_rev_parse_rejection_reports_not_found(taskmaster, reconciler, eve
 
 
 @pytest.mark.asyncio
+async def test_rev_parse_rc1_reports_not_found(taskmaster, reconciler, event_buffer, tmp_path):
+    """Under `--verify --quiet`, rc=1 is git's verdict on the ref, so it
+    keeps the assertive wording. git is equally silent for an unknown name
+    and for an ambiguous short prefix, so the fallback detail must be true
+    of both rather than claim the commit does not exist."""
+    sha = _init_git_repo(tmp_path)
+
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+        ScriptedGitRunner({'rev-parse': GitResult(1, '', '')}),
+    )
+
+    assert 'not found in' in reason
+    assert 'does not name exactly one commit' in reason
+    assert 'ambiguous short prefix' in reason
+    assert 'could not be resolved in' not in reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('checkout', 'make_dir', 'expected_detail'),
+    [
+        ('not-a-repo', True, 'not a git repository'),
+        ('absent', False, 'cannot change to'),
+    ],
+    ids=['not-a-repository', 'missing-directory'],
+)
+async def test_unreadable_checkout_reports_unresolved(
+    taskmaster, reconciler, event_buffer, tmp_path, monkeypatch,
+    checkout, make_dir, expected_detail,
+):
+    """A project_root git cannot read as a repository never let rev-parse
+    evaluate the ref, so it must not be reported as "not found in"."""
+    project_root = tmp_path / checkout
+    if make_dir:
+        project_root.mkdir()
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+    monkeypatch.delenv('GIT_DIR', raising=False)
+    monkeypatch.delenv('GIT_WORK_TREE', raising=False)
+
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(project_root), 'deadbeef' * 5, run_git,
+    )
+
+    assert 'could not be resolved in' in reason
+    assert 'not found in' not in reason
+    assert expected_detail in reason
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('outcome', 'expected_detail', 'expected_warnings'),
     [
@@ -5578,17 +5708,31 @@ async def test_rev_parse_rejection_reports_not_found(taskmaster, reconciler, eve
         (FileNotFoundError('git'), 'git binary not found', 0),
         (PermissionError('denied'), 'PermissionError: denied', 1),
         (GitResult(0, '', ''), 'empty rev-parse output', 0),
+        (
+            GitResult(128, '', 'fatal: not a git repository (or any of the parent directories): .git'),
+            'fatal: not a git repository',
+            0,
+        ),
+        (GitResult(128, '', ''), 'rev-parse failed', 0),
     ],
-    ids=['timeout', 'missing-binary', 'unexpected-exception', 'empty-output'],
+    ids=[
+        'timeout',
+        'missing-binary',
+        'unexpected-exception',
+        'empty-output',
+        'rc128-not-a-repo',
+        'rc128-empty-stderr',
+    ],
 )
 async def test_rev_parse_failure_reports_unresolved(
     taskmaster, reconciler, event_buffer, tmp_path, caplog,
     outcome, expected_detail, expected_warnings,
 ):
     """A rev-parse that never rendered a verdict on the ref (timeout,
-    missing binary, unexpected error, empty output) must NOT be reported as
-    "not found in <project_root>" -- same honesty contract as the ancestor
-    check one step later. Only the unexpected exception is logged."""
+    missing binary, unexpected error, empty output, a git-level rc=128)
+    must NOT be reported as "not found in <project_root>" -- same honesty
+    contract as the ancestor check one step later. Only the unexpected
+    exception is logged."""
     sha = _init_git_repo(tmp_path)
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
@@ -6092,6 +6236,45 @@ async def test_reopen_freshness_exempts_operational_verified(
             await fresh.close()
         assert task['status'] == 'done', task
         assert task['metadata']['done_provenance']['kind'] == 'operational-verified'
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_deterministic_gate_escalation_id_persists_against_real_backend(
+    tmp_path, event_buffer,
+):
+    """Task 5274's VERIFY scenario at the persistence floor: a
+    deterministic-gate close keeps its escalation_id through a real
+    SqliteTaskBackend, read back by a fresh instance. The AsyncMock-taskmaster
+    tests above cannot see a backend-floor drop."""
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=FusedMemoryConfig())
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance=_gate_provenance(escalation_id='esc-5274-1'),
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+        assert task['metadata']['done_provenance']['kind'] == 'deterministic-gate'
+        assert task['metadata']['done_provenance']['escalation_id'] == 'esc-5274-1'
     finally:
         await backend.close()
 

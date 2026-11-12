@@ -32,6 +32,8 @@ class DeadBaseSite(StrEnum):
     DISPATCH_VOID = 'dispatch_void'
     #: A stale merge discarded at dispatch (Mechanism 2).
     STALE_DISCARD = 'stale_discard'
+    #: A deep chain tip whose reserved links did not all land (task 7720).
+    CHAIN_RELEASED = 'chain_released'
 
 
 class VoidPoint(StrEnum):

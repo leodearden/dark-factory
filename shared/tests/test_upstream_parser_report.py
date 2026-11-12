@@ -72,6 +72,9 @@ import pytest
 from test_toolcall_markup import assert_repair_invariants
 
 import shared.toolcall_markup as tm
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Mirrors shared/tests/conftest.py:21 rather than inventing a second
 # root-finding scheme.

@@ -710,7 +710,7 @@ The stamp outlives the conversion, so it is the status check together with the i
 
 Two harness detectors file sentinel L1s that are monitor signals. Each linked handler's **Class discriminator** decides which L1s a row covers. Each is promoted only under the condition below; otherwise it is handled at L1 (Leo, 2026-11-04: `plans/decision-stream-prd.md` §3.12, boundary rows 19 and 20). θ2 counts, over 14 days, any veto-streak or strand-sweep L2 these rules should have prevented; that count, not a text test, measures the rules.
 
-<!-- q6-detector-sentinels:begin — first column mirrored against recovery_emission.py::RECOVERY_VETO_STREAK_SENTINEL_PREFIX and harness.py::Harness._STALE_L0_STRAND_SENTINEL by tests/scripts/test_escalation_watcher_auto_q6_sentinels.py -->
+<!-- q6-detector-sentinels:begin — first column mirrored against recovery_emission.py::RECOVERY_VETO_STREAK_SENTINEL_PREFIX and stale_l0_strand_identity.py::STALE_L0_STRAND_SENTINEL by tests/scripts/test_escalation_watcher_auto_q6_sentinels.py -->
 | sentinel `task_id` | promote only when | otherwise, at L1 |
 |---|---|---|
 | `__recovery_veto_streak__` | no id on its `Pinning escalations:` line is a pending L2 or a member of one, and its release edge is not due | no promote, no close: leave it for the release edge — see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) |

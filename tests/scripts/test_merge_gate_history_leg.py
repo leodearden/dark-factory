@@ -44,8 +44,11 @@ from _pytest.mark.expression import Expression
 from orchestrator.config import ModuleConfig, OrchestratorConfig, _discover_module_configs
 from orchestrator.pytest_markers import locate_pytest_config, resolve_marker_expression
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 MARKER = 'reads_git_history'
@@ -107,6 +110,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_landing.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_deep_reservation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_speculation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_plan_tools_server.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,

@@ -34,6 +34,9 @@ from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_p
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
 from shared.proc_group import process_group_members, read_stat_fields
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture

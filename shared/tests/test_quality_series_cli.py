@@ -19,6 +19,9 @@ from quality_series_fixtures import (
 )
 
 from shared.quality_series import cli, landings, rows_for, summary
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 POST_MERGE = 'post_merge_verify'

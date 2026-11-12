@@ -39,6 +39,9 @@ from audit_offcontract_review_findings import (
     select_population,
     validate_report,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Synthetic issue dicts — one per schema variant measured across the 14 frozen

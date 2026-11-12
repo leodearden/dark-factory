@@ -34,6 +34,9 @@ from legibility import (
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
 from legibility_census_scaffold import journaled, narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 _DATE = "2026-10-06"

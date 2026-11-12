@@ -24,6 +24,9 @@ from inline_suppression_consumers import FIRST_PARTY_CODES, Consumer, ConsumerMo
 from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, write_files
 from inline_suppression_kinds import KIND_SPECS, Kind, Site
 from inline_suppression_refusal import InstrumentFailure
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

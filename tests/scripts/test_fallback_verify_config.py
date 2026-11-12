@@ -40,7 +40,10 @@ import pytest
 import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"

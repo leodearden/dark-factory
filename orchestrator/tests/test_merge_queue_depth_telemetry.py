@@ -58,11 +58,11 @@ def _sentinel_entry() -> InflightEntry:
 
     The tests below care about the *count* of frozen entries
     (``_verify_frontier_depth`` is a pure ``len()`` delegation).  Dispatch
-    also reads each entry's ``item`` and ``gate`` for the bases a new item
-    may stack on; ``None`` for both contributes no base commit, so no real
-    merge-result/lease graph is needed.
+    also reads each entry's ``item``, ``gate`` and ``chain`` for the bases a
+    new item may stack on; ``None`` for all three contributes no base commit,
+    so no real merge-result/lease graph is needed.
     """
-    return cast(InflightEntry, SimpleNamespace(item=None, gate=None))
+    return cast(InflightEntry, SimpleNamespace(item=None, gate=None, chain=None))
 
 
 # ---------------------------------------------------------------------------

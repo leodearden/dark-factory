@@ -14,7 +14,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from _filer_first_layout import FILER_PROJECT, TASK_27_FILES, stale_snapshot_registry
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.path_scope_guard import (
@@ -29,6 +31,8 @@ from fused_memory.middleware.path_scope_guard import (
     local_attesting_signals,
 )
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:

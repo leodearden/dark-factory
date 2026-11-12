@@ -6,7 +6,7 @@ import asyncio
 import logging
 import sqlite3
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -16,8 +16,15 @@ from typing import Any
 import pytest
 from _dt_helpers import fixed_clock, installed_clock
 from _quality_fixture import GitRepo, config_reload, routing_decision
-from _quality_rows import NO_OUTCOMES, history, write_landing_events, write_quality_db
+from _quality_rows import (
+    NO_OUTCOMES,
+    history,
+    write_landing_events,
+    write_marker_state_db,
+    write_quality_db,
+)
 from _runs_db_fixture import EventRow
+from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck
 from shared.quality_series.rows import LandingRow, Outcomes
 
@@ -31,8 +38,7 @@ from dashboard.api.window import (
 from dashboard.config import DashboardConfig
 from dashboard.data import quality_markers
 from dashboard.data.quality_marker_sampler import refresh_markers
-from dashboard.data.quality_markers import DerivedState, PromptCoverage, RoutingFold
-from dashboard.data.quality_store import QualitySample, write_marker_state
+from dashboard.data.quality_store import QualitySample
 from dashboard.loops import _QualityStore
 
 LANDINGS: dict[str, int | None] = {'100': 100, '300': 300, 'all': None}
@@ -88,15 +94,18 @@ STORED_START = NOW - timedelta(days=1) - timedelta(hours=2 * (STORED - 1))
 def _seeded(
     client: Any, tmp_path: Path, extra_events: Iterable[EventRow] = (),
     outcome: Callable[[int], Outcomes] = lambda ordinal: NO_OUTCOMES,
+    modules: Callable[[int], tuple[ModuleLines, ...]] = lambda ordinal: (),
+    units: Sequence[int] | None = None,
 ) -> Iterator[Any]:
     """The app over a root named 'dark_factory' holding STORED sampled landings, beside an
     unsampled 'other-proj', serving at NOW; runs.db also holds *extra_events* verbatim, and
-    *outcome* gives each landing's outcomes by ordinal."""
+    *outcome* and *modules* give each landing's outcomes and modules by ordinal, *units* its
+    verify units as _quality_rows.history takes them."""
     root, other = tmp_path / 'dark_factory', tmp_path / 'other-proj'
     root.mkdir()
     other.mkdir()
     config = DashboardConfig(project_root=root, known_project_roots=[other])
-    rows = history(STORED, start=STORED_START, outcome=outcome)
+    rows = history(STORED, start=STORED_START, outcome=outcome, modules=modules, units=units)
     write_landing_events(root, rows, extra_events)
     sample = QualitySample.value(
         'dark_factory', NOW - timedelta(minutes=5), cursor_sha=rows[-1].landing.merge_sha,
@@ -360,16 +369,8 @@ def curated_artefact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _store_an_empty_derivation(config: DashboardConfig) -> None:
-    async def write() -> None:
-        async with _QualityStore(config.quality_db) as store:
-            await write_marker_state(store.connection, DerivedState(
-                fold=replace(RoutingFold.empty('dark_factory'), complete=True), markers=(),
-                skipped=0, prompt_coverage=PromptCoverage(
-                    digest_since=None, roles_py_landings=None, counted_since=None,
-                    reason='no routing decision is folded yet'),
-                refreshed_at=NOW - timedelta(minutes=5)))
-            await store.connection.commit()
-    asyncio.run(write())
+    asyncio.run(write_marker_state_db(config.quality_db, 'dark_factory', (),
+                                      refreshed_at=NOW - timedelta(minutes=5)))
 
 
 def test_row_6_a_curated_artefact_is_excluded_from_the_baseline_and_served_as_a_range(
@@ -497,3 +498,98 @@ def test_a_quality_db_that_is_not_a_database_is_served_unknown_naming_the_error(
     records = [r for r in caplog.records if r.name == 'dashboard.api.quality']
     assert len(records) == 2, 'one WARNING per datum that read quality.db'
     assert all(record.exc_info is not None for record in records)
+
+
+# --- the module drill-down: ?module= keeps the landings touching one module ------------------
+
+DRILL_TRAIN = range(61, 64)
+"""The ordinals of one coalesced train whose members all touch the dashboard module."""
+DRILL_UNITS = [1] * DRILL_TRAIN.start + [len(DRILL_TRAIN)] + [1] * (STORED - DRILL_TRAIN.stop)
+
+
+def _touches_dashboard(ordinal: int) -> bool:
+    return ordinal % 3 == 0 or ordinal in DRILL_TRAIN
+
+
+def _drill_modules(ordinal: int) -> tuple[ModuleLines, ...]:
+    """Every third landing and the train touch dashboard; every other landing, and every fifth
+    one besides, touches orchestrator."""
+    dashboard = (ModuleLines('dashboard', 40),) if _touches_dashboard(ordinal) else ()
+    elsewhere = not _touches_dashboard(ordinal) or ordinal % 5 == 0
+    return (*dashboard, *((ModuleLines('orchestrator', 25),) if elsewhere else ()))
+
+
+def _rejected_in_dashboard(ordinal: int) -> Outcomes:
+    rejected = _touches_dashboard(ordinal)
+    return replace(NO_OUTCOMES, rejected=rejected, rejection_events=int(rejected))
+
+
+DASHBOARD_ORDINALS = [ordinal for ordinal in range(STORED) if _touches_dashboard(ordinal)]
+UNSAMPLED: EventRow = (NOW - timedelta(hours=1), '9100', 'merge_finalized',
+                       {'state': 'done', 'merge_sha': 'sha-not-yet-sampled'})
+"""A landing runs.db records after the sampled cursor that quality.db does not hold."""
+
+
+@pytest.fixture
+def drill_client(client, tmp_path: Path) -> Iterator[Any]:
+    with _seeded(client, tmp_path, [UNSAMPLED], outcome=_rejected_in_dashboard,
+                 modules=_drill_modules, units=DRILL_UNITS) as seeded:
+        yield seeded
+
+
+def _metric_arrays(metric: dict[str, Any]) -> dict[str, list[Any]]:
+    arrays = {'points': metric['points'],
+              **{f'rolling.{name}': values for name, values in metric['rolling'].items()}}
+    if metric['ewma'] is not None:
+        arrays.update({f'ewma.{name}': values for name, values in metric['ewma'].items()})
+    return arrays
+
+
+def test_a_module_serves_the_axis_of_the_landings_touching_it(drill_client) -> None:
+    value = _get(drill_client, 'project=dark_factory&module=dashboard&window=all')['QUALITY']['value']
+
+    ordinals = [point['ordinal'] for point in value['axis']]
+    assert ordinals == DASHBOARD_ORDINALS
+    assert ordinals != list(range(ordinals[0], ordinals[0] + len(ordinals))), 'a gapped subset'
+    assert set(DRILL_TRAIN) <= set(ordinals), 'a train is served whole'
+    for metric_id, metric in value['metrics'].items():
+        for name, array in _metric_arrays(metric).items():
+            assert len(array) == len(ordinals), f'{metric_id}.{name}'
+
+
+def test_a_module_headline_is_computed_over_its_landings(drill_client) -> None:
+    whole = _get(drill_client, 'project=dark_factory&window=all')['QUALITY']['value']
+    drilled = _get(drill_client, 'project=dark_factory&module=dashboard&window=all')
+
+    headline = drilled['QUALITY']['value']['metrics']['rejected']['headline']
+    assert headline['state'] == whole['metrics']['rejected']['headline']['state']
+    assert (headline['value']['n'], headline['value']['k']) == (
+        len(DASHBOARD_ORDINALS), len(DASHBOARD_ORDINALS))
+    assert whole['metrics']['rejected']['headline']['value']['k'] < 100
+
+
+def test_a_module_reads_the_freshness_of_the_whole_project(drill_client) -> None:
+    whole = _get(drill_client, 'project=dark_factory&window=all')['QUALITY']
+    drilled = _get(drill_client, 'project=dark_factory&module=dashboard&window=all')['QUALITY']
+
+    assert (drilled['state'], drilled['reason']) == ('stale', '1 landing not yet sampled')
+    assert (whole['state'], whole['reason']) == (drilled['state'], drilled['reason'])
+
+
+def test_a_module_no_landing_touches_is_an_empty_axis_with_unknown_headlines(drill_client) -> None:
+    quality = _get(drill_client, 'project=dark_factory&module=nowhere&window=all')['QUALITY']
+
+    assert quality['state'] == 'stale'
+    assert quality['value']['axis'] == []
+    for metric_id, metric in quality['value']['metrics'].items():
+        assert (metric['headline']['state'], metric['headline']['value']) == ('unknown', None), (
+            metric_id)
+        assert all(array == [] for array in _metric_arrays(metric).values()), metric_id
+
+
+def test_a_blank_module_serves_what_no_module_serves(drill_client) -> None:
+    whole = _get(drill_client, 'project=dark_factory&window=all')
+    blank = _get(drill_client, 'project=dark_factory&module=&window=all')
+
+    assert blank == whole
+    assert len(whole['QUALITY']['value']['axis']) == STORED

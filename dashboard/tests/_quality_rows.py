@@ -1,4 +1,5 @@
-"""Stored quality rows for the γ tests: a landing history, quality.db holding it, runs.db recording it.
+"""Stored quality rows for the γ tests: a landing history, quality.db holding it and a marker
+derivation, runs.db recording it.
 
 The builders hold no expectations; tests do. Every row passes α's dataclass invariants, so what a
 test stores is what read_landing_rows hands back. runs.db is written through
@@ -8,6 +9,7 @@ _quality_fixture.write_quality_runs_db, so a test can make runs.db record landin
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -18,7 +20,13 @@ from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import Landing, LandingSource, LinesBase
 from shared.quality_series.rows import Cost, LandingRow, Outcomes, SourceEpochs
 
-from dashboard.data.quality_store import QualitySample, insert_sample, upsert_landing_rows
+from dashboard.data.quality_markers import DerivedState, Marker, PromptCoverage, RoutingFold
+from dashboard.data.quality_store import (
+    QualitySample,
+    insert_sample,
+    upsert_landing_rows,
+    write_marker_state,
+)
 from dashboard.loops import _QualityStore
 
 NO_OUTCOMES = Outcomes(
@@ -142,6 +150,24 @@ async def write_quality_db(
         await store.connection.commit()
     finally:
         await store.close()
+
+
+async def write_marker_state_db(
+    path: Path, project_id: str, markers: Iterable[Marker], *, refreshed_at: datetime,
+) -> None:
+    """Store *markers* as *project_id*'s complete marker derivation, refreshed at *refreshed_at*,
+    in quality.db at *path*; no routing decision is folded."""
+    state = DerivedState(
+        fold=replace(RoutingFold.empty(project_id), complete=True), markers=tuple(markers),
+        skipped=0,
+        prompt_coverage=PromptCoverage(digest_since=None, roles_py_landings=None,
+                                       counted_since=None,
+                                       reason='no routing decision is folded yet'),
+        refreshed_at=refreshed_at,
+    )
+    async with _QualityStore(path) as store:
+        await write_marker_state(store.connection, state)
+        await store.connection.commit()
 
 
 def _unit_event(members: list[Landing]) -> EventRow:

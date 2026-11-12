@@ -35,6 +35,9 @@ import types
 from collections.abc import Callable, Mapping
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = pathlib.Path(__file__).parents[2] / "scripts"
 

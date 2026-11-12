@@ -263,6 +263,49 @@ negative, so an EWMA chart can never show improvement at these rates.
     server-resolved `ordinal` fractions; `tab_escalation_analytics.jsx` consumes the lifted overlay through
     an adapter from its date labels. No view is computed in JS (`deriveVelocitySeries` is the
     counter-precedent).
+
+    **Correction (ε, 2026-11-12).** What shipped, and where each part is homed:
+    - `/api/v2/dashboard/quality` is an on-demand read, never polled: one read costs 0.5–1.3 s, its data
+      moves on the sampler's 600 s tick, and a polled row cannot carry `?project=`. It is the `quality`
+      row of `dashboard/src/dashboard/static/redux/data.js::ON_DEMAND_KEYS`. The param is the canonical
+      query `data.js::qualityQuery` builds (project, window, module, in that order), an opaque identity
+      that nothing parses back. The body's keys are fixed while their values depend on the param, so the
+      row declares `fields` (`QUALITY`, `QUALITY_MARKERS`, `QUALITY_SNAPSHOTS`), each landed under
+      `<FIELD>:<query>` and read from the body by `data.js::fromBody`. `data.js::onDemandReceipt` exposes
+      the request's receipt and its `WINDOW` echo. `endpointsFor` and its pins are unchanged.
+    - The landing window belongs to the tab, not the global chip. The vocabulary is
+      `dashboard/src/dashboard/static/redux/window_chip.js::WINDOW_SETS` (`landings`, default
+      `::LANDING_DEFAULT_WINDOW`), and `::TAB_WINDOWS` has no `quality` entry. Two facts force this. An
+      on-demand receipt is keyed by its query, not by a path the global chip can look up. And the global
+      window is also sent to the day-windowed chrome endpoints. One echo validator,
+      `window_chip.js::receiptWindow`, accepts both day and landing echoes, so the label, highlight and
+      pending functions are shared.
+    - `?module=` drills down on the server. `dashboard/src/dashboard/data/quality_series.py::read_quality_series(module=)`
+      keeps only the stored landings whose lines touch the module, and
+      `dashboard/src/dashboard/api/quality.py::api_quality` passes the parameter through. The filter
+      runs after the freshness check, so "N landings not yet sampled" still describes the whole
+      project's store. Train members share modules, so verify units stay whole.
+    - The overlay is an HTML layer over the chart (`dashboard/src/dashboard/static/redux/charts.jsx::Markers`,
+      wrapped with its chart by `::MarkedChart`). It is positioned from the one `charts.jsx::PLOT_PAD`
+      that `LineChart` and `StackedAreaChart` also use. Its decisions live in
+      `dashboard/src/dashboard/static/redux/chart_marks.js`: the style for each marker kind, placement
+      on a gapped ordinal axis or a date-label axis, the hover text and the legend. The server places
+      each marker at a landing ordinal; turning that ordinal into a fraction of the served axis is
+      placement (`chart_marks.js::fractionAt`), not a view. Escalation analytics uses the overlay through
+      `chart_marks.js::dateLabelMarks`, and its regime marks render exactly the DOM its old
+      `RegimeMarkers` did (sketch row 21).
+    - The tab is `dashboard/src/dashboard/static/redux/tab_quality.jsx::QualityTab`. Its quality-specific
+      decisions live in `dashboard/src/dashboard/static/redux/quality_view.js`: the layout, the text of a
+      headline, rule, alarm verdict, before/after comparison and cost-model reading, the chart arrays
+      (served verbatim) and each metric's marks. While the tab is open it polls only `/orchestrators`,
+      for its project selector (`poll_scope.js::TAB_ENDPOINTS`).
+    - Two wire limits are rendered around, not computed. The wire carries no per-landing residual
+      series: the cost model is shown as `cost_model.reference_cost_100` and
+      `cost_model.residual_median`. The wire carries no occurrence-cap field: mass events reach the
+      tab only as the served `artefact` markers, drawn as hatched ranges.
+    - Tests: the client half of quality sketch rows 3, 4, 5, 9, 10 and 12 is
+      `dashboard/tests/js/boundary_quality.test.mjs`. The tab's render cases are in
+      `dashboard/tests/js/jsx_render_quality.test.mjs`.
 17. **Item 2: measurement identity.** Schema 3 `params` adds `python_version` and `instrument` (blob
     shas of `scripts/quality_metrics_snapshot.py` and `scripts/source_measures.py`); identity =
     (`as_of_sha`, `params`); a test pins byte-identity below `run_id` and `cost` for two runs at one

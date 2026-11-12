@@ -28,6 +28,7 @@ from shared.config_dir import TaskConfigDir
 from shared.project_layout import escalation_queue_dir
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.testing import make_gate_mock
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.reconciliation import (
@@ -56,6 +57,8 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _async_is_live(result: bool):

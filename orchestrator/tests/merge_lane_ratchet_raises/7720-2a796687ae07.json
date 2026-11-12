@@ -1,0 +1,48 @@
+{
+  "task_id": "7720",
+  "reason": "amend (review of 7720): heartbeat expiry gets its own try so a failing heartbeat log cannot suppress it; the look-ahead hold buffers queue arrivals so S's dispatch can chain them (LookaheadHold.wait gains a wake); ChainReservations keeps a link->owner index so holds() is O(1); _frontier_base_commits reads remerge_base.entry_bases (SPOT)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/chain_reservation.py",
+      "baseline": 22,
+      "current": 24
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/lookahead_hold.py",
+      "baseline": 6,
+      "current": 10
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/lookahead_hold.py::LookaheadHold::wait",
+      "baseline": 2,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_await_dispatch_decision",
+      "baseline": 0,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_frontier_base_commits",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_heartbeat_loop",
+      "baseline": 5,
+      "current": 7
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5188,
+      "current": 5189
+    }
+  ]
+}

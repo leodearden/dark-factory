@@ -23,7 +23,10 @@ import check_network_exposure as exposure
 import pytest
 import yaml
 from setup_host_sections import checker_repo, run_section, slice_section, usage_error_checker
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import stub_bin_dir, write_stub
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 COMPOSE_PATH = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"

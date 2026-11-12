@@ -5003,7 +5003,7 @@ class MemoryService:
         ``kind`` render the SAME node name while comparing unequal as frozen
         dataclasses. Comparing the objects would therefore miss a convergence
         the mint will then actually perform. It happens to be unobservable
-        today only because ``canonical_labels._KIND_LABELS`` has exactly one
+        today only because ``canonical_labels.KIND_LABELS`` has exactly one
         entry, and this is a pre-write safety gate for destructive edge
         surgery — the post-hoc ``reassign_edge`` ValueError arrives too late to
         substitute for it — so it must not silently depend on that.

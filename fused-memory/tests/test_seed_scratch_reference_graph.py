@@ -24,9 +24,12 @@ from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.topology import read_topology, topology_hash
 from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SEED = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'seed_scratch_reference_graph.py'

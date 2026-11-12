@@ -20,6 +20,7 @@ from shared.project_layout import runs_db
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
 from dashboard.data.quality_marker_sampler import (
     FACTORY_REPO,
     MARKER_GIT_TIMEOUT_SECONDS,
@@ -433,23 +434,35 @@ async def test_a_factory_path_that_is_not_a_repo_is_a_coverage_reason_not_a_fail
 async def test_the_quality_loop_stores_marker_state_within_its_first_tick(
     tmp_path: Path,
 ) -> None:
-    """The marker tick runs on the loop's first tick, before its first aligned sleep."""
+    """The marker tick runs on the loop's first tick, before its first aligned sleep.
+
+    It is read through a DbPool connection of its own, as /api/v2/dashboard/quality reads it,
+    because the loop's connection is the loop's alone
+    (dashboard/src/dashboard/app.py::lifespan) and a commit on it ends any snapshot read sharing it.
+    """
     project = build_quality_project(tmp_path / 'proj',
                                     first_landed_at=datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
     append_events(runs_db(project.root), REVIEWER_FLIP)
     pid = project_id_for_root(project.root)
-    store = _QualityStore(tmp_path / 'quality.db')
+    path = tmp_path / 'quality.db'
+    store = _QualityStore(path)
     await store.open()
+    pool = DbPool()
     loop = asyncio.create_task(_quality_loop(store, DashboardConfig(project_root=project.root)))
     try:
+        reader = await pool.get(path)
+        assert reader is not None
         async with asyncio.timeout(60):
-            while (stored := await read_marker_state(store.connection, pid)) is None:
+            while (stored := await read_marker_state(reader, pid)) is None:
                 await asyncio.sleep(0.05)
     finally:
         loop.cancel()
         with suppress(asyncio.CancelledError):
             await loop
-        await store.close()
+        try:
+            await pool.close_all()
+        finally:
+            await store.close()
 
     assert stored.failure is None, stored.failure
     assert stored.derived is not None

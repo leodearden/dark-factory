@@ -149,6 +149,33 @@ class TestChainBuildTimeout:
             MergeDeepConfig(chain_build_timeout_secs=bad_value)
 
 
+class TestChainReservationTimeout:
+    """``chain_reservation_timeout_secs``: shipped default 7200, strictly positive,
+    green-tier, and declared in the shipped defaults.yaml (task 7720).
+    """
+
+    def test_default_is_7200(self):
+        assert MergeDeepConfig().chain_reservation_timeout_secs == 7200.0
+
+    @pytest.mark.parametrize('bad_value', [0, -1])
+    def test_non_positive_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            MergeDeepConfig(chain_reservation_timeout_secs=bad_value)
+
+    def test_is_green_tier(self):
+        assert 'merge_deep.chain_reservation_timeout_secs' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_yaml_ships_7200(self):
+        defaults = load_packaged_defaults()
+        assert (
+            OrchestratorConfig().merge_deep.chain_reservation_timeout_secs
+            == defaults['merge_deep']['chain_reservation_timeout_secs']
+            == MergeDeepConfig.model_fields['chain_reservation_timeout_secs'].default
+            == 7200
+        )
+
+
 class TestMergeDeepReloadDisposition:
     """PRD decision #7: the knob is green-tier, so enable/retune/kill never needs
     a process restart. Mirrors TestPsiAdmissionReloadDisposition

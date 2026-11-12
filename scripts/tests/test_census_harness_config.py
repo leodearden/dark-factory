@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
 from legibility import census as mod
 from legibility import (
     census_run,
@@ -24,6 +25,9 @@ from legibility import (
     session_runner,
 )
 from legibility import config as config_mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _write_legibility_yaml(config_path, *, project_id="target_project", project_root=None):

@@ -38,10 +38,11 @@ from legibility import (
     session_runner,
     synthesis,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import config as config_mod
 
-pytestmark = pytest.mark.timeout(300)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _VERDICT = '{"verified": true, "reason": "observed"}'
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner

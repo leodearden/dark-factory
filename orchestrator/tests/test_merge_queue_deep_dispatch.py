@@ -86,11 +86,12 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
 def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
     """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
 
-    Dispatch reads each frozen entry's ``item`` and ``gate`` for the bases a
-    new item may stack on; ``None`` for both contributes no base commit.
+    Dispatch reads each frozen entry's ``item``, ``gate`` and ``chain`` for
+    the bases a new item may stack on; ``None`` for all three contributes no
+    base commit.
     """
     worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
-        lambda: [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+        lambda: [SimpleNamespace(item=None, gate=None, chain=None) for _ in range(frontier)]
     )
 
 
@@ -853,9 +854,13 @@ class TestDeepChainPlacementBuild:
 
         res = await worker._deep_chain_placement(item)
 
-        assert len(walks) == 1, f'expected exactly one O(n) walk, got {len(walks)}'
-        assert built[0]['queue_snapshot'] == tuple(worker.chain_snapshot()), (
+        assert walks == [2], f'expected exactly one O(n) walk, got {walks}'
+        assert [r.task_id for r in built[0]['queue_snapshot']] == ['102', '103'], (
             'the reused snapshot is the one build_chain was handed'
+        )
+        assert worker.chain_snapshot() == (), (
+            'the built links are reserved for the tip verify (task 7720), so a '
+            'later snapshot no longer offers them'
         )
         assert res is not None
         await merge_liveness.release_chain_build_lane(
@@ -1978,10 +1983,11 @@ class _DeepScene:
         """Drive ONE full dispatch round through ``_dispatch_item``.
 
         Returns the recorded ``_run_inflight_verify`` kwargs for the round
-        (plus ``'result'``).  Releases the host lease and any worktree the
-        ordinary (non-chain) arm hands back, so the next round starts from the
-        same resource state — which is what makes the ROUND SEQUENCE, and not
-        a slowly-leaking fixture, the thing under test.
+        (plus ``'result'``).  Releases the host lease, any worktree the
+        ordinary (non-chain) arm hands back, and the chain reservation a
+        passing tip hands to finalize (task 7720), so the next round starts
+        from the same resource state — which is what makes the ROUND SEQUENCE,
+        and not a slowly-leaking fixture, the thing under test.
         """
         self._round_no += 1
         worker = self.worker
@@ -1999,6 +2005,7 @@ class _DeepScene:
         rec['round'] = self._round_no
         if entry.lease is not None:
             await worker._host_allocator.release(entry.lease)
+        worker._chain_reservations.release(item.request.request_id)
         vr = rec['result']
         if vr.merge_wt is not None:
             # The ordinary arm hands its verified worktree to _finalize_inflight;

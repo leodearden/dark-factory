@@ -1442,8 +1442,9 @@ def _classify_npx(output: str) -> FailureCategory:
 
 # ---------------------------------------------------------------------------
 # ToolKind.PYRIGHT — structured JSON only (Invariant C2). An error
-# diagnostic is TYPE_ERROR (task 4843). There is still NO text table, so
-# non-JSON PYRIGHT output deliberately falls through to the OPAQUE ladder
+# diagnostic is TYPE_ERROR (task 4843). There is still NO classification
+# text table, so non-JSON PYRIGHT output deliberately falls through to the
+# OPAQUE ladder
 # (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
@@ -1482,9 +1483,9 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
 
 # ---------------------------------------------------------------------------
 # ToolKind.RUFF — structured JSON only (Invariant C2). A violations array is
-# LINT_ERROR (task 4843). There is still NO text table, so non-JSON RUFF
-# output deliberately falls through to the OPAQUE ladder (Invariants C1/C2;
-# see classify_failure's docstring).
+# LINT_ERROR (task 4843). There is still NO classification text table, so
+# non-JSON RUFF output deliberately falls through to the OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1512,6 +1513,51 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
     if not any(isinstance(item, dict) for item in payload):
         return None
     return FailureCategory.LINT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.RUFF / ToolKind.PYRIGHT — the no-finding witness of a killed leg
+# (task 6461): the lines each tool prints without having found anything.
+# verify.classify_leg consults it; classify_failure never does, so it is not
+# a classification table.
+# ---------------------------------------------------------------------------
+
+# bash's report that its child died of SIGTERM or SIGHUP. The bare word
+# 'Terminated' was measured 2026-11-12; the job-report long form was measured
+# on bash 5.2.21 by task 4843.
+_SHELL_KILL_REPORT = r'(?:\S+: line \d+: +\d+ +)?(?:Terminated|Hangup)(?: .*)?'
+
+_NO_FINDING_LINE_BY_TOOL: dict[ToolKind, re.Pattern[str]] = {
+    # ruff's `warning:` lines are its own notices, printed during the run;
+    # no ruff finding starts that way, in any output format.
+    ToolKind.RUFF: re.compile(rf'(?:All checks passed!|warning: .+|{_SHELL_KILL_REPORT})'),
+    # The zero-error summary only: a diagnostic line of ANY severity is a
+    # finding, so none is admitted.
+    ToolKind.PYRIGHT: re.compile(
+        rf'(?:0 errors, \d+ warnings?, \d+ informations?|{_SHELL_KILL_REPORT})',
+    ),
+}
+
+
+def output_proves_no_finding(tool: ToolKind, output: str) -> bool:
+    """Return True when *output* proves that *tool*, a lint or type checker
+    with a known no-finding vocabulary, reached no finding.
+
+    Every non-blank line must be one *tool* prints without having found
+    anything, or bash's report of its kill. An unrecognised line counts as a
+    finding, so any real diagnostic wins. Empty output qualifies, because
+    these tools print a summary only on completion. A tool with no known
+    vocabulary never qualifies: False means unproven, not a finding.
+
+    Output only: whether the leg was killed is the caller's to decode
+    (``is_shell_reported_external_kill``). Pure and total.
+    """
+    pattern = _NO_FINDING_LINE_BY_TOOL.get(tool)
+    if pattern is None:
+        return False
+    return all(
+        pattern.fullmatch(line.rstrip()) for line in output.splitlines() if line.strip()
+    )
 
 
 # ---------------------------------------------------------------------------

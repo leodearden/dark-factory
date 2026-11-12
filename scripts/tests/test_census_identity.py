@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 from legibility import census_identity, census_state, state_docs
 from legibility.census_identity import PriorCensus, RunIdentity
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ID_DAY = date(2026, 10, 6)
 

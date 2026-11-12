@@ -22,9 +22,12 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 from shared.testing_streams import StdoutWithAFailingFlush
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import WriteTriageProjectCalibration
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 

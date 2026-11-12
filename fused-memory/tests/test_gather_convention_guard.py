@@ -29,8 +29,11 @@ import pathlib
 from unittest.mock import AsyncMock
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.summary_pool import enforce_summary_pool_cap
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestCapturedCancelledErrorPropagatesFromSummaryPool:

@@ -29,12 +29,26 @@ def entry_commit(entry: InflightEntry) -> str | None:
     return None
 
 
+def entry_successor_base(entry: InflightEntry) -> str | None:
+    """What a successor of *entry* stacks on: the chain tip when *entry*'s
+    dispatch chained links (task 7720), else *entry*'s own merge commit."""
+    chain = entry.chain
+    if chain is not None and chain.links:
+        return chain.tip.strip() or None
+    return entry_commit(entry)
+
+
+def entry_bases(entry: InflightEntry) -> frozenset[str]:
+    """Every commit *entry* stands for: its own merge commit and its successor base."""
+    return frozenset(filter(None, (entry_commit(entry), entry_successor_base(entry))))
+
+
 def frontier_tip(entries: Sequence[InflightEntry]) -> str | None:
-    """The newest real merge commit among *entries*, or None when there is none."""
+    """The newest successor base among *entries*, or None when there is none."""
     for entry in reversed(entries):
-        commit = entry_commit(entry)
-        if commit is not None:
-            return commit
+        base = entry_successor_base(entry)
+        if base is not None:
+            return base
     return None
 
 
@@ -56,19 +70,20 @@ def _verify_alive(entry: InflightEntry) -> bool:
 
 def _breaks_chain(entry: InflightEntry, main_sha: str, dead_bases: Container[str]) -> bool:
     """INV-3's base-dead-and-not-main rule (worker.py::_chain_dead_link), plus
-    the entry's own commit being dead."""
+    the entry's own commit or its successor base being dead."""
     item = entry.item
     if not isinstance(item, RealMergeItem):
         return False
     base = item.base_sha.strip()
     if base and base != main_sha and base in dead_bases:
         return True
-    commit = entry_commit(entry)
-    return commit is not None and commit in dead_bases
+    return any(sha in dead_bases for sha in entry_bases(entry))
 
 
 def _owner_index(tip: str, frontier: Sequence[InflightEntry]) -> int | None:
-    return next((i for i, entry in enumerate(frontier) if entry_commit(entry) == tip), None)
+    return next(
+        (i for i, entry in enumerate(frontier) if entry_successor_base(entry) == tip), None,
+    )
 
 
 def _fall_to_main_reason(
