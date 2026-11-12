@@ -157,6 +157,38 @@ class TestTheArms:
         assert (result.arm, result.model, result.reasoning_effort) == ('o6-low', mod.O6_MODEL, 'low')
 
     @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_at_another_effort_before_any_call(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'o6-low')
+        assert all(name in str(raised.value) for name in ('o6-low', "'low'", "'medium'"))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_effort_arm_refuses_a_client_sending_no_effort(self) -> None:
+        """A client sending no effort runs at the API's default, which nobody chose."""
+        llm = _FakeLLM(model=mod.O6_MODEL)
+        with pytest.raises(mod.ArmClientMismatch):
+            await _replay(llm, 'o6-low')
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_on_another_model_before_any_call(self) -> None:
+        llm = _FakeLLM(model='m-small', reasoning_effort='medium')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'o6-medium')
+        assert all(name in str(raised.value) for name in ('o6-medium', mod.O6_MODEL, 'm-small'))
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_control_refuses_an_effort_client(self) -> None:
+        """The control's records claim the configured client, so an effort client must not run it."""
+        llm = _FakeLLM(reasoning_effort='low')
+        with pytest.raises(mod.ArmClientMismatch):
+            await _replay(llm, 'control')
+        assert llm.calls == []
+
+    @pytest.mark.asyncio
     async def test_a_client_whose_tokens_cannot_be_attributed_is_refused_before_any_call(self) -> None:
         llm = _FakeLLM()
         llm.token_tracker = TokenUsageTracker()
@@ -241,6 +273,19 @@ class TestTheResult:
     async def test_the_result_records_the_extracted_entity_names(self) -> None:
         result = await _replay(_FakeLLM(entities=('Alpha', 'Beta', 'Gamma')))
         assert result.entities == ('Alpha', 'Beta', 'Gamma')
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_record_carries_the_clients_reasoning_effort(self) -> None:
+        o6_low = await _replay(_FakeLLM(model=mod.O6_MODEL, reasoning_effort='low'), 'o6-low')
+        control = await _replay(_FakeLLM(), 'control')
+        assert mod.replayed_record(o6_low, _input())['reasoning_effort'] == 'low'
+        assert mod.replayed_record(control, _input())['reasoning_effort'] is None
+
+    def test_a_failed_record_carries_the_clients_model_and_reasoning_effort(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+        record = mod.failed_record(mod.ARMS['o6-medium'], llm, _worksheet_row(), RuntimeError('provider down'))
+        assert (record['arm'], record['model'], record['reasoning_effort']) == ('o6-medium', mod.O6_MODEL, 'medium')
+        assert (record['kind'], record['error_type']) == ('failed', 'RuntimeError')
 
     @pytest.mark.asyncio
     async def test_tokens_are_measured_per_prompt(self) -> None:
