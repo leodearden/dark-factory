@@ -294,11 +294,10 @@ dev = [
     # becoming a timeout landmine. 7.0.1's cost grows roughly cubically
     # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
     # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The ratchet
-    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s and this
-    # file's own `timeout = 300`-equivalent budget; exceeding it fails the
-    # ratchet test, and only once complexipy's Rust call returns, because signal
-    # cannot interrupt it sooner (see
-    # tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it
+    # fails the ratchet test, and only once complexipy's Rust call returns,
+    # because signal cannot interrupt it sooner (see
+    # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
     # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
     "complexipy>=6.2,<7",
     # mutmut — the mutation-score baseline of task 5035 ([tool.mutmut] below).

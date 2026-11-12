@@ -67,6 +67,9 @@ pytest.importorskip('escalation.queue')
 from escalation.dedupe import compute_content_fingerprint  # noqa: E402
 from escalation.models import Escalation  # noqa: E402
 from escalation.queue import EscalationQueue  # noqa: E402
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'test-project'
 PROJECT_ROOT = '/tmp/test-project'

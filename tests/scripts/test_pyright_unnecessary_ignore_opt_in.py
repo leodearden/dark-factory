@@ -60,7 +60,10 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from pyright_json import pyright_json_report
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_command_invariants import PYRIGHT, anchor_split, required_segment
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from collections.abc import Callable

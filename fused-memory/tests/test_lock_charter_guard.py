@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import shared.reify_checkout as reify_checkout
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.gitignored_deliverable_guard import (
     GitignoredDeliverableFinding,
@@ -25,6 +26,8 @@ from fused_memory.middleware.lock_charter_guard import (
     is_file_path,
     lock_charter_error,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # _resolve_reify_checkout — marker-bound adapter over `shared.reify_checkout`,

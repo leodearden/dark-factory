@@ -72,7 +72,11 @@ import sys
 import tomllib
 from typing import Any
 
+import pytest
 from pyright_json import pyright_json_report
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

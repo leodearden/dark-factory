@@ -30,6 +30,9 @@ from manifest_drift_fixtures import (
     write_manifest,
 )
 from shared.task_statuses import TERMINAL, TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # load_task_store_scan — ONE read of tasks.db feeds BOTH directions.

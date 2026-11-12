@@ -23,7 +23,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from legibility import trickle_state
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = (Path(__file__).parent.parent
           / 'legibility' / 'install-trickle-health-timer.sh')

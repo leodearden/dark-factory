@@ -13,6 +13,9 @@ from datetime import UTC, datetime, timedelta
 
 import audit_model_admission
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # --- scan_routing_decisions: the resolver-decision surface (checks 1 and 3) ---
 

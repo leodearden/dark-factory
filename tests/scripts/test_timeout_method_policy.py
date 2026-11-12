@@ -140,6 +140,9 @@ from pytest_config_discovery import (
     discovered_pytest_configs,
     workspace_members,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'

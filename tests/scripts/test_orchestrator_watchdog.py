@@ -25,6 +25,7 @@ import types
 import _watchdog_crash_loop as crash_loop
 import pytest
 from fake_uv import argv_flag, recorded_argvs, write_fake_uv
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Importable by name only because tests/scripts/conftest.py puts this
 # directory on sys.path, which pytest's --import-mode=importlib deliberately
@@ -59,6 +60,8 @@ from df_pytest_isolation import (  # noqa: E402
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _load_watchdog() -> types.ModuleType:

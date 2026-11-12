@@ -15,6 +15,9 @@ from pathlib import Path
 import pytest
 import yaml
 from _loopback_host import is_loopback_host
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -45,7 +45,7 @@ from _config_default_scan import (
     iter_config_path_blanking_sites,
     iter_default_asserting_tests,
 )
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 
@@ -56,7 +56,7 @@ from orchestrator.config import OrchestratorConfig
 # --max-worker-restart=0 then truncates the ENTIRE suite, reporting against
 # some innocent guard that shared the dead worker (esc-3980-1, esc-3787-1).
 # WHY 300s and the guard that ENFORCES this mark rather than trusting it to be
-# sprinkled: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# sprinkled: see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

@@ -16,6 +16,9 @@ import pytest
 from escalation.archive import ARCHIVE_SUBDIR, DATE_FORMAT, archive_dir_for_date
 from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(settle.__file__).resolve()
 CATEGORY = 'design_concern'

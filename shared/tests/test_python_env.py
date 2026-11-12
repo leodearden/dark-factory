@@ -9,6 +9,9 @@ from __future__ import annotations
 import pytest
 
 from shared.python_env import without_python_env_selection
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 ORCH_VENV = '/srv/orch/.venv'
 

@@ -30,6 +30,9 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
 from shared.mcp_session import McpCallError, McpFailureKind
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN = 'review-dark_factory-20261109-1'
 OTHER_RUN = 'hotspot-survey-dark_factory-20261101-1'

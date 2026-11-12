@@ -51,12 +51,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module rglob()s every *.py under the production src trees and
 # ast.parse()s each one, so it is a member of the whole-tree-scanner family and
 # carries that family's mark. The derivation of the ceiling and the full
-# measurement record live at WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py;
+# measurement record live at shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT;
 # test_whole_tree_scan_timeout_guard.py recomputes the family census from
 # source, so omitting this would turn that meta-guard red rather than merely
 # risking a truncated verify run.

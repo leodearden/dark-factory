@@ -107,12 +107,14 @@ PURE_STDLIB_LEAVES = (
     'testing_fake_claude',
     'testing_mcp_stub',
     'testing_reify_layout',
+    'testing_repo_wide_tests',
     'testing_streams',
     'testing_timeout_markers',
     'testing_virtual_clock',
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'whole_tree_guard_family',
 )
 
 # Child program: snapshot sys.modules, import argv[1], report the top-level

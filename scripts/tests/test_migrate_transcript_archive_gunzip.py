@@ -24,6 +24,9 @@ from pathlib import Path
 
 import migrate_transcript_archive_gunzip as mig
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LOG_PREFIX = "migrate_transcript_archive_gunzip:"
 

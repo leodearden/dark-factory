@@ -11,8 +11,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from _fm_helpers import load_script_module
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import BLESSED_METADATA_KEYS
 from fused_memory.middleware import (
@@ -24,6 +26,8 @@ from fused_memory.middleware import (
 from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
 from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 from fused_memory.reconciliation import flag_dedup, internal_writers, mem0_tombstone
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 

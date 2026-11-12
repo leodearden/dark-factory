@@ -15,6 +15,7 @@ import module_budget_family
 import pytest
 import verify_budget_census
 import verify_budget_census_records
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_budget_census_fixture import (
     FULL_SUITE,
     command_entry,
@@ -24,6 +25,8 @@ from verify_budget_census_fixture import (
     write_module_yaml,
     write_worktree_record,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

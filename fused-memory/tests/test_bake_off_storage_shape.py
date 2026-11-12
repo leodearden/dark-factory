@@ -40,8 +40,12 @@ import uuid
 from collections.abc import Container
 from pathlib import Path
 
+import pytest
 from _fm_helpers import lease_isolated_monkeypatch, load_script_module
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -67,8 +71,6 @@ def _mod() -> types.ModuleType:
 # synthetic fixtures in tmp_path.  No network, no Qdrant.
 
 import json  # noqa: E402
-
-import pytest  # noqa: E402
 
 # Lease-dir isolation (task 4775), autouse for every test in this module:
 # see _fm_helpers.py::lease_dir_fixture.

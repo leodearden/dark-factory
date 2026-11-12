@@ -23,11 +23,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers

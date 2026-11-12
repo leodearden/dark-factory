@@ -18,6 +18,7 @@ from functools import cache
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.corpus import corpus_sha
@@ -39,6 +40,8 @@ from fused_memory.arm_harness.preregistration import (
 )
 from fused_memory.arm_harness.run import OUTCOMES_FILENAME, RUN_MANIFEST_FILENAME, load_outcomes
 from fused_memory.arm_harness.run_manifest import RunManifest, load_run_manifest
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[3]
 CONTROLS_RELATIVE = 'plans/local-memory-models-eval-controls'

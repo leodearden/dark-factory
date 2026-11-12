@@ -20,8 +20,11 @@ from _fm_helpers import load_script_module
 from shared.project_layout import tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import RO_COMMAND
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'

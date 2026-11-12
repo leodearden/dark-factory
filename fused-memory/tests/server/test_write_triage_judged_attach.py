@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _sdk_client_stubs import sdk_client_double
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -47,6 +48,8 @@ from fused_memory.server.write_triage import (
 )
 from fused_memory.server.write_triage_judge import CANDIDATE_ID_KEY, VERDICT_KEY
 from fused_memory.services.memory_service import RRF_K, SearchResults
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _T_HIGH = 0.90
 _T_LOW = 0.70

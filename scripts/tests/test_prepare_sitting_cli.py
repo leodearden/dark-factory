@@ -19,6 +19,7 @@ from orchestrator.session_registry import (
     normalize_escalations_dir,
 )
 from shared.project_id import fold_project_token
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
@@ -33,6 +34,8 @@ from sitting.inventory import (
 )
 from sitting.ownership import ProbeResult
 from sitting.preparation import Manual, Standing
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = '2026-09-26T09:00:00+00:00'
 LATER = '2026-09-26T10:00:00+00:00'

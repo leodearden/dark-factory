@@ -45,6 +45,10 @@ from df_pytest_isolation import (
     deploy_clock_guard_roots,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PROTECTED_ENV_VARS = tuple(PROTECTED_DEPLOY_CLOCK_ENV_VARS.values())

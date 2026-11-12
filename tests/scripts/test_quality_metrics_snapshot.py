@@ -24,6 +24,9 @@ import quality_metrics_snapshot as snapshot
 import source_measures
 from git_listing import git
 from quality_snapshot_identity import below_run_id_and_cost
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 

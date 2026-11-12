@@ -18,6 +18,9 @@ from audit_manifest_descriptor_drift import (
     load_task_store_scan,
 )
 from manifest_drift_fixtures import labelled_row, make_project, run_cli
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # THE SIGNAL-BINDING CHECK (task 6582).
