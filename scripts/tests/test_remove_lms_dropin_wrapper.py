@@ -25,6 +25,7 @@ import contextlib
 import errno
 import fcntl
 import functools
+import itertools
 import os
 import re
 import shutil
@@ -1239,6 +1240,22 @@ def _remove_template_residue(template: str) -> None:
         shutil.rmtree(unit_dir / f"{template}.service.d", ignore_errors=True)
     except OSError:
         pass
+
+
+_HOST_BUS_TRANSPORT_ERRNOS = (errno.ENOTCONN, errno.ECONNRESET, errno.ECONNREFUSED)
+_HOST_BUS_TRANSPORT_SUFFIXES = {e: f": {os.strerror(e)}" for e in _HOST_BUS_TRANSPORT_ERRNOS}
+
+
+def _host_bus_transport_errno(result: subprocess.CompletedProcess[str]) -> int | None:
+    """Parse systemctl's `%m` error lines, at the boundary, into a typed errno.
+
+    Only the connection-lost/refused class sd-bus reports when the user-manager bus drops.
+    """
+    lines = f"{result.stdout or ''}\n{result.stderr or ''}".splitlines()
+    for line, (err, suffix) in itertools.product(lines, _HOST_BUS_TRANSPORT_SUFFIXES.items()):
+        if line.rstrip().endswith(suffix):
+            return err
+    return None
 
 
 def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: str) -> None:
