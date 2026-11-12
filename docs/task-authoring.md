@@ -168,7 +168,10 @@ for every kind:
 - **Evidence is type-checked, not filtered.** A wrongly-typed field such as
   `pid: "abc"` or `fire_delay_secs: "soon"` refuses the whole write with
   `done_provenance_invalid`; it is not silently dropped. A well-typed field
-  the kind does not record (for example `pid` on `merged`) is discarded.
+  the kind does not record (for example `pid` on `merged`, or an
+  `escalation_id` on a kind whose row above does not name it) is
+  discarded, so cite a resolving escalation in `note` when the kind does
+  not record one.
 - **The `deterministic-gate` `escalation_id` requirement is write-time
   only.** New `done` writes must carry it, while stored blobs written before
   task 5241, which lack it, still read without a schema warning.

@@ -731,22 +731,29 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 # (confirmed, detail) NamedTuple, and the caller emits one of two distinct
 # prefixes per probe depending on it, rather than reporting every failure
 # mode (timeout, missing binary, unexpected error) under the single
-# assertive "not found" / "is not on main" wording. So the prefix is now
-# the verdict at BOTH steps and this note can describe it as such.
+# assertive "not found" / "is not on main" wording; task 5274 moved an
+# unreadable checkout (rc=128) onto the honest side too. So the prefix is
+# now the verdict at BOTH steps and this note can describe it as such.
 SERVER_BACKSTOP_NOTE = """\
 The server runs the same checks as a backstop, in this order:
 
-1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
-   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
-   Failure is reported under one of two distinct prefixes:
-     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
-       rejected the ref against this checkout. This is the server's rc=128
-       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
-       so `git -C <project_root> fetch --all` and re-run before re-deriving.
-     - `commit <x> could not be resolved in <project_root>: <detail>` ->
-       rev-parse never rendered a verdict on the ref (5s timeout, missing git
-       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
-       checkout and retry.
+1. `git rev-parse --verify --quiet <commit>^{commit}` resolves the SHA first,
+   so an unresolvable or mistyped SHA is rejected HERE, before merge-base ever
+   runs. `--quiet` is what separates the two outcomes below: without it, a
+   rejected ref and an unreadable checkout both exit 128, so reproduce this
+   step with the flag. Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rc=1, the ONLY
+       "not found" verdict: rev-parse ran inside a readable repository and
+       rejected the ref (unknown, not a commit, or an ambiguous short
+       prefix). This is the server's analogue of the ancestry check's rc=128
+       "Not a valid object name": usually a stale/unfetched <project_root> or
+       a mistyped SHA, so `git -C <project_root> fetch --all` and re-run
+       before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` -> any
+       other outcome; rev-parse never rendered a verdict on the ref (rc=128
+       for a <project_root> that is not a readable git repository or does
+       not exist, 5s timeout, missing git binary, unexpected error).
+       NOT-YET-CONFIRMED, not a bad SHA: fix the checkout and retry.
 2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
    accepts. Failure is likewise reported under one of two distinct prefixes,
    so the prefix itself is the verdict at both steps -- no need to interpret

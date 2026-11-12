@@ -6489,16 +6489,21 @@ def _render_done_provenance_kinds() -> str:
 
 
 _DONE_PROVENANCE_KINDS_TEXT = _render_done_provenance_kinds()
+_CALLER_SELECTABLE_KINDS_GUIDANCE = (
+    '{"kind": "merged", "commit": "<merge-sha>"} after the merge_request '
+    'landed the commit on main; '
+    '{"kind": "found_on_main", "commit": "<sha>", "note": "<text>"} when the '
+    'implementation is already on main from a sibling task (the commit is '
+    'ancestor-checked); or '
+    '{"kind": "operational-verified", "escalation_id": "<esc-id>", '
+    '"note": "<text>"} for a no-code operational ask closed via a resolved '
+    'escalation. The deterministic-* kinds are stamped by DeterministicRunner '
+    'and never supplied by hand. The per-kind table in docs/task-authoring.md '
+    'is canonical.'
+)
 _KIND_REQUIRED_REASON = (
     f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
-    'Use kind="merged" with commit=<merge-sha> after a successful '
-    'merge_request; kind="found_on_main" with commit=<sha> and '
-    'note=<explanation> when the implementation is already on main '
-    'from a sibling task; or kind="operational-verified" with '
-    'escalation_id=<id> and note=<text> for a no-code operational ask '
-    'closed via a resolved escalation. The deterministic-* kinds are '
-    'stamped by DeterministicRunner, not supplied by hand — see the '
-    'per-kind table in docs/task-authoring.md.'
+    f'Pass done_provenance= one of: {_CALLER_SELECTABLE_KINDS_GUIDANCE}'
 )
 
 
@@ -6748,10 +6753,9 @@ async def _validate_done_provenance(
         logger.warning(
             'set_task_status(%s, done) called without done_provenance; '
             'Stage-2 reconciliation will treat this task as provenance-unknown. '
-            'Pass done_provenance={"kind": "merged", "commit": "..."} or '
-            '{"kind": "found_on_main", "commit": "...", "note": "..."} to '
-            'record verified evidence.',
+            'To record verified evidence, pass done_provenance= one of: %s',
             task_id,
+            _CALLER_SELECTABLE_KINDS_GUIDANCE,
         )
         return None, None
 
@@ -6902,30 +6906,42 @@ async def _verify_commit_on_main(
 async def _resolve_commit_sha(
     project_root: str, commit: str, *, git_runner: GitProbeRunner,
 ) -> str | _CommitResolutionFailure:
-    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
+    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify --quiet``.
 
     Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
     ``confirmed_absent`` flag says whether git actually rendered a verdict
-    (task 3455, mirroring :func:`_verify_commit_on_main`):
+    (task 3455, mirroring :func:`_verify_commit_on_main`'s rc=1 policy):
 
-    - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
-      evaluated the ref against this checkout, and rejected it. Only then
-      may the caller say the commit was "not found in <project_root>".
-    - ``confirmed_absent=False`` for a timeout, a missing git binary, an
-      unexpected exception, or empty output on rc=0 — rev-parse never
-      rendered a verdict on the ref, so the honest report is "could not be
-      resolved", with the same fetch / fix-the-checkout / retry remedy as
-      an unconfirmed ancestor check. Any failure branch added later
-      inherits ``False``, i.e. the weaker claim, by default.
+    - ``confirmed_absent=True`` ONLY for rc=1 under ``--verify --quiet`` —
+      git ran inside a readable repository, evaluated the ref, and rejected
+      it (missing, unknown name, not peelable to a commit, ambiguous
+      prefix). Only then may the caller say the commit was "not found in
+      <project_root>".
+    - ``confirmed_absent=False`` for every other outcome: rc=128, which git
+      returns for a project_root that is not a readable git repository or
+      does not exist (task 5274); a timeout; a missing git binary; an
+      unexpected exception; or empty output on rc=0.
+      rev-parse never rendered a verdict on the ref, so the honest report
+      is "could not be resolved", with the same fetch / fix-the-checkout /
+      retry remedy as an unconfirmed ancestor check. Any failure branch
+      added later inherits ``False``, i.e. the weaker claim, by default.
 
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
-    result = await _git_probe(git_runner, project_root, 'rev-parse', '--verify', f'{commit}^{{commit}}')
+    result = await _git_probe(
+        git_runner, project_root, 'rev-parse', '--verify', '--quiet', f'{commit}^{{commit}}',
+    )
     if isinstance(result, _ProbeUnavailable):
         return _CommitResolutionFailure(False, result.detail)
+    if result.returncode == 1:
+        return _CommitResolutionFailure(
+            True,
+            result.stderr or 'does not name exactly one commit (an unknown name, or an '
+            'ambiguous short prefix: pass the full 40-char SHA)',
+        )
     if result.returncode != 0:
-        return _CommitResolutionFailure(True, result.stderr or 'no such ref')
+        return _CommitResolutionFailure(False, result.stderr or 'rev-parse failed')
     if len(result.stdout) < 7:
         return _CommitResolutionFailure(False, 'empty rev-parse output')
     return result.stdout
@@ -7343,11 +7359,7 @@ def _done_provenance_missing_error(task_id: str) -> dict:
         'hint': (
             'Cannot mark task done: done_provenance is required when '
             'reconciliation.require_done_provenance is enabled. Pass '
-            'done_provenance={"kind": "merged", "commit": "<merge-sha>"} when '
-            'the merge_request landed a commit on main, or '
-            'done_provenance={"kind": "found_on_main", "commit": "<sha>", '
-            '"note": "<text>"} when the implementation is already on main '
-            'from a sibling task (commit is ancestor-checked).'
+            f'done_provenance= one of: {_CALLER_SELECTABLE_KINDS_GUIDANCE}'
         ),
     }
 
