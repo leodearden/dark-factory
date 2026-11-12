@@ -163,6 +163,7 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
     DoneStepIntegrityVerdict,
@@ -13080,13 +13081,14 @@ class TaskWorkflow:
             # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
             # verdict, or a malformed one all block the merge — a merger
             # that produces no trustworthy disposition must never proceed.
-            reason = (
-                f'Merger invocation failed: {merger_result.output[:200]}'
-                if not merger_result.success
-                else f'Merger emitted no/invalid disposition: {merger_result.output[:200]}'
+            report = merger_failure_report(
+                merger_result, observed_at=datetime.now(UTC).isoformat(),
             )
-            self._write_merge_failure_review('merger_blocked', reason)
-            return await self._mark_blocked(reason, merge_phase=merge_phase)
+            self._write_merge_failure_review('merger_blocked', report.detail)
+            return await self._mark_blocked(
+                report.reason, detail=report.detail, evidence=report.evidence,
+                suggested_action=report.suggested_action, merge_phase=merge_phase,
+            )
 
         if verdict['blocked']:
             reason = verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
