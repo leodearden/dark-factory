@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 import uvicorn
 from _git_fixtures import seed_repo
 from _trigger_chain_doc_shapes import concretize, snippet_submit_calls
-from escalation.models import Escalation
+from escalation.models import Escalation, ReviewDueState
 from escalation.queue import EscalationQueue
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig as FusedMemoryServerConfig
@@ -48,6 +48,7 @@ from orchestrator.workflow import WorkflowOutcome
 
 PROJECT_ID = 'lambda_fixture'
 FIRST_CHECK_SECS = 86400
+INTERIM_DELAY_SECS = 259200
 
 _READY_TIMEOUT_S = 60.0
 _READY_POLL_S = 0.05
@@ -277,6 +278,16 @@ class TriggerChainRig:
         await self.call_ok('commit_planning', project_root=str(self.root), task_ids=f'{completion_id},{human_id}')
         return Chain(completion_id, human_id)
 
+    async def file_interim_gate(self, run_id: str, deps: tuple[str, ...], skill: str = 'review') -> str:
+        """The snippet's §4 interim form: the human gate, delayed, held until its dependencies exist."""
+        call = self.snippet_call('human_gate', run_id, skill)
+        call['metadata']['milestone'] = {'mode': 'delayed', 'after_secs': INTERIM_DELAY_SECS}
+        human_id = await self.submit(call)
+        for dep in deps:
+            await self.call_ok('add_dependency', id=human_id, depends_on=dep, project_root=str(self.root))
+        await self.call_ok('commit_planning', project_root=str(self.root), task_ids=human_id)
+        return human_id
+
     async def seed_run(self, run_id: str, *findings: tuple[str, str]) -> tuple[str, ...]:
         """File *run_id*'s findings as (priority, status) pairs, the way the lanes that own them write."""
         return tuple(
@@ -330,6 +341,13 @@ class TriggerChainRig:
         event_store = self.scheduler.event_store
         assert event_store is not None
         return event_store.fetch_events_by_type(event_type)
+
+
+def review_due(escalation: Escalation) -> ReviewDueState:
+    """A ``review_due`` escalation's payload; any other escalation fails the test."""
+    if escalation.review_due is None:
+        raise AssertionError(f'{escalation.id} ({escalation.category}) carries no review_due payload')
+    return escalation.review_due
 
 
 def _scheduler(root: Path, url: str, clock: FakeClock, state_dir: Path) -> Scheduler:
