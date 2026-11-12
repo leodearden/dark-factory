@@ -3165,7 +3165,7 @@ class Mem0UpdateConfig(BaseModel):
             'mid-run over its own success count. Green-tier hot-reloadable — read '
             'live on every call and passed into StormCounter.record(), which is '
             'what makes the leaf genuinely reloadable rather than restart-only in '
-            'disguise (see server/storm_counter.py).'
+            'disguise (see shared/src/shared/storm_counter.py).'
         ),
     )
     storm_window_seconds: float = Field(
@@ -3269,7 +3269,7 @@ class EntityMintConfig(BaseModel):
             'has already landed. Green-tier hot-reloadable — read live on every '
             'call and passed into StormCounter.record(), which is what makes the '
             'leaf genuinely reloadable rather than restart-only in disguise (see '
-            'server/storm_counter.py).'
+            'shared/src/shared/storm_counter.py).'
         ),
     )
     storm_window_seconds: float = Field(
