@@ -22,6 +22,7 @@ from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
+    is_task_vocabulary_qualifier,
     parse_node_name,
     scan_content,
 )
@@ -163,6 +164,11 @@ class TestParseNodeNameMatchesLocalForms:
         assert second is not None
         assert second.node_name == 'Task 132'
 
+    def test_the_whitespace_gap_stays_broad(self):
+        referent = parse_node_name('task\n132')
+        assert referent is not None
+        assert referent.node_name == 'Task 132'
+
 
 class TestParseNodeNameMatchesQualifiedForms:
     """A project-qualified node name parses to a FOREIGN referent whose
@@ -211,6 +217,8 @@ class TestParseNodeNameNonMatches:
             # Task vocabulary is never a project id, in the qualified form too.
             'subtask: 2500',
             'sub-task: 2500',
+            pytest.param('task\n#132', id='hash-separator-never-spans-a-line-break'),
+            pytest.param('task\n:132', id='colon-separator-never-spans-a-line-break'),
         ],
     )
     def test_returns_none(self, name):
@@ -1396,6 +1404,13 @@ class TestScanContentAmbiguityPartition:
         assert scan.refs == ()
         assert [r.node_name for r in scan.ambiguous] == ['dark_factory:2500', 'Task 2500']
 
+    def test_a_line_wrapped_bare_mention_still_contests(self):
+        """The whitespace gap spans a line break, because removing a bare
+        mention removes a contest, which is the dangerous direction."""
+        scan = scan_content('reify:5 blocks task\n5', group_id='dark_factory')
+        assert scan.refs == ()
+        assert {r.node_name for r in scan.ambiguous} == {'reify:5', 'Task 5'}
+
 
 class TestSelfQualifiedRefsNeverContestForeignRefs:
     """A SELF-qualified reference ('reify:2500' scanned in group reify) is
@@ -1479,3 +1494,70 @@ class TestUnregisteredKindIsRejectedLoudly:
 
     def test_registered_kinds_are_exactly_task(self):
         assert dict(canonical_labels.KIND_LABELS) == {'task': 'Task'}
+
+
+class TestTaskVocabularyQualifier:
+    """The predicate reads a qualifier its caller has already lowercased, so it
+    matches the lowercase task vocabulary only, and only as a whole string."""
+
+    @pytest.mark.parametrize(
+        ('qualifier', 'expected'),
+        [
+            ('task', True),
+            ('tasks', True),
+            ('subtask', True),
+            ('subtasks', True),
+            ('sub_task', True),
+            ('sub_tasks', True),
+            pytest.param('Task', False, id='uppercase-is-not-vocabulary-until-lowercased'),
+            ('TASK', False),
+            pytest.param('taskmaster', False, id='a-project-that-starts-with-task'),
+            ('reify', False),
+            pytest.param('task\n', False, id='fullmatch-refuses-a-trailing-newline'),
+        ],
+    )
+    def test_recognises_exactly_the_task_vocabulary(self, qualifier, expected):
+        assert is_task_vocabulary_qualifier(qualifier) is expected
+
+
+class TestOneGrammar:
+    """The rules are composed from shared fragment objects, so a rule that
+    re-spells a fragment inline fails here (row 19 of the S26 PRD)."""
+
+    @pytest.mark.parametrize(
+        ('fragment', 'rules'),
+        [
+            pytest.param(
+                '_QUALIFIER',
+                ('_QUALIFIED_REF_PATTERN', '_QUALIFIED_NODE_NAME_PATTERN'),
+                id='one-qualifier-class',
+            ),
+            pytest.param(
+                '_NUMBER',
+                (
+                    '_TASK_NODE_NAME_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
+                id='one-digit-capture',
+            ),
+            pytest.param(
+                '_NUMBER_END',
+                ('_LOCAL_MENTION_PATTERN', '_QUALIFIED_REF_PATTERN'),
+                id='one-right-edge',
+            ),
+            pytest.param(
+                '_TASK_WORD',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-task-word',
+            ),
+        ],
+    )
+    def test_each_rule_is_built_from_the_shared_fragment(self, fragment, rules):
+        shared = getattr(canonical_labels, fragment)
+        for rule in rules:
+            parts = getattr(canonical_labels, rule).parts
+            assert any(part is shared for part in parts), (
+                f'{rule} spells {fragment} itself instead of composing the shared fragment'
+            )
