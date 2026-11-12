@@ -256,6 +256,24 @@ over 41 min on two consecutive runs of different tasks, or over 46 min;
 landings below baseline over 4 ticks; any oom_kill; MemAvailable under
 16 GB; a paused project resuming).
 
+### 2026-11-12 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-12 04:27Z. Two consecutive local merge verifies of
+different tasks ran over the 46-min ceiling:
+
+| Run end | Task | Runner | Duration |
+|---|---|---|---|
+| 04:23Z | 8525 | local | 52.3 min, passed |
+| 04:24Z | 7341 | local | 52.9 min, passed |
+
+Context: host PSI 30-min median 53.0 (2 h 28.0), root CPU 32 of 32, mean
+idle 1.7 threads. In the 10 s cgroup sample `orchestrator-reify.service` drew
+15.6 cores: reify's scheduler is still halted, but its unit was re-seeding warm
+lanes (`seed-warm-lane.sh` onto base gen 642) and running cargo-nextest. dark
+factory's task slots do not govern that load. Task-leg admission wait was
+1.0 min, landings 1 in 2 h. The 3-slot period (11-11 23:27Z to 11-12 04:27Z)
+had local merge verifies of 20-28 min until reify's warm-lane work began.
+
 ---
 
 ## 2026-09-27 — task 5797: 48h gate on the 1 -> 2 raise
