@@ -1987,9 +1987,10 @@ class TestExemptionSeparatorVariants:
 # sanctioned rise where every added violation was newly SEEN, not new debt:
 #   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
 #     618 across 20, every one under orchestrator/tests/);
-#   * task 7800: 298 across 84 files in five packages after Rule C learned
+#   * task 7800: 309 across 90 files in five packages after Rule C learned
 #     asyncio.timeout blocks and clock-deadline polls — every added violation newly
-#     SEEN, not new debt (220 across 39 before it).
+#     SEEN, not new debt (220 across 39 before it), sites rebased in from main
+#     admitted at their measured counts per esc-7800-5 and esc-7800-7.
 # Counted as VIOLATIONS, not sites — one call can produce two.
 # test_merge_speculation.py measures ZERO (tasks 3980 and 7800 migrated it) and is
 # deliberately ABSENT.
@@ -2004,6 +2005,7 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_harness_lifecycle_registry.py',
     'orchestrator/tests/test_merge_queue_deep_dispatch.py',
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
+    'orchestrator/tests/_task_verify_integration_rig.py',
     'orchestrator/tests/test_git_ops.py',
     'orchestrator/tests/test_invoke.py',
     'orchestrator/tests/test_merge_queue_bounce.py',
@@ -2019,12 +2021,12 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
     'orchestrator/tests/test_offline_lane_infra_integration.py',
     'orchestrator/tests/test_offline_lane_integration.py',
+    'orchestrator/tests/test_verify_cancel_unwind.py',
     'orchestrator/tests/test_verify_ruff_config_boundary.py',
     'orchestrator/tests/test_before_done_script.py',
     'orchestrator/tests/test_cancel_scope_bounded_cleanup.py',
     'orchestrator/tests/test_cascade_unblock.py',
     'orchestrator/tests/test_coalesce_integration_gate.py',
-    'orchestrator/tests/test_delivered_check_gate.py',
     'orchestrator/tests/test_done_phase_wedge.py',
     'orchestrator/tests/test_harness_force_release_wedged_slot.py',
     'orchestrator/tests/test_harness_offline_lane.py',
@@ -2036,12 +2038,15 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_restart_hook.py',
     'orchestrator/tests/test_offline_lane_records.py',
     'orchestrator/tests/test_remote_gate.py',
+    'orchestrator/tests/test_task_verify_host_race.py',
     'orchestrator/tests/test_verify.py',
     'orchestrator/tests/test_verify_admission_cancel_release.py',
     'orchestrator/tests/test_verify_admission_executor_bypass.py',
     'orchestrator/tests/test_verify_admission_gate.py',
     'orchestrator/tests/test_verify_admission_order_integration.py',
     'orchestrator/tests/test_verify_admission_watch.py',
+    'orchestrator/tests/test_verify_hosts.py',
+    'orchestrator/tests/test_verify_plan_latch.py',
     'orchestrator/tests/test_verify_run_cmd_reap.py',
     'orchestrator/tests/test_workflow_halt_owner.py',
     'dashboard/tests/test_db.py',
@@ -2052,13 +2057,15 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'dashboard/tests/test_api_curator.py',
     'dashboard/tests/test_memory_exchange_isolation.py',
     'dashboard/tests/test_merge_queue_data.py',
+    'dashboard/tests/test_quality_sampler.py',
+    'dashboard/tests/test_escalation_corpus.py',
     'fused-memory/tests/test_harness.py',
     'fused-memory/tests/test_drain_signal_handler.py',
     'fused-memory/tests/test_memory_service.py',
     'fused-memory/tests/test_operator_signal_handler.py',
     'fused-memory/tests/test_periodic_rebuild_summaries.py',
     'fused-memory/tests/test_task_interceptor.py',
-    'fused-memory/tests/_fm_helpers.py',
+    'fused-memory/tests/_fm_polling.py',
     'fused-memory/tests/server/test_grouped_read.py',
     'fused-memory/tests/test_dependency_direction_check.py',
     'fused-memory/tests/test_e2e_durable_queue.py',
@@ -2068,11 +2075,11 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'fused-memory/tests/test_event_loop_lag.py',
     'fused-memory/tests/test_event_queue.py',
     'fused-memory/tests/test_main_curator_usage_gate.py',
+    'shared/tests/test_cli_invoke.py',
     'shared/tests/test_uuid_prefix_guard.py',
     'shared/tests/test_async_sqlite_base.py',
     'shared/tests/test_auth_failed.py',
     'shared/tests/test_auth_reprobe_opt_out.py',
-    'shared/tests/test_cli_invoke.py',
     'shared/tests/test_cli_invoke_transcript_offloop.py',
     'shared/tests/test_failover_integration.py',
     'shared/tests/test_git_async.py',
@@ -2133,7 +2140,7 @@ class TestWallClockDeadlineDebtBaseline:
 
     Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
     650 across 47 files in four packages once task 5269 widened its detection, and
-    298 across 84 files in five packages once task 7800 taught it asyncio.timeout
+    309 across 90 files in five packages once task 7800 taught it asyncio.timeout
     blocks and clock-deadline polls (220 across 39 before; every added one newly
     SEEN, not new debt) — mean a hot default-on rule would turn those packages' lint_commands red
     immediately and stall the merge lane repo-wide — the identical situation Rule B
