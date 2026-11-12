@@ -22,6 +22,8 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.token_tracker import TokenUsageTracker
+from graphiti_core.prompts.extract_edges import ExtractedEdges
+from graphiti_core.prompts.extract_nodes import ExtractedEntities
 from graphiti_core.prompts.models import Message
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from pydantic import BaseModel
@@ -297,10 +299,16 @@ class TestTheResult:
         }
 
 
-class _RecordingSdk:
-    """A fake AsyncOpenAI: records the kwargs of every Responses and chat call it is sent."""
+class _Answer(BaseModel):
+    answer: str
 
-    def __init__(self) -> None:
+
+class _RecordingSdk:
+    """A fake AsyncOpenAI: records the kwargs of every Responses and chat call it is sent, and
+    answers each Responses call with the JSON *answers* holds for its text_format."""
+
+    def __init__(self, answers: dict[type[BaseModel], dict[str, Any]] | None = None) -> None:
+        self.answers = answers if answers is not None else {_Answer: {'answer': 'yes'}}
         self.sent: list[dict[str, Any]] = []
         self.responses = SimpleNamespace(parse=self._parse)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
@@ -308,7 +316,7 @@ class _RecordingSdk:
     async def _parse(self, **kwargs: Any) -> Any:
         self.sent.append(kwargs)
         return SimpleNamespace(
-            output_text=json.dumps({'answer': 'yes'}),
+            output_text=json.dumps(self.answers[kwargs['text_format']]),
             usage=SimpleNamespace(input_tokens=11, output_tokens=7),
         )
 
@@ -317,16 +325,26 @@ class _RecordingSdk:
         raise AssertionError('a JSON-mode chat completion cannot carry the effort')
 
 
-class _Answer(BaseModel):
-    answer: str
-
-
 EFFORT_MAX_TOKENS = 4096
+"""config.yaml's llm.max_tokens: the client's own cap, which extract_nodes uses because it passes none."""
+EXTRACT_EDGES_MAX_TOKENS = 16384
+"""graphiti_core 0.28.2 edge_operations.py::extract_edges' own cap, passed on every edge call."""
+EXTRACTION_ANSWERS: dict[type[BaseModel], dict[str, Any]] = {
+    ExtractedEntities: {'extracted_entities': [
+        {'name': 'Alpha', 'entity_type_id': 0}, {'name': 'Beta', 'entity_type_id': 0},
+    ]},
+    ExtractedEdges: {'edges': [
+        {'source_entity_name': 'Alpha', 'target_entity_name': 'Beta', 'relation_type': 'ADOPTS',
+         'fact': 'Alpha adopts Beta'},
+    ]},
+}
 
 
-def _effort_client(effort: str = 'low') -> tuple[Any, _RecordingSdk, OpenAIClient]:
+def _effort_client(
+    effort: str = 'low', sdk: _RecordingSdk | None = None,
+) -> tuple[Any, _RecordingSdk, OpenAIClient]:
     """An OpenAIClient as build_llm_client builds one for O6_MODEL, wrapped at *effort*."""
-    sdk = _RecordingSdk()
+    sdk = sdk if sdk is not None else _RecordingSdk()
     built = OpenAIClient(
         config=GraphitiLLMConfig(api_key='test', model=mod.O6_MODEL, small_model=mod.O6_MODEL, temperature=0.0),
         client=sdk, max_tokens=EFFORT_MAX_TOKENS,
@@ -375,6 +393,42 @@ class TestTheExplicitEffortClient:
         with pytest.raises(NotImplementedError, match='reasoning.effort'):
             await _structured_call(client, response_model=None)
         assert sdk.sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('message', [
+        {'role': 'assistant', 'content': 'an earlier answer'},
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'a content part'}]},
+    ])
+    async def test_a_message_graphiti_never_emits_is_refused_before_anything_is_sent(self, message: Any) -> None:
+        """graphiti's message conversion emits only system and user text, so through
+        generate_response this is unreachable; the hook graphiti calls is where it is refused."""
+        client, sdk, _ = _effort_client()
+        messages: list[Any] = [{'role': 'system', 'content': 'extract'}, message]
+        with pytest.raises(TypeError, match='is not Responses input'):
+            await client._create_structured_completion(
+                model=mod.O6_MODEL, messages=messages, temperature=None,
+                max_tokens=EFFORT_MAX_TOKENS, response_model=_Answer,
+            )
+        assert sdk.sent == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    async def test_graphitis_own_extraction_sends_the_effort_and_each_stages_cap(self, effort: str) -> None:
+        """design.md §2.2: both stages go through the structured path, so both carry the effort and
+        no temperature, and each carries its own output cap."""
+        sdk = _RecordingSdk(EXTRACTION_ANSWERS)
+        client, _, _ = _effort_client(effort, sdk)
+        result = await mod.replay_episode(client, _input(), mod.ARMS[f'o6-{effort}'])
+        assert [sent['text_format'] for sent in sdk.sent] == [ExtractedEntities, ExtractedEdges]
+        assert [sent['max_output_tokens'] for sent in sdk.sent] == [EFFORT_MAX_TOKENS, EXTRACT_EDGES_MAX_TOKENS]
+        for sent in sdk.sent:
+            assert set(sent) == {'model', 'input', 'max_output_tokens', 'text_format', 'reasoning'}
+            assert sent['reasoning'] == {'effort': effort}
+            assert [message['role'] for message in sent['input']] == ['system', 'user']
+        assert [(m.source_name, m.target_name, m.fact) for m in result.minted] == [
+            ('Alpha', 'Beta', 'Alpha adopts Beta'),
+        ]
+        assert (result.model, result.reasoning_effort) == (mod.O6_MODEL, effort)
 
 
 class TestBuildArmLlm:
@@ -1205,8 +1259,8 @@ class TestOneReplayAcrossArmClients:
             assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == EDGES_PER_EPISODE
             hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
             assert hashes == sorted(hashes)
-            keys = row.keys() | {key for m in row['minted'] for key in m}
-            assert not {'arm', 'model', 'reasoning_effort', 'low', 'medium'} & keys
+            assert row.keys() == {'graph', 'uuid', 'stratum', 'content', 'minted'}
+            assert all(m.keys() == {'edge_uuid', 'fact', 'source_name', 'target_name'} for m in row['minted'])
         text = paths['blind'].read_text()
         assert mod.O6_MODEL not in text and CONFIGURED not in text
         assert not any(arm in text for arm in ('o6-low', 'o6-medium', 'control'))

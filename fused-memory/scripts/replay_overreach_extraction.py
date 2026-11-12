@@ -261,20 +261,20 @@ class ExplicitEffortOpenAIClient(OpenAIClient):
     model is sent temperature and never sent reasoning. This client sends no
     temperature, and exactly the arm's reasoning effort (esc-9065-2). It wraps
     the client build_llm_client built, reusing its SDK client, config,
-    max_tokens and token tracker.
+    max_tokens and token tracker. graphiti's own ``reasoning`` stays at its
+    default and is never read: ``reasoning_effort`` is the one copy.
     """
 
     def __init__(self, built: OpenAIClient, effort: ReasoningEffort) -> None:
         if effort is None:
             raise ValueError('an effort client sends a chosen effort; build the configured client instead')
-        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens, reasoning=effort)
+        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens)
         self.token_tracker = built.token_tracker
         self._reasoning_effort: ReasoningEffort = effort
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
-        """The effort sent. Not graphiti's own ``reasoning``, which every OpenAIClient carries
-        ('minimal' by default), even when it sends nothing."""
+        """The effort every structured call sends."""
         return self._reasoning_effort
 
     async def _create_structured_completion(
