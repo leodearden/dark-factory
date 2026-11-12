@@ -4696,7 +4696,7 @@ def create_server(
             )
             if resolved_tip is None:
                 logger.warning(
-                    'merge_request: branch %s (task %s) did not resolve; recording the '
+                    'merge_request: no tip resolved for branch %s (task %s); recording the '
                     'verified_green vouch with tip_sha_unresolved',
                     full_branch, task_id,
                 )
