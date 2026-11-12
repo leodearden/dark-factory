@@ -104,7 +104,7 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
 from shared.toolcall_markup import detect_for, repair
 
-from orchestrator import plan_descope
+from orchestrator import plan_descope, quarantine_provenance
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
@@ -1094,9 +1094,11 @@ def _create_plan(
     #
     # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
     # through a plain `artifacts.read_plan()` for the same reason, and it
-    # touches only the guard's own `_markup_rejections` block and the C4
+    # touches only the guard's own `_markup_rejections` block, the C4
     # descope record (`plan_descope.DESCOPE_PLAN_KEYS`), whose prose already
-    # passed the inbound guard on `record_descoped_step`. Do not "simplify"
+    # passed the inbound guard on `record_descoped_step`, and the quarantine
+    # back-pointer (`quarantine_provenance.QUARANTINED_FROM_KEY`), which the
+    # orchestrator writes and which carries no agent prose. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
     carried: dict[str, Any] = {}
@@ -1142,6 +1144,7 @@ def _create_plan(
         # dropped; a wholesale overwrite must not erase it.
         if isinstance(existing, dict):
             carried.update(plan_descope.descope_record_of(existing))
+            carried.update(quarantine_provenance.quarantined_from_of(existing))
             replaced = Plan.from_json(existing)
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
