@@ -13,24 +13,39 @@ import asyncio
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Protocol
 
-from shared.proc_group import read_session_id, read_stat_fields
+from shared.proc_group import read_session_id, read_stat_fields, unified_cgroup_path
 
 _PROC_ROOT = Path('/proc')
 
 
+class SpawnedChild(Protocol):
+    """The caller's handle on a child it spawned, as ``asyncio.subprocess.Process`` exposes it."""
+
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+
 async def relocated_scopes(
-    leader: int, *, launched_in: str | None, proc_root: Path = _PROC_ROOT
+    child: SpawnedChild, *, launched_in: str | None, proc_root: Path = _PROC_ROOT
 ) -> frozenset[str]:
-    """The scope units holding members of the session *leader* leads, other than
+    """The scope units holding members of the session *child* leads, other than
     *launched_in* and the caller's own scope.
 
-    Empty unless *leader* is the caller's own child leading its own session;
-    only then is /proc scanned, on a worker thread. Never raises.
+    Empty unless *child* is unreaped, still the caller's child, and leads its
+    own session. A reaped child's pid may already name another process, the
+    hazard ``shared/src/shared/proc_group.py::terminate_process_group`` refuses
+    on the same ``returncode`` test. Only then is /proc scanned, on a worker
+    thread. An unreadable /proc entry names nothing; what the thread hop
+    itself raises (``asyncio.to_thread``) propagates.
     """
-    if not _is_own_session_leader(proc_root / str(leader)):
+    if child.returncode is not None or not _is_own_session_leader(proc_root, child.pid):
         return frozenset()
-    return await asyncio.to_thread(_scopes_of_session, leader, launched_in, proc_root)
+    return await asyncio.to_thread(_scopes_of_session, child.pid, launched_in, proc_root)
 
 
 def _scopes_of_session(leader: int, launched_in: str | None, proc_root: Path) -> frozenset[str]:
@@ -39,22 +54,18 @@ def _scopes_of_session(leader: int, launched_in: str | None, proc_root: Path) ->
     return frozenset(scope for scope in scopes if scope is not None and scope not in excluded)
 
 
-def _is_own_session_leader(entry: Path) -> bool:
+def _is_own_session_leader(proc_root: Path, leader: int) -> bool:
+    entry = proc_root / str(leader)
     fields = read_stat_fields(entry, skip_malformed=True)
-    return (
-        fields is not None
-        and fields.ppid == os.getpid()
-        and read_session_id(entry) == int(entry.name)
-    )
+    return fields is not None and fields.ppid == os.getpid() and read_session_id(entry) == leader
 
 
 def _scope_of(entry: Path) -> str | None:
-    """The deepest ``*.scope`` segment of *entry*'s unified (``0::``) cgroup path."""
+    """The deepest ``*.scope`` segment of *entry*'s unified cgroup path."""
     try:
-        text = os.fsdecode((entry / 'cgroup').read_bytes())
+        unified = unified_cgroup_path(os.fsdecode((entry / 'cgroup').read_bytes()))
     except OSError:
         return None
-    unified = next((line[3:] for line in text.splitlines() if line.startswith('0::')), None)
     if unified is None:
         return None
     return next(

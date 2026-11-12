@@ -6090,22 +6090,44 @@ async def _reap_command_subtree(
     (orchestrator/src/orchestrator/relocated_scopes.py::relocated_scopes), which
     reaps process-group escapes, then its spawn process group as the backstop.
 
+    Discovery runs first, while the leader still proves ownership, and never
+    costs the kills: a failure finds nothing, and a cancellation during it
+    still kills the launch scope and the process group before propagating.
+
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
     if proc is None:
         return
-    relocated = await relocated_scopes(proc.pid, launched_in=scope_unit)
+    relocated: frozenset[str] = frozenset()
+    try:
+        relocated = await _discover_relocated_scopes(proc, scope_unit)
+    finally:
+        launched = [] if scope_unit is None else [scope_unit]
+        for unit in [*launched, *sorted(relocated)]:
+            await _kill_cgroup_scope(unit)
+        if pgid is not None:
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+
+async def _discover_relocated_scopes(
+    proc: asyncio.subprocess.Process, scope_unit: str | None
+) -> frozenset[str]:
+    try:
+        relocated = await relocated_scopes(proc, launched_in=scope_unit)
+    except Exception:
+        logger.warning(
+            'verify command pid %d: finding the scopes it moved into failed; '
+            'reaping only its launch scope and process group',
+            proc.pid, exc_info=True,
+        )
+        return frozenset()
     if relocated:
         logger.info(
             'verify command pid %d moved into scopes %s; killing them too',
             proc.pid, sorted(relocated),
         )
-    launched = [] if scope_unit is None else [scope_unit]
-    for unit in [*launched, *sorted(relocated)]:
-        await _kill_cgroup_scope(unit)
-    if pgid is not None:
-        await terminate_process_group(proc, pgid, grace_secs=5.0)
+    return relocated
 
 
 async def _run_cmd(

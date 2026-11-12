@@ -4,11 +4,13 @@ Everything is driven through the PUBLIC ``run_verification`` entry. The guards
 use recording ``systemd-run`` / ``systemctl`` stand-ins first on PATH; the
 confirmation runs a reify-shaped governed merge leg under real systemd, whose
 governed exec relocates the workload with a nested ``systemd-run --scope
---slice``.
+--slice``. A failing or cancelled discovery has no host trigger, so those
+tests replace verify.py's ``relocated_scopes`` binding.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import os
@@ -69,6 +71,13 @@ def _killed_units(argv_dir: Path) -> set[str]:
     }
 
 
+def _launched_unit(systemd_run_argv_dir: Path) -> str:
+    """The ``--unit`` of the one recorded scope spawn."""
+    (spawn,) = recorded_scope_spawns(systemd_run_argv_dir)
+    (launched,) = [arg.removeprefix('--unit=') for arg in spawn if arg.startswith('--unit=')]
+    return launched
+
+
 def _timing_out_module(test_command: str, timeout_secs: float) -> ModuleConfig:
     return ModuleConfig(
         prefix='pkg',
@@ -103,9 +112,7 @@ class TestReapTargetsOnlyWhatTheCommandOccupies:
             max_retries=0, role='task',
         )
         assert result.timed_out, result.summary
-        (spawn,) = recorded_scope_spawns(fake_systemd_run)
-        (launched,) = [arg.removeprefix('--unit=') for arg in spawn if arg.startswith('--unit=')]
-        assert _killed_units(fake_systemctl) == {launched}
+        assert _killed_units(fake_systemctl) == {_launched_unit(fake_systemd_run)}
 
 
 def _fresh_slice_name() -> str:
@@ -125,6 +132,8 @@ def _nested_scope_relocates() -> bool:
     """Whether a nested ``systemd-run --scope --slice`` moves its payload out of the outer scope.
 
     Probed independently of verify.py, so the skip depends only on the host.
+    A user manager too slow to answer raises ``subprocess.TimeoutExpired``,
+    which the cache does not keep.
     """
     probe_slice = _fresh_slice_name()
     try:
@@ -137,7 +146,7 @@ def _nested_scope_relocates() -> bool:
             ],
             capture_output=True, text=True, timeout=15,
         )
-    except Exception:
+    except OSError:
         return False
     finally:
         _stop_unit(probe_slice)
@@ -171,20 +180,34 @@ def _describe(pid: int) -> str:
     return f'pid {pid} argv={_argv_of(str(pid))!r} cgroup={cgroup!r}'
 
 
+def _survivors(marker: str, *, within_secs: float = 5.0) -> list[int]:
+    """The live processes still carrying *marker* once *within_secs* has passed."""
+    deadline = time.monotonic() + within_secs
+    survivors = _live_pids_carrying(marker)
+    while survivors and time.monotonic() < deadline:
+        time.sleep(0.1)
+        survivors = _live_pids_carrying(marker)
+    return survivors
+
+
 @pytest.fixture
-def marker() -> str:
-    """A ``sleep`` duration no other process on the host carries in its argv."""
-    return f'900.{random.randrange(10**6):06d}'
+def marker() -> Iterator[str]:
+    """A ``sleep`` duration no other process on the host carries in its argv.
+
+    Teardown kills whatever a failing run left carrying it.
+    """
+    marker = f'900.{random.randrange(10**6):06d}'
+    yield marker
+    for pid in _live_pids_carrying(marker):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 @pytest.fixture
 def governed_slice(marker: str) -> Iterator[str]:
-    """A fresh slice for the governed workload; teardown kills what a failing run left."""
+    """A fresh slice for the governed workload, stopped at teardown."""
     slice_name = _fresh_slice_name()
     yield slice_name
-    for pid in _live_pids_carrying(marker):
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
     _stop_unit(slice_name)
 
 
@@ -207,7 +230,11 @@ class TestRealGovernedMergeLeg:
     async def test_timed_out_governed_merge_leg_leaves_no_survivors(
         self, worktree, governed_slice, marker, tmp_path,
     ):
-        if not _nested_scope_relocates():
+        try:
+            relocates = _nested_scope_relocates()
+        except subprocess.TimeoutExpired:
+            pytest.skip('the systemd user manager did not answer the nested-scope probe in 15s')
+        if not relocates:
             pytest.skip('nested systemd user scopes do not relocate on this host')
         governed = _governed_exec(tmp_path / 'gov.sh', governed_slice)
         config = OrchestratorConfig(
@@ -223,9 +250,46 @@ class TestRealGovernedMergeLeg:
         )
         assert result.timed_out, result.summary
 
-        deadline = time.monotonic() + 5.0
-        survivors = _live_pids_carrying(marker)
-        while survivors and time.monotonic() < deadline:
-            time.sleep(0.1)
-            survivors = _live_pids_carrying(marker)
+        survivors = _survivors(marker)
         assert survivors == [], '\n'.join(_describe(pid) for pid in survivors)
+
+
+async def _failing_discovery(*_args: object, **_kwargs: object) -> frozenset[str]:
+    raise RuntimeError('cannot schedule new futures after shutdown')
+
+
+async def _cancelled_discovery(*_args: object, **_kwargs: object) -> frozenset[str]:
+    raise asyncio.CancelledError
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestDiscoveryNeverCostsTheKills:
+
+    @pytest.mark.asyncio
+    async def test_a_failed_discovery_still_kills_the_launch_scope_and_group(
+        self, fake_systemd_run, fake_systemctl, worktree, marker, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr('orchestrator.verify.relocated_scopes', _failing_discovery)
+        result = await run_verification(
+            worktree, OrchestratorConfig(verify_use_cgroup_scope=True),
+            module_config=_timing_out_module(f'sleep {marker} & wait', 1),
+            max_retries=0, role='task',
+        )
+        assert result.timed_out, result.summary
+        assert _killed_units(fake_systemctl) == {_launched_unit(fake_systemd_run)}
+        assert _survivors(marker) == []
+        assert 'finding the scopes it moved into failed' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_discovery_kills_the_launch_scope_and_group_then_propagates(
+        self, fake_systemd_run, fake_systemctl, worktree, marker, monkeypatch,
+    ):
+        monkeypatch.setattr('orchestrator.verify.relocated_scopes', _cancelled_discovery)
+        with pytest.raises(asyncio.CancelledError):
+            await run_verification(
+                worktree, OrchestratorConfig(verify_use_cgroup_scope=True),
+                module_config=_timing_out_module(f'sleep {marker} & wait', 1),
+                max_retries=0, role='task',
+            )
+        assert _killed_units(fake_systemctl) == {_launched_unit(fake_systemd_run)}
+        assert _survivors(marker) == []
