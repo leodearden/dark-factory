@@ -7,6 +7,7 @@ the replay never needs one.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -43,10 +44,11 @@ class _FakeLLM(LLMClient):
     def __init__(
         self, entities: tuple[str, ...] = ('Alpha', 'Beta'),
         edges: tuple[tuple[str, str, str], ...] = (('Alpha', 'Beta', 'Alpha adopts Beta'),),
-        *, model: str = 'fake-extractor',
+        *, model: str = 'fake-extractor', reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(GraphitiLLMConfig(model=model))
         self.token_tracker = AttributingTokenUsageTracker()
+        self.reasoning_effort = reasoning_effort
         self.entities = entities
         self.edges = edges
         self.calls: list[tuple[str | None, list[Message]]] = []
@@ -116,29 +118,38 @@ class TestTheArms:
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
-    def test_o6_is_the_controls_instructions_on_the_stronger_model(self) -> None:
-        o6, control = mod.ARMS['o6'], mod.ARMS['control']
+    def test_o6_is_two_arms_one_per_reasoning_effort(self) -> None:
+        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm."""
+        assert sorted(mod.ARMS) == ['control', 'o1', 'o6-low', 'o6-medium']
+
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    def test_each_o6_arm_is_the_controls_instructions_on_the_stronger_model_at_its_effort(
+        self, effort: str,
+    ) -> None:
+        o6 = mod.ARMS[f'o6-{effort}']
+        assert o6.llm == mod.ExtractionLlm(mod.O6_MODEL, effort)
         assert (o6.instructions, o6.instructions_version) == (None, mod.NO_INSTRUCTIONS)
-        assert (control.instructions, control.instructions_version) == (None, mod.NO_INSTRUCTIONS)
-        assert o6.model == mod.O6_MODEL
-        assert control.model is None and mod.ARMS['o1'].model is None
+
+    @pytest.mark.parametrize('arm', ['control', 'o1'])
+    def test_the_control_and_o1_extract_on_the_configured_client(self, arm: str) -> None:
+        llm = mod.ARMS[arm].llm
+        assert llm == mod.ExtractionLlm()
+        assert (llm.model, llm.reasoning_effort) == (None, None)
+
+    def test_an_extraction_llm_is_a_frozen_hashable_key(self) -> None:
+        llm = mod.ExtractionLlm(mod.O6_MODEL, 'low')
+        assert {llm: 1}[mod.ExtractionLlm(mod.O6_MODEL, 'low')] == 1
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            llm.reasoning_effort = 'medium'  # type: ignore[misc]
 
     @pytest.mark.asyncio
-    async def test_the_o6_arm_splices_nothing_and_runs_on_its_model(self) -> None:
-        llm = _FakeLLM(model=mod.O6_MODEL)
-        result = await _replay(llm, 'o6')
+    async def test_the_o6_low_arm_splices_nothing_and_runs_on_its_client(self) -> None:
+        llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='low')
+        result = await _replay(llm, 'o6-low')
         first_line = mod.O1_INSTRUCTIONS.strip().splitlines()[0]
         assert first_line not in llm.prompt(NODE_PROMPT)
         assert first_line not in llm.prompt(EDGE_PROMPT)
-        assert (result.arm, result.model) == ('o6', mod.O6_MODEL)
-
-    @pytest.mark.asyncio
-    async def test_an_arm_refuses_a_client_on_another_model_before_any_call(self) -> None:
-        llm = _FakeLLM(model='m-small')
-        with pytest.raises(mod.ArmModelMismatch) as raised:
-            await _replay(llm, 'o6')
-        assert all(name in str(raised.value) for name in ('o6', mod.O6_MODEL, 'm-small'))
-        assert llm.calls == []
+        assert (result.arm, result.model, result.reasoning_effort) == ('o6-low', mod.O6_MODEL, 'low')
 
     @pytest.mark.asyncio
     async def test_a_client_whose_tokens_cannot_be_attributed_is_refused_before_any_call(self) -> None:
