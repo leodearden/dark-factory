@@ -4330,7 +4330,7 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
                 agent_id='claude-interactive',
             )
 
-        assert any('show' in call.argv for call in runner.calls), runner.calls
+        assert any(call.subcommand == 'show' for call in runner.calls), runner.calls
         assert result['success'] is False
         assert result['error'] == 'done_evidence_stale'
         assert result['task_id'] == '1'
@@ -5432,6 +5432,17 @@ class TestDeterministicProvenanceCallerBar:
 _TIMED_OUT = GitResult(124, '', 'timed out after 5.0s', timed_out=True)
 
 
+def _probe_warnings(caplog, subcommand):
+    """WARNING records the interceptor logged for an unexpected exception
+    from the git *subcommand* probe."""
+    return [
+        r for r in caplog.records
+        if r.name == 'fused_memory.middleware.task_interceptor'
+        and r.levelno == logging.WARNING
+        and f'git {subcommand} probe' in r.getMessage()
+    ]
+
+
 async def _refused_merged_done_reason(
     taskmaster, reconciler, event_buffer, project_root, commit, git_runner=None,
 ):
@@ -5483,8 +5494,7 @@ async def test_merge_base_git_error_reports_unconfirmed(taskmaster, reconciler, 
 @pytest.mark.asyncio
 async def test_merge_base_timeout_reports_unconfirmed(taskmaster, reconciler, event_buffer, tmp_path):
     """A merge-base timeout is NOT-YET-CONFIRMED, not off-main, and the probe
-    asks its runner for a bounded wait, so a hanging git cannot hold the
-    write lock indefinitely."""
+    asks its runner for a bounded wait, so a hanging git child is bounded."""
     sha = _init_git_repo(tmp_path)
     runner = ScriptedGitRunner({'merge-base': _TIMED_OUT})
 
@@ -5494,7 +5504,7 @@ async def test_merge_base_timeout_reports_unconfirmed(taskmaster, reconciler, ev
 
     assert 'could not be confirmed on main: git merge-base timed out' in reason
     assert 'is not on main:' not in reason
-    merge_base_timeouts = [call.timeout for call in runner.calls if 'merge-base' in call.argv]
+    merge_base_timeouts = [call.timeout for call in runner.calls if call.subcommand == 'merge-base']
     assert merge_base_timeouts == [5.0]
 
 
@@ -5517,28 +5527,32 @@ async def test_merge_base_missing_binary_reports_unconfirmed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('outcome', 'expected_detail'),
+    ('outcome', 'expected_detail', 'expected_warnings'),
     [
-        (GitResult(128, '', ''), 'merge-base failed'),
-        (PermissionError('denied'), 'PermissionError: denied'),
+        (GitResult(128, '', ''), 'merge-base failed', 0),
+        (PermissionError('denied'), 'PermissionError: denied', 1),
     ],
     ids=['git-error-empty-stderr', 'unexpected-exception'],
 )
 async def test_merge_base_residual_failures_report_unconfirmed(
-    taskmaster, reconciler, event_buffer, tmp_path, outcome, expected_detail,
+    taskmaster, reconciler, event_buffer, tmp_path, caplog,
+    outcome, expected_detail, expected_warnings,
 ):
     """The two fallback branches -- a non-1 exit with EMPTY stderr (detail
     falls back to 'merge-base failed') and an unexpected exception -- are
-    NOT-YET-CONFIRMED too, not off-main verdicts."""
+    NOT-YET-CONFIRMED too, not off-main verdicts. Only the exception is
+    logged: git's own answer is not a fault of the probe."""
     sha = _init_git_repo(tmp_path)
 
-    reason = await _refused_merged_done_reason(
-        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
-        ScriptedGitRunner({'merge-base': outcome}),
-    )
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        reason = await _refused_merged_done_reason(
+            taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+            ScriptedGitRunner({'merge-base': outcome}),
+        )
 
     assert f'could not be confirmed on main: {expected_detail}' in reason
     assert 'is not on main:' not in reason
+    assert len(_probe_warnings(caplog, 'merge-base')) == expected_warnings
 
 
 @pytest.mark.asyncio
@@ -5558,32 +5572,35 @@ async def test_rev_parse_rejection_reports_not_found(taskmaster, reconciler, eve
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('outcome', 'expected_detail'),
+    ('outcome', 'expected_detail', 'expected_warnings'),
     [
-        (_TIMED_OUT, 'git rev-parse timed out'),
-        (FileNotFoundError('git'), 'git binary not found'),
-        (PermissionError('denied'), 'PermissionError: denied'),
-        (GitResult(0, '', ''), 'empty rev-parse output'),
+        (_TIMED_OUT, 'git rev-parse timed out', 0),
+        (FileNotFoundError('git'), 'git binary not found', 0),
+        (PermissionError('denied'), 'PermissionError: denied', 1),
+        (GitResult(0, '', ''), 'empty rev-parse output', 0),
     ],
     ids=['timeout', 'missing-binary', 'unexpected-exception', 'empty-output'],
 )
 async def test_rev_parse_failure_reports_unresolved(
-    taskmaster, reconciler, event_buffer, tmp_path, outcome, expected_detail,
+    taskmaster, reconciler, event_buffer, tmp_path, caplog,
+    outcome, expected_detail, expected_warnings,
 ):
     """A rev-parse that never rendered a verdict on the ref (timeout,
     missing binary, unexpected error, empty output) must NOT be reported as
     "not found in <project_root>" -- same honesty contract as the ancestor
-    check one step later."""
+    check one step later. Only the unexpected exception is logged."""
     sha = _init_git_repo(tmp_path)
 
-    reason = await _refused_merged_done_reason(
-        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
-        ScriptedGitRunner({'rev-parse': outcome}),
-    )
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        reason = await _refused_merged_done_reason(
+            taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+            ScriptedGitRunner({'rev-parse': outcome}),
+        )
 
     assert 'could not be resolved in' in reason
     assert expected_detail in reason
     assert 'not found in' not in reason
+    assert len(_probe_warnings(caplog, 'rev-parse')) == expected_warnings
 
 
 @pytest.mark.asyncio
@@ -5620,6 +5637,7 @@ async def test_nul_commit_is_refused_as_unresolved_not_raised(
     )
 
     assert 'could not be resolved in' in reason
+    assert 'ValueError' in reason
     assert 'not found in' not in reason
 
 
