@@ -57,6 +57,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.relocated_scopes import relocated_scopes
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_admission_gate import (
     AdmissionGrant,
@@ -6084,16 +6085,25 @@ async def _reap_command_subtree(
     pgid: int | None,
     scope_unit: str | None,
 ) -> None:
-    """Kill a spawned verify command's whole subtree: its cgroup scope first
-    (reaps process-group escapes), then its spawn process group as the backstop.
+    """Kill a spawned verify command's whole subtree: its launch scope and every
+    scope its session moved into
+    (orchestrator/src/orchestrator/relocated_scopes.py::relocated_scopes), which
+    reaps process-group escapes, then its spawn process group as the backstop.
 
     A no-op when the spawn never returned a process: either it failed before
     any scope existed, or it was interrupted and asyncio's spawn cleanup
     already killed the child."""
     if proc is None:
         return
-    if scope_unit is not None:
-        await _kill_cgroup_scope(scope_unit)
+    relocated = await relocated_scopes(proc.pid, launched_in=scope_unit)
+    if relocated:
+        logger.info(
+            'verify command pid %d moved into scopes %s; killing them too',
+            proc.pid, sorted(relocated),
+        )
+    launched = [] if scope_unit is None else [scope_unit]
+    for unit in [*launched, *sorted(relocated)]:
+        await _kill_cgroup_scope(unit)
     if pgid is not None:
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
@@ -6125,6 +6135,8 @@ async def _run_cmd(
     inner GNU ``timeout`` that setpgid'd cargo into a separate group, which
     defeats the ``killpg``-on-spawn-pgid fallback and was the leak that let a
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
+    A scope the command moves itself into (a nested ``systemd-run --scope``)
+    is reaped too, found by the command's session (``_reap_command_subtree``).
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
@@ -6916,9 +6928,10 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
     path, creates an *inner* ``systemd-run --user --scope --slice=...``
     scope.  The inner scope MOVES the governed workload out of the outer
-    ``df-verify`` scope into its own scope under that slice, so neither the
-    outer scope's CPUWeight nor its cgroup kill reaches that workload —
-    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``df-verify`` scope into its own scope under that slice, so the outer
+    scope's CPUWeight does not reach that workload — ``cpu-governed-exec.sh``
+    sets the workload's weight itself.  The kill still reaches it: an abnormal
+    exit kills the relocated scope too (``verify.py::_reap_command_subtree``).
     ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
     nested-scope failure degrades gracefully.
     """
