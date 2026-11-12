@@ -1,12 +1,17 @@
-"""Throwaway real-git repos (signing off, hooks disabled) for tests whose
-verdict is git semantics.
+"""Real-git fixtures for tests whose verdict is git semantics: throwaway repos
+(signing off, hooks disabled) plus a runner that scripts chosen git
+subcommands over them.
 
 Lives outside conftest.py, imported by name, under the convention stated in
 _fm_helpers' module docstring.
 """
 
 import subprocess
-from typing import TypedDict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any, NamedTuple, TypedDict
+
+from shared.git_async import GitResult, run_git
 
 # ---------------------------------------------------------------------------
 # Real-git repo builders
@@ -151,3 +156,47 @@ def init_merge_history_repo(path) -> MergeHistoryShas:
     conflict_merge = git_stdout(path, 'rev-parse', 'HEAD')
 
     return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
+
+
+# ---------------------------------------------------------------------------
+# Scripted git runner
+# ---------------------------------------------------------------------------
+
+
+class GitCall(NamedTuple):
+    """One call a :class:`ScriptedGitRunner` received."""
+
+    argv: tuple[str, ...]
+    timeout: float | None
+
+
+class ScriptedGitRunner:
+    """A ``shared.git_async.run_git`` stand-in that scripts chosen subcommands.
+
+    *script* maps a git subcommand (``'merge-base'``, ``'rev-parse'``,
+    ``'show'``) to the ``GitResult`` it returns or the exception it raises. A
+    call naming no scripted subcommand goes to the real ``run_git``, so a test
+    faking ``merge-base`` still resolves its SHA for real against
+    :func:`_init_git_repo`'s repo. Every call is recorded in ``calls``.
+    """
+
+    def __init__(self, script: Mapping[str, GitResult | Exception]):
+        self._script = dict(script)
+        self.calls: list[GitCall] = []
+
+    async def __call__(
+        self,
+        cmd: Sequence[str],
+        cwd: Path | str | None = None,
+        *,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> GitResult:
+        argv = tuple(cmd)
+        self.calls.append(GitCall(argv, timeout))
+        for subcommand, outcome in self._script.items():
+            if subcommand in argv:
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+        return await run_git(cmd, cwd, timeout=timeout, **kwargs)
