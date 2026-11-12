@@ -2085,6 +2085,26 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
 # budget tests is exact.
 _RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
 
+# One Rule C violation per non-Call leg: an asyncio.timeout block wrapping a poll,
+# and a poll giving up against a clock-deadline read.
+_RULE_C_POLL_LEGS = (
+    'import asyncio\n'
+    '\n'
+    '\n'
+    'async def await_ready(verifier, timeout):\n'
+    '    async with asyncio.timeout(timeout):\n'
+    '        while not verifier.ready:\n'
+    '            await asyncio.sleep(0.01)\n'
+    '\n'
+    '\n'
+    'async def await_done(state, deadline):\n'
+    '    loop = asyncio.get_running_loop()\n'
+    '    while loop.time() < deadline:\n'
+    '        if state.done:\n'
+    '            return\n'
+    '        await asyncio.sleep(0.01)\n'
+)
+
 
 def _live_rule_c_debt_entry() -> tuple[str, int]:
     """The live baseline entry with the LARGEST budget, for the find_violations legs.
@@ -2657,6 +2677,20 @@ class TestScanRepoTestDirs:
 
         assert by_relpath['pkg_a/tests/_helper.py'].rule_c_count == 1
         assert by_relpath['pkg_a/tests/test_bad.py'].rule_c_count == 0
+
+    def test_rule_c_count_includes_the_timeout_block_and_clock_poll_legs(self, tmp_path: Path):
+        relpath = 'pkg_a/tests/_poll_helper.py'
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text(_RULE_C_POLL_LEGS, encoding='utf-8')
+
+        [record] = _scan_repo_test_dirs(tmp_path, ('pkg_a/tests',))
+
+        reported = [
+            v for v in find_violations(_RULE_C_POLL_LEGS, relpath) if 'wall-clock-deadline' in v.message
+        ]
+        assert record.rule_c_count == 2
+        assert record.rule_c_count == len(reported)
 
     def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
         by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
