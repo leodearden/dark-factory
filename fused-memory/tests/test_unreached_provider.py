@@ -182,16 +182,29 @@ async def test_a_judge_that_answers_passes_without_skipping():
     assert decision.outcome == OUTCOME_STORED
 
 
+@pytest.mark.parametrize(
+    ('unreached_recorded', 'fail_open_count', 'named'),
+    [
+        pytest.param(0, 1, 'no recorded cause', id='nothing-recorded'),
+        pytest.param(1, 2, 'APIConnectionError', id='more-counted-than-recorded'),
+        pytest.param(2, 1, 'APIConnectionError', id='fewer-counted-than-recorded'),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_fail_open_the_recorder_never_saw_fails():
+async def test_a_fail_open_count_the_recorded_causes_do_not_match_fails(
+    unreached_recorded, fail_open_count, named,
+):
     causes = FailOpenCauses()
-    with pytest.raises(openai.APIConnectionError):
-        await causes.recording(_judge_calling(connect_error))()
+    seam = causes.recording(_judge_calling(connect_error))
+    for _ in range(unreached_recorded):
+        with pytest.raises(openai.APIConnectionError):
+            await seam()
 
     with pytest.raises((pytest.fail.Exception, pytest.skip.Exception)) as excinfo:
-        causes.assert_no_fail_open_unless_unreached(2)
+        causes.assert_no_fail_open_unless_unreached(fail_open_count)
 
     assert isinstance(excinfo.value, pytest.fail.Exception), excinfo.value
+    assert named in str(excinfo.value)
 
 
 @pytest.mark.asyncio

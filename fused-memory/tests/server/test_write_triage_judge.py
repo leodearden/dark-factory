@@ -2988,31 +2988,35 @@ class TestTheFrontierArmSkipGuard:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('construct', 'write_triage'),
+        ('construct', 'write_triage', 'recorded'),
         [
-            pytest.param(_hanging_sdk, {'judge_timeout_seconds': 0.01}, id='budget-expiry'),
-            pytest.param(real_sdk_over(read_timeout), {}, id='read-timeout'),
+            pytest.param(
+                _hanging_sdk, {'judge_timeout_seconds': 0.01}, 'TimeoutError',
+                id='budget-expiry',
+            ),
+            pytest.param(real_sdk_over(read_timeout), {}, 'APITimeoutError', id='read-timeout'),
             pytest.param(
                 real_sdk_over(lambda request: httpx.Response(500, request=request)), {},
-                id='provider-5xx',
+                'InternalServerError', id='provider-5xx',
             ),
             pytest.param(
                 real_sdk_over(lambda request: httpx.Response(429, request=request)), {},
-                id='provider-429',
+                'RateLimitError', id='provider-429',
             ),
         ],
     )
     async def test_any_other_judge_failure_fails_open_and_keeps_the_live_test_red(
-        self, construct: Callable[..., object], write_triage: dict[str, Any],
+        self, construct: Callable[..., object], write_triage: dict[str, Any], recorded: str,
     ) -> None:
         verdicts: list[TriageJudgeVerdict] = []
 
         with patch('openai.AsyncOpenAI', side_effect=construct), \
-                _failing_on_skip('failing'), pytest.raises(pytest.fail.Exception):
+                _failing_on_skip('failing'), pytest.raises(pytest.fail.Exception) as excinfo:
             await _frontier_arm_triage(
                 _mid_band_service(**write_triage), content='c', verdicts=verdicts,
             )
 
+        assert recorded in str(excinfo.value)
         assert verdicts == []
 
 
