@@ -591,7 +591,7 @@ class _NoStewardApplicable(_HumanHandoff):
 
 if TYPE_CHECKING:
     from escalation.disposition import ExitKind
-    from escalation.models import Escalation, TrainState
+    from escalation.models import Escalation, EvidenceEntry, TrainState
     from escalation.queue import EscalationQueue
 
     from orchestrator.merge_lane.types import OperatorMergeCancel
@@ -17448,12 +17448,15 @@ class TaskWorkflow:
         dry_run_spawn: DryRunSpawn = DryRunSpawn.OUTSIDE_MERGE_PHASE,
         root_cause: str = '',
         disposition: BlockDisposition | None = None,
+        evidence: Sequence[EvidenceEntry] = (),
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
         *reason* is used as the escalation summary (truncated to 200 chars).
         *detail* is the full diagnostic context persisted in the escalation
         file; defaults to *reason* when not provided.
+        *evidence* is the structured raw observations attached to every
+        escalation record this call files.
         *block_status* (task 2200 / ω4) is the task-row status written when
         *merge_phase* is False — defaults to the generic ``'blocked'``.  Pass
         ``'infra-hold'`` to land the row on the first-class infra-hold status
@@ -17656,7 +17659,7 @@ class TaskWorkflow:
             if escalate_to_human:
                 await self._ensure_l1_escalation_for_blocked(
                     reason, detail or reason, category=category,
-                    root_cause=root_cause,
+                    root_cause=root_cause, evidence=evidence,
                 )
                 observed = await self._park_merge_phase_row(
                     merge_phase, block_status,
@@ -17686,6 +17689,7 @@ class TaskWorkflow:
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
                     filing_claimant_run_id=self._filing_claimant_run_id,
+                    evidence=list(evidence),
                 )
                 if dedupe_fingerprint:
                     # Cross-task N->1 dedup: stamp the fingerprint and route
@@ -17959,7 +17963,7 @@ class TaskWorkflow:
         # surfaces unconditionally, which is task 2757's whole point.
         if not skip_escalation:
             await self._ensure_l1_escalation_for_blocked(
-                reason, detail or reason, category=category,
+                reason, detail or reason, category=category, evidence=evidence,
             )
 
         # Fix #2 — this slot is exiting BLOCKED, so a pending L0's only
@@ -18156,6 +18160,7 @@ class TaskWorkflow:
     async def _ensure_l1_escalation_for_blocked(
         self, reason: str, detail: str, *, category: str = 'task_failure',
         root_cause: str = '',
+        evidence: Sequence[EvidenceEntry] = (),
     ) -> None:
         """Submit a level-1 escalation if none is open for this task.
 
@@ -18199,6 +18204,7 @@ class TaskWorkflow:
             train_state=train_state,
             root_cause=root_cause,
             filing_claimant_run_id=self._filing_claimant_run_id,
+            evidence=list(evidence),
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
