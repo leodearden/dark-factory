@@ -104,6 +104,13 @@ caller string. The annotations `GraphitiBackend.add_episode` prepends,
 classification, so a tagged write stays in its category's stratum; any other
 leading text is a caller string and buckets as `add_episode`.
 
+**The axis is closed.** `build_corpus.KNOWN_PAYLOAD_KINDS` declares the four
+measured kinds, and `add_episode` is deliberately not among them. A build (or
+`--dry-run`) over a population carrying any other kind exits 1, naming the
+kinds and the `source_description` values that produced them. The remedy is to
+re-measure the census before building the next corpus, or, when the cause is a
+new writer annotation, to extend the annotation regex.
+
 Allocation is **min-1 floor + largest-remainder proportional, capped at cell
 size**. The floor is load-bearing, not tidiness: the
 `('2026-04', 'procedural_knowledge')` cell holds exactly **one** episode of
@@ -195,11 +202,14 @@ handle so only `ro_query` can be reached.
 
 Test lane: the offline suite runs by default; the single live test is
 `@pytest.mark.integration` (per-test, never module-level — `addopts` is
-`-m 'not integration'`) and skips cleanly with no FalkorDB.
+`-m 'not integration'`) and skips cleanly with no FalkorDB. It seeds and
+deletes a throwaway graph on the scratch FalkorDB and reads it read-only. No
+automated check asserts the real population's size, month span or window
+start; the build report prints them for the operator.
 
 ```bash
 uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py            # offline
-uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, read-only
+uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, scratch FalkorDB
 ```
 
 ## Self-check
