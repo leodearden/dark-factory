@@ -107,6 +107,7 @@ from shared.toolcall_markup import detect_for, repair
 from orchestrator import plan_descope
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
 
@@ -1866,6 +1867,31 @@ def _report_false_premise(
     return {'status': 'ok', 'classification': classification}
 
 
+def _report_missing_plan_file(
+    artifacts: TaskArtifacts,
+    path: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record a writer's request to add an existing file to the declared scope.
+
+    The workflow applies it at the next writer boundary
+    (``workflow.py::TaskWorkflow._apply_scope_requests``). Reads the declared
+    files with ``peek_plan``, which never writes plan.json.
+    """
+    try:
+        request = ScopeRequest(path, reason)
+    except InvalidScopeRequest as exc:
+        return {'status': 'error', 'field': exc.field, 'message': str(exc)}
+    if not pending_scope_paths([request], artifacts.peek_plan().get('files', [])):
+        return {'status': 'already_in_scope', 'path': request.path}
+    artifacts.write_scope_request(request)
+    return {
+        'status': 'ok',
+        'path': request.path,
+        'pending': len(artifacts.read_scope_requests()),
+    }
+
+
 def _resolve_main_sha(worktree: Path) -> str:
     """Return the current ``main`` HEAD SHA visible from *worktree*.
 
@@ -2891,6 +2917,33 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _report_false_premise(
             artifacts, classification, premise, evidence, proposed_resolution
         )
+
+    @mcp.tool()
+    @accepts_markup_override
+    def report_missing_plan_file(
+        path: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Report an EXISTING file you must edit that the plan's ``files`` omits.
+
+        Use this BEFORE editing such a file when the list was merely
+        incomplete. You may then make the edit and keep working; there is no
+        need to stop. When this session ends the orchestrator tries to take
+        the file's lock and adds it to plan.json ``files``. Your next
+        briefing reports it granted, or contested with the task holding it.
+        If it is contested, revert your edits to it, or call
+        ``escalate_blocker(category='scope_violation')`` with the design
+        reason it must change.
+
+        A file you CREATE needs no report. A file that is out of scope for a
+        DESIGN reason (another owner's module, another PRD) is
+        ``escalate_blocker``, not this tool.
+
+        Args:
+            path: The repo-relative path of the existing file.
+            reason: One line: why this task must edit it.
+        """
+        return _report_missing_plan_file(artifacts, path, reason)
 
     return mcp
 
