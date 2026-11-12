@@ -14,9 +14,9 @@ import pytest
 from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
 
 from orchestrator.agents.agent_run_home import (
-    operator_home,
     private_run_home,
     redirected_home_env,
+    require_operator_home,
     write_owner_only_json,
 )
 
@@ -27,19 +27,22 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-class TestOperatorHome:
+class TestRequireOperatorHome:
 
     def test_the_operator_home_is_the_inherited_home(self):
-        assert operator_home({'HOME': '/home/operator', 'PATH': '/bin'}, backend='mimo') == (
-            OPERATOR_HOME
-        )
+        assert require_operator_home(
+            {'HOME': '/home/operator', 'PATH': '/bin'}, backend='mimo',
+        ) == OPERATOR_HOME
 
+    @pytest.mark.parametrize('backend', ['mimo', 'zcode'])
     @pytest.mark.parametrize('base_env', [{}, {'HOME': ''}, {'HOME': '   '}])
-    def test_a_missing_or_blank_home_is_refused_naming_home_and_the_backend(self, base_env):
+    def test_a_missing_or_blank_home_is_refused_naming_home_and_the_backend(
+        self, base_env, backend,
+    ):
         with pytest.raises(ValueError) as excinfo:
-            operator_home(base_env, backend='mimo')
+            require_operator_home(base_env, backend=backend)
         assert 'HOME' in str(excinfo.value)
-        assert 'mimo' in str(excinfo.value)
+        assert backend in str(excinfo.value)
 
 
 class TestPrivateRunHome:

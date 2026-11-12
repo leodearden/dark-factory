@@ -18,7 +18,6 @@ from shared.cli_invoke import AgentResult, _SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.agent_run_home import (
-    operator_home,
     private_run_home,
     redirected_home_env,
     write_owner_only_json,
@@ -107,10 +106,6 @@ def _zcode_mcp_server(name: str, server: Mapping[str, Any]) -> dict[str, Any]:
     raise ValueError(
         f'MCP server {name!r} has neither a stdio command nor an http/sse url for zcode to carry',
     )
-
-
-def zcode_operator_home(base_env: Mapping[str, str]) -> Path:
-    return operator_home(base_env, backend='zcode')
 
 
 @dataclass(frozen=True)

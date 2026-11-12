@@ -27,7 +27,6 @@ from orchestrator.agents.zcode_backend import (
     parse_zcode_output,
     zcode_argv,
     zcode_cli_config,
-    zcode_operator_home,
     zcode_provider_config,
     zcode_run_home,
     zcode_spawn_env,
@@ -333,17 +332,6 @@ def _run_home(system_prompt: str = 'SYS PROMPT', operator_home: Path = OPERATOR_
         system_prompt=system_prompt, model='glm-5.3', endpoint=ENDPOINT,
         mcp_config=plan_tools_mcp(), operator_home=operator_home,
     )
-
-
-class TestZCodeOperatorHome:
-
-    def test_the_operator_home_is_the_inherited_home(self):
-        assert zcode_operator_home({'HOME': '/home/operator', 'PATH': '/bin'}) == OPERATOR_HOME
-
-    @pytest.mark.parametrize('base_env', [{}, {'HOME': ''}, {'HOME': '   '}])
-    def test_a_missing_or_blank_home_is_refused_by_name(self, base_env):
-        with pytest.raises(ValueError, match='HOME'):
-            zcode_operator_home(base_env)
 
 
 class TestZCodeRunHome:

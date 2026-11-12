@@ -239,6 +239,14 @@ class TestInvokeZCode:
             await _invoke(worktree, env_overrides={'ANTHROPIC_BASE_URL': BASE_URL})
         assert not fake_zcode.capture_path.exists()
 
+    async def test_a_missing_home_is_refused_naming_zcode_before_any_spawn(
+        self, fake_zcode, worktree, monkeypatch,
+    ):
+        monkeypatch.delenv('HOME')
+        with pytest.raises(ValueError, match='HOME.*zcode|zcode.*HOME'):
+            await _invoke(worktree)
+        assert not fake_zcode.capture_path.exists()
+
     async def test_the_run_home_is_writable_inside_the_sandbox(
         self, fake_zcode, worktree, monkeypatch,
     ):

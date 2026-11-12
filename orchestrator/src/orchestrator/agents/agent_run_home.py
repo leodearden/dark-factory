@@ -27,7 +27,7 @@ OPERATOR_TOOL_HOMES: tuple[tuple[str, str], ...] = (
 )
 
 
-def operator_home(base_env: Mapping[str, str], *, backend: str) -> Path:
+def require_operator_home(base_env: Mapping[str, str], *, backend: str) -> Path:
     home = (base_env.get('HOME') or '').strip()
     if not home:
         raise ValueError(

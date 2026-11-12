@@ -41,7 +41,7 @@ from shared.process_cost import ProcessCostBasis
 from shared.python_env import without_python_env_selection
 from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
 
-from orchestrator.agents.agent_run_home import operator_home
+from orchestrator.agents.agent_run_home import require_operator_home
 from orchestrator.agents.mimo_backend import (
     MimoEndpoint,
     mimo_config_document,
@@ -57,7 +57,6 @@ from orchestrator.agents.zcode_backend import (
     ZCodeEndpoint,
     parse_zcode_output,
     zcode_argv,
-    zcode_operator_home,
     zcode_run_home,
     zcode_spawn_env,
 )
@@ -1395,7 +1394,7 @@ async def _invoke_zcode(
         max_turns, max_budget_usd, effort, allowed_tools, timeout_seconds,
     )
     base_env = {**os.environ, **(env_overrides or {})}
-    operator_home = zcode_operator_home(base_env)
+    operator_home = require_operator_home(base_env, backend='zcode')
     with zcode_run_home(
         system_prompt=system_prompt, model=model, endpoint=endpoint, mcp_config=mcp_config,
         operator_home=operator_home,
@@ -1453,13 +1452,13 @@ async def _invoke_mimo(
         max_budget_usd, allowed_tools,
     )
     base_env = {**os.environ, **(env_overrides or {})}
-    home_of_operator = operator_home(base_env, backend='mimo')
+    operator_home = require_operator_home(base_env, backend='mimo')
     document = mimo_config_document(
         model=model, endpoint=endpoint, mcp_config=mcp_config,
         permission=mimo_permission_rules(disallowed_tools), max_turns=max_turns,
     )
     with mimo_run_home(
-        system_prompt=system_prompt, config_document=document, operator_home=home_of_operator,
+        system_prompt=system_prompt, config_document=document, operator_home=operator_home,
     ) as home:
         env = mimo_spawn_env(base_env, home)
         extras = [*(sandbox_extras or []), str(home.root)]
