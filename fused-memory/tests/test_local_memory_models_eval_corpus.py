@@ -46,7 +46,12 @@ from shared.testing_streams import (
 )
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphProxy, open_graph
-from fused_memory.backends.paged_read import RESULTSET_SIZE
+from fused_memory.backends.paged_read import (
+    DEFAULT_READ_PAGE_SIZE,
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    RESULTSET_SIZE,
+)
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 
 SCRIPT_PATH = (
@@ -906,6 +911,32 @@ class TestReaderProjectionCarriesNoOutcomeSignal:
             assert 'WHERE' not in cypher.upper(), cypher
 
 
+class _NoCensusDouble(_FalkorDouble):
+    """A store whose ``count(...)`` census answers no rows; its pages are served as usual."""
+
+    def _answer(self, cypher: str) -> list[list[object]]:
+        if 'count(' in cypher:
+            return []
+        return super()._answer(cypher)
+
+
+class _WriteMidReadDouble(_FalkorDouble):
+    """A store written to between its first and second page.
+
+    The written uuid sorts before every ``u…`` one, so it lands below the
+    cursor: the page boundary shifts by one and the second page re-returns
+    the first page's last row, although no node is duplicated in the store.
+    """
+
+    WRITTEN_UUID = '0-written-mid-read'
+
+    def _answer(self, cypher: str) -> list[list[object]]:
+        answer = super()._answer(cypher)
+        if ' SKIP 0 ' in cypher:
+            self.rows.append(_row(self.WRITTEN_UUID))
+        return answer
+
+
 class TestThePopulationIsReadWholePastTheServerCap:
     """FalkorDB truncates every answer at its result-set cap, silently.
 
@@ -913,6 +944,9 @@ class TestThePopulationIsReadWholePastTheServerCap:
     every proportional share computed from them would be wrong with it. On
     2026-11-12 the unpaged read of dark_factory returned exactly 10000 rows:
     the cap, not the population.
+
+    A read that cannot be proven to be the whole population is refused, with
+    its cause named, rather than stratified.
     """
 
     def test_a_population_above_the_cap_is_read_whole(self):
@@ -920,6 +954,34 @@ class TestThePopulationIsReadWholePastTheServerCap:
         population = _fetch(_FalkorDouble([_row(uuid) for uuid in uuids]))
         assert len(population) == len(uuids)
         assert {record.uuid for record in population} == set(uuids)
+
+    def test_a_server_cap_below_the_assumed_one_is_refused(self):
+        """The census catches a server configured below the cap the reader assumes."""
+        rows = [_row(f'u{i:05d}') for i in range(4000)]
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _fetch(_FalkorDouble(rows, cap=3000))
+        message = str(exc.value)
+        assert _mod.DEFAULT_GRAPH in message
+        assert INCOMPLETE_SHORT_READ in message
+        assert '3000' in message
+        assert '4000' in message
+
+    def test_a_census_that_reports_no_count_is_refused(self):
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _fetch(_NoCensusDouble([_row('u1'), _row('u2')]))
+        assert INCOMPLETE_CENSUS_UNAVAILABLE in str(exc.value)
+
+    def test_a_write_during_the_paged_read_is_refused_as_a_write_not_a_duplicate(self):
+        """No node is duplicated in the store, so the error must not say one is."""
+        census = DEFAULT_READ_PAGE_SIZE + 1
+        double = _WriteMidReadDouble([_row(f'u{i:05d}') for i in range(census)])
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _fetch(double)
+        assert [row[0] for row in double.rows].count(_WriteMidReadDouble.WRITTEN_UUID) == 1
+        message = str(exc.value)
+        assert str(census) in message
+        assert str(census + 1) in message
+        assert 'duplicate' not in message.lower()
 
 
 class TestOutcomeFailedEpisodesStayEligible:
@@ -2794,6 +2856,52 @@ class TestARefusedCommandIsATypedErrorNotATraceback:
         assert err.startswith('error: ')
         assert 'GRAPH.RO_QUERY' in err
         assert 'Traceback' not in err
+
+
+class TestAnIncompletePopulationReadIsARunFailureNotAVerdict:
+    """A short read fails the run: no corpus is built and no verdict is reached.
+
+    Under --verify a truncated population would otherwise surface as a
+    spurious missing_episodes or id_mismatch, blaming the manifest for what
+    the read failed to return.
+    """
+
+    def test_an_incomplete_read_fails_the_build_and_writes_nothing(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        rows = _cli_rows()
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch,
+            '--n',
+            '20',
+            '--seed',
+            's',
+            '--out',
+            str(out),
+            double=_FalkorDouble(rows, cap=len(rows) - 1),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert INCOMPLETE_SHORT_READ in err
+
+    def test_an_incomplete_read_under_verify_reaches_no_verdict(self, monkeypatch, tmp_path):
+        out = tmp_path / 'corpus_manifest.json'
+        rows = _cli_rows()
+        built, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), rows=rows)
+        assert built == 0
+        code, _ = _run_cli(
+            monkeypatch,
+            '--verify',
+            '--out',
+            str(out),
+            double=_FalkorDouble(rows, cap=len(rows) - 1),
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        assert code not in set(_mod.EXIT_CODES.values())
 
 
 class TestAWriteFailureIsNotBlamedOnTheStore:
