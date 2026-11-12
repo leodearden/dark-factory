@@ -72,7 +72,7 @@ from fused_memory.reconciliation.finding_task_escalation import (
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation.judge import Judge, NoVerdict, NoVerdictReason
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
@@ -3403,10 +3403,15 @@ class ReconciliationHarness:
         try:
             assert self.judge is not None
             verdict = await self.judge.review_run(run_id)
-            if verdict:
-                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
+            if isinstance(verdict, NoVerdict):
+                logger.log(
+                    logging.INFO if verdict.reason is NoVerdictReason.PROJECT_HALTED
+                    else logging.WARNING,
+                    'Judge produced no verdict for run %s: reason=%s detail=%s',
+                    run_id, verdict.reason.value, verdict.detail,
+                )
             else:
-                logger.warning(f'Judge returned no verdict for run {run_id}')
+                logger.info(f'Judge verdict for {run_id}: severity={verdict.severity}')
         except asyncio.CancelledError:
             # Shutdown drain (or a cycle-aware restart) cancelled the judge
             # mid-review, before add_verdict's atomic marker-clear ran. The
