@@ -75,9 +75,10 @@ __all__ = [
 #   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
 #   test_merge_queue_reachback_patch_guard.py and the serial-worker import
 #   guard -- which is what makes this a
-#   FAMILY defect rather than three accidents, and why the rest are marked
-#   preemptively: a marked-but-fast test costs nothing, while an
-#   unmarked-and-slow one cost a whole session then, and costs a false red now.
+#   FAMILY defect rather than three accidents, and why the rest were marked
+#   preemptively.  Marking is not free: since task 7253 a member joins every
+#   task-role run of its leg, and a hang in it is caught only at this ceiling,
+#   not at the ini default (docs/task-role-pytest-floor.md).
 # The current anchor is
 # orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_MEASURED_UNDER_LOAD_WORST_CASE,
 # which floors the family at
