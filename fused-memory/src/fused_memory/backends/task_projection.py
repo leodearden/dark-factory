@@ -2,8 +2,11 @@
 
 A projection names top-level task keys (``TASK_ROW_KEYS``, the wire shape
 ``fused_memory/backends/sqlite_task_backend.py::_row_to_task`` emits, in its
-spelling and order) and ``metadata.<key>`` entries. ``id`` is always kept, and
-a requested metadata key absent on a task is omitted rather than nulled.
+spelling and order) and ``metadata.<key>`` entries. ``id`` is always kept. A
+requested metadata key absent on a task, or a requested
+``SCHEMA_OPTIONAL_ROW_KEYS`` entry a store whose v6 ALTER never landed cannot
+emit, is omitted rather than nulled; every other row key is always emitted, so
+its absence is a ``KeyError``.
 ``SqliteTaskBackend.get_tasks`` parses before it reads and applies after
 ``_row_to_task``'s coercion; the MCP tool parses the same argument at its
 boundary for the INV-2 error payload. The contract is
@@ -32,7 +35,10 @@ TASK_ROW_KEYS: tuple[str, ...] = (
     'claimant_run_id',
     'heartbeat_at',
     'candidate_key',
+    'created_at',
+    'created_at_source',
 )
+SCHEMA_OPTIONAL_ROW_KEYS: tuple[str, ...] = ('created_at', 'created_at_source')
 METADATA_FIELD_PREFIX = 'metadata.'
 PROJECTION_METADATA_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 ALLOWED_FIELDS: tuple[str, ...] = (*TASK_ROW_KEYS, f'{METADATA_FIELD_PREFIX}<key>')
@@ -57,7 +63,11 @@ class TaskProjection:
     metadata_keys: tuple[str, ...]
 
     def apply(self, task: Mapping[str, Any]) -> dict[str, Any]:
-        projected = {key: task[key] for key in self.row_keys}
+        projected = {
+            key: task[key]
+            for key in self.row_keys
+            if key in task or key not in SCHEMA_OPTIONAL_ROW_KEYS
+        }
         if self.metadata_keys:
             metadata = task['metadata']
             projected['metadata'] = {

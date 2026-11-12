@@ -3132,7 +3132,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -3150,7 +3150,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 5."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 6."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -3177,13 +3177,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 5
+    assert user_version == 6
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_6(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -3209,7 +3209,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 5, f'Fresh DB should have user_version=5; got {user_version}'
+    assert user_version == 6, f'Fresh DB should have user_version=6; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -3307,7 +3307,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 5, f'Expected user_version=5 after v1->v5 migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after v1->v6 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -3576,7 +3576,7 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     # residual audit over the same rows is trivially clean too, so the chain
     # runs on past v4 (index built) to the v4->v5 pending_since back-fill
     # rather than stopping at v3.
-    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -3940,7 +3940,7 @@ async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog
     assert after[11] is None
 
     # (e) the chain lands at the new top.
-    assert user_version == 5, f'Expected user_version=5; got {user_version}'
+    assert user_version == 6, f'Expected user_version=6; got {user_version}'
 
     # (f) exactly one line, reporting the COUNT -- the migration reporting N is
     # part of the user-observable signal (PRD boundary row 3).
@@ -3992,7 +3992,7 @@ async def test_v4_to_v5_backfill_is_a_no_op_on_reopen(tmp_path, caplog):
     after_second, user_version = _read_backfill_state(db_path)
     assert after_second == after_first, 'a second open must touch no row'
     assert [r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()] == []
-    assert user_version == 5
+    assert user_version == 6
 
 
 @pytest.mark.asyncio
@@ -4124,8 +4124,8 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
     # (d) the version advances past 4 on a clean build -- the v3->v4 step
     # stamps 4 and the chain then runs the v4->v5 back-fill to the top.
-    assert user_version == 5, (
-        f'Expected user_version=5 after clean v3->v4 migration + chain; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after clean v3->v4 migration + chain; got {user_version}'
     )
 
 
@@ -4372,8 +4372,8 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert 'ux_tasks_candidate_key' in indexes, (
         f'Expected the index to be built once the residual is self-healed; got {indexes}'
     )
-    assert user_version == 5, (
-        f'Expected user_version=5 after a fully self-healed residual; got {user_version}'
+    assert user_version == 6, (
+        f'Expected user_version=6 after a fully self-healed residual; got {user_version}'
     )
 
     # (e) nothing ambiguous here — the escalation callback must NOT fire.
