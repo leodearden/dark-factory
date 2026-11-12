@@ -1889,12 +1889,13 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         assert worker._live_items[req.request_id] is remerged
         assert worker._intake.pending_redispatch()[0] is remerged
 
-    async def test_gate_reverify_sub_transitions_finalizing_gate_reverify_finalizing(
+    async def test_gate_reverify_sub_transitions_finalizing_gate_reverify_redispatch(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """A ``rebased_pending_reverify`` retry must be observed at
-        GATE_REVERIFY, then transition back to FINALIZING once the gate
-        clears and the CAS loop continues — mirrors test_merge_queue.py::
+        GATE_REVERIFY; the gate's full re-verify then parks the head as its
+        rebased commit, which comes back through dispatch to VERIFYING and
+        FINALIZING (task 8525) — mirrors test_merge_queue.py::
         TestSpeculativeGateReverifyConsumesAdvanceOutcome's ``advance_main``
         side_effect technique to force the branch deterministically.
         """
@@ -1907,6 +1908,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         queue: asyncio.Queue = asyncio.Queue()
         worker = make_lane(git_ops, queue)
         req = _make_request('kappa-gate-reverify', 'kappa-gate-reverify', wt, config)
+        main_sha = await git_ops.get_main_sha()
 
         advance_calls: list[Any] = []
 
@@ -1915,7 +1917,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             if len(advance_calls) == 1:
                 return AdvanceOutcome(
                     'rebased_pending_reverify',
-                    advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
+                    advanced_sha=main_sha, rebased_from='ba' * 20, rebased_onto=main_sha,
                 )
             # Second call (post-rebuild): terminal failure — sidesteps the
             # success-path gate machinery, which is not this test's concern.
@@ -1932,9 +1934,9 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
         async with running_lane(worker):
-            # No re-verify double: the fabricated rebase shas make the real
-            # overlap probe fail CLOSED, so _reverify_rebased_tree runs its real
-            # overlapping-delta arm through _run_post_merge_verify and clears.
+            # No re-verify double: the fabricated rebased_from makes the real
+            # overlap probe fail CLOSED, so _reverify_rebased_tree decides a
+            # full re-verify, which the worker dispatches as the rebased head.
             with patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect):
                 await queue.put(req)
                 outcome = await wait_responsive(
@@ -1946,9 +1948,12 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
             assert (ItemLifecycleState.FINALIZING, ItemLifecycleState.GATE_REVERIFY) in observed, (
                 f'missing FINALIZING -> GATE_REVERIFY: {observed!r}'
             )
-            assert (ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING) in observed, (
-                f'missing GATE_REVERIFY -> FINALIZING (gate cleared, loop continues): {observed!r}'
+            parked_at = observed.index(
+                (ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.REDISPATCH_PARKED),
             )
+            assert (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING) in (
+                observed[parked_at:]
+            ), f'missing the rebased head re-verifying, then finalizing: {observed!r}'
 
 
 # ---------------------------------------------------------------------------

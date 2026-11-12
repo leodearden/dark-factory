@@ -923,7 +923,8 @@ async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[MergeRequest
 
     Main moves by a direct commit while the head verifies, so its CAS rebases.
     That commit is unverified drift, so the gate cannot take the disjoint skip
-    and really re-verifies.  Returns the head's request and that main sha.
+    and really re-verifies, as a dispatch of the head's rebased commit (task
+    8525).  Returns the head's request and that main sha.
     """
     head = await lane.enqueue(GATED_HEAD)
     await wait_responsive(verifier.head_entered.wait(), label=f'{GATED_HEAD} verify under way')
@@ -935,17 +936,19 @@ async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[MergeRequest
         verifier.gate_entered.wait(), label=f'{GATED_HEAD} gate re-verify under way',
     )
     await lane.settle(
-        lambda: lane.states().get(GATED_HEAD) == 'gate_reverify',
-        expected=f'{GATED_HEAD} in gate_reverify',
-        why='main moved under the verified head, so its CAS must rebase and gate.',
+        lambda: lane.states().get(GATED_HEAD) == 'verifying'
+        and _hosts_of(lane).get('local') == [GATED_HEAD],
+        expected=f'{GATED_HEAD} verifying its rebased commit on local',
+        why='main moved under the verified head, so its CAS must rebase and re-verify.',
     )
     return head, drift
 
 
 @pytest.mark.asyncio
 class TestGateReverifyDoesNotParkTheLoop:
-    """The head's gate re-verify runs like a head verify: through the lane's
-    verify port, and without parking DISPATCH-FILL or FINALIZE-HEAD.
+    """The head's gate re-verify runs as a head verify, a dispatch of its
+    rebased commit (task 8525): through the lane's verify port, and without
+    parking DISPATCH-FILL or FINALIZE-HEAD.
     """
 
     async def test_gate_reverify_runs_through_the_lanes_verify_port(
@@ -977,7 +980,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
             progress = lane.worker.snapshot()['verify_in_progress']
             assert (progress['task_id'], progress['phase']) == (
-                GATED_HEAD, 'gate_reverify',
+                GATED_HEAD, 'verifying',
             ), progress
 
             waiter = await lane.enqueue(GATE_WAITER)
@@ -985,12 +988,13 @@ class TestGateReverifyDoesNotParkTheLoop:
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
                 why=(
-                    "the verifier loop is parked inside the head's gate "
-                    're-verify, so nothing dispatches to a free host until it ends.'
+                    "the verifier loop is blocked on the head's dispatched "
+                    'rebased-commit verify, so nothing dispatches to a free host '
+                    'until it ends.'
                 ),
             )
 
-            assert lane.states()[GATED_HEAD] == 'gate_reverify', lane.observed()
+            assert lane.states()[GATED_HEAD] == 'verifying', lane.observed()
             assert not head.result.done(), lane.observed()
             assert lane.worker.frozen_prefix() == (head.request_id, waiter.request_id)
 
@@ -1005,7 +1009,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
 
             lane.remote_gate.set()
@@ -1042,7 +1046,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
 
             verifier.gate_release.set()
@@ -1071,7 +1075,7 @@ class TestGateReverifyDoesNotParkTheLoop:
                 lambda: lane.inflight_ids() == {GATED_HEAD, GATE_WAITER}
                 and _hosts_of(lane).get('local') == [GATED_HEAD],
                 expected=f'{GATE_WAITER} verifying on a remote beside the gated head',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
             assert lane.free_hosts() == 1, lane.observed()
 
@@ -1088,7 +1092,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert GATE_WAITER in lane.inflight_ids(), lane.observed()
             assert not waiter.result.done(), lane.observed()
 
-    async def test_a_second_rebase_parks_the_head_on_a_second_gate(
+    async def test_a_second_rebase_dispatches_the_head_a_second_time(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         verifier = _GateVerifier()
@@ -1107,9 +1111,12 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's second gate re-verify.",
+                why=(
+                    "the verifier loop is blocked on the head's second dispatched "
+                    'rebased-commit verify.'
+                ),
             )
-            assert lane.states()[GATED_HEAD] == 'gate_reverify', lane.observed()
+            assert lane.states()[GATED_HEAD] == 'verifying', lane.observed()
 
             verifier.regate_release.set()
             lane.remote_gate.set()

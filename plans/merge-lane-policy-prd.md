@@ -381,8 +381,10 @@ definition for phantom heads (the §5.3 "separate task"); the pre-verify screen'
 
 1. **Where p̂'s 30-verdict window persists across restarts.** Suggested: in-memory, seeded from the last 30
    `merge_verify` rows at start (the probe's `_recent_verify_outcomes` shape). Decide in ζ.
-2. **Whether the gate-rebased item (γ) prefers the head's previous host.** Suggested: no; `prefer_remote`
-   as for any dispatch. Decide in γ.
+2. **Whether the gate-rebased item (γ) prefers the head's previous host.** DECIDED in γ (task 8525): no
+   head-host preference. The rebased head is dispatched like any item, through `HostAllocator.acquire`
+   with the configured `verify_host_policy`. See
+   `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._dispatch_rebased_head`.
 3. **The hook's screen-leg file set.** DECIDED in η (task 8531): exactly the D8 globs, not narrowed. A
    "package" is a uv workspace member with a `src` dir, so `scripts/` is not one. See
    `scripts/hook_module_checks.py::screen_triggered`.
