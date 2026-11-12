@@ -274,6 +274,58 @@ async def test_one_failing_root_does_not_stop_another(
     assert (await _derived(conn, measured.project_id)).markers == _full_markers(measured)
 
 
+async def test_a_write_quality_db_refuses_is_recorded_and_keeps_the_previous_state(
+    conn: aiosqlite.Connection, project: Root, factory: Path, no_curated: Path,
+) -> None:
+    await _tick(conn, [project.root], factory, no_curated)
+    previous = await _derived(conn, project.project_id)
+    append_events(project.runs_db, MERGER_FLIP)
+    await conn.execute("CREATE TRIGGER refuse_markers BEFORE INSERT ON markers_derived"
+                       " BEGIN SELECT RAISE(ABORT, 'markers_derived refused'); END")
+    await conn.commit()
+    later = NOW + timedelta(minutes=10)
+
+    await _tick(conn, [project.root], factory, no_curated, now=later)
+
+    assert await read_marker_state(conn, project.project_id) == StoredMarkerState(
+        derived=previous, attempted_at=later,
+        failure='marker write failed: IntegrityError: markers_derived refused',
+    )
+
+
+POISONS = {
+    'retired-marker-kind': "UPDATE markers_derived SET kind = 'retired_kind' WHERE project_id = ?",
+    'retired-routing-layer':
+        "UPDATE routing_steps SET source_layer = 'retired_layer' WHERE project_id = ?",
+    'unparseable-fold-bound':
+        "UPDATE marker_state SET first_decision_at = 'not an instant' WHERE project_id = ?",
+    'inconsistent-coverage': 'UPDATE marker_state SET roles_py_landings = -1 WHERE project_id = ?',
+}
+"""Stored rows a later vocabulary or invariant change could leave undecodable."""
+
+
+@pytest.mark.parametrize('poison', POISONS.values(), ids=POISONS.keys())
+async def test_a_stored_state_that_no_longer_decodes_heals_and_stops_no_other_root(
+    conn: aiosqlite.Connection, factory: Path, no_curated: Path, tmp_path: Path, poison: str,
+) -> None:
+    poisoned = _checkout(tmp_path / 'poisoned')
+    other = _checkout(tmp_path / 'other', MERGER_FLIP)
+    roots = [poisoned.root, other.root]
+    await _tick(conn, roots, factory, no_curated)
+    await conn.execute(poison, (poisoned.project_id,))
+    await conn.commit()
+    with pytest.raises(ValueError):
+        await read_marker_state(conn, poisoned.project_id)
+    later = NOW + timedelta(minutes=10)
+
+    await _tick(conn, roots, factory, no_curated, now=later)
+
+    healed = await _derived(conn, poisoned.project_id)
+    assert (healed.fold, healed.markers) == (_full_fold(poisoned), _full_markers(poisoned))
+    assert healed.refreshed_at == later
+    assert (await _derived(conn, other.project_id)).refreshed_at == later
+
+
 def _dated(monkeypatch: pytest.MonkeyPatch, at: str) -> None:
     monkeypatch.setenv('GIT_AUTHOR_DATE', at)
     monkeypatch.setenv('GIT_COMMITTER_DATE', at)

@@ -10,10 +10,10 @@ budget. Design: plans/quality-dashboard-prd.md decisions 10-12 and 14.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from collections.abc import Awaitable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import aiosqlite
@@ -30,16 +30,16 @@ from dashboard.data.quality_markers import (
     RoutingFold,
     derive,
     fold_routing_decisions,
-    in_scope,
     load_curated_markers,
 )
-from dashboard.data.quality_sampler import (
+from dashboard.data.quality_root_tick import (
     describe_root_failure,
     git_checkouts,
     run_in_root_threads,
+    store_root,
 )
 from dashboard.data.quality_store import (
-    read_marker_state,
+    read_routing_fold,
     record_marker_failure,
     write_marker_state,
 )
@@ -57,7 +57,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-MARKER_ROUTING_BATCH = 20_000
+MARKER_ROUTING_BATCH = 500_000
+"""Bounds one tick's fold so it stays inside the per-root budget, yet folds a cold start in one tick.
+Measured 2026-11-12: the live df runs.db's 27,152 routing rows fold in 0.32 s, so 500,000 take
+about 6 s."""
 MARKER_PER_ROOT_BUDGET_SECONDS = 120.0
 MARKER_GIT_TIMEOUT_SECONDS = 30.0
 
@@ -70,8 +73,8 @@ FACTORY_REPO = Path(__file__).resolve().parents[4]
 
 def _counted_since(fold: RoutingFold, curated: CuratedMarkers) -> datetime | None:
     """The newest curated prompt marker in the project's scope, else its first routing decision."""
-    prompts = [marker.at for marker in curated.markers
-               if marker.kind is MarkerKind.PROMPT and in_scope(marker, fold.project_id)]
+    prompts = [marker.at for marker in curated.for_project(fold.project_id)
+               if marker.kind is MarkerKind.PROMPT]
     return max(prompts, default=fold.first_at)
 
 
@@ -123,11 +126,23 @@ def _refresh_root(
     )
 
 
-async def _stored_fold(conn: aiosqlite.Connection, project_id: str) -> RoutingFold:
-    stored = await read_marker_state(conn, project_id)
-    if stored is None or stored.derived is None:
+async def _resume_fold(conn: aiosqlite.Connection, project_id: str) -> RoutingFold:
+    """The stored fold to continue, else an empty one, including when the stored fold no longer
+    decodes: every marker table is derived only, so folding from the start again loses nothing,
+    and this tick's write replaces the rows that failed."""
+    try:
+        stored = await read_routing_fold(conn, project_id)
+    except Exception:
+        logger.warning('The stored routing fold of %s does not decode; folding it from the start',
+                       project_id, exc_info=True)
         return RoutingFold.empty(project_id)
-    return stored.derived.fold
+    return RoutingFold.empty(project_id) if stored is None else stored
+
+
+async def _record_failure(
+    conn: aiosqlite.Connection, project_id: str, now: datetime, failure: str,
+) -> None:
+    await record_marker_failure(conn, project_id, attempted_at=now, failure=failure)
 
 
 async def _store(
@@ -137,27 +152,10 @@ async def _store(
     """The root's new derivation, or a failure keeping its previous one; the caller commits."""
     if isinstance(result, BaseException):
         logger.warning('Quality marker refresh failed for %s', project_id, exc_info=result)
-        await record_marker_failure(
-            conn, project_id, attempted_at=now,
-            failure=describe_root_failure(result, 'marker refresh', per_root_budget_s),
-        )
+        await _record_failure(conn, project_id, now,
+                              describe_root_failure(result, 'marker refresh', per_root_budget_s))
         return
     await write_marker_state(conn, result)
-
-
-async def _commit_or_roll_back(
-    conn: aiosqlite.Connection, project_id: str, write: Awaitable[None],
-) -> Exception | None:
-    """Await *write* and commit it; on failure log, roll back, and hand back the exception."""
-    try:
-        await write
-        await conn.commit()
-    except Exception as exc:
-        logger.warning('Failed to store the quality markers of %s', project_id, exc_info=True)
-        with contextlib.suppress(Exception):
-            await conn.rollback()
-        return exc
-    return None
 
 
 async def refresh_markers(
@@ -175,13 +173,14 @@ async def refresh_markers(
     Each root folds at most *batch* routing rows after its stored cursor and re-derives every
     marker. A root that raises or overruns *per_root_budget_s* records a failure naming why and
     keeps its previous derivation; each root commits on its own, and one whose write fails
-    records that failure instead.
+    records that failure instead. A stored fold that no longer decodes is folded again from the
+    start.
     """
     now_dt = resolve_now(now)
     checkouts = git_checkouts(roots)
     project_ids = [project_id_for_root(root) for root in checkouts]
     curated = await asyncio.to_thread(load_curated_markers, curated_path)
-    previous = [await _stored_fold(conn, pid) for pid in project_ids]
+    previous = [await _resume_fold(conn, pid) for pid in project_ids]
 
     results: list[DerivedState | BaseException] = await run_in_root_threads(
         _refresh_root,
@@ -192,11 +191,7 @@ async def refresh_markers(
     )
 
     for pid, result in zip(project_ids, results, strict=True):
-        failure = await _commit_or_roll_back(
+        await store_root(
             conn, pid, _store(conn, pid, now_dt, result, per_root_budget_s),
+            partial(_record_failure, conn, pid, now_dt), what='marker',
         )
-        if failure is not None:
-            await _commit_or_roll_back(conn, pid, record_marker_failure(
-                conn, pid, attempted_at=now_dt,
-                failure=f'marker write failed: {type(failure).__name__}: {failure}',
-            ))

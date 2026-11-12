@@ -6,23 +6,28 @@ Design: plans/quality-dashboard-prd.md decision 14 and open question 3.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import TypeVar
 
 import aiosqlite
 from shared.project_id import project_id_for_root
 from shared.project_layout import runs_db
 from shared.quality_series.landings import GitCrossCheck, landings
 from shared.quality_series.rows import LandingRow, rows_for
-from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
+from shared.tasks_db_readonly import connect_ro
 
+from dashboard.data.quality_root_tick import (
+    describe_root_failure,
+    describe_unreadable,
+    git_checkouts,
+    run_in_root_threads,
+    store_root,
+)
 from dashboard.data.quality_store import (
     QualitySample,
     insert_sample,
@@ -38,10 +43,7 @@ __all__ = [
     'QUALITY_REV_LIST_TIMEOUT_SECONDS',
     'QUALITY_SAMPLE_INTERVAL_SECONDS',
     'collect_quality',
-    'describe_root_failure',
     'describe_unreadable',
-    'git_checkouts',
-    'run_in_root_threads',
 ]
 
 logger = logging.getLogger(__name__)
@@ -80,55 +82,10 @@ def _measure_root(
     return _RootMeasurement(tuple(rows), batch.git_check, len(batch.landings) - len(rows))
 
 
-def git_checkouts(roots: Iterable[Path]) -> list[Path]:
-    """The roots that are git checkouts, in order: the only roots a quality tick reads."""
-    return [root for root in roots if (root / '.git').exists()]
-
-
-_Result = TypeVar('_Result')
-
-
-async def run_in_root_threads(
-    work: Callable[..., _Result],
-    per_root_args: Sequence[tuple[object, ...]],
-    per_root_budget_s: float,
-    *,
-    thread_name_prefix: str,
-) -> list[_Result | BaseException]:
-    """``work(*args)`` for every root's args at once, each on a thread of its own, in order.
-
-    Neither git nor a runs.db scan ever holds a request's thread. A root that raises gets its
-    exception; one that overruns *per_root_budget_s* gets a TimeoutError and is abandoned to
-    finish on its own thread.
-    """
-    if not per_root_args:
-        return []
-    loop = asyncio.get_running_loop()
-    pool = ThreadPoolExecutor(max_workers=len(per_root_args), thread_name_prefix=thread_name_prefix)
-    try:
-        return await asyncio.gather(
-            *(
-                asyncio.wait_for(loop.run_in_executor(pool, work, *args), timeout=per_root_budget_s)
-                for args in per_root_args
-            ),
-            return_exceptions=True,
-        )
-    finally:
-        pool.shutdown(wait=False)
-
-
-def describe_unreadable(exc: TaskDbUnreadable) -> str:
-    """From its fields: the message's remedy is written for tasks.db, not runs.db."""
-    return f'{type(exc).__name__}: {exc.path}: {exc.reason.value}'
-
-
-def describe_root_failure(exc: BaseException, work: str, per_root_budget_s: float) -> str:
-    """Why one root's *work* produced nothing, for a run_in_root_threads failure."""
-    if isinstance(exc, TimeoutError):
-        return f'{work} exceeded the {per_root_budget_s}s per-root budget'
-    if isinstance(exc, TaskDbUnreadable):
-        return describe_unreadable(exc)
-    return f'{type(exc).__name__}: {exc}'
+async def _write_gap(
+    conn: aiosqlite.Connection, project_id: str, now: datetime, reason: str,
+) -> None:
+    await insert_sample(conn, QualitySample.gap(project_id, now, reason))
 
 
 async def _write_sample(
@@ -141,8 +98,8 @@ async def _write_sample(
 ) -> None:
     if isinstance(result, BaseException):
         logger.warning('Quality sampling failed for %s', root, exc_info=result)
-        reason = describe_root_failure(result, 'quality sampling', per_root_budget_s)
-        await insert_sample(conn, QualitySample.gap(project_id, now, reason))
+        await _write_gap(conn, project_id, now,
+                         describe_root_failure(result, 'quality sampling', per_root_budget_s))
         return
     await upsert_landing_rows(conn, result.rows, sampled_at=now)
     await insert_sample(conn, QualitySample.value(
@@ -152,21 +109,6 @@ async def _write_sample(
         landings_deferred=result.deferred,
         git_check=result.git_check,
     ))
-
-
-async def _commit_or_roll_back(
-    conn: aiosqlite.Connection, root: Path, write: Awaitable[None],
-) -> Exception | None:
-    """Await *write* and commit it; on failure log, roll back, and hand back the exception."""
-    try:
-        await write
-        await conn.commit()
-    except Exception as exc:
-        logger.warning('Failed to write the quality sample for %s', root, exc_info=True)
-        with contextlib.suppress(Exception):
-            await conn.rollback()
-        return exc
-    return None
 
 
 async def collect_quality(
@@ -202,14 +144,10 @@ async def collect_quality(
         )
 
         for root, pid, result in zip(checkouts, project_ids, results, strict=True):
-            failure = await _commit_or_roll_back(
+            await store_root(
                 conn, root, _write_sample(conn, root, pid, now_dt, result, per_root_budget_s),
+                partial(_write_gap, conn, pid, now_dt), what='sample',
             )
-            if failure is not None:
-                reason = f'sample write failed: {type(failure).__name__}: {failure}'
-                await _commit_or_roll_back(
-                    conn, root, insert_sample(conn, QualitySample.gap(pid, now_dt, reason)),
-                )
     except Exception:
         with contextlib.suppress(Exception):
             await conn.rollback()
