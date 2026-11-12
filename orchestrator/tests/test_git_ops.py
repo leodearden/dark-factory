@@ -50,6 +50,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere, BranchHolderAction
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 
 @pytest.fixture
@@ -7200,9 +7201,9 @@ class TestColdReattachIdentityGuard:
         )
         sha_before = sha_before.strip()
 
-        # quarantine_worktree never raises by contract — it returns None when
-        # it could not relocate. Force that outcome.
-        git_ops.quarantine_worktree = AsyncMock(return_value=None)
+        # quarantine_worktree never raises by contract — it returns
+        # NOT_RELOCATED when it could not relocate. Force that outcome.
+        git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
 
         with pytest.raises(RuntimeError) as excinfo:
             await git_ops.create_worktree(
@@ -7373,8 +7374,9 @@ class TestOrphanWorktreeHelpers:
         )
         (wt / conflicted_path).write_text(marker_content)
 
-        dest = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert not wt.exists()  # still relocated despite the refused commit
@@ -7391,8 +7393,9 @@ class TestOrphanWorktreeHelpers:
         (info.path / 'work.py').write_text('x = 1\n')
         await git_ops.commit(info.path, 'committed work')
 
-        dest = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-task', 'unit-test')
 
+        dest = outcome.dest
         assert dest is not None
         assert dest.parent == git_ops.quarantine_base
         assert (dest / 'work.py').exists()  # committed work preserved
@@ -7402,6 +7405,30 @@ class TestOrphanWorktreeHelpers:
             ['git', 'branch', '--list', 'task/q-task'], cwd=git_ops.project_root,
         )
         assert branches.strip() == ''
+
+    async def test_quarantine_outcome_describes_the_parked_branch(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-count')
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'first commit beyond main')
+        (info.path / 'two.py').write_text('b = 2\n')
+        await git_ops.commit(info.path, 'second commit beyond main')
+
+        outcome = await git_ops.quarantine_worktree(info.path, 'q-count', 'unit-test')
+
+        assert outcome.dest is not None
+        assert outcome.branch == f'task/{outcome.dest.name}'
+        assert outcome.tip_sha is not None
+        assert await git_ops.resolve_branch_sha(outcome.branch) == outcome.tip_sha
+        assert outcome.unique_commit_count == 2
+
+    async def test_commits_beyond_main_counts_or_reports_none(self, git_ops: GitOps):
+        info = await git_ops.create_worktree('q-beyond')
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 0
+        (info.path / 'one.py').write_text('a = 1\n')
+        await git_ops.commit(info.path, 'a commit beyond main')
+
+        assert await git_ops.commits_beyond_main('task/q-beyond') == 1
+        assert await git_ops.commits_beyond_main('task/no-such-branch') is None
 
     async def test_unsaved_work_false_when_clean_no_commits(self, git_ops: GitOps):
         info = await git_ops.create_worktree('clean-wt')

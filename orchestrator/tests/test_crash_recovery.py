@@ -23,6 +23,7 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
 from orchestrator.startup_steps import EntryFailures
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -81,7 +82,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # explicitly to exercise the guard itself.
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     # W11 delta: GitOps.__init__ built _lane_lifecycle against the ORIGINAL
     # worktree_base (before the reassignment above) — rebind it so the
     # record-driven recovery path reads/writes the same .lane-state dir
@@ -1475,7 +1476,7 @@ class TestRecoverIdentityGuard:
     task 3770.
     """
 
-    async def test_quarantines_on_title_mismatch(self, harness: Harness):
+    async def test_quarantines_on_title_mismatch(self, harness: Harness, tmp_path: Path):
         """The 3770 scenario: worktree holds a trajectory plan but the live
         (recycled-id) task is the cycle-breaker → quarantine, do not adopt."""
         plan = _make_plan(steps_done=3, steps_total=5, task_id='3770')
@@ -1486,15 +1487,19 @@ class TestRecoverIdentityGuard:
         harness.scheduler.get_task = AsyncMock(
             return_value={'id': '3770', 'title': 'Cycle-breaker beta: dedup edges'},
         )
+        outcome = _populated_outcome(tmp_path, '3770')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         await harness._recover_crashed_tasks()
 
         assert '3770' not in harness._recovered_plans
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            wt, '3770', 'recovery-identity-mismatch',
-        )
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        quarantine.assert_called_once_with(wt, '3770', 'recovery-identity-mismatch')
+        assert _quarantine_emits(events) == [
+            {'task_id': '3770', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
 
     async def test_adopts_on_match_with_autoeval_prefix(self, harness: Harness):
         """A benign ``[auto-eval redo] `` prefix normalises away → adopt."""
@@ -1626,6 +1631,21 @@ def _seed_lane_record(
     lifecycle.transition(
         lane, DurableLaneState.ASSIGNED, task_id=task_id, branch=branch,
     )
+
+
+def _populated_outcome(tmp_path: Path, task_id: str) -> QuarantineOutcome:
+    """A relocated outcome with every field set, so a payload test sees each one."""
+    return QuarantineOutcome(
+        dest=tmp_path / 'q', branch=f'task/{task_id}-T', tip_sha='abc', unique_commit_count=3,
+    )
+
+
+def _quarantine_emits(events: MagicMock) -> list[dict]:
+    """The keyword arguments of each ``worktree_quarantined`` emit, in order."""
+    return [
+        call.kwargs for call in events.emit.call_args_list
+        if call.args[0] == EventType.worktree_quarantined
+    ]
 
 
 def _setup_task_plan(base: Path, task_id: str, plan: dict) -> Path:
@@ -2313,7 +2333,7 @@ class TestRecordDrivenRecovery:
         assert pool.assignment_for('42') == lane
 
     async def test_quarantine_on_registration_divergence(
-        self, harness: Harness, caplog,
+        self, harness: Harness, caplog, tmp_path: Path,
     ):
         """B2: durable record ASSIGNED:'42' branch='task/42' but the git
         admin entry is gone (the 2097/2098 orphaned-worktree divergence) ->
@@ -2333,13 +2353,16 @@ class TestRecordDrivenRecovery:
 
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=False)
         harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._recover_crashed_tasks()
 
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
-        )
+        quarantine.assert_called_once_with(lane, 'task/42', 'recovery-record-divergence')
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
         record = lifecycle.read(lane)
@@ -2352,8 +2375,9 @@ class TestRecordDrivenRecovery:
         assert pool.state(lane) == LaneState.FREE
         assert '42' not in harness._recovered_plans
 
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-record-divergence')},
+        ]
 
         assert any(
             rec.levelno == logging.WARNING
@@ -2368,6 +2392,49 @@ class TestRecordDrivenRecovery:
         assert result is not None, (
             'pool must not be stuck exhausted after quarantining a lane'
         )
+
+    async def test_quarantine_on_record_identity_mismatch(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The record-driven Fix C cell: durable record ASSIGNED:'42' and git
+        reality matches (registered, branch OK), but the lane's stored title
+        is not the live task's -> QUARANTINE with the full outcome payload,
+        never adopt.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={'42': lane})
+        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'title': 'A different live task'},
+        )
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
+
+        await harness._recover_crashed_tasks()
+
+        quarantine.assert_awaited_once()
+        await_args = quarantine.await_args
+        assert await_args is not None
+        assert await_args.args[0] == lane
+        assert await_args.args[2] == 'recovery-identity-mismatch'
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
+        assert pool.assignment_for('42') is None
+        assert '42' not in harness._recovered_plans
 
     async def test_terminal_task_releases_lane_not_adopted(self, harness: Harness):
         """Terminal task (T10 amplifier): durable record ASSIGNED:'42'

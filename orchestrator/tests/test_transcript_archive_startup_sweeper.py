@@ -35,6 +35,7 @@ from shared.storm_counter import StormCounter
 from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 
 # A representative encoded-project directory name (Claude Code encodes the
 # absolute project path into this leaf; the exact encoding is irrelevant here).
@@ -68,7 +69,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     h.git_ops._lane_lifecycle = LaneLifecycle(
         h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,
     )

@@ -25,6 +25,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -1341,7 +1342,9 @@ class TestRecoveryTerminalTaskLaneRelease:
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
 
         with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
-             patch.object(git_ops, 'quarantine_worktree', new_callable=AsyncMock) as mock_quarantine, \
+             patch.object(
+                 git_ops, 'quarantine_worktree', new_callable=AsyncMock, return_value=NOT_RELOCATED,
+             ) as mock_quarantine, \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 

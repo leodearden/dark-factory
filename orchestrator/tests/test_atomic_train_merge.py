@@ -43,6 +43,7 @@ from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
 )
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -1097,7 +1098,7 @@ class TestScenario6ParkPrefixDerail:
         # to this test's live-vs-orphan routing.
         harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-        harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
+        harness.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / "q-dest"))
         harness.git_ops.cleanup_worktree = AsyncMock()
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
