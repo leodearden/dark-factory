@@ -169,6 +169,71 @@ class TestTheFiledEscalation:
 
 
 @_needs_escalation
+class TestTheLinkHealCalibrationAndRunReportRoutes:
+    """The link-heal sweep's two anchors (task 7159), filed through
+    ``FoldedEscapeFiler`` into a real queue.
+
+    A failed calibration is an alarm, so a second filing folds into the open
+    record. A run report is a distinct payload per run, and a fold would
+    discard every later night's report path, so it never folds.
+    """
+
+    @staticmethod
+    def _file(tmp_path, anchor: str, summary: str, report: str) -> str | None:
+        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+            Escape,
+            FoldedEscapeFiler,
+        )
+
+        return FoldedEscapeFiler(str(tmp_path))(
+            Escape(anchor=anchor, summary=summary, detail={'report': report}),
+        )
+
+    def test_a_failed_calibration_files_a_blocking_risk_and_folds(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+            CALIBRATION_ANCHOR,
+        )
+
+        first = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed', 'one.md')
+        second = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed again', 'two.md')
+
+        assert first is not None
+        assert second == first
+        [record] = _filed(tmp_path)
+        assert record['task_id'] == CALIBRATION_ANCHOR == 'link-heal-calibration'
+        assert (record['category'], record['severity'], record['level']) == (
+            'risk_identified', 'blocking', 1,
+        )
+
+    def test_a_run_report_files_info_and_never_folds(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        records = _filed(tmp_path)
+        assert sorted(record['summary'] for record in records) == [
+            'link-heal sweep: one.md', 'link-heal sweep: two.md',
+        ]
+        for record in records:
+            assert record['task_id'] == RUN_REPORT_ANCHOR == 'link-heal-run-report'
+            assert record['status'] == 'pending'
+            assert (record['category'], record['severity'], record['level']) == (
+                'link_heal_run_report', 'info', 1,
+            )
+
+    def test_the_run_report_category_is_registered(self):
+        from escalation.categories import require_registered_category  # noqa: PLC0415
+
+        require_registered_category('link_heal_run_report')
+
+
+@_needs_escalation
 class TestTheAnchorIsRequired:
     """The one property the consolidation must not collapse."""
 
@@ -968,10 +1033,16 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         BACKLOG_ANCHOR as LINK_HEAL_BACKLOG_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
+        CALIBRATION_ANCHOR as LINK_HEAL_CALIBRATION_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
         CORRECTS_SHARE_ANCHOR as LINK_HEAL_CORRECTS_SHARE_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         MISFILE_SHARE_ANCHOR as LINK_HEAL_MISFILE_SHARE_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        RUN_REPORT_ANCHOR as LINK_HEAL_RUN_REPORT_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
@@ -1063,12 +1134,14 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
         'markup_guard residue': GUARD_RESIDUE_ANCHOR,
-        # -- the link-heal executor's run escapes (tasks 6181, 6184) ----------
+        # -- the link-heal executor's run escapes (tasks 6181, 6184, 7159) ----
         'link_heal backlog': LINK_HEAL_BACKLOG_ANCHOR,
         'link_heal write-failure': LINK_HEAL_WRITE_FAILURE_ANCHOR,
         'link_heal misfile-share': LINK_HEAL_MISFILE_SHARE_ANCHOR,
         'link_heal corrects-share': LINK_HEAL_CORRECTS_SHARE_ANCHOR,
         'link_heal adjudicator': LINK_HEAL_ADJUDICATOR_ANCHOR,
+        'link_heal calibration': LINK_HEAL_CALIBRATION_ANCHOR,
+        'link_heal run-report': LINK_HEAL_RUN_REPORT_ANCHOR,
         # -- the ticket janitor's curation backlog, one anchor per defer reason
         **{
             f'ticket_janitor curation-backlog {reason}': curation_backlog_anchor(reason)
@@ -1179,6 +1252,8 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal misfile-share',
             'link_heal corrects-share',
             'link_heal adjudicator',
+            'link_heal calibration',
+            'link_heal run-report',
             'curator_escalator',
             'ticket_janitor curator-bucket',
         ):
