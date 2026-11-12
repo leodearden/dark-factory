@@ -27,7 +27,7 @@ from orchestrator.quarantine_provenance import (
 )
 
 _STAMP_KEYS = {'branch', 'tip_sha', 'unique_commit_count', 'quarantined_at', 'reason', 'parking'}
-_SNAPSHOT_NAMES = ('plan.json', 'metadata.json', 'review_state.json', 'iterations.jsonl')
+_SNAPSHOT_NAMES: tuple[str, ...] = ('plan.json', 'metadata.json', 'review_state.json', 'iterations.jsonl')
 _PLAN = {
     'task_id': '42',
     'title': 'T',
@@ -209,6 +209,7 @@ class TestStampQuarantinedFrom:
 class TestRecordQuarantineProvenance:
     def test_snapshots_then_stamps(self, artifacts: TaskArtifacts, lane, tmp_path):
         parking = tmp_path / 'quarantine' / '42-20261112T000000Z'
+        parking.parent.mkdir()
         os.rename(lane, parking)
         outcome = QuarantineOutcome(dest=parking, branch='task/42-X', tip_sha='abc', unique_commit_count=3)
 
