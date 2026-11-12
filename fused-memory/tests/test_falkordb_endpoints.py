@@ -11,6 +11,12 @@ from fused_memory.config.falkordb_endpoints import (
     ProductionFalkorDBTarget,
     is_production_falkordb,
     scratch_falkordb_from_env,
+    with_falkordb,
+)
+from fused_memory.config.schema import (
+    FalkorDBProviderConfig,
+    FusedMemoryConfig,
+    GraphitiBackendConfig,
 )
 
 
@@ -74,6 +80,7 @@ class TestScratchFalkorDBFromEnv:
         [
             {'FALKOR_PORT': '6379'},
             {'FALKOR_HOST': '127.0.0.1', 'FALKOR_PORT': '6379'},
+            {'FALKOR_HOST': '0.0.0.0', 'FALKOR_PORT': '6379'},
         ],
     )
     def test_a_production_aim_is_refused(self, environ):
@@ -92,12 +99,59 @@ class TestScratchFalkorDBFromEnv:
 
 
 class TestIsProductionFalkorDB:
-    @pytest.mark.parametrize('host', ['localhost', '127.0.0.1', '::1', ''])
-    def test_loopback_6379_is_production(self, host):
+    @pytest.mark.parametrize(
+        'host',
+        [
+            'localhost', '127.0.0.1', '::1', '',
+            'LOCALHOST', 'localhost.', ' localhost ', 'localhost.localdomain', 'ip6-localhost',
+            'falkordb.localhost', '[::1]', '127.0.0.2', '127.1', '::ffff:127.0.0.1',
+            '0.0.0.0', '::', '0',
+        ],
+    )
+    def test_this_host_on_6379_is_production_in_any_spelling(self, host):
+        """A 0.0.0.0 copied from a docker bind address connects to production as surely as localhost."""
         assert is_production_falkordb(FalkorEndpoint(host, 6379))
+
+    @pytest.mark.parametrize('host', ['10.0.0.5', '::ffff:10.0.0.5', 'localhost.example.com', 'notlocalhost'])
+    def test_another_host_on_6379_is_not_production(self, host):
+        assert not is_production_falkordb(FalkorEndpoint(host, 6379))
 
     def test_the_scratch_port_is_not_production(self):
         assert not is_production_falkordb(FalkorEndpoint('localhost', 6380))
 
     def test_a_remote_host_on_6379_is_not_production(self):
         assert not is_production_falkordb(FalkorEndpoint('falkordb.internal', 6379))
+
+
+class TestWithFalkorDB:
+    def _config(self) -> FusedMemoryConfig:
+        falkordb = FalkorDBProviderConfig(
+            uri='redis://corpus.invalid:7001',
+            password='secret',
+            database='legacy',
+            expected_graph_timeout_ms=1234,
+        )
+        return FusedMemoryConfig.model_construct(graphiti=GraphitiBackendConfig(falkordb=falkordb))
+
+    def test_moves_the_uri_and_drops_the_password(self):
+        moved = with_falkordb(self._config(), FalkorEndpoint('127.0.0.1', 16380)).graphiti.falkordb
+
+        assert moved.uri == 'redis://127.0.0.1:16380'
+        assert moved.password is None
+
+    def test_keeps_every_other_field(self):
+        cfg = self._config()
+
+        moved = with_falkordb(cfg, SCRATCH_FALKORDB).graphiti.falkordb
+
+        untouched = {'uri', 'password'}
+        assert moved.model_dump(exclude=untouched) == cfg.graphiti.falkordb.model_dump(exclude=untouched)
+        assert moved.model_dump(exclude=untouched) != FalkorDBProviderConfig().model_dump(exclude=untouched)
+
+    def test_leaves_the_given_config_alone(self):
+        cfg = self._config()
+
+        with_falkordb(cfg, SCRATCH_FALKORDB)
+
+        assert cfg.graphiti.falkordb.uri == 'redis://corpus.invalid:7001'
+        assert cfg.graphiti.falkordb.password == 'secret'

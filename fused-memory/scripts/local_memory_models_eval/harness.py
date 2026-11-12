@@ -210,7 +210,11 @@ from fused_memory.arm_harness.topology import (
     topology_hash,
 )
 from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
-from fused_memory.config.falkordb_endpoints import FalkorEndpoint, scratch_falkordb_from_env
+from fused_memory.config.falkordb_endpoints import (
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+    with_falkordb,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.eval.retrieval_probe import canonical_hit, content_key
 from fused_memory.eval.topic_registry import Canonical, RegistryError, load_topic_registry
@@ -297,12 +301,7 @@ def build_live_deps() -> HarnessDeps:
     configured = FusedMemoryConfig()
     corpus_source = FalkorEndpoint.from_uri(configured.graphiti.falkordb.uri)
     scratch = scratch_falkordb_from_env()
-    scratch_falkordb = configured.graphiti.falkordb.model_copy(
-        update={'uri': scratch.uri, 'password': None}
-    )
-    base = configured.model_copy(
-        update={'graphiti': configured.graphiti.model_copy(update={'falkordb': scratch_falkordb})}
-    )
+    base = with_falkordb(configured, scratch)
 
     def episode_reader(graph_name: str) -> EpisodeSource:
         return build_corpus.EpisodeReader(

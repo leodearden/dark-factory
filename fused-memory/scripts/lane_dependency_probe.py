@@ -38,8 +38,12 @@ from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from fused_memory.arm_harness.checks import SMOKE_MESSAGES, SmokeEntities
 from fused_memory.backends.graphiti_client import build_embedder, build_llm_client
-from fused_memory.config.falkordb_endpoints import FalkorEndpoint, scratch_falkordb_from_env
-from fused_memory.config.schema import FalkorDBProviderConfig, FusedMemoryConfig
+from fused_memory.config.falkordb_endpoints import (
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+    with_falkordb,
+)
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -216,10 +220,7 @@ async def first_failure(dependencies: Sequence[str], cfg: FusedMemoryConfig) -> 
 
 def probe_config(cfg: FusedMemoryConfig, scratch: FalkorEndpoint) -> FusedMemoryConfig:
     """*cfg* with its FalkorDB replaced by the scratch server, which has no password."""
-    falkordb = FalkorDBProviderConfig(
-        uri=scratch.uri, expected_graph_timeout_ms=cfg.graphiti.falkordb.expected_graph_timeout_ms
-    )
-    return cfg.model_copy(update={'graphiti': cfg.graphiti.model_copy(update={'falkordb': falkordb})})
+    return with_falkordb(cfg, scratch)
 
 
 def build_parser() -> LoudArgumentParser:

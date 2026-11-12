@@ -2,17 +2,25 @@
 scratch server that tests and evals write to (task 7792; OPERATIONS.md
 "The scratch FalkorDB")."""
 
+from __future__ import annotations
+
+import ipaddress
 import os
+import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from fused_memory.config.schema import FusedMemoryConfig
 
 FALKOR_HOST_ENV = 'FALKOR_HOST'
 FALKOR_PORT_ENV = 'FALKOR_PORT'
 
 _DEFAULT_HOST = 'localhost'
 _REDIS_DEFAULT_PORT = 6379
-_LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1', ''})
+_THIS_HOST_NAMES = frozenset({'', 'localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'})
 
 
 @dataclass(frozen=True)
@@ -25,7 +33,7 @@ class FalkorEndpoint:
         return f'redis://{self.host}:{self.port}'
 
     @classmethod
-    def from_uri(cls, uri: str) -> 'FalkorEndpoint':
+    def from_uri(cls, uri: str) -> FalkorEndpoint:
         parts = urlsplit(uri)
         return cls(parts.hostname or _DEFAULT_HOST, parts.port or _REDIS_DEFAULT_PORT)
 
@@ -39,10 +47,38 @@ class ProductionFalkorDBTarget(RuntimeError):
 
 
 def is_production_falkordb(endpoint: FalkorEndpoint) -> bool:
-    return (
-        endpoint.port == PRODUCTION_FALKORDB.port
-        and endpoint.host in _LOOPBACK_HOSTS
-    )
+    return endpoint.port == PRODUCTION_FALKORDB.port and _names_this_host(endpoint.host)
+
+
+def _names_this_host(host: str) -> bool:
+    """Whether a connect to *host* lands on this machine, in any spelling: localhost, loopback, unspecified."""
+    name = host.strip().strip('[]').rstrip('.').lower()
+    if name in _THIS_HOST_NAMES or name.endswith('.localhost'):
+        return True
+    address = _numeric_address(name)
+    if address is None:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback or address.is_unspecified
+
+
+def _numeric_address(name: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """*name* as an IP address, accepting the short IPv4 forms a resolver accepts (``127.1``)."""
+    try:
+        return ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(name))
+    except OSError:
+        return None
+
+
+def with_falkordb(cfg: FusedMemoryConfig, endpoint: FalkorEndpoint) -> FusedMemoryConfig:
+    """*cfg* with its FalkorDB moved to *endpoint*, which takes no password; every other field kept."""
+    falkordb = cfg.graphiti.falkordb.model_copy(update={'uri': endpoint.uri, 'password': None})
+    return cfg.model_copy(update={'graphiti': cfg.graphiti.model_copy(update={'falkordb': falkordb})})
 
 
 def scratch_falkordb_from_env(environ: Mapping[str, str] = os.environ) -> FalkorEndpoint:

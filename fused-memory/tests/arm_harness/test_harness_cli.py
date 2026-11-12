@@ -1366,24 +1366,12 @@ def test_topology_refuses_a_protected_graph_before_any_dependency(harness, live,
 # --- live dependencies -----------------------------------------------------------------
 
 
-class RecordingFalkorDB:
-    """Stands in for ``falkordb.asyncio.FalkorDB``, whose constructor dials its address."""
-
-    def __init__(self, opened: list[dict[str, Any]], **address: Any) -> None:
-        opened.append(address)
-
-    async def aclose(self) -> None:
-        pass
-
-
 def test_live_deps_write_to_the_scratch_falkordb_and_read_the_corpus_where_it_lives(
     harness, monkeypatch
 ):
     monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
     monkeypatch.setenv('FALKOR_HOST', '127.0.0.1')
     monkeypatch.setenv('FALKOR_PORT', '16380')
-    opened: list[dict[str, Any]] = []
-    monkeypatch.setattr(harness, 'FalkorDB', lambda **address: RecordingFalkorDB(opened, **address))
 
     live = harness.build_live_deps()
 
@@ -1391,13 +1379,6 @@ def test_live_deps_write_to_the_scratch_falkordb_and_read_the_corpus_where_it_li
     assert live.base_config.graphiti.falkordb.password is None
     corpus_reader = live.episode_reader(CORPUS_GRAPH)
     assert (corpus_reader.host, corpus_reader.port) == ('corpus.invalid', 7001)
-
-    async def _open_scratch() -> None:
-        async with live.open_falkordb():
-            pass
-
-    asyncio.run(_open_scratch())
-    assert opened == [{'host': '127.0.0.1', 'port': 16380, 'password': None}]
 
 
 def test_live_deps_refuse_a_scratch_target_that_is_production(harness, monkeypatch):
