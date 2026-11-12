@@ -118,6 +118,22 @@ module_overrides:
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
+  # DOCUMENTATION FILES (Leo's ruling of 2026-11-12): unbounded for the same reason
+  # as the ratchet paths. OPERATIONS.md is declared by 171 pending tasks and was at
+  # capacity 99% of 2026-11-09..11-12; two edits of a prose file conflict textually,
+  # at rebase. INTERIM for task 5467, which strips docs/ and root-level Markdown
+  # from lock derivation for every project: remove these ten keys when it lands.
+  # skills/ is deliberately not listed (agent instructions; no ruling).
+  OPERATIONS.md: 99
+  ARCHITECTURE.md: 99
+  CHANGELOG.md: 99
+  CLAUDE.md: 99
+  CONTRIBUTING.md: 99
+  DESIGN.md: 99
+  README.md: 99
+  RECONCILIATION_PLAN.md: 99
+  SETUP.md: 99
+  docs/task-authoring.md: 99
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
