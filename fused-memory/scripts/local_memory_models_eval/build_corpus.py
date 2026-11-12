@@ -800,16 +800,22 @@ the payload-kind stratification dimension here — and the MCP tool clamps
 
 
 def _whole_population_rows(read: PagedRead, graph_name: str) -> list[list]:
-    """The rows of *read*, refused unless they are the whole, exactly censused population.
+    """The rows of *read*, refused unless the read is complete and its row count equals the census.
 
     Branches only on the typed fields; ``read.reason`` is diagnostic prose,
     carried into the message and never parsed.
 
     Exact equality is stricter than ``read.complete``, which accepts more rows
-    than the census as growth. A row written below the cursor while the pages
-    are read shifts a page boundary, so the next page re-returns a row the
-    store holds once. Refused here, that is reported as the write it was
-    rather than as a duplicate episode in the store.
+    than the census as growth. The census is taken before the first page, so
+    any SINGLE write while the pages are read moves the row count off it: a
+    row inserted below the cursor shifts a page boundary and the next page
+    re-returns a row the store holds once. Refused here, that is reported as
+    the write it was rather than as a duplicate episode in the store.
+
+    What this checks is the COUNT, not the identity of the rows. SKIP/LIMIT
+    pages are not a snapshot, so two writes that offset each other (one
+    delete and one insert, on opposite sides of the cursor) leave the count
+    equal and pass, over a row set that omits a live episode or repeats one.
     """
     if not read.complete:
         raise CorpusBuildError(
@@ -862,10 +868,11 @@ class EpisodeReader:
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
 
-        Paged, census-checked, no filter. A read that cannot be proven to be
-        the whole population, exactly as censused, is refused as a
+        Paged, census-checked, no filter. A read that is not complete, or
+        whose row count differs from the census, is refused as a
         :class:`CorpusBuildError` before any row is examined — so a read
         defect is reported as one, never as a row or duplicate-uuid defect.
+        :func:`_whole_population_rows` states what that count check cannot see.
 
         A row whose ``created_at`` or
         ``source_description`` cannot be parsed aborts the build via

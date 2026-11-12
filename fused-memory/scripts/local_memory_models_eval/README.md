@@ -161,9 +161,12 @@ must stay untouched. The guarantee is mechanized three ways, each tested in
    whole: FalkorDB truncates every answer silently at its result-set cap
    (`fused_memory/backends/paged_read.py::RESULTSET_SIZE`), so the read is
    paged in `e.uuid` order and checked against a `count(e)` census. The
-   `LIMIT` each page carries is the page size, not a filter. A read that is
-   not exactly the censused population (a short read, no census, the page
-   cap, or a write mid-read) makes the build exit 1. Tests assert the
+   `LIMIT` each page carries is the page size, not a filter. The build exits
+   1 on a short read, a missing census or the page cap, and on any row count
+   that differs from the census, which catches any single write during the
+   read. The check is on the count, not on which rows came back: two writes
+   that offset each other mid-read leave the count equal and are not
+   caught. Tests assert the
    projected field set by equality and assert the absence of a filter clause
    directly.
 2. **The record cannot hold it.** `EpisodeRecord` has no outcome field, so no

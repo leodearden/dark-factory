@@ -2888,11 +2888,14 @@ class TestAnIncompletePopulationReadIsARunFailureNotAVerdict:
         assert err.startswith('error: ')
         assert INCOMPLETE_SHORT_READ in err
 
-    def test_an_incomplete_read_under_verify_reaches_no_verdict(self, monkeypatch, tmp_path):
+    def test_an_incomplete_read_under_verify_reaches_no_verdict(
+        self, monkeypatch, tmp_path, capsys
+    ):
         out = tmp_path / 'corpus_manifest.json'
         rows = _cli_rows()
         built, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), rows=rows)
         assert built == 0
+        capsys.readouterr()
         code, _ = _run_cli(
             monkeypatch,
             '--verify',
@@ -2901,7 +2904,9 @@ class TestAnIncompletePopulationReadIsARunFailureNotAVerdict:
             double=_FalkorDouble(rows, cap=len(rows) - 1),
         )
         assert code == _mod.EXIT_RUN_FAILED
-        assert code not in set(_mod.EXIT_CODES.values())
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert INCOMPLETE_SHORT_READ in err
 
 
 class TestAWriteFailureIsNotBlamedOnTheStore:
@@ -3836,7 +3841,7 @@ def test_live_population_read_smoke(monkeypatch):
     assert projected == set(SEEDED_EPISODES)
     assert {_mod.stratum_key(r) for r in population} == SEEDED_STRATA
 
-    # The hazard, measured: every command went over the read-only path.
+    # The hazard, measured by the tripwire: the read went through the recorder,
+    # whose __getattr__ raises on any primitive other than ro_query.
     [recorder] = recorders
     assert recorder.commands
-    assert all(command == 'ro_query' for command in recorder.commands), recorder.commands
