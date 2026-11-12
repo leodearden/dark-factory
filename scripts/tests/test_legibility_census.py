@@ -38,6 +38,7 @@ from legibility import (
     account_pool,
     alarm,
     census_findings,
+    census_headroom,
     census_identity,
     census_state,
     census_trigger,
@@ -73,6 +74,7 @@ from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
     REAL_CLI_CAP_HIT_MESSAGES,
     REAL_CLI_CAP_MESSAGES,
+    looks_like_blocking_banner,
 )
 from shared.finding_key import finding_key
 from shared.testing_mcp_stub import StubMcpServer
@@ -663,7 +665,7 @@ def test_render_matrix_empty_matrix_is_deterministic_placeholder():
 
 def test_preflight_headroom_ok_on_normal_reply():
     fake_invoke = _make_fake_invoke(default="pong")
-    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is True
     assert fake_invoke.calls[0]["model"] == "sonnet"
 
@@ -679,14 +681,14 @@ def test_preflight_headroom_ok_on_normal_reply():
 )
 def test_preflight_headroom_defers_on_known_banner(banner):
     fake_invoke = _make_fake_invoke(default=banner)
-    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
 
 def test_preflight_headroom_banner_match_is_case_insensitive():
     fake_invoke = _make_fake_invoke(default="USAGE LIMIT REACHED, TRY AGAIN LATER")
-    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
 
 
@@ -696,7 +698,7 @@ def test_preflight_headroom_invocation_error_defers_fail_safe():
             "claude CLI exited 1 (model='sonnet'): simulated backend outage"
         )
 
-    result = mod.preflight_headroom(raising_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(raising_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
@@ -725,7 +727,7 @@ def test_preflight_headroom_defers_on_every_real_cli_cap_message(message):
     verdict.
     """
     fake_invoke = _make_fake_invoke(default=message)
-    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False, f"real CLI cap message passed the probe: {message!r}"
     assert result.reason
     # The reason must quote the marker that fired, so an operator reading the
@@ -744,7 +746,7 @@ def test_preflight_headroom_defers_on_ticket_weekly_limit_phrasing():
     fake_invoke = _make_fake_invoke(
         default="You've hit your weekly limit - resets Aug 5, 11am"
     )
-    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
@@ -2562,7 +2564,7 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
     assert outcome.reason
     # The two defer sites must be distinguishable by FIELD, not by parsing
     # prose out of a shared reason string (task 3645).
-    assert outcome.stage is mod.CensusStage.PREFLIGHT
+    assert outcome.stage is census_headroom.CensusStage.PREFLIGHT
 
     assert len(fake_escalate_fn.calls) == 1
     call = fake_escalate_fn.calls[0]
@@ -2595,7 +2597,7 @@ def _capped_after_preflight_invoke(cap_message=REAL_CLI_CAP_MESSAGES[0]):
     probes = []
 
     def response_fn(prompt, model):
-        if prompt == mod._HEADROOM_PROBE_PROMPT:
+        if prompt == census_headroom.HEADROOM_PROBE_PROMPT:
             probes.append(prompt)
             return "pong" if len(probes) == 1 else cap_message
         return _happy_invoke_response(prompt, model)
@@ -2631,7 +2633,7 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
         outcome = mod.run_census(**kwargs)
 
     outcome = _deferred(outcome)
-    assert outcome.stage is mod.CensusStage.VERIFY
+    assert outcome.stage is census_headroom.CensusStage.VERIFY
     assert outcome.counts.unverified == 1
     assert outcome.reason
     assert "verify" in outcome.reason.lower(), "the reason names the stage that was skipped"
@@ -2657,7 +2659,7 @@ def test_a_verify_stage_deferral_of_a_mined_run_persists_and_files_nothing(tmp_p
 
     outcome = _deferred(mod.run_census(**kwargs))
 
-    assert outcome.stage is mod.CensusStage.VERIFY
+    assert outcome.stage is census_headroom.CensusStage.VERIFY
     assert kwargs["effects"].submit_fn.calls == []
     assert kwargs["effects"].commit.calls == []
     for path in (
@@ -2917,7 +2919,7 @@ def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
 def _declared_and_free_text_slug_response(prompt, model):
     """A mining reply matching entry-a: the `digest-alpha` session names the
     declared slug, every other session a free-text value."""
-    if prompt == mod._HEADROOM_PROBE_PROMPT:
+    if prompt == census_headroom.HEADROOM_PROBE_PROMPT:
         return "pong"
     slug = "known-slug" if "digest-alpha" in prompt else "free-text-one"
     return json.dumps(
@@ -2960,7 +2962,7 @@ def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
 
     outcome = _done(outcome)
     mining_prompts = [
-        c["prompt"] for c in fake_invoke.calls if c["prompt"] != mod._HEADROOM_PROBE_PROMPT
+        c["prompt"] for c in fake_invoke.calls if c["prompt"] != census_headroom.HEADROOM_PROBE_PROMPT
     ]
     assert len(mining_prompts) == 2
     for prompt in mining_prompts:
@@ -6346,7 +6348,7 @@ def _probe_over_the_pool(tmp_path, fake_claude_cli, pool_roster, by_name):
     )
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with session_runner.SessionRunner(gate, label="census-test") as runner:
-        result = mod.preflight_headroom(runner.invoker(mining), model="haiku")
+        result = census_headroom.preflight_headroom(runner.invoker(mining), model="haiku")
     return result, gate
 
 
@@ -6458,17 +6460,17 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
         return replies[len(calls) - 1]
 
     probe = _make_recording_probe(
-        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+        census_headroom.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
     )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(5), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.reason and "banner" in exc.reason.lower()
     assert exc.verified == 2, "the two clusters adjudicated before the cap"
     assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
@@ -6525,7 +6527,7 @@ def test_default_verify_fn_does_not_read_a_cap_themed_verdict_as_a_banner(marker
         return _cap_themed_verdict(marker)
 
     probe = _make_recording_probe(
-        mod.HeadroomResult(ok=False, reason="must never be consulted on a parsed verdict")
+        census_headroom.HeadroomResult(ok=False, reason="must never be consulted on a parsed verdict")
     )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
@@ -6548,7 +6550,7 @@ def test_default_verify_fn_reads_a_cap_themed_refutation_as_an_ordinary_rejectio
     def invoke(prompt, model):
         return _cap_themed_verdict(marker, verified=False)
 
-    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=False, reason="must never be consulted"))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
     )
@@ -6578,7 +6580,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     verdict = _cap_themed_verdict("usage limit", remediation=_IN_TREE_REMEDIATION)
 
     def response_fn(prompt, model):
-        if prompt == mod._HEADROOM_PROBE_PROMPT:
+        if prompt == census_headroom.HEADROOM_PROBE_PROMPT:
             return "pong"
         if prompt.startswith("You are the periodic-census verifier"):
             return verdict
@@ -6659,7 +6661,7 @@ def test_default_verify_fn_rejects_unparseable_cap_themed_prose_when_the_probe_s
     cluster rejects and the loop runs to completion, exactly as it would for
     any other malformed reply.
     """
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=True))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
     )
@@ -6674,17 +6676,17 @@ def test_default_verify_fn_rejects_unparseable_cap_themed_prose_when_the_probe_s
 def test_default_verify_fn_raises_when_an_unparseable_banner_reply_is_probe_confirmed():
     """A probe that reports no capacity turns the same content into an abort."""
     probe = _make_recording_probe(
-        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+        census_headroom.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
     )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     reason = (exc.reason or "").lower()
@@ -6723,17 +6725,17 @@ def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
         return _verdict()
 
     probe = _make_recording_probe(
-        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+        census_headroom.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
     )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert len(probe.calls) == 1, "exactly one re-probe, on a path that already failed"
@@ -6755,7 +6757,7 @@ def test_default_verify_fn_still_rejects_when_the_reprobe_says_healthy():
             raise session_runner.InvocationFailed("claude CLI exited 1: unrelated outage")
         return _verdict()
 
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=True))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
     )
@@ -6802,8 +6804,8 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
     last_census_at never advanced past a window that was not adjudicated.
     """
     def raising_verify_fn(clusters, *, model):
-        raise mod.CensusHeadroomExhausted(
-            stage=mod.CensusStage.VERIFY,
+        raise census_headroom.CensusHeadroomExhausted(
+            stage=census_headroom.CensusStage.VERIFY,
             reason="verify reply carries a banner marker: 'weekly limit'",
             verified=1,
             unverified=4,
@@ -6827,7 +6829,7 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
         outcome = mod.run_census(**kwargs)
 
     outcome = _deferred(outcome)
-    assert outcome.stage is mod.CensusStage.VERIFY
+    assert outcome.stage is census_headroom.CensusStage.VERIFY
     assert outcome.counts.unverified == 4
 
     # synthesize_fn and commit are _poison: reaching either would have raised.
@@ -6889,7 +6891,7 @@ def test_default_verify_fn_probes_at_batch_boundaries_only():
     twice, not twelve times. The probe is cheap but not free, and verification
     is already one agentic call per cluster.
     """
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=True))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
     )
@@ -6903,17 +6905,17 @@ def test_default_verify_fn_probes_at_batch_boundaries_only():
 def test_default_verify_fn_backstop_raises_at_the_first_failing_boundary():
     """The backstop aborts at its boundary, leaving the rest untouched."""
     probe = _make_recording_probe(
-        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+        census_headroom.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
     )
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(12), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 5
     assert exc.unverified == 7, "clusters 6-12, none of them adjudicated"
     assert len(probe.calls) == 1
@@ -6921,7 +6923,7 @@ def test_default_verify_fn_backstop_raises_at_the_first_failing_boundary():
 
 def test_default_verify_fn_backstop_does_not_probe_after_the_last_cluster():
     """No probe when nothing remains -- it would guard a stage already over."""
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=True))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
     )
@@ -7041,7 +7043,7 @@ def test_default_verify_fn_reports_the_headroom_probes_it_spent():
     counter would have to be threaded through a second wiring site that
     nothing forces anyone to connect.
     """
-    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=True))
     verify_fn = mod._build_default_verify_fn(
         "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
     )
@@ -7074,7 +7076,7 @@ def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
     spent in the scenario it pins.
     """
     def response_fn(prompt, model):
-        if prompt == mod._HEADROOM_PROBE_PROMPT:
+        if prompt == census_headroom.HEADROOM_PROBE_PROMPT:
             return "pong"
         if prompt.startswith("You are the periodic-census verifier"):
             return _verdict()
@@ -7089,7 +7091,7 @@ def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
             str(tmp_path),
             fake_invoke,
             headroom_probe=functools.partial(
-                mod.preflight_headroom, fake_invoke, model="haiku",
+                census_headroom.preflight_headroom, fake_invoke, model="haiku",
             ),
             probe_every=5,
         ),
@@ -7144,11 +7146,11 @@ def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
         "/tmp/root", invoke, headroom_probe=_raising_probe(), probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower(), (
@@ -7165,11 +7167,11 @@ def test_default_verify_fn_backstop_treats_a_raising_probe_as_no_headroom():
         probe_every=5,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(12), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 5
     assert exc.unverified == 7
     assert "raised" in (exc.reason or "").lower()
@@ -7189,9 +7191,9 @@ def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path,
 
     def fake_run_census(**kwargs):
         return mod.Deferred(
-            stage=mod.CensusStage.VERIFY,
+            stage=census_headroom.CensusStage.VERIFY,
             reason="headroom exhausted during verification: probe reports no capacity",
-            counts=mod.DeferralCounts(unverified=7),
+            counts=census_headroom.DeferralCounts(unverified=7),
         )
 
     monkeypatch.setattr(mod, "run_census", fake_run_census)
@@ -7216,11 +7218,11 @@ def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headr
         probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage is mod.CensusStage.VERIFY
+    assert exc.stage is census_headroom.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower()
@@ -7517,7 +7519,7 @@ _UNPARSEABLE_BANNERED_PROSE = (
 
 
 def _no_headroom(reason="probe reports no capacity"):
-    return mod.HeadroomResult(ok=False, reason=reason)
+    return census_headroom.HeadroomResult(ok=False, reason=reason)
 
 
 def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_backstop():
@@ -7538,7 +7540,7 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
         probe_every=3,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(clusters, model="sonnet")
 
     exc = excinfo.value
@@ -7568,7 +7570,7 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
         probe_every=100,                       # no backstop — isolate this site
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(clusters, model="sonnet")
 
     exc = excinfo.value
@@ -7580,10 +7582,10 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
 
 def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_banner():
     """(c) The unparseable-banner site — also a not-yet-appended site."""
-    assert mod.looks_like_blocking_banner(_UNPARSEABLE_BANNERED_PROSE) is not None, (
+    assert looks_like_blocking_banner(_UNPARSEABLE_BANNERED_PROSE) is not None, (
         "fixture sanity: the bannered reply must actually match a marker"
     )
-    assert mod.looks_like_blocking_banner(_UNPARSEABLE_PLAIN_PROSE) is None, (
+    assert looks_like_blocking_banner(_UNPARSEABLE_PLAIN_PROSE) is None, (
         "fixture sanity: the plain reply must NOT match, so it spends no probe"
     )
     calls = []
@@ -7603,7 +7605,7 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
         probe_every=100,
     )
 
-    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+    with pytest.raises(census_headroom.CensusHeadroomExhausted) as excinfo:
         verify_fn(clusters, model="sonnet")
 
     exc = excinfo.value
@@ -7631,8 +7633,8 @@ def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
     """5 clusters offered, 2 already adjudicated (1 verified + 1 rejected),
     3 never reached. The message must name all three counts AND the total."""
     def raising_verify_fn(clusters, *, model):
-        raise mod.CensusHeadroomExhausted(
-            stage=mod.CensusStage.VERIFY,
+        raise census_headroom.CensusHeadroomExhausted(
+            stage=census_headroom.CensusStage.VERIFY,
             reason="probe reports no capacity",
             verified=1, rejected=1, unverified=3,
         )
@@ -7701,7 +7703,7 @@ def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     outcome = _deferred(outcome)
-    assert outcome.stage is mod.CensusStage.PREFLIGHT
+    assert outcome.stage is census_headroom.CensusStage.PREFLIGHT
     blob = _defer_blob(fake_escalate_fn)
     assert "cluster(s) verified" not in blob, (
         f"a preflight defer must carry no counts clause at all; got {blob!r}"
@@ -8182,7 +8184,7 @@ def test_default_verify_fn_rejects_a_parsed_reply_that_is_no_verdict_without_a_p
     tmp_path, caplog,
 ):
     reply = json.dumps({"verified": "yes", "reason": REAL_CLI_CAP_MESSAGES[0]})
-    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    probe = _make_recording_probe(census_headroom.HeadroomResult(ok=False, reason="must never be consulted"))
     verify_fn = mod._build_default_verify_fn(
         str(_tree_with_guide(tmp_path)), lambda prompt, model: reply, headroom_probe=probe,
     )
@@ -9815,7 +9817,7 @@ def _reverifying_verify_fn(answer: str):
             found = _fake_verdict(_IN_TREE_REMEDIATION)
             return {"verified": [{**c, "verdict": found} for c in clusters], "rejected": [], "fixed": []}
         if answer == "headroom":
-            raise mod.CensusHeadroomExhausted(stage=mod.CensusStage.VERIFY, reason="capped mid-reverify", unverified=len(marked))
+            raise census_headroom.CensusHeadroomExhausted(stage=census_headroom.CensusStage.VERIFY, reason="capped mid-reverify", unverified=len(marked))
         if answer in ("present", "structural"):
             route = verdict.Route.MECHANICAL if answer == "present" else verdict.Route.STRUCTURAL
             found = _fake_verdict(_IN_TREE_REMEDIATION, route=route)
@@ -11090,8 +11092,8 @@ def _queue_verify_fn(*, verified_titles=(), raise_on_queue=False):
     def verify_fn(clusters, *, model):
         calls.append({"clusters": clusters, "model": model})
         if raise_on_queue and any(cluster["title"] != _L6_NOVEL_TITLE for cluster in clusters):
-            raise mod.CensusHeadroomExhausted(
-                stage=mod.CensusStage.VERIFY, reason="usage limit reached", unverified=len(clusters),
+            raise census_headroom.CensusHeadroomExhausted(
+                stage=census_headroom.CensusStage.VERIFY, reason="usage limit reached", unverified=len(clusters),
             )
         verified = [cluster for cluster in clusters if cluster["title"] in verified_titles]
         result = _verifying_unremediated_at_the_row5_anchor(verified, model=model)
@@ -11243,7 +11245,7 @@ def test_a_queue_with_no_novel_cluster_is_gated_on_headroom_before_its_verify_ca
 
     outcome = mod.run_census(**kwargs)
 
-    assert _deferred(outcome).stage is mod.CensusStage.VERIFY
+    assert _deferred(outcome).stage is census_headroom.CensusStage.VERIFY
     assert verify_fn.calls == []
     assert not kwargs["report_path"].exists()
     assert not kwargs["codebook_path"].exists()
