@@ -450,7 +450,11 @@ against the same-run control under §6.2's unchanged checks.
     the $0.01669/episode estimated above.
 * **Decision.** Both arms pass all three §6.2 checks with zero adjudicated
   overreach (0 of 905 and 0 of 1,057 minted, against control's 48 of 328),
-  so the R→R+O6 trigger fires at effort low.
+  so the R→R+O6 trigger fires at effort low. One self-blinded adjudicator
+  labelled every edge, and the arms' styles leaked which edges shared an
+  arm, so that perfect separation cannot rule out adjudicator expectation.
+  The new record's §8 names a second rater on an o6 sample as the cheap
+  check.
 * **Routing must inherit the client.** Any routing follow-up must inherit
   the omit-temperature and explicit-effort handling of
   `fused-memory/scripts/replay_overreach_extraction.py::ExplicitEffortOpenAIClient`.

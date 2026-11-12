@@ -6,7 +6,9 @@
   "pre_registration_commit": {
     "git_sha": "861870f4450bd6f16d3ca12d4a9e1c20e6afda1a",
     "git_sha_before_rebase": "1022d9d43ac8db1ba2e3a35049d77720474330c8",
-    "subject": "docs(9065): PRE-REGISTRATION — O6 at reasoning effort low and medium, §1 Question and §2 Method"
+    "subject": "docs(9065): PRE-REGISTRATION — O6 at reasoning effort low and medium, §1 Question and §2 Method",
+    "design_md_blob": "d75e0dccb7885723cdbdefaedb55d2b5575f96ff",
+    "design_md_blob_note": "The git hash-object id of docs/ruling-overreach-o6-replay-2026-11-12/design.md as the pre-registration committed it (identical at 6320af7524 and 861870f445). Unlike git_sha, a rebase cannot orphan it: `git cat-file -p d75e0dcc` recovers the pre-registered §1-§2 for comparison with design.md at any later commit."
   },
   "code_pins": "Each run's git_sha is its commit on branch task/9065 when this file was written, and a later rebase rewrites it. code_blobs are the git hash-object ids of the files that run executed; they survive any rebase (`git log --all --find-object=<blob>`). git_sha_before_rebase is the sha HEAD carried when the run executed, before the branch's rebases onto main.",
   "runs": [
