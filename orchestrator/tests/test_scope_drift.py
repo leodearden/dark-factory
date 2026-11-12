@@ -1,0 +1,169 @@
+"""Unit tests for orchestrator.scope_drift: scope requests and drift reports (task 3090)."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.scope_drift import (
+    IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
+    IMPLEMENT_SCOPE_EXPANDED,
+    InvalidScopeRequest,
+    ScopeDriftReport,
+    ScopeRequest,
+    build_scope_drift_report,
+    pending_scope_paths,
+)
+
+LOCK_DEPTH = 12
+
+
+class TestScopeRequest:
+    def test_accepts_a_repo_relative_file_path(self):
+        request = ScopeRequest('orchestrator/src/orchestrator/foo.py', 'plan omitted it')
+        assert request.path == 'orchestrator/src/orchestrator/foo.py'
+        assert request.reason == 'plan omitted it'
+
+    def test_normalizes_a_leading_dot_slash(self):
+        request = ScopeRequest('./orchestrator/src/orchestrator/foo.py', 'plan omitted it')
+        assert request.path == 'orchestrator/src/orchestrator/foo.py'
+
+    @pytest.mark.parametrize(
+        'path',
+        [
+            '/abs/orchestrator/foo.py',
+            'orchestrator/../secrets/foo.py',
+            '../foo.py',
+            '.task/plan.json',
+            'orchestrator/src/orchestrator',
+            '',
+        ],
+    )
+    def test_rejects_an_invalid_path_naming_it(self, path):
+        with pytest.raises(InvalidScopeRequest) as excinfo:
+            ScopeRequest(path, 'plan omitted it')
+        assert excinfo.value.field == 'path'
+        assert repr(path) in str(excinfo.value)
+
+    @pytest.mark.parametrize('reason', ['', '   ', '\n\t'])
+    def test_rejects_an_empty_reason(self, reason):
+        with pytest.raises(InvalidScopeRequest) as excinfo:
+            ScopeRequest('pkg/a.py', reason)
+        assert excinfo.value.field == 'reason'
+        assert repr(reason) in str(excinfo.value)
+
+    def test_is_frozen(self):
+        request = ScopeRequest('pkg/a.py', 'plan omitted it')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            request.path = 'pkg/b.py'  # type: ignore[misc]
+
+    def test_mapping_round_trip(self):
+        request = ScopeRequest('pkg/a.py', 'plan omitted it')
+        assert ScopeRequest.from_mapping(request.to_mapping()) == request
+
+    @pytest.mark.parametrize(
+        ('mapping', 'field'),
+        [
+            ({'reason': 'plan omitted it'}, 'path'),
+            ({'path': 'pkg/a.py'}, 'reason'),
+            ({'path': 7, 'reason': 'plan omitted it'}, 'path'),
+            ({'path': 'pkg/a.py', 'reason': None}, 'reason'),
+        ],
+    )
+    def test_from_mapping_rejects_a_missing_or_non_string_field(self, mapping, field):
+        with pytest.raises(InvalidScopeRequest) as excinfo:
+            ScopeRequest.from_mapping(mapping)
+        assert excinfo.value.field == field
+
+
+class TestPendingScopePaths:
+    def test_drops_declared_paths_and_duplicates_keeping_order(self):
+        requests = [
+            ScopeRequest('pkg/c.py', 'r'),
+            ScopeRequest('pkg/a.py', 'r'),
+            ScopeRequest('pkg/b.py', 'r'),
+            ScopeRequest('pkg/c.py', 'again'),
+        ]
+        assert pending_scope_paths(requests, ['pkg/a.py']) == ('pkg/c.py', 'pkg/b.py')
+
+    def test_plan_entries_are_compared_after_dot_slash_normalization(self):
+        requests = [ScopeRequest('pkg/a.py', 'r'), ScopeRequest('pkg/b.py', 'r')]
+        assert pending_scope_paths(requests, ['./pkg/a.py']) == ('pkg/b.py',)
+
+    def test_empty_when_every_request_is_declared(self):
+        requests = [ScopeRequest('pkg/a.py', 'r')]
+        assert pending_scope_paths(requests, ['pkg/a.py', 'pkg/z.py']) == ()
+
+    def test_empty_without_requests(self):
+        assert pending_scope_paths([], ['pkg/a.py']) == ()
+
+
+def _report(requested, contested=()):
+    return build_scope_drift_report(
+        requested,
+        contested,
+        lock_depth=LOCK_DEPTH,
+        role='implementer',
+        iteration=2,
+        task_id='42',
+    )
+
+
+class TestBuildScopeDriftReport:
+    def test_all_acquired_is_scope_expanded(self):
+        report = _report(['pkg/a.py', 'pkg/b.py'])
+        assert report.reason == IMPLEMENT_SCOPE_EXPANDED == 'implement_scope_expanded'
+        assert report.requested == ('pkg/a.py', 'pkg/b.py')
+        assert report.acquired == ('pkg/a.py', 'pkg/b.py')
+        assert report.contested == ()
+
+    def test_a_contested_path_maps_to_its_holder(self):
+        report = _report(
+            ['pkg/a.py', 'pkg/b.py'],
+            [Blocker('pkg/b.py', '777', BlockerKind.HELD)],
+        )
+        assert (
+            report.reason
+            == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+            == 'implement_blast_radius_lock_conflict'
+        )
+        assert report.acquired == ('pkg/a.py',)
+        assert report.contested == (('pkg/b.py', '777'),)
+
+    def test_several_holders_record_the_lowest_in_blocker_order(self):
+        report = _report(
+            ['pkg/b.py'],
+            [
+                Blocker('pkg/b.py', '9', BlockerKind.PARKED),
+                Blocker('pkg/b.py', '12', BlockerKind.HELD),
+            ],
+        )
+        assert report.contested == (('pkg/b.py', '12'),)
+
+    def test_a_path_deriving_no_lock_key_is_acquired(self):
+        report = _report(['pkg/subdir'], [Blocker('pkg/subdir', '5', BlockerKind.HELD)])
+        assert report.acquired == ('pkg/subdir',)
+        assert report.contested == ()
+        assert report.reason == IMPLEMENT_SCOPE_EXPANDED
+
+    def test_event_data_shape(self):
+        report = _report(
+            ['pkg/a.py', 'pkg/b.py'],
+            [Blocker('pkg/b.py', '777', BlockerKind.HELD)],
+        )
+        assert report.event_data() == {
+            'reason': 'implement_blast_radius_lock_conflict',
+            'role': 'implementer',
+            'iteration': 2,
+            'requested': ['pkg/a.py', 'pkg/b.py'],
+            'acquired': ['pkg/a.py'],
+            'contested': {'pkg/b.py': '777'},
+        }
+
+    def test_report_is_frozen(self):
+        report = _report(['pkg/a.py'])
+        assert isinstance(report, ScopeDriftReport)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            report.reason = 'other'  # type: ignore[misc]
