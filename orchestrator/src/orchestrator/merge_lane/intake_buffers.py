@@ -733,8 +733,10 @@ class MergeIntake:
 
         Returns ``None`` when the request is no longer buffered.  That is a
         REAL state, not a defensive branch: ``_run_inflight_verify`` awaits a
-        whole verify between the build and this walk, and the merger loop is
-        free to :meth:`pop_next_pickable` a follower during it.  The caller MUST
+        whole verify between the build and this walk.  A reserved link cannot
+        be popped (task 7720), but once its reservation has ended (expiry, or a
+        release) the merger loop may :meth:`pop_next_pickable` it, and a
+        cancel or a relane can take it at any time.  The caller MUST
         stop the walk on ``None`` — the pipeline has taken ownership of that
         item elsewhere, and landing it from here would be the double-land the
         removal above exists to prevent.

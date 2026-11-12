@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import sqlite3
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -613,23 +614,66 @@ class TestBTheReservationIsTimeLimited:
     async def test_a_reservation_holds_before_its_deadline(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """B2: well inside the bound, the row is still there after the lane's
-        loops have run the clock on by an hour."""
-        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(reservation_timeout=1e9))
+        """B2: an hour into a two-hour bound the row is still there, and its
+        deadline was started by the confirm, on the lane's monotonic clock."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(reservation_timeout=7200))
         release_s, s_entered = asyncio.Event(), asyncio.Event()
         async with _deep_round(
             scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
         ) as rnd:
+            before_build = rnd.clock.monotonic()
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
-            start = rnd.clock.monotonic()
+            after_confirm = rnd.clock.monotonic()
             await _until(
-                lambda: rnd.clock.monotonic() > start + 3600, label='an hour of lane time',
+                lambda: rnd.clock.monotonic() > after_confirm + 3600, label='an hour of lane time',
             )
-            assert [r['link_task_ids'] for r in _reservations(rnd.lane)] == [['F1', 'F2']]
+            now = rnd.clock.monotonic()
+            (row,) = _reservations(rnd.lane)
+            assert row['link_task_ids'] == ['F1', 'F2']
+            assert 7200 - (now - before_build) <= row['seconds_left'] <= 7200 - (now - after_confirm)
             release_s.set()
             await rnd.land_head_and_p()
             outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
-            assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert sorted(await _landed_task_files(scene)) == ['F1', 'F2', 'H', 'P', 'S']
+
+    async def test_expiry_survives_a_failing_heartbeat_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """B3: a heartbeat whose event write raises on every tick still expires
+        the reservation; the expiry does not depend on the log step."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep(reservation_timeout=600))
+        events = _HeartbeatWriteFails(db_path=tmp_path / 'events-hb.db', run_id='hb')
+        scene.events = events
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
+        ) as rnd:
+            await wait_responsive(s_entered.wait(), label="S's tip verify under way")
+            await _until(
+                lambda: events.failed_writes > 0, label='a heartbeat write failed',
+            )
+            await _until(lambda: _reservations(rnd.lane) == [], label='the reservation expired')
+            release_s.set()
+            await rnd.land_head_and_p()
+            outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+        assert any(
+            'expired' in rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING
+        )
+
+
+class _HeartbeatWriteFails(EventStore):
+    """An event store whose merge-heartbeat write raises, as a locked database would."""
+
+    failed_writes = 0
+
+    def emit(self, event_type: EventType, **fields: Any) -> None:
+        if event_type is EventType.merge_heartbeat:
+            self.failed_writes += 1
+            raise sqlite3.OperationalError('database is locked')
+        super().emit(event_type, **fields)
 
 
 @dataclasses.dataclass
@@ -784,6 +828,41 @@ class TestDTheLookAheadWaitsForTheChainDecision:
             assert [outcomes[n].landed_via_chain for n in ('S', 'S1')] == [1, 1]
             assert verifier.verified == ['H', 'S']
             assert await _landed_task_files(scene) == ['H', 'S', 'S1']
+
+    async def test_arrivals_while_s_waits_for_a_host_are_chained(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D5: F1 and F2 arrive after S is merged and before H frees the one
+        host; the held merger buffers them, and S's dispatch chains them."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        reqs = await _requests(scene, 'H', 'S', 'F1', 'F2')
+        h_entered, release_h = asyncio.Event(), asyncio.Event()
+        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=2) as run:
+            run.put(reqs['H'])
+            await wait_responsive(h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='H verify under way on local')
+            run.put(reqs['S'])
+            await _until(
+                lambda: lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH,
+                label='S merged and waiting for a host',
+            )
+            run.put(reqs['F1'], reqs['F2'])
+            followers = (reqs['F1'].request_id, reqs['F2'].request_id)
+            await _until(
+                lambda: run.lane.unfrozen_suffix() == followers,
+                label='the held merger buffered the arrivals',
+            )
+            assert lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
+
+            release_h.set()
+            outcomes = {
+                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+                for name in ('H', 'S', 'F1', 'F2')
+            }
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert [outcomes[n].landed_via_chain for n in ('S', 'F1', 'F2')] == [1, 1, 1]
+            assert verifier.verified == ['H', 'S']
+            assert await _landed_task_files(scene) == ['H', 'S', 'F1', 'F2']
 
     async def test_a_declined_chain_releases_the_merger_at_dispatch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

@@ -229,7 +229,8 @@ Phase 3 — observability + rollout:
     pop, for the dispatch of the speculative item it just queued
     (`merge_lane/lookahead_hold.py`). The dispatch publishes the successor
     base above, so the pop cannot take a follower first. With no free host
-    the merger waits and the followers stay buffered.
+    the merger waits and the followers stay buffered. Requests arriving
+    while it waits are buffered too, so the dispatch can chain them.
 - Kill switch: cap=0 ⇒ no chain code executes on any dispatch path
   (byte-identity, asserted by test).
 - Telemetry: `merge_verify.chain_items >= 1` on every merge verify;

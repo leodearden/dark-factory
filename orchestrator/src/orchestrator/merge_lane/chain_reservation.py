@@ -52,10 +52,11 @@ class ChainReservations:
         self._monotonic = monotonic
         self._on_release = on_release
         self._by_owner: dict[str, ChainReservation] = {}
+        self._owner_of_link: dict[str, str] = {}
 
     def holds(self, request_id: str) -> bool:
         """True iff *request_id* is a link some chain reserves."""
-        return self._holder_of(request_id) is not None
+        return request_id in self._owner_of_link
 
     def reserve_candidates(
         self, owner: MergeRequest, candidates: Sequence[MergeRequest],
@@ -72,7 +73,7 @@ class ChainReservations:
             owner_task_id=owner.task_id,
             links=tuple((c.request_id, c.task_id) for c in candidates),
         )
-        self._by_owner[owner.request_id] = record
+        self._put(record)
         return record
 
     def confirm(
@@ -91,14 +92,14 @@ class ChainReservations:
         confirmed = dataclasses.replace(
             record, links=kept, tip=tip, deadline=self._monotonic() + timeout_secs,
         )
-        self._by_owner[owner_request_id] = confirmed
+        self._put(confirmed)
         if len(kept) < len(record.links):
             self._on_release()
         return confirmed
 
     def release(self, owner_request_id: str) -> ChainReservation | None:
         """End *owner_request_id*'s hold; None when it holds nothing (idempotent)."""
-        record = self._by_owner.pop(owner_request_id, None)
+        record = self._drop(owner_request_id)
         if record is not None:
             self._on_release()
         return record
@@ -108,7 +109,7 @@ class ChainReservations:
         now = self._monotonic()
         expired = [r for r in self._by_owner.values() if _past_deadline(r, now)]
         for record in expired:
-            del self._by_owner[record.owner_request_id]
+            self._drop(record.owner_request_id)
             logger.warning(
                 'Deep chain reservation of task %s expired: links %s go back to '
                 'the ordinary pipeline while its tip verify continues',
@@ -136,12 +137,24 @@ class ChainReservations:
     def clear(self) -> None:
         """Drop every reservation without a WARNING (lane stop)."""
         self._by_owner.clear()
+        self._owner_of_link.clear()
+
+    def _put(self, record: ChainReservation) -> None:
+        self._drop(record.owner_request_id)
+        self._by_owner[record.owner_request_id] = record
+        for request_id in record.link_request_ids:
+            self._owner_of_link[request_id] = record.owner_request_id
+
+    def _drop(self, owner_request_id: str) -> ChainReservation | None:
+        record = self._by_owner.pop(owner_request_id, None)
+        if record is not None:
+            for request_id in record.link_request_ids:
+                self._owner_of_link.pop(request_id, None)
+        return record
 
     def _holder_of(self, request_id: str) -> ChainReservation | None:
-        for record in self._by_owner.values():
-            if request_id in record.link_request_ids:
-                return record
-        return None
+        owner_request_id = self._owner_of_link.get(request_id)
+        return None if owner_request_id is None else self._by_owner[owner_request_id]
 
     def _refuse_foreign_hold(self, owner: MergeRequest, candidate: MergeRequest) -> None:
         holder = self._holder_of(candidate.request_id)

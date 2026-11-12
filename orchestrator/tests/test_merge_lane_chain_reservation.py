@@ -167,12 +167,13 @@ def test_a_provisional_reservation_never_expires(reservations, clock, requests) 
 def test_double_reservation_is_refused_naming_both_owners(reservations, requests) -> None:
     reservations.reserve_candidates(requests['S'], [requests['F1'], requests['F2']])
     with pytest.raises(ValueError) as excinfo:
-        reservations.reserve_candidates(requests['O'], [requests['F2']])
+        reservations.reserve_candidates(requests['O'], [requests['F3'], requests['F2']])
     message = str(excinfo.value)
     assert requests['F2'].request_id in message
-    assert 'S' in message
-    assert 'O' in message
-    assert not reservations.holds(requests['X'].request_id)
+    assert "by task S's chain" in message
+    assert "task O's chain cannot" in message
+    assert [r['owner_task_id'] for r in reservations.snapshot()] == ['S']
+    assert not reservations.holds(requests['F3'].request_id)
 
 
 def test_snapshot_lists_every_live_reservation(reservations, clock, requests) -> None:

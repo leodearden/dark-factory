@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import enum
 import functools
 import json
 import logging
@@ -164,7 +165,7 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
-    entry_commit,
+    entry_bases,
     entry_successor_base,
     frontier_tip,
 )
@@ -7708,6 +7709,14 @@ class ProbePlacement:
     base: str
 
 
+class _LookAhead(enum.Enum):
+    """How the merger's look-ahead after a speculative merge ended."""
+
+    PICKED = 'picked'
+    PENDING = 'pending'
+    SHUTDOWN = 'shutdown'
+
+
 class SpeculativeMergeWorker:
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -10739,10 +10748,7 @@ class SpeculativeMergeWorker:
         """The commits :meth:`_verifier_loop`'s head-failure cascade tears down
         and records dead whenever :meth:`_finalize_inflight` returns False:
         each entry's own commit and, when it chained, its chain tip."""
-        return frozenset(
-            c for e in self._inflight
-            for c in (entry_commit(e), entry_successor_base(e)) if c is not None
-        )
+        return frozenset(sha for e in self._inflight for sha in entry_bases(e))
 
     def _record_item_commit_dead(
         self, item: SpeculativeItem, site: DeadBaseSite, *, doomed: Collection[str] = (),
@@ -12122,8 +12128,9 @@ class SpeculativeMergeWorker:
         shutdown sentinel has been seen.
         """
         while True:
-            # Drain any newly arrived items into lane buffers.
+            # Buffer anything the persistent getter or the queue delivered.
             # Sets _shutdown_signaled if the sentinel is encountered.
+            self._harvest_pending_get()
             self._drain_queue_into_lanes()
 
             # δ/1889 — refresh the conflict-graph over the unfrozen suffix.
@@ -12154,31 +12161,40 @@ class SpeculativeMergeWorker:
             if await self._dissolve_coalesce_trains_if_halted():
                 continue
 
-            # Nothing pickable — start (or reuse) the persistent queue getter
-            # and wait for EITHER a new arrival OR a lane resume.
-            if self._pending_get is None or self._pending_get.done():
-                self._pending_get = asyncio.ensure_future(self._queue.get())
-
+            # Nothing pickable — wait for EITHER a new arrival OR a lane resume;
+            # the loop top harvests the arrival.
+            arrival = self._live_pending_get()
             self._resume_signal.clear()
             resume_task = asyncio.ensure_future(self._resume_signal.wait())
             try:
-                done, _ = await asyncio.wait(
-                    [self._pending_get, resume_task],
-                    return_when=asyncio.FIRST_COMPLETED,
+                await asyncio.wait(
+                    [arrival, resume_task], return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
                 if not resume_task.done():
                     resume_task.cancel()
 
-            # If _pending_get finished, harvest its result into lane buffers.
-            if self._pending_get in done:
-                item = self._pending_get.result()
-                self._pending_get = None
-                if item is None:
-                    self._shutdown_signaled = True
-                else:
-                    self._intake.buffer_owned_request(item)
-            # Loop to try pop_next_pickable again (maybe the resume unblocked a lane).
+    def _live_pending_get(self) -> asyncio.Task:
+        """The persistent queue getter, started when none is live.
+
+        Never replaced while it holds an undelivered item: only
+        :meth:`_harvest_pending_get` clears it.  Cancelling a pending
+        ``get()`` could lose an item, so it persists across waits.
+        """
+        if self._pending_get is None:
+            self._pending_get = asyncio.ensure_future(self._queue.get())
+        return self._pending_get
+
+    def _harvest_pending_get(self) -> None:
+        """Buffer the item the persistent getter delivered, noting a shutdown sentinel."""
+        if self._pending_get is None or not self._pending_get.done():
+            return
+        item = self._pending_get.result()
+        self._pending_get = None
+        if item is None:
+            self._shutdown_signaled = True
+        else:
+            self._intake.buffer_owned_request(item)
 
     # ── ι=1894 metric wiring helpers ─────────────────────────────────────────
 
@@ -13386,10 +13402,11 @@ class SpeculativeMergeWorker:
              swallows per-path errors internally (ENOENT/OSError) so it can
              never starve the heartbeat log.
           2. Delegates the fire/rate-limit/format/emit decision to the
-             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`,
-             then hands back the links of every deep chain reservation past
-             its deadline (:meth:`_expire_chain_reservations`, task 7720).
-          3. Delegates to the rate-limited, clock-injectable
+             synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+          3. Hands back the links of every deep chain reservation past its
+             deadline (:meth:`_expire_chain_reservations`, task 7720), the
+             only bound on a reservation nothing else released.
+          4. Delegates to the rate-limited, clock-injectable
              :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
              steady-state counterpart to the startup-only orphan reap — this
              is what bounds an audit-flagged leak's on-disk lifetime instead
@@ -13400,21 +13417,23 @@ class SpeculativeMergeWorker:
              a timed-out sweep is logged and simply retried on a later poll,
              subject to its own rate limit.
 
-        Steps 1-2 and step 3 are wrapped in their OWN, SEPARATE try/except
-        (mirroring the swallow-and-log convention used here and in
-        :meth:`_reprobe_loop`) so a fault in the periodic reap can never
-        suppress — or be suppressed by — the touch/heartbeat step, and
-        either kind of bug is logged and swallowed instead of crashing the
-        worker.
+        Steps 1-2, step 3 and step 4 are each wrapped in their OWN, SEPARATE
+        try/except (mirroring the swallow-and-log convention used here and in
+        :meth:`_reprobe_loop`) so a fault in one can never suppress — or be
+        suppressed by — another, and every kind of bug is logged and
+        swallowed instead of crashing the worker.
         """
         while self._running:
             await self._clock.sleep(_HEARTBEAT_POLL_S)
             try:
                 self._touch_owned_merge_worktrees()
                 self._maybe_log_queue_heartbeat(self._clock.now())
-                self._expire_chain_reservations()
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
+            try:
+                self._expire_chain_reservations()
+            except Exception:
+                logger.exception('merge queue heartbeat: chain-reservation expiry failed')
             try:
                 await asyncio.wait_for(
                     self._maybe_reap_orphaned_merge_worktrees(self._clock.now()),
@@ -15361,8 +15380,9 @@ class SpeculativeMergeWorker:
                     # 2435 kappa-b: self._inflight_req field deleted).
 
                     decided_base = await self._await_dispatch_decision(req) if held else None
-                    if await self._look_ahead(req, decided_base or merge_commit):
-                        break  # shutdown sentinel and nothing left to speculate
+                    look_ahead = await self._look_ahead(req, decided_base or merge_commit)
+                    if look_ahead is _LookAhead.SHUTDOWN:
+                        break
                 except WorktreeMissing as exc:
                     # The task worktree was removed out-of-band (typical
                     # cause: a human marked the task done and cleaned up
@@ -15507,21 +15527,29 @@ class SpeculativeMergeWorker:
         when no dispatch decided (see :meth:`_dispatch_deciding`).
 
         Races the verifier loop, so a verifier that dies undecided can never
-        wedge the merger; ``stop()`` releases every hold.
+        wedge the merger; ``stop()`` releases every hold.  Requests arriving
+        meanwhile go into the lane buffers, where *req*'s dispatch can chain
+        them: *req* may wait hours for a host.
         """
         verifier = self._verifier_task
         assert verifier is not None, 'a look-ahead hold needs a live verifier loop'
-        return await self._lookahead_hold.wait(req.request_id, alive=verifier)
+        ended = None
+        while ended is None:
+            self._harvest_pending_get()
+            self._drain_queue_into_lanes()
+            arrival = None if self._shutdown_signaled else self._live_pending_get()
+            ended = await self._lookahead_hold.wait(
+                req.request_id, alive=verifier, wake=arrival,
+            )
+        return ended.successor_base
 
-    async def _look_ahead(self, req: MergeRequest, base: str) -> bool:
+    async def _look_ahead(self, req: MergeRequest, base: str) -> _LookAhead:
         """Pre-pick the request to merge after *req*, onto *base*.
 
         *base* is what *req*'s successors stack on: its chain tip when its
         dispatch built a chain, else its own merge commit, re-merged when its
         dispatch re-merged it
         (:func:`~orchestrator.merge_lane.remerge_base.entry_successor_base`).
-        Returns True when the shutdown sentinel arrived and nothing was left
-        to speculate on.
         """
         # ── Speculative look-ahead (depth-K cap) ──────────────────
         # Acquire one speculation permit before the look-ahead peek.
@@ -15533,13 +15561,7 @@ class SpeculativeMergeWorker:
         await self._speculation_controller.acquire_for_lookahead()  # depth-K cap
         # Harvest any item already delivered to the persistent
         # getter so the look-ahead can see it via MergeIntake.pop_next_pickable.
-        if self._pending_get is not None and self._pending_get.done():
-            _item = self._pending_get.result()
-            self._pending_get = None
-            if _item is None:
-                self._shutdown_signaled = True
-            else:
-                self._intake.buffer_owned_request(_item)
+        self._harvest_pending_get()
         self._drain_queue_into_lanes()
         next_req = self._intake.pop_next_pickable()
         if next_req is not None:
@@ -15549,23 +15571,23 @@ class SpeculativeMergeWorker:
                 f'Task {req.task_id}: speculative look-ahead for '
                 f'{next_req.task_id} (base={base[:8]})'
             )
-        elif self._shutdown_signaled:
+            return _LookAhead.PICKED
+        if self._shutdown_signaled:
             self._speculation_controller.on_shutdown()  # return unused permit
-            return True
-        else:
-            # Nothing pickable right now AND predecessor is in-flight.
-            # RETAIN the held speculation permit so a late-arriving
-            # successor can attach to *base* (task 1862: close the
-            # disjoint-skip semantic-conflict hole).
-            #
-            # • DON'T release: the permit transfers to the late arrival
-            #   on ATTACH (or is released on FALLBACK at next dequeue).
-            # • DON'T set spec_base: the late arrival hasn't been dequeued
-            #   yet; spec_base is set at the ATTACH/FALLBACK decision.
-            # • Record predecessor's commit so the next dequeue can attach.
-            self._speculation_controller.on_lookahead_pending(base, req)
-            # held_by_merger stays 1 — permit retained for late arrival
-        return False
+            return _LookAhead.SHUTDOWN
+        # Nothing pickable right now AND predecessor is in-flight.
+        # RETAIN the held speculation permit so a late-arriving
+        # successor can attach to *base* (task 1862: close the
+        # disjoint-skip semantic-conflict hole).
+        #
+        # • DON'T release: the permit transfers to the late arrival
+        #   on ATTACH (or is released on FALLBACK at next dequeue).
+        # • DON'T set spec_base: the late arrival hasn't been dequeued
+        #   yet; spec_base is set at the ATTACH/FALLBACK decision.
+        # • Record predecessor's commit so the next dequeue can attach.
+        self._speculation_controller.on_lookahead_pending(base, req)
+        # held_by_merger stays 1 — permit retained for late arrival
+        return _LookAhead.PENDING
 
     # ------------------------------------------------------------------
     # Verifier coroutine
@@ -20144,6 +20166,10 @@ class SpeculativeMergeWorker:
             # A head parked on its gate keeps its lease, permit, chain flag
             # and drift base until the call that resumes it ends.
             if entry.gate is None:
+                # First, ahead of the awaits below: a raise or cancel there must
+                # not leave the links reserved until the deadline (idempotent;
+                # a landed chain already ended it).
+                self._end_chain_reservation(req.request_id, all_landed=False)
                 # Always: release the host lease (unless passthrough / already skipped),
                 # release the speculation permit iff one was threaded, and update
                 # _n_failed.
@@ -20165,7 +20191,6 @@ class SpeculativeMergeWorker:
                 # stops finding `entry` the moment a caller retires it from
                 # `_live_items` (or, for the RUNNER_UNAVAILABLE re-merge path above,
                 # once it transitions off VERIFYING/GATE_REVERIFY/FINALIZING).
-                self._end_chain_reservation(req.request_id, all_landed=False)
                 # ι=1894 amend: defensive _drift_base cleanup — idempotent pop that covers
                 # all terminal exit paths (blocked/error/halt/wip_halted/cas-exhausted/
                 # rebased-gate-failure).  _note_merge_landing and _note_conflict_detected
@@ -20806,10 +20831,7 @@ class SpeculativeMergeWorker:
         """The frozen prefix's merge commits, chain tips and gate-rebased heads a
         dispatch may be built on."""
         frozen = self._frozen_inflight_entries()
-        stacked_on = {
-            e.item.merge_result.merge_commit for e in frozen
-            if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
-        } | {b for e in frozen if (b := entry_successor_base(e)) is not None}
+        stacked_on = {sha for e in frozen for sha in entry_bases(e)}
         rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         rebased_heads |= rebased_head_commits(frozen)
         return stacked_on, rebased_heads

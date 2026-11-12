@@ -28,6 +28,7 @@ from orchestrator.merge_lane.remerge_base import (
     RemergeClaim,
     choose_remerge_base,
     claim_remerge_base,
+    entry_bases,
     entry_commit,
     entry_successor_base,
     frontier_tip,
@@ -357,6 +358,30 @@ class TestAChainedEntrysSuccessorBaseIsItsChainTip:
         assert entry_successor_base(plain) == entry_commit(plain) == 'sha-p'
         assert entry_successor_base(empty) == entry_commit(empty) == 'sha-e'
 
+    async def test_a_chained_entry_stands_for_its_commit_and_its_tip(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        chained = _entry(
+            config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(), chain=_CHAIN,
+        )
+        plain = _entry(config, 'p', base=_MAIN, commit='sha-p', verify=verifies.pending())
+        built_nothing = _entry(config, 'n', base=_MAIN, commit=None, verify=verifies.pending())
+        assert entry_bases(chained) == {'sha-s', 'TIP'}
+        assert entry_bases(plain) == {'sha-p'}
+        assert entry_bases(built_nothing) == frozenset()
+
+    async def test_a_dead_chained_commit_is_tip_dead(
+        self, config: OrchestratorConfig, verifies: VerifyTasks,
+    ) -> None:
+        frontier = [
+            _entry(
+                config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(),
+                chain=_CHAIN,
+            ),
+        ]
+        chosen = _choose('TIP', frontier, dead=frozenset({'sha-s'}))
+        assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
+
     async def test_the_frontier_tip_is_the_chain_tip(
         self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
@@ -393,23 +418,12 @@ class TestAChainedEntrysSuccessorBaseIsItsChainTip:
         chosen = _choose('TIP', frontier, dead=frozenset({'TIP'}))
         assert chosen == RemergeBase(None, RemergeReason.TIP_DEAD)
 
-    async def test_the_frozen_prefix_links_a_successor_through_the_chain_tip(
-        self, config: OrchestratorConfig, verifies: VerifyTasks,
-    ) -> None:
-        worker = _make_worker(GitOps(config.git, config.project_root))
-        _seed_frozen(
-            worker,
-            _entry(
-                config, 's', base=_MAIN, commit='sha-s', verify=verifies.pending(),
-                chain=_CHAIN,
-            ),
-            _entry(config, 'x', base='TIP', commit='sha-x', verify=verifies.pending()),
-        )
-        assert worker.check_frozen_prefix_invariant(_MAIN) == []
-
     async def test_a_successor_on_the_chained_entrys_own_commit_breaks_the_chain(
         self, config: OrchestratorConfig, verifies: VerifyTasks,
     ) -> None:
+        """The converse of the live C1 row (test_merge_queue_deep_reservation.py),
+        which stacks a successor on the tip: no live lane builds this state,
+        so it is seeded."""
         worker = _make_worker(GitOps(config.git, config.project_root))
         behind = _entry(config, 'x', base='sha-s', commit='sha-x', verify=verifies.pending())
         _seed_frozen(

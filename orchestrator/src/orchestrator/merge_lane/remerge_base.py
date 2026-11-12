@@ -38,6 +38,11 @@ def entry_successor_base(entry: InflightEntry) -> str | None:
     return entry_commit(entry)
 
 
+def entry_bases(entry: InflightEntry) -> frozenset[str]:
+    """Every commit *entry* stands for: its own merge commit and its successor base."""
+    return frozenset(filter(None, (entry_commit(entry), entry_successor_base(entry))))
+
+
 def frontier_tip(entries: Sequence[InflightEntry]) -> str | None:
     """The newest successor base among *entries*, or None when there is none."""
     for entry in reversed(entries):
@@ -72,10 +77,7 @@ def _breaks_chain(entry: InflightEntry, main_sha: str, dead_bases: Container[str
     base = item.base_sha.strip()
     if base and base != main_sha and base in dead_bases:
         return True
-    return any(
-        sha is not None and sha in dead_bases
-        for sha in (entry_commit(entry), entry_successor_base(entry))
-    )
+    return any(sha in dead_bases for sha in entry_bases(entry))
 
 
 def _owner_index(tip: str, frontier: Sequence[InflightEntry]) -> int | None:
