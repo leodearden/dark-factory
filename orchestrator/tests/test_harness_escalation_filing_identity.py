@@ -233,7 +233,7 @@ class TestEveryHarnessFilingSiteIsStamped:
     to 0 would silently lose the stamp — which is how this defect arose.
     """
 
-    def test_all_escalation_constructions_pass_filing_claimant_run_id(self) -> None:
+    def test_every_filing_site_passes_filing_claimant_run_id(self) -> None:
         calls = _filing_call_sites(_HARNESS_SRC_PATH)
         # Baseline at the time of writing; a drop means sites moved out of
         # this module and the tripwire's coverage silently shrank.  Raised

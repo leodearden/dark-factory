@@ -10213,7 +10213,7 @@ class Harness:
         if not dirty:
             if self._escalation_queue is not None:
                 for esc in self._escalation_queue.get_by_task(
-                    _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+                    _DIRTY_TREE_ALARM.task_id, status='pending', level=_DIRTY_TREE_ALARM.level,
                 ):
                     self._escalation_queue.resolve(
                         esc.id,
