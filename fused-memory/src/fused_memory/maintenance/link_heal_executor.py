@@ -85,6 +85,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     LinkHealLedger,
     RunSource,
     UndoTarget,
+    WriteRecords,
 )
 from fused_memory.maintenance.link_heal_store import (
     LinkCensus,
@@ -691,11 +692,13 @@ def link_heal_agent_id(run_id: str) -> str:
 
 @dataclass(frozen=True)
 class _Outcome:
-    """One heal's ledger state; ``wrote`` says whether a write was attempted."""
+    """One heal's ledger state; ``wrote`` says whether a write was attempted, and
+    ``records`` holds the reads the state was decided on."""
 
     state: ActionState
     detail: Mapping[str, Any] | None = None
     wrote: bool = False
+    records: WriteRecords | None = None
 
 
 def _read_failure(phase: str, failure: StoreReadFailed) -> dict[str, Any]:
@@ -708,7 +711,20 @@ def _read_failure(phase: str, failure: StoreReadFailed) -> dict[str, Any]:
     }
 
 
-async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> StaleField | None:
+@dataclass(frozen=True)
+class _Corroboration:
+    """The live reads a heal was corroborated against, and how they differ from its plan."""
+
+    child: LiveRecord | None
+    parent: LiveRecord | None
+    mismatch: StaleField | None
+
+    @property
+    def records(self) -> WriteRecords:
+        return WriteRecords(before_child=self.child, before_parent=self.parent)
+
+
+async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> _Corroboration:
     """Re-read the child, its parent when the heal rests on it, and (for a
     completion) its children, live."""
     child = await store.read(heal.project_id, heal.child_id)
@@ -723,13 +739,19 @@ async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> StaleField 
         if heal.action in COMPLETION_ACTIONS
         else None
     )
-    return corroboration_mismatch(heal, child, parent, child_count)
+    return _Corroboration(
+        child=child,
+        parent=parent,
+        mismatch=corroboration_mismatch(heal, child, parent, child_count),
+    )
 
 
 async def _verify(
     store: LinkHealStore, project_id: str, child_id: str, image: LinkImage,
-) -> StaleField | None:
-    return verification_mismatch(image, await store.read(project_id, child_id))
+) -> tuple[StaleField | None, LiveRecord | None]:
+    """Whether the record now shows *image*, and the record as read."""
+    record = await store.read(project_id, child_id)
+    return verification_mismatch(image, record), record
 
 
 async def _write_and_verify(
@@ -741,36 +763,48 @@ async def _write_and_verify(
     *,
     run_id: str,
     reason: str,
+    before: WriteRecords,
 ) -> _Outcome:
-    """Send *change* as one write, then confirm the record shows *after*."""
+    """Send *change* as one write, then confirm the record shows *after*.
+
+    The outcome's records are *before* plus the child the verification read.
+    """
     reply = await store.write(
         project_id, child_id, change,
         agent_id=link_heal_agent_id(run_id), causation_id=run_id, reason=reason,
     )
     if not reply.landed:
         detail = {'failure': 'write', 'error_type': reply.error_type, 'error': reply.error}
-        return _Outcome(ActionState.FAILED, detail, wrote=True)
+        return _Outcome(ActionState.FAILED, detail, wrote=True, records=before)
     try:
-        mismatch = await _verify(store, project_id, child_id, after)
+        mismatch, verified = await _verify(store, project_id, child_id, after)
     except StoreReadFailed as failure:
-        return _Outcome(ActionState.FAILED, _read_failure('verify', failure), wrote=True)
+        return _Outcome(
+            ActionState.FAILED, _read_failure('verify', failure), wrote=True, records=before,
+        )
+    records = replace(before, after_child=verified)
     if mismatch is not None:
         detail = {'failure': 'verify', 'field': mismatch.value}
-        return _Outcome(ActionState.FAILED, detail, wrote=True)
-    return _Outcome(ActionState.APPLIED, wrote=True)
+        return _Outcome(ActionState.FAILED, detail, wrote=True, records=records)
+    return _Outcome(ActionState.APPLIED, wrote=True, records=records)
 
 
 async def _heal_one(heal: PlannedAction, *, store: LinkHealStore, run_id: str) -> _Outcome:
     try:
-        stale = await _corroborate(store, heal)
+        corroboration = await _corroborate(store, heal)
     except StoreReadFailed as failure:
         return _Outcome(ActionState.FAILED, _read_failure('read', failure))
-    if stale is not None:
-        return _Outcome(ActionState.SKIPPED_STALE, {'stale_field': stale.value})
+    if corroboration.mismatch is not None:
+        return _Outcome(
+            ActionState.SKIPPED_STALE,
+            {'stale_field': corroboration.mismatch.value},
+            records=corroboration.records,
+        )
     return await _write_and_verify(
         store, heal.project_id, heal.child_id, heal.change, heal.post_image,
         run_id=run_id,
         reason=journal_reason(run_id[:8], heal.action, heal.pre_image),
+        before=corroboration.records,
     )
 
 
@@ -847,7 +881,9 @@ async def _drain(
             outcome = _Outcome(ActionState.SKIPPED_CAP)
         else:
             outcome = await _heal_one(row.planned, store=store, run_id=run_id)
-        ledger.set_outcome(row.action_id, outcome.state, run_id, outcome.detail)
+        ledger.set_outcome(
+            row.action_id, outcome.state, run_id, outcome.detail, records=outcome.records,
+        )
         if drain.record(outcome):
             drain.stop(not_attempted=len(pending) - index - 1)
             break
@@ -965,15 +1001,17 @@ async def _undo_step(
 ) -> _Outcome:
     """Corroborate that the record shows *before*, write *change*, verify *after*."""
     try:
-        stale = await _verify(store, heal.project_id, heal.child_id, before)
+        stale, current = await _verify(store, heal.project_id, heal.child_id, before)
     except StoreReadFailed as failure:
         return _Outcome(ActionState.FAILED, _read_failure('read', failure))
+    records = WriteRecords(before_child=current)
     if stale is not None:
-        return _Outcome(ActionState.SKIPPED_STALE, {'stale_field': stale.value})
+        return _Outcome(ActionState.SKIPPED_STALE, {'stale_field': stale.value}, records=records)
     return await _write_and_verify(
         store, heal.project_id, heal.child_id, change, after,
         run_id=run_id,
         reason=journal_reason(run_id[:8], UNDO_ACTION, before),
+        before=records,
     )
 
 
@@ -998,6 +1036,7 @@ async def _undo_heal(
         outcome = await _undo_step(heal, change, before, after, store=store, run_id=run_id)
         ledger.add_undo_step(
             run_id, row, before=before, after=after, state=outcome.state, detail=outcome.detail,
+            records=outcome.records,
         )
         wrote = wrote or outcome.wrote
         if outcome.state is not ActionState.APPLIED:

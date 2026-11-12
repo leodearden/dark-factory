@@ -203,7 +203,8 @@ _ADDED_COLUMNS = (
 _ACTION_COLUMNS = (
     'actions.id, actions.run_id, project_id, child_id, action, pre_image_json, '
     'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, state, '
-    'detail, executed_run_id, undone_run_id'
+    'detail, executed_run_id, undone_run_id, before_child_snapshot_id, '
+    'before_parent_snapshot_id, after_child_snapshot_id'
 )
 _HEALS_ONLY = f"basis_source != '{BasisSource.UNDO}'"
 _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
@@ -274,8 +275,19 @@ class NothingToUndo(LookupError):
 
 
 @dataclass(frozen=True)
+class WriteRecords:
+    """The records one heal's outcome was decided on, as the heal itself read them:
+    the child and parent its corroboration read, and the child its verification read."""
+
+    before_child: LiveRecord | None = None
+    before_parent: LiveRecord | None = None
+    after_child: LiveRecord | None = None
+
+
+@dataclass(frozen=True)
 class ActionRow:
-    """A planned heal and what became of it."""
+    """A planned heal and what became of it, with the snapshots of the records its
+    last outcome was decided on (see :class:`WriteRecords`)."""
 
     action_id: int
     run_id: str
@@ -284,6 +296,9 @@ class ActionRow:
     detail: Mapping[str, Any] | None
     executed_run_id: str | None
     undone_run_id: str | None
+    before_child_snapshot_id: int | None = None
+    before_parent_snapshot_id: int | None = None
+    after_child_snapshot_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +442,8 @@ class UndoStepRow:
     basis_key: str
     state: ActionState
     detail: Mapping[str, Any] | None
+    before_child_snapshot_id: int | None = None
+    after_child_snapshot_id: int | None = None
 
 
 class LinkHealLedger:
@@ -649,13 +666,47 @@ class LinkHealLedger:
         state: ActionState,
         executed_run_id: str,
         detail: Mapping[str, Any] | None,
+        *,
+        records: WriteRecords | None = None,
     ) -> None:
         with self._conn:
-            self._conn.execute(
-                'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ? '
-                'WHERE id = ?',
-                (state.value, executed_run_id, _json_or_none(detail), _now(), action_id),
+            snapshot_ids = (
+                (None, None, None)
+                if records is None
+                else self._record_snapshot_ids(self._action_project(action_id), records)
             )
+            self._conn.execute(
+                'UPDATE actions SET state = ?, executed_run_id = ?, detail = ?, at = ?, '
+                'before_child_snapshot_id = ?, before_parent_snapshot_id = ?, '
+                'after_child_snapshot_id = ? WHERE id = ?',
+                (
+                    state.value, executed_run_id, _json_or_none(detail), _now(),
+                    *snapshot_ids, action_id,
+                ),
+            )
+
+    def _action_project(self, action_id: int) -> str:
+        row = self._conn.execute(
+            'SELECT project_id FROM actions WHERE id = ?', (action_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f'no link-heal action {action_id} in {self.db_path}')
+        return row['project_id']
+
+    def _record_snapshot_ids(
+        self, project_id: str, records: WriteRecords | None,
+    ) -> tuple[int | None, int | None, int | None]:
+        """The snapshot ids of *records*' before-child, before-parent and after-child."""
+        if records is None:
+            return None, None, None
+        return (
+            self._optional_snapshot_id(project_id, records.before_child),
+            self._optional_snapshot_id(project_id, records.before_parent),
+            self._optional_snapshot_id(project_id, records.after_child),
+        )
+
+    def _optional_snapshot_id(self, project_id: str, record: LiveRecord | None) -> int | None:
+        return None if record is None else self._snapshot_id(project_id, record)
 
     def mark_undone(self, action_id: int, undo_run_id: str) -> None:
         with self._conn:
@@ -699,19 +750,25 @@ class LinkHealLedger:
         after: LinkImage,
         state: ActionState,
         detail: Mapping[str, Any] | None,
+        records: WriteRecords | None = None,
     ) -> int:
         heal = original.planned
         with self._conn:
+            before_child, _parent, after_child = self._record_snapshot_ids(
+                heal.project_id, records,
+            )
             cursor = self._conn.execute(
                 'INSERT INTO actions (run_id, project_id, child_id, action, pre_image_json, '
                 'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, '
-                'state, detail, at, executed_run_id) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'state, detail, at, executed_run_id, before_child_snapshot_id, '
+                'after_child_snapshot_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     undo_run_id, heal.project_id, heal.child_id, UNDO_ACTION,
                     _image_json(before), _image_json(after), BasisSource.UNDO.value,
                     str(original.action_id), heal.child_sha256, heal.parent_sha256,
                     state.value, _json_or_none(detail), _now(), undo_run_id,
+                    before_child, after_child,
                 ),
             )
         return _lastrowid(cursor)
@@ -888,6 +945,9 @@ def _action_row(row: sqlite3.Row) -> ActionRow:
         detail=_loads_or_none(row['detail']),
         executed_run_id=row['executed_run_id'],
         undone_run_id=row['undone_run_id'],
+        before_child_snapshot_id=row['before_child_snapshot_id'],
+        before_parent_snapshot_id=row['before_parent_snapshot_id'],
+        after_child_snapshot_id=row['after_child_snapshot_id'],
     )
 
 
@@ -923,6 +983,8 @@ def _undo_step_row(row: sqlite3.Row) -> UndoStepRow:
         basis_key=row['basis_key'],
         state=ActionState(row['state']),
         detail=_loads_or_none(row['detail']),
+        before_child_snapshot_id=row['before_child_snapshot_id'],
+        after_child_snapshot_id=row['after_child_snapshot_id'],
     )
 
 
