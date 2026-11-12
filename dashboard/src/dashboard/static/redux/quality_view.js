@@ -1,8 +1,8 @@
 // quality_view.js — the pure decisions behind the Quality tab
-// (tab_quality.jsx): which served metrics each section draws, the text of a
-// headline, a counting rule, an alarm verdict and a before/after comparison,
-// the arrays a metric's chart draws, the cost model's readings, and where each
-// served marker and alarm sits on that chart.
+// (tab_quality.jsx): which served metrics each section draws and their titles,
+// the text of a headline, a counting rule, an alarm verdict and a before/after
+// comparison, the arrays and y-axis a metric's chart draws, the cost model's
+// readings, and where each served marker and alarm sits on that chart.
 //
 // Every figure is read from the served QUALITY / QUALITY_MARKERS values
 // (dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire and
@@ -41,6 +41,23 @@ const QUALITY_LAYOUT = Object.freeze({
   ]),
 });
 
+const QUALITY_LAID_OUT = Object.freeze([...QUALITY_LAYOUT.outcomes, ...QUALITY_LAYOUT.changeCost]);
+
+// A metric laid out beside another has no layout title, so it is named by what
+// its served rule counts, as the panel it sits in names it.
+function metricTitle(metricId, metric) {
+  const entry = QUALITY_LAID_OUT.find(laidOut => laidOut.metric === metricId);
+  return entry ? entry.title : metric.rule.counts;
+}
+
+// The one way a renderer is chosen from a table keyed by a served field: a
+// value the table has no entry for is refused, named, rather than failing
+// later as an anonymous call of undefined inside a render.
+function qualityRendererFor(table, key, refusal) {
+  if (!Object.prototype.hasOwnProperty.call(table, key)) throw new TypeError(`quality_view.js ${refusal}`);
+  return table[key];
+}
+
 function qualityPercent(share) {
   return `${(share * 100).toFixed(1)}%`;
 }
@@ -70,10 +87,10 @@ const QUALITY_HEADLINE_TEXT = Object.freeze({
 });
 
 function headlineText(headline, unit) {
-  if (!Object.prototype.hasOwnProperty.call(QUALITY_HEADLINE_TEXT, headline.form)) {
-    throw new TypeError(`quality_view.js renders no headline form ${JSON.stringify(headline.form)}`);
-  }
-  return QUALITY_HEADLINE_TEXT[headline.form](headline, unit);
+  const render = qualityRendererFor(
+    QUALITY_HEADLINE_TEXT, headline.form, `renders no headline form ${JSON.stringify(headline.form)}`,
+  );
+  return render(headline, unit);
 }
 
 function ruleCaption(rule) {
@@ -96,6 +113,22 @@ function chartSeries(metric) {
   }
   const band = metric.kind === 'rate' ? { lo: metric.rolling.lo, hi: metric.rolling.hi } : null;
   return { series, band };
+}
+
+const QUALITY_TICK_TEXT = Object.freeze({
+  rate: () => qualityPercent,
+  count: unit => value => qualityAmount(value, unit),
+  cost: unit => value => qualityAmount(value, unit),
+});
+
+// A metric chart's y-axis: ticks in its headline's units, scaled to the data
+// (minAxisMax 0). LineChart's default least maximum of 1 would draw every rate
+// on 0..1, pressing a 3% rate, its band and its UCL onto the floor of the plot.
+function chartAxis(metric) {
+  const tickText = qualityRendererFor(
+    QUALITY_TICK_TEXT, metric.kind, `draws no axis for metric kind ${JSON.stringify(metric.kind)}`,
+  );
+  return { formatY: tickText(metric.unit), minAxisMax: 0 };
 }
 
 function indexMarkers(markers) {
@@ -124,7 +157,11 @@ function qualityNotYetText(entry, kind) {
 
 function beforeAfterText(entry, kind) {
   if (entry.state === 'not_yet') return qualityNotYetText(entry, kind);
-  return `${QUALITY_EFFECT_TEXT[kind](entry)} · n ${entry.n_before} → ${entry.n_after}`;
+  const effectText = qualityRendererFor(
+    QUALITY_EFFECT_TEXT, kind,
+    `renders no ${JSON.stringify(kind)} comparison (marker ${entry.marker_id}, metric ${entry.metric})`,
+  );
+  return `${effectText(entry)} · n ${entry.n_before} → ${entry.n_after}`;
 }
 
 const QUALITY_BASELINE_HINT = Object.freeze({
@@ -198,9 +235,11 @@ function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
 // datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
 const QUALITY_VIEW_API = {
   QUALITY_LAYOUT,
+  metricTitle,
   headlineText,
   ruleCaption,
   chartSeries,
+  chartAxis,
   indexMarkers,
   alarmVerdict,
   beforeAfterText,

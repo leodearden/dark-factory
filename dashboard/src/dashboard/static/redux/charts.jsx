@@ -141,8 +141,8 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 // (task 6370); formatY is presentation only. Rationale at spark_path.js::axisMax.
 // `band` ({ lo, hi, color? }) is drawn beneath the series wherever both bounds
 // are plottable, and its hi joins the axis fold. A series with `dash` is drawn
-// dashed.
-function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false }) {
+// dashed. `minAxisMax` is the least axis maximum, the seed of that fold.
+function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, countAxis = false, minAxisMax = 1 }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -158,12 +158,13 @@ function LineChart({ series, labels, band, height = 220, yLabel, formatY = (v) =
   // Hole-excluding fold (task 3489): one undefined/NaN sample used to poison
   // maxV to NaN, `range = NaN - NaN || 1` silently fell back to 1, and every y
   // became NaN — a single NaN token invalidates the whole `d` attribute, so SVG
-  // dropped the ENTIRE path. The `1` seed is preserved deliberately, as is
-  // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
-  // samples in-range and silently re-frame every LineChart on the dashboard.
-  // This is a null-handling fix, not a re-scaling.
+  // dropped the ENTIRE path. The `1` seed is preserved deliberately as the
+  // minAxisMax default, as is minV = 0: switching to a `Math.min(...)` fold
+  // would newly bring negative samples in-range and silently re-frame every
+  // LineChart on the dashboard. This is a null-handling fix, not a re-scaling;
+  // a chart of small fractions opts out of the seed by passing minAxisMax.
   const ticks = 4;
-  const maxV = axisMax(plottableMax(all, 1), ticks, countAxis);
+  const maxV = axisMax(plottableMax(all, minAxisMax), ticks, countAxis);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
@@ -663,10 +664,13 @@ const DATUM_AGE_STYLE = Object.freeze({ fontFamily: 'var(--mono)', fontSize: 10,
 // The age badge sits beside the delta, in the same row: both are secondary
 // annotations on the value above them, and putting the age there costs the
 // value cell no width when there is nothing to badge.
-function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint }) {
+//
+// `title` is the whole tile's tooltip; a hole's reason still wins over it on
+// the value cell.
+function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint, title }) {
   const view = datumView(datum, { now: Date.now(), format });
   return (
-    <div className="kpi">
+    <div className="kpi" title={title}>
       <div className="lbl">{label}{hint && <span style={{ color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0, fontSize: 10 }}> · {hint}</span>}</div>
       <div className="val" title={view.title || undefined}>{view.text}{unit && <span className="unit">{unit}</span>}</div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 6 }}>

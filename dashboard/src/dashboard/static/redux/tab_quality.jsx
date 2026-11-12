@@ -32,9 +32,11 @@ const {
 const { Segmented: QualitySegmented, DatumReading: QualityDatumReading } = window.DF_SHELL;
 const {
   QUALITY_LAYOUT: QUALITY_TAB_LAYOUT,
+  metricTitle,
   headlineText,
   ruleCaption,
   chartSeries,
+  chartAxis,
   indexMarkers,
   beforeAfterText,
   costModelReadings,
@@ -73,11 +75,6 @@ function qualityFieldDatum(query, field) {
   return datumFor(QUALITY_ON_DEMAND_KEYS.quality.key(query, field));
 }
 
-function qualityTitleOf(metricId) {
-  const entry = [...QUALITY_TAB_LAYOUT.outcomes, ...QUALITY_TAB_LAYOUT.changeCost].find(e => e.metric === metricId);
-  return entry ? entry.title : metricId;
-}
-
 function QualityHeader({ projects, project, onProject, landings, onLandings, query, moduleName, onClearModule }) {
   const echo = receiptWindow(onDemandReceipt('quality', query));
   const pending = pendingWindow(landings, echo, QUALITY_WINDOW_SETS.landings);
@@ -113,6 +110,7 @@ function QualityHeadlines({ metrics }) {
             datum={metric.headline}
             format={value => headlineText(value, metric.unit)}
             history={metric.rolling.center}
+            title={ruleCaption(metric.rule)}
           />
         );
       })}
@@ -134,6 +132,7 @@ function QualityMetricPanel({ entry, quality, markers }) {
     return <div className="panel" data-quality-metric={entry.metric} style={QUALITY_NOTE_STYLE}>{entry.title}: not served</div>;
   }
   const { series, band } = chartSeries(metric);
+  const { formatY, minAxisMax } = chartAxis(metric);
   const marks = qualityMarks({
     axis: quality.axis, markers, alarms: metric.alarms, beforeAfter: quality.before_after,
     metricId: entry.metric, kind: metric.kind,
@@ -149,6 +148,8 @@ function QualityMetricPanel({ entry, quality, markers }) {
             series={series.map(s => ({ ...s, color: QUALITY_SERIES_COLORS[s.key], fill: false }))}
             band={band}
             labels={quality.axis.map(point => `#${point.ordinal}`)}
+            formatY={formatY}
+            minAxisMax={minAxisMax}
             height={180}
           />
         </QualityMarkedChart>
@@ -199,7 +200,7 @@ function QualityBeforeAfter({ quality, markers }) {
             <div style={{ fontSize: 12 }}>{byId.has(id) ? byId.get(id).label : id}</div>
             {entries.filter(entry => entry.marker_id === id).map(entry => (
               <div key={entry.metric} style={QUALITY_NOTE_STYLE}>
-                {qualityTitleOf(entry.metric)}: <span className="mono">{beforeAfterText(entry, quality.metrics[entry.metric].kind)}</span>
+                {metricTitle(entry.metric, quality.metrics[entry.metric])}: <span className="mono">{beforeAfterText(entry, quality.metrics[entry.metric].kind)}</span>
               </div>
             ))}
           </div>

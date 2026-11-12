@@ -34,9 +34,11 @@ function loadQualityView() {
 const { api: view, window: loadedWindow } = loadQualityView();
 const {
   QUALITY_LAYOUT,
+  metricTitle,
   headlineText,
   ruleCaption,
   chartSeries,
+  chartAxis,
   indexMarkers,
   alarmVerdict,
   beforeAfterText,
@@ -54,8 +56,8 @@ const CATALOGUE_IDS = [
 test('quality_view.js assigns window.DF_QUALITY_VIEW to its module surface', () => {
   assert.equal(loadedWindow.DF_QUALITY_VIEW, view);
   assert.deepEqual(Object.keys(view).sort(), [
-    'QUALITY_LAYOUT', 'alarmVerdict', 'beforeAfterText', 'chartSeries', 'costModelReadings',
-    'headlineText', 'indexMarkers', 'qualityMarks', 'ruleCaption',
+    'QUALITY_LAYOUT', 'alarmVerdict', 'beforeAfterText', 'chartAxis', 'chartSeries', 'costModelReadings',
+    'headlineText', 'indexMarkers', 'metricTitle', 'qualityMarks', 'ruleCaption',
   ]);
 });
 
@@ -87,6 +89,21 @@ test('every laid-out metric is a served catalogue metric and every entry is titl
     assert.ok(entry.beside === null || CATALOGUE_IDS.includes(entry.beside), entry.beside);
     assert.equal(typeof entry.title, 'string');
     assert.notEqual(entry.title, '');
+  }
+});
+
+test('a laid-out metric is titled by its layout entry', () => {
+  const metric = qualityMetric({ points: [0, 1] });
+
+  assert.equal(metricTitle('rejected', metric), 'Verify rejections');
+  assert.equal(metricTitle('turns', qualityMetric({ kind: 'count', points: [1] })), 'Turns per landing');
+});
+
+test('a metric drawn only beside another is titled by what its served rule counts', () => {
+  for (const id of ['rejections_per_landing', 'flakes_real_red', 'turns_capped']) {
+    const metric = qualityMetric({ points: [0, 1], source: `${id}_source` });
+
+    assert.equal(metricTitle(id, metric), metric.rule.counts, id);
   }
 });
 
@@ -194,6 +211,33 @@ test('a count or a cost charts its rolling centre alone, with no band', () => {
   }
 });
 
+// ── Chart axes ────────────────────────────────────────────────────────────
+
+test('a rate axis is scaled to its data and ticks in percent, as its headline reads', () => {
+  const { formatY, minAxisMax } = chartAxis(rateMetric());
+
+  assert.equal(minAxisMax, 0);
+  assert.equal(formatY(0.0183), '1.8%');
+  assert.equal(formatY(0), '0.0%');
+});
+
+test('a count axis ticks in fixed decimals, so a float-noise tick reads as its value', () => {
+  const { formatY, minAxisMax } = chartAxis(qualityMetric({ kind: 'count', points: [1.2, 1.6] }));
+
+  assert.equal(minAxisMax, 0);
+  assert.equal(formatY(1.2000000000000002), '1.20');
+});
+
+test('a cost axis in usd ticks in dollars', () => {
+  const { formatY } = chartAxis(qualityMetric({ kind: 'cost', points: [3.5] }));
+
+  assert.equal(formatY(3.5), '$3.50');
+});
+
+test('an axis for a metric kind the view does not know is refused, naming it', () => {
+  assert.throws(() => chartAxis(qualityMetric({ kind: 'ratio', points: [1] })), /"ratio"/);
+});
+
 // ── Alarms ────────────────────────────────────────────────────────────────
 
 const FLIP = qualityMarker({ id: 'routing:reviewer_comprehensive:1', ordinal: 13, label: 'reviewer effort high → xhigh', ref: 'task 7972' });
@@ -253,6 +297,18 @@ test('a not-yet comparison omits what the server did not measure', () => {
   });
 
   assert.equal(beforeAfterText(entry, 'cost'), 'n 250 → 40');
+});
+
+test('a measured comparison of a kind the view has no text for is refused, naming the kind, marker and metric', () => {
+  const entry = comparison({ metric: 'turns', effect: 1.2, lo: 1.1, hi: 1.3 });
+
+  assert.throws(
+    () => beforeAfterText(entry, 'count'),
+    error => error instanceof TypeError
+      && error.message.includes('"count"')
+      && error.message.includes(FLIP.id)
+      && error.message.includes('turns'),
+  );
 });
 
 // ── The cost model in force ───────────────────────────────────────────────

@@ -45,9 +45,10 @@ function plotGeom(window, count, range, { width = CHART_WIDTH, height = CHART_HE
   };
 }
 
-function axisRange(window, values) {
+// LineChart's axis maximum over `values`, its least maximum `minAxisMax`.
+function axisRange(window, values, minAxisMax = 1) {
   const { axisMax, plottableMax } = window.DF_SPARK_PATH;
-  return axisMax(plottableMax(values, 1), 4, false);
+  return axisMax(plottableMax(values, minAxisMax), 4, false);
 }
 
 function mountLineChart(harness, props) {
@@ -119,6 +120,15 @@ test('charts.jsx::LineChart folds the band hi into the axis maximum', t => {
 
   assert.equal(yTickTexts(without).at(-1), '3');
   assert.equal(yTickTexts(withBand).at(-1), '9', 'a band above every series value raises the top tick');
+});
+
+test('charts.jsx::LineChart scales small fractions to their data when minAxisMax is lowered', t => {
+  const harness = openWindow(t);
+  const series = [{ key: 'rate', values: [0.02, 0.04] }];
+  const labels = ['a', 'b'];
+
+  assert.equal(yTickTexts(mountLineChart(harness, { series, labels })).at(-1), '1', 'the default least maximum is 1');
+  assert.equal(yTickTexts(mountLineChart(harness, { series, labels, minAxisMax: 0 })).at(-1), '0.04');
 });
 
 test('charts.jsx::LineChart draws no band when none is passed, or when it is all holes', t => {
@@ -428,6 +438,7 @@ const NOT_YET = qualityComparison({
   markerId: FLIP.id, metric: 'rejected', state: 'not_yet', nBefore: 290, nAfter: 25, etaDays: 6.25, minDetectable: 0.1255,
 });
 const COST_RATIO = qualityComparison({ markerId: FLIP.id, metric: 'all_role_usd', effect: 0.82, lo: 0.7, hi: 0.95 });
+const BESIDE_RATE = qualityComparison({ markerId: FLIP.id, metric: 'flakes_real_red', effect: -0.02, lo: -0.05, hi: 0.01 });
 const COST_MODEL = { a: 0.4, b: 0.7, reference_cost_100: 1.837, residual_median: -0.1204, state: 'frozen' };
 const MODULE_ROWS = [
   qualityModuleRow({ module: 'dashboard' }),
@@ -471,7 +482,7 @@ function qualityFixture(window, { served = '100', requested = served } = {}) {
     metrics: Object.fromEntries(ids.map(id => [id, qualityFixtureMetric(id)])),
     costModel: COST_MODEL,
     modules: MODULE_ROWS,
-    beforeAfter: [NOT_YET, COST_RATIO],
+    beforeAfter: [NOT_YET, COST_RATIO, BESIDE_RATE],
   });
   const body = qualityBody({ quality, markers: qualityMarkers(QUALITY_MARKER_ROWS), window: served });
   return { ...body, WINDOW: { ...body.WINDOW, requested } };
@@ -573,11 +584,14 @@ test('tab_quality.jsx::QualityTab renders one StatTile per laid-out metric, its 
   const { datumView } = window.DF_DATUM;
   const { sparkPaths } = window.DF_SPARK_PATH;
 
+  const { ruleCaption } = window.DF_QUALITY_VIEW;
+
   const tiles = [...section(container, 'headlines').querySelectorAll('.kpi')];
   const entries = layoutEntries(window);
   assert.deepEqual(tiles.map(tile => tile.querySelector('.lbl').textContent), entries.map(entry => entry.title));
   entries.forEach((entry, i) => {
     const metric = quality.metrics[entry.metric];
+    assert.equal(tiles[i].getAttribute('title'), ruleCaption(metric.rule), `${entry.metric}: its tooltip is its rule`);
     const expected = datumView(metric.headline, { format: value => headlineText(value, metric.unit) }).text;
     assert.equal(tiles[i].querySelector('.val').textContent, expected, entry.metric);
     const spark = tiles[i].querySelector('.spark path[fill="none"]');
@@ -585,24 +599,28 @@ test('tab_quality.jsx::QualityTab renders one StatTile per laid-out metric, its 
   });
 });
 
-function plotGeomOf(window, panel, count, values) {
+function plotGeomOf(window, panel, count, values, minAxisMax) {
   const [, , width, height] = panel.querySelector('svg').getAttribute('viewBox').split(' ').map(Number);
-  return plotGeom(window, count, axisRange(window, values), { width, height });
+  return plotGeom(window, count, axisRange(window, values, minAxisMax), { width, height });
 }
 
 test('tab_quality.jsx::QualityTab draws each outcome chart from chartSeries: its band, EWMA line and dashed UCL', async t => {
   const harness = openWindow(t);
   const { window } = harness;
   const { container, quality } = await mountAnswered(harness);
-  const { chartSeries, QUALITY_LAYOUT } = window.DF_QUALITY_VIEW;
+  const { chartSeries, chartAxis, QUALITY_LAYOUT } = window.DF_QUALITY_VIEW;
   const { axisPaths, bandPaths } = window.DF_SPARK_PATH;
 
   for (const { metric: id } of QUALITY_LAYOUT.outcomes) {
     const panel = metricPanel(section(container, 'outcomes'), id);
     assert.ok(panel, `the outcomes section draws ${id}`);
     const { series, band } = chartSeries(quality.metrics[id]);
+    const { formatY, minAxisMax } = chartAxis(quality.metrics[id]);
     const values = [...series.flatMap(s => s.values), ...(band ? band.hi : [])];
-    const geom = plotGeomOf(window, panel, LANDINGS, values);
+    const geom = plotGeomOf(window, panel, LANDINGS, values, minAxisMax);
+    const ticks = Array.from({ length: 5 }, (_, i) => geom.min + (geom.range * i) / 4);
+
+    assert.deepEqual(yTickTexts(panel), ticks.map(formatY), `${id}: the y axis is chartAxis's, in its headline units`);
 
     assert.deepEqual(bandDs(panel), band ? [...bandPaths(band.lo, band.hi, geom)] : [], `${id}: band`);
     for (const s of series) {
@@ -678,6 +696,18 @@ test('tab_quality.jsx::QualityTab shows each before/after comparison under its m
   assert.ok(panel.textContent.includes(FLIP.label), panel.textContent);
   assert.ok(panel.textContent.includes(beforeAfterText(NOT_YET, 'rate')), panel.textContent);
   assert.ok(panel.textContent.includes(beforeAfterText(COST_RATIO, 'cost')), panel.textContent);
+});
+
+test('tab_quality.jsx::QualityTab titles every before/after row through metricTitle, a beside metric by its rule', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container, quality } = await mountAnswered(harness);
+  const { metricTitle } = window.DF_QUALITY_VIEW;
+  const rows = [...section(container, 'before-after').querySelectorAll('.mono')].map(value => value.parentElement.textContent);
+
+  const titles = rows.map(row => row.slice(0, row.indexOf(': ')));
+  assert.deepEqual(titles, [NOT_YET, COST_RATIO, BESIDE_RATE].map(entry => metricTitle(entry.metric, quality.metrics[entry.metric])));
+  assert.equal(titles.includes(BESIDE_RATE.metric), false, 'no row is titled by its raw metric id');
 });
 
 function moduleRow(container, name) {
