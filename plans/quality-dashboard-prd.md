@@ -573,7 +573,16 @@ are in `dashboard/src/dashboard/data/quality_markers.py`.
   reviewer_policy, routing_rule, cli and regime are boundaries. artefact is an exclusion range.
   deploy and instrument are not landing-axis events. Derived markers carry `series = null`, so each
   is a regime event for every series. The route passes the stream's `regime_events()` to
-  `read_quality_series` (`dashboard/src/dashboard/api/quality.py::api_quality`).
+  `read_quality_series` (`dashboard/src/dashboard/api/quality.py::api_quality`). Before the
+  project's first derivation, when `QUALITY_MARKERS` is unknown, it passes the curated markers in
+  the project's scope instead, so a curated artefact is excluded from the start
+  (`dashboard/src/dashboard/api/quality.py::_regime_events`).
+- Steps (`::fold_routing_decisions`): a role's steps are run-length encoded from its decisions
+  with `source_layer ∈ {config, role_default}` that no policy rule matched (`rule_id` null).
+  `orchestrator/src/orchestrator/routing.py::resolve_route` applies a matched rule's effort,
+  budget and turns even when it refuses the rule's model, which leaves the layer `config` or
+  `role_default`. Such a row feeds only its rule's span. A row naming a layer outside
+  `::SourceLayer` is skipped and counted.
 - Persistence (decision 11, in `::_persists` and `::_counted_groups`): a non-start step counts iff
   it has ≥3 decisions and either spans ≥24 h, or the next step changes a field it did not. The span
   runs to the next step's first dispatch, or for the open step to the fold's newest decision.
@@ -594,8 +603,12 @@ are in `dashboard/src/dashboard/data/quality_markers.py`.
   table (`dashboard/src/dashboard/data/quality_store.py::ensure_marker_tables`).
 - Tick: `dashboard/src/dashboard/data/quality_marker_sampler.py::refresh_markers` runs after
   `collect_quality` in `dashboard/src/dashboard/loops.py::_quality_loop`. Each tick folds at most
-  `MARKER_ROUTING_BATCH` routing rows per root and re-derives every marker from the fold plus the
-  small sources.
+  `MARKER_ROUTING_BATCH` (500,000) routing rows per root and re-derives every marker from the fold
+  plus the small sources. Measured 2026-11-12, df's 27,152 routing rows fold in 0.32 s, so a cold
+  start completes in one tick. The tick resumes from the stored fold alone
+  (`dashboard/src/dashboard/data/quality_store.py::read_routing_fold`). A stored fold that no
+  longer decodes is folded again from the start, and that root's write replaces it. Both quality
+  ticks share their per-root machinery (`dashboard/src/dashboard/data/quality_root_tick.py`).
 - `load_curated_markers(path)` returns `CuratedMarkers(markers, parse_failures)`. `kind` takes the
   whole marker vocabulary. `until` (artefact only) is the inclusive end of its UTC day. Every
   rejected entry is counted. `derived_markers(runs_db, project_id, snapshots)` is the stateless full

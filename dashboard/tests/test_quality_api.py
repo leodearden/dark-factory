@@ -211,10 +211,20 @@ DF_EVENTS: list[EventRow] = [
 REIFY_EVENTS: list[EventRow] = _reviewer_flip(REIFY_FLIP)
 
 
+FLIP_LANDINGS = 48
+
+
+def _every_third_flaky(ordinal: int) -> Outcomes:
+    return replace(NO_OUTCOMES, flake_confirmed=ordinal % 3 == 0, flake_real_red=False,
+                   flake_rows=1)
+
+
 def _project(root: Path, project_id: str, events: list[EventRow]) -> list[LandingRow]:
-    """A git checkout whose runs.db records 48 landings across 2026-11-01 and *events*."""
+    """A git checkout whose runs.db records 48 landings across 2026-11-01 and *events*; every
+    landing has a flake verdict, every third one confirmed."""
     GitRepo(root).init()
-    rows = history(48, start=FLIP_START, project_id=project_id)
+    rows = history(FLIP_LANDINGS, start=FLIP_START, project_id=project_id,
+                   outcome=_every_third_flaky)
     write_landing_events(root, rows, events)
     return rows
 
@@ -227,14 +237,19 @@ async def _refresh(config: DashboardConfig, at: datetime, factory: Path, curated
 
 @pytest.fixture
 def derived_client(client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
-    """df and reify, each with stored landings and its own runs.db, after one marker tick."""
+    """df and reify, each with stored landings and its own runs.db, after one marker tick; df's
+    landings also have a value sample."""
     no_curated = tmp_path / 'no-curated-markers.yaml'
     monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', no_curated)
     df = _project(tmp_path / 'dark_factory', 'dark_factory', DF_EVENTS)
     reify = _project(tmp_path / 'reify', 'reify', REIFY_EVENTS)
     config = DashboardConfig(project_root=tmp_path / 'dark_factory',
                              known_project_roots=[tmp_path / 'reify'])
-    asyncio.run(write_quality_db(config.quality_db, [*df, *reify]))
+    df_sample = QualitySample.value(
+        'dark_factory', NOW - timedelta(minutes=5), cursor_sha=df[-1].landing.merge_sha,
+        landings_sampled=len(df), landings_deferred=0, git_check=GitCrossCheck(0, 0, 0),
+    )
+    asyncio.run(write_quality_db(config.quality_db, [*df, *reify], [df_sample]))
     asyncio.run(_refresh(config, NOW - timedelta(minutes=5), tmp_path / 'not-a-repo', no_curated))
     client.app.state.config = config
     with installed_clock(client.app, fixed_clock(NOW)):
@@ -242,7 +257,7 @@ def derived_client(client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> I
 
 
 def _first_landing_at_or_after(at: datetime) -> int:
-    landed_at = [row.landing.landed_at for row in history(48, start=FLIP_START)]
+    landed_at = [row.landing.landed_at for row in history(FLIP_LANDINGS, start=FLIP_START)]
     return bisect_left(landed_at, at)
 
 
@@ -269,6 +284,23 @@ def test_row_7_each_project_serves_its_own_flip_dated_from_its_own_runs_db(
         'effort', REIFY_FLIP.isoformat(), 'reify')
     assert reify_flip['source'] == {'type': 'routing', 'role': 'reviewer_comprehensive'}
     assert reify_flip['ordinal'] == _first_landing_at_or_after(REIFY_FLIP)
+
+
+def test_a_derived_routing_marker_splits_the_quality_series_at_its_landing(
+    derived_client,
+) -> None:
+    body = _get(derived_client, 'project=dark_factory&window=all')
+
+    [flip] = _routing(body['QUALITY_MARKERS'])
+    boundaries = [marker['id'] for marker in body['QUALITY_MARKERS']['value']['markers']
+                  if marker['kind'] not in {'deploy', 'instrument', 'artefact'}]
+    assert boundaries == [flip['id']]
+    assert flip['id'].startswith('routing:reviewer_comprehensive:')
+    [comparison] = [comparison for comparison in body['QUALITY']['value']['before_after']
+                    if comparison['metric'] == 'flakes_confirmed']
+    assert comparison['marker_id'] == flip['id']
+    assert (comparison['n_before'], comparison['n_after']) == (
+        flip['ordinal'], FLIP_LANDINGS - flip['ordinal'])
 
 
 def test_row_8_a_one_dispatch_fallback_is_availability_not_a_marker(derived_client) -> None:
@@ -313,6 +345,20 @@ def _flaky(ordinal: int) -> Outcomes:
     return replace(NO_OUTCOMES, flake_confirmed=confirmed, flake_real_red=False, flake_rows=1)
 
 
+def _rate_outside_the_artefact() -> float:
+    outside = [row.outcomes.flake_confirmed is True
+               for row in history(STORED, start=STORED_START, outcome=_flaky)
+               if row.landing.ordinal not in ARTEFACT_ORDINALS]
+    return sum(outside) / len(outside)
+
+
+@pytest.fixture
+def curated_artefact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    curated = tmp_path / 'regime-markers.yaml'
+    curated.write_text(CURATED_ARTEFACT)
+    monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', curated)
+
+
 def _store_an_empty_derivation(config: DashboardConfig) -> None:
     async def write() -> None:
         async with _QualityStore(config.quality_db) as store:
@@ -327,26 +373,30 @@ def _store_an_empty_derivation(config: DashboardConfig) -> None:
 
 
 def test_row_6_a_curated_artefact_is_excluded_from_the_baseline_and_served_as_a_range(
-    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    client, tmp_path: Path, curated_artefact: None,
 ) -> None:
-    curated = tmp_path / 'regime-markers.yaml'
-    curated.write_text(CURATED_ARTEFACT)
-    monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', curated)
-    rows = history(STORED, start=STORED_START, outcome=_flaky)
-    outside = [row.outcomes.flake_confirmed is True for row in rows
-               if row.landing.ordinal not in ARTEFACT_ORDINALS]
-
     with _seeded(client, tmp_path, outcome=_flaky) as seeded:
         _store_an_empty_derivation(seeded.app.state.config)
         body = _get(seeded, 'project=dark_factory&window=all')
 
     assert len(ARTEFACT_ORDINALS) == 12
     baseline = body['QUALITY']['value']['metrics']['flakes_confirmed']['baseline']
-    assert baseline['p0'] == pytest.approx(sum(outside) / len(outside))
+    assert baseline['p0'] == pytest.approx(_rate_outside_the_artefact())
     [artefact] = body['QUALITY_MARKERS']['value']['markers']
     assert artefact['kind'] == 'artefact'
     assert (artefact['ordinal'], artefact['until_ordinal']) == (
         min(ARTEFACT_ORDINALS), max(ARTEFACT_ORDINALS))
+
+
+def test_before_the_first_derivation_a_curated_artefact_is_still_excluded(
+    client, tmp_path: Path, curated_artefact: None,
+) -> None:
+    with _seeded(client, tmp_path, outcome=_flaky) as seeded:
+        body = _get(seeded, 'project=dark_factory&window=all')
+
+    assert body['QUALITY_MARKERS']['state'] == 'unknown'
+    baseline = body['QUALITY']['value']['metrics']['flakes_confirmed']['baseline']
+    assert baseline['p0'] == pytest.approx(_rate_outside_the_artefact())
 
 
 def test_a_label_and_a_project_id_spelling_resolve_to_the_same_root(quality_client) -> None:

@@ -6,7 +6,8 @@ route's vocabulary, parsed by ``dashboard.api.window.parse_landing_window``.
 ``shared.project_id.fold_project_token`` folds. QUALITY_MARKERS is the project's
 stored marker derivation plus the curated markers in its scope, placed on its
 stored landing axis; its regime events are what the QUALITY statistics split at
-and exclude. The snapshot datum is unknown until its producer lands
+and exclude. Before the project's first derivation, the curated markers in its
+scope still are. The snapshot datum is unknown until its producer lands
 (plans/quality-dashboard-prd.md leaf ι).
 """
 
@@ -18,7 +19,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -30,7 +31,13 @@ from dashboard.api.window import parse_landing_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumContractError, unknown_datum, validate_datum
 from dashboard.data.db import DbPool
-from dashboard.data.quality_markers import MarkerStream, load_curated_markers, marker_datum
+from dashboard.data.quality_markers import (
+    CuratedMarkers,
+    MarkerStream,
+    load_curated_markers,
+    marker_datum,
+    regime_events,
+)
 from dashboard.data.quality_series import QUALITY_FRESHNESS_BOUND_SECONDS, read_quality_series
 from dashboard.data.quality_store import landing_axis, read_marker_state
 
@@ -73,7 +80,10 @@ def _unresolved_reason(token: str | None) -> str:
     return f'no configured project root is labelled or identified as {token!r}'
 
 
-async def _served(what: str, root: Path, read: Callable[[], Awaitable[Datum[Any]]]) -> Datum[Any]:
+_T = TypeVar('_T')
+
+
+async def _served(what: str, root: Path, read: Callable[[], Awaitable[Datum[_T]]]) -> Datum[_T]:
     """*read*'s datum, or an unknown one naming why *what* could not be read; never raises."""
     try:
         return await read()
@@ -92,20 +102,23 @@ async def _served(what: str, root: Path, read: Callable[[], Awaitable[Datum[Any]
 
 
 async def _marker_stream(
-    config: DashboardConfig, pool: DbPool, root: Path, now: datetime,
+    config: DashboardConfig, pool: DbPool, project_id: str, curated: CuratedMarkers, now: datetime,
 ) -> Datum[MarkerStream]:
-    project_id = project_id_for_root(root)
     db = await pool.get(config.quality_db)
     stored = None if db is None else await read_marker_state(db, project_id)
     axis = [] if db is None or stored is None else await landing_axis(db, project_id)
-    curated = await asyncio.to_thread(load_curated_markers)
     return marker_datum(project_id, stored, curated, axis, now=now,
                         freshness_bound_seconds=QUALITY_FRESHNESS_BOUND_SECONDS)
 
 
-def _regime_events(markers: Datum[Any]) -> Sequence[RegimeEvent]:
-    stream = markers.value
-    return stream.regime_events() if isinstance(stream, MarkerStream) else ()
+def _regime_events(
+    markers: Datum[MarkerStream], curated: CuratedMarkers, project_id: str,
+) -> Sequence[RegimeEvent]:
+    """The served stream's regime events; with no stream served, the curated ones in the
+    project's scope, which need no derivation."""
+    if markers.value is not None:
+        return markers.value.regime_events()
+    return regime_events(curated.for_project(project_id))
 
 
 async def _quality_series(
@@ -129,9 +142,11 @@ async def api_quality(request: Request) -> JSONResponse:
     if root is None:
         quality = markers = _unknown(_unresolved_reason(token))
     else:
+        project_id = project_id_for_root(root)
+        curated = await asyncio.to_thread(load_curated_markers)
         markers = await _served('the quality marker stream', root,
-                                lambda: _marker_stream(config, pool, root, now))
-        events = _regime_events(markers)
+                                lambda: _marker_stream(config, pool, project_id, curated, now))
+        events = _regime_events(markers, curated, project_id)
         quality = await _served('the quality series', root, lambda: _quality_series(
             config, pool, root, window.landings, now, events))
     datums: dict[str, Datum[Any]] = {
