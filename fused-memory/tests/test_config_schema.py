@@ -14,6 +14,7 @@ from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTU
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import (
     ConsolidationAutoConfig,
@@ -50,6 +51,8 @@ from fused_memory.topic_slug import (
     TOPIC_SLUG_RE,
     is_valid_topic_slug,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class _DummySettings(BaseSettings):

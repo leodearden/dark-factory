@@ -61,7 +61,6 @@ from _orch_helpers import (
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 from shared.testing_timeout_markers import (
@@ -75,6 +74,10 @@ from shared.testing_timeout_markers import (
     scan_python_tree,
     timeout_marker_sites,
     verify_cli_timeout,
+)
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
 )
 
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
@@ -173,13 +176,18 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: definition out of the tree and fails if the two disagree.  This map is a
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 1200.0,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME: float(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
     'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
     'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
 }
+
+#: The sanctioned names defined OUTSIDE this directory.  Each entry above is
+#: imported from its one home, so it cannot drift from it, and no binding
+#: under :data:`_TESTS_DIR` exists for :class:`TestSanctionedNameMirrors` to find.
+_SANCTIONED_NAMES_DEFINED_ELSEWHERE = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
 
 
 def _parse(source: str) -> ast.Module | None:
@@ -660,7 +668,9 @@ class TestSanctionedNameMirrors:
         empty binding list.
         """
         defined = {binding.name for binding in _tree_scan().bindings}
-        undefined = sorted(set(_SANCTIONED_TIMEOUT_NAMES) - defined)
+        undefined = sorted(
+            set(_SANCTIONED_TIMEOUT_NAMES) - _SANCTIONED_NAMES_DEFINED_ELSEWHERE - defined
+        )
 
         assert not undefined, (
             f'_SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '

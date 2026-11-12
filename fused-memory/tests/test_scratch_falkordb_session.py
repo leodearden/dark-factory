@@ -14,9 +14,12 @@ import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT
 from _fm_sockets import refused_port
 from shared.lane_probe import LANE_ROLE_VARIABLE, OFFLINE_LANE_ROLE
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.falkordb_endpoints import FALKOR_HOST_ENV, FALKOR_PORT_ENV, FalkorEndpoint
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 THIS_FILE = Path(__file__).resolve()
 FM_ROOT = THIS_FILE.parents[1]

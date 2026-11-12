@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 from shared.memory_eval_metrics import Metric
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import (
     FINISHED_AT,
@@ -38,6 +39,8 @@ from fused_memory.arm_harness.metrics_record import (
     load_metrics_records,
     record_for,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 UNTIL = '2026-10-08T00:00:00+00:00'

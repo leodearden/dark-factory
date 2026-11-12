@@ -16,13 +16,13 @@ import ast
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import orchestrator.merge_lane as merge_lane
 import orchestrator.merge_lane.worker as mq
 
 # test_no_copy_of_the_serial_worker_anywhere reads every *.py under the tests
-# and the production package; see _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+# and the production package; see shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _RETIRED_CLASS = 'MergeWorker'

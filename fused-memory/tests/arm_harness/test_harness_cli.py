@@ -17,6 +17,7 @@ from _fm_helpers import load_script_module
 from _mock_openai_server import mock_openai_server
 from shared.cli_boundary import EXIT_STDOUT_FAILED
 from shared.memory_eval_metrics import Metric
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import (
     FINISHED_AT,
@@ -77,6 +78,8 @@ from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER, read_top
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 STAMP = '20261005T120000Z'

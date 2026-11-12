@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 from git_checkout_root import checkout_root_or_skip
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB_RELPATH = "scripts/lib/resolve_uv.sh"

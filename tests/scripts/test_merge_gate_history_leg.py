@@ -44,8 +44,11 @@ from _pytest.mark.expression import Expression
 from orchestrator.config import ModuleConfig, OrchestratorConfig, _discover_module_configs
 from orchestrator.pytest_markers import locate_pytest_config, resolve_marker_expression
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 MARKER = 'reads_git_history'

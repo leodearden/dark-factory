@@ -23,6 +23,9 @@ import pytest
 import verify_command_invariants as vci
 from orchestrator.harness import Harness
 from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_SENTINEL_PREFIX
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SKILL = REPO_ROOT / 'skills' / 'escalation-watcher-auto' / 'SKILL.md'

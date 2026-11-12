@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
@@ -42,6 +43,9 @@ from manifest_drift_fixtures import (
     task_row,
     write_manifest,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Non-vacuity / loudness. A silently-empty corpus must NEVER render as a clean

@@ -34,9 +34,12 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search import search_utils
 from graphiti_core.utils import bulk_utils
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from falkordb.asyncio import FalkorDB

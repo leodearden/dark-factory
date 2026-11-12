@@ -37,7 +37,11 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 TASK_CURATOR = SRC_ROOT / 'middleware' / 'task_curator.py'

@@ -23,6 +23,9 @@ import pytest
 from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
 from _write_triage_calibration_fixtures import CALIBRATION_FIXTURES, REIFY_FIXTURE_PATH
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 

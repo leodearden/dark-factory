@@ -38,6 +38,9 @@ from manifest_drift_fixtures import (
     one_project,
     task_row,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # audit_project — the comparison core.

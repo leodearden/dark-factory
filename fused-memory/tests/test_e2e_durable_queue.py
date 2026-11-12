@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 from _fm_polling import poll_until
 from _queued_write_fixtures import insert_raw_row, queued
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.llm_token_usage import measure_llm_tokens
 from fused_memory.middleware import dead_letter_escalator
@@ -27,6 +28,8 @@ from fused_memory.middleware.dead_letter_escalator import (
 )
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _mock_backends(svc: MemoryService) -> MemoryService:

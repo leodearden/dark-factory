@@ -36,6 +36,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
@@ -65,6 +66,8 @@ from df_pytest_isolation import (  # noqa: E402
     fixture_marker,
     run_session_token,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
 # fixture into a TEST module binds it as a module-scoped fixture that SHADOWS

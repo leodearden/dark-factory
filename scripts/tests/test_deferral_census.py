@@ -37,6 +37,9 @@ from shared.task_deferral import (
     record_to_json,
 )
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 DAY = timedelta(days=1)

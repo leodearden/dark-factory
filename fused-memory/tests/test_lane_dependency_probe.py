@@ -26,6 +26,7 @@ from _fm_helpers import (
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from _fm_sockets import has_pending_connection, refused_port, silent_listener
 from shared.lane_probe import OUTAGE_EXIT_STATUS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.falkordb_endpoints import (
     PRODUCTION_FALKORDB,
@@ -33,6 +34,8 @@ from fused_memory.config.falkordb_endpoints import (
     scratch_falkordb_from_env,
 )
 from fused_memory.config.schema import FusedMemoryConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FM_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = FM_ROOT / 'scripts' / 'lane_dependency_probe.py'

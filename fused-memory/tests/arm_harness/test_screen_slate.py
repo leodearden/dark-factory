@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness._fakes import CODE_SHA, CORPUS_SHA, PREREG_SHA, SCREENING_PARAMS, slate_arm
 from arm_harness._loopback_http import HELD_PROMPT_TOKENS, held_upstream, post_json, unused_port
@@ -28,6 +29,8 @@ from fused_memory.arm_harness.screening_evidence import (
 )
 from fused_memory.arm_harness.slate import SlateArm, arm_endpoint, candidate_spec
 from fused_memory.arm_harness.usage_tap import CallRecord, load_call_records
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 QWEN = slate_arm()

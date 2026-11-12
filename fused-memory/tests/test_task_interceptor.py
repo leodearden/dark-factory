@@ -26,6 +26,7 @@ from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
 from shared.git_async import GitResult, run_git
 from shared.task_statuses import TaskStatus
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -56,6 +57,8 @@ from fused_memory.reconciliation.consolidation_gate import (
     build_consolidation_gate_task,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture

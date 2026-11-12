@@ -16,12 +16,15 @@ from pathlib import Path
 import pytest
 import yaml
 from _ast_guard import parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.safe_yaml import (
     SAFE_YAML_LOADER,
     load_yaml_list_file,
     resolve_safe_yaml_loader,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LOG = logging.getLogger('tests.safe_yaml_owner')
 

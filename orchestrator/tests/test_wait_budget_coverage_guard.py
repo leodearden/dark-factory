@@ -33,8 +33,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _wait_budget_audit import ItemWaitAudit, audit_module, is_module_level_item
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),

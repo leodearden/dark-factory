@@ -28,8 +28,11 @@ from review_all_program_fixture import (
     load_state,
     running_fake_store,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from shared import task_statuses
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 state = load_state()
 

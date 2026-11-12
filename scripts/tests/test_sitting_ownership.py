@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 from orchestrator.session_registry import SessionRecord, Status
 from shared.task_deferral import CarriedByDeferral, UntilConditionDeferral, record_to_json
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ownership as mod
 from sitting.inventory import OpenItem, escalation_key
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 QUEUE = '/src/dark-factory/data/escalations'

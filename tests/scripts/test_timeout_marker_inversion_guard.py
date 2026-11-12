@@ -17,6 +17,7 @@ import functools
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+import pytest
 import yaml
 from shared.testing_timeout_markers import (
     InversionVerdict,
@@ -27,6 +28,12 @@ from shared.testing_timeout_markers import (
     scan_timeout_marker_sites,
     verify_cli_timeout,
 )
+from shared.whole_tree_guard_family import (
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TIMEOUT_NAME,
+)
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TESTS_DIR = Path(__file__).resolve().parent
 _COLLECTING_CONFIGS = (
@@ -34,10 +41,11 @@ _COLLECTING_CONFIGS = (
     _TESTS_DIR.parents[1] / 'scripts' / 'orchestrator.yaml',
 )
 
-#: No named timeout constant is shared across this tree's modules, so a
-#: marker spelled as a NAME reads as "no opinion".  The guard is a floor, with
-#: the same stated limit as orchestrator's.
-_SANCTIONED: Mapping[str, float] = {}
+#: The one named timeout constant this tree's modules share: the whole-tree
+#: guard family's ceiling, resolved from its home.  Any other marker spelled as
+#: a NAME reads as "no opinion".  The guard is a floor, with the same stated
+#: limit as orchestrator's.
+_SANCTIONED: Mapping[str, float] = {WHOLE_TREE_SCAN_TIMEOUT_NAME: WHOLE_TREE_SCAN_TEST_TIMEOUT}
 
 #: Set below the 128 files and 9 sites measured on 2026-10-30.
 _FLOORS = SweepFloors(test_files=90, marker_sites=6)

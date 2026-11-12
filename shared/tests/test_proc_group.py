@@ -40,6 +40,9 @@ from shared.proc_group import (
     terminate_process_group,
     unified_cgroup_path,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 async def _await_group_membership(

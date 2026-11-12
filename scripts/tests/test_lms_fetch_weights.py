@@ -20,6 +20,9 @@ Two measured facts drive the rest:
 import lms_fetch_weights
 import lms_manifest
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _BACKGROUND_SHELL_TOKENS = ('nohup', 'setsid', 'disown', '&')
 

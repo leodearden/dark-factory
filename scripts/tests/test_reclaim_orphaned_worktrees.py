@@ -25,14 +25,18 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import reclaim_orphaned_worktrees as row
 from reclaim_orphaned_worktrees import parse_parking_dir_name
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import (
     _GIT_REDIRECT_ENV,
     _GIT_REDIRECT_ENV_PREFIXES,
     git_redirect_env,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LOG_PREFIX = "reclaim_orphaned_worktrees:"
 SCRIPT = Path(__file__).parent.parent / "reclaim_orphaned_worktrees.py"

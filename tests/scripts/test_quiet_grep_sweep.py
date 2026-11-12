@@ -18,7 +18,10 @@ tests/scripts/shell_sections.py, guarded by
 from __future__ import annotations
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import REPO_ROOT, grep_q_offenders, sets_pipefail
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Every script in which the construct is forbidden, listed ONCE, repo-relative.
 # check_write_triage_flip_preconditions.sh, memory-metadata-coverage-census.sh

@@ -66,8 +66,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
 # authorship time -- and ast.parse()s each one; its module-scoped
@@ -80,7 +80,7 @@ from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_va
 # it.  A per-test decorator here would REPLACE the mark, not add to it.
 # WHY that budget, the thread-mode os._exit() cost model it clears, and the
 # guard that ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

@@ -42,6 +42,9 @@ from shared.task_metadata import (
     script_root_kind_conflict,
     validate_model_overrides,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _assert_only_test_owned_registry_keys(added: set[str]) -> None:

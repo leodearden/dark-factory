@@ -34,6 +34,7 @@ import pathlib
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     EXEC_START_PREFIX,
     FACTORY_INIT_REFERENCE,
@@ -41,6 +42,8 @@ from systemd_unit_invariants import (
     MalformedExecStart,
     logical_exec_start,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

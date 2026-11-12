@@ -21,6 +21,9 @@ import pytest
 import yaml
 from legibility import config as mod
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 MINIMAL_YAML = textwrap.dedent("""\
     project_id: dark_factory

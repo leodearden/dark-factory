@@ -102,7 +102,10 @@ from repair_wiped_metadata_files import (
 )
 from shared.task_store_schema import TASK_STORE_DDL
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from tasks_db_schema import columns_outside, introspect, introspect_ddl
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Synthetic candidate builder.
