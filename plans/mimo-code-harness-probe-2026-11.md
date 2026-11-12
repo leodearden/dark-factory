@@ -82,6 +82,13 @@ endpoint honouring `tool_choice: 'none'`. No cost or budget flag exists, and
 429/404 retry forever. The arm therefore sets `steps = max_turns` AND refuses
 an invocation without a wall-clock timeout.
 
+That timeout bounds `mimo run` only. The store read that follows, one
+`session list` plus one `export` per session, is bounded separately: each
+call gets
+`orchestrator/src/orchestrator/agents/mimo_backend.py::SESSION_READ_TIMEOUT_SECS`
+(120 s). So an invocation over N sessions can last up to
+`timeout_seconds + (1 + N) × 120 s`.
+
 ## (d) Isolation
 
 - `MIMOCODE_HOME` holds `{config, data, cache, state}`; `data` holds the

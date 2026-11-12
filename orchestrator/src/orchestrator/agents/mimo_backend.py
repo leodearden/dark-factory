@@ -33,6 +33,7 @@ MODEL_LIMITS = {'context': 1048576, 'output': 131072}
 TITLE = 'dark-factory'
 MIMO_VARIANTS = ('low', 'medium', 'high')
 FALLBACK_VARIANT = 'high'
+SESSION_READ_TIMEOUT_SECS = 120
 MIMOCODE_ENV_PREFIX = 'MIMOCODE_'
 MIMOCODE_FLAGS = {
     'MIMOCODE_ENABLE_ANALYSIS': 'false',
@@ -55,7 +56,7 @@ _MCP_TOOL = re.compile(r'mcp__(?P<server>[A-Za-z0-9_-]+?)__(?P<tool>[A-Za-z0-9_-
 _BASH_PATTERN = re.compile(r'Bash\((?P<pattern>.+)\)')
 
 CostOf = Callable[[int, int, int], float]
-SessionSpawn = Callable[[list[str]], Awaitable[_SubprocessResult]]
+SessionSpawn = Callable[[list[str], float], Awaitable[_SubprocessResult]]
 
 
 class MimoEndpointMissing(ValueError):
@@ -226,8 +227,11 @@ def mimo_export_argv(session_id: str) -> list[str]:
 
 
 async def read_mimo_sessions(spawn: SessionSpawn) -> list[dict[str, Any]]:
-    """Every session the run home's store holds, as ``mimo export`` documents, in list order."""
-    listing = await spawn(mimo_session_list_argv())
+    """Every session the run home's store holds, as ``mimo export`` documents, in list order.
+
+    *spawn* runs one argv under a timeout; each read gets SESSION_READ_TIMEOUT_SECS of its own, outside the run's wall clock.
+    """
+    listing = await spawn(mimo_session_list_argv(), SESSION_READ_TIMEOUT_SECS)
     sessions = _decoded(listing)
     if not isinstance(sessions, list):
         logger.warning(
@@ -240,7 +244,7 @@ async def read_mimo_sessions(spawn: SessionSpawn) -> list[dict[str, Any]]:
         session_id = session.get('id') if isinstance(session, dict) else None
         if not session_id:
             continue
-        exported = await spawn(mimo_export_argv(str(session_id)))
+        exported = await spawn(mimo_export_argv(str(session_id)), SESSION_READ_TIMEOUT_SECS)
         document = _decoded(exported)
         if isinstance(document, dict):
             exports.append(document)

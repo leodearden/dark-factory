@@ -1419,9 +1419,6 @@ async def _invoke_zcode(
 # MiMo Code backend — its translation layer is orchestrator.agents.mimo_backend
 # ---------------------------------------------------------------------------
 
-MIMO_SESSION_READ_TIMEOUT_SECS = 120
-
-
 async def _invoke_mimo(
     prompt: str,
     system_prompt: str,
@@ -1463,15 +1460,13 @@ async def _invoke_mimo(
         env = mimo_spawn_env(base_env, home)
         extras = [*(sandbox_extras or []), str(home.root)]
 
-        async def spawn(
-            argv: list[str], stdin: bytes = b'', timeout: float = MIMO_SESSION_READ_TIMEOUT_SECS,
-        ) -> _SubprocessResult:
+        async def spawn(argv: list[str], timeout: float, stdin: bytes = b'') -> _SubprocessResult:
             cmd, wrapped_env = _sandbox_spawn(argv, env, cwd, sandbox_modules, extras)
             return await _run_subprocess_local(
                 cmd, cwd, wrapped_env, 'mimo', model, max_budget_usd, timeout, stdin_data=stdin,
             )
 
-        run = await spawn(mimo_run_argv(model, cwd, effort), prompt.encode(), timeout_seconds)
+        run = await spawn(mimo_run_argv(model, cwd, effort), timeout_seconds, prompt.encode())
         exports = await read_mimo_sessions(spawn)
     return parse_mimo_sessions(
         exports, run,

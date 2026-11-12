@@ -346,13 +346,15 @@ class _FakeSessionStore:
 
     def __init__(self, ids=('ses_a', 'ses_b'), *, listing=None, exports=None):
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.listing = listing if listing is not None else _subprocess_result(
             stdout=json.dumps([{'id': sid} for sid in ids]),
         )
         self.exports = exports or {}
 
-    async def __call__(self, argv: list[str]) -> _SubprocessResult:
+    async def __call__(self, argv: list[str], timeout: float) -> _SubprocessResult:
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         if argv[1:3] == ['session', 'list']:
             return self.listing
         assert argv[1] == 'export'
@@ -370,6 +372,11 @@ class TestReadMimoSessions:
         assert spawn.calls == [
             mimo_session_list_argv(), mimo_export_argv('ses_a'), mimo_export_argv('ses_b'),
         ]
+
+    async def test_each_read_is_bounded_by_its_own_timeout(self):
+        spawn = _FakeSessionStore()
+        await read_mimo_sessions(spawn)
+        assert spawn.timeouts == [mimo_backend.SESSION_READ_TIMEOUT_SECS] * 3
 
     @pytest.mark.parametrize('bad_export', [
         _subprocess_result(stdout=json.dumps(measured_export('ses_a')), returncode=1),
