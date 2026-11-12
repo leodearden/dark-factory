@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import enum
 import functools
 import json
 import logging
@@ -54,7 +55,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, assert_never
 
 import yaml
 
@@ -588,6 +589,10 @@ class CensusHeadroomExhausted(Exception):
         self.verified = verified
         self.rejected = rejected
         self.unverified = unverified
+
+    @property
+    def counts(self) -> DeferralCounts:
+        return DeferralCounts(verified=self.verified, rejected=self.rejected, unverified=self.unverified)
 
 
 class CensusPreconditionFailed(RuntimeError):
@@ -1185,7 +1190,7 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
                 "census is PARTIAL coverage, not a full sweep."
             )
             # Gated on the count discrepancy itself, not on any batch's
-            # status == "failure": sub-storm coding failures (below the >50%
+            # "failure" status: sub-storm coding failures (below the >50%
             # threshold, PRD §8.6) still make coded < drawn and still
             # overstate coverage if left unsaid, and this line's job is the
             # count, not the storm classification (run_census reports storm
@@ -2136,146 +2141,83 @@ def _ensure_output_parents(*paths) -> None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
-class CensusOutcome:
-    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
-    gate failed -- NOTHING was persisted), ``"done"`` (the full pipeline
-    ran to completion and its commit landed) or ``"unlanded"`` (the
-    pipeline ran and filed its tickets, but its commit did not land, so
-    every written path -- census-state included -- was handed to
-    ``roll_back`` to be quarantined and restored to HEAD; ``rollback``
-    says whether that restore completed).
+class CensusStage(enum.StrEnum):
+    """The headroom gates at which a census defers."""
 
-    On an ``"unlanded"`` outcome ``rollback`` is the one authority on where
-    each written output now is, and no other field points at a live file:
-    ``report_path`` is ``None``, and ``dry_run`` is kept only for the facts
-    that still hold (nothing was filed; ``payload_count`` payloads were
-    built) -- its ``path`` names where the payloads file was WRITTEN, not
-    where it is now."""
+    PREFLIGHT = "preflight"
+    VERIFY = "verify"
 
-    status: str
-    reason: str | None = None
-    report_path: str | None = None
-    filed_ticket_ids: list[str] = field(default_factory=list)
-    stop_reason: str | None = None
+
+@dataclass(frozen=True)
+class DeferralCounts:
+    """What a verify-stage deferral had adjudicated when the cap hit."""
+
+    verified: int = 0
+    rejected: int = 0
+    unverified: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.verified + self.rejected + self.unverified
+
+
+@dataclass(frozen=True)
+class Deferred:
+    """A headroom gate failed at *stage*; nothing was persisted, so a re-run
+    loses nothing."""
+
+    stage: CensusStage
+    reason: str
+    counts: DeferralCounts = DeferralCounts()
+
+
+@dataclass(frozen=True)
+class Done:
+    """The full pipeline ran and its commit landed."""
+
+    report_path: str
+    record_path: str
+    run_id: str
+    stop_reason: str
+    gate: landing_gate.GateVerdict
+    filed_ticket_ids: tuple[str, ...] = ()
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
+    released_entry_ids: tuple[str, ...] = ()
+    dropped_verdicts: tuple[DroppedVerdict, ...] = ()
+    withheld: tuple[filing_policy.WithheldCluster, ...] = ()
+    skipped_deletions: tuple[codebook.SkippedRecord, ...] = ()
+    dry_run: DryRunFiling | None = None
+    filing: disposition.FilingReport | None = None
+    ledger_rows_written: int | None = None
+    ledger_write_error: str | None = None
+
+    @property
+    def unresolved_verdicts(self) -> int:
+        return len(self.dropped_verdicts)
+
+
+@dataclass(frozen=True)
+class Unlanded:
+    """The pipeline ran and filed its tickets, but its commit did not land, so
+    every written output was rolled back; ``rollback`` says where each one is
+    now. ``dry_run.path`` names where the payloads file was WRITTEN."""
+
+    rollback: unlanded.Rollback
+    gate: landing_gate.GateVerdict
+    filed_ticket_ids: tuple[str, ...] = ()
     dry_run: DryRunFiling | None = None
 
-    rollback: unlanded.Rollback | None = None
-    """Where the refused outputs were quarantined and whether the checkout
-    is back at HEAD. Set iff ``status == "unlanded"``."""
 
-    gate: landing_gate.GateVerdict | None = None
-    """What the landing gate said, on every run that wrote its outputs."""
-
-    deferred_stage: str | None = None
-    """Which headroom gate deferred this run: ``"preflight"`` (before any
-    work) or ``"verify"`` (after mining, before or during verification).
-    Meaningful ONLY when ``status == "deferred"``; ``None`` otherwise.
-
-    Exists so the two are distinguishable by FIELD rather than by parsing
-    prose out of ``reason``. They differ in what an operator has lost: a
-    preflight defer spent nothing, a verify defer sank the mining cost.
-    Neither persisted anything, so both recover by re-running."""
-
-    verified_clusters: int = 0
-    """How many novel clusters a ``"verify"`` deferral had already seen come
-    back VERIFIED when the gate hit -- adjudication paid for, not an absence.
-
-    This count, ``rejected_clusters`` and ``unverified_clusters`` always sum
-    to the clusters the run offered (the invariant
-    ``CensusHeadroomExhausted`` carries and ``_defer`` renders as a total).
-    All three are FIELDS for the reason ``unresolved_verdicts`` below is one:
-    so a caller can assert what the operator is being asked to trust
-    structurally, instead of grepping digits out of the escalation prose."""
-
-    rejected_clusters: int = 0
-    """How many novel clusters a ``"verify"`` deferral had already seen come
-    back REJECTED when the gate hit. See ``verified_clusters`` for the
-    invariant the three counts satisfy together."""
-
-    unverified_clusters: int = 0
-    """How many novel clusters were left unadjudicated by a ``"verify"``
-    deferral -- the hitting cluster plus every one never attempted.
-
-    NOT a loss count: a deferred run persists and ledgers nothing, so these
-    sessions are re-mined by the next run. It is the size of the work the
-    cap interrupted, which is what makes a defer legible next to an
-    ordinary run in which the verifier genuinely rejected everything."""
-
-    dropped_verdicts: tuple[DroppedVerdict, ...] = ()
-    """Every verdict this run PAID FOR that resolved to no pending candidate
-    and was dropped, one record each (``"done"`` and ``"unlanded"`` runs
-    only).
-
-    THE authority on what was dropped: ``unresolved_verdicts`` below is its
-    length, the run-summary WARNING is rendered from it, and the report's
-    unresolved-verdicts section is built from it. A caller asking WHICH titles
-    went nowhere, and whether any of them contradicts a standing record, reads
-    records rather than the English of a log line."""
-
-    unresolved_verdicts: int = 0
-    """How many verify verdicts this run PAID FOR resolved to no pending
-    candidate and were dropped (``"done"`` and ``"unlanded"`` runs only) --
-    ``len(dropped_verdicts)``, kept as its own field because it is what
-    ``main``'s summary line and every count-only caller actually want.
-
-    NOT a loss of persisted state -- the codebook is correct either way. The
-    standing prior verdict holding is the CORRECT outcome; the merger is
-    right not to fabricate a pending twin over an adjudicated record (task
-    4144). It sizes the adjudication effort that went nowhere. Carried as a
-    FIELD, not just a log line, so it is assertable structurally rather than
-    by log-scraping, exactly like ``unverified_clusters`` above.
-
-    A recurring non-zero count is the operator's cue that a title keeps
-    being re-mined and re-verified against a verdict that will never change
-    without a hand re-open."""
-
-    withheld: tuple[filing_policy.WithheldCluster, ...] = ()
-    """Verified clusters promoted into the codebook, marked withheld, and NOT
-    filed, because ``filing_policy.is_fileable`` found neither an in-tree
-    remediation nor a recurrence (``"done"`` and ``"unlanded"`` runs only).
-    Each files automatically once a later census counts
-    ``filing_policy.MIN_UNREMEDIATED_SIGHTINGS`` sightings of it."""
-
-    cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
-    """The subset of ``filed_ticket_ids`` filed into a project other than the
-    observed one, each naming the project_root ``resolve_ticket`` needs."""
-
-    released_entry_ids: tuple[str, ...] = ()
-    """Withheld codebook entries filed this run because they recurred, each
-    now marked ``filing: filed``."""
-
-    filing: disposition.FilingReport | None = None
-    """What contract §8 decided for every finding this run would file, and
-    what the ticket pass resolved. ``filed_ticket_ids`` and
-    ``cross_project_tickets`` are the curator tickets among its decisions."""
-
-    run_id: str | None = None
-    record_path: str | None = None
-    """The JSON record the report was rendered from; ``None`` exactly when
-    ``report_path`` is."""
-
-    ledger_rows_written: int | None = None
-    """Sessions this run newly ledgered as coded; ``None`` when it ledgered
-    nothing (no mining window, an unlanded commit, or a failed write)."""
-
-    ledger_write_error: str | None = None
-    """Why a landed run's codings could not be ledgered, naming the ledger
-    path; those sessions are re-mined by the next census."""
-
-    skipped_deletions: tuple[codebook.SkippedRecord, ...] = ()
-    """Mined coding records the merge skipped as deletion-shaped."""
+CensusOutcome = Deferred | Done | Unlanded
 
 
 def _defer(
-    stage: str,
+    stage: CensusStage,
     reason: str | None,
     *,
     escalate_fn,
-    verified: int = 0,
-    rejected: int = 0,
-    unverified: int = 0,
-) -> CensusOutcome:
+    counts: DeferralCounts,
+) -> Deferred:
     """Abort the census at *stage*: raise one WARNING alarm, return the outcome.
 
     ONE owner of the deferral shape, so the preflight gate, the
@@ -2286,14 +2228,15 @@ def _defer(
     exact failure this whole guard exists to prevent.
     """
     reason = reason or f"headroom gate failed at the {stage} stage"
+    verified, rejected, unverified = counts.verified, counts.rejected, counts.unverified
 
     # Derived here, not threaded from the raise sites, so they cannot
     # disagree about what "total" means (CensusHeadroomExhausted's INVARIANT
     # guarantees the three terms sum to the clusters offered at every site).
-    total = verified + rejected + unverified
+    total = counts.total
 
     detail = reason
-    if stage != "preflight":
+    if stage is not CensusStage.PREFLIGHT:
         # All THREE counts plus the derived total, so the numbers account for
         # every offered cluster. A REJECTION is adjudication already paid for,
         # not an absence: with only verified/unverified, "1 verified, 3
@@ -2319,21 +2262,14 @@ def _defer(
             f"legibility census deferred at the {stage} stage "
             f"({verified} cluster(s) verified, {rejected} rejected, "
             f"{unverified} unverified of {total} offered): {reason}"
-            if stage != "preflight"
+            if stage is not CensusStage.PREFLIGHT
             else f"legibility census deferred: {reason}"
         ),
         detail=detail,
         level=logging.WARNING,
     )
 
-    return CensusOutcome(
-        status="deferred",
-        reason=reason,
-        deferred_stage=stage,
-        verified_clusters=verified,
-        rejected_clusters=rejected,
-        unverified_clusters=unverified,
-    )
+    return Deferred(stage=stage, reason=reason, counts=counts)
 
 
 @dataclass(frozen=True)
@@ -2361,22 +2297,21 @@ def _gate_refusal(verdict: landing_gate.GateVerdict) -> _Refusal:
 
 def _unlanded(
     refusal: _Refusal,
-    landed: CensusOutcome,
+    landed: Done,
     *,
     commit_paths: list[str],
     roll_back,
     escalate_fn,
     project_id: str,
-) -> CensusOutcome:
+) -> Unlanded:
     """Put back a census that did not land, for *refusal*'s reason: roll
     back, raise one ERROR alarm, return the outcome.
 
-    ONE owner of the ``"unlanded"`` shape, as ``_defer`` is of the deferral
+    ONE owner of the ``Unlanded`` shape, as ``_defer`` is of the deferral
     shape: a landing-gate refusal and a commit that did not land differ only
     in *refusal*. *landed* is the outcome the run would have returned had it
-    landed; the unlanded outcome is that one with every output -- report and
-    dry-run payloads file alike -- rolled back (see ``CensusOutcome`` for
-    what its fields then name).
+    landed; every one of its outputs -- report and dry-run payloads file
+    alike -- is rolled back.
     """
     rollback = roll_back(paths=commit_paths)
     if rollback.restored:
@@ -2405,8 +2340,8 @@ def _unlanded(
         f"{state_line}"
     )
     escalate_fn(summary=summary, detail=detail, level=logging.ERROR)
-    return replace(
-        landed, status="unlanded", report_path=None, record_path=None, rollback=rollback,
+    return Unlanded(
+        rollback=rollback, gate=landed.gate, filed_ticket_ids=landed.filed_ticket_ids, dry_run=landed.dry_run,
     )
 
 
@@ -2485,7 +2420,7 @@ def run_census(
     on this same path. Both defer through ``_defer``, so all three aborts
     emit an identical log/escalation/outcome shape, and all three return
     BEFORE any persistence -- nothing is ledgered, so every session is
-    re-mined by the next run. The outcome's ``deferred_stage``/``unverified_clusters`` tell the two
+    re-mined by the next run. The ``Deferred`` outcome's ``stage``/``counts`` tell the two
     apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
     the pre-screen (``prescreen.screen``: a title or session already
@@ -2567,7 +2502,7 @@ def run_census(
     *roll_back*, which quarantines them and
     restores them to HEAD -- census-state included, so ``last_census_at``
     is not advanced by a census that did not land -- and the run returns
-    status ``"unlanded"`` (see ``_unlanded``).
+    ``Unlanded`` (see ``_unlanded``).
 
     A cluster whose fix surface belongs to *harness_project*
     (``filing_policy.resolve_target``) files into that project's task tree:
@@ -2686,9 +2621,10 @@ def run_census(
     headroom = preflight_headroom(effects.invoke, model=config.models.trickle)
     if not headroom.ok:
         return _defer(
-            "preflight",
+            CensusStage.PREFLIGHT,
             headroom.reason or "headroom preflight failed",
             escalate_fn=effects.escalate_fn,
+            counts=DeferralCounts(),
         )
 
     # Every output parent, created ONCE, here -- not at each of the four
@@ -2841,11 +2777,11 @@ def run_census(
             # it is new information, rather than in _defer where it would
             # rewrite both.
             return _defer(
-                "verify",
+                CensusStage.VERIFY,
                 "headroom gate failed at the verify stage boundary: "
                 f"{stage_headroom.reason or 'no headroom'}",
                 escalate_fn=effects.escalate_fn,
-                unverified=len(clusters_to_verify),
+                counts=DeferralCounts(unverified=len(clusters_to_verify)),
             )
 
     # A cap detected INSIDE verification lands here. The except must sit so
@@ -2858,12 +2794,10 @@ def run_census(
         verify_result = effects.verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
     except CensusHeadroomExhausted as exc:
         return _defer(
-            "verify",
+            CensusStage.VERIFY,
             f"headroom exhausted during verification: {exc.reason}",
             escalate_fn=effects.escalate_fn,
-            verified=exc.verified,
-            rejected=exc.rejected,
-            unverified=exc.unverified,
+            counts=exc.counts,
         )
     # The default verifier probes internally (detectors (a)/(b)/(c)) and
     # reports how many probes it spent, so the cost note below counts those
@@ -3173,7 +3107,7 @@ def run_census(
         outcomes, reverified, status_changes, refiled, disposition.entry_dispositions(updated_codebook, standings),
     ).to_record()
     verify_calls = len(clusters_to_verify) + len(offered) + dispositions_record["reverify"]["offered"]
-    filed_ticket_ids = [decision.ticket for decision in disposal.decisions if decision.ticket is not None]
+    filed_ticket_ids = tuple(decision.ticket for decision in disposal.decisions if decision.ticket is not None)
     cross_project_tickets = tuple(
         CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
         for decision in disposal.decisions
@@ -3295,8 +3229,7 @@ def run_census(
     )
 
     verdict = effects.gate()
-    landed = CensusOutcome(
-        status="done",
+    landed = Done(
         report_path=str(report_path),
         run_id=run_id,
         record_path=str(record_path),
@@ -3304,7 +3237,6 @@ def run_census(
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
-        unresolved_verdicts=len(dropped_verdicts),
         withheld=withheld,
         cross_project_tickets=cross_project_tickets,
         released_entry_ids=released_entry_ids,
@@ -3334,12 +3266,12 @@ def run_census(
 
 
 def _ledger_census_codings(
-    landed: CensusOutcome,
+    landed: Done,
     records: list[dict],
     *,
     run_id: str,
     ledger: session_ledger.LedgerSnapshot,
-) -> CensusOutcome:
+) -> Done:
     """Ledger every session this landed run coded, so the next census skips
     it. A failure costs only a re-mine of those sessions, so it is reported
     on the outcome rather than raised."""
@@ -3980,7 +3912,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     Returns non-zero only on a genuine fail-loud error. Every such exit
     after the config has loaded has raised exactly one ERROR alarm:
     :func:`alarm.fail_loud_boundary`'s for any raise, a refused precondition
-    included, or ``run_census``'s own for an ``"unlanded"`` census whose
+    included, or ``run_census``'s own for an ``Unlanded`` census whose
     commit did not land. Before the config loads there is no escalation target, so a bad
     ``--project-root`` or an unloadable config is reported on stderr only.
     A deferred (headroom-preflight) outcome still exits 0, mirroring
@@ -4119,7 +4051,7 @@ def _run_configured_census(
     config_path: Path, escalate_fn,
 ) -> int:
     """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
-    ``"unlanded"`` outcome, which ``run_census`` has already escalated."""
+    ``Unlanded`` outcome, which ``run_census`` has already escalated."""
     mismatch = config.project_root_mismatch(project_root, cfg, config_path)
     if mismatch is not None:
         raise CensusPreconditionFailed(mismatch)
@@ -4245,73 +4177,56 @@ def _run_configured_census(
             harness_project=harness_project,
         )
 
-    if outcome.status == "deferred":
-        # The FIELDS, not only the prose. The two defer flavours read much the
-        # same in `reason` but cost an operator completely different things: a
-        # preflight defer spent nothing, a verify defer sank the whole mining
-        # spend and left N clusters unadjudicated (re-mined next run, never
-        # lost). Printing neither hides that from the person watching the run.
-        print(
-            f"census: deferred -- stage={outcome.deferred_stage} "
-            f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
-        )
-        return 0
+    return _exit_code(outcome)
 
-    if outcome.status == "unlanded":
-        # run_census already logged ERROR and escalated; this line is for
-        # whoever watches the run, and the exit code for nightly's launcher.
-        rollback = (
-            outcome.rollback.describe() if outcome.rollback is not None
-            else "no rollback was recorded"
-        )
-        if outcome.gate is not None and not outcome.gate.passed:
+
+def _exit_code(outcome: CensusOutcome) -> int:
+    """Print *outcome*'s one summary line and return main's exit code: 0 for a
+    deferral or a landed run, 1 for a run that did not land, which run_census
+    has already escalated."""
+    match outcome:
+        case Deferred(stage=stage, reason=reason, counts=counts):
+            print(f"census: deferred -- stage={stage} unverified_clusters={counts.unverified} -- {reason}")
+            return 0
+        case Unlanded(rollback=rollback, gate=gate) if not gate.passed:
             print(
-                f"census: landing gate refused the census -- {outcome.gate.describe()} -- {rollback}",
+                f"census: landing gate refused the census -- {gate.describe()} -- {rollback.describe()}",
                 file=sys.stderr,
             )
             return 1
-        print(
-            f"census: commit did not land -- {rollback} "
-            f"filed_tickets={len(outcome.filed_ticket_ids)}",
-            file=sys.stderr,
-        )
-        return 1
+        case Unlanded(rollback=rollback, filed_ticket_ids=filed_ticket_ids):
+            print(
+                f"census: commit did not land -- {rollback.describe()} filed_tickets={len(filed_ticket_ids)}",
+                file=sys.stderr,
+            )
+            return 1
+        case Done():
+            print(_done_line(outcome))
+            return 0
+        case _:
+            assert_never(outcome)
 
-    # Appended ONLY when set, so a normal run's summary line stays
-    # byte-identical: the clause appears exactly when it carries information.
-    # Same reasoning as the report's coverage-shortfall gating -- a line
-    # trained to be ignored is a line that will be ignored.
-    ledger_failed = (
-        f" ledger_write_failed: {outcome.ledger_write_error}"
-        if outcome.ledger_write_error else ""
-    )
-    unreachable = None if outcome.filing is None else outcome.filing.disposal.unreachable
+
+def _done_line(done: Done) -> str:
+    """The landed run's summary line; each optional clause appears only when
+    it carries information, so a normal run's line stays byte-identical."""
+    ledger_failed = f" ledger_write_failed: {done.ledger_write_error}" if done.ledger_write_error else ""
+    unreachable = None if done.filing is None else done.filing.disposal.unreachable
     dedup_unreachable = f" dedup_unreachable: {unreachable}" if unreachable else ""
-    if outcome.dry_run is not None:
-        # A bare filed_tickets=0 here would read as "a normal run that had
-        # nothing to file" -- name the review file and the count instead.
-        print(
-            f"census: done -- report={outcome.report_path} "
-            f"dry-run-filing: {outcome.dry_run.payload_count} payload(s) -> "
-            f"{outcome.dry_run.path} (nothing filed) "
-            f"stop_reason={outcome.stop_reason}{ledger_failed}{dedup_unreachable}"
+    if done.dry_run is not None:
+        return (
+            f"census: done -- report={done.report_path} "
+            f"dry-run-filing: {done.dry_run.payload_count} payload(s) -> "
+            f"{done.dry_run.path} (nothing filed) "
+            f"stop_reason={done.stop_reason}{ledger_failed}{dedup_unreachable}"
         )
-        return 0
-
-    unresolved = (
-        f" unresolved_verdicts={outcome.unresolved_verdicts}"
-        if outcome.unresolved_verdicts else ""
+    unresolved = f" unresolved_verdicts={done.unresolved_verdicts}" if done.unresolved_verdicts else ""
+    skipped = f" skipped_deletions={len(done.skipped_deletions)}" if done.skipped_deletions else ""
+    return (
+        f"census: done -- report={done.report_path} "
+        f"filed_tickets={len(done.filed_ticket_ids)} "
+        f"stop_reason={done.stop_reason}{unresolved}{skipped}{ledger_failed}{dedup_unreachable}"
     )
-    skipped = (
-        f" skipped_deletions={len(outcome.skipped_deletions)}"
-        if outcome.skipped_deletions else ""
-    )
-    print(
-        f"census: done -- report={outcome.report_path} "
-        f"filed_tickets={len(outcome.filed_ticket_ids)} "
-        f"stop_reason={outcome.stop_reason}{unresolved}{skipped}{ledger_failed}{dedup_unreachable}"
-    )
-    return 0
 
 
 if __name__ == "__main__":
