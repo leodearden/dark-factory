@@ -249,12 +249,14 @@ it ran; otherwise re-run the two commands above now that you've written it.)
 - Health check:
 
 ```bash
-curl -sf http://localhost:8002/health && echo healthy
+curl -sf http://127.0.0.1:8002/health && echo healthy
 journalctl --user -u fused-memory -f   # tail logs
 ```
 
 The MCP endpoint itself is `http://127.0.0.1:8002/mcp` (wired into Claude
-Code sessions via each project's `.mcp.json`).
+Code sessions via each project's `.mcp.json`). fused-memory listens on
+loopback only by design, so a connect on the machine's LAN or tailnet
+address is refused; see `OPERATIONS.md` §"Network exposure check".
 
 ## 7. Dashboard + watchdog units
 
