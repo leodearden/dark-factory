@@ -72,7 +72,14 @@ from legibility import (
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import digest as digest_mod
-from legibility_census_scaffold import journaled, narrowing, with_seams
+from legibility_census_scaffold import (
+    cap_themed_verdict,
+    journaled,
+    make_fake_invoke,
+    narrowing,
+    quality_block_of,
+    with_seams,
+)
 from legibility_task_store_fake import FakeTaskStore
 from quality_doc_texts import code_quality
 from shared.cap_markers import (
@@ -182,25 +189,6 @@ def _minimal_v2_codebook() -> dict:
 # of this file's tests build on, so no test ever reaches a real subprocess,
 # network call, or model.
 # ---------------------------------------------------------------------------
-
-def _make_fake_invoke(response_fn=None, *, default="{}"):
-    """Fake `invoke(prompt, model) -> str` seam (the one-shot LLM-call
-    primitive used for Sonnet mining via coder.code_digests(invoke=...)
-    and the tiny headroom probe). Records every call as a dict in
-    `.calls` (prompt/model) so a test can assert routing/content. When
-    `response_fn(prompt, model)` is given it decides the reply per call;
-    otherwise every call returns `default` verbatim."""
-    calls = []
-
-    def fake_invoke(prompt, model):
-        calls.append({"prompt": prompt, "model": model})
-        if response_fn is not None:
-            return response_fn(prompt, model)
-        return default
-
-    fake_invoke.calls = calls
-    return fake_invoke
-
 
 def _make_fake_submit_fn():
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
@@ -352,7 +340,7 @@ def test_mine_to_saturation_stops_after_two_consecutive_saturated_batches():
     novel_sessions = {f"b0-{i}" for i in range(5)} | {"b1-0"} | {"b2-0"}
     source = _TrackingBatchSource([batch0, batch1, batch2, batch3])
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+    fake_invoke = make_fake_invoke(_mining_response_fn(novel_sessions))
 
     result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
@@ -382,7 +370,7 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
     novel_sessions = {f"e{i}-{j}" for i in range(3) for j in range(4)}
     source = _TrackingBatchSource(batches)
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+    fake_invoke = make_fake_invoke(_mining_response_fn(novel_sessions))
 
     result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
@@ -439,7 +427,7 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
     fail_sessions = {f"b1-{i}" for i in range(6)}
     source = _TrackingBatchSource([batch0, batch1, batch2, batch3, batch4])
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(
+    fake_invoke = make_fake_invoke(
         _mining_response_fn_with_failures(novel_sessions, fail_sessions)
     )
 
@@ -497,7 +485,7 @@ def test_mine_to_saturation_stops_at_operator_batch_cap():
     live_codebook = _minimal_v2_codebook()
     source, novel_sessions = _never_saturating_source(6)
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+    fake_invoke = make_fake_invoke(_mining_response_fn(novel_sessions))
 
     result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
@@ -518,7 +506,7 @@ def test_mine_to_saturation_cap_not_reached_leaves_stop_reason_unchanged():
     live_codebook = _minimal_v2_codebook()
     source, novel_sessions = _never_saturating_source(6)
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+    fake_invoke = make_fake_invoke(_mining_response_fn(novel_sessions))
 
     result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
@@ -541,7 +529,7 @@ def test_mine_to_saturation_saturation_at_the_cap_reports_saturated_not_capped()
     batch2 = _batch_digests(10, "b2")  # must never be pulled
     source = _TrackingBatchSource([batch0, batch1, batch2])
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
-    fake_invoke = _make_fake_invoke(_mining_response_fn({"b0-0", "b1-0"}))
+    fake_invoke = make_fake_invoke(_mining_response_fn({"b0-0", "b1-0"}))
 
     result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
@@ -562,7 +550,7 @@ def test_mine_to_saturation_records_max_batches_on_result():
     source, novel_sessions = _never_saturating_source(3)
     capped = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions)),
+        config=saturation, invoke=make_fake_invoke(_mining_response_fn(novel_sessions)),
         max_batches=2, invariant_slugs=(),
     )
     assert capped.max_batches == 2, "the cap must travel on the result for the report"
@@ -570,7 +558,7 @@ def test_mine_to_saturation_records_max_batches_on_result():
     source2, novel_sessions2 = _never_saturating_source(3)
     flagless = census_mining.mine_to_saturation(
         source2, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)), invariant_slugs=(),
+        config=saturation, invoke=make_fake_invoke(_mining_response_fn(novel_sessions2)), invariant_slugs=(),
     )
     assert flagless.max_batches is None, "no cap passed -> nothing to report"
     assert flagless.stop_reason == "exhausted"
@@ -667,7 +655,7 @@ def test_render_matrix_empty_matrix_is_deterministic_placeholder():
 # ---------------------------------------------------------------------------
 
 def test_preflight_headroom_ok_on_normal_reply():
-    fake_invoke = _make_fake_invoke(default="pong")
+    fake_invoke = make_fake_invoke(default="pong")
     result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is True
     assert fake_invoke.calls[0]["model"] == "sonnet"
@@ -683,14 +671,14 @@ def test_preflight_headroom_ok_on_normal_reply():
     ],
 )
 def test_preflight_headroom_defers_on_known_banner(banner):
-    fake_invoke = _make_fake_invoke(default=banner)
+    fake_invoke = make_fake_invoke(default=banner)
     result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
 
 def test_preflight_headroom_banner_match_is_case_insensitive():
-    fake_invoke = _make_fake_invoke(default="USAGE LIMIT REACHED, TRY AGAIN LATER")
+    fake_invoke = make_fake_invoke(default="USAGE LIMIT REACHED, TRY AGAIN LATER")
     result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
 
@@ -729,7 +717,7 @@ def test_preflight_headroom_defers_on_every_real_cli_cap_message(message):
     every subsequent verify call was fail-closed rejected as an ordinary
     verdict.
     """
-    fake_invoke = _make_fake_invoke(default=message)
+    fake_invoke = make_fake_invoke(default=message)
     result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False, f"real CLI cap message passed the probe: {message!r}"
     assert result.reason
@@ -746,7 +734,7 @@ def test_preflight_headroom_defers_on_ticket_weekly_limit_phrasing():
     incidental punctuation the CLI has already varied, and a guard that
     depends on it is one release away from silence.
     """
-    fake_invoke = _make_fake_invoke(
+    fake_invoke = make_fake_invoke(
         default="You've hit your weekly limit - resets Aug 5, 11am"
     )
     result = census_headroom.preflight_headroom(fake_invoke, model="sonnet")
@@ -2507,7 +2495,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         effects=census_run.CensusEffects(
             batch_source=(),
             selection_of=_no_selection,
-            invoke=_make_fake_invoke(default="pong"),
+            invoke=make_fake_invoke(default="pong"),
             verify_fn=_poison("verify_fn"),
             synthesize_fn=_poison("synthesize_fn"),
             # Nothing is ever similar and the queue cap is 0, so a suite not about
@@ -2554,7 +2542,7 @@ _unlanded = narrowing(census_run.Unlanded)
 def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(default="You have reached your usage limit for this period."),
+        invoke=make_fake_invoke(default="You have reached your usage limit for this period."),
         batch_source=_poison("batch_source"),
     )
     fake_submit_fn = kwargs["effects"].submit_fn
@@ -2623,7 +2611,7 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
     batch = [_hand_digest("novel-verified", "a genuinely new confusion shape")]
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_capped_after_preflight_invoke()),
+        invoke=make_fake_invoke(_capped_after_preflight_invoke()),
         batch_source=[batch],
         verify_fn=_poison("verify_fn"),
         synthesize_fn=_poison("synthesize_fn"),
@@ -2658,7 +2646,7 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 
 def test_a_verify_stage_deferral_of_a_mined_run_persists_and_files_nothing(tmp_path):
     kwargs = _mined_run_kwargs(tmp_path, commit=_make_fake_commit())
-    _override(kwargs, invoke=_make_fake_invoke(_capped_after_preflight_invoke()))
+    _override(kwargs, invoke=make_fake_invoke(_capped_after_preflight_invoke()))
 
     outcome = _deferred(census_run.run_census(**kwargs))
 
@@ -2818,7 +2806,7 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
         _hand_digest("novel-rejected", "a spurious one-off"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_invoke = make_fake_invoke(_happy_invoke_response)
     fake_verify_fn = _make_fake_verify_fn(
         verified_titles={"Silent no-op subagent contract"},
         rejected_titles={"Spurious pattern"},
@@ -2895,7 +2883,7 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
 def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -2940,7 +2928,7 @@ def _slug_screening_census(tmp_path):
     doc = tmp_path / invariants.DOC_RELPATH
     doc.parent.mkdir(parents=True)
     doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
-    fake_invoke = _make_fake_invoke(_declared_and_free_text_slug_response)
+    fake_invoke = make_fake_invoke(_declared_and_free_text_slug_response)
     kwargs = _run_census_kwargs(
         tmp_path,
         invoke=fake_invoke,
@@ -3055,7 +3043,7 @@ def _mined_run_kwargs(tmp_path, **overrides):
     novel one and files a ticket for it; *overrides* supply its commit."""
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[
             _hand_digest("dup-1", "nothing new here"),
             _hand_digest("novel-verified", "a genuinely new confusion shape"),
@@ -3454,7 +3442,7 @@ def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
 ):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_match_or_delete_entry_a),
+        invoke=make_fake_invoke(_match_or_delete_entry_a),
         batch_source=[[
             _hand_digest("sess-delete", "please-delete entry-a"),
             _hand_digest("sess-match", "the same confusion again"),
@@ -3531,7 +3519,7 @@ def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     *overrides* win, so `_verified_run_kwargs` below is this same run with the
     opposite verdict and a caller can substitute any verifier at all."""
     defaults = dict(
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
         verify_fn=_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -3970,7 +3958,7 @@ def test_run_census_advances_census_state_when_the_status_fetch_fails(
 
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[batch],
         verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4013,7 +4001,7 @@ def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog)
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_invoke = make_fake_invoke(_happy_invoke_response)
     fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
     fake_commit = _make_fake_commit()
 
@@ -4070,7 +4058,7 @@ def test_run_census_submit_fn_non_dict_result_is_not_counted_as_filed(tmp_path, 
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_invoke = make_fake_invoke(_happy_invoke_response)
     fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
 
     def none_returning_submit_fn(**kwargs):
@@ -4115,7 +4103,7 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_invoke = make_fake_invoke(_happy_invoke_response)
     fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
 
     def error_returning_submit_fn(**kwargs):
@@ -4175,7 +4163,7 @@ def _normalisation_counts(**nonzero):
 def _promotion_kwargs(tmp_path, *, verify_fn, invoke=None):
     return _run_census_kwargs(
         tmp_path,
-        invoke=invoke or _make_fake_invoke(_happy_invoke_response),
+        invoke=invoke or make_fake_invoke(_happy_invoke_response),
         batch_source=[_novel_verified_batch()],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4335,7 +4323,7 @@ def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_veri
             return malformed
         return _happy_invoke_response(prompt, model)
 
-    fake_invoke = _make_fake_invoke(respond)
+    fake_invoke = make_fake_invoke(respond)
     kwargs = _promotion_kwargs(
         tmp_path,
         invoke=fake_invoke,
@@ -4374,7 +4362,7 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
 
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(storm_invoke),
+        invoke=make_fake_invoke(storm_invoke),
         batch_source=[batch],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4448,7 +4436,7 @@ def test_run_census_storm_batch_capped_reports_coded_of_drawn_end_to_end(tmp_pat
 
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(storm_invoke),
+        invoke=make_fake_invoke(storm_invoke),
         batch_source=[batch],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4509,7 +4497,7 @@ def test_run_census_max_batches_caps_mining_and_reports_it(tmp_path):
 
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=source,
         verify_fn=fake_verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4548,7 +4536,7 @@ def test_run_census_without_max_batches_is_unchanged(tmp_path):
     source = _TrackingBatchSource([_happy_batch(f"b{i}") for i in range(2)])
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=source,
         verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4611,7 +4599,7 @@ def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tm
     fake_verify_fn = _make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=fake_verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4668,7 +4656,7 @@ def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
     fake_verify_fn = _make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=fake_verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4702,7 +4690,7 @@ def test_run_census_warns_and_escalates_when_every_cluster_is_rejected(tmp_path,
     fake_escalate_fn = _make_fake_escalate_fn()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles=set()),  # every cluster rejects
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4734,7 +4722,7 @@ def test_run_census_does_not_warn_when_some_cluster_verifies(tmp_path, caplog):
     gets filtered out before the real incident."""
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -4796,7 +4784,7 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
     fake_commit = _make_fake_commit()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_make_fake_verify_fn(
             verified_titles={"Silent no-op subagent contract"},
@@ -4875,7 +4863,7 @@ def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
     payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_make_fake_verify_fn(
             verified_titles={"Silent no-op subagent contract"},
@@ -4939,7 +4927,7 @@ def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
 def _dry_run_kwargs(tmp_path, payloads_path, *, verify_fn, submit_fn, commit):
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -5038,7 +5026,7 @@ def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tm
     fake_submit_fn = _make_fake_submit_fn()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -5081,7 +5069,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     )
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=source,
         verify_fn=fake_verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -6438,26 +6426,6 @@ def test_every_real_cli_cap_message_fails_to_parse_as_a_verdict(message):
 # escalations claiming the account is capped.
 # ---------------------------------------------------------------------------
 
-def _cap_themed_verdict(marker, *, verified=True, remediation=None):
-    """A WELL-FORMED verdict whose `reason` quotes a cap-themed cluster.
-
-    This is ordinary healthy verifier output, not a banner: the model is
-    adjudicating a confusion cluster that happens to be ABOUT usage limits.
-    *remediation*, when given, is the verdict's in-tree remediation proposal.
-    """
-    verdict = {
-        "verified": verified,
-        "reason": (
-            "Confirmed against main: the watcher rotation was interrupted "
-            f"by a {marker}; the 'continue where you left off' resume "
-            "prompt appears at turns 17/27."
-        ),
-    }
-    if remediation is not None:
-        verdict["remediation"] = remediation
-    return json.dumps(verdict)
-
-
 def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts(tmp_path):
     """END-TO-END: a cap-themed verdict must not stall the census.
 
@@ -6473,7 +6441,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
     """
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
-    verdict = _cap_themed_verdict("usage limit", remediation=_IN_TREE_REMEDIATION)
+    verdict = cap_themed_verdict("usage limit", remediation=_IN_TREE_REMEDIATION)
 
     def response_fn(prompt, model):
         if prompt == census_headroom.HEADROOM_PROBE_PROMPT:
@@ -6482,7 +6450,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
             return verdict
         return _happy_invoke_response(prompt, model)
 
-    fake_invoke = _make_fake_invoke(response_fn)
+    fake_invoke = make_fake_invoke(response_fn)
     fake_submit_fn = _make_fake_submit_fn()
     fake_escalate_fn = _make_fake_escalate_fn()
 
@@ -6549,7 +6517,7 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
     fake_escalate_fn = _make_fake_escalate_fn()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=raising_verify_fn,
         synthesize_fn=_poison("synthesize_fn"),
@@ -6599,7 +6567,7 @@ def test_run_census_calls_verify_fn_once_with_the_full_cluster_list(tmp_path):
     fake_verify_fn = _make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES))
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=fake_verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -6629,7 +6597,7 @@ def test_report_cost_note_counts_real_headroom_probes(tmp_path):
     """
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -6654,7 +6622,7 @@ def test_report_cost_note_reports_one_probe_when_nothing_is_verified(tmp_path):
     """
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -6738,7 +6706,7 @@ def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
             return _verdict()
         return _twelve_novel_invoke(prompt, model)
 
-    fake_invoke = _make_fake_invoke(response_fn)
+    fake_invoke = make_fake_invoke(response_fn)
     kwargs = _run_census_kwargs(
         tmp_path,
         invoke=fake_invoke,
@@ -6868,7 +6836,7 @@ def _two_batch_source_with_a_failing_second_batch():
     # dup_rate 0.9 / consecutive 3 with an all-duplicate healthy batch would
     # saturate at batch 2; consecutive_batches=3 keeps both batches consumed.
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=3)
-    fake_invoke = _make_fake_invoke(
+    fake_invoke = make_fake_invoke(
         _mining_response_fn_with_two_failure_reasons(set(), fail_a, fail_b)
     )
     return source, fake_invoke, saturation, fail_a, fail_b
@@ -7109,7 +7077,7 @@ def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
     fake_escalate_fn = _make_fake_escalate_fn()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=raising_verify_fn,
         synthesize_fn=_poison("synthesize_fn"),
@@ -7161,7 +7129,7 @@ def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
     fake_escalate_fn = _make_fake_escalate_fn()
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(default="I cannot answer: you have hit your weekly limit."),
+        invoke=make_fake_invoke(default="I cannot answer: you have hit your weekly limit."),
         batch_source=_poison("batch_source"),
         verify_fn=_poison("verify_fn"),
         escalate_fn=fake_escalate_fn,
@@ -7250,7 +7218,7 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
 def test_run_census_uncapped_mass_rejection_is_stated_in_the_committed_report(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles=set()),   # all 3 reject
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -7284,7 +7252,7 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
     not on any uncapped run. One cluster surviving is an ordinary census."""
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -7332,7 +7300,7 @@ def _codebook_with_a_rejected_candidate_for(title):
 
 def _rejected_twin_kwargs(tmp_path, **overrides):
     kwargs: dict[str, Any] = dict(
-        invoke=_make_fake_invoke(_three_novel_invoke),
+        invoke=make_fake_invoke(_three_novel_invoke),
         batch_source=[_three_novel_batch()],
         verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -7496,14 +7464,6 @@ _REMEDIATED_TITLE = "Docs omit the X convention"
 # computed here at test time, never pasted.
 # ---------------------------------------------------------------------------
 
-_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
-
-
-def _quality_block_of(prompt):
-    assert prompt.count(_QUALITY_MARKER) == 1
-    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]
-
-
 def _synthesis_brief() -> synthesis.Brief:
     """A brief holding one new finding: the entry a run promoted from session s-1."""
     anchor = "orchestrator/x.py::f"
@@ -7534,14 +7494,14 @@ def _synthesis_brief() -> synthesis.Brief:
 
 def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_brief():
     brief = _synthesis_brief()
-    fake_invoke = _make_fake_invoke(default="the raw reply")
+    fake_invoke = make_fake_invoke(default="the raw reply")
 
     reply = mod.build_synthesize_fn(fake_invoke)(brief, model="fable")
 
     [call] = fake_invoke.calls
     prompt = call["prompt"]
     assert (reply, call["model"]) == ("the raw reply", "fable")
-    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert quality_block_of(prompt) == code_quality.guidance()
     assert synthesis.reply_instructions() in prompt
     assert json.dumps(brief.to_record()) in prompt
 
@@ -7564,7 +7524,7 @@ def _gate_kwargs(tmp_path, *, sessions=("s1",), remediation=None, **overrides):
     ]
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[batch],
         verify_fn=_make_fake_verify_fn(verified_titles={_GATED_TITLE}, remediation=remediation),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -7666,7 +7626,7 @@ def _hosted_kwargs(tmp_path, *, remediation=None, **overrides):
     both sight the harness-marked cluster -- fileable by recurrence alone."""
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_df_marked_invoke_response),
+        invoke=make_fake_invoke(_df_marked_invoke_response),
         batch_source=[[
             _hand_digest("s1-df-marked", "a task-store read timed out"),
             _hand_digest("s2-df-marked", "a task-store read timed out again"),
@@ -7818,7 +7778,7 @@ def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **override
     kwargs = dict(
         codebook_dict=codebook.load(first["codebook_path"]),
         batch_source=[[_hand_digest("s2-recurrence", "the same confusion again")]],
-        invoke=_make_fake_invoke(response_fn),
+        invoke=make_fake_invoke(response_fn),
         verify_fn=_make_fake_verify_fn(remediation=None),
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
@@ -8018,7 +7978,7 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
         codebook_dict=legacy,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(remediation=None),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8203,7 +8163,7 @@ def _rejection_kwargs(tmp_path, *, rejected_verdict):
     _write_briefing(tmp_path)
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_keyed_verify_fn(rejected_verdict=rejected_verdict),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8287,7 +8247,7 @@ def _sighting_kwargs(tmp_path, cb):
     return _run_census_kwargs(
         tmp_path,
         codebook_dict=cb,
-        invoke=_make_fake_invoke(response_fn),
+        invoke=make_fake_invoke(response_fn),
         batch_source=[[_hand_digest("s2-re-sighted", "both confusions again")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8364,7 +8324,7 @@ def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
         codebook_dict=cb,
-        invoke=_make_fake_invoke(response_fn),
+        invoke=make_fake_invoke(response_fn),
         batch_source=[[_hand_digest("s2-recurrence", "the same confusion again")]],
         verify_fn=_make_fake_verify_fn(remediation=None),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8623,7 +8583,7 @@ def _routed_verify_fn(*, second_route=verdict.Route.STRUCTURAL):
 def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_one(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_routed_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8752,7 +8712,7 @@ def _duplicate_only_kwargs(tmp_path, store, **overrides):
     """A run that only re-sights entry-a, so it files nothing new."""
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -8855,7 +8815,7 @@ def _key_of(tmp_path, anchor) -> str:
 def _two_mechanical_dry_run_kwargs(tmp_path, store):
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_happy_batch("b0")],
         verify_fn=_routed_verify_fn(second_route=verdict.Route.MECHANICAL),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -9733,7 +9693,7 @@ def test_a_novel_title_from_an_already_sighted_session_waits_as_pending_unverifi
     verify_fn = _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -9767,7 +9727,7 @@ def test_a_title_re_observing_a_fixed_entry_is_surfaced_and_verified(tmp_path):
     verify_fn = _make_fake_verify_fn(rejected_titles={_L6_NOVEL_TITLE})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -9788,7 +9748,7 @@ def test_the_verify_cap_counts_only_the_clusters_the_screen_leaves(tmp_path):
     verify_fn = _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[
             _hand_digest("novel-rejected", "a spurious one-off"),
             _hand_digest("novel-verified", "a genuinely new confusion shape"),
@@ -9894,7 +9854,7 @@ def test_within_run_twins_at_one_anchor_promote_one_entry(tmp_path):
     _write_briefing(tmp_path)
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[
             _hand_digest("novel-verified", "a genuinely new confusion shape"),
             _hand_digest("novel-rejected", "a spurious one-off"),
@@ -9981,7 +9941,7 @@ def _unremediated_twins_kwargs(tmp_path, *, invoke, batch):
     _write_briefing(tmp_path)
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(invoke),
+        invoke=make_fake_invoke(invoke),
         batch_source=[batch],
         verify_fn=_verifying_unremediated_at_the_row5_anchor,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -10160,7 +10120,7 @@ def _similarity_kwargs(tmp_path, chosen, *, codebook_dict=None, batch=None, **ad
     embed = _keyed_embed(chosen)
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[batch or [_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -10489,7 +10449,7 @@ def test_a_cap_hit_on_the_queue_call_leaves_the_queue_pending_and_the_run_done(t
 
 def test_a_queue_with_no_novel_cluster_is_gated_on_headroom_before_its_verify_call(tmp_path):
     verify_fn = _queue_verify_fn()
-    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, invoke=_make_fake_invoke(_capped_after_preflight_invoke()))
+    kwargs = _queue_kwargs(tmp_path, verify_fn=verify_fn, invoke=make_fake_invoke(_capped_after_preflight_invoke()))
 
     outcome = census_run.run_census(**kwargs)
 
@@ -10603,7 +10563,7 @@ def _synthesis_kwargs(root, *, synthesize_fn, escalate_fn=None, **overrides):
     _write_briefing(root)
     kwargs = _run_census_kwargs(
         root,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[_novel_verified_batch()],
         verify_fn=_keyed_verify_fn(),
         synthesize_fn=synthesize_fn,
@@ -10714,7 +10674,7 @@ def test_run_census_applies_a_correction_to_a_re_observed_standing_entry(tmp_pat
     synthesize_fn = _make_fake_synthesize_fn(correcting)
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_re_observing_invoke),
+        invoke=make_fake_invoke(_re_observing_invoke),
         batch_source=[[_hand_digest("dup-k", "the earlier shape again")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=synthesize_fn,
@@ -10742,7 +10702,7 @@ def test_run_census_applies_a_correction_to_a_re_observed_standing_entry(tmp_pat
 def test_run_census_makes_no_synthesis_call_when_nothing_is_new_or_re_observed(tmp_path):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=_make_fake_verify_fn(),
         synthesize_fn=_poison("synthesize_fn"),
@@ -10807,7 +10767,7 @@ def test_two_sessions_mining_one_novel_title_are_one_cluster_named_by_its_candid
     verify_fn = _make_fake_verify_fn(verified_titles={_SHARED_TITLE})
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_shared_title_response),
+        invoke=make_fake_invoke(_shared_title_response),
         batch_source=[[_hand_digest("twin-one", "first sighting"), _hand_digest("twin-two", "second sighting")]],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -10837,7 +10797,7 @@ def test_a_reworded_reply_still_promotes_and_rejects_its_candidates_by_id(tmp_pa
     ))
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[
             _hand_digest("novel-verified", "a genuinely new confusion shape"),
             _hand_digest("novel-rejected", "a spurious one-off"),
@@ -10864,7 +10824,7 @@ def test_a_reworded_reply_still_promotes_and_rejects_its_candidates_by_id(tmp_pa
 def test_a_capped_candidate_is_adjudicated_from_the_next_runs_queue_under_a_reworded_reply(tmp_path):
     first = _run_census_kwargs(
         tmp_path / "first",
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[
             _hand_digest("novel-verified", "a genuinely new confusion shape"),
             _hand_digest("novel-rejected", "a spurious one-off"),
@@ -10882,7 +10842,7 @@ def test_a_capped_candidate_is_adjudicated_from_the_next_runs_queue_under_a_rewo
     verify_fn = _rewording(_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}))
     second = _run_census_kwargs(
         tmp_path / "second",
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("dup-1", "nothing new here")]],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -10984,7 +10944,7 @@ def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified
         batch=[_hand_digest("surfaced-twin", "the fixed shape is back")],
     )
     verify_fn = _make_fake_verify_fn(verified_titles={_SURFACED_PENDING, _QUEUE_NEIGHBOUR})
-    _override(kwargs, invoke=_make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
+    _override(kwargs, invoke=make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
 
     outcome = census_run.run_census(**kwargs)
 
@@ -11013,7 +10973,7 @@ def _without_titles(fake):
 def test_a_promoted_entry_carries_its_candidates_title_whatever_the_reply_restates(tmp_path, restating):
     kwargs = _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
         verify_fn=restating(_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})),
         synthesize_fn=_make_fake_synthesize_fn(),
@@ -11035,7 +10995,7 @@ def test_an_entry_reported_fixed_twice_or_already_retired_is_retired_once(tmp_pa
     kwargs = _run_census_kwargs(
         tmp_path,
         codebook_dict=cb,
-        invoke=_make_fake_invoke(_happy_invoke_response),
+        invoke=make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
         verify_fn=_make_fake_verify_fn(
             verified_titles={_L6_NOVEL_TITLE}, fixed_entry_ids=("entry-a", "entry-a", "entry-gone"),
@@ -11083,7 +11043,7 @@ def test_screened_novel_candidates_attach_in_mining_order(tmp_path):
         },
         batch=[_hand_digest("many-near", "six shapes near entry a")],
     )
-    _override(kwargs, invoke=_make_fake_invoke(_near_entry_a_response))
+    _override(kwargs, invoke=make_fake_invoke(_near_entry_a_response))
 
     outcome = census_run.run_census(**kwargs)
 
@@ -11132,7 +11092,7 @@ def _fixed_twin_entry(title: str) -> dict:
 def _pairing_kwargs(tmp_path, cb, *, verify_fn, batch=("fresh-twin",)):
     return _run_census_kwargs(
         tmp_path,
-        invoke=_make_fake_invoke(_pairing_response),
+        invoke=make_fake_invoke(_pairing_response),
         batch_source=[[_hand_digest(session, "a mined shape") for session in batch]],
         verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),

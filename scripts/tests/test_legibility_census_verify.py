@@ -10,6 +10,7 @@ import logging
 
 import pytest
 from legibility import census_headroom, census_verify, session_runner, verdict
+from legibility_census_scaffold import cap_themed_verdict, make_fake_invoke, quality_block_of
 from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
@@ -18,58 +19,11 @@ from shared.cap_markers import (
 )
 
 
-def _make_fake_invoke(response_fn=None, *, default="{}"):
-    """Fake `invoke(prompt, model) -> str` seam (the one-shot LLM-call
-    primitive used for Sonnet mining via coder.code_digests(invoke=...)
-    and the tiny headroom probe). Records every call as a dict in
-    `.calls` (prompt/model) so a test can assert routing/content. When
-    `response_fn(prompt, model)` is given it decides the reply per call;
-    otherwise every call returns `default` verbatim."""
-    calls = []
-
-    def fake_invoke(prompt, model):
-        calls.append({"prompt": prompt, "model": model})
-        if response_fn is not None:
-            return response_fn(prompt, model)
-        return default
-
-    fake_invoke.calls = calls
-    return fake_invoke
-
-
 def _verdict(verified=True):
     return json.dumps({"verified": verified, "reason": "because"})
 
 
-def _cap_themed_verdict(marker, *, verified=True, remediation=None):
-    """A WELL-FORMED verdict whose `reason` quotes a cap-themed cluster.
-
-    This is ordinary healthy verifier output, not a banner: the model is
-    adjudicating a confusion cluster that happens to be ABOUT usage limits.
-    *remediation*, when given, is the verdict's in-tree remediation proposal.
-    """
-    verdict = {
-        "verified": verified,
-        "reason": (
-            "Confirmed against main: the watcher rotation was interrupted "
-            f"by a {marker}; the 'continue where you left off' resume "
-            "prompt appears at turns 17/27."
-        ),
-    }
-    if remediation is not None:
-        verdict["remediation"] = remediation
-    return json.dumps(verdict)
-
-
 _REMEDIATED_TITLE = "Docs omit the X convention"
-
-
-_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
-
-
-def _quality_block_of(prompt):
-    assert prompt.count(_QUALITY_MARKER) == 1
-    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +127,7 @@ def test_default_verify_fn_does_not_read_a_cap_themed_verdict_as_a_banner(marker
     author happened to think of".
     """
     def invoke(prompt, model):
-        return _cap_themed_verdict(marker)
+        return cap_themed_verdict(marker)
 
     probe = _make_recording_probe(
         census_headroom.HeadroomResult(ok=False, reason="must never be consulted on a parsed verdict")
@@ -197,7 +151,7 @@ def test_default_verify_fn_reads_a_cap_themed_refutation_as_an_ordinary_rejectio
     not abort the census.
     """
     def invoke(prompt, model):
-        return _cap_themed_verdict(marker, verified=False)
+        return cap_themed_verdict(marker, verified=False)
 
     probe = _make_recording_probe(census_headroom.HeadroomResult(ok=False, reason="must never be consulted"))
     verify_fn = census_verify.build_verify_fn(
@@ -796,7 +750,7 @@ def test_default_verify_fn_does_not_mutate_the_input_cluster(tmp_path):
 
 
 def test_verify_prompt_requests_the_remediation_key(tmp_path):
-    fake_invoke = _make_fake_invoke(default=_verdict())
+    fake_invoke = make_fake_invoke(default=_verdict())
     census_verify.build_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     assert '"remediation"' in fake_invoke.calls[0]["prompt"]
 
@@ -878,7 +832,7 @@ def test_default_verify_fn_logs_one_warning_per_verdict_normalisation(tmp_path, 
     messages = [
         record.getMessage()
         for record in caplog.records
-        if record.levelno == logging.WARNING and record.name == "legibility.census.verify"
+        if record.levelno == logging.WARNING and record.name == "legibility.census.verdicts"
     ]
     for kind, offered in (("tag_dropped", "'bogus'"), ("severity_substituted", "'critical'")):
         naming = [m for m in messages if _REMEDIATED_TITLE in m and kind in m and offered in m]
@@ -898,11 +852,11 @@ _C4_KEYS = (
 
 
 def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict(tmp_path):
-    fake_invoke = _make_fake_invoke(default=_verdict())
+    fake_invoke = make_fake_invoke(default=_verdict())
     census_verify.build_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     prompt = fake_invoke.calls[0]["prompt"]
 
-    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert quality_block_of(prompt) == code_quality.guidance()
     assert prompt.startswith("You are the periodic-census verifier")
     for key in _C4_KEYS:
         assert f'"{key}"' in prompt, key

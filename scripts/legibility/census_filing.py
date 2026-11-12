@@ -15,7 +15,7 @@ if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) 
 from legibility import (
     census_findings,
     census_report,
-    census_verify,
+    census_verdicts,
     codebook,
     disposition,
     filing_policy,
@@ -262,7 +262,7 @@ def _carrying(pending: PendingFiling, refiling: disposition.Refiling) -> Pending
     remediation."""
     cluster = pending.cluster
     if refiling.found is not None and not pending.verified_present:
-        cluster = census_verify.with_verdict(cluster, refiling.found)
+        cluster = census_verdicts.with_verdict(cluster, refiling.found)
     return replace(
         pending,
         cluster=cluster,

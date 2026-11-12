@@ -8,12 +8,20 @@ import pytest
 
 LEGIBILITY = Path(__file__).resolve().parents[1] / "legibility"
 
+CENSUS_MODULES = sorted(path.stem for path in LEGIBILITY.glob("census*.py"))
+
 LAYERS = {
+    "census_findings": 0,
     "census_headroom": 0,
     "census_mining": 0,
+    "census_state": 0,
+    "census_verdicts": 0,
+    "census_window": 0,
+    "census_identity": 1,
     "census_report": 1,
     "census_verify": 1,
     "census_filing": 2,
+    "census_trigger": 2,
     "census_run": 3,
     "census": 4,
 }
@@ -35,11 +43,16 @@ def _census_imports(module: str) -> set[str]:
                 imported.add(parts[1])
             else:
                 imported.add(parts[0])
-    return imported & LAYERS.keys()
+    return imported & set(CENSUS_MODULES)
 
 
-@pytest.mark.parametrize("module", sorted(LAYERS))
+def test_every_census_module_has_a_layer():
+    assert sorted(LAYERS) == CENSUS_MODULES
+
+
+@pytest.mark.parametrize("module", CENSUS_MODULES)
 def test_census_layer_imports_only_lower_layers(module):
+    assert module in LAYERS, f"{module} has no layer in LAYERS"
     for imported in sorted(_census_imports(module)):
         assert LAYERS[imported] < LAYERS[module], (
             f"{module} (layer {LAYERS[module]}) imports {imported} (layer {LAYERS[imported]}); "

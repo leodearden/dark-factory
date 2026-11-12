@@ -1,4 +1,4 @@
-"""The census's verify seam: the default per-cluster verifier, and the Verdict every verified cluster carries."""
+"""The census's default per-cluster verifier."""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) 
 if (_ORCH_SRC := str(Path(__file__).resolve().parents[2] / "orchestrator" / "src")) not in sys.path:
     sys.path.insert(0, _ORCH_SRC)
 
-from legibility import census_headroom, coder
+from legibility import census_headroom, census_verdicts, coder
 from legibility import verdict as verdict_mod
 from orchestrator.agents import code_quality
 from shared.cap_markers import looks_like_blocking_banner
@@ -72,61 +72,6 @@ def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> s
     )
 
 
-def with_verdict(cluster: dict, found: verdict_mod.Verdict) -> dict:
-    """*cluster* carrying its Verdict, its remediation exactly the Verdict's
-    in-tree one when the claim is verified: a refuted claim, or a Verdict
-    without a remediation, carries none whatever the cluster arrived with."""
-    unremediated = {key: value for key, value in cluster.items() if key != "remediation"}
-    with_verdict = {**unremediated, "verdict": found}
-    if found.verified and found.remediation is not None:
-        return {**with_verdict, "remediation": found.remediation.to_record()}
-    return with_verdict
-
-
-def _log_verdict_normalisations(title, found: verdict_mod.Verdict) -> None:
-    for note in found.normalisations:
-        logger.warning(
-            "census: verdict for cluster %r normalised (%s): offered %s, used %r",
-            title, note.kind.value, note.offered, note.used,
-        )
-
-
-def _verdict_of(cluster: dict, *, project_root: str) -> verdict_mod.Verdict:
-    """*cluster*'s Verdict, else the verdict parser's reading of a verified
-    reply stating only the cluster's own remediation: normalised, logged and
-    counted like any other verdict."""
-    found = cluster.get("verdict")
-    if isinstance(found, verdict_mod.Verdict):
-        return found
-    defaulted = verdict_mod.parse_verdict(
-        {"verified": True, "remediation": cluster.get("remediation")},
-        title=cluster.get("title") or "",
-        project_root=project_root,
-    )
-    _log_verdict_normalisations(cluster.get("title"), defaulted)
-    return defaulted
-
-
-def verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
-    """*verified*, every cluster carrying a Verdict (``_verdict_of``) and
-    that Verdict's remediation (``with_verdict``)."""
-    verdictless = [
-        cluster.get("title")
-        for cluster in verified
-        if not isinstance(cluster.get("verdict"), verdict_mod.Verdict)
-    ]
-    if verdictless:
-        logger.warning(
-            "census: %d verified cluster(s) arrived without a verdict; promoting "
-            "them on the verdict parser's defaults: %s",
-            len(verdictless), verdictless,
-        )
-    return [
-        with_verdict(cluster, _verdict_of(cluster, project_root=project_root))
-        for cluster in verified
-    ]
-
-
 def build_verify_fn(
     project_root: str,
     invoke,
@@ -143,10 +88,10 @@ def build_verify_fn(
     Fail-closed per cluster: any per-cluster failure (an invocation error,
     unparseable output, a reply that is no verdict) rejects that cluster
     rather than crashing the census, and no "fixed" entry is ever reported.
-    A rejection means the claim could not be verified only because
-    ``census.census_stage_specs`` roots the verifier's cwd in *project_root*;
-    ``census_run.run_census`` flags the all-rejected signature any other
-    infra cause leaves.
+    A rejection is evidence against the claim, not a sign the verifier could
+    not see the tree, only because ``census.census_stage_specs`` roots the
+    verifier's cwd in *project_root*; ``census_run.run_census`` flags the
+    all-rejected signature any other infra cause leaves.
 
     A usage cap is carved out of that default: it is an infra failure, never
     a verdict. With *headroom_probe* supplied, three detectors raise
@@ -294,11 +239,11 @@ def build_verify_fn(
                 )
                 rejected.append(cluster)
                 continue
-            _log_verdict_normalisations(cluster.get("title"), found)
+            census_verdicts.log_normalisations(cluster.get("title"), found)
             if found.verified:
-                verified.append(with_verdict(cluster, found))
+                verified.append(census_verdicts.with_verdict(cluster, found))
             else:
-                rejected.append(with_verdict(cluster, found))
+                rejected.append(census_verdicts.with_verdict(cluster, found))
 
             # (c) The backstop. Guarded on `remaining > 1` so no probe is
             # spent after the last cluster, where it would guard a stage

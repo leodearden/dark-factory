@@ -22,7 +22,7 @@ from legibility import (
     census_report,
     census_state,
     census_trigger,
-    census_verify,
+    census_verdicts,
     census_window,
     codebook,
     codebook_lifecycle,
@@ -405,7 +405,7 @@ def _adjudicate_queue(
         return QueueOutcome(inconclusive=f"headroom exhausted: {exc.reason}")
     verified = _offered_replies(result.get("verified") or [], clusters, verdict="verified")
     return QueueOutcome(
-        verified=tuple(census_verify.verified_with_verdicts(verified, project_root=project_root)),
+        verified=tuple(census_verdicts.verified_with_verdicts(verified, project_root=project_root)),
         rejected=tuple(_offered_replies(result.get("rejected") or [], clusters, verdict="rejected")),
         probes=_reported_probes(result),
     )
@@ -947,7 +947,7 @@ def adjudicate(run: CensusRun, effects: CensusEffects, mined: Mined, merged: Mer
         )
     probes += _reported_probes(verify_result)
 
-    verified = census_verify.verified_with_verdicts(
+    verified = census_verdicts.verified_with_verdicts(
         _offered_replies(verify_result.get("verified") or [], merged.to_verify, verdict="verified"),
         project_root=run.project_root,
     )
