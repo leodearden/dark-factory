@@ -11,7 +11,8 @@ Replaces verify.py's raw-shell-string find/replace-surgery command model
   for well-formed, non-OPAQUE commands).
 - A set of pure ``VerifyCmd -> VerifyCmd`` mutators (``scope_to``,
   ``strip_cwd``, ``reproject``, ``cargo_scope``, ``serial_pytest``,
-  ``govern_cpu``) replace the old string-surgery helpers.
+  ``serial_confirm_pytest``, ``govern_cpu``) replace the old string-surgery
+  helpers.
 
 ``ToolKind`` is a ``StrEnum`` — mirrors verify_categories.FailureCategory
 (task α) so tool identity is JSON-serialisable and ``str(ToolKind.X) == 'x'``.
@@ -173,7 +174,8 @@ _PYTEST_VALUE_FLAGS = frozenset({
 
 # The SUBSET of the above that THIS MODULE's own mutators emit —
 # `-p no:xdist -o addopts=` (serial_pytest), `-n <count>`
-# (apply_pytest_numprocesses), `--timeout <secs>` (with_pytest_timeout),
+# (apply_pytest_numprocesses), `-n 0` (serial_confirm_pytest),
+# `--timeout <secs>` (with_pytest_timeout),
 # `--junitxml <path>` (with_junitxml). A subset rather than a second
 # declaration folded into the set above, because the two answer orthogonal
 # questions: the parse side answers "does pytest take a separate value token
@@ -1937,6 +1939,7 @@ def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     ``-p no:xdist`` also unregisters xdist's fixtures (``worker_id``,
     ``testrun_uid``), so a test requesting one ERRORs at setup;
     ``verify.py::reproduced_failures`` says what such an ERROR confirms.
+    A confirm re-run uses ``serial_confirm_pytest``, which keeps them.
 
     *ini_addopts* is the RAW ``addopts`` of the config pytest will read for
     this command, supplied by the caller
@@ -1997,17 +2000,106 @@ def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     return _append_value_flag(_append_value_flag(shed, '-p', 'no:xdist'), '-o', addopts)
 
 
+def serial_confirm_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
+    """Return *cmd* in the confirm-isolation form: serial, with xdist still loaded.
+
+    Where xdist is in play (``_xdist_in_play``) this appends ``-n 0``. The
+    plugin stays registered, so its ``worker_id`` and ``testrun_uid``
+    fixtures do too, and xdist sets ``dist='no'`` and ``tx=[]`` at
+    ``numprocesses == 0`` (``xdist/plugin.py::pytest_cmdline_main``). pytest
+    prepends addopts to argv and argparse keeps the last ``-n``, so the
+    governing config applies whole and nothing is stripped.
+
+    Where xdist is not in play this is ``serial_pytest``: an unchanged
+    command would be re-parallelised by ``apply_pytest_numprocesses`` at the
+    gated roles. *ini_addopts* is as for ``serial_pytest``. A non-PYTEST
+    command, or a raw chain the appender refuses, comes back as *cmd* ITSELF,
+    for the caller's ``is`` guard.
+    """
+    if cmd.tool is not ToolKind.PYTEST:
+        return cmd
+    if not _xdist_in_play(cmd, ini_addopts):
+        return serial_pytest(cmd, ini_addopts)
+    if cmd.raw is not None:
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, ' -n 0')
+        if rewritten == cmd.raw:
+            return cmd
+        return replace(cmd, raw=rewritten)
+    return _append_value_flag(cmd, '-n', '0')
+
+
+def _xdist_in_play(cmd: VerifyCmd, ini_addopts: Sequence[str]) -> bool:
+    """True when an xdist option governs *cmd* and nothing disables the plugin."""
+    if cmd.raw is not None:
+        on_argv = _raw_pytest_carries_xdist_option(cmd.raw)
+    else:
+        on_argv = any(_is_xdist_option(token) for token in cmd.base_flags)
+    in_config = any(_is_xdist_option(token) for token in ini_addopts)
+    disabled = _disables_xdist_plugin(cmd) or 'no:xdist' in ini_addopts
+    return (on_argv or in_config) and not disabled
+
+
+def _disables_xdist_plugin(cmd: VerifyCmd) -> bool:
+    """True when *cmd* carries ``no:xdist`` (see ``_is_serial_forced``)."""
+    if cmd.raw is not None:
+        return 'no:xdist' in cmd.raw
+    return 'no:xdist' in cmd.base_flags or 'no:xdist' in cmd.targets
+
+
+_WORKER_COUNT_OPTIONS = frozenset({'-n', '--numprocesses'})
+
+
+def _pins_zero_workers(tokens: Sequence[str]) -> bool:
+    """True when the LAST xdist worker count in argv *tokens* is ``0``.
+
+    The last one is what argparse applies. The walk pairs every
+    ``_PYTEST_VALUE_FLAGS`` member with its value, as ``_strip_xdist_options``
+    does, so a value such as the ``-n0`` in ``-k -n0`` is never read as a
+    count.
+    """
+    count = None
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in _PYTEST_VALUE_FLAGS and i + 1 < len(tokens):
+            if token in _WORKER_COUNT_OPTIONS:
+                count = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith('--numprocesses='):
+            count = token.removeprefix('--numprocesses=')
+        elif token.startswith('-n') and not token.startswith('--') and len(token) > 2:
+            count = token[2:]
+        i += 1
+    return count == '0'
+
+
+def _raw_pytest_pins_zero_workers(raw: str) -> bool:
+    """True when a pytest invocation in *raw* pins zero workers; a span that will not tokenise does not."""
+    for start, end in _pytest_invocation_spans(raw):
+        try:
+            tokens = shlex.split(raw[start:end])
+        except ValueError:
+            continue
+        if _pins_zero_workers(tokens):
+            return True
+    return False
+
+
 def _is_serial_forced(cmd: VerifyCmd) -> bool:
-    """True when *cmd* has been forced serial (xdist plugin disabled).
+    """True when *cmd* has been forced serial, in either of two forms.
 
     ``serial_pytest`` disables xdist by appending ``-p no:xdist`` — to
     ``base_flags`` for a structured command, or into every ``pytest``
     invocation in ``raw`` for a chain. With the xdist plugin disabled pytest
     does not register the ``-n``/``--numprocesses`` option, so injecting
     ``-n`` afterwards makes pytest exit with ``unrecognized arguments: -n``.
+    ``serial_confirm_pytest`` instead pins the last worker count to ``0``
+    (``_pins_zero_workers``; an operator's own ``-n 0`` counts too), and a
+    ``-n`` injected after it would re-parallelise the confirm.
     ``apply_pytest_numprocesses`` consults this to stay a no-op on any
-    already-serial command (the env-transient and flaky-scoped recovery
-    re-runs both pass such commands back through the injection site).
+    already-serial command (the env-transient recovery and every confirm
+    re-run pass such commands back through the injection site).
 
     That is one direction of the interaction. The other — an xdist option
     already on argv when the command is forced serial — is closed in
@@ -2025,9 +2117,11 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
     too — the ``targets`` check is now defensive-only (guards a
     hand-constructed or pre-fix-shaped ``VerifyCmd``) but harmless to keep.
     """
+    if _disables_xdist_plugin(cmd):
+        return True
     if cmd.raw is not None:
-        return 'no:xdist' in cmd.raw
-    return 'no:xdist' in cmd.base_flags or 'no:xdist' in cmd.targets
+        return _raw_pytest_pins_zero_workers(cmd.raw)
+    return _pins_zero_workers(cmd.base_flags)
 
 
 def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
@@ -2117,11 +2211,11 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     unreachable via the scoper — the pytest slot is off the gate's
     tail-preservation allowlist, so it now yields a structured command.
 
-    The α confirm gate injects this AFTER ``serial_pytest``'s
-    ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test
-    ``timeout`` default (300 since 2026-09-12, 60 before that) lives in
-    ``[tool.pytest.ini_options]``, NOT in
-    ``addopts``, so ``-o addopts=`` does not clear it. Without a GENEROUS
+    The α confirm gate injects this AFTER ``serial_confirm_pytest``'s
+    confirm form: the pyproject per-test ``timeout`` default (300 since
+    2026-09-12, 60 before that) is its own ``[tool.pytest.ini_options]`` key,
+    NOT part of ``addopts``, so even the fallback form's ``-o addopts=``
+    leaves it governing the re-run. Without a GENEROUS
     explicit override the isolated confirm re-run could itself starve into a
     false non-suppression (never masking a real red is a hard constraint, but
     masking a genuine flake as a real red just because the confirm run was
