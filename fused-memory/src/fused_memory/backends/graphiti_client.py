@@ -32,6 +32,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
 
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
@@ -539,7 +540,13 @@ class IncompleteEnumerationError(Exception):
 # Every read answering "what is currently true?" interpolates this constant.
 # Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
 # retired edges; `count_foreign_relationships` most emphatically so.
+# `_active_edge_filter` is the same invariant spelled as a graphiti filter.
 _ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
+
+
+def _active_edge_filter() -> SearchFilters:
+    """``_ACTIVE_EDGE_PREDICATE`` as graphiti SearchFilters, for reads through graphiti's own search; it compiles to ``((e.invalid_at IS NULL))``."""
+    return SearchFilters(invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]])
 
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
@@ -1646,7 +1653,7 @@ class GraphitiBackend:
         num_results: int = 10,
         center_node_uuid: str | None = None,
     ) -> list[Any]:
-        """Search for entity edges (facts)."""
+        """Search for active entity edges (facts) only, so a retired edge never takes a leg or fused slot."""
         client = self._require_client()
         gids = group_ids or []
         driver = self._driver_for(gids[0]) if gids else None
@@ -1656,6 +1663,7 @@ class GraphitiBackend:
                 group_ids=gids,
                 num_results=num_results,
                 center_node_uuid=center_node_uuid,
+                search_filter=_active_edge_filter(),
                 driver=driver,
             ),
             'search',
