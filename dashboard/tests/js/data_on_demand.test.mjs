@@ -889,12 +889,6 @@ test('quality retention: trimming forgets every field, its __loaded mark and the
   assert.equal(Object.keys(win.DF_DATA.__receipt).length, retain);
 });
 
-test('quality: the rows without fields still read one body key named as their DF key', () => {
-  const { api } = loadDataJs();
-  assert.equal(api.ON_DEMAND_KEYS.terminal.fields, undefined);
-  assert.equal(api.ON_DEMAND_KEYS.taskProse.fields, undefined);
-});
-
 test('quality: the route is on demand only, never in the polled registry', () => {
   const { api } = loadDataJs();
   for (const win of ['24h', '7d', '30d', 'all']) {

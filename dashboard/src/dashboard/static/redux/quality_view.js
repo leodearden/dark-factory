@@ -11,7 +11,7 @@
 //
 // LOAD CONTRACT. It destructures window.DF_CHART_MARKS at module scope with no
 // fallback, so index.html loads it after chart_marks.js and before the Babel
-// JSX tags (test_index_html.py::_READING_MODULES pins both edges). node
+// JSX tags (test_index_html.py::_MODULE_EDGES pins both edges). node
 // requires the same file as CommonJS once its test has put that global on a
 // window shim; coverage is behavioural, in
 // dashboard/tests/js/quality_view.test.mjs.
