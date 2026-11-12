@@ -798,7 +798,7 @@ class TestStatusPreservationOnResume:
             briefed.append(scope_drift)
             return 'Resume'
 
-        workflow.briefing.build_resume_prompt = build_resume_prompt  # type: ignore[method-assign]
+        monkeypatch.setattr(workflow.briefing, 'build_resume_prompt', build_resume_prompt)
 
         async def invoke_taking_a_turn(role, build_prompt, cwd, output_schema=None):
             await build_prompt()
