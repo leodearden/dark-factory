@@ -1482,3 +1482,75 @@ def test_selftest_surfaces_script_under_test_output(tmp_path: Path) -> None:
         f"{SELFTEST_SH.name} discarded the script under test's output, so its "
         f"systemctl error {transport_error!r} never reached the run's output." + detail
     )
+
+
+def _completed(
+    *, returncode: int = 1, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """A hand-built .sh result, for the pure tests of the gate's helpers."""
+    return subprocess.CompletedProcess(
+        args=["bash", str(SELFTEST_SH)], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected"),
+    [
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+            errno.ENOTCONN,
+            id="reload-ENOTCONN-on-stderr",
+        ),
+        pytest.param(
+            f"    | Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+            "",
+            errno.ENOTCONN,
+            id="reload-ENOTCONN-captured-by-the-sh",
+        ),
+        pytest.param(
+            "",
+            f"Failed to get properties: {os.strerror(errno.ECONNRESET)}\n",
+            errno.ECONNRESET,
+            id="show-ECONNRESET",
+        ),
+        pytest.param(
+            "",
+            f"Failed to connect to bus: {os.strerror(errno.ECONNREFUSED)}\n",
+            errno.ECONNREFUSED,
+            id="connect-ECONNREFUSED",
+        ),
+        pytest.param(
+            "",
+            "  FAIL: WorkingDirectory now resolves to the repo root -- expected '/tmp/x', got ''\n",
+            None,
+            id="genuine-check-failure",
+        ),
+        pytest.param(
+            "",
+            "remove-lms-arm-worktree-dropin: ERROR: launcher absent at "
+            "/nonexistent/not-a-repo/scripts/local-model-serving/lms_serve.py -- task 3713 "
+            "has not landed on main. REFUSING to remove the drop-in: doing so now would "
+            "break every lms-arm@ instance.\n",
+            None,
+            id="script-refusal",
+        ),
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ENOTCONN)} (while reloading)\n",
+            None,
+            id="transport-text-mid-line",
+        ),
+        pytest.param(
+            "",
+            f"Failed to reload daemon: {os.strerror(errno.ETIMEDOUT)}\n",
+            None,
+            id="out-of-set-ETIMEDOUT",
+        ),
+    ],
+)
+def test_host_bus_transport_errno_reads_only_line_ending_transport_errors(
+    stdout: str, stderr: str, expected: int | None
+) -> None:
+    """Only a line ENDING in ': <strerror>' of a transport-class errno is a lost bus."""
+    assert _host_bus_transport_errno(_completed(stdout=stdout, stderr=stderr)) == expected
