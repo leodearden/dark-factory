@@ -34,10 +34,12 @@ Usage:
 
 Exit codes:
     0  completed.
-    2  could not start, and nothing was written: the tasks.db is absent,
-       empty or not a database; it lacks the created_at columns (fused-memory
-       adds them when it next opens the store); or a runs.db exists but cannot
-       be read, which must not silently degrade every row to a weaker source.
+    2  refused, and nothing was written: the tasks.db is absent, empty or not
+       a database; it lacks the created_at columns (fused-memory adds them
+       when it next opens the store); a runs.db exists but cannot be read,
+       which must not silently degrade every row to a weaker source; or the
+       fill failed inside sqlite, typically "database is locked" because
+       fused-memory held the write lock past the busy timeout. Re-run it.
 """
 from __future__ import annotations
 
@@ -62,6 +64,7 @@ EXIT_OK = 0
 EXIT_REFUSED = 2
 
 _EVENT_TAG = 'master'
+_BUSY_TIMEOUT_MS = 5000
 _CREATED_AT_COLUMNS = ('created_at', 'created_at_source')
 _BACKFILL_SOURCES = (
     CreatedAtSource.FIRST_EVENT,
@@ -75,7 +78,7 @@ _FILL = (
 
 
 class BackfillRefused(Exception):
-    """The backfill could not start; nothing was written."""
+    """The backfill was refused; nothing was written."""
 
 
 @dataclass(frozen=True)
@@ -213,7 +216,7 @@ def _fill(store: Path, events: FirstEvents | None, *, dry_run: bool) -> tuple[Fi
     conn = sqlite3.connect(f'{store.resolve().as_uri()}?mode=rw', uri=True, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute('PRAGMA busy_timeout = 5000')
+        conn.execute(f'PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}')
         conn.execute('BEGIN IMMEDIATE')
         try:
             fills = plan_fills(
@@ -232,23 +235,37 @@ def _fill(store: Path, events: FirstEvents | None, *, dry_run: bool) -> tuple[Fi
     return fills, rows_written
 
 
+def _fill_or_refuse(
+    store: Path, events: FirstEvents | None, *, dry_run: bool
+) -> tuple[Fills, int]:
+    """:func:`_fill`, with any sqlite failure refused: the transaction never committed."""
+    try:
+        return _fill(store, events, dry_run=dry_run)
+    except sqlite3.OperationalError as exc:
+        raise BackfillRefused(
+            f'{store}: the fill failed ({exc}); nothing was written. A "database is '
+            f'locked" means another writer held the store past {_BUSY_TIMEOUT_MS} ms; '
+            're-run.'
+        ) from exc
+
+
 def run(project_root: Path, *, dry_run: bool) -> dict[str, object]:
     """Fill every NULL ``created_at`` under *project_root*; return the report.
 
     Raises:
-        BackfillRefused: the backfill could not start; nothing was written.
+        BackfillRefused: the backfill was refused; nothing was written.
     """
     store = tasks_db(project_root)
     _require_created_at_columns(store)
     events = _read_first_events(runs_db(project_root))
-    fills, rows_written = _fill(store, events, dry_run=dry_run)
+    fills, rows_written = _fill_or_refuse(store, events, dry_run=dry_run)
     return {
         'project_root': str(project_root),
         'tasks_db': str(store),
         'runs_db': 'absent' if events is None else 'present',
         'dry_run': dry_run,
         'counts': {source.value: fills.counts[source] for source in _BACKFILL_SOURCES},
-        'skipped_unusable_updated_at': fills.skipped,
+        'skipped_no_usable_source': fills.skipped,
         'unparseable_event_timestamps': 0 if events is None else events.unparseable_timestamps,
         'rows_written': rows_written,
     }

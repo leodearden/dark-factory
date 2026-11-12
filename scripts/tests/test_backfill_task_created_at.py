@@ -60,6 +60,7 @@ _ROWS: tuple[Mapping[str, object], ...] = (
     },
     {'id': 8, 'updated_at': '2026-07-28T12:00:00.000Z'},
     {'id': 9, 'updated_at': '2026-06-01T00:00:00.000Z'},
+    {'tag': 'feature', 'id': 10, 'updated_at': '2026-06-15T00:00:00.000Z'},
 )
 
 _EVENTS = (
@@ -73,6 +74,8 @@ _EVENTS = (
     {'task_id': 7, 'event_type': 'starvation_detected', 'timestamp': '2026-11-05T00:00:00+00:00'},
     {'task_id': 8, 'event_type': 'starvation_detected', 'timestamp': '2026-11-05T00:00:00+00:00'},
     {'task_id': 9, 'event_type': 'task_started', 'timestamp': '2026-06-01T00:00:00+00:00'},
+    # Events carry no tag, so this one is master task 10's, not the feature row's.
+    {'task_id': 10, 'event_type': 'task_started', 'timestamp': '2026-06-10T00:00:00+00:00'},
     {'task_id': 'main-sweep-x', 'event_type': 'sweep', 'timestamp': '2026-01-01T00:00:00+00:00'},
     {'task_id': None, 'event_type': 'sweep', 'timestamp': '2026-01-01T00:00:00+00:00'},
 )
@@ -87,6 +90,7 @@ _FILLED = {
     7: ('2026-07-28T00:00:00.000Z', 'pending_since'),
     8: ('2026-07-28T12:00:00.000Z', 'updated_at'),
     9: ('2026-06-01T00:00:00.000Z', 'first_event'),
+    10: ('2026-06-15T00:00:00.000Z', 'updated_at'),
 }
 
 
@@ -157,10 +161,10 @@ def test_the_first_run_fills_each_null_row_from_its_earliest_source(capsys, proj
         'tasks_db': str(tasks_db(project)),
         'runs_db': 'present',
         'dry_run': False,
-        'counts': {'first_event': 2, 'pending_since': 2, 'updated_at': 3},
-        'skipped_unusable_updated_at': 1,
+        'counts': {'first_event': 2, 'pending_since': 2, 'updated_at': 4},
+        'skipped_no_usable_source': 1,
         'unparseable_event_timestamps': 1,
-        'rows_written': 7,
+        'rows_written': 8,
     }
     assert _created_at(project) == _FILLED
 
@@ -197,7 +201,8 @@ def test_a_dry_run_reports_the_same_counts_and_writes_nothing(capsys, project):
     report = _report(capsys, project, '--dry-run')
 
     assert report['dry_run'] is True
-    assert report['counts'] == {'first_event': 2, 'pending_since': 2, 'updated_at': 3}
+    assert report['counts'] == {'first_event': 2, 'pending_since': 2, 'updated_at': 4}
+    assert report['rows_written'] == 8
     assert _all_rows(project) == before
 
 
@@ -209,7 +214,7 @@ def test_without_a_runs_db_every_row_falls_through_to_its_metadata_or_updated_at
     report = _report(capsys, project)
 
     assert report['runs_db'] == 'absent'
-    assert report['counts'] == {'first_event': 0, 'pending_since': 2, 'updated_at': 5}
+    assert report['counts'] == {'first_event': 0, 'pending_since': 2, 'updated_at': 6}
     assert _created_at(project)[1] == ('2026-04-20T00:00:00.000Z', 'updated_at')
 
 
@@ -223,6 +228,21 @@ def test_a_store_fused_memory_has_not_migrated_is_refused_untouched(capsys, tmp_
     assert 'created_at' in err
     assert 'get_tasks' in err
     assert tasks_db(root).read_bytes() == before
+
+
+def test_a_store_whose_write_lock_outlasts_the_busy_timeout_is_refused_untouched(
+    capsys, project
+):
+    before = _all_rows(project)
+
+    with contextlib.closing(sqlite3.connect(tasks_db(project), isolation_level=None)) as holder:
+        holder.execute('BEGIN IMMEDIATE')
+        err = _refusal(capsys, project)
+        holder.execute('ROLLBACK')
+
+    assert 'database is locked' in err
+    assert 'nothing was written' in err
+    assert _all_rows(project) == before
 
 
 def test_a_project_root_without_a_task_store_is_refused_and_no_file_is_created(
