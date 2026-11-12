@@ -43,6 +43,7 @@ from dashboard.data.quality_markers import (
     RoutingStep,
     RuleSpan,
     SnapshotIdentity,
+    SourceLayer,
     SourceType,
     StoredMarkerState,
     availability_flags,
@@ -452,7 +453,8 @@ def _fold(store: Path, fold: RoutingFold | None = None, *, batch: int | None = N
 
 def _step(
     role: str, first: float, last: float, decisions: int, *, first_id: int | None = None,
-    last_id: int | None = None, layer: str = 'config', model: str = 'fable', effort: str = 'high',
+    last_id: int | None = None, layer: SourceLayer = SourceLayer.CONFIG, model: str = 'fable',
+    effort: str = 'high',
     budget_usd: float = 8.0, max_turns: int = 100, digest: str | None = None,
 ) -> RoutingStep:
     """A step whose event ids equal its minutes unless given (one row per minute in the fixtures)."""
@@ -496,14 +498,16 @@ class TestRoutingFold:
         assert fold.steps == (
             _step('merger', 1, 3, 2),
             _step('reviewer_comprehensive', 2, 2, 1, model='opus', budget_usd=12.0, max_turns=60),
-            _step('merger', 4, 4, 1, layer='role_default', model='opus'),
+            _step('merger', 4, 4, 1, layer=SourceLayer.ROLE_DEFAULT, model='opus'),
             _step('merger', 5, 5, 1),
         )
         assert (fold.cursor, fold.first_at, fold.newest_at) == (5, _t(1), _t(5))
         assert fold.complete
         assert fold.project_id == 'dark_factory'
 
-    def test_rule_rows_feed_rule_spans_and_only_config_layers_feed_steps(self, tmp_path: Path) -> None:
+    def test_rule_rows_feed_rule_spans_and_only_unmatched_config_layers_feed_steps(
+        self, tmp_path: Path,
+    ) -> None:
         store = _runs(tmp_path, [
             _decision(1, 'implementer'),
             _decision(2, 'implementer', layer='policy_rule', rule_id='large-plan-steps',
@@ -517,7 +521,7 @@ class TestRoutingFold:
 
         fold = _fold(store)
 
-        assert fold.steps == (_step('implementer', 1, 5, 3),)
+        assert fold.steps == (_step('implementer', 1, 3, 2),)
         assert fold.rules == (
             RuleSpan(rule_id='large-plan-steps', first_event_id=2, first_at=_t(2),
                      last_at=_t(6), decisions=2),
@@ -525,6 +529,41 @@ class TestRoutingFold:
                      last_at=_t(5), decisions=1),
         )
         assert fold.cursor == 6
+
+    def test_a_rule_whose_model_is_refused_still_sets_fields_and_splits_no_step(
+        self, tmp_path: Path,
+    ) -> None:
+        """resolve_route applies a rule's effort, budget and turns even when it refuses the rule's
+        model, so such a row keeps layer config or role_default but carries the rule's values."""
+        store = _runs(tmp_path, [
+            _decision(1, 'implementer'),
+            _decision(2, 'implementer', rule_id='large-plan-steps', max_turns=120),
+            _decision(3, 'implementer'),
+            _decision(4, 'implementer', layer='role_default', model='opus', max_turns=120,
+                      rule_id='large-plan-steps'),
+            _decision(5, 'implementer'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.steps == (_step('implementer', 1, 5, 3),)
+        assert fold.rules == (RuleSpan(rule_id='large-plan-steps', first_event_id=2,
+                                       first_at=_t(2), last_at=_t(4), decisions=2),)
+        assert (routing_markers(fold, ()), availability_flags(fold)) == ([], [])
+
+    def test_a_row_naming_an_unknown_layer_is_skipped_and_counted(self, tmp_path: Path) -> None:
+        store = _runs(tmp_path, [
+            _decision(1, 'merger'),
+            _decision(2, 'merger', layer='retired_layer', model='opus'),
+            _decision(3, 'merger'),
+        ])
+
+        fold = _fold(store)
+
+        assert fold.skipped == 1
+        assert fold.steps == (_step('merger', 1, 3, 2),)
+        assert fold.steps[0].source_layer is SourceLayer.CONFIG
+        assert fold.newest_at == _t(3)
 
     def test_an_absent_digest_never_splits_a_step_and_a_new_one_does(self, tmp_path: Path) -> None:
         store = _runs(tmp_path, [
@@ -628,7 +667,8 @@ class _Steps:
         self.steps: list[RoutingStep] = []
 
     def add(
-        self, first_at: str, decisions: int, *, layer: str = 'config', model: str = 'opus',
+        self, first_at: str, decisions: int, *, layer: SourceLayer = SourceLayer.CONFIG,
+        model: str = 'opus',
         effort: str = 'high', budget_usd: float = 12.0, max_turns: int = 60,
         digest: str | None = None,
     ) -> _Steps:
@@ -700,7 +740,7 @@ class TestRoutingMarkers:
                   .add('2026-09-12T08:52:00', 15, model='fable', effort='max', budget_usd=8.0,
                        max_turns=100)
                   .add('2026-09-25T06:13:00', 37, model='fable', budget_usd=8.0, max_turns=100)
-                  .add('2026-10-27T13:46:00', 1, layer='role_default', budget_usd=8.0,
+                  .add('2026-10-27T13:46:00', 1, layer=SourceLayer.ROLE_DEFAULT, budget_usd=8.0,
                        max_turns=100)
                   .add('2026-10-27T20:12:00', 6, model='fable', budget_usd=8.0, max_turns=100))
         fold = _routing_fold(merger, newest_at='2026-11-01T00:00:00')
@@ -718,7 +758,7 @@ class TestRoutingMarkers:
 
     def test_an_unreturned_role_default_run_is_no_availability_flag(self) -> None:
         merger = (_Steps('merger').add('2026-10-01T00:00:00', 30, model='fable')
-                  .add('2026-10-27T13:46:00', 1, layer='role_default'))
+                  .add('2026-10-27T13:46:00', 1, layer=SourceLayer.ROLE_DEFAULT))
 
         assert availability_flags(_routing_fold(merger, newest_at='2026-10-28T00:00:00')) == []
 
@@ -778,7 +818,7 @@ class TestRoutingMarkers:
 
     def test_an_empty_diff_against_the_previous_counted_state_is_no_marker(self) -> None:
         role = (_Steps('merger').add('2026-10-01T00:00:00', 40)
-                .add('2026-10-05T00:00:00', 40, layer='role_default'))
+                .add('2026-10-05T00:00:00', 40, layer=SourceLayer.ROLE_DEFAULT))
 
         assert routing_markers(_routing_fold(role, newest_at='2026-10-10T00:00:00'), ()) == []
 
@@ -1119,7 +1159,7 @@ def _state(
     *, complete: bool = True, refreshed_at: datetime = NOW - timedelta(minutes=5),
 ) -> DerivedState:
     merger = (_Steps('merger').add('2026-10-01T00:00:00', 30, model='fable')
-              .add('2026-10-27T13:46:00', 1, layer='role_default')
+              .add('2026-10-27T13:46:00', 1, layer=SourceLayer.ROLE_DEFAULT)
               .add('2026-10-27T20:12:00', 6, model='fable'))
     fold = replace(_routing_fold(merger, newest_at='2026-11-01T00:00:00'), complete=complete,
                    skipped=2)

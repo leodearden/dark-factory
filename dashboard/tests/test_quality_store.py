@@ -35,6 +35,7 @@ from dashboard.data.quality_markers import (
     RoutingFold,
     RoutingStep,
     RuleSpan,
+    SourceLayer,
     SourceType,
     StoredMarkerState,
 )
@@ -48,6 +49,7 @@ from dashboard.data.quality_store import (
     newest_samples,
     read_landing_rows,
     read_marker_state,
+    read_routing_fold,
     read_samples,
     record_marker_failure,
     stored_cursor,
@@ -445,7 +447,7 @@ def _minute(minutes: int) -> datetime:
 
 
 def _route_step(
-    role: str, first_event_id: int, decisions: int, *, layer: str = 'config',
+    role: str, first_event_id: int, decisions: int, *, layer: SourceLayer = SourceLayer.CONFIG,
     model: str = 'opus', digest: str | None = None,
 ) -> RoutingStep:
     return RoutingStep(
@@ -460,7 +462,7 @@ def _route_step(
 STEPS = (
     _route_step('merger', 10, 3),
     _route_step('reviewer_comprehensive', 11, 4, model='fable'),
-    _route_step('merger', 20, 1, layer='role_default'),
+    _route_step('merger', 20, 1, layer=SourceLayer.ROLE_DEFAULT),
     _route_step('merger', 30, 6, digest=DIGEST),
 )
 RULES = (
@@ -627,6 +629,41 @@ async def test_a_derivation_after_a_failure_clears_it(conn: aiosqlite.Connection
     await _write(conn, state)
 
     assert await read_marker_state(conn, DF) == _stored(state)
+
+
+async def test_the_routing_fold_reads_alone_as_its_derivation_stored_it(
+    conn: aiosqlite.Connection,
+) -> None:
+    state = _derived_state()
+    await _write(conn, _derived_state('reify'))
+    await _write(conn, state)
+    await record_marker_failure(conn, DF, attempted_at=REFRESHED + timedelta(minutes=10),
+                                failure='OperationalError: database is locked')
+    await conn.commit()
+
+    assert await read_routing_fold(conn, DF) == state.fold
+
+
+async def test_no_derivation_is_no_routing_fold(conn: aiosqlite.Connection) -> None:
+    await record_marker_failure(conn, DF, attempted_at=REFRESHED, failure='runs.db is absent')
+    await conn.commit()
+
+    assert await read_routing_fold(conn, DF) is None
+    assert await read_routing_fold(conn, 'reify') is None
+
+
+async def test_the_routing_fold_reads_without_decoding_the_markers(
+    conn: aiosqlite.Connection,
+) -> None:
+    state = _derived_state()
+    await _write(conn, state)
+    await conn.execute("UPDATE markers_derived SET kind = 'retired_kind' WHERE project_id = ?",
+                       (DF,))
+    await conn.commit()
+
+    with pytest.raises(ValueError, match='retired_kind'):
+        await read_marker_state(conn, DF)
+    assert await read_routing_fold(conn, DF) == state.fold
 
 
 def _with_marker(**overrides: object) -> DerivedState:

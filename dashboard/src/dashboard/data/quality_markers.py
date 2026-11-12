@@ -265,9 +265,18 @@ class Marker:
         return None
 
 
+def regime_events(markers: Iterable[Marker]) -> tuple[RegimeEvent, ...]:
+    """The markers the landing-axis statistics read: boundaries and exclusion ranges."""
+    return tuple(event for marker in markers if (event := marker.regime_event()) is not None)
+
+
 class CuratedMarkers(NamedTuple):
     markers: tuple[Marker, ...]
     parse_failures: int
+
+    def for_project(self, project_id: str) -> tuple[Marker, ...]:
+        """The curated markers in *project_id*'s scope, in file order."""
+        return tuple(marker for marker in self.markers if in_scope(marker, project_id))
 
 
 class _CuratedFieldError(ValueError):
@@ -405,13 +414,24 @@ def _curated_id(
     return 'curated:' + hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-STEP_LAYERS = frozenset({'config', 'role_default'})
+class SourceLayer(StrEnum):
+    """The routing layer that chose a decision's model
+    (orchestrator/src/orchestrator/routing.py::resolve_route)."""
+
+    ROLE_DEFAULT = 'role_default'
+    CONFIG = 'config'
+    POLICY_RULE = 'policy_rule'
+    METADATA_OVERRIDE = 'metadata_override'
+
+
+STEP_LAYERS = frozenset({SourceLayer.CONFIG, SourceLayer.ROLE_DEFAULT})
 """The routing layers whose decisions form a role's steps; policy rules and overrides do not."""
 
 
 @dataclass(frozen=True)
 class RoutingStep:
-    """A run of one role's consecutive config/role_default decisions with one route.
+    """A run of one role's consecutive config/role_default decisions, matched by no policy rule,
+    with one route.
 
     ``prompt_digest`` None means no decision in the run carried one yet.
     """
@@ -422,7 +442,7 @@ class RoutingStep:
     last_event_id: int
     last_at: datetime
     decisions: int
-    source_layer: str
+    source_layer: SourceLayer
     model: str
     effort: str
     budget_usd: float
@@ -488,7 +508,7 @@ class _Decision(NamedTuple):
     event_id: int
     at: datetime
     role: str
-    source_layer: str
+    source_layer: SourceLayer
     model: str
     effort: str
     budget_usd: float
@@ -498,12 +518,13 @@ class _Decision(NamedTuple):
 
 
 def _decision(row: tuple[object, ...]) -> _Decision | None:
-    """One routing_decision row, or None when it cannot be read as one."""
+    """One routing_decision row, or None when it cannot be read as one; an unknown layer cannot."""
     event_id, timestamp, role, layer, model, effort, budget, turns, rule_id, digest = row
-    texts = (role, layer, model, effort)
+    texts = (role, model, effort)
     if not (
         isinstance(event_id, int) and isinstance(timestamp, str)
         and all(isinstance(text, str) and text for text in texts)
+        and isinstance(layer, str) and layer in SourceLayer
         and isinstance(budget, (int, float)) and isinstance(turns, int)
         and (rule_id is None or isinstance(rule_id, str))
         and (digest is None or isinstance(digest, str))
@@ -513,8 +534,8 @@ def _decision(row: tuple[object, ...]) -> _Decision | None:
         at = parse_utc(timestamp)
     except ValueError:
         return None
-    return _Decision(event_id, at, str(role), str(layer), str(model), str(effort), float(budget),
-                     turns, rule_id, digest)
+    return _Decision(event_id, at, str(role), SourceLayer(layer), str(model), str(effort),
+                     float(budget), turns, rule_id, digest)
 
 
 def fold_routing_decisions(
@@ -556,7 +577,7 @@ class _FoldBuilder:
             self._digest_since = decision.at
         if decision.rule_id is not None:
             self._add_rule(decision.rule_id, decision)
-        if decision.source_layer in STEP_LAYERS:
+        elif decision.source_layer in STEP_LAYERS:
             self._add_step(decision)
 
     def _add_rule(self, rule_id: str, decision: _Decision) -> None:
@@ -787,12 +808,14 @@ def _without_fallbacks(
 
 def _fallback_end(kept: Sequence[RoutingStep], steps: Sequence[RoutingStep], index: int) -> int | None:
     """The index of the config step a role_default run starting at *index* returns to, else None."""
-    if not kept or kept[-1].source_layer != 'config' or steps[index].source_layer != 'role_default':
+    if (not kept or kept[-1].source_layer is not SourceLayer.CONFIG
+            or steps[index].source_layer is not SourceLayer.ROLE_DEFAULT):
         return None
     end = index
-    while end < len(steps) and steps[end].source_layer == 'role_default':
+    while end < len(steps) and steps[end].source_layer is SourceLayer.ROLE_DEFAULT:
         end += 1
-    if end < len(steps) and steps[end].source_layer == 'config' and not _route_diff(kept[-1], steps[end]):
+    if (end < len(steps) and steps[end].source_layer is SourceLayer.CONFIG
+            and not _route_diff(kept[-1], steps[end])):
         return end
     return None
 
@@ -912,27 +935,35 @@ RULE_QUIET_DAYS = 7
 """A policy rule that has not matched for this long, at the fold's newest decision, is retired."""
 
 
+class RuleMatch(StrEnum):
+    """Which end of a policy rule's matches a routing_rule marker marks."""
+
+    FIRST = 'first'
+    LAST = 'last'
+
+
 def rule_markers(fold: RoutingFold) -> list[Marker]:
     """Each policy rule's first match, and its last once it has been quiet for RULE_QUIET_DAYS."""
     markers: list[Marker] = []
     for span in fold.rules:
-        markers.append(_rule_marker(fold.project_id, span, 'first', span.first_at,
+        markers.append(_rule_marker(fold.project_id, span, RuleMatch.FIRST, span.first_at,
                                     ref=str(span.first_event_id)))
         quiet = fold.newest_at is not None and (
             fold.newest_at - span.last_at >= timedelta(days=RULE_QUIET_DAYS)
         )
         if quiet:
-            markers.append(_rule_marker(fold.project_id, span, 'last', span.last_at, ref=None))
+            markers.append(_rule_marker(fold.project_id, span, RuleMatch.LAST, span.last_at,
+                                        ref=None))
     return markers
 
 
 def _rule_marker(
-    project_id: str, span: RuleSpan, end: str, at: datetime, *, ref: str | None,
+    project_id: str, span: RuleSpan, end: RuleMatch, at: datetime, *, ref: str | None,
 ) -> Marker:
     return Marker(
-        marker_id=f'policy_rule:{span.rule_id}:{end}', at=at, kind=MarkerKind.ROUTING_RULE,
+        marker_id=f'policy_rule:{span.rule_id}:{end.value}', at=at, kind=MarkerKind.ROUTING_RULE,
         scope=project_id, series=None, until=None,
-        label=f'routing rule {span.rule_id}: {end} match',
+        label=f'routing rule {span.rule_id}: {end.value} match',
         source=MarkerSource(SourceType.POLICY_RULE, rule=span.rule_id), ref=ref,
     )
 
@@ -1188,15 +1219,14 @@ class MarkerStream:
         }
 
     def regime_events(self) -> tuple[RegimeEvent, ...]:
-        """The markers the landing-axis statistics read: boundaries and exclusion ranges."""
-        return tuple(event for marker in self.markers if (event := marker.regime_event()) is not None)
+        return regime_events(self.markers)
 
 
 def marker_stream(
     project_id: str, derived: DerivedState, curated: CuratedMarkers, axis: Sequence[AxisLanding],
 ) -> MarkerStream:
     """The project's derived markers plus the curated ones in its scope, placed on its axis."""
-    chosen = [*derived.markers, *(marker for marker in curated.markers if in_scope(marker, project_id))]
+    chosen = [*derived.markers, *curated.for_project(project_id)]
     ordered = sorted(chosen, key=lambda marker: (marker.at, marker.marker_id))
     return MarkerStream(
         project_id=project_id,

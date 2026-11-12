@@ -45,6 +45,7 @@ from dashboard.data.quality_markers import (
     RoutingFold,
     RoutingStep,
     RuleSpan,
+    SourceLayer,
     StoredMarkerState,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     'newest_samples',
     'read_landing_rows',
     'read_marker_state',
+    'read_routing_fold',
     'read_samples',
     'record_marker_failure',
     'stored_cursor',
@@ -607,7 +609,7 @@ class _ProjectTable:
 _STEPS = _ProjectTable('routing_steps', RoutingStep, (
     ('role', _PLAIN), ('first_event_id', _PLAIN), ('first_at', _UTC),
     ('last_event_id', _PLAIN), ('last_at', _UTC), ('decisions', _PLAIN),
-    ('source_layer', _PLAIN), ('model', _PLAIN), ('effort', _PLAIN), ('budget_usd', _PLAIN),
+    ('source_layer', _enum(SourceLayer)), ('model', _PLAIN), ('effort', _PLAIN), ('budget_usd', _PLAIN),
     ('max_turns', _PLAIN), ('prompt_digest', _PLAIN),
 ), order_by='first_event_id')
 
@@ -726,38 +728,65 @@ async def _fetch(conn: aiosqlite.Connection, sql: str, project_id: str) -> list[
         return list(await cursor.fetchall())
 
 
+async def _fetch_state(conn: aiosqlite.Connection, project_id: str) -> dict[str, Any] | None:
+    found = await _fetch(conn, _SELECT_STATE_SQL, project_id)
+    return dict(zip(_STATE_COLUMNS, found[0], strict=True)) if found else None
+
+
+async def _fetch_fold_rows(
+    conn: aiosqlite.Connection, project_id: str,
+) -> tuple[list[Any], list[Any]]:
+    return (await _fetch(conn, _STEPS.select_sql(), project_id),
+            await _fetch(conn, _RULES.select_sql(), project_id))
+
+
+def _decode_fold(
+    project_id: str, state: Mapping[str, Any], steps: Iterable[Any], rules: Iterable[Any],
+) -> RoutingFold:
+    return RoutingFold(
+        project_id=project_id, cursor=state['routing_cursor'],
+        steps=tuple(_STEPS.decode(record) for record in steps),
+        rules=tuple(_RULES.decode(record) for record in rules),
+        first_at=_UTC.decode(state['first_decision_at']),
+        newest_at=_UTC.decode(state['newest_decision_at']),
+        digest_since=_UTC.decode(state['digest_since']),
+        skipped=state['skipped_routing'], complete=_BOOL.decode(state['fold_complete']),
+    )
+
+
+async def read_routing_fold(conn: aiosqlite.Connection, project_id: str) -> RoutingFold | None:
+    """The routing fold of the project's newest good derivation, without its markers; None if it
+    has never had one."""
+    async with _one_snapshot(conn):
+        state = await _fetch_state(conn, project_id)
+        if state is None or state['refreshed_at'] is None:
+            return None
+        steps, rules = await _fetch_fold_rows(conn, project_id)
+    return _decode_fold(project_id, state, steps, rules)
+
+
 async def read_marker_state(
     conn: aiosqlite.Connection, project_id: str,
 ) -> StoredMarkerState | None:
     """The project's newest good derivation and newest attempt; None if it has never had one."""
     async with _one_snapshot(conn):
-        found = await _fetch(conn, _SELECT_STATE_SQL, project_id)
-        if not found:
+        state = await _fetch_state(conn, project_id)
+        if state is None:
             return None
-        stored = dict(zip(_STATE_COLUMNS, found[0], strict=True))
-        attempted_at, failure = parse_utc(stored['attempted_at']), stored['failure']
-        if stored['refreshed_at'] is None:
+        attempted_at, failure = parse_utc(state['attempted_at']), state['failure']
+        if state['refreshed_at'] is None:
             return StoredMarkerState(derived=None, attempted_at=attempted_at, failure=failure)
-        steps = await _fetch(conn, _STEPS.select_sql(), project_id)
-        rules = await _fetch(conn, _RULES.select_sql(), project_id)
+        steps, rules = await _fetch_fold_rows(conn, project_id)
         markers = await _fetch(conn, _SELECT_MARKERS_SQL, project_id)
-    digest_since = _UTC.decode(stored['digest_since'])
-    fold = RoutingFold(
-        project_id=project_id, cursor=stored['routing_cursor'],
-        steps=tuple(_STEPS.decode(record) for record in steps),
-        rules=tuple(_RULES.decode(record) for record in rules),
-        first_at=_UTC.decode(stored['first_decision_at']),
-        newest_at=_UTC.decode(stored['newest_decision_at']), digest_since=digest_since,
-        skipped=stored['skipped_routing'], complete=_BOOL.decode(stored['fold_complete']),
-    )
+    fold = _decode_fold(project_id, state, steps, rules)
     derived = DerivedState(
         fold=fold,
         markers=tuple(_decode_marker(project_id, record) for record in markers),
-        skipped=stored['skipped_derived'],
+        skipped=state['skipped_derived'],
         prompt_coverage=PromptCoverage(
-            digest_since=digest_since, roles_py_landings=stored['roles_py_landings'],
-            counted_since=_UTC.decode(stored['roles_py_since']), reason=stored['roles_py_reason'],
+            digest_since=fold.digest_since, roles_py_landings=state['roles_py_landings'],
+            counted_since=_UTC.decode(state['roles_py_since']), reason=state['roles_py_reason'],
         ),
-        refreshed_at=parse_utc(stored['refreshed_at']),
+        refreshed_at=parse_utc(state['refreshed_at']),
     )
     return StoredMarkerState(derived=derived, attempted_at=attempted_at, failure=failure)
