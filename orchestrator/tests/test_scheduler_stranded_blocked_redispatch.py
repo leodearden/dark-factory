@@ -20,6 +20,7 @@ workflow_cancel_recent) are covered separately (step-07/08).
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1557,3 +1558,61 @@ class TestHarnessAndSchedulerCannotDriftAgain:
         assert report_pins_blocked_recovery(report) is records_pin_blocked_recovery(
             'T1', rows, live_claimant=False,
         ), label
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchFlipLogNamesUnpinnedRecords:
+    """The flip line names the open records it flipped past (task 6145).
+
+    It used to say "no open escalation" whatever was open, so a task held only
+    by records that do not pin read as a task with no record at all.
+    """
+
+    @staticmethod
+    async def _flip_message(tmp_path: Path, caplog, rows: list) -> str:
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+
+        assert any(
+            c.args[:2] == ('T1', 'pending')
+            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        ), 'the sweep must flip for its flip line to be under test'
+        [message] = [
+            r.getMessage() for r in caplog.records
+            if 'crash-stranded-blocked-redispatch' in r.getMessage() and 'T1' in r.getMessage()
+        ]
+        return message
+
+    async def test_names_every_open_record_it_flipped_past(self, tmp_path: Path, caplog):
+        """The task-121 shape: an info L2 and an info L1, neither of which pins."""
+        message = await self._flip_message(tmp_path, caplog, [
+            _esc('esc-121-3', severity='info', level=2, category='design_concern'),
+            _esc('esc-121-2', severity='info', level=1, category='design_concern'),
+        ])
+
+        assert 'esc-121-3' in message
+        assert 'esc-121-2' in message
+        assert 'severity=info' in message
+        assert 'level=2' in message
+        assert 'no open escalation' not in message
+
+    async def test_names_a_dead_l0_it_flipped_past(self, tmp_path: Path, caplog):
+        message = await self._flip_message(
+            tmp_path, caplog, [_esc('esc-1', level=0, category='task_failure')],
+        )
+
+        assert 'esc-1' in message
+        assert 'level=0' in message
+        assert 'no open escalation' not in message
+
+    async def test_an_empty_record_set_still_says_no_open_escalation(
+        self, tmp_path: Path, caplog,
+    ):
+        message = await self._flip_message(tmp_path, caplog, [])
+
+        assert 'no open escalation' in message
