@@ -10,6 +10,14 @@ Once its indexes are serving it must match the source's topology hash and index
 definitions, or it is deleted again. A verified copy is saved, so the RDB-only
 scratch server keeps it across restarts.
 
+It does not call the store-mutation preflight. That preflight guards the
+shared mem0/Qdrant store, and this script touches neither. It writes FalkorDB
+only on the scratch server (``scratch_falkordb_from_env`` refuses production)
+and only under an ``evalmem_`` name (``require_scratch_name``). It never
+replaces a graph, and its one delete removes the copy it has just restored.
+That reasoning dies if the script gains a MemoryService, a Qdrant client, or a
+target that can be production.
+
 Usage, from ``fused-memory/``: ``python scripts/seed_scratch_reference_graph.py
 [--graph NAME]`` (OPERATIONS.md "The scratch FalkorDB").
 """
