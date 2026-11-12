@@ -1417,6 +1417,20 @@ class TestBlockedRedispatchConsumesTheSharedPredicate:
 
         assert not self._flipped(scheduler)
 
+    async def test_a_parked_stranded_blocked_l2_still_vetoes(self, tmp_path: Path):
+        """The relaxation stops once a human holds the record (task 6145).
+
+        `EscalationQueue.park()` lifts a `stranded_blocked` L1 to L2.  The
+        merge-entry wait then hands off on that L2 without filing a new
+        record, so before this fix the sweep re-pended the task every tick
+        and the re-dispatch blocked it again.
+        """
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', level=2, category=_REMEDIABLE)],
+        )
+
+        assert not self._flipped(scheduler)
+
     async def test_an_unreadable_store_still_skips_and_still_describes(
         self, tmp_path: Path,
     ):
