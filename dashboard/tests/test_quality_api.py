@@ -333,7 +333,7 @@ def test_row_6_a_curated_artefact_is_excluded_from_the_baseline_and_served_as_a_
     curated.write_text(CURATED_ARTEFACT)
     monkeypatch.setattr(quality_markers, 'CURATED_MARKERS_PATH', curated)
     rows = history(STORED, start=STORED_START, outcome=_flaky)
-    outside = [row.outcomes.flake_confirmed for row in rows
+    outside = [row.outcomes.flake_confirmed is True for row in rows
                if row.landing.ordinal not in ARTEFACT_ORDINALS]
 
     with _seeded(client, tmp_path, outcome=_flaky) as seeded:
