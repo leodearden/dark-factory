@@ -123,10 +123,11 @@ class TestCreatedWindow:
         [
             '2026-11-11T00:00:00+00:00',
             '2026-11-11T12:30:00.123456+00:00',
-            '2026-11-11T20:00:00-07:00',
+            '2026-11-11T16:00:00-07:00',
+            '2026-11-12T08:59:59+09:00',
             '2026-11-11T23:59:59.999999Z',
         ],
-        ids=['at-since', 'inside', 'other-offset-inside', 'just-before-until'],
+        ids=['at-since', 'inside', 'west-offset-inside', 'east-offset-inside', 'just-before-until'],
     )
     def test_admits_a_payload_created_inside_the_window(self, created_at):
         window = CreatedWindow(since=SINCE, until=UNTIL)
@@ -138,10 +139,10 @@ class TestCreatedWindow:
         [
             '2026-11-10T23:59:59.999999+00:00',
             '2026-11-12T00:00:00+00:00',
-            '2026-11-11T18:00:00-07:00',
-            '2026-11-12T08:00:00+09:00',
+            '2026-11-11T20:00:00-07:00',
+            '2026-11-12T09:00:00+09:00',
         ],
-        ids=['before-since', 'at-until', 'other-offset-after', 'other-offset-at-until'],
+        ids=['before-since', 'at-until', 'west-offset-after', 'east-offset-at-until'],
     )
     def test_refuses_a_payload_created_outside_the_window(self, created_at):
         window = CreatedWindow(since=SINCE, until=UNTIL)
@@ -420,8 +421,8 @@ class TestQdrantLinkCensus:
     async def test_a_window_keeps_only_the_admitted_ids(self):
         inside, outside, unknown = (str(uuid.UUID(int=n)) for n in (1, 2, 3))
         backend = _FakeScrollBackend([
-            _Point(inside, {'parent_id': 'p', 'created_at': '2026-11-11T20:00:00-07:00'}),
-            _Point(outside, {'parent_id': 'p', 'created_at': '2026-11-10T00:00:00+00:00'}),
+            _Point(inside, {'parent_id': 'p', 'created_at': '2026-11-11T16:00:00-07:00'}),
+            _Point(outside, {'parent_id': 'p', 'created_at': '2026-11-11T20:00:00-07:00'}),
             _Point(unknown, {'parent_id': 'p'}),
         ])
         census = QdrantLinkCensus(cast('Mem0Backend', backend), 'fused')

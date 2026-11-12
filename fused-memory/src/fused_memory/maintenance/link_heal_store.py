@@ -10,7 +10,9 @@ a server URL, for every script that reads the live store.
 
 One read bypasses the server: no tool enumerates the records that carry a
 ``parent_id``, so :class:`QdrantLinkCensus` scrolls each project's collection
-directly for their ids, and only their ids.
+directly for their ids, and only their ids. A :class:`CreatedWindow` narrows
+that census to links whose child was created in a span, judged on the payloads
+the scroll already fetched.
 
 This is the bottom layer of the link-heal modules and imports none of them.
 """
@@ -22,6 +24,7 @@ import hashlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -45,11 +48,48 @@ WRITE_TOOL = 'update_memory'
 #: carrying ``found`` proves the server reads the project.
 PROBE_MEMORY_ID = str(uuid.UUID(int=0))
 
+CREATED_AT_KEY = 'created_at'
+UPDATED_AT_KEY = 'updated_at'
+
 
 def text_sha256(text: str) -> str:
     """The hash the hand-link corpus took: sha256 over the UTF-8 bytes of a
     record's ``get_memory_by_id`` ``content``."""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def parse_record_time(value: object) -> datetime | None:
+    """A payload timestamp as an aware datetime; ``None`` for anything else,
+    a naive timestamp included, since it cannot be placed on the UTC line."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+@dataclass(frozen=True)
+class CreatedWindow:
+    """The span ``[since, until)`` a link's child must have been created in."""
+
+    since: datetime
+    until: datetime
+
+    def __post_init__(self) -> None:
+        aware = self.since.tzinfo is not None and self.until.tzinfo is not None
+        if not aware or self.since >= self.until:
+            raise ValueError(
+                'a CreatedWindow needs timezone-aware bounds with since < until; got '
+                f'since={self.since.isoformat()} until={self.until.isoformat()}',
+            )
+
+    def admits(self, payload: Mapping[str, Any]) -> bool:
+        """Whether *payload* was created inside the window. An unknown creation
+        time is admitted: a sweep errs toward examining a link, never hiding it."""
+        created = parse_record_time(payload.get(CREATED_AT_KEY))
+        return created is None or self.since <= created < self.until
 
 
 @dataclass(frozen=True)
@@ -66,6 +106,14 @@ class LiveRecord:
     @property
     def text_sha256(self) -> str:
         return text_sha256(self.text)
+
+    @property
+    def created_at(self) -> datetime | None:
+        return parse_record_time(self.metadata.get(CREATED_AT_KEY))
+
+    @property
+    def updated_at(self) -> datetime | None:
+        return parse_record_time(self.metadata.get(UPDATED_AT_KEY))
 
 
 @dataclass(frozen=True)
@@ -278,12 +326,15 @@ class CensusFailed(Exception):
 
 
 class LinkCensus(Protocol):
-    """Enumerates the ids of a project's records that carry a ``parent_id``.
+    """Enumerates the ids of a project's records that carry a ``parent_id``,
+    only those *created_in* admits when it is given.
 
     One that cannot raises :class:`CensusFailed`.
     """
 
-    async def linked_ids(self, project_id: str) -> list[str]: ...
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]: ...
 
 
 class QdrantLinkCensus:
@@ -293,7 +344,9 @@ class QdrantLinkCensus:
         self._backend = backend
         self._collection_prefix = collection_prefix
 
-    async def linked_ids(self, project_id: str) -> list[str]:
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]:
         collection = Scope(project_id=project_id).mem0_collection_name(
             self._collection_prefix,
         )
@@ -304,6 +357,10 @@ class QdrantLinkCensus:
             collection, scroll_filter=has_parent,
         )
         try:
-            return [str(point.id) async for point in points]
+            return [
+                str(point.id)
+                async for point in points
+                if created_in is None or created_in.admits(point.payload or {})
+            ]
         except Exception as exc:  # noqa: BLE001 -- a partial census is no census
             raise CensusFailed(project_id, type(exc).__name__, str(exc)) from exc

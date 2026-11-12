@@ -45,6 +45,7 @@ from fused_memory.maintenance.link_heal_executor import (
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
+    CreatedWindow,
     LinkHealStore,
     ToolCaller,
     text_sha256,
@@ -183,11 +184,15 @@ class FakeMem0:
         ]
         return rows[:limit]
 
-    async def linked_ids(self, project_id: str) -> list[str]:
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]:
         return [
             memory_id
             for (project, memory_id), payload in self.points.items()
-            if project == project_id and payload.get(PARENT_ID_KEY) not in (None, [])
+            if project == project_id
+            and payload.get(PARENT_ID_KEY) not in (None, [])
+            and (created_in is None or created_in.admits(payload))
         ]
 
     def search_results(self, query: str, project_id: str, limit: int) -> SearchResults:
@@ -206,7 +211,9 @@ class FailingCensus:
 
     DETAIL = 'qdrant is down'
 
-    async def linked_ids(self, project_id: str) -> list[str]:
+    async def linked_ids(
+        self, project_id: str, created_in: CreatedWindow | None = None,
+    ) -> list[str]:
         raise CensusFailed(project_id, 'ResponseHandlingException', self.DETAIL)
 
 

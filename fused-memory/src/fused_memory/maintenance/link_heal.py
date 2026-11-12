@@ -31,6 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 from fused_memory.maintenance.link_heal_store import (
+    CreatedWindow,
     LinkCensus,
     LinkHealStore,
     LiveRecord,
@@ -779,12 +780,17 @@ class LinkReads:
 
 
 async def read_links(
-    store: LinkHealStore, census: LinkCensus, projects: Sequence[str],
+    store: LinkHealStore,
+    census: LinkCensus,
+    projects: Sequence[str],
+    created_in: CreatedWindow | None = None,
 ) -> LinkReads:
+    """Every live link of *projects*, only those whose child *created_in* admits
+    when it is given."""
     states: list[LinkState] = []
     unread: list[tuple[str, str]] = []
     for project_id in projects:
-        for child_id in await census.linked_ids(project_id):
+        for child_id in await census.linked_ids(project_id, created_in):
             try:
                 state = await read_link_state(store, project_id, child_id, projects)
             except StoreReadFailed:
@@ -811,9 +817,11 @@ async def build_plan(
     store: LinkHealStore,
     census: LinkCensus,
     projects: Sequence[str],
+    created_in: CreatedWindow | None = None,
 ) -> Plan:
-    """Decide every live link of *projects* against *bases*. Writes nothing."""
-    return plan_links(await read_links(store, census, projects), bases)
+    """Decide every live link of *projects* (narrowed by *created_in*, as in
+    :func:`read_links`) against *bases*. Writes nothing."""
+    return plan_links(await read_links(store, census, projects, created_in), bases)
 
 
 def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[str, str, str | None]:
