@@ -161,7 +161,11 @@ from shared.cli_boundary import (
     run_cli,
 )
 
-from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
+from fused_memory.backends.falkor_read_only import (
+    NonReadOnlyCommandError,
+    PagedQuery,
+    ReadOnlyGraphReader,
+)
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -760,25 +764,31 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
 DEFAULT_GRAPH = 'dark_factory'
 """The graph this corpus is drawn from."""
 
-POPULATION_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
-    f'e.{field}' for field in PROJECTED_FIELDS
+POPULATION_READ = PagedQuery(
+    match='MATCH (e:Episodic)',
+    row='e',
+    returns=tuple(f'e.{field}' for field in PROJECTED_FIELDS),
 )
-"""The single query this builder issues. Built from :data:`PROJECTED_FIELDS`.
+"""The population read this builder issues. Built from :data:`PROJECTED_FIELDS`.
 
-Note what is deliberately absent:
+Note what is deliberately absent, and what is deliberately present:
 
 * **No ``entity_edges``** and no other incumbent-success signal — the binding
   hazard. The projection is derived from one constant that a test pins, so the
   query and the manifest's claim about the query cannot drift apart.
 * **No ``WHERE``** — no filter of any kind. The population IS the population.
-* **No ``LIMIT``** — the full population is required or the stratum
+* **Read whole** — the full population is required or the stratum
   denominators are wrong, and every proportional share computed from them
-  would be wrong with it.
+  would be wrong with it. FalkorDB truncates every answer silently at its
+  result-set cap (``fused_memory/backends/paged_read.py::RESULTSET_SIZE``), so
+  the population is read in pages ordered on ``e.uuid`` and checked against a
+  ``count(e)`` census. On 2026-11-12 the unpaged read of ``dark_factory``
+  returned exactly 10000 rows: the cap, not the population.
 
 Why not the product ``get_episodes`` read path: ``MemoryService.get_episodes``
 projects six fields that do **not** include ``source_description`` — which is
 the payload-kind stratification dimension here — and the MCP tool clamps
-``last_n`` to 1000, well below the ~2770-row population.
+``last_n`` to 1000, below the size of the population.
 """
 
 
@@ -816,7 +826,7 @@ class EpisodeReader:
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
 
-        One query, no filter, no limit. A row whose ``created_at`` or
+        Paged, census-checked, no filter. A row whose ``created_at`` or
         ``source_description`` cannot be parsed aborts the build via
         :class:`CorpusBuildError` rather than being dropped — a silently
         dropped row would shrink a stratum's denominator and skew every
@@ -837,11 +847,11 @@ class EpisodeReader:
         forwards.
         """
         try:
-            rows = await self._reader.read_unpaged(POPULATION_CYPHER)
+            read = await self._reader.read_paged(POPULATION_READ)
         except NonReadOnlyCommandError as exc:
             raise CorpusBuildError(f'build_corpus is strictly read-only: {exc}') from exc
         population: list[EpisodeRecord] = []
-        for index, row in enumerate(rows):
+        for index, row in enumerate(read.rows):
             if len(row) != len(PROJECTED_FIELDS):
                 raise CorpusBuildError(
                     f'row {index} has {len(row)} columns, expected '
@@ -919,9 +929,11 @@ never invalidates an existing artifact.
 NO_OUTCOME_FILTER_STATEMENT = (
     'Corpus membership is NEVER conditioned on the incumbent extraction '
     "pipeline's outcome. The population query projects only the six fields "
-    'listed in projected_fields and applies no WHERE clause, no LIMIT and no '
-    'ranking of any kind; e.entity_edges — the per-episode record of what the '
-    'incumbent produced — is never read, never filtered on, and never used as a '
+    'listed in projected_fields and applies no WHERE clause and no ranking of '
+    'any kind; the population is read whole, in pages ordered on e.uuid and '
+    'checked against a count(e) census. e.entity_edges — the per-episode '
+    'record of what the incumbent produced — is never read, never filtered on, '
+    'and never used as a '
     'stratification dimension. Within each stratum the draw is an unconditioned '
     'seeded permutation, not a score-ranked take. An episode the incumbent '
     'extracted zero edges from is exactly as eligible as any other.'
@@ -1031,7 +1043,7 @@ def build_manifest(
             'entity_edges_queried': False,
             'entity_edges_used_as_filter': False,
             'entity_edges_used_as_stratum': False,
-            'population_query': POPULATION_CYPHER,
+            'population_query': POPULATION_READ.page_template,
             'projected_fields': list(PROJECTED_FIELDS),
             # Reflected off EpisodeRecord, NOT copied from PROJECTED_FIELDS
             # above: two independent derivations of the same claim, so the
@@ -1563,9 +1575,10 @@ def _build_parser() -> argparse.ArgumentParser:
         # first line plus the two guarantees is what an operator needs here.
         description=(
             f'{(__doc__ or "LME replay corpus builder").splitlines()[0]}\n\n'
-            'Strictly read-only: one GRAPH.RO_QUERY against the graph, one\n'
-            'committed manifest written beside this script. Corpus membership\n'
-            "is never conditioned on the incumbent pipeline's outcome."
+            'Strictly read-only: GRAPH.RO_QUERY reads of the graph (a count\n'
+            'census plus uuid-ordered pages), one committed manifest written\n'
+            'beside this script. Corpus membership is never conditioned on\n'
+            "the incumbent pipeline's outcome."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
