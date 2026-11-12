@@ -8,13 +8,20 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from shared.cli_invoke import AgentResult, _SubprocessResult
 from shared.process_cost import ProcessCostBasis
+
+from orchestrator.agents.agent_run_home import (
+    private_run_home,
+    redirected_home_env,
+    write_owner_only_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +33,14 @@ MODEL_LIMITS = {'context': 1048576, 'output': 131072}
 TITLE = 'dark-factory'
 MIMO_VARIANTS = ('low', 'medium', 'high')
 FALLBACK_VARIANT = 'high'
+MIMOCODE_FLAGS = {
+    'MIMOCODE_ENABLE_ANALYSIS': 'false',
+    'MIMOCODE_DISABLE_CLAUDE_CODE_MCP': '1',
+    'MIMOCODE_DISABLE_MODELS_FETCH': '1',
+    'MIMOCODE_DISABLE_AUTOUPDATE': '1',
+    'MIMOCODE_DISABLE_CRON': '1',
+    'MIMOCODE_DISABLE_SHARE': '1',
+}
 # MiMo Code's catalog providers xiaomi-token-plan-* / xiaomi; see plans/mimo-code-harness-probe-2026-11.md (e).
 OPENAI_BASE_BY_ANTHROPIC_BASE = {
     'https://token-plan-cn.xiaomimimo.com/anthropic': 'https://token-plan-cn.xiaomimimo.com/v1',
@@ -148,6 +163,33 @@ def _mimo_mcp_server(name: str, server: Mapping[str, Any]) -> dict[str, Any]:
     raise ValueError(
         f'MCP server {name!r} has neither a stdio command nor an http/sse url for mimo to carry',
     )
+
+
+@dataclass(frozen=True)
+class MimoRunHome:
+    root: Path
+    config_path: Path
+    operator_home: Path
+
+
+@contextmanager
+def mimo_run_home(
+    *, system_prompt: str, config_document: Mapping[str, Any], operator_home: Path,
+) -> Iterator[MimoRunHome]:
+    """A private MIMOCODE_HOME for one invocation, holding the only copy of the endpoint key; removed on exit."""
+    with private_run_home(backend='mimo', operator_home=operator_home) as root:
+        config_path = root / 'config' / 'mimocode.json'
+        write_owner_only_json(config_path, config_document)
+        (root / 'config' / 'AGENTS.md').write_text(system_prompt)
+        yield MimoRunHome(root=root, config_path=config_path, operator_home=operator_home)
+
+
+def mimo_spawn_env(base_env: Mapping[str, str], home: MimoRunHome) -> dict[str, str]:
+    return {
+        **redirected_home_env(base_env, root=home.root, operator_home=home.operator_home),
+        'MIMOCODE_HOME': str(home.root),
+        **MIMOCODE_FLAGS,
+    }
 
 
 def mimo_variant(effort: str | None) -> str | None:
