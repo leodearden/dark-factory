@@ -719,7 +719,10 @@ class TestVllmBridgeUpstreamHeaders:
     ):
         """The client's Accept-Encoding offer stays on the client-to-bridge hop."""
         upstream_url, received = mock_upstream_header_capture
-        await _post_through_bridge(upstream_url, path, {'Accept-Encoding': 'br, zstd'})
+        coding_no_aiohttp_build_decodes = 'x-test-sentinel'
+        await _post_through_bridge(
+            upstream_url, path, {'Accept-Encoding': coding_no_aiohttp_build_decodes}
+        )
 
         upstream_headers = _only_request_to(received, path)
-        assert upstream_headers.get('accept-encoding') != 'br, zstd'
+        assert coding_no_aiohttp_build_decodes not in upstream_headers.get('accept-encoding', '')
