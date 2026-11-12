@@ -21,7 +21,13 @@ from fused_memory.models.reconciliation import (
     VerdictSeverity,
 )
 from fused_memory.reconciliation import judge as judge_module
-from fused_memory.reconciliation.judge import Judge, is_phantom_verdict
+from fused_memory.reconciliation.judge import (
+    Judge,
+    JudgeInfraError,
+    NoVerdict,
+    NoVerdictReason,
+    is_phantom_verdict,
+)
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 
@@ -2966,7 +2972,8 @@ class TestReviewRunNoStructuredVerdict:
             first = await judge.review_run('run-nostruct')
 
             # First occurrence: still no fabricated severity=serious row.
-            assert first is None
+            assert isinstance(first, NoVerdict)
+            assert first.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
             mock_journal.add_verdict.assert_not_called()
             mock_journal.set_halt.assert_not_called()
             assert judge.is_halted('proj-nostruct-findings') is False
@@ -2999,7 +3006,8 @@ class TestReviewRunNoStructuredVerdict:
         ):
             verdict = await judge.review_run('run-nostruct')
 
-        assert verdict is None
+        assert isinstance(verdict, NoVerdict)
+        assert verdict.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         mock_journal.add_verdict.assert_not_called()
         mock_journal.set_halt.assert_not_called()
         assert judge.is_halted('proj-nostruct-a') is False
@@ -3145,8 +3153,9 @@ class TestReviewRunInfraFailureHandling:
             v1 = await judge.review_run('run-infra')
             v2 = await judge.review_run('run-infra')
 
-        assert v1 is None
-        assert v2 is None
+        for v in (v1, v2):
+            assert isinstance(v, NoVerdict)
+            assert v.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         mock_journal.set_halt.assert_not_called()
         mock_journal.add_verdict.assert_not_called()
         assert not judge.is_halted('proj-infra-a')
@@ -3207,7 +3216,8 @@ class TestReviewRunInfraFailureHandling:
         ):
             v = await judge.review_run('run-infra')
 
-        assert v is None
+        assert isinstance(v, NoVerdict)
+        assert v.reason is NoVerdictReason.JUDGE_INFRA_FAILURE
         assert not judge.is_halted('proj-infra-c')
         mock_journal.set_halt.assert_not_called()
 
@@ -3302,6 +3312,108 @@ class TestReviewRunInfraFailureHandling:
         assert judge.is_halted('proj-A')
         assert not judge.is_halted('proj-B')
         mock_journal.set_halt.assert_called_once()
+
+
+def _judge_over_one_run(mock_journal, project_id: str, run_id: str = 'run-x', **cfg) -> Judge:
+    """A judge whose journal serves one completed run of *project_id*."""
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+    )
+
+    judge = Judge(config=_make_judge_config(**cfg), journal=mock_journal)
+    mock_journal.get_run = AsyncMock(return_value=ReconciliationRun(
+        id=run_id,
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=datetime.now(UTC),
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    ))
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+    return judge
+
+
+_OK_VERDICT_TEXT = '{"severity": "ok", "findings": []}'
+
+
+class TestReviewRunReturnsATypedNoVerdict:
+    """INV-11: every way review_run produces no verdict says which way it was."""
+
+    @pytest.mark.asyncio
+    async def test_a_missing_run_is_run_not_found(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+        result = await judge.review_run('run-x')
+
+        assert result == NoVerdict('run-x', NoVerdictReason.RUN_NOT_FOUND)
+
+    @pytest.mark.asyncio
+    async def test_a_halted_project_is_project_halted(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-halted')
+        mock_journal.get_halt_states = AsyncMock(return_value=[{
+            'project_id': 'proj-halted', 'unhalted_at': None, 'cooldown_until': None,
+            'halted_at': None, 'reason': 'operator halt', 'unhalt_grace_remaining': 0,
+        }])
+        await judge.initialize()
+
+        result = await judge.review_run('run-x')
+
+        assert result == NoVerdict('run-x', NoVerdictReason.PROJECT_HALTED)
+
+    @pytest.mark.asyncio
+    async def test_an_infra_failure_is_judge_infra_failure(self, mock_journal):
+        judge = _judge_over_one_run(
+            mock_journal, 'proj-infra', judge_infra_max_consecutive_failures=3,
+        )
+
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm')),
+        ):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert (result.run_id, result.reason) == ('run-x', NoVerdictReason.JUDGE_INFRA_FAILURE)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_journal_read_is_review_error_naming_the_exception(
+        self, mock_journal,
+    ):
+        judge = _judge_over_one_run(mock_journal, 'proj-review-error')
+        mock_journal.get_run_actions_combined = AsyncMock(
+            side_effect=RuntimeError('actions table locked'),
+        )
+
+        result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert (result.run_id, result.reason) == ('run-x', NoVerdictReason.REVIEW_ERROR)
+        assert 'RuntimeError' in result.detail
+        assert 'actions table locked' in result.detail
+
+    @pytest.mark.asyncio
+    async def test_a_raising_verdict_write_is_review_error(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-review-error')
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, NoVerdict)
+        assert result.reason is NoVerdictReason.REVIEW_ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_review_returns_a_verdict(self, mock_journal):
+        judge = _judge_over_one_run(mock_journal, 'proj-healthy')
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            result = await judge.review_run('run-x')
+
+        assert isinstance(result, JudgeVerdict)
+        assert result.severity == VerdictSeverity.ok
 
 
 # ─────────────────────────────────────────────────────────────────────
