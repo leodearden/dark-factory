@@ -188,6 +188,28 @@ def read_cpu_ticks(entry: Path) -> int | None:
         return None
 
 
+def read_session_id(entry: Path) -> int | None:
+    """Session id (stat field 6) of ``<entry>/stat``; None if unreadable or malformed."""
+    path = entry / 'stat'
+    try:
+        _comm, fields = _stat_tail(path, _read_proc_text(path))
+        # stat fields 4-6 (ppid, pgrp, session); fields[0] is field 3, state.
+        _ppid, _pgrp, session = (int(field) for field in fields[1:4])
+        return session
+    except (OSError, ValueError):
+        return None
+
+
+def unified_cgroup_path(cgroup_text: str) -> str | None:
+    """The cgroup path on the unified (``0::``) line of a ``/proc/<pid>/cgroup`` text.
+
+    None when there is no such line, or when it carries no path: joining an
+    empty path would name the ROOT cgroup, which is a failure, not an answer.
+    """
+    line = next((line for line in cgroup_text.splitlines() if line.startswith('0::')), None)
+    return None if line is None else line[len('0::') :] or None
+
+
 def pid_running(pid: int) -> bool:
     """True iff *pid* has a ``/proc`` entry that has not terminated.
 

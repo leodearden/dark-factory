@@ -31,13 +31,18 @@ from shared.proc_group import (
     process_group_members,
     process_group_terminated,
     read_cpu_ticks,
+    read_session_id,
     read_stat_fields,
     reap_process_groups,
     scan_process_groups_under_path,
     sigkill_process_group,
     snapshot_process_group,
     terminate_process_group,
+    unified_cgroup_path,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 async def _await_group_membership(
@@ -278,18 +283,20 @@ def _synthetic_stat_line(
     state: str = 'S',
     comm: str = 'weird (name) proc',
     cpu: tuple[int, int, int, int] = (0, 0, 0, 0),
+    session: int | None = None,
 ) -> str:
-    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp ...``.
+    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp session ...``.
 
     The default *comm* deliberately contains spaces AND a ``)`` so the parser's
     ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
     mis-read this line, and the kernel really does allow it (a process can
     set an arbitrary 15-char comm).  *cpu* is utime, stime, cutime and cstime,
-    stat fields 14-17.
+    stat fields 14-17.  *session* is stat field 6, and defaults to *pgrp*.
     """
     counters = ['0'] * 4 + [str(ticks) for ticks in cpu] + ['0'] * 12
+    sid = pgrp if session is None else session
     return (
-        f'{pid} ({comm}) {state} 1 {pgrp} {pgrp} 0 -1 4194304 '
+        f'{pid} ({comm}) {state} 1 {pgrp} {sid} 0 -1 4194304 '
         + ' '.join(counters)
         + '\n'
     )
@@ -2446,6 +2453,72 @@ class TestReadCpuTicks:
             (entry / 'stat').mkdir()
 
         assert read_cpu_ticks(entry) is None
+
+
+class TestReadSessionId:
+    """The session id (stat field 6) of one ``/proc/<pid>``, on the parse read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_six_not_the_pgrp(self, tmp_path):
+        entry = tmp_path / '4242'
+        entry.mkdir()
+        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, session=777))
+
+        assert read_session_id(entry) == 777
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param('7 (x) S 1 7\n', id='session-truncated'),
+            pytest.param('7 (x) S 1 7 x 0\n', id='session-not-an-int'),
+        ],
+    )
+    def test_a_malformed_line_is_none(self, tmp_path, text):
+        entry = tmp_path / '810'
+        entry.mkdir()
+        (entry / 'stat').write_text(text)
+
+        assert read_session_id(entry) is None
+
+    @pytest.mark.parametrize('stat_is_a_directory', [False, True], ids=['missing', 'directory'])
+    def test_an_unreadable_entry_is_none(self, tmp_path, stat_is_a_directory):
+        entry = tmp_path / '600'
+        entry.mkdir()
+        if stat_is_a_directory:
+            (entry / 'stat').mkdir()
+
+        assert read_session_id(entry) is None
+
+    def test_on_the_real_proc_it_is_our_own_session(self):
+        assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+class TestUnifiedCgroupPath:
+    """The ``0::`` path of a ``/proc/<pid>/cgroup`` text."""
+
+    def test_the_unified_line_is_read_among_v1_lines(self):
+        text = '12:pids:/user.slice\n1:name=systemd:/x\n0::/user.slice/run-u7.scope\n'
+
+        assert unified_cgroup_path(text) == '/user.slice/run-u7.scope'
+
+    def test_the_root_cgroup_is_a_path(self):
+        assert unified_cgroup_path('0::/\n') == '/'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('1:name=systemd:/x\n', id='v1-only'),
+            pytest.param('0::\n', id='no-path'),
+        ],
+    )
+    def test_no_unified_path_is_none(self, text):
+        assert unified_cgroup_path(text) is None
+
+    def test_on_the_real_proc_it_is_an_absolute_path(self):
+        unified = unified_cgroup_path((Path('/proc') / str(os.getpid()) / 'cgroup').read_text())
+
+        assert unified is not None and unified.startswith('/')
 
 
 class TestCpuTicksUnderPathOnTheRealProc:
