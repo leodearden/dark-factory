@@ -47,6 +47,8 @@ def snapshot(path):
 home = os.environ.get('MIMOCODE_HOME', '')
 store = Path(home, 'fake-store.json')
 command = sys.argv[1] if len(sys.argv) > 1 else ''
+if command == 'run':
+    store.write_text(ERROR_EXPORT if os.environ.get('MIMO_FAKE_ERROR') else MEASURED_EXPORT)
 record = {'argv': sys.argv[1:], 'environ': dict(os.environ), 'cwd': os.getcwd()}
 if command == 'run':
     record['stdin'] = sys.stdin.read()
@@ -56,7 +58,6 @@ if command == 'run':
 with open(os.environ['MIMO_FAKE_CAPTURE'], 'a') as capture:
     capture.write(json.dumps(record) + '\\n')
 if command == 'run':
-    store.write_text(ERROR_EXPORT if os.environ.get('MIMO_FAKE_ERROR') else MEASURED_EXPORT)
     if not os.environ.get('MIMO_FAKE_LOSE_STDOUT'):
         print(json.dumps({'type': 'step_finish', 'sessionID': 'ses_x'}), flush=True)
     time.sleep(float(os.environ.get('MIMO_FAKE_SLEEP') or 0))
@@ -228,8 +229,8 @@ class TestInvokeMimo:
     async def test_the_wall_clock_kills_a_run_whose_tokens_are_still_counted(
         self, fake_mimo, worktree, monkeypatch,
     ):
-        monkeypatch.setenv('MIMO_FAKE_SLEEP', '5')
-        result = await _invoke(worktree, timeout_seconds=1)
+        monkeypatch.setenv('MIMO_FAKE_SLEEP', '60')
+        result = await _invoke(worktree, timeout_seconds=3)
         assert result.timed_out is True
         assert result.success is False
         assert result.input_tokens == 1400
