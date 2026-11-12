@@ -144,6 +144,8 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
+from df_pytest_isolation import wait_pid_gone
+
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
 
@@ -474,6 +476,41 @@ def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
     report = str(failure.value)
     assert f'within its budget of {budget_secs}s' in report, report
     assert 'stdout:' in report and 'stderr:' in report, report
+
+
+def test_a_descendant_still_holding_the_probe_childs_output_does_not_hold_up_the_probe(
+    tmp_path: pathlib.Path,
+) -> None:
+    suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    pidfile = tmp_path / 'lingerer.pid'
+    # Spawned after the session summary, like a descendant that outlives the
+    # controller; it inherits the child's stdout and stderr, and sleeps past
+    # the budget so that a run waiting for EOF overruns while a leak still
+    # ends by itself.
+    (suite.root / 'conftest.py').write_text(
+        'import pathlib\n'
+        'import subprocess\n'
+        'import sys\n'
+        '\n'
+        '\n'
+        'def pytest_unconfigure(config):\n'
+        '    lingerer = subprocess.Popen(\n'
+        f"        [sys.executable, '-c', 'import time; time.sleep({PROBE_SUBPROCESS_TIMEOUT_SECS + 60})']\n"
+        '    )\n'
+        f'    pathlib.Path({str(pidfile)!r}).write_text(str(lingerer.pid))\n',
+        encoding='utf-8',
+    )
+
+    result = _run_probe_suite(suite, '-n', '0', '-k', MAIN_THREAD_TEST)
+
+    assert result.returncode == pytest.ExitCode.OK, (
+        f'the probe child exited {result.returncode}, not 0 (OK).\n{_captured(result)}'
+    )
+    lingerer = int(pidfile.read_text(encoding='utf-8'))
+    assert wait_pid_gone(lingerer, timeout=30), (
+        f'the lingering descendant {lingerer} is still running: the probe\'s '
+        'process group must not outlive the run.'
+    )
 
 
 @pytest.mark.parametrize(
