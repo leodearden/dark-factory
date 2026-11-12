@@ -568,8 +568,8 @@ class TestUnicodeDigitsAreNotTaskNumbers:
 
         Before the fix this parsed to Referent(number='12٣') — a mangled number
         naming no task. What refuses it now is purely '([0-9]+)': the two anchored
-        patterns carry NO '(?!\\d)' clause at all — their right edge is '\\s*$', and a
-        Unicode digit is not '\\s', so the match dies at the anchor either way.
+        patterns carry NO '(?!\\d)' clause at all — their right edge is a pad then
+        '\\Z', and a Unicode digit is neither, so the match dies at the anchor either way.
 
         The lookahead's breadth, and the reason it deliberately stays BROAD while
         the capture narrows, is pinned by the UNANCHORED siblings instead:
@@ -579,7 +579,7 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         assumed: mutating both '([0-9]+)(?!\\d)' occurrences to '([0-9]+)(?![0-9])'
         fails exactly those three and NOT this one, minting Referent(number='12')
         and Referent(project_id='reify', number='12') — the TRUNCATED PREFIX that
-        lookahead's own comment says it exists to prevent, and strictly worse than
+        lookahead exists to prevent, and strictly worse than
         the bug being fixed, since 'Task ٣' is obvious junk while 'Task 12' names
         a REAL node a consumer will happily rename or re-attach edges on. So do
         not trim those three as duplicative of this one: this one survives the
@@ -944,10 +944,9 @@ class TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly:
     def test_the_task_node_pattern_keeps_its_broad_padding(self):
         """The contrast that makes the acceptance above coherent rather than
         arbitrary: the LOCAL pattern's '\\s' padding is deliberately NOT
-        narrowed, so the same NBSP spelling still parses there. Measured. This
-        also guards the module docstring's claim that '\\s' padding stays
-        Unicode-broad, which now points at _TASK_NODE_NAME_PATTERN because
-        _QUALIFIED_NODE_NAME_PATTERN no longer has any."""
+        narrowed, so the same NBSP spelling still parses there. Measured. So the
+        local rule's padding stays Unicode-broad '\\s' while the qualified rule's
+        is space or tab only."""
         referent = parse_node_name('task' + NO_BREAK_SPACE + '132')
         assert referent is not None
         assert referent.node_name == 'Task 132'
