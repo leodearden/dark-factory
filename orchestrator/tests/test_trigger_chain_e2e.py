@@ -8,6 +8,7 @@ script, and a real EscalationQueue.  Only the host processes are stood in for.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import AsyncIterator
@@ -578,3 +579,42 @@ class TestLostStatusWrite:
         rig.clock.set(_at(gate))
         assignment, _ = await rig.dispatch()
         assert assignment is not None and assignment.task_id == chain.completion_id
+
+
+@pytest.mark.asyncio
+class TestPendingReport:
+    async def test_a_project_with_no_chain_says_none_was_ever_filed_distinct_from_none_open(
+        self, rig: TriggerChainRig
+    ) -> None:
+        never_filed = f'no trigger chain has been filed in {rig.root}'
+        none_open = f'no open trigger chain in {rig.root}'
+
+        before = rig.pending_report()
+
+        assert before.rc == 0, before.stderr
+        assert any(never_filed in line for line in before.lines)
+        assert not any(none_open in line for line in before.lines)
+
+        chain = await rig.file_final_chain(RUN)
+        await rig.set_status(chain.human_id, 'cancelled')
+        await rig.set_status(chain.completion_id, 'cancelled')
+        after = rig.pending_report()
+
+        assert after.rc == 0, after.stderr
+        assert any(none_open in line for line in after.lines)
+        assert not any(never_filed in line for line in after.lines)
+
+    async def test_an_open_chain_reports_its_streak_and_live_share(
+        self, rig: TriggerChainRig
+    ) -> None:
+        first = await _first_check_not_yet(rig)
+        stamped = _metadata(await rig.task(first.chain.completion_id))['predicate_verdict']
+
+        report = rig.pending_report('--json')
+
+        assert report.rc == 0, report.stderr
+        (project,) = json.loads(report.lines[-1])['projects']
+        (chain,) = project['chains']
+        assert (chain['skill'], chain['run_id']) == ('review', RUN)
+        assert chain['completion_gate']['streak'] == 1
+        assert chain['verdict']['share'] == stamped['share']
