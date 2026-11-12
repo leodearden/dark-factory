@@ -1,9 +1,10 @@
 """The scratch FalkorDB's seed: a graph copied from the source server by DUMP and RESTORE.
 
 The offline cases are refused before any connection, with both servers aimed at
-refused ports. The live cases copy one ``evalmem_test_`` graph onto another on the
-scratch server and delete both in ``finally``; run them with
-``uv run pytest -m integration tests/test_seed_scratch_reference_graph.py``.
+refused ports. The live cases run on the scratch server alone: a seeded
+``evalmem_test_`` graph is read, deleted and restored under its own name, which is
+the cross-server copy seen from one server. The graph is deleted in ``finally``;
+run them with ``uv run pytest -m integration tests/test_seed_scratch_reference_graph.py``.
 """
 
 from __future__ import annotations
@@ -97,7 +98,7 @@ def test_a_source_that_is_the_scratch_server_is_refused(monkeypatch, capsys):
     assert 'Traceback' not in err
 
 
-# --- live copies on the scratch server ------------------------------------------------
+# --- live round trips on the scratch server -------------------------------------------
 
 
 async def _seed_source(graph: AsyncGraph, name: str) -> None:
@@ -112,20 +113,17 @@ async def _topology_hash(graph: AsyncGraph, name: str) -> str:
 
 
 @contextlib.asynccontextmanager
-async def _two_clients():
-    source_client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
-    target_client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+async def _seeded_scratch_graph():
+    name = _scratch_name()
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    graph = client.select_graph(name)
     try:
-        yield source_client, target_client
+        await _seed_source(graph, name)
+        yield client, graph, name
     finally:
-        await source_client.aclose()
-        await target_client.aclose()
-
-
-async def _delete_quietly(*graphs: AsyncGraph) -> None:
-    for graph in graphs:
         with contextlib.suppress(Exception):
             await graph.delete()
+        await client.aclose()
 
 
 @falkor_skipif()
@@ -133,50 +131,36 @@ async def _delete_quietly(*graphs: AsyncGraph) -> None:
 @pytest.mark.timeout(300)
 class TestLiveSeed:
     @pytest.mark.asyncio
-    async def test_a_copy_keeps_the_topology_vectors_and_indexes_and_is_saved(self):
-        source_name, target_name = _scratch_name(), _scratch_name()
-        async with _two_clients() as (source_client, target_client):
-            source = source_client.select_graph(source_name)
-            target = target_client.select_graph(target_name)
-            try:
-                await _seed_source(source, source_name)
-                seeded_at = int(time.time())
+    async def test_a_restored_graph_keeps_its_topology_vectors_and_indexes_and_is_saved(self):
+        async with _seeded_scratch_graph() as (client, graph, name):
+            topology_before = await _topology_hash(graph, name)
+            definitions_before = (await graph.ro_query(INDEX_DEFINITION_QUERY)).result_set
+            vectors_before = (await graph.ro_query(VECTORS_QUERY)).result_set
+            source = await SEED.read_source(client, name)
+            await graph.delete()
+            restored_from = int(time.time())
 
-                verdict = await SEED.seed_graph(
-                    source_client, target_client, source_name, target_name
-                )
+            identity = await SEED.restore_graph(client, source)
 
-                source_hash = await _topology_hash(source, source_name)
-                source_definitions = (await source.ro_query(INDEX_DEFINITION_QUERY)).result_set
-                assert verdict.topology_hash == source_hash
-                assert await _topology_hash(target, target_name) == source_hash
-                assert verdict.index_definitions == tuple(map(tuple, source_definitions))
-                assert (
-                    await target.ro_query(INDEX_DEFINITION_QUERY)
-                ).result_set == source_definitions
-                assert (await target.ro_query(VECTORS_QUERY)).result_set == (
-                    await source.ro_query(VECTORS_QUERY)
-                ).result_set
-                assert (await target.ro_query(FULLTEXT_QUERY)).result_set == [['n-merge']]
-                last_save = await target_client.connection.lastsave()
-                assert last_save.timestamp() >= seeded_at
-            finally:
-                await _delete_quietly(source, target)
+            assert identity == source.identity
+            assert identity.topology_hash == topology_before
+            assert identity.index_definitions == tuple(map(tuple, definitions_before))
+            assert name in await client.list_graphs()
+            assert await _topology_hash(graph, name) == topology_before
+            assert (await graph.ro_query(INDEX_DEFINITION_QUERY)).result_set == definitions_before
+            assert (await graph.ro_query(VECTORS_QUERY)).result_set == vectors_before
+            assert (await graph.ro_query(FULLTEXT_QUERY)).result_set == [['n-merge']]
+            last_save = await client.connection.lastsave()
+            assert last_save.timestamp() >= restored_from
 
     @pytest.mark.asyncio
-    async def test_an_existing_target_is_refused_and_left_untouched(self):
-        source_name, target_name = _scratch_name(), _scratch_name()
-        async with _two_clients() as (source_client, target_client):
-            source = source_client.select_graph(source_name)
-            target = target_client.select_graph(target_name)
-            try:
-                await _seed_source(source, source_name)
-                await target.query('CREATE (:Entity {uuid: "n-existing", name: "already here"})')
-                existing_hash = await _topology_hash(target, target_name)
+    async def test_a_graph_the_target_already_holds_is_refused_and_left_untouched(self):
+        async with _seeded_scratch_graph() as (client, graph, name):
+            topology_before = await _topology_hash(graph, name)
+            vectors_before = (await graph.ro_query(VECTORS_QUERY)).result_set
 
-                with pytest.raises(SEED.TargetGraphExists, match=target_name):
-                    await SEED.seed_graph(source_client, target_client, source_name, target_name)
+            with pytest.raises(SEED.TargetGraphExists, match=name):
+                await SEED.seed_graph(client, client, name)
 
-                assert await _topology_hash(target, target_name) == existing_hash
-            finally:
-                await _delete_quietly(source, target)
+            assert await _topology_hash(graph, name) == topology_before
+            assert (await graph.ro_query(VECTORS_QUERY)).result_set == vectors_before
