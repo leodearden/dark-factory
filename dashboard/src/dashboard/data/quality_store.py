@@ -715,7 +715,8 @@ async def record_marker_failure(
 
 @asynccontextmanager
 async def _one_snapshot(conn: aiosqlite.Connection) -> AsyncIterator[None]:
-    """Every read inside sees one database state, so a tick committing meanwhile cannot tear it."""
+    """Every read inside sees one database state: a tick committing on another connection cannot
+    tear it, but a commit on this one ends the savepoint, so a reader never shares a writer's."""
     await conn.execute('SAVEPOINT read_marker_state')
     try:
         yield
