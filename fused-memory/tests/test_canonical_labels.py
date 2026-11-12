@@ -15,6 +15,7 @@ leaf-module shape and pytest conventions this module copies.
 from __future__ import annotations
 
 import dataclasses
+import operator
 
 import pytest
 
@@ -1488,8 +1489,7 @@ class TestUnregisteredKindIsRejectedLoudly:
             Referent(kind='escalation', number='7')
 
     def test_the_kind_registry_is_read_only(self):
-        with pytest.raises(TypeError):
-            canonical_labels.KIND_LABELS['ticket'] = 'Ticket'  # pyright: ignore[reportIndexIssue]
+        pytest.raises(TypeError, operator.setitem, canonical_labels.KIND_LABELS, 'ticket', 'Ticket')
 
     def test_registered_kinds_are_exactly_task(self):
         assert dict(canonical_labels.KIND_LABELS) == {'task': 'Task'}
