@@ -23,6 +23,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
 from escalation.disposition import ExitKind
+from escalation.file_or_refresh import RefreshableAlarm, file_or_refresh
 from escalation.grant_delivery import (
     GRANT_NOT_DELIVERED_MARKER,
     GrantDelivery,
@@ -354,6 +355,15 @@ def _bumped_routing_dump(metadata: Any, by: int = 1) -> dict[str, Any]:
 # waits on this sentinel, so dispatch is never blocked. A stable sentinel
 # also gives get_by_task(..., level=2) a durable dedup key across restarts.
 _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
+_DIRTY_TREE_ALARM = RefreshableAlarm(
+    task_id=_DIRTY_TREE_ESCALATION_SENTINEL,
+    level=2,
+    agent_role='orchestrator-dirty-tree-guard',
+    severity='critical',
+    category=EscalationCategory.CLEANUP_NEEDED,
+    suggested_action='Commit or stash the dirty files listed above in project_root.',
+)
+_DIRTY_TREE_SUMMARY = 'dirty project_root at startup - commit or stash WIP'
 
 # Sentinel task_id for the unknown-config-key born-at-L2 filer (task 2989),
 # mirroring _DIRTY_TREE_ESCALATION_SENTINEL: a stable synthetic task_id that no
@@ -10203,7 +10213,7 @@ class Harness:
         if not dirty:
             if self._escalation_queue is not None:
                 for esc in self._escalation_queue.get_by_task(
-                    _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+                    _DIRTY_TREE_ALARM.task_id, status='pending', level=_DIRTY_TREE_ALARM.level,
                 ):
                     self._escalation_queue.resolve(
                         esc.id,
@@ -10224,8 +10234,6 @@ class Harness:
         if self._escalation_queue is None:
             return
 
-        from escalation.models import Escalation
-
         detail = (
             f'project_root has uncommitted tracked changes at startup:\n{dirty}\n\n'
             'The orchestrator started anyway (task 2380: dirty trees no '
@@ -10233,37 +10241,13 @@ class Harness:
             'stashed — an uncommitted tree left indefinitely risks being '
             'clobbered by unrelated operations run against project_root.'
         )
-
-        # Dedup across restarts: has_open_l1 is hardcoded to level=1
-        # (escalation/queue.py), so get_by_task is used directly (mirrors
-        # _alarm_verify_worktree_contention in merge_queue.py). A hit is
-        # refreshed in place (same id, re-submitted) rather than filed as a
-        # duplicate, so the watchdog's Restart=on-failure loop surfaces one
-        # persistent L2 instead of a burst of criticals.
-        existing = self._escalation_queue.get_by_task(
-            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+        file_or_refresh(
+            self._escalation_queue,
+            _DIRTY_TREE_ALARM,
+            summary=_DIRTY_TREE_SUMMARY,
+            detail=detail,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
-        if existing:
-            esc = existing[0]
-            esc.detail = detail
-            esc.timestamp = datetime.now(UTC).isoformat()
-            esc.dedupe_count += 1
-        else:
-            esc = Escalation(
-                id=self._escalation_queue.make_id(_DIRTY_TREE_ESCALATION_SENTINEL),
-                task_id=_DIRTY_TREE_ESCALATION_SENTINEL,
-                agent_role='orchestrator-dirty-tree-guard',
-                severity='critical',
-                level=2,
-                category='cleanup_needed',
-                summary='dirty project_root at startup - commit or stash WIP',
-                detail=detail,
-                suggested_action=(
-                    'Commit or stash the dirty files listed above in project_root.'
-                ),
-                filing_claimant_run_id=self._filing_claimant_run_id,
-            )
-        self._escalation_queue.submit(esc)
 
     async def _file_config_unknown_keys_escalation(self) -> None:
         """File (or self-heal) a born-at-L2 escalation for unknown project-config keys.

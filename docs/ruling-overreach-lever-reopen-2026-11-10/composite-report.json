@@ -1,0 +1,141 @@
+{
+  "composite_recall": {
+    "judge_recall": {
+      "ci": [
+        0.0583,
+        0.3231
+      ],
+      "rate": 0.1467
+    },
+    "label": "product of two frames: the offline judge recall on the 2026-08-25..2026-10-01 adjudicated window times Stage-1 recall on the flags handed in this sample's window; the range multiplies their bounds and is not the interval of any one estimator",
+    "point": 0.0486,
+    "range": [
+      0.0106,
+      0.1699
+    ]
+  },
+  "decision": {
+    "bars": {
+      "precision_lower_min": 0.65,
+      "precision_min": 0.8
+    },
+    "checks": {
+      "retire_precision": true,
+      "retire_precision_lower_bound": true
+    },
+    "passes": true
+  },
+  "flag_precision": {
+    "ci": [
+      0.3292,
+      0.6019
+    ],
+    "effective_n": 47.6,
+    "rate": 0.4628
+  },
+  "holding_retired_share": {
+    "ci": [
+      0.0063,
+      0.1445
+    ],
+    "effective_n": 37.3,
+    "rate": 0.0317
+  },
+  "holdings_retired_per_day": 0.32,
+  "label_counts": {
+    "dark_factory": {
+      "kept": {
+        "bookkeeping": 0,
+        "context": 8,
+        "holding": 4,
+        "misbound": 0,
+        "overreach": 8,
+        "unjudgeable": 0
+      },
+      "retired": {
+        "bookkeeping": 0,
+        "context": 1,
+        "holding": 1,
+        "misbound": 0,
+        "overreach": 18,
+        "unjudgeable": 0
+      }
+    },
+    "reify": {
+      "kept": {
+        "bookkeeping": 0,
+        "context": 8,
+        "holding": 3,
+        "misbound": 3,
+        "overreach": 6,
+        "unjudgeable": 0
+      },
+      "retired": {
+        "bookkeeping": 0,
+        "context": 0,
+        "holding": 0,
+        "misbound": 0,
+        "overreach": 20,
+        "unjudgeable": 0
+      }
+    }
+  },
+  "overreach_retired_per_day": 9.48,
+  "retire_precision": {
+    "ci": [
+      0.811,
+      0.9807
+    ],
+    "effective_n": 37.3,
+    "rate": 0.9366
+  },
+  "sample": {
+    "cap": 20,
+    "hash_rule": "sha256(graph:edge_uuid)",
+    "strata": [
+      "retired",
+      "kept"
+    ],
+    "window_end": "2026-11-10T00:00:00+00:00",
+    "window_start": "2026-10-24T00:00:00+00:00"
+  },
+  "stage1_recall_on_flags": {
+    "ci": [
+      0.1811,
+      0.5259
+    ],
+    "effective_n": 25.3,
+    "rate": 0.3312
+  },
+  "unweighted": {
+    "flag_precision": {
+      "ci": [
+        0.5408,
+        0.7455
+      ],
+      "k": 52,
+      "n": 80,
+      "rate": 0.65
+    },
+    "retire_precision": {
+      "ci": [
+        0.835,
+        0.9862
+      ],
+      "k": 38,
+      "n": 40,
+      "rate": 0.95
+    }
+  },
+  "verdicts": 80,
+  "weights": {
+    "dark_factory": {
+      "kept": 30.8,
+      "retired": 5.45
+    },
+    "reify": {
+      "kept": 13.15,
+      "retired": 3.15
+    }
+  }
+}

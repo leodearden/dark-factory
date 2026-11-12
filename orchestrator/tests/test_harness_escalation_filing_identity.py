@@ -204,8 +204,12 @@ class TestHarnessFilingsCarryTheIdentity:
         assert report.vetoes_done_flip is True  # ...but the done-flip veto holds
 
 
-def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
-    """Every ``Escalation(...)`` construction in *module_path*.
+_FILING_CALLABLES = frozenset({'Escalation', 'file_or_refresh'})
+
+
+def _filing_call_sites(module_path: Path) -> list[ast.Call]:
+    """Every filing site in *module_path*: an ``Escalation(...)`` construction,
+    or a ``file_or_refresh(...)`` call, which builds the Escalation for its caller.
 
     MUST be ``ast``, never a regex: ``harness.py`` carries docstring and
     comment prose mentioning ``Escalation(...)``, which a regex would report
@@ -216,7 +220,7 @@ def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == 'Escalation'
+        and node.func.id in _FILING_CALLABLES
     ]
 
 
@@ -229,21 +233,25 @@ class TestEveryHarnessFilingSiteIsStamped:
     to 0 would silently lose the stamp — which is how this defect arose.
     """
 
-    def test_all_escalation_constructions_pass_filing_claimant_run_id(self) -> None:
-        calls = _escalation_call_sites(_HARNESS_SRC_PATH)
+    def test_every_filing_site_passes_filing_claimant_run_id(self) -> None:
+        calls = _filing_call_sites(_HARNESS_SRC_PATH)
         # Baseline at the time of writing; a drop means sites moved out of
         # this module and the tripwire's coverage silently shrank.  Raised
         # 27 -> 28 when this branch rebased onto main: task 3172 step-14 added
         # _file_stale_l0_strand_escalation, a 28th filing site, which this
-        # rebase stamps like the other 27.
-        assert len(calls) >= 28, f'expected >=28 Escalation(...) sites, found {len(calls)}'
+        # rebase stamps like the other 27.  A filing routed through
+        # escalation.file_or_refresh is counted at its call (task 8926).
+        assert len(calls) >= 28, (
+            f'expected >=28 Escalation(...) or file_or_refresh(...) sites, '
+            f'found {len(calls)}'
+        )
 
         unstamped = [
             node.lineno for node in calls
             if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
         ]
         assert not unstamped, (
-            f'{_HARNESS_SRC_PATH.name}: Escalation(...) without '
+            f'{_HARNESS_SRC_PATH.name}: Escalation(...) or file_or_refresh(...) without '
             f'filing_claimant_run_id at lines {unstamped} — every filing site '
             f'must stamp the filing incarnation (task 3550); use '
             f'self._filing_claimant_run_id.'

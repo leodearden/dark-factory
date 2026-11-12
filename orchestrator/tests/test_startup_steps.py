@@ -172,6 +172,8 @@ class TestFailedStep:
         assert esc.category == 'infra_issue'
         assert esc.agent_role == 'orchestrator-startup'
         assert esc.filing_claimant_run_id == CLAIMANT
+        assert esc.task_id == sentinel_task_id('2c')
+        assert esc.suggested_action == 'investigate_startup_step'
         assert '2c' in esc.summary
         assert 'RuntimeError' in esc.summary
 
@@ -194,6 +196,24 @@ class TestFailedStep:
         assert 'second' in refreshed.detail
         assert refreshed.timestamp >= first.timestamp
         assert len(queue.get_pending()) == 1
+
+    @pytest.mark.asyncio
+    async def test_repeat_failure_refreshes_summary_and_keeps_the_first_filer(
+        self, journal, event_store, queue,
+    ) -> None:
+        for claimant, message in (('claimant-run-a', 'first'), ('claimant-run-b', 'second')):
+            await run_startup_step(
+                StartupStep('2f', _raiser(RuntimeError(message))),
+                journal=journal,
+                event_store=event_store,
+                escalation_queue=queue,
+                filing_claimant_run_id=claimant,
+            )
+
+        [refreshed] = _pending_l1s(queue, '2f')
+        assert 'second' in refreshed.summary
+        assert 'first' not in refreshed.summary
+        assert refreshed.filing_claimant_run_id == 'claimant-run-a'
 
 
 class TestPartialStep:
