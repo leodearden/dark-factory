@@ -750,9 +750,15 @@ it, and the gate slug where one corresponds:
   repository file, and names the memories to amend) is handled under self-execute line 14, with
   every check that line requires, and reported afterwards (Leo, 2026-11-10, scoping_intake
   esc-866-1; precedent esc-787-1). Any other milestone gate is still asked. **Second exception:**
-  `review_due` is handled under "`review_due` (born-at-L2, human gate)", which spawns the attended
-  run with no prior ask (D10, Leo 2026-10-05). The spawn itself is not a `spend_or_eval_launch`:
-  the spawned skill confirms scope and cost with Leo before any agent runs.
+  `review_due`, or a `milestone_gate` whose task carries `metadata.trigger_chain.role='human_gate'`
+  (an interim gate, filed before ζ deployed), is handled under "`review_due` (born-at-L2, human
+  gate)", which spawns the attended run with no prior ask (D10, Leo 2026-10-05). A withheld gate
+  does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
+  rather than review_due because …"
+  (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
+  or a config without project_id or project_root) is asked like any other milestone gate. The
+  spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
+  before any agent runs.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
