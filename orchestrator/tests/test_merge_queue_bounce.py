@@ -683,6 +683,7 @@ class TestBounceBookkeeping:
 
     async def test_a_reserved_request_records_no_bounce(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A deep chain's reserved link (task 7720) is skipped before any bounce
         is recorded: no rebase of its worktree, no escalation, no count. The
@@ -704,7 +705,7 @@ class TestBounceBookkeeping:
         )
         tracker.signature = ((held.request_id, peer.request_id), 'abc123')
         rebase_spy = AsyncMock(return_value=True)
-        git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', rebase_spy)
 
         await tracker.bounce_conflicting_suffix_items()
 

@@ -490,14 +490,18 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
 
 async def _git_retrying_index_lock(repo: Path, *argv: str) -> None:
     """Run one git command, retrying while the live lane holds the repo's index lock."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + MERGE_GATE_BARRIER_TIMEOUT
-    while True:
-        rc, _, err = await _run(['git', *argv], cwd=repo)
-        if rc == 0:
-            return
-        assert 'index.lock' in err and loop.time() < deadline, err
-        await asyncio.sleep(_POLL_SECS)
+    async def _attempt_until_unlocked() -> None:
+        while True:
+            rc, _, err = await _run(['git', *argv], cwd=repo)
+            if rc == 0:
+                return
+            assert 'index.lock' in err, err
+            await asyncio.sleep(_POLL_SECS)
+    await wait_responsive(
+        _attempt_until_unlocked(),
+        timeout=MERGE_GATE_BARRIER_TIMEOUT,
+        label=f'the live lane released the index lock for git {argv[0]}',
+    )
 
 
 async def _move_main_by_a_foreign_commit(scene: _Scene) -> None:
