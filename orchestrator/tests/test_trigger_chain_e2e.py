@@ -227,6 +227,8 @@ class TestCompletionGate:
     async def test_not_yet_re_arms_without_escalating(self, rig: TriggerChainRig) -> None:
         first = await _first_check_not_yet(rig)
 
+        assert first.chain.completion_id not in rig.scheduler.get_state_snapshot().requeue_cooldowns
+        assert await rig.dispatch() == (None, None)
         gate = await rig.task(first.chain.completion_id)
         meta = _metadata(gate)
         assert gate['status'] == 'pending'
