@@ -2493,7 +2493,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
     # single annotation cleared 337 of the 350 errors this file carried.
     kwargs: dict[str, Any] = dict(
         effects=mod.CensusEffects(
-            batch_source=None,
+            batch_source=(),
             selection_of=_no_selection,
             invoke=_make_fake_invoke(default="pong"),
             verify_fn=_poison("verify_fn"),
@@ -8459,10 +8459,8 @@ def test_run_census_files_a_withheld_entry_once_a_matches_op_makes_it_recur(tmp_
 
 
 def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_path):
-    first = {
-        **_hosted_kwargs(tmp_path, harness_project=_HARNESS),
-        "batch_source": [[_hand_digest("s1-df-marked", "a task-store read timed out")]],
-    }
+    first = _hosted_kwargs(tmp_path, harness_project=_HARNESS)
+    _override(first, batch_source=[[_hand_digest("s1-df-marked", "a task-store read timed out")]])
     mod.run_census(**first)
     assert first["effects"].submit_fn.calls == [], "run 1 must withhold the singleton"
     second = _recurrence_kwargs(
@@ -8642,7 +8640,8 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _rejected_first_run(tmp_path):
-    first = {**_gate_kwargs(tmp_path), "verify_fn": _make_fake_verify_fn(rejected_titles={_GATED_TITLE})}
+    first = _gate_kwargs(tmp_path)
+    _override(first, verify_fn=_make_fake_verify_fn(rejected_titles={_GATED_TITLE}))
     mod.run_census(**first)
     [candidate] = [
         c for c in codebook.load(first["codebook_path"])["candidates"] if c["title"] == _GATED_TITLE

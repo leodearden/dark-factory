@@ -19,26 +19,8 @@ of it (a gate refusal, or a commit that does not land, is rolled back to
 HEAD and quarantined; see ``run_census``).
 ``--force`` for operator-initiated runs.
 
-Every LLM / MCP / git side effect in this module is an INJECTED seam
-(``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
-``task_store``, ``escalate_fn``, ``status_fetcher``, ``gate``, ``commit``,
-``roll_back``, ``batch_source``, ``selection_of``) --
-mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
-``census_trigger.decide_for_project(completion_runner=)``. The scripts/ test env (``uv run
---project shared``) has no live models. Every seam is ALWAYS faked in this
-module's own test suite for DETERMINISM -- to keep the suite off the
-network and make both the request shape and the failure path assertable
-regardless of what is installed or listening, never because a client
-library is absent: an MCP client IS importable there too, symmetrically
-with httpx below -- ``fastmcp>=3.2`` is a direct dependency of ``shared``
-(``shared/pyproject.toml``, task 3689), pulling in ``mcp>=1.24`` -- so an
-un-faked seam would really reach whatever is listening on
-``$FUSED_MEMORY_MCP_URL`` (default localhost:8002). The deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network. Note that
-httpx IS available there -- a direct dependency of ``shared``
-(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965).
+Every LLM / MCP / git / disk side effect of a run is a field of
+``CensusEffects``, always faked in this module's own test suite.
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -67,7 +49,7 @@ import os
 import sys
 import textwrap
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -134,6 +116,7 @@ from legibility import (  # noqa: E402
     unlanded,
 )
 from legibility import verdict as verdict_mod  # noqa: E402
+from legibility.task_store import TaskStore  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
@@ -2427,21 +2410,28 @@ def _unlanded(
     )
 
 
+@dataclass(frozen=True)
+class CensusEffects:
+    """Every effect run_census has on the world, each an injected seam."""
+
+    batch_source: Iterable[Sequence[Any]]
+    selection_of: Callable[[], census_window.SessionSelection | None]
+    invoke: Callable[[str, str], str]
+    verify_fn: Callable[..., Mapping[str, Any] | None]
+    synthesize_fn: Callable[..., str]
+    embedder: embeddings.Embedder
+    submit_fn: Callable[..., Any]
+    task_store: TaskStore
+    status_fetcher: Callable[[], Any]
+    escalate_fn: Callable[..., object]
+    gate: Callable[[], landing_gate.GateVerdict]
+    commit: Callable[..., unlanded.CommitResult]
+    roll_back: Callable[..., unlanded.Rollback]
+
+
 def run_census(
     *,
-    batch_source,
-    selection_of: Callable[[], census_window.SessionSelection | None],
-    invoke,
-    verify_fn,
-    synthesize_fn,
-    submit_fn,
-    task_store: task_store.TaskStore,
-    escalate_fn,
-    status_fetcher,
-    gate: Callable[[], landing_gate.GateVerdict],
-    commit,
-    roll_back,
-    embedder: embeddings.Embedder,
+    effects: CensusEffects,
     codebook_dict: dict,
     config,
     project_root: str,
@@ -2693,12 +2683,12 @@ def run_census(
     # below and the stage gate); the verifier's own in-verify probes are
     # added from its reported count at the verify site.
     probe_count = [1]
-    headroom = preflight_headroom(invoke, model=config.models.trickle)
+    headroom = preflight_headroom(effects.invoke, model=config.models.trickle)
     if not headroom.ok:
         return _defer(
             "preflight",
             headroom.reason or "headroom preflight failed",
-            escalate_fn=escalate_fn,
+            escalate_fn=effects.escalate_fn,
         )
 
     # Every output parent, created ONCE, here -- not at each of the four
@@ -2752,16 +2742,16 @@ def run_census(
         logger.warning("census: finding area map: %s", note)
     instrument_findings = prescreen.load_instrument_findings(project_root, project_id)
     mining_result = mine_to_saturation(
-        batch_source,
+        effects.batch_source,
         codebook_dict,
         project=project_id,
         model=config.models.census_miner,
         config=config.census.saturation,
         invariant_slugs=invariant_slugs,
-        invoke=invoke,
+        invoke=effects.invoke,
         max_batches=max_batches,
     )
-    selection = selection_of()
+    selection = effects.selection_of()
 
     # The pre-screen (plans/census-incremental-prd.md L6): a cluster already
     # catalogued by title, or from a session already sighted, costs no verify
@@ -2795,11 +2785,11 @@ def run_census(
     view = similarity.build_view(
         codebook_dict,
         {candidate_id: resolved.clusters[candidate_id] for candidate_id in resolved.uncatalogued},
-        embedder=embedder,
+        embedder=effects.embedder,
         settings=config.census.adjudication,
     )
     if view.skipped is not None:
-        _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=escalate_fn)
+        _escalate_skipped_similarity(view.skipped, project_id=project_id, escalate_fn=effects.escalate_fn)
     novel_clusters = [
         cluster for candidate_id, cluster in resolved.clusters.items() if not view.screens(candidate_id)
     ]
@@ -2842,7 +2832,7 @@ def run_census(
     # about to skip.
     if clusters_to_verify or offered:
         stage_headroom = _stage_headroom_gate(
-            invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
+            effects.invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
         )
         if not stage_headroom.ok:
             # The reason NAMES the stage. The preflight's reason is left
@@ -2854,7 +2844,7 @@ def run_census(
                 "verify",
                 "headroom gate failed at the verify stage boundary: "
                 f"{stage_headroom.reason or 'no headroom'}",
-                escalate_fn=escalate_fn,
+                escalate_fn=effects.escalate_fn,
                 unverified=len(clusters_to_verify),
             )
 
@@ -2865,12 +2855,12 @@ def run_census(
     # cap-poisoned cluster is ever recorded as a verdict and last_census_at
     # never advances past a window that was not actually adjudicated.
     try:
-        verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+        verify_result = effects.verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
     except CensusHeadroomExhausted as exc:
         return _defer(
             "verify",
             f"headroom exhausted during verification: {exc.reason}",
-            escalate_fn=escalate_fn,
+            escalate_fn=effects.escalate_fn,
             verified=exc.verified,
             rejected=exc.rejected,
             unverified=exc.unverified,
@@ -2891,19 +2881,19 @@ def run_census(
     fixed_entry_ids = verify_result.get("fixed") or []
 
     mass_rejection = _detect_mass_rejection(
-        len(clusters_to_verify), len(verified), clusters="verified-candidate", escalate_fn=escalate_fn,
+        len(clusters_to_verify), len(verified), clusters="verified-candidate", escalate_fn=effects.escalate_fn,
     )
 
     queue = _adjudicate_queue(
         offered,
         cb=codebook_dict,
-        verify_fn=verify_fn,
+        verify_fn=effects.verify_fn,
         model=config.models.census_verify,
         project_root=project_root,
         probe_count=probe_count,
     )
     queue_mass_rejection = None if queue.inconclusive is not None else _detect_mass_rejection(
-        len(offered), len(queue.verified), clusters="pending-queue", escalate_fn=escalate_fn,
+        len(offered), len(queue.verified), clusters="pending-queue", escalate_fn=effects.escalate_fn,
     )
     verified = [*verified, *queue.verified]
     rejected = [*rejected, *queue.rejected]
@@ -3076,8 +3066,8 @@ def run_census(
         },
     )
     synthesized = _synthesis_stage(
-        brief, updated_codebook, standing=codebook_dict, clusters=placed, synthesize_fn=synthesize_fn,
-        model=config.models.census_synthesis, project_id=project_id, escalate_fn=escalate_fn,
+        brief, updated_codebook, standing=codebook_dict, clusters=placed, synthesize_fn=effects.synthesize_fn,
+        model=config.models.census_synthesis, project_id=project_id, escalate_fn=effects.escalate_fn,
     )
     updated_codebook = synthesized.refined.codebook
     matrix_md = render_matrix(compute_matrix(
@@ -3091,21 +3081,21 @@ def run_census(
     # read plus a codebook update. disposition.backfill never raises and logs
     # its own failure.
     updated_codebook, backfilled = disposition.backfill(
-        updated_codebook, store=task_store, project_root=project_root, run_id=run_id,
+        updated_codebook, store=effects.task_store, project_root=project_root, run_id=run_id,
     )
 
     # Outcome feedback (plans/census-incremental-prd.md L5, D8), after the
     # backfill so the tasks it linked are read this run. Re-verifies take
     # only what the verify cap leaves after the novel clusters.
-    statuses, statuses_error = _read_statuses(status_fetcher)
+    statuses, statuses_error = _read_statuses(effects.status_fetcher)
     outcomes = disposition.read_outcomes(
         updated_codebook, statuses=statuses, statuses_error=statuses_error,
-        observed_root=project_root, store=task_store,
+        observed_root=project_root, store=effects.task_store,
     )
     reverified = _reverify(
         outcomes.due,
         cb=updated_codebook,
-        verify_fn=verify_fn,
+        verify_fn=effects.verify_fn,
         model=config.models.census_verify,
         remaining=None if remaining is None else remaining - len(offered),
         probe_count=probe_count,
@@ -3129,8 +3119,8 @@ def run_census(
     )
     disposal = disposition.dispose(
         [pending.filing(payload) for pending, payload in zip(filing_queue, task_payloads, strict=True)],
-        store=task_store,
-        submit=None if dry_run_payloads_path is not None else submit_fn,
+        store=effects.task_store,
+        submit=None if dry_run_payloads_path is not None else effects.submit_fn,
         awaiting=outcomes.awaiting,
     )
     withheld_entry_ids = {
@@ -3165,7 +3155,7 @@ def run_census(
         run_id=run_id, as_of_sha=as_of_sha,
     )
     updated_codebook, resolutions = disposition.resolve_tickets(
-        updated_codebook, store=task_store, run_id=run_id,
+        updated_codebook, store=effects.task_store, run_id=run_id,
     )
     # Synthesis corrections land after filing, so this run's filing pairing
     # and sighting counts read the codebook the run verified.
@@ -3304,7 +3294,7 @@ def run_census(
         session_watermark=selection.window.end if selection is not None else None,
     )
 
-    verdict = gate()
+    verdict = effects.gate()
     landed = CensusOutcome(
         status="done",
         report_path=str(report_path),
@@ -3328,12 +3318,12 @@ def run_census(
     if dry_run_filing is not None:
         commit_paths.append(dry_run_filing.path)
     unlanded_as = functools.partial(
-        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=roll_back,
-        escalate_fn=escalate_fn, project_id=project_id,
+        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=effects.roll_back,
+        escalate_fn=effects.escalate_fn, project_id=project_id,
     )
     if not verdict.passed:
         return unlanded_as(_gate_refusal(verdict))
-    landing = commit(paths=commit_paths, message=f"legibility census {date}")
+    landing = effects.commit(paths=commit_paths, message=f"legibility census {date}")
     if not landing.ok:
         return unlanded_as(_commit_refusal(landing))
     if selection is None:
@@ -4205,7 +4195,7 @@ def _run_configured_census(
         mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
             cfg, project_root=project_root, runner=runner,
         )
-        outcome = run_census(
+        effects = CensusEffects(
             batch_source=batch_source,
             selection_of=lambda: batch_source.selection,
             invoke=mining_invoke,
@@ -4221,19 +4211,22 @@ def _run_configured_census(
                 ),
             ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
+            embedder=embeddings.Embedder(
+                embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),
+            ),
             submit_fn=default_submit_fn,
             task_store=task_store.McpTaskStore(url=_fused_memory_base_url(), post=_post_mcp_tool_call),
-            escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
+            escalate_fn=escalate_fn,
             gate=functools.partial(landing_gate.run_gate, project_root, cfg.census.landing_gate),
             commit=functools.partial(unlanded.commit_only, project_root),
             roll_back=functools.partial(
                 unlanded.roll_back, project_root,
                 project_id=cfg.project_id, label=f"census-{date_str}",
             ),
-            embedder=embeddings.Embedder(
-                embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),
-            ),
+        )
+        outcome = run_census(
+            effects=effects,
             codebook_dict=codebook_dict,
             config=cfg,
             project_root=str(project_root),

@@ -86,7 +86,7 @@ class _Recorder:
         self._result = result
         self._effect = effect
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> Any:
         self.calls.append(kwargs)
         if self._effect is not None:
             self._effect()
