@@ -169,6 +169,7 @@ from orchestrator.pause_policy import (
 )
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
     LeaveReason,
@@ -4472,22 +4473,13 @@ class Harness:
                                 entry.name, rec.task_id, stored_title,
                                 live.get('title'),
                             )
-                            dest = await self.git_ops.quarantine_worktree(
-                                entry, rec.branch or rec.task_id,
+                            await self._quarantine_and_emit(
+                                entry, rec.task_id, rec.branch or rec.task_id,
                                 'recovery-identity-mismatch',
                             )
                             self.git_ops._lane_lifecycle.transition(
                                 entry, DurableLaneState.QUARANTINED,
                             )
-                            if self.event_store:
-                                self.event_store.emit(
-                                    EventType.worktree_quarantined,
-                                    task_id=rec.task_id,
-                                    data={
-                                        'reason': 'recovery-identity-mismatch',
-                                        'dest': str(dest) if dest else None,
-                                    },
-                                )
                             return _WorktreeRecovery.CLEANED
 
                     pool.restore_assignment(rec.task_id, entry)
@@ -4573,21 +4565,12 @@ class Harness:
                         'branch_ok=%s) — quarantining, not re-pinning',
                         entry.name, rec.task_id, is_registered, branch_ok,
                     )
-                    dest = await self.git_ops.quarantine_worktree(
-                        entry, rec.branch or rec.task_id, reason,
+                    await self._quarantine_and_emit(
+                        entry, rec.task_id, rec.branch or rec.task_id, reason,
                     )
                     self.git_ops._lane_lifecycle.transition(
                         entry, DurableLaneState.QUARANTINED,
                     )
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.worktree_quarantined,
-                            task_id=rec.task_id,
-                            data={
-                                'reason': reason,
-                                'dest': str(dest) if dest else None,
-                            },
-                        )
                     return _WorktreeRecovery.CLEANED
 
         # The task this entry was dispatched for. A cold worktree is named
@@ -4703,15 +4686,9 @@ class Harness:
                     '%r != live %r; quarantining',
                     recovery_id, stored_title, live.get('title'),
                 )
-                await self.git_ops.quarantine_worktree(
-                    entry, recovery_id, 'recovery-identity-mismatch',
+                await self._quarantine_and_emit(
+                    entry, recovery_id, recovery_id, 'recovery-identity-mismatch',
                 )
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.worktree_quarantined,
-                        task_id=recovery_id,
-                        data={'reason': 'recovery-identity-mismatch'},
-                    )
                 return _WorktreeRecovery.CLEANED
 
         # For lanes: restore the in-memory pool assignment so the lane is
@@ -5110,6 +5087,17 @@ class Harness:
             )
         return failures
 
+    async def _quarantine_and_emit(
+        self, entry: Path, task_id: str, branch: str, reason: str,
+    ) -> QuarantineOutcome:
+        """Quarantine *entry* for *reason* and emit ``worktree_quarantined`` with the outcome's payload."""
+        outcome = await self.git_ops.quarantine_worktree(entry, branch, reason)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.worktree_quarantined, task_id=task_id, data=outcome.event_data(reason),
+            )
+        return outcome
+
     async def _reap_orphan_entry(
         self, entry: Path, live_ids: set[str],
     ) -> _OrphanDisposition:
@@ -5183,18 +5171,7 @@ class Harness:
 
         # Orphan: numeric id no longer maps to a live task.
         if await self.git_ops.worktree_has_unsaved_work(entry, name):
-            dest = await self.git_ops.quarantine_worktree(
-                entry, name, 'orphan-reaper',
-            )
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.worktree_quarantined,
-                    task_id=name,
-                    data={
-                        'reason': 'orphan-reaper',
-                        'dest': str(dest) if dest else None,
-                    },
-                )
+            await self._quarantine_and_emit(entry, name, name, 'orphan-reaper')
             logger.info(
                 'Orphan reaper: quarantined %s (had unsaved work)', name,
             )

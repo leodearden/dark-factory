@@ -111,6 +111,7 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
+from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
@@ -4922,19 +4923,19 @@ class GitOps:
                         'creating fresh',
                         worktree_path, stored_title, expected_title,
                     )
-                    dest = await self.quarantine_worktree(
+                    outcome = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
                     )
                     # Relocate (not delete) the foreign sibling .task-meta
                     # root alongside the quarantined worktree — mirrors the
                     # cold-reattach guard's identical call below; see
                     # _relocate_foreign_meta_root's docstring. Skipped when
-                    # dest is None (relocation failed): worktree_path is
+                    # outcome.dest is None (relocation failed): worktree_path is
                     # still a live registered worktree, so the elif
                     # self-heal branch below raises rather than destroying
                     # anything, and the sidecar is correctly left in place.
-                    if dest is not None:
-                        await self._relocate_foreign_meta_root(worktree_path, dest)
+                    if outcome.dest is not None:
+                        await self._relocate_foreign_meta_root(worktree_path, outcome.dest)
                     reuse_ok = False
             if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
@@ -5282,11 +5283,11 @@ class GitOps:
                     'creating fresh',
                     worktree_path, stored_title, expected_title, full_branch,
                 )
-                dest = await self.quarantine_worktree(
+                outcome = await self.quarantine_worktree(
                     worktree_path, branch_name, 'cold-reattach-identity-mismatch',
                 )
-                if dest is None:
-                    # quarantine_worktree never raises — a None return means
+                if outcome.dest is None:
+                    # quarantine_worktree never raises — a None dest means
                     # the relocation could not complete, so the branch is
                     # STILL task/<branch_name> and worktree_path is STILL
                     # attached. Falling through here would make the caller's
@@ -5316,7 +5317,7 @@ class GitOps:
                 # detect the mismatch) and ONLY on this confirmed-mismatch
                 # route — never on the match/fail-open path below, a
                 # same-task resume whose own artifacts must be preserved.
-                await self._relocate_foreign_meta_root(worktree_path, dest)
+                await self._relocate_foreign_meta_root(worktree_path, outcome.dest)
                 return None
 
         return await self._reuse_warm_lane(
@@ -8703,7 +8704,7 @@ class GitOps:
         Used by the two "nothing is destroyed" quarantine guards —
         ``create_worktree``'s REUSE-path and ``_reattach_cold_worktree``'s
         cold-path ``expected_title`` mismatch checks — where *dest* is the
-        :meth:`quarantine_worktree` return value
+        :meth:`quarantine_worktree` outcome's ``.dest``
         (``quarantine_base/<branch>-<ts>``). Unlike
         :meth:`_clear_foreign_meta_root` (used by the warm-lane
         DIFFERENT-task ACQUISITION routes, where the sidecar is genuinely
@@ -9391,23 +9392,28 @@ class GitOps:
                 result[name[len(head_prefix):]] = matched
         return result
 
-    async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
-        """Whether *full_branch* carries commits beyond main.
-
-        **Fail-safe ``True``** on any git error or unparseable output — never
-        report a branch as empty (safe to delete) when we cannot prove it.
-        """
+    async def commits_beyond_main(self, full_branch: str) -> int | None:
+        """How many commits *full_branch* carries beyond main; None on any git error or unparseable output."""
         rc, out, _ = await _run(
             ['git', 'rev-list', '--count',
              f'{self.config.main_branch}..{full_branch}'],
             cwd=self.project_root,
         )
         if rc != 0:
-            return True
+            return None
         try:
-            return int(out.strip()) > 0
+            return int(out.strip())
         except ValueError:
-            return True
+            return None
+
+    async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
+        """Whether *full_branch* carries commits beyond main.
+
+        **Fail-safe ``True``** on any git error or unparseable output — never
+        report a branch as empty (safe to delete) when we cannot prove it.
+        """
+        count = await self.commits_beyond_main(full_branch)
+        return count is None or count > 0
 
     async def branch_tip_if_no_commits_beyond(
         self, full_branch: str, base_ref: str,
@@ -16418,15 +16424,16 @@ class GitOps:
 
     async def quarantine_worktree(
         self, worktree: Path, branch: str, reason: str,
-    ) -> Path | None:
+    ) -> QuarantineOutcome:
         """Relocate a worktree (and its branch) into the quarantine base.
 
         Best-effort: commits any uncommitted WIP first (so it is preserved on
         the renamed branch), then moves the worktree to
         ``quarantine_base/<branch>-<UTC-ts>`` and renames the branch to
-        ``task/<branch>-<ts>``.  Logs a WARNING and returns the destination
-        path, or ``None`` if the relocation could not complete.  **Never
-        raises** — callers treat a ``None`` return as "left in place".
+        ``task/<branch>-<ts>``.  Logs a WARNING and returns the parking as a
+        :class:`QuarantineOutcome`, or ``NOT_RELOCATED`` if the relocation
+        could not complete.  **Never raises** — callers treat a ``None``
+        ``dest`` as "left in place".
         """
         dest_name = f'{branch}-{_utc_stamp()}'
         dest_path = self.quarantine_base / dest_name
@@ -16444,13 +16451,23 @@ class GitOps:
                 'QUARANTINED worktree %s -> %s (reason=%s)',
                 worktree, dest_path, reason,
             )
-            return dest_path
+            return await self._parked_outcome(dest_path, f'{self.config.branch_prefix}{dest_name}')
         except Exception as e:
             logger.warning(
                 'quarantine_worktree: failed to relocate %s (reason=%s): %s',
                 worktree, reason, e,
             )
-            return None
+            return NOT_RELOCATED
+
+    async def _parked_outcome(self, dest: Path, parked_branch: str | None) -> QuarantineOutcome:
+        if parked_branch is None:
+            return QuarantineOutcome(dest=dest)
+        return QuarantineOutcome(
+            dest=dest,
+            branch=parked_branch,
+            tip_sha=await self.resolve_branch_sha(parked_branch),
+            unique_commit_count=await self.commits_beyond_main(parked_branch),
+        )
 
     async def park_prior_incarnation(
         self, branch_name: str, *, reason: str,
@@ -16494,10 +16511,10 @@ class GitOps:
         cold = self.worktree_base / branch_name
         if not await self._is_registered_worktree(cold):
             return None
-        dest = await self.quarantine_worktree(cold, branch_name, reason)
-        if dest is None:
+        outcome = await self.quarantine_worktree(cold, branch_name, reason)
+        if outcome.dest is None:
             raise RuntimeError(f'park_prior_incarnation: could not quarantine {cold}')
-        return dest
+        return outcome.dest
 
     async def _rename_branch_aside(self, branch_name: str, parked_name: str) -> None:
         """Free any lane checkout of ``task/<branch_name>``, then rename it."""
