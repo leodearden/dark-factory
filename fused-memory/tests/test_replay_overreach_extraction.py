@@ -1035,6 +1035,13 @@ class TestScorePerArm:
         }
         assert arms['o1']['tokens']['extract_edges'] == {'input_tokens': 1400, 'output_tokens': 160, 'llm_calls': 8}
 
+    def test_a_record_without_a_reasoning_effort_scores_as_effort_none(self, tmp_path: Path) -> None:
+        records, _ = _score_records(PASSING)
+        assert not any('reasoning_effort' in record for record in records)
+        assert {arm: block['reasoning_effort'] for arm, block in _scored(tmp_path)['arms'].items()} == {
+            'control': None, 'o1': None,
+        }
+
     def test_each_arm_names_its_model_and_instructions(self, tmp_path: Path) -> None:
         arms = _scored(tmp_path)['arms']
         assert (arms['o1']['model'], arms['o1']['instructions_version']) == ('gpt-4o-mini', mod.O1_INSTRUCTIONS_VERSION)
@@ -1158,32 +1165,24 @@ CLI_SCORE_BASELINE = {
 }
 OVERREACHING_FACT = 'Beta overrides Alpha'
 CONFIGURED_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'), ('Beta', 'Alpha', OVERREACHING_FACT))
-O6_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'),)
+O6_LOW_EDGES = tuple(('Alpha', 'Beta', f'Alpha adopts Beta for queue {index}') for index in range(8))
+"""Eight holdings per episode and no overreach: enough edges that its Wilson upper bound clears
+the control's point, so o6-low passes."""
+O6_MEDIUM_EDGES = CONFIGURED_EDGES
+"""The control's overreach rate exactly, so o6-medium fails."""
+EDGES_PER_EPISODE = len(CONFIGURED_EDGES) + len(O6_LOW_EDGES) + len(O6_MEDIUM_EDGES)
 
 
-class TestOneReplayAcrossArmModels:
+class TestOneReplayAcrossArmClients:
     def _replayed(self, tmp_path: Path) -> dict[str, Path]:
         paths = _cli_inputs(tmp_path, baseline=CLI_SCORE_BASELINE)
-        factory = _ClientsByLlm(edges={CONTROL_LLM: CONFIGURED_EDGES, O6_LOW_LLM: O6_EDGES, O6_MEDIUM_LLM: O6_EDGES})
+        factory = _ClientsByLlm(edges={
+            CONTROL_LLM: CONFIGURED_EDGES, O6_LOW_LLM: O6_LOW_EDGES, O6_MEDIUM_LLM: O6_MEDIUM_EDGES,
+        })
         assert _run_replay_on(paths, factory, 'control', 'o6-low', 'o6-medium') == 0
         return paths
 
-    def test_the_worksheet_interleaves_every_clients_edges_naming_no_arm(self, tmp_path: Path) -> None:
-        paths = self._replayed(tmp_path)
-        assert mod.run(_worksheet_argv(paths)) == 0
-        records = _records(paths['replay'])
-        for row in _records(paths['blind']):
-            replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
-            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == 4
-            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
-            assert hashes == sorted(hashes)
-            keys = row.keys() | {key for m in row['minted'] for key in m}
-            assert not {'arm', 'model', 'reasoning_effort', 'low', 'medium'} & keys
-        text = paths['blind'].read_text()
-        assert mod.O6_MODEL not in text and CONFIGURED not in text
-        assert not any(arm in text for arm in ('o6-low', 'o6-medium', 'control'))
-
-    def test_the_score_judges_o6_against_the_same_files_control(self, tmp_path: Path) -> None:
+    def _report(self, tmp_path: Path) -> dict[str, Any]:
         paths = self._replayed(tmp_path)
         records = _records(paths['replay'])
         labels = {
@@ -1194,12 +1193,79 @@ class TestOneReplayAcrossArmModels:
         verdict_file.write_text(json.dumps(_score_verdicts(records, labels)))
         assert mod.run(['score', '--replay', str(paths['replay']), '--verdicts', str(verdict_file),
                         '--baseline-report', str(paths['baseline']), '--out', str(out)]) == 0
-        report = json.loads(out.read_text())
-        control, o6 = report['arms']['control'], report['arms']['o6-low']
-        assert (control['model'], o6['model']) == (CONFIGURED, mod.O6_MODEL)
-        assert o6['instructions_version'] == mod.NO_INSTRUCTIONS
-        assert o6['population_weighted']['overreach_rate_minted']['rate'] == 0.0
-        assert control['population_weighted']['overreach_rate_minted']['rate'] == 0.5
-        assert report['comparison']['o6-low'] == mod.lever_decision(
-            control['population_weighted'], o6['population_weighted'],
-        )
+        return json.loads(out.read_text())
+
+    def test_the_worksheet_interleaves_every_clients_edges_naming_no_arm(self, tmp_path: Path) -> None:
+        paths = self._replayed(tmp_path)
+        assert mod.run(_worksheet_argv(paths)) == 0
+        records = _records(paths['replay'])
+        for row in _records(paths['blind']):
+            replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
+            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == EDGES_PER_EPISODE
+            hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
+            assert hashes == sorted(hashes)
+            keys = row.keys() | {key for m in row['minted'] for key in m}
+            assert not {'arm', 'model', 'reasoning_effort', 'low', 'medium'} & keys
+        text = paths['blind'].read_text()
+        assert mod.O6_MODEL not in text and CONFIGURED not in text
+        assert not any(arm in text for arm in ('o6-low', 'o6-medium', 'control'))
+
+    def test_each_arm_block_names_its_client(self, tmp_path: Path) -> None:
+        arms = self._report(tmp_path)['arms']
+        assert {arm: (block['model'], block['reasoning_effort']) for arm, block in arms.items()} == {
+            'control': (CONFIGURED, None), 'o6-low': (mod.O6_MODEL, 'low'), 'o6-medium': (mod.O6_MODEL, 'medium'),
+        }
+        assert {arms[arm]['instructions_version'] for arm in ('o6-low', 'o6-medium')} == {mod.NO_INSTRUCTIONS}
+
+    def test_each_o6_arm_is_judged_against_the_same_files_control(self, tmp_path: Path) -> None:
+        report = self._report(tmp_path)
+        control = report['arms']['control']['population_weighted']
+        assert control['overreach_rate_minted']['rate'] == 0.5
+        assert set(report['comparison']) == {'o6-low', 'o6-medium'}
+        for arm in ('o6-low', 'o6-medium'):
+            assert report['comparison'][arm] == mod.lever_decision(control, report['arms'][arm]['population_weighted'])
+
+    def test_the_two_efforts_are_decided_independently(self, tmp_path: Path) -> None:
+        comparison = self._report(tmp_path)['comparison']
+        assert (comparison['o6-low']['passes'], comparison['o6-medium']['passes']) == (True, False)
+
+
+# --------------------------------------------------------------------------- #
+# 9040's committed evidence still scores to its committed report
+# --------------------------------------------------------------------------- #
+
+REPO = Path(__file__).resolve().parents[2]
+EVIDENCE_9040 = REPO / 'docs' / 'ruling-overreach-lever-reopen-2026-11-10'
+BASELINE_4716 = REPO / 'docs' / 'ruling-overreach-guard-design-2026-10-01' / 'report.json'
+
+
+class TestThe9040EvidenceRescoresUnchanged:
+    """The 2026-11-10 design.md documents re-scoring its committed files, so a 9040-era replay
+    (no reasoning_effort key) must still score, and its decision-bearing output must not move."""
+
+    @pytest.fixture(scope='class')
+    def rescored(self, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+        out = tmp_path_factory.mktemp('rescore-9040') / 'report.json'
+        assert mod.run([
+            'score', '--replay', str(EVIDENCE_9040 / 'replay.jsonl'),
+            '--verdicts', str(EVIDENCE_9040 / 'verdicts.json'),
+            '--baseline-report', str(BASELINE_4716), '--out', str(out),
+        ]) == 0
+        return json.loads(out.read_text())
+
+    @pytest.fixture(scope='class')
+    def committed(self) -> dict[str, Any]:
+        return json.loads((EVIDENCE_9040 / 'report.json').read_text())
+
+    def test_the_comparison_and_fidelity_are_unchanged(
+        self, rescored: dict[str, Any], committed: dict[str, Any],
+    ) -> None:
+        assert rescored['comparison'] == committed['comparison']
+        assert rescored['fidelity'] == committed['fidelity']
+
+    def test_each_arm_block_gains_only_reasoning_effort_none(
+        self, rescored: dict[str, Any], committed: dict[str, Any],
+    ) -> None:
+        assert set(rescored['arms']) == set(committed['arms']) == {'control', 'o1'}
+        for arm, block in committed['arms'].items():
+            assert rescored['arms'][arm] == block | {'reasoning_effort': None}
