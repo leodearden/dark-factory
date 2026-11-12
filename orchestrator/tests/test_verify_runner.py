@@ -23,7 +23,7 @@ from _gate_fixtures import (
 )
 from _orch_helpers import pydantic_spec, wait_responsive
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
@@ -330,6 +330,48 @@ class TestMergeVerifySpec:
         legacy.pop("verify_cold_preprovision_command", None)
         restored = MergeVerifySpec.from_dict(legacy)
         assert restored.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    def test_scope_cargo_and_config_only_globs_round_trip(self):
+        spec = dataclasses.replace(
+            self._make_spec(),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=(
+                'dark-factory-orchestrator.yaml', 'crates/*/Cargo.toml',
+            ),
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored == spec
+        assert isinstance(restored.merge_config_only_full_gate_globs, tuple)
+        assert spec_from_json(spec_to_json(spec)) == spec
+
+    def test_scope_cargo_and_config_only_globs_default_to_not_carried(self):
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.scope_cargo is None
+        assert spec.merge_config_only_full_gate_globs is None
+
+    def test_from_dict_back_compat_missing_scope_cargo_and_globs(self):
+        """BACK-COMPAT: a pre-7465 dispatcher's dict lacks both keys and decodes
+        to None, which leaves the consuming host's own values in force."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("scope_cargo", None)
+        legacy.pop("merge_config_only_full_gate_globs", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.scope_cargo is None
+        assert restored.merge_config_only_full_gate_globs is None
+
+    def test_empty_globs_round_trip_as_carried(self):
+        """() is a carried value that replaces the host's globs, never None."""
+        spec = dataclasses.replace(self._make_spec(), merge_config_only_full_gate_globs=())
+        assert MergeVerifySpec.from_dict(spec.to_dict()).merge_config_only_full_gate_globs == ()
+        assert spec_from_json(spec_to_json(spec)).merge_config_only_full_gate_globs == ()
 
 
 # ---------------------------------------------------------------------------
@@ -2115,17 +2157,24 @@ class TestRetryScopeEventFields:
 class TestBuildMergeVerifySpec:
     """build_merge_verify_spec projects config + module_configs into a MergeVerifySpec."""
 
-    def _make_module_config(self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None):
+    def _make_module_config(
+        self, prefix, *, test_cmd=None, lint_cmd=None, type_check_cmd=None, scope_cargo=None,
+    ):
         mc = MagicMock()
         mc.prefix = prefix
         mc.test_command = test_cmd
         mc.lint_command = lint_cmd
         mc.type_check_command = type_check_cmd
+        # Task 7465: collapsed_module_overrides reads these; a bare MagicMock
+        # attr is non-None and truthy, so it would flag every mock module.
+        mc.scope_cargo = scope_cargo
+        mc.verify_env = None
         return mc
 
     def _make_config(
         self, *, verify_env=None, cold_timeout=None,
         test_cmd=None, lint_cmd=None, type_check_cmd=None,
+        scope_cargo=True, config_only_globs=(),
     ):
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
@@ -2146,6 +2195,9 @@ class TestBuildMergeVerifySpec:
         config.type_check_command = type_check_cmd
         # Task 6127: projected onto the spec, so it needs a real (JSON-native) value.
         config.verify_cold_preprovision_command = ''
+        # Task 7465: both projected onto the spec, so they need real values.
+        config.scope_cargo = scope_cargo
+        config.git = GitConfig(merge_config_only_full_gate_globs=list(config_only_globs))
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -2332,6 +2384,52 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(OrchestratorConfig(), [], None)
         assert spec.verify_cold_preprovision_command == ''
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs ride the spec ---
+
+    @pytest.mark.parametrize('scope_cargo', [True, False])
+    def test_scope_cargo_projected_from_config(self, scope_cargo):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(scope_cargo=scope_cargo), [], None)
+        assert spec.scope_cargo is scope_cargo
+
+    def test_config_only_globs_projected_from_config_git(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(config_only_globs=('dark-factory-orchestrator.yaml',))
+        spec = build_merge_verify_spec(config, [], None)
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+        config.git.merge_config_only_full_gate_globs.append('later.yaml')
+
+        assert spec.merge_config_only_full_gate_globs == ('dark-factory-orchestrator.yaml',)
+
+    def _collapsing_modules(self, override):
+        return [
+            ModuleConfig(prefix='crates/a', test_command='cargo test --workspace', scope_cargo=override),
+            ModuleConfig(prefix='crates/b', test_command='cargo test --workspace'),
+        ]
+
+    @pytest.mark.parametrize('override', [False, True])
+    def test_collapsed_per_module_scope_cargo_ships_scope_cargo_false(self, override):
+        """A per-module scope_cargo cannot ride the spec, so the spec ships False,
+        which on the remote can only widen cargo scope.
+
+        The spec is also built for LOCAL merges, so a collapse must never raise.
+        """
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True), self._collapsing_modules(override), None,
+        )
+        assert spec.scope_cargo is False
+
+    def test_per_module_verify_env_alone_leaves_scope_cargo_carried(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(
+            self._make_config(scope_cargo=True),
+            [ModuleConfig(prefix='m', verify_env={'X': '1'})],
+            None,
+        )
+        assert spec.scope_cargo is True
 
 
 # ---------------------------------------------------------------------------
@@ -3056,6 +3154,73 @@ class TestRunMergeVerifyOnWorktree:
         )
 
         assert effective_config.verify_cold_preprovision_command == 'HOST_PROVISION'
+
+    # --- task 7465: scope_cargo and the config-only full-gate globs reach the remote leg
+
+    _CONFIG_ONLY_GLOB = 'dark-factory-orchestrator.yaml'
+
+    @pytest.mark.parametrize(('host_scope_cargo', 'spec_scope_cargo'), [(True, False), (False, True)])
+    async def test_spec_scope_cargo_overrides_host_scope_cargo(
+        self, host_scope_cargo, spec_scope_cargo,
+    ):
+        caller_config = self._host_config(scope_cargo=host_scope_cargo)
+        spec = dataclasses.replace(self._preprovision_spec(''), scope_cargo=spec_scope_cargo)
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.scope_cargo is spec_scope_cargo
+        assert caller_config.scope_cargo is host_scope_cargo
+
+    @pytest.mark.parametrize(('host_globs', 'spec_globs'), [
+        pytest.param([], (_CONFIG_ONLY_GLOB,), id='carried_glob_fills_an_empty_host'),
+        pytest.param(['host.yaml'], (), id='carried_empty_wipes_the_host'),
+    ])
+    async def test_spec_config_only_globs_override_host_globs(self, host_globs, spec_globs):
+        caller_config = self._host_config(
+            git=GitConfig(main_branch='trunk', merge_config_only_full_gate_globs=host_globs),
+        )
+        caller_git = caller_config.git
+        spec = dataclasses.replace(
+            self._preprovision_spec(''), merge_config_only_full_gate_globs=spec_globs,
+        )
+
+        effective_config = await self._effective_config(caller_config, spec)
+
+        assert effective_config.git.merge_config_only_full_gate_globs == list(spec_globs)
+        assert effective_config.git.main_branch == 'trunk'
+        assert caller_config.git is caller_git
+        assert caller_config.git.merge_config_only_full_gate_globs == host_globs
+
+    async def test_legacy_spec_keeps_host_scope_cargo_and_globs(self):
+        config = self._host_config(
+            scope_cargo=True, git=GitConfig(merge_config_only_full_gate_globs=['host.yaml']),
+        )
+        legacy = dataclasses.replace(
+            self._preprovision_spec(''),
+            scope_cargo=False,
+            merge_config_only_full_gate_globs=('spec.yaml',),
+        ).to_dict()
+        legacy.pop('scope_cargo')
+        legacy.pop('merge_config_only_full_gate_globs')
+
+        effective_config = await self._effective_config(config, MergeVerifySpec.from_dict(legacy))
+
+        assert effective_config.scope_cargo is True
+        assert effective_config.git.merge_config_only_full_gate_globs == ['host.yaml']
+
+    async def test_collapsed_per_module_scope_cargo_reaches_the_remote_as_false(self):
+        from orchestrator.verify_runner import build_merge_verify_spec
+        dispatcher = OrchestratorConfig(scope_cargo=True)
+        module = ModuleConfig(
+            prefix='crates/a', test_command='cargo test --workspace', scope_cargo=False,
+        )
+        spec = spec_from_json(spec_to_json(
+            build_merge_verify_spec(dispatcher, [module], ('crates/a/src/lib.rs',)),
+        ))
+
+        effective_config = await self._effective_config(self._host_config(scope_cargo=True), spec)
+
+        assert effective_config.scope_cargo is False
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
