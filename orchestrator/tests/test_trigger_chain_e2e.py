@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -27,13 +28,16 @@ from _trigger_chain_doc_shapes import (
     snippet_submit_calls,
     submit_calls,
 )
-from _trigger_chain_rig import TriggerChainRig, open_rig
+from _trigger_chain_rig import Chain, TriggerChainRig, open_rig
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
 )
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, parse_metadata
+
+from orchestrator.event_store import EventType
+from orchestrator.workflow import WorkflowOutcome
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
 
@@ -174,3 +178,114 @@ class TestSubmitBoundary:
         assert 'does not exist under project_root' in refused['error']
         assert 'task_id' not in refused
         assert accepted.get('task_id')
+
+
+def _metadata(task: dict) -> dict:
+    return task['metadata']
+
+
+def _at(task: dict, key: str = 'at') -> datetime:
+    return datetime.fromisoformat(_metadata(task)['milestone'][key])
+
+
+def _rearm_events(rig: TriggerChainRig, task_id: str) -> list[dict]:
+    return [e for e in rig.events(EventType.predicate_rearmed) if e['task_id'] == task_id]
+
+
+@dataclass(frozen=True)
+class _FirstCheck:
+    chain: Chain
+    findings: tuple[str, ...]
+    first_at: datetime
+
+
+async def _first_check_not_yet(rig: TriggerChainRig) -> _FirstCheck:
+    """Run R = (high open, medium done, low done) behind a final-form chain, checked once at its `at`."""
+    findings = await rig.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    chain = await rig.file_final_chain(RUN)
+    first_at = _at(await rig.task(chain.completion_id))
+
+    assert await rig.dispatch() == (None, None)
+    rig.clock.set(first_at)
+    assignment, outcome = await rig.dispatch()
+
+    assert assignment is not None and assignment.task_id == chain.completion_id
+    assert outcome == WorkflowOutcome.REQUEUED
+    return _FirstCheck(chain, findings, first_at)
+
+
+@pytest.mark.asyncio
+class TestCompletionGate:
+    async def test_not_yet_re_arms_without_escalating(self, rig: TriggerChainRig) -> None:
+        first = await _first_check_not_yet(rig)
+
+        gate = await rig.task(first.chain.completion_id)
+        meta = _metadata(gate)
+        assert gate['status'] == 'pending'
+        assert _at(gate) == first.first_at + timedelta(seconds=86400)
+        assert _at(gate, 'scheduled_fire_at') == first.first_at
+        assert meta['predicate_recheck']['consecutive'] == 1
+        assert datetime.fromisoformat(meta['predicate_recheck']['first_rearmed_at']) == first.first_at
+        assert meta['predicate_verdict']['verdict'] == 'not_yet'
+        assert meta['predicate_verdict']['run'] == RUN
+        (event,) = _rearm_events(rig, first.chain.completion_id)
+        assert (event['data']['rc'], event['data']['consecutive'], event['data']['recheck_secs']) == (
+            75,
+            1,
+            86400,
+        )
+        assert rig.own_escalations(first.chain.completion_id) == []
+        assert rig.own_escalations(first.chain.human_id) == []
+        assert (await rig.task(first.chain.human_id))['status'] == 'pending'
+
+    async def test_seven_tenths_at_point_seven_passes(self, rig: TriggerChainRig) -> None:
+        await rig.seed_run(RUN, ('critical', 'done'), ('high', 'done'), ('high', 'pending'))
+        chain = await rig.file_final_chain(RUN)
+        rig.clock.set(_at(await rig.task(chain.completion_id)))
+
+        assignment, outcome = await rig.dispatch()
+
+        assert assignment is not None and assignment.task_id == chain.completion_id
+        assert outcome == WorkflowOutcome.DONE
+        gate = await rig.task(chain.completion_id)
+        verdict = _metadata(gate)['predicate_verdict']
+        assert gate['status'] == 'done'
+        assert _metadata(gate)['done_provenance']['kind'] == 'deterministic-milestone'
+        assert '"verdict":"pass"' in _metadata(gate)['done_provenance']['note']
+        assert verdict['share'] == 0.7
+        assert (verdict['landed'], verdict['pending']) == (7, 3)
+
+    async def test_the_scripts_own_transport_pages_the_live_lookup(
+        self, rig: TriggerChainRig
+    ) -> None:
+        seed = [('high', 'pending')] * 50 + [('low', 'done')] * 51
+        await rig.seed_run(RUN, *seed)
+        chain = await rig.file_final_chain(RUN)
+        rig.clock.set(_at(await rig.task(chain.completion_id)))
+
+        _, outcome = await rig.dispatch()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        verdict = _metadata(await rig.task(chain.completion_id))['predicate_verdict']
+        assert verdict['total'] == 101
+        assert verdict['by_priority'] == {'high': [0, 50, 0], 'low': [51, 0, 0]}
+
+    async def test_an_undeclared_seventy_five_is_a_failed_check(
+        self, rig: TriggerChainRig
+    ) -> None:
+        await rig.seed_run(RUN, ('high', 'pending'))
+        call = rig.snippet_call('completion_gate', RUN)
+        del call['metadata']['trigger_chain']
+        del call['metadata']['before_done']['recheck_secs']
+        gate_id = await rig.submit(call)
+        await rig.call('commit_planning', project_root=str(rig.root), task_ids=gate_id)
+        rig.clock.set(_at(await rig.task(gate_id)))
+
+        _, outcome = await rig.dispatch()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        (escalation,) = rig.own_escalations(gate_id, status='pending')
+        assert (escalation.category, escalation.level) == ('milestone_check_failed', 2)
+        assert 'before_done.recheck_secs is not declared' in escalation.detail
+        assert (await rig.task(gate_id))['status'] == 'blocked'
+        assert _rearm_events(rig, gate_id) == []
