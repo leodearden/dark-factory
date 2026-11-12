@@ -5057,7 +5057,7 @@ class TaskWorkflow:
                 self._scope_drift_report = carried.merged_with(report) if carried else report
                 self._scope_drift_briefed = False
             if requests:
-                self.artifacts.clear_scope_requests()
+                self.artifacts.clear_scope_requests(requests)
         except Exception:
             logger.warning(
                 'Task %s: applying %s scope requests at iteration %s failed; '

@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -1079,17 +1079,32 @@ class TaskArtifacts:
         """
         self._clear_path('blocking_dependency.json')
 
-    def write_scope_request(self, request: ScopeRequest) -> None:
+    def write_scope_request(self, request: ScopeRequest) -> int:
         """Record a writer agent's request to add an existing file to its scope.
 
         One entry per path: a repeat replaces the earlier entry and moves to
-        the end. The workflow reads and clears this artifact after each
-        implementer/debugger invocation
+        the end. Returns how many requests are now pending. The plan-tools
+        server runs concurrent tool calls on threads, so the read-modify-write
+        holds :meth:`_scope_requests_mutex`. The workflow applies and removes
+        them at each writer boundary
         (``workflow.py::TaskWorkflow._apply_scope_requests``).
         """
-        kept = [r for r in self.read_scope_requests() if r.path != request.path]
-        entries = [r.to_mapping() for r in (*kept, request)]
-        self._write_json('scope_requests.json', {'requests': entries})
+        with self._scope_requests_mutex():
+            kept = [r for r in self.read_scope_requests() if r.path != request.path]
+            entries = [r.to_mapping() for r in (*kept, request)]
+            self._write_json('scope_requests.json', {'requests': entries})
+            return len(entries)
+
+    @contextmanager
+    def _scope_requests_mutex(self) -> Iterator[None]:
+        lock_path = Path(
+            os.path.realpath(self.artifact_path('scope_requests.json'))
+        ).with_name('scope_requests.json.mutex')
+        if not lock_path.parent.is_dir():
+            yield
+            return
+        with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
+            yield
 
     def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
         """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
@@ -1106,9 +1121,20 @@ class TaskArtifacts:
                 logger.warning('Dropping scope request %r from scope_requests.json: %s', entry, exc)
         return tuple(requests)
 
-    def clear_scope_requests(self) -> None:
-        """Remove the scope-request artifact once the workflow has applied it."""
-        self._clear_path('scope_requests.json')
+    def clear_scope_requests(self, applied: Iterable[ScopeRequest]) -> None:
+        """Remove the *applied* requests, keeping any filed since they were read.
+
+        The artifact goes once nothing is left in it.
+        """
+        done = set(applied)
+        with self._scope_requests_mutex():
+            remaining = [r for r in self.read_scope_requests() if r not in done]
+            if remaining:
+                self._write_json(
+                    'scope_requests.json', {'requests': [r.to_mapping() for r in remaining]},
+                )
+            else:
+                self._clear_path('scope_requests.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)

@@ -1884,12 +1884,8 @@ def _report_missing_plan_file(
         return {'status': 'error', 'field': exc.field, 'message': str(exc)}
     if not pending_scope_paths([request], artifacts.peek_plan().get('files', [])):
         return {'status': 'already_in_scope', 'path': request.path}
-    artifacts.write_scope_request(request)
-    return {
-        'status': 'ok',
-        'path': request.path,
-        'pending': len(artifacts.read_scope_requests()),
-    }
+    pending = artifacts.write_scope_request(request)
+    return {'status': 'ok', 'path': request.path, 'pending': pending}
 
 
 def _resolve_main_sha(worktree: Path) -> str:

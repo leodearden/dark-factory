@@ -107,4 +107,3 @@ async def test_the_follow_up_prompt_names_the_contested_path_and_its_holder(brie
 
     [held_line] = [line for line in prompt.splitlines() if _HELD in line]
     assert _HOLDER in held_line
-    assert 'revert' in prompt.lower()

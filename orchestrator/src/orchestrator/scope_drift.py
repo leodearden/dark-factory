@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from shared.locking import is_file_path
@@ -21,8 +22,22 @@ from shared.locking import is_file_path
 from orchestrator.module_charter import derive_modules
 from orchestrator.pin_reservation import Blocker
 
-IMPLEMENT_SCOPE_EXPANDED = 'implement_scope_expanded'
-IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT = 'implement_blast_radius_lock_conflict'
+
+class ScopeDriftReason(StrEnum):
+    """The ``scope_drift`` event discriminator: why the task's scope moved."""
+
+    IMPLEMENT_SCOPE_EXPANDED = 'implement_scope_expanded'
+    IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT = 'implement_blast_radius_lock_conflict'
+
+    @classmethod
+    def for_implement(cls, *, contested: bool) -> ScopeDriftReason:
+        """The implement-phase reason for a boundary that did or did not meet a held lock."""
+        return cls.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT if contested else cls.IMPLEMENT_SCOPE_EXPANDED
+
+
+IMPLEMENT_SCOPE_EXPANDED = ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
+IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT = ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+_IMPLEMENT_REASONS = frozenset({IMPLEMENT_SCOPE_EXPANDED, IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT})
 
 _DOT_SLASH = './'
 _TASK_STATE_DIR = '.task'
@@ -106,28 +121,40 @@ def pending_scope_paths(
 class ScopeDriftReport:
     """What one writer boundary did with the scope requests it found."""
 
-    reason: str
+    reason: ScopeDriftReason
     role: str
     iteration: int
     requested: tuple[str, ...]
     acquired: tuple[str, ...]
     contested: tuple[tuple[str, str], ...]
 
+    def __post_init__(self) -> None:
+        reason = ScopeDriftReason(self.reason)
+        object.__setattr__(self, 'reason', reason)
+        if reason in _IMPLEMENT_REASONS and reason is not ScopeDriftReason.for_implement(
+            contested=bool(self.contested)
+        ):
+            raise ValueError(
+                f'reason {reason.value!r} disagrees with contested={dict(self.contested)!r}'
+            )
+
     def merged_with(self, later: ScopeDriftReport) -> ScopeDriftReport:
         """This report folded with a *later* boundary's, for a writer not yet briefed.
 
         A path the later boundary acquired is no longer contested; the later
-        boundary's holder wins for a path both contest.
+        boundary's holder wins for a path both contest. An implement-phase
+        reason is re-derived from the merged contest; any other is the later one's.
         """
         acquired = tuple(dict.fromkeys((*self.acquired, *later.acquired)))
         contested = {
             path: holder for path, holder in self.contested if path not in acquired
         }
         contested.update(later.contested)
+        reason = later.reason
+        if reason in _IMPLEMENT_REASONS:
+            reason = ScopeDriftReason.for_implement(contested=bool(contested))
         return ScopeDriftReport(
-            reason=(
-                IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT if contested else IMPLEMENT_SCOPE_EXPANDED
-            ),
+            reason=reason,
             role=later.role,
             iteration=later.iteration,
             requested=tuple(dict.fromkeys((*self.requested, *later.requested))),
@@ -137,7 +164,7 @@ class ScopeDriftReport:
 
     def event_data(self) -> dict[str, Any]:
         return {
-            'reason': self.reason,
+            'reason': self.reason.value,
             'role': self.role,
             'iteration': self.iteration,
             'requested': list(self.requested),
@@ -178,9 +205,7 @@ def build_scope_drift_report(
         else:
             acquired.append(path)
     return ScopeDriftReport(
-        reason=(
-            IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT if contested_paths else IMPLEMENT_SCOPE_EXPANDED
-        ),
+        reason=ScopeDriftReason.for_implement(contested=bool(contested_paths)),
         role=role,
         iteration=iteration,
         requested=paths,

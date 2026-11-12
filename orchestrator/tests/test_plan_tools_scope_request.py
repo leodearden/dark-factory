@@ -6,6 +6,7 @@ never writes plan.json; the workflow applies it at the next writer boundary.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -95,3 +96,14 @@ async def test_an_invalid_request_returns_an_error_and_writes_nothing(
     assert isinstance(result['message'], str) and result['message']
     assert artifacts.read_scope_requests() == ()
     assert _plan_bytes(artifacts) == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reports_lose_no_request(artifacts):
+    paths = [f'orchestrator/src/orchestrator/m{n}.py' for n in range(8)]
+
+    results = await asyncio.gather(*(_report(artifacts, path, 'parallel') for path in paths))
+
+    assert all(result['status'] == 'ok' for result in results)
+    assert sorted(r.path for r in artifacts.read_scope_requests()) == sorted(paths)
+    assert sorted(result['pending'] for result in results) == list(range(1, 9))

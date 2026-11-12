@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -96,11 +97,35 @@ def test_an_invalid_entry_is_dropped_with_a_warning_naming_it(arts, caplog):
 
 
 def test_clear_removes_the_artifact_and_tolerates_absence(arts):
-    arts.write_scope_request(ScopeRequest('pkg/b.py', 'plan omitted it'))
-    arts.clear_scope_requests()
+    request = ScopeRequest('pkg/b.py', 'plan omitted it')
+    arts.write_scope_request(request)
+    arts.clear_scope_requests([request])
     assert not arts.artifact_path('scope_requests.json').exists()
     assert arts.read_scope_requests() == ()
-    arts.clear_scope_requests()
+    arts.clear_scope_requests([request])
+
+
+def test_clear_keeps_a_request_filed_after_the_applied_ones_were_read(arts):
+    applied = ScopeRequest('pkg/b.py', 'plan omitted it')
+    later = ScopeRequest('pkg/c.py', 'filed meanwhile')
+    arts.write_scope_request(applied)
+    read = arts.read_scope_requests()
+    arts.write_scope_request(later)
+    arts.clear_scope_requests(read)
+    assert arts.read_scope_requests() == (later,)
+
+
+def test_write_returns_the_pending_count(arts):
+    assert arts.write_scope_request(ScopeRequest('pkg/b.py', 'one')) == 1
+    assert arts.write_scope_request(ScopeRequest('pkg/c.py', 'two')) == 2
+    assert arts.write_scope_request(ScopeRequest('pkg/b.py', 'again')) == 2
+
+
+def test_concurrent_writes_from_threads_lose_no_request(arts):
+    paths = [f'pkg/m{n}.py' for n in range(16)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda path: arts.write_scope_request(ScopeRequest(path, 'r')), paths))
+    assert sorted(r.path for r in arts.read_scope_requests()) == sorted(paths)
 
 
 def test_the_trio_never_touches_plan_json(arts):
@@ -108,6 +133,5 @@ def test_the_trio_never_touches_plan_json(arts):
     plan_path = arts.artifact_path('plan.json')
     before = plan_path.read_bytes()
     arts.write_scope_request(ScopeRequest('pkg/b.py', 'plan omitted it'))
-    arts.read_scope_requests()
-    arts.clear_scope_requests()
+    arts.clear_scope_requests(arts.read_scope_requests())
     assert plan_path.read_bytes() == before

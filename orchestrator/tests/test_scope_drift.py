@@ -11,6 +11,7 @@ from orchestrator.scope_drift import (
     IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
     IMPLEMENT_SCOPE_EXPANDED,
     InvalidScopeRequest,
+    ScopeDriftReason,
     ScopeDriftReport,
     ScopeRequest,
     build_scope_drift_report,
@@ -189,3 +190,34 @@ class TestMergedWith:
         assert merged.acquired == ('pkg/a.py',)
         assert merged.contested == (('pkg/b.py', '777'),)
         assert merged.reason == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+
+
+class TestScopeDriftReason:
+    def test_the_reason_is_the_enum_and_serializes_to_its_string(self):
+        report = _report(['pkg/a.py'])
+        assert report.reason is ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
+        assert report.event_data()['reason'] == 'implement_scope_expanded'
+        assert type(report.event_data()['reason']) is str
+
+    @pytest.mark.parametrize(
+        ('reason', 'contested'),
+        [
+            (ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED, (('pkg/b.py', '7'),)),
+            (ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT, ()),
+        ],
+    )
+    def test_an_implement_reason_that_disagrees_with_contested_is_refused(
+        self, reason, contested
+    ):
+        with pytest.raises(ValueError, match=reason.value):
+            ScopeDriftReport(
+                reason=reason, role='implementer', iteration=1,
+                requested=('pkg/b.py',), acquired=(), contested=contested,
+            )
+
+    def test_an_unknown_reason_string_is_refused(self):
+        with pytest.raises(ValueError):
+            ScopeDriftReport(
+                reason='made_up', role='implementer', iteration=1,  # type: ignore[arg-type]
+                requested=(), acquired=(), contested=(),
+            )
