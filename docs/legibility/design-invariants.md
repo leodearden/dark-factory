@@ -437,18 +437,16 @@ tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
 the entries it retires, so nothing notices when one of those tasks completes
 and entries remain.
 
-**House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
-disposition vocabulary, the ratification table, the inline-marker grammar,
-the multiset ratchet kernel, the exception register and the owner-liveness
-sweep. The landed mechanism is `shared/src/shared/governed_exceptions.py`
-(the disposition vocabulary and the inline-marker grammar),
-`shared/src/shared/ratchet.py` (the multiset ratchet kernel),
-`scripts/exception_register.py` (the exception register and the
-ratification-table loader), `scripts/inline_suppressions.py` (the
-inline-suppression gate and ratchet) and
-`docs/legibility/exception-ratifications.yaml` (the ratification table). The
-owner-liveness sweep (PRD step η) has not landed yet; the PRD is its only
-reference.
+**House pattern**: `shared/src/shared/governed_exceptions.py` (the
+disposition vocabulary, the `governed_exceptions(...)` declaration and the
+inline-marker grammar), `shared/src/shared/ratchet.py` (the multiset ratchet
+kernel), `scripts/inline_suppressions.py` (the inline-suppression gate and
+ratchet over its committed baseline), `scripts/exception_register.py` (the
+exception register, the ratification-table loader and `--report`),
+`scripts/exception_owner_sweep.py` (the nightly owner-liveness sweep) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table).
+Rationale: `plans/inv12-exceptions-owned-or-ratified-prd.md`. Operator
+runbook: `OPERATIONS.md` §12a.
 
 **Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
 adjacent — both ask who owns a thing and what notices when the owner is
