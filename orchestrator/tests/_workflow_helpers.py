@@ -552,12 +552,19 @@ class FakeBriefing:
         escalation_summary: str,
         resolution: str,
         worktree=None,
+        *, scope_drift=None,
     ) -> str:
         return f'Resume: {resolution[:100]}'
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift, task_id: str | None = None,
+    ) -> str:
+        return 'Settle the contested scope request'
 
     async def build_amender_prompt(
         self, plan: dict, suggestions: list, locked_modules: list,
         context: str | None = None, task_id: str | None = None,
+        *, scope_drift=None,
     ) -> str:
         return 'Amend the plan'
 

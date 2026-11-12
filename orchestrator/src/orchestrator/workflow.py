@@ -683,6 +683,10 @@ class _BriefingLike(Protocol):
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = ...,
+        *, scope_drift: ScopeDriftReport | None = ...,
+    ) -> str: ...
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift: ScopeDriftReport, task_id: str | None = ...,
     ) -> str: ...
     async def build_implementer_prompt(
         self, plan: dict, context: str | None = ...,
@@ -694,6 +698,7 @@ class _BriefingLike(Protocol):
         self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
+        *, scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,

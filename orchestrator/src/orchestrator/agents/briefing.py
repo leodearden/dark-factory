@@ -1231,6 +1231,7 @@ Before writing any new code, walk the pending steps in plan order:
         locked_modules: list[str],
         context: str | None = None,
         task_id: str | None = None,
+        *,
         scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
@@ -1582,6 +1583,7 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = None,
+        *,
         scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
