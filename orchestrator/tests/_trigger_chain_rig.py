@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import socket
 import threading
 from collections.abc import AsyncIterator, Coroutine
@@ -23,6 +24,8 @@ from unittest.mock import AsyncMock
 import uvicorn
 from _git_fixtures import seed_repo
 from _trigger_chain_doc_shapes import concretize, snippet_submit_calls
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig as FusedMemoryServerConfig
 from fused_memory.config.schema import TaskmasterConfig
@@ -32,8 +35,16 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 from shared.mcp_envelope import parse_tool_result
 
-from orchestrator.config import FusedMemoryConfig, OrchestratorConfig, PsiAdmissionConfig
-from orchestrator.scheduler import Scheduler
+from orchestrator.config import (
+    PREDICATE_RECHECK_STALL_CAP,
+    FusedMemoryConfig,
+    OrchestratorConfig,
+    PsiAdmissionConfig,
+)
+from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.workflow import WorkflowOutcome
 
 PROJECT_ID = 'lambda_fixture'
 FIRST_CHECK_SECS = 86400
@@ -201,11 +212,18 @@ class FakeClock:
 
 
 @dataclass(frozen=True)
+class Chain:
+    completion_id: str
+    human_id: str
+
+
+@dataclass(frozen=True)
 class TriggerChainRig:
     root: Path
     factory_root: Path
     server: LiveFusedMemory
     scheduler: Scheduler
+    queue: EscalationQueue
     clock: FakeClock
     project_id: str = PROJECT_ID
 
@@ -241,15 +259,92 @@ class TriggerChainRig:
             raise AssertionError(f'submit_task refused {call["title"]!r}: {reply}')
         return str(reply['task_id'])
 
+    async def call_ok(self, tool: str, **arguments: Any) -> dict[str, Any]:
+        """*tool*'s payload, which must not be a refusal."""
+        reply = await self.call(tool, **arguments)
+        if 'error' in reply:
+            raise AssertionError(f'{tool} refused: {reply}')
+        return reply
 
-def _scheduler(root: Path, url: str, clock: FakeClock) -> Scheduler:
+    async def task(self, task_id: str) -> dict[str, Any]:
+        return await self.call_ok('get_task', id=task_id, project_root=str(self.root))
+
+    async def file_final_chain(self, run_id: str, skill: str = 'review') -> Chain:
+        """The snippet's §3 final form: both gates, the dependency, then one commit."""
+        completion_id = await self.submit(self.snippet_call('completion_gate', run_id, skill))
+        human_id = await self.submit(self.snippet_call('human_gate', run_id, skill))
+        await self.call_ok('add_dependency', id=human_id, depends_on=completion_id, project_root=str(self.root))
+        await self.call_ok('commit_planning', project_root=str(self.root), task_ids=f'{completion_id},{human_id}')
+        return Chain(completion_id, human_id)
+
+    async def seed_run(self, run_id: str, *findings: tuple[str, str]) -> tuple[str, ...]:
+        """File *run_id*'s findings as (priority, status) pairs, the way the lanes that own them write."""
+        return tuple(
+            [await self.server.run(self._seed_finding(run_id, n, *finding)) for n, finding in enumerate(findings)]
+        )
+
+    async def _seed_finding(self, run_id: str, n: int, priority: str, status: str) -> str:
+        backend = self.server.backend
+        added = await backend.add_task(
+            project_root=str(self.root),
+            title=f'{run_id} finding {n}',
+            priority=priority,
+            metadata=json.dumps({'x_finding_run': run_id}),
+        )
+        if status != 'pending':
+            await backend.set_task_status(added['id'], status, str(self.root))
+        return str(added['id'])
+
+    async def set_finding_status(self, task_id: str, status: str) -> None:
+        await self.server.run(self.server.backend.set_task_status(task_id, status, str(self.root)))
+
+    def runner(
+        self, *, stall_cap: int = PREDICATE_RECHECK_STALL_CAP, scheduler: Any = None
+    ) -> DeterministicRunner:
+        """A runner as the harness builds one per slot, on the fake clock, running the real script."""
+        return DeterministicRunner(
+            scheduler=scheduler or self.scheduler,
+            escalation_queue=self.queue,
+            predicate_recheck_stall_cap=stall_cap,
+            clock=self.clock,
+        )
+
+    async def dispatch(
+        self, *, runner: DeterministicRunner | None = None
+    ) -> tuple[TaskAssignment | None, WorkflowOutcome | None]:
+        """One scheduler tick; a deterministic assignment runs and is released as the harness slot does."""
+        assignment = await self.scheduler.acquire_next()
+        if assignment is None:
+            return None, None
+        outcome: WorkflowOutcome | None = None
+        try:
+            outcome = await (runner or self.runner()).run(assignment)
+        finally:
+            self.scheduler.release(assignment.task_id, requeued=outcome == WorkflowOutcome.REQUEUED)
+        return assignment, outcome
+
+    def own_escalations(self, task_id: str, status: str | None = None) -> list[Escalation]:
+        return self.queue.get_by_task(task_id, status=status, agent_role=DETERMINISTIC_AGENT_ROLE)
+
+    def events(self, event_type: EventType) -> list[dict]:
+        event_store = self.scheduler.event_store
+        assert event_store is not None
+        return event_store.fetch_events_by_type(event_type)
+
+
+def _scheduler(root: Path, url: str, clock: FakeClock, state_dir: Path) -> Scheduler:
     config = OrchestratorConfig(
         project_root=root,
         fused_memory=FusedMemoryConfig(url=url, project_id=PROJECT_ID),
         max_per_module=1,
         psi_admission=PsiAdmissionConfig(enabled=False),
     )
-    scheduler = Scheduler(config, wall_time_source=clock, time_source=clock.timestamp)
+    scheduler = Scheduler(
+        config,
+        event_store=EventStore(state_dir / 'orchestrator-events.db', run_id='lambda-e2e'),
+        wall_time_source=clock,
+        time_source=clock.timestamp,
+    )
     scheduler.finish_startup()
     return scheduler
 
@@ -265,7 +360,8 @@ async def open_rig(tmp_path: Path, factory_root: Path) -> AsyncIterator[TriggerC
         root=root,
         factory_root=factory_root,
         server=server,
-        scheduler=_scheduler(root, server.url, clock),
+        scheduler=_scheduler(root, server.url, clock, state_dir),
+        queue=EscalationQueue(tmp_path / 'escalations'),
         clock=clock,
     )
     try:

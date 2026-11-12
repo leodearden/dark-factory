@@ -42,6 +42,8 @@ from orchestrator.workflow import WorkflowOutcome
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
 
 RUN = 'review-lambda-20261112-1'
+# An open finding is held by another lane, so this rig's scheduler never dispatches it.
+OPEN = 'in-progress'
 
 
 @pytest.fixture
@@ -201,7 +203,7 @@ class _FirstCheck:
 
 async def _first_check_not_yet(rig: TriggerChainRig) -> _FirstCheck:
     """Run R = (high open, medium done, low done) behind a final-form chain, checked once at its `at`."""
-    findings = await rig.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    findings = await rig.seed_run(RUN, ('high', OPEN), ('medium', 'done'), ('low', 'done'))
     chain = await rig.file_final_chain(RUN)
     first_at = _at(await rig.task(chain.completion_id))
 
@@ -239,7 +241,7 @@ class TestCompletionGate:
         assert (await rig.task(first.chain.human_id))['status'] == 'pending'
 
     async def test_seven_tenths_at_point_seven_passes(self, rig: TriggerChainRig) -> None:
-        await rig.seed_run(RUN, ('critical', 'done'), ('high', 'done'), ('high', 'pending'))
+        await rig.seed_run(RUN, ('critical', 'done'), ('high', 'done'), ('high', OPEN))
         chain = await rig.file_final_chain(RUN)
         rig.clock.set(_at(await rig.task(chain.completion_id)))
 
@@ -258,7 +260,7 @@ class TestCompletionGate:
     async def test_the_scripts_own_transport_pages_the_live_lookup(
         self, rig: TriggerChainRig
     ) -> None:
-        seed = [('high', 'pending')] * 50 + [('low', 'done')] * 51
+        seed = [('high', OPEN)] * 50 + [('low', 'done')] * 51
         await rig.seed_run(RUN, *seed)
         chain = await rig.file_final_chain(RUN)
         rig.clock.set(_at(await rig.task(chain.completion_id)))
@@ -273,7 +275,7 @@ class TestCompletionGate:
     async def test_an_undeclared_seventy_five_is_a_failed_check(
         self, rig: TriggerChainRig
     ) -> None:
-        await rig.seed_run(RUN, ('high', 'pending'))
+        await rig.seed_run(RUN, ('high', OPEN))
         call = rig.snippet_call('completion_gate', RUN)
         del call['metadata']['trigger_chain']
         del call['metadata']['before_done']['recheck_secs']
