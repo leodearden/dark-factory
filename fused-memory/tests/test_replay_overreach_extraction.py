@@ -144,8 +144,9 @@ class TestTheArms:
     def test_an_extraction_llm_is_a_frozen_hashable_key(self) -> None:
         llm = mod.ExtractionLlm(mod.O6_MODEL, 'low')
         assert {llm: 1}[mod.ExtractionLlm(mod.O6_MODEL, 'low')] == 1
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            llm.reasoning_effort = 'medium'  # type: ignore[misc]
+        for field in dataclasses.fields(llm):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(llm, field.name, 'medium')
 
     @pytest.mark.asyncio
     async def test_the_o6_low_arm_splices_nothing_and_runs_on_its_client(self) -> None:
