@@ -111,7 +111,11 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
-from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
+from orchestrator.quarantine_provenance import (
+    NOT_RELOCATED,
+    QuarantineOutcome,
+    record_quarantine_provenance,
+)
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
@@ -16435,6 +16439,13 @@ class GitOps:
         uncommitted WIP committed, so it is preserved on the renamed branch;
         a dir git no longer lists as a worktree is moved with a plain rename.
 
+        A relocation is recorded before this returns
+        (``orchestrator/src/orchestrator/quarantine_provenance.py::record_quarantine_provenance``):
+        the task's artifacts are copied into the parking, and the live task
+        plan gains a ``_quarantined_from`` entry. It reads the PRE-move
+        *worktree* path, so it runs ahead of any caller relocating a
+        ``.task-meta`` root.
+
         Logs a WARNING and returns the parking as a :class:`QuarantineOutcome`,
         or ``NOT_RELOCATED`` if the relocation could not complete. **Never
         raises** — callers treat a ``None`` ``dest`` as "left in place".
@@ -16446,17 +16457,20 @@ class GitOps:
             parked_branch = await self._relocate_into_quarantine(
                 worktree, dest_path, bare, parked, reason=reason,
             )
-            logger.warning(
-                'QUARANTINED worktree %s -> %s (reason=%s)',
-                worktree, dest_path, reason,
-            )
-            return await self._parked_outcome(dest_path, parked_branch)
+            outcome = await self._parked_outcome(dest_path, parked_branch)
         except Exception as e:
             logger.warning(
                 'quarantine_worktree: failed to relocate %s (reason=%s): %s',
                 worktree, reason, e,
             )
             return NOT_RELOCATED
+        logger.warning(
+            'QUARANTINED worktree %s -> %s (reason=%s, parked branch=%s, '
+            'commits beyond main=%s)',
+            worktree, dest_path, reason, outcome.branch, outcome.unique_commit_count,
+        )
+        record_quarantine_provenance(worktree, bare, outcome, reason)
+        return outcome
 
     async def _relocate_into_quarantine(
         self, worktree: Path, dest: Path, bare: str, parked: str, *, reason: str,
