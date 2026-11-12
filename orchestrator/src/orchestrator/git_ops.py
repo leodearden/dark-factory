@@ -67,7 +67,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.git_async import run_git
 from shared.merge_subject import (
     MergeSubject,
@@ -16427,37 +16427,82 @@ class GitOps:
     ) -> QuarantineOutcome:
         """Relocate a worktree (and its branch) into the quarantine base.
 
-        Best-effort: commits any uncommitted WIP first (so it is preserved on
-        the renamed branch), then moves the worktree to
-        ``quarantine_base/<branch>-<UTC-ts>`` and renames the branch to
-        ``task/<branch>-<ts>``.  Logs a WARNING and returns the parking as a
-        :class:`QuarantineOutcome`, or ``NOT_RELOCATED`` if the relocation
-        could not complete.  **Never raises** — callers treat a ``None``
-        ``dest`` as "left in place".
+        *branch* may be a bare id (``42``) or a full ref (``task/42``): it is
+        normalized here, once, through
+        ``shared/src/shared/branch_names.py::bare_queued_branch_id``. The
+        worktree moves to ``quarantine_base/<bare>-<UTC-ts>`` and its branch
+        to ``task/<bare>-<ts>``. A registered worktree first has any
+        uncommitted WIP committed, so it is preserved on the renamed branch;
+        a dir git no longer lists as a worktree is moved with a plain rename.
+
+        Logs a WARNING and returns the parking as a :class:`QuarantineOutcome`,
+        or ``NOT_RELOCATED`` if the relocation could not complete. **Never
+        raises** — callers treat a ``None`` ``dest`` as "left in place".
         """
-        dest_name = f'{branch}-{_utc_stamp()}'
-        dest_path = self.quarantine_base / dest_name
+        bare = bare_queued_branch_id(branch, self.config.branch_prefix)
+        parked = f'{bare}-{_utc_stamp()}'
+        dest_path = self.quarantine_base / parked
         try:
-            # Preserve uncommitted WIP on the branch before relocating.
-            try:
-                await self.commit(worktree, f'chore: quarantine WIP ({reason})')
-            except Exception as e:
-                logger.warning(
-                    'quarantine_worktree: WIP commit failed for %s (%s) — '
-                    'continuing with relocation: %s', worktree, reason, e,
-                )
-            await self.rename_worktree(worktree, dest_path, branch, dest_name)
+            parked_branch = await self._relocate_into_quarantine(
+                worktree, dest_path, bare, parked, reason=reason,
+            )
             logger.warning(
                 'QUARANTINED worktree %s -> %s (reason=%s)',
                 worktree, dest_path, reason,
             )
-            return await self._parked_outcome(dest_path, f'{self.config.branch_prefix}{dest_name}')
+            return await self._parked_outcome(dest_path, parked_branch)
         except Exception as e:
             logger.warning(
                 'quarantine_worktree: failed to relocate %s (reason=%s): %s',
                 worktree, reason, e,
             )
             return NOT_RELOCATED
+
+    async def _relocate_into_quarantine(
+        self, worktree: Path, dest: Path, bare: str, parked: str, *, reason: str,
+    ) -> str | None:
+        """Move *worktree* to *dest* and branch ``<prefix><bare>`` to ``<prefix><parked>``.
+
+        Returns the parked full ref, or None when there was no branch to park.
+        """
+        if not await self._is_registered_worktree(worktree):
+            return await self._relocate_unregistered(worktree, dest, bare, parked)
+        try:
+            await self.commit(worktree, f'chore: quarantine WIP ({reason})')
+        except Exception as e:
+            logger.warning(
+                'quarantine_worktree: WIP commit failed for %s (%s) — '
+                'continuing with relocation: %s', worktree, reason, e,
+            )
+        await self.rename_worktree(worktree, dest, bare, parked)
+        return f'{self.config.branch_prefix}{parked}'
+
+    async def _relocate_unregistered(
+        self, worktree: Path, dest: Path, bare: str, parked: str,
+    ) -> str | None:
+        """Rename a dir ``git worktree move`` refuses (its admin entry is gone) to *dest*.
+
+        The branch is renamed first and renamed back if the move fails, so the
+        two stay together. ``os.rename`` never copies: a cross-device *dest*
+        fails rather than duplicating a warm lane's build tree.
+        """
+        prefix = self.config.branch_prefix
+        full_old, full_new = f'{prefix}{bare}', f'{prefix}{parked}'
+        has_branch = await self.resolve_branch_sha(full_old) is not None
+        if has_branch:
+            rc, _, err = await _run(['git', 'branch', '-m', full_old, full_new], cwd=self.project_root)
+            if rc != 0:
+                raise RuntimeError(f'git branch -m {full_old} -> {full_new} failed (rc={rc}): {err}')
+        try:
+            if dest.exists():
+                raise FileExistsError(f'quarantine destination {dest} already exists')
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(worktree, dest)
+        except OSError:
+            if has_branch:
+                await _run(['git', 'branch', '-m', full_new, full_old], cwd=self.project_root)
+            raise
+        return full_new if has_branch else None
 
     async def _parked_outcome(self, dest: Path, parked_branch: str | None) -> QuarantineOutcome:
         if parked_branch is None:
