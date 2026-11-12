@@ -630,8 +630,22 @@ _RUFF_FULL_FORMAT_F821 = (
 )
 
 
+# Real capture, pyright 1.1.408: the first `npx pyright` link of a /bin/bash -c
+# chain SIGTERM'd.
+_PYRIGHT_NPX_SIGTERM = 'Terminated\n'
+
+# Real capture, pyright 1.1.408: the live type chain's second `npx pyright` link
+# of a /bin/bash -c chain SIGTERM'd, after the first link's green summary. This
+# pyright prints no trailing space after 'informations'.
+_PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM = '0 errors, 0 warnings, 0 informations\nTerminated\n'
+
+
 def _ruff_leg(rc: int, output: str, *, timed_out: bool = False) -> FailureCategory:
     return classify_leg(LegSlot.LINT, rc, output, timed_out, ROOT_LINT_COMMAND)
+
+
+def _pyright_leg(rc: int, output: str) -> FailureCategory:
+    return classify_leg(LegSlot.TYPE, rc, output, False, ROOT_TYPE_CHECK_COMMAND)
 
 
 class TestVerdictlessLintTypeExitIsInfraAbort:
@@ -692,6 +706,59 @@ class TestVerdictlessLintTypeExitIsInfraAbort:
         category = _ruff_leg(rc, _RUFF_GREEN_THEN_LATER_LINK_SIGTERM)
         assert category == FailureCategory.LINT_ERROR, why
 
+    def test_killed_first_pyright_link_is_infra_abort(self):
+        _assert_infra_abort(_pyright_leg(143, _PYRIGHT_NPX_SIGTERM))
+
+    def test_green_pyright_link_then_killed_later_link_is_infra_abort(self):
+        """The live type chain runs its pyrights under &&, so a kill in any
+        link after the first follows an earlier link's green summary."""
+        _assert_infra_abort(_pyright_leg(143, _PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM))
+
+    def test_older_trailing_space_summary_is_infra_abort(self):
+        """The summary form ``_PYRIGHT_TEXT_OUTPUT`` records ends in a space."""
+        output = '0 errors, 0 warnings, 0 informations \nTerminated\n'
+        _assert_infra_abort(_pyright_leg(143, output))
+
+    @pytest.mark.asyncio
+    async def test_killed_type_leg_makes_the_run_infra_abort(self, tmp_path: Path):
+        """Also proves the task-6127 TYPE refinement does not intercept it."""
+        result = await _verify_legs(
+            tmp_path, type_=(143, _PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM),
+        )
+        assert result.category == FailureCategory.INFRA_ABORT
+        assert result.failing_leg_categories == ['infra_abort']
+
+    def test_pyright_error_and_failing_summary_veto_the_abort(self):
+        assert _pyright_leg(143, _PYRIGHT_TEXT_OUTPUT) == FailureCategory.TYPE_ERROR
+
+    def test_failing_pyright_summary_vetoes_the_abort(self):
+        output = _rewrite(_PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM, '0 errors', '1 error')
+        assert _pyright_leg(143, output) == FailureCategory.TYPE_ERROR
+
+    def test_warning_diagnostic_vetoes_the_abort(self):
+        """Rule: a diagnostic line of any severity is a finding."""
+        output = (
+            '  /repo/orchestrator/src/x.py:1:1 - warning: Import cycle detected '
+            '(reportImportCycles)\n'
+            '0 errors, 1 warning, 0 informations\n'
+            'Terminated\n'
+        )
+        assert _pyright_leg(143, output) == FailureCategory.TYPE_ERROR
+
+    def test_file_header_line_vetoes_the_abort(self):
+        """pyright's file-header line is not in its no-finding vocabulary."""
+        output = '/repo/orchestrator/src/x.py\nTerminated\n'
+        assert _pyright_leg(143, output) == FailureCategory.TYPE_ERROR
+
+    def test_ruff_witness_does_not_count_for_a_type_leg(self):
+        output = _RUFF_GREEN_THEN_LATER_LINK_SIGTERM
+        assert _pyright_leg(143, output) == FailureCategory.TYPE_ERROR
+
+    def test_sigkilled_type_leg_keeps_the_type_gate(self):
+        """Rule: SIGKILL is excluded, the branch-OOM residual."""
+        category = _pyright_leg(137, _PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM)
+        assert category == FailureCategory.TYPE_ERROR
+
     def test_unidentified_tool_has_no_witness(self):
         """An OPAQUE lint command's empty output must not abort by vacuous
         truth: verify does not know what that tool prints on completion."""
@@ -741,6 +808,14 @@ class TestTheWorstLegDecidesTheRun:
                 },
                 'lint_error', ['infra_abort', 'lint_error'],
                 id='lint_error_outranks_infra_abort',
+            ),
+            pytest.param(
+                {
+                    'lint': (143, _RUFF_UV_FORWARDED_SIGTERM),
+                    'type_': (1, _PYRIGHT_TEXT_OUTPUT),
+                },
+                'type_error', ['infra_abort', 'type_error'],
+                id='type_error_outranks_lint_infra_abort',
             ),
             pytest.param(
                 {
