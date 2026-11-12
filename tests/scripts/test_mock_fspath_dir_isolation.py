@@ -25,10 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
+from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402  # debt: task 6997
 
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation  # noqa: E402  # debt: task 6997
+from df_pytest_isolation import (  # noqa: E402  # debt: task 6997
     MOCK_FSPATH_ROOT_NAMES,
     STDLIB_MOCK_CLASSES,
     fixture_marker,
