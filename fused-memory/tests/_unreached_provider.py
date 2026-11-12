@@ -1,4 +1,6 @@
-"""A live OpenAI-SDK test skips only when its call never reached the provider."""
+"""A live OpenAI-SDK test skips only when its call failed in the connect phase,
+before any byte reached the provider.
+"""
 
 from __future__ import annotations
 
@@ -9,13 +11,15 @@ import httpx
 import openai
 import pytest
 
+_CONNECT_PHASE_CAUSES = (httpx.ConnectError, httpx.ConnectTimeout)
 
-def unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
-    """The skip reason when *exc* shows the provider's connect phase timed out
-    before any response; None for every other failure.
+
+def unreached_provider_skip_reason(exc: BaseException) -> str | None:
+    """The skip reason when *exc* shows the provider's connect phase failed
+    (ConnectError or ConnectTimeout) before any response; None for every other failure.
     """
     cause = exc.__cause__
-    if not (isinstance(exc, openai.APIConnectionError) and isinstance(cause, httpx.ConnectTimeout)):
+    if not (isinstance(exc, openai.APIConnectionError) and isinstance(cause, _CONNECT_PHASE_CAUSES)):
         return None
     return (
         f'{exc.request.url.host} was not reached: {type(cause).__name__} before any '

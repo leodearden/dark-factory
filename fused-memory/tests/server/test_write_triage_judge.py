@@ -3030,9 +3030,9 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
 async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
     """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
-    A budget expiry, a provider 5xx, a transient 429 and a connect timeout (the provider was
-    never reached) each yield no verdict, so they say nothing about the wording. Connection
-    errors other than a connect timeout, read or SDK timeouts with no connect-timeout cause,
+    A budget expiry, a provider 5xx, a transient 429 and a connect-phase failure (the provider
+    was never reached) each yield no verdict, so they say nothing about the wording. Connection
+    failures after the connect phase, read or SDK timeouts with no connect-phase cause,
     other 4xx and unusable answers stay red, and so does a 429 whose code is
     `insufficient_quota`: an account out of credit is a lasting fault, and skipping it would
     silently retire every wording check on every run.
