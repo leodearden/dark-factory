@@ -1,13 +1,13 @@
-"""Scaffolding shared by the suites that drive ``census.run_census``.
+"""Scaffolding shared by the suites that drive ``census_run.run_census``.
 
 A plain module rather than a conftest fixture, the same convention as
 ``legibility_task_store_fake``: conftest appends this directory to
 ``sys.path``, so the test files import it by bare name.
 
-Nothing here imports the census module. A suite may load it as
-``legibility.census`` or by its bare name ``census``, and those are two
-module objects with two sets of classes, so each helper takes the caller's
-``CensusEffects`` instance or outcome class instead.
+Nothing here imports a census module. The outcome and effects classes come
+from ``legibility.census_run``; a bare ``import census_run`` would load a
+second module object with a second set of classes, so each helper takes the
+caller's ``CensusEffects`` instance or outcome class instead.
 """
 from __future__ import annotations
 

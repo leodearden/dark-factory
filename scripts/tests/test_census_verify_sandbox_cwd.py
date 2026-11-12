@@ -31,6 +31,7 @@ import census as mod
 import pytest
 from legibility import (
     account_pool,
+    census_run,
     census_trigger,
     disposition,
     landing_gate,
@@ -95,7 +96,7 @@ def _make_seam_driving_run_census():
         kwargs["effects"].invoke("ping", "haiku")
         kwargs["effects"].verify_fn([{"title": "x"}], model="sonnet")
         kwargs["effects"].synthesize_fn(_EMPTY_BRIEF, model="fable")
-        return mod.Done(
+        return census_run.Done(
             report_path="plans/confusion-census-2026-08-03.md",
             record_path="plans/confusion-census-2026-08-03.json",
             run_id="census-dark_factory-20260803",
@@ -152,7 +153,7 @@ def census_main(tmp_path, monkeypatch, fake_claude_cli, pool_roster, sentinel_lo
             label, accounts_file=accounts_file, env_file=env_file,
         ),
     )
-    monkeypatch.setattr(mod, "run_census", _make_seam_driving_run_census())
+    monkeypatch.setattr(census_run, "run_census", _make_seam_driving_run_census())
     # Every test here passes --force, which must never reach the gate.
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -239,7 +240,7 @@ def test_build_stage_invokes_runs_each_stage_in_the_project_under_the_runners_co
 
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with session_runner.SessionRunner(gate, label="census-test") as runner:
-        mining, verify, synth = mod._build_stage_invokes(
+        mining, verify, synth = mod.build_stage_invokes(
             cfg, project_root=tmp_path, runner=runner,
         )
         mining("p", "haiku")
