@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, patch
@@ -41,6 +42,7 @@ from _quality_rows import (
     history,
     train,
     write_landing_events,
+    write_marker_state_db,
     write_quality_db,
 )
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
@@ -62,19 +64,10 @@ from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
-from dashboard.data.quality_markers import (
-    DerivedState,
-    Marker,
-    MarkerKind,
-    MarkerSource,
-    PromptCoverage,
-    RoutingFold,
-    SourceType,
-)
+from dashboard.data.quality_markers import Marker, MarkerKind, MarkerSource, SourceType
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
-from dashboard.data.quality_store import QualitySample, write_marker_state
+from dashboard.data.quality_store import QualitySample
 from dashboard.data.scheduler import _scheduler_cache_clear
-from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -997,12 +990,6 @@ def _render_quality(client: TestClient, at: datetime, **module: str) -> dict[str
         return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW), **module)
 
 
-async def _write_markers(path: Path, state: DerivedState) -> None:
-    async with _QualityStore(path) as store:
-        await write_marker_state(store.connection, state)
-        await store.connection.commit()
-
-
 def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: datetime) -> None:
     """Store one derived reviewer effort change at *at* as dark_factory's marker derivation."""
     marker = Marker(
@@ -1011,14 +998,9 @@ def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: dat
         label='reviewer_comprehensive effort high → xhigh',
         source=MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive'),
     )
-    state = DerivedState(
-        fold=replace(RoutingFold.empty('dark_factory'), complete=True), markers=(marker,), skipped=0,
-        prompt_coverage=PromptCoverage(digest_since=None, roles_py_landings=None, counted_since=None,
-                                       reason='no routing decision is folded yet'),
-        refreshed_at=refreshed_at,
-    )
     assert client.portal is not None, 'quality.db is written inside a live TestClient'
-    client.portal.call(_write_markers, app.state.config.quality_db, state)
+    client.portal.call(partial(write_marker_state_db, app.state.config.quality_db, 'dark_factory',
+                               (marker,), refreshed_at=refreshed_at))
 
 
 def _alarm_scenario(

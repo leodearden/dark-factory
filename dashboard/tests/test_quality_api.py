@@ -16,7 +16,13 @@ from typing import Any
 import pytest
 from _dt_helpers import fixed_clock, installed_clock
 from _quality_fixture import GitRepo, config_reload, routing_decision
-from _quality_rows import NO_OUTCOMES, history, write_landing_events, write_quality_db
+from _quality_rows import (
+    NO_OUTCOMES,
+    history,
+    write_landing_events,
+    write_marker_state_db,
+    write_quality_db,
+)
 from _runs_db_fixture import EventRow
 from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck
@@ -32,8 +38,7 @@ from dashboard.api.window import (
 from dashboard.config import DashboardConfig
 from dashboard.data import quality_markers
 from dashboard.data.quality_marker_sampler import refresh_markers
-from dashboard.data.quality_markers import DerivedState, PromptCoverage, RoutingFold
-from dashboard.data.quality_store import QualitySample, write_marker_state
+from dashboard.data.quality_store import QualitySample
 from dashboard.loops import _QualityStore
 
 LANDINGS: dict[str, int | None] = {'100': 100, '300': 300, 'all': None}
@@ -364,16 +369,8 @@ def curated_artefact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _store_an_empty_derivation(config: DashboardConfig) -> None:
-    async def write() -> None:
-        async with _QualityStore(config.quality_db) as store:
-            await write_marker_state(store.connection, DerivedState(
-                fold=replace(RoutingFold.empty('dark_factory'), complete=True), markers=(),
-                skipped=0, prompt_coverage=PromptCoverage(
-                    digest_since=None, roles_py_landings=None, counted_since=None,
-                    reason='no routing decision is folded yet'),
-                refreshed_at=NOW - timedelta(minutes=5)))
-            await store.connection.commit()
-    asyncio.run(write())
+    asyncio.run(write_marker_state_db(config.quality_db, 'dark_factory', (),
+                                      refreshed_at=NOW - timedelta(minutes=5)))
 
 
 def test_row_6_a_curated_artefact_is_excluded_from_the_baseline_and_served_as_a_range(
