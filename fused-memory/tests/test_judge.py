@@ -2672,7 +2672,7 @@ class TestCallJudgeCliTaxonomy:
     async def test_ordinary_transport_failure_carries_no_code(self):
         """(g) The new code is SPECIFIC: an ordinary transport failure keeps the
         generic build_failure_message dump and a ``code`` of None, so
-        _handle_infra_failure's log can tell a deny-list break apart from a
+        _record_no_verdict_failure's log can tell a deny-list break apart from a
         run-of-the-mill api_error."""
         from shared.cli_invoke import AgentResult
 

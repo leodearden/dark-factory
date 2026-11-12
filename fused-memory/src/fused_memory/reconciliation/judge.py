@@ -238,7 +238,8 @@ class JudgeInfraError(Exception):
     ``severity=serious`` halt whose reason ("Serious verdict in run X") lied
     about a review that never happened. ``review_run`` catches this exception,
     applies bounded backoff, and only halts (truthfully, "judge-unreachable")
-    after ``judge_infra_max_consecutive_failures`` consecutive occurrences.
+    after ``judge_infra_max_consecutive_failures`` consecutive no-verdict
+    failures.
     Carries a human-readable message (e.g. the ``build_failure_message`` dump)
     and, for case 2, a machine-readable ``code``.
     """
@@ -267,6 +268,27 @@ class NoVerdict:
     detail: str = ''
 
 
+#: The halt reason a no-verdict streak gives, chosen by its LAST failure's
+#: reason: a review error must not be described as a judge outage.
+_NO_VERDICT_HALT_REASONS: dict[NoVerdictReason, str] = {
+    NoVerdictReason.JUDGE_INFRA_FAILURE: (
+        'judge-unreachable halt: reconciliation judge outage '
+        '(cap-storm/CLI failure) — project halted after {count} '
+        'consecutive infra failures; last error: {error}'
+    ),
+    NoVerdictReason.REVIEW_ERROR: (
+        'judge-review-error halt: the reconciliation judge failed to complete a '
+        'review — project halted after {count} consecutive no-verdict failures; '
+        'last error: {error}'
+    ),
+}
+
+_NO_VERDICT_LOG_EVENTS: dict[NoVerdictReason, str] = {
+    NoVerdictReason.JUDGE_INFRA_FAILURE: 'reconciliation.judge_infra_failure',
+    NoVerdictReason.REVIEW_ERROR: 'reconciliation.judge_review_error',
+}
+
+
 class Judge:
     """Async LLM reviewer that evaluates reconciliation run quality."""
 
@@ -283,11 +305,12 @@ class Judge:
         self._halted_projects: set[str] = set()
         self._halt_cooldown_until: dict[str, datetime] = {}
         self._unhalt_grace_remaining: dict[str, int] = {}
-        # Per-project runs of CONSECUTIVE judge transport/infra failures
-        # (JudgeInfraError), reset on any successful transport or once a
-        # judge-unreachable halt fires. Bounds the phantom-halt blast radius
-        # (task 2947 ask a).
-        self._infra_failures: KeyedStreaks[str] = KeyedStreaks(
+        # Per-project runs of CONSECUTIVE no-verdict failures on a loaded run
+        # (JudgeInfraError or a review error), reset when a review completes or
+        # once the streak's halt fires. Bounds the phantom-halt blast radius
+        # (task 2947 ask a) and keeps a judge that crashes on every run from
+        # leaving runs ungraded forever (task 5370).
+        self._no_verdict_streaks: KeyedStreaks[str] = KeyedStreaks(
             threshold=config.judge_infra_max_consecutive_failures,
         )
         # Last halt reason per project (task 2947 ask b), so the harness can
@@ -343,6 +366,7 @@ class Judge:
 
     async def review_run(self, run_id: str) -> JudgeVerdict | NoVerdict:
         """Review a completed reconciliation run asynchronously."""
+        run = None
         try:
             run = await self.journal.get_run(run_id)
             if run is None:
@@ -379,15 +403,10 @@ class Judge:
                 # judge_infra_max_consecutive_failures in a row. This except is
                 # deliberately INSIDE the broad try so its return short-circuits
                 # before _parse_verdict / add_verdict.
-                return await self._handle_infra_failure(run.project_id, run_id, err)
-
-            # Successful transport (even a malformed-content verdict, which stays
-            # fail-closed serious below) clears the per-project infra streak so a
-            # recovered judge starts fresh.  For the claude_cli provider a success
-            # that carried NO usable verdict is not "successful transport" for this
-            # purpose — it raises JudgeInfraError above and is diverted before this
-            # line, so it correctly keeps counting toward the streak.
-            self._infra_failures.success(run.project_id)
+                return await self._record_no_verdict_failure(
+                    run.project_id, run_id,
+                    reason=NoVerdictReason.JUDGE_INFRA_FAILURE, error=err,
+                )
 
             verdict = self._parse_verdict(response_text, run_id)
 
@@ -407,12 +426,12 @@ class Judge:
                     # string. A genuine content severity=serious verdict has no
                     # such marker and keeps the already-truthful reason. (Infra
                     # failures never reach here — they are diverted to
-                    # _handle_infra_failure before _parse_verdict.)
+                    # _record_no_verdict_failure before _parse_verdict.)
                     #
                     # For the claude_cli provider this fabricated-serious branch
                     # is now UNREACHABLE: its verdict arrives as a validated
                     # structured payload, and a success carrying no usable
-                    # verdict is diverted to _handle_infra_failure BEFORE
+                    # verdict is diverted to _record_no_verdict_failure BEFORE
                     # _parse_verdict (raised in _call_judge_cli as
                     # cli_output_empty / cli_output_unparseable). The branch
                     # survives for the anthropic/openai text fallback, which has
@@ -447,82 +466,94 @@ class Judge:
             # Check error trends using the windowed verdicts + the fresh one
             await self._check_error_trends(run.project_id, trend_verdicts + [verdict])
 
+            # Only a COMPLETED review resets the no-verdict streak: a reset at
+            # transport success would let a failure after it (parse, add_verdict,
+            # trends) recur forever without ever reaching the threshold.
+            self._no_verdict_streaks.success(run.project_id)
             return verdict
 
         except Exception as e:
             logger.error(f'Judge review failed for run {run_id}: {e}', exc_info=True)
-            return NoVerdict(run_id, NoVerdictReason.REVIEW_ERROR, f'{type(e).__name__}: {e}')
+            if run is None:
+                return NoVerdict(
+                    run_id, NoVerdictReason.REVIEW_ERROR, f'{type(e).__name__}: {e}',
+                )
+            return await self._record_no_verdict_failure(
+                run.project_id, run_id, reason=NoVerdictReason.REVIEW_ERROR, error=e,
+            )
 
-    async def _handle_infra_failure(
-        self, project_id: str, run_id: str, err: JudgeInfraError,
+    async def _record_no_verdict_failure(
+        self,
+        project_id: str,
+        run_id: str,
+        *,
+        reason: NoVerdictReason,
+        error: BaseException,
     ) -> NoVerdict:
-        """Bounded-backoff handling for a judge transport/infra failure (task 2947).
+        """Bounded backoff for a review of *project_id* that produced no verdict.
 
-        A JudgeInfraError means the judge CLI was unreachable/broken for this run
-        — there is NO verdict to trust. Rather than fabricating a phantom
-        severity=serious halt whose "Serious verdict in run X" reason lies about a
-        review that never happened (the defect this fixes), count consecutive
-        infra failures per project:
+        A JudgeInfraError (task 2947) or a review error (task 5370) leaves NO
+        verdict to trust. Rather than fabricating a phantom severity=serious
+        halt whose "Serious verdict in run X" reason lies about a review that
+        never happened, count consecutive no-verdict failures per project:
 
         - below ``config.judge_infra_max_consecutive_failures``: log a structured
           warning and return no verdict — none is stamped and no halt fires, so a
           transient outage (e.g. an account-cap storm) is given room to recover.
-        - at the threshold: reset the streak (so a post-halt recovery
-          starts clean) and, when ``halt_on_judge_serious`` is set, apply a
-          TRUTHFUL 'judge-unreachable' halt — which routes the existing
-          infra_issue escalation via the harness. Gated on the same master switch
-          as the serious-verdict halt.
+        - at the threshold: reset the streak (so a post-halt recovery starts
+          clean) and, when ``halt_on_judge_serious`` is set, apply a TRUTHFUL
+          halt whose reason names the last failure's kind — which routes the
+          existing infra_issue escalation via the harness. Gated on the same
+          master switch as the serious-verdict halt.
 
-        Always returns a JUDGE_INFRA_FAILURE :class:`NoVerdict` (review_run
-        propagates it as the run's result). The
-        infra streak is reset elsewhere on any successful transport (see
-        review_run), so only genuinely-consecutive failures reach the threshold.
+        Always returns a :class:`NoVerdict` carrying *reason* (review_run
+        propagates it as the run's result). The streak is reset elsewhere when a
+        review completes (see review_run), so only genuinely-consecutive
+        failures reach the threshold.
         """
-        step = self._infra_failures.failure(project_id)
+        detail = (
+            str(error) if isinstance(error, JudgeInfraError)
+            else f'{type(error).__name__}: {error}'
+        )
+        step = self._no_verdict_streaks.failure(project_id)
         count = step.count
         threshold = self.config.judge_infra_max_consecutive_failures
 
         if not step.fired:
             logger.warning(
-                'reconciliation.judge_infra_failure',
+                _NO_VERDICT_LOG_EVENTS[reason],
                 extra={
                     'run_id': run_id,
                     'project_id': project_id,
+                    'reason': reason.value,
                     'consecutive_failures': count,
                     'threshold': threshold,
-                    'error': str(err),
+                    'error': detail,
                     # None for a CLI transport failure; 'cli_output_empty' /
                     # 'cli_output_unparseable' for a success that carried no
                     # usable verdict. Lets a cap-storm-with-no-content occurrence
                     # be told apart from a CLI failure in the logs — the
                     # distinction that took a hand-dug transcript to establish on
                     # 2026-07-25.
-                    'code': getattr(err, 'code', None),
+                    'code': getattr(error, 'code', None),
                 },
             )
-            return NoVerdict(run_id, NoVerdictReason.JUDGE_INFRA_FAILURE, str(err))
+            return NoVerdict(run_id, reason, detail)
 
         # Threshold reached: reset the streak so a later recovery starts clean,
         # then (if enabled) halt truthfully.
-        self._infra_failures.forget((project_id,))
+        self._no_verdict_streaks.forget((project_id,))
         if self.config.halt_on_judge_serious:
-            reason = (
-                f'judge-unreachable halt: reconciliation judge outage '
-                f'(cap-storm/CLI failure) — project halted after {count} '
-                f'consecutive infra failures; last error: {err}'
-            )
-            await self._apply_halt(project_id, reason=reason)
-            logger.error(
-                f'Judge: judge-unreachable — halting project {project_id} after '
-                f'{count} consecutive infra failures; last error: {err}'
-            )
+            halt_reason = _NO_VERDICT_HALT_REASONS[reason].format(count=count, error=detail)
+            await self._apply_halt(project_id, reason=halt_reason)
+            logger.error(f'Judge: halting project {project_id} — {halt_reason}')
         else:
             logger.error(
-                f'Judge: {count} consecutive judge infra failures for project '
+                f'Judge: {count} consecutive judge no-verdict failures for project '
                 f'{project_id}, but halt_on_judge_serious is disabled — not '
-                f'halting; last error: {err}'
+                f'halting; last error ({reason.value}): {detail}'
             )
-        return NoVerdict(run_id, NoVerdictReason.JUDGE_INFRA_FAILURE, str(err))
+        return NoVerdict(run_id, reason, detail)
 
     def _build_review_prompt(self, run, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
@@ -749,15 +780,15 @@ Review this run and provide your verdict as JSON.
             # ``severity`` is re-validated just above.
             #
             # Why the raise lives HERE and not in _parse_verdict's dict branch:
-            # review_run's ``except JudgeInfraError`` -> _handle_infra_failure
+            # review_run's ``except JudgeInfraError`` -> _record_no_verdict_failure
             # diversion wraps ONLY the ``await self._call_llm(prompt)`` call.
-            # _parse_verdict runs OUTSIDE that inner try, and AFTER the infra
-            # streak has already been reset — so a JudgeInfraError raised from
-            # there would fall through to the broad ``except Exception`` and
-            # vanish as a silent None with no infra accounting at all (no
-            # verdict, no halt, no signal — the claude_cli mirror of the
-            # text-path hole closed in _parse_verdict's caught tuple).  Do NOT
-            # "simplify" this probe down into _parse_verdict.
+            # _parse_verdict runs OUTSIDE that inner try, so a JudgeInfraError
+            # raised from there would fall through to the broad
+            # ``except Exception`` and be counted as a REVIEW_ERROR, halting
+            # with a review-error reason for what is a no-verdict CLI success
+            # (the claude_cli mirror of the text-path hole closed in
+            # _parse_verdict's caught tuple).  Do NOT "simplify" this probe
+            # down into _parse_verdict.
             # TypeError is in the tuple so the probe stays TOTAL against
             # _verdict_from_payload's full raise surface (it also rejects a
             # non-mapping payload).  The non-dict guard above means it cannot
@@ -854,7 +885,7 @@ Review this run and provide your verdict as JSON.
         The structured warning is the record that made the 2026-07-25 RCA possible
         (it took a hand-dug CLI transcript to establish that the halting run had
         exited 0 with 727 output tokens and no payload).  The message embeds the
-        code and an output prefix so ``_handle_infra_failure``'s ``str(err)``
+        code and an output prefix so ``_record_no_verdict_failure``'s ``str(err)``
         stays diagnostic.
 
         ``schema_tool_denied`` is deliberately NOT logged here: cli_invoke can only
