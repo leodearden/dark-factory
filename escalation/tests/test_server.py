@@ -4543,6 +4543,9 @@ class TestMergeRequestWorkflowVerifyEmission:
         from unittest.mock import AsyncMock
 
         import orchestrator.merge_lane.worker as orchestrator_merge_queue
+        from orchestrator.stranded_verified_green import last_verified_green_tip
+        from orchestrator.verify_checkpoint import green_checkpoint_at_tip
+        from orchestrator.verify_evidence import VerifySite, workflow_verify_event_data
 
         tip = 't' * 40
         sentinel_base_sha = 's' * 40
@@ -4607,10 +4610,84 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert row['data']['base_sha'] == sentinel_base_sha, (
                 f"Expected data['base_sha']=={sentinel_base_sha!r}, got: {row}"
             )
+            # Task 5409: one constructor builds both emitters' rows, and the
+            # vouch records the tip the server resolved.
+            assert (
+                row['data']['tip_sha'], row['data']['tip_sha_unresolved'],
+                row['data']['site'], row['data']['runner'],
+            ) == (tip, False, 'mcp:merge_request', 'local'), row
+            assert row['data'].keys() == workflow_verify_event_data(
+                True, tip_sha=tip, base_sha=sentinel_base_sha, branch='task/777',
+                result=None, site=VerifySite.MCP_MERGE_REQUEST, runner='local',
+            ).keys()
+            # esc-5422-5: the vouch now arms the reaper, the architect's
+            # ready_to_merge gate and the VERIFY checkpoint.
+            assert last_verified_green_tip(event_store, '777') == tip
+            assert green_checkpoint_at_tip(event_store, EventType.workflow_verify, '777', tip)
         finally:
             # Fresh dispatch with no worker draining the queue leaves the
             # waiter future pending — cancel it via merge_cancel (mirrors the
             # never_future.cancel() cleanup in TestMergeRequestDedup).
+            assert result.get('status') == 'queued', (
+                f'Expected status queued, got: {result}'
+            )
+            await call_merge_cancel(server, request_id=result['request_id'])
+
+    async def test_verified_green_with_unresolvable_branch_records_why(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A vouch whose branch ref cannot be resolved still records the green,
+        with tip_sha_unresolved and the reason, and says so in a WARNING."""
+        from unittest.mock import AsyncMock
+
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'resolve_dispatch_time_merge_base',
+            AsyncMock(return_value='s' * 40),
+        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
+
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(return_value=None),
+            is_ancestor=AsyncMock(return_value=False),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-unresolved')
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=stub_harness,
+            orch_config=OrchestratorConfig(project_root=tmp_path / 'repo'),
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await call_merge_request(
+                server,
+                task_id='779',
+                branch='779',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                verified_green=True,
+                wait_secs=0,
+            )
+
+        try:
+            [row] = event_store.fetch_events_by_type(EventType.workflow_verify)
+            assert (
+                row['data']['tip_sha'], row['data']['tip_sha_unresolved'],
+                row['data']['tip_sha_unresolved_reason'],
+            ) == (None, True, 'branch_unresolved'), row
+            assert any(
+                record.levelno == logging.WARNING and 'task/779' in record.getMessage()
+                for record in caplog.records
+            ), caplog.text
+        finally:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
