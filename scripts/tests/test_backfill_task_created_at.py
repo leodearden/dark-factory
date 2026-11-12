@@ -1,9 +1,10 @@
 """Tests for scripts/backfill_task_created_at.py (task 8558).
 
 PRD ``plans/instruments-honesty-prd.md`` decision 3 and boundary row 7: the
-backfill fills only rows whose ``created_at`` is NULL, from the task's first
-runs.db event, else its un-back-filled ``metadata.pending_since``, else its
-``updated_at``; it prints per-source counts and a second run writes nothing.
+backfill fills only rows whose ``created_at`` is NULL, with the earliest usable
+of the task's first runs.db event, its un-back-filled ``metadata.pending_since``
+and its ``updated_at`` (each is an upper bound on the filing time; an exact tie
+goes to that order); it prints per-source counts and a second run writes nothing.
 
 Each test builds a project root holding a real-shape tasks.db (from
 ``shared.task_store_schema.TASK_STORE_DDL``) and a runs.db (from conftest's
@@ -19,6 +20,7 @@ import contextlib
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 
 import backfill_task_created_at as backfill
@@ -26,15 +28,20 @@ import pytest
 from shared.project_layout import runs_db, tasks_db
 from shared.task_store_schema import TASK_STORE_DDL
 
+_ROW_3_BACKFILLED_PENDING_SINCE = '2026-05-02T00:00:00.000Z'
 _ROW_3_UPDATED_AT = '2026-05-03T00:00:00.000Z'
 
 _ROWS: tuple[Mapping[str, object], ...] = (
     {'id': 1, 'updated_at': '2026-04-20T00:00:00.000Z'},
-    {'id': 2, 'metadata': json.dumps({'pending_since': '2026-05-01T00:00:00.000Z'})},
+    {
+        'id': 2,
+        'metadata': json.dumps({'pending_since': '2026-05-01T00:00:00.000Z'}),
+        'updated_at': '2026-05-06T00:00:00.000Z',
+    },
     {
         'id': 3,
         'metadata': json.dumps(
-            {'pending_since': '2026-05-02T00:00:00.000Z', 'pending_since_backfilled': True}
+            {'pending_since': _ROW_3_BACKFILLED_PENDING_SINCE, 'pending_since_backfilled': True}
         ),
         'updated_at': _ROW_3_UPDATED_AT,
     },
@@ -44,7 +51,15 @@ _ROWS: tuple[Mapping[str, object], ...] = (
         'id': 6,
         'created_at': '2026-11-05T00:00:00.000Z',
         'created_at_source': 'stamped',
+        'updated_at': '2026-11-05T00:00:00.000Z',
     },
+    {
+        'id': 7,
+        'metadata': json.dumps({'pending_since': '2026-07-28T00:00:00.000Z'}),
+        'updated_at': '2026-07-30T00:00:00.000Z',
+    },
+    {'id': 8, 'updated_at': '2026-07-28T12:00:00.000Z'},
+    {'id': 9, 'updated_at': '2026-06-01T00:00:00.000Z'},
 )
 
 _EVENTS = (
@@ -54,6 +69,10 @@ _EVENTS = (
     {'task_id': 1, 'event_type': 'task_started', 'timestamp': '2026-04-09T16:53:21.119808+00:00'},
     {'task_id': 2, 'event_type': 'task_started', 'timestamp': 'not a time'},
     {'task_id': 6, 'event_type': 'task_started', 'timestamp': '2026-01-01T00:00:00+00:00'},
+    # A long-waiting task's first event is the starvation alarm, not its filing.
+    {'task_id': 7, 'event_type': 'starvation_detected', 'timestamp': '2026-11-05T00:00:00+00:00'},
+    {'task_id': 8, 'event_type': 'starvation_detected', 'timestamp': '2026-11-05T00:00:00+00:00'},
+    {'task_id': 9, 'event_type': 'task_started', 'timestamp': '2026-06-01T00:00:00+00:00'},
     {'task_id': 'main-sweep-x', 'event_type': 'sweep', 'timestamp': '2026-01-01T00:00:00+00:00'},
     {'task_id': None, 'event_type': 'sweep', 'timestamp': '2026-01-01T00:00:00+00:00'},
 )
@@ -61,10 +80,13 @@ _EVENTS = (
 _FILLED = {
     1: ('2026-04-09T16:53:21.119Z', 'first_event'),
     2: ('2026-05-01T00:00:00.000Z', 'pending_since'),
-    3: (_ROW_3_UPDATED_AT, 'updated_at'),
+    3: (_ROW_3_BACKFILLED_PENDING_SINCE, 'updated_at'),
     4: ('2026-05-10T19:04:47.522Z', 'updated_at'),
     5: (None, None),
     6: ('2026-11-05T00:00:00.000Z', 'stamped'),
+    7: ('2026-07-28T00:00:00.000Z', 'pending_since'),
+    8: ('2026-07-28T12:00:00.000Z', 'updated_at'),
+    9: ('2026-06-01T00:00:00.000Z', 'first_event'),
 }
 
 
@@ -127,7 +149,7 @@ def _refusal(capsys, root: Path) -> str:
     return captured.err
 
 
-def test_the_first_run_fills_each_null_row_from_its_best_source(capsys, project):
+def test_the_first_run_fills_each_null_row_from_its_earliest_source(capsys, project):
     report = _report(capsys, project)
 
     assert report == {
@@ -135,12 +157,27 @@ def test_the_first_run_fills_each_null_row_from_its_best_source(capsys, project)
         'tasks_db': str(tasks_db(project)),
         'runs_db': 'present',
         'dry_run': False,
-        'counts': {'first_event': 1, 'pending_since': 1, 'updated_at': 2},
+        'counts': {'first_event': 2, 'pending_since': 2, 'updated_at': 3},
         'skipped_unusable_updated_at': 1,
         'unparseable_event_timestamps': 1,
-        'rows_written': 4,
+        'rows_written': 7,
     }
     assert _created_at(project) == _FILLED
+
+
+def test_no_filled_row_is_filed_after_its_own_update(capsys, project):
+    _report(capsys, project)
+
+    with contextlib.closing(sqlite3.connect(tasks_db(project))) as conn:
+        filed_after_update = [
+            task_id
+            for task_id, created_at, updated_at in conn.execute(
+                'SELECT id, created_at, updated_at FROM tasks WHERE created_at IS NOT NULL'
+            )
+            if datetime.fromisoformat(created_at) > datetime.fromisoformat(updated_at)
+        ]
+
+    assert filed_after_update == []
 
 
 def test_a_second_run_writes_nothing(capsys, project):
@@ -160,7 +197,7 @@ def test_a_dry_run_reports_the_same_counts_and_writes_nothing(capsys, project):
     report = _report(capsys, project, '--dry-run')
 
     assert report['dry_run'] is True
-    assert report['counts'] == {'first_event': 1, 'pending_since': 1, 'updated_at': 2}
+    assert report['counts'] == {'first_event': 2, 'pending_since': 2, 'updated_at': 3}
     assert _all_rows(project) == before
 
 
@@ -172,7 +209,7 @@ def test_without_a_runs_db_every_row_falls_through_to_its_metadata_or_updated_at
     report = _report(capsys, project)
 
     assert report['runs_db'] == 'absent'
-    assert report['counts'] == {'first_event': 0, 'pending_since': 1, 'updated_at': 3}
+    assert report['counts'] == {'first_event': 0, 'pending_since': 2, 'updated_at': 5}
     assert _created_at(project)[1] == ('2026-04-20T00:00:00.000Z', 'updated_at')
 
 
