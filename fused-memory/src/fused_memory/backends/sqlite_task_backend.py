@@ -116,7 +116,11 @@ logger = logging.getLogger(__name__)
 #       plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1). No
 #       column or index change — a pure metadata back-fill. See
 #       ``_migrate_v4_to_v5``.
-_SCHEMA_VERSION = 5
+#   v6: + created_at / created_at_source columns (task 8558, PRD
+#       plans/instruments-honesty-prd.md decision 3); stamped by add_task,
+#       backfilled only by scripts/backfill_task_created_at.py. See
+#       ``_migrate_v5_to_v6``.
+_SCHEMA_VERSION = 6
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -354,6 +358,11 @@ async def _migrate(
       ``metadata.pending_since`` back-fill (task 3816). Gated on a RE-READ of
       ``PRAGMA user_version``, not on the local ``version``, because the
       preceding step is self-gating (see the dispatch below).
+    * v5 → v6: see :func:`_migrate_v5_to_v6` — add ``created_at`` /
+      ``created_at_source`` (task 8558). Only a store that reached v5 is
+      stamped 6. A store the self-gating v3 → v4 step held below v4 still
+      gains both columns, unstamped, because ``add_task`` names them on every
+      INSERT; its version catches up through this ladder once the index lands.
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``TASK_STORE_DDL`` already created every column runs all steps as no-op
@@ -459,6 +468,13 @@ async def _migrate(
 
     if version >= 4 and version < 5:
         await _migrate_v4_to_v5(conn)
+        version = 5
+
+    if version == 5:
+        await _migrate_v5_to_v6(conn)
+    else:
+        await _add_created_at_columns(conn)
+        await conn.commit()
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -1045,6 +1061,31 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     )
 
     await conn.execute('PRAGMA user_version = 5')
+    await conn.commit()
+
+
+async def _add_created_at_columns(conn: aiosqlite.Connection) -> None:
+    """Add the nullable ``created_at`` / ``created_at_source`` pair; never commits."""
+    await add_column_if_missing(conn, 'tasks', 'created_at', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'created_at_source', 'TEXT')
+
+
+async def _migrate_v5_to_v6(conn: aiosqlite.Connection) -> None:
+    """v5 -> v6 (task 8558, PRD plans/instruments-honesty-prd.md decision 3):
+    add the ``created_at`` / ``created_at_source`` columns.
+
+    Adds whichever column is missing, then stamps ``user_version = 6``. No
+    row gains a value here: a pre-existing row reads NULL until
+    ``scripts/backfill_task_created_at.py`` fills it, because this open-time
+    step is lazy per store and must not reach into another store's runs.db.
+
+    IMPORTANT: never short-circuit to just stamping the version.
+    ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never adds
+    columns to an existing table, so a v5 production store would silently
+    keep missing columns forever if this step only stamped the version.
+    """
+    await _add_created_at_columns(conn)
+    await conn.execute('PRAGMA user_version = 6')
     await conn.commit()
 
 
