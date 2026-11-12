@@ -558,6 +558,7 @@ _TASK_ROW_KEYS = frozenset({
     'id', 'project', 'title', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
     'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
+    'created_at', 'created_at_source',
     'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
 })
 """One active ``TaskRow``'s keys: ``_build_task_row``'s plus ``started`` and ``deps``.

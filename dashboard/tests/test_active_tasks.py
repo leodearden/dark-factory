@@ -580,6 +580,8 @@ async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_p
         # Claim projection (task 3543): carried on every row. A 'pending' task
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
+        # Filing-time pair, carried on every row; this fixture's shaped task has none.
+        'created_at': None, 'created_at_source': None,
     }]
 
 
