@@ -474,3 +474,107 @@ class TestStall:
         assert _recheck(gate)['consecutive'] == 2
         assert datetime.fromisoformat(_recheck(gate)['last_checked_at']) == rig.clock()
         assert rig.own_escalations(gate_id, status='pending') == []
+
+
+RUN_2 = 'review-lambda-20261112-2'
+
+
+@pytest.mark.asyncio
+class TestSupersede:
+    async def test_an_open_chain_refuses_a_rival_until_superseded(
+        self, rig: TriggerChainRig
+    ) -> None:
+        chain = await rig.file_final_chain(RUN)
+        original_at = _at(await rig.task(chain.completion_id))
+        rival = rig.snippet_call('completion_gate', RUN_2)
+
+        refused = await rig.call('submit_task', **rival)
+
+        assert refused['error_type'] == 'TriggerChainOpen'
+        assert {task['id'] for task in refused['open_chain']} == {
+            chain.completion_id,
+            chain.human_id,
+        }
+        assert 'task_id' not in refused
+        assert await _titled(rig, rival['title']) == []
+
+        await rig.supersede(chain, RUN_2, launched_from=None)
+
+        for task_id in (chain.completion_id, chain.human_id):
+            task = await rig.task(task_id)
+            assert task['status'] == 'cancelled'
+            assert _metadata(task)['trigger_chain']['superseded_by'] == RUN_2
+        rig.clock.set(original_at + timedelta(seconds=1))
+        assert await rig.dispatch() == (None, None)
+        assert rig.queue.get_by_task(chain.human_id) == []
+        await rig.file_final_chain(RUN_2)
+
+    async def test_cancelling_the_completion_gate_first_would_fire_the_human_gate(
+        self, rig: TriggerChainRig
+    ) -> None:
+        chain = await rig.file_final_chain(RUN)
+        await rig.call_ok(
+            'set_task_status', id=chain.completion_id, status='cancelled', project_root=str(rig.root)
+        )
+
+        assignment, _ = await rig.dispatch()
+
+        assert assignment is not None and assignment.task_id == chain.human_id
+
+    async def test_the_launched_run_answers_and_supersedes_in_one_step(
+        self, rig: TriggerChainRig
+    ) -> None:
+        fired = await _human_gate_fired(rig)
+        chain = fired.first.chain
+        launching = fired.escalation
+        gate_before = _metadata(await rig.task(chain.completion_id))
+
+        await rig.supersede(chain, RUN_2, launched_from=launching.id)
+
+        (answered,) = rig.own_escalations(chain.human_id)
+        assert answered.id == launching.id
+        assert (answered.status, answered.resolution, answered.resolution_action) == (
+            'resolved',
+            f'ran as {RUN_2}',
+            'resume',
+        )
+        human = await rig.task(chain.human_id)
+        assert human['status'] == 'done'
+        assert _metadata(human)['done_provenance']['kind'] == 'deterministic-gate'
+        assert _metadata(human)['done_provenance']['escalation_id'] == launching.id
+        gate = await rig.task(chain.completion_id)
+        assert gate['status'] == 'done'
+        assert _metadata(gate) == {
+            **gate_before,
+            'trigger_chain': {**gate_before['trigger_chain'], 'superseded_by': RUN_2},
+        }
+        await rig.file_final_chain(RUN_2)
+
+
+@pytest.mark.asyncio
+class TestLostStatusWrite:
+    async def test_a_lost_pending_write_still_withholds_until_at(
+        self, rig: TriggerChainRig
+    ) -> None:
+        await rig.seed_run(RUN, ('high', OPEN))
+        chain = await rig.file_final_chain(RUN)
+        first_at = _at(await rig.task(chain.completion_id))
+        rig.clock.set(first_at)
+        failing = rig.status_write_failing('pending')
+
+        _, outcome = await rig.dispatch(runner=rig.runner(scheduler=failing))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert failing.refused == [(chain.completion_id, 'pending')]
+        gate = await rig.task(chain.completion_id)
+        # A deterministic slot writes no dispatch-time in-progress stamp, so nothing is stranded.
+        assert gate['status'] == 'pending'
+        assert _at(gate) == first_at + timedelta(seconds=86400)
+        assert _recheck(gate)['consecutive'] == 1
+        assert rig.own_escalations(chain.completion_id) == []
+
+        rig.clock.set(_at(gate) - timedelta(seconds=1))
+        assert await rig.dispatch() == (None, None)
+        rig.clock.set(_at(gate))
+        assignment, _ = await rig.dispatch()
+        assert assignment is not None and assignment.task_id == chain.completion_id
