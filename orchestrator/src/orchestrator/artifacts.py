@@ -25,6 +25,7 @@ from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -677,6 +678,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'ready_to_merge.json': ArtifactRoot.LANE,
     'false_premise.json': ArtifactRoot.LANE,
     'unactionable_task.json': ArtifactRoot.LANE,
+    'scope_requests.json': ArtifactRoot.LANE,
     'plan.json': ArtifactRoot.TASK,
     'plan.lock': ArtifactRoot.TASK,
     'iterations.jsonl': ArtifactRoot.TASK,
@@ -1076,6 +1078,37 @@ class TaskArtifacts:
         subsequent architect invocation does not see a stale report.
         """
         self._clear_path('blocking_dependency.json')
+
+    def write_scope_request(self, request: ScopeRequest) -> None:
+        """Record a writer agent's request to add an existing file to its scope.
+
+        One entry per path: a repeat replaces the earlier entry and moves to
+        the end. The workflow reads and clears this artifact after each
+        implementer/debugger invocation
+        (``workflow.py::TaskWorkflow._apply_scope_requests``).
+        """
+        kept = [r for r in self.read_scope_requests() if r.path != request.path]
+        entries = [r.to_mapping() for r in (*kept, request)]
+        self._write_json('scope_requests.json', {'requests': entries})
+
+    def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
+        """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
+        data = self._read_json_object('scope_requests.json') or {}
+        entries = data.get('requests', [])
+        if not isinstance(entries, list):
+            logger.warning('Malformed scope_requests.json: requests is %r', entries)
+            return ()
+        requests: list[ScopeRequest] = []
+        for entry in entries:
+            try:
+                requests.append(ScopeRequest.from_mapping(entry))
+            except InvalidScopeRequest as exc:
+                logger.warning('Dropping scope request %r from scope_requests.json: %s', entry, exc)
+        return tuple(requests)
+
+    def clear_scope_requests(self) -> None:
+        """Remove the scope-request artifact once the workflow has applied it."""
+        self._clear_path('scope_requests.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)

@@ -81,7 +81,9 @@ class ScopeRequest:
         return {'path': self.path, 'reason': self.reason}
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any]) -> ScopeRequest:
+    def from_mapping(cls, mapping: object) -> ScopeRequest:
+        if not isinstance(mapping, Mapping):
+            raise InvalidScopeRequest('request', f'scope request {mapping!r} is not a mapping')
         for field in ('path', 'reason'):
             if field not in mapping:
                 raise InvalidScopeRequest(field, f'{field} is missing from {dict(mapping)!r}')
