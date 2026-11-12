@@ -44,6 +44,7 @@ from fused_memory.backends.graphiti_client import (
 )
 
 _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
+_PAGED_READ_LOGGER_NAME = 'fused_memory.backends.paged_read'
 
 # Measured live row counts (dark_factory, 2026-08-17), used as fixture corpus
 # sizes. Deliberately FROZEN at the measurement that motivated the fix rather
@@ -319,7 +320,7 @@ class TestPageBoundSubstitution:
     """
 
     def test_literal_cypher_braces_survive_substitution(self):
-        from fused_memory.backends.graphiti_client import _render_page_bounds
+        from fused_memory.backends.paged_read import _render_page_bounds
 
         template = (
             'MATCH (n:Entity {name: $name}) RETURN n.uuid '
@@ -355,7 +356,7 @@ class TestPageBoundSubstitution:
         server truncation, which is the one diagnosis this module exists to
         make trustworthy.
         """
-        from fused_memory.backends.graphiti_client import _render_page_bounds
+        from fused_memory.backends.paged_read import _render_page_bounds
 
         template = (
             'MATCH (n:Entity) RETURN n.uuid ORDER BY n.uuid '
@@ -416,7 +417,7 @@ class TestPagedRoQueryStructuralGuards:
         )
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
             paged = await _paged_ro_query(
                 graph,
                 _PAGE_TEMPLATE,
@@ -453,7 +454,7 @@ class TestPagedRoQueryStructuralGuards:
         )
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
             paged = await _paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10, max_pages=2
             )
@@ -502,7 +503,7 @@ class TestPagedRoQueryCensusGuards:
             census_result_set=census_result_set,
             census_result_set_set=True,
         )
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
             paged = await _paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
@@ -525,7 +526,7 @@ class TestPagedRoQueryCensusGuards:
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, census_override=150
         )
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
             paged = await _paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
@@ -554,7 +555,7 @@ class TestPagedRoQueryCensusGuards:
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, census_override=50
         )
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with caplog.at_level(logging.WARNING, logger=_PAGED_READ_LOGGER_NAME):
             paged = await _paged_ro_query(
                 graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
             )
