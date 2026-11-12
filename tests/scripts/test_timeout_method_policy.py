@@ -134,6 +134,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
+from process_group_run import ProcessGroupOverrun, run_process_group
 from pytest_config_discovery import (
     REPO_ROOT,
     ROOT_CONFIG_NAME,
@@ -263,8 +264,11 @@ def _run_probe_suite(
 ) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
 
-    A child still running after *budget_secs* is killed and fails the calling
-    test with whatever it had printed.
+    A child still running after *budget_secs* fails the calling test with
+    whatever it had printed and the live members of its process group. The
+    whole group is killed when the run ends, so no descendant can hold the run
+    open or outlive it
+    (``tests/scripts/process_group_run.py::run_process_group``).
 
     ``PYTEST_*`` is scrubbed from the child's environment, so an inherited
     ``PYTEST_ADDOPTS``, ``PYTEST_TIMEOUT`` or ``PYTEST_XDIST_WORKER`` cannot
@@ -283,7 +287,7 @@ def _run_probe_suite(
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
     env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     try:
-        result = subprocess.run(
+        result = run_process_group(
             [
                 sys.executable, '-m', 'pytest',
                 '-c', str(suite.ini),
@@ -294,21 +298,20 @@ def _run_probe_suite(
                 '-rA',
                 *extra,
             ],
-            cwd=str(suite.root),
+            cwd=suite.root,
             env=env,
-            capture_output=True,
-            text=True,
-            timeout=budget_secs,
-            check=False,
+            budget_secs=budget_secs,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ProcessGroupOverrun as overrun:
         pytest.fail(
             f'the probe child did not finish within its budget of {budget_secs}s. '
-            'A starved child and a wedged one look the same here; the partial '
-            'output shows how far it got: the header alone means it was stuck '
-            'in startup, and progress characters without an F mean no test in '
+            'Its output goes to files, so no descendant can hold it open: the '
+            'controller itself was still running. A stdout ending in the '
+            'terminal summary means the controller hung in its own exit after '
+            'the session finished, the header alone means it was stuck in '
+            'startup, and progress characters without an F mean no test in '
             f'{BLOCKING_TESTS!r} ever timed out.\n'
-            f'{_captured(exc)}',
+            f'{overrun}',
             pytrace=False,
         )
     loaded = _header_plugins(result.stdout)
@@ -346,17 +349,8 @@ def _failure_sections(output: str) -> dict[str, str]:
     return dict(zip(parts[1::2], parts[2::2], strict=True))
 
 
-def _captured(result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired) -> str:
-    return f'stdout:\n{_text(result.stdout)}\nstderr:\n{_text(result.stderr)}'
-
-
-def _text(stream: str | bytes | None) -> str:
-    """*stream* as text: a TimeoutExpired holds bytes or None even under ``text=True``."""
-    if stream is None:
-        return ''
-    if isinstance(stream, bytes):
-        return stream.decode('utf-8', errors='replace')
-    return stream
+def _captured(result: subprocess.CompletedProcess[str]) -> str:
+    return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
@@ -442,28 +436,12 @@ def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     )
 
 
-def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
-    partial = 'bringing up nodes...\n........'
-    timed_out = subprocess.TimeoutExpired(
-        ['python', '-m', 'pytest'], 240, output=partial.encode(), stderr=None
-    )
-
-    report = _captured(timed_out)
-
-    assert partial in report, (
-        "a TimeoutExpired carries the child's streams as bytes, even under "
-        f'text=True; they must be decoded, not shown as a repr.\n{report}'
-    )
-    assert 'stdout:' in report and 'stderr:' in report, report
-    assert "b'" not in report, report
-
-
 def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
     tmp_path: pathlib.Path,
 ) -> None:
     budget_secs = 0.5
     # --timeout=0 lifts the cap on BLOCKING_TEST, so the child can never finish;
-    # -n 0 runs it in the child itself, so the kill leaves no xdist worker behind.
+    # -n 0 keeps the child to one process.
     never_finishes = ('--timeout=0', '-n', '0')
 
     with pytest.raises(pytest.fail.Exception) as failure:
