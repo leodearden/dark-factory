@@ -22,6 +22,7 @@ no session bus.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import functools
 import os
@@ -1281,6 +1282,15 @@ def test_shell_selftest_is_executable() -> None:
     )
 
 
+def _write_fake_systemctl(bin_dir: Path, body: str) -> Path:
+    """Write an executable POSIX-sh `systemctl` running *body* into *bin_dir*."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "systemctl"
+    shim.write_text(f"#!/bin/sh\n{body}")
+    shim.chmod(0o755)
+    return shim
+
+
 def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     """The LMS_SELFTEST_TEMPLATE seam must actually REACH the .sh's paths.
 
@@ -1327,10 +1337,7 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     scripts/tests/test_lms_ctl.py.
     """
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    shim = fake_bin / "systemctl"
-    shim.write_text("#!/bin/sh\nexit 0\n")
-    shim.chmod(0o755)
+    _write_fake_systemctl(fake_bin, "exit 0\n")
 
     unit_dir = tmp_path / "systemd" / "user"
     unit_dir.mkdir(parents=True)
@@ -1416,3 +1423,62 @@ def test_shell_selftest_passes() -> None:
             _assert_selftest_passed(_run_selftest(template), template)
         finally:
             _remove_template_residue(template)
+
+
+# ---------------------------------------------------------------------------
+# A lost user-manager bus: self-diagnosing, and a named skip rather than a red
+# ---------------------------------------------------------------------------
+
+# The .sh sets LMS_UNIT_TEMPLATE only as a prefix on its script invocations, so
+# this fails the SCRIPT UNDER TEST's daemon-reload and never the .sh's own.
+_FAKE_SYSTEMCTL_FAILING_SCRIPT_RELOAD = """\
+if [ -n "${LMS_UNIT_TEMPLATE:-}" ]; then
+    for arg in "$@"; do
+        if [ "$arg" = daemon-reload ]; then
+            echo "Failed to reload daemon: $FAKE_SYSTEMCTL_ERROR" >&2
+            exit 1
+        fi
+    done
+fi
+exit 0
+"""
+
+
+def _run_selftest_with_failing_script_reload(
+    tmp_path: Path, template: str, error_text: str
+) -> subprocess.CompletedProcess[str]:
+    """Drive the .sh with no systemd, failing only the script under test's reload."""
+    fake_bin = tmp_path / "bin"
+    _write_fake_systemctl(fake_bin, _FAKE_SYSTEMCTL_FAILING_SCRIPT_RELOAD)
+    return _run_selftest(
+        template,
+        extra_env={
+            "XDG_CONFIG_HOME": str(tmp_path),
+            "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+            "LMS_UNIT_TEMPLATE": "",  # only the .sh's own prefix may arm the fake
+            "FAKE_SYSTEMCTL_ERROR": error_text,
+        },
+        timeout=60,
+    )
+
+
+def test_selftest_surfaces_script_under_test_output(tmp_path: Path) -> None:
+    """A systemctl failure inside the script under test must reach the .sh's output.
+
+    Otherwise a red can say only that the script exited non-zero, never why.
+    """
+    transport_error = os.strerror(errno.ENOTCONN)
+    template = _unique_template()
+
+    result = _run_selftest_with_failing_script_reload(tmp_path, template, transport_error)
+
+    detail = (
+        f"\n--- template: {template}\n"
+        f"--- exit code: {result.returncode}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+    assert transport_error in result.stdout + result.stderr, (
+        f"{SELFTEST_SH.name} discarded the script under test's output, so its "
+        f"systemctl error {transport_error!r} never reached the run's output." + detail
+    )
