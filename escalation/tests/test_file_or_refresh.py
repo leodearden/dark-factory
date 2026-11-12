@@ -141,6 +141,10 @@ class TestFailures:
         with pytest.raises(UnregisteredEscalationCategory):
             dataclasses.replace(ALARM, category='not_a_category')
 
+    def test_a_level_0_alarm_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match='level=0'):
+            dataclasses.replace(ALARM, level=0)
+
     def test_a_failing_submit_propagates(self, tmp_path):
         queue = _SubmitFailsQueue(tmp_path / 'escalations')
 

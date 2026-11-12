@@ -29,6 +29,13 @@ class RefreshableAlarm:
 
     def __post_init__(self) -> None:
         require_registered_category(self.category)
+        if self.level < 1:
+            raise ValueError(
+                f'RefreshableAlarm {self.task_id!r} has level={self.level}; it needs level 1 '
+                'or above. A refresh keeps the filing incarnation in filing_claimant_run_id, '
+                'and an L0 whose filing incarnation is dead stops pinning (escalation.pins), '
+                'so a refreshed L0 would read as abandoned while a live filer keeps it current.'
+            )
 
 
 def file_or_refresh(
@@ -46,9 +53,15 @@ def file_or_refresh(
     filing_claimant_run_id, which names the incarnation that FILED the record
     (task 3550); a refresh is not a filing.
 
-    Records at another level, and records no longer pending, are never
-    refreshed. The level is part of the key because has_open_l1 only sees
-    level 1.
+    Any pending record at (alarm.task_id, alarm.level) is taken to be this
+    alarm's, whoever filed it, so alarm.task_id must belong to this alarm
+    alone. Alarms at different levels on one task_id are separate and never
+    merge, and a record no longer pending is never refreshed.
+
+    The refresh holds no lock between its read and its write, so a record
+    resolved in that gap comes back as pending, and two concurrent refreshes
+    can lose a dedupe_count increment (follow-up ticket
+    tkt_0RWWPZJQAHK6HGVB5T7F93HEVD).
 
     Failures propagate, and the caller decides what a failed filing costs.
     """
