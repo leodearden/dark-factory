@@ -21,6 +21,7 @@ import pytest
 from legibility import census as mod
 from legibility import (
     census_identity,
+    census_report,
     census_window,
     config,
     embeddings,
@@ -239,7 +240,7 @@ def test_the_run_writes_its_record_first_and_renders_the_report_from_it(census):
     record_path = report_path.with_suffix(".json")
     assert outcome.record_path == str(record_path)
     text, record = _record_of(report_path)
-    assert report_path.read_text(encoding="utf-8") == mod.render_report(json.loads(text))
+    assert report_path.read_text(encoding="utf-8") == census_report.render_report(json.loads(text))
     assert record["run_id"] == _RUN_ID
     [commit] = kwargs["effects"].commit.calls
     assert set(commit["paths"]) >= {

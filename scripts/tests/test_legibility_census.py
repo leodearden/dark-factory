@@ -41,6 +41,7 @@ from legibility import (
     census_headroom,
     census_identity,
     census_mining,
+    census_report,
     census_state,
     census_trigger,
     census_window,
@@ -605,7 +606,7 @@ def test_compute_matrix_tallies_origin_manifestation_pairs():
         {"origin_phase": "implement", "manifested_phase": "verify"},
         {"origin_phase": "review", "manifested_phase": "merge"},
     ]
-    matrix = mod.compute_matrix(sightings)
+    matrix = census_report.compute_matrix(sightings)
     assert matrix["implement"]["merge"] == 2
     assert matrix["implement"]["verify"] == 1
     assert matrix["review"]["merge"] == 1
@@ -618,7 +619,7 @@ def test_compute_matrix_unknown_origin_or_manifested_lands_in_explicit_unknown_b
         {"origin_phase": "implement", "manifested_phase": "unknown"},
         {"origin_phase": None, "manifested_phase": None},  # absent entirely -> unknown/unknown
     ]
-    matrix = mod.compute_matrix(sightings)
+    matrix = census_report.compute_matrix(sightings)
     assert matrix["unknown"]["merge"] == 1
     assert matrix["implement"]["unknown"] == 1
     assert matrix["unknown"]["unknown"] == 1
@@ -627,7 +628,7 @@ def test_compute_matrix_unknown_origin_or_manifested_lands_in_explicit_unknown_b
 
 
 def test_compute_matrix_empty_sightings_is_empty_matrix():
-    assert mod.compute_matrix([]) == {}
+    assert census_report.compute_matrix([]) == {}
 
 
 def test_render_matrix_deterministic_table_with_unknown_row_col_when_present():
@@ -636,8 +637,8 @@ def test_render_matrix_deterministic_table_with_unknown_row_col_when_present():
         {"origin_phase": "implement", "manifested_phase": "merge"},
         {"origin_phase": "unknown", "manifested_phase": "merge"},
     ]
-    matrix = mod.compute_matrix(sightings)
-    rendered = mod.render_matrix(matrix)
+    matrix = census_report.compute_matrix(sightings)
+    rendered = census_report.render_matrix(matrix)
 
     lines = rendered.rstrip("\n").split("\n")
     assert lines[0] == "| origin \\ manifested | merge |"
@@ -646,18 +647,18 @@ def test_render_matrix_deterministic_table_with_unknown_row_col_when_present():
     assert lines[3] == "| unknown | 1 |"
     assert len(lines) == 4
     # deterministic: same input renders byte-identical output every time
-    assert rendered == mod.render_matrix(mod.compute_matrix(sightings))
+    assert rendered == census_report.render_matrix(census_report.compute_matrix(sightings))
 
 
 def test_render_matrix_omits_unknown_when_no_unknown_sightings():
     sightings = [{"origin_phase": "implement", "manifested_phase": "merge"}]
-    matrix = mod.compute_matrix(sightings)
-    rendered = mod.render_matrix(matrix)
+    matrix = census_report.compute_matrix(sightings)
+    rendered = census_report.render_matrix(matrix)
     assert "unknown" not in rendered
 
 
 def test_render_matrix_empty_matrix_is_deterministic_placeholder():
-    assert mod.render_matrix({}) == "_No sightings recorded._\n"
+    assert census_report.render_matrix({}) == "_No sightings recorded._\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1022,38 +1023,38 @@ def test_render_report_carries_each_piece_in_its_own_section():
     # The key set doubles as the force-marker absence check this test used to
     # spell `"--force" not in report`.
     assert [section.key for section in sections] == [
-        mod.SECTION_HEADER,
-        mod.SECTION_METHOD,
-        mod.SECTION_SATURATION,
-        mod.SECTION_SCREENED,
-        mod.SECTION_ADJUDICATION,
-        mod.SECTION_MATRIX,
-        mod.SECTION_SYNTHESIS,
-        mod.SECTION_FINDINGS,
-        mod.SECTION_FILED_TASKS,
-        mod.SECTION_STRUCTURAL,
-        mod.SECTION_DISPOSITIONS,
-        mod.SECTION_COST,
+        census_report.SECTION_HEADER,
+        census_report.SECTION_METHOD,
+        census_report.SECTION_SATURATION,
+        census_report.SECTION_SCREENED,
+        census_report.SECTION_ADJUDICATION,
+        census_report.SECTION_MATRIX,
+        census_report.SECTION_SYNTHESIS,
+        census_report.SECTION_FINDINGS,
+        census_report.SECTION_FILED_TASKS,
+        census_report.SECTION_STRUCTURAL,
+        census_report.SECTION_DISPOSITIONS,
+        census_report.SECTION_COST,
     ]
 
     # Each piece in its OWN section -- strictly stronger than `in report`,
     # which passed if a piece landed anywhere in the blob, including under the
     # wrong heading.
-    header = _section_text(sections, mod.SECTION_HEADER)
+    header = _section_text(sections, census_report.SECTION_HEADER)
     assert "# confusion census 2026-07-14" in header
     assert "Project: dark_factory" in header
-    assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
-    assert ": prose" in _section_text(sections, mod.SECTION_SYNTHESIS)
-    filed = _filed_table(_section_text(sections, mod.SECTION_FILED_TASKS))
+    assert matrix_md in _section_text(sections, census_report.SECTION_MATRIX), "embedded verbatim"
+    assert ": prose" in _section_text(sections, census_report.SECTION_SYNTHESIS)
+    filed = _filed_table(_section_text(sections, census_report.SECTION_FILED_TASKS))
     assert [row["ticket"] for row in filed] == ["tkt_1234", "tkt_1235"]
     assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
-        sections, mod.SECTION_COST
+        sections, census_report.SECTION_COST
     )
 
     # The saturation tallies as whole lines, not bare digits: the old
     # `"2" in report` / `"0.5" in report` checks passed against a rendering
     # that had dropped the batch index or transposed the fields.
-    saturation = _section(sections, mod.SECTION_SATURATION).lines
+    saturation = _section(sections, census_report.SECTION_SATURATION).lines
     assert "- batches: 2" in saturation
     assert "- stop reason: saturated" in saturation
     assert any("batch 0:" in line and "dup_rate=0.50" in line for line in saturation)
@@ -1074,13 +1075,13 @@ def test_the_synthesis_section_is_the_rendering_of_the_records_synthesis_value(r
         brief=_synthesis_brief(), result=result, applied=synthesis.Applied(), standing=3,
     ).to_record())
 
-    lines = _section(mod.census_report_sections(record), mod.SECTION_SYNTHESIS).lines
+    lines = _section(census_report.census_report_sections(record), census_report.SECTION_SYNTHESIS).lines
 
     assert lines == tuple(synthesis.report_lines(record["synthesis"]))
 
 
 def test_render_report_is_deterministic_no_clock():
-    assert mod.render_report(_census_record()) == mod.render_report(_census_record())
+    assert census_report.render_report(_census_record()) == census_report.render_report(_census_record())
 
 
 _NO_INSTRUMENT_RECORDS_NOTE = (
@@ -1349,7 +1350,7 @@ def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
 
     assert batches == _storm_capped_mining_result().batch_stats
     assert all(isinstance(batch.status, coder.CodingStatus) for batch in batches)
-    assert mod.census_report_sections(restored) == mod.census_report_sections(record)
+    assert census_report.census_report_sections(restored) == census_report.census_report_sections(record)
 
 
 def test_a_census_record_batch_status_outside_coding_status_is_rejected():
@@ -1358,7 +1359,7 @@ def test_a_census_record_batch_status_outside_coding_status_is_rejected():
     restored["mining"]["batch_stats"][1]["status"] = "stormy"
 
     with pytest.raises(ValueError, match="stormy"):
-        mod.census_report_sections(restored)
+        census_report.census_report_sections(restored)
 
 
 def _section(sections, key):
@@ -1396,7 +1397,7 @@ def _saturation_lines(sections, prefix):
     substrings like "total=10 ... succeeded=4", so asserting against the whole
     section would pass even against unfixed code."""
     return [
-        line for line in _section(sections, mod.SECTION_SATURATION).lines
+        line for line in _section(sections, census_report.SECTION_SATURATION).lines
         if line.strip().startswith(prefix)
     ]
 
@@ -1520,15 +1521,15 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
 
 
 def _census_record(**overrides):
-    return mod.build_census_record(**_render_kwargs(**overrides))
+    return census_report.build_census_record(**_render_kwargs(**overrides))
 
 
 def _render(**overrides):
-    return mod.render_report(_census_record(**overrides))
+    return census_report.render_report(_census_record(**overrides))
 
 
 def _sections(**overrides):
-    return mod.census_report_sections(_census_record(**overrides))
+    return census_report.census_report_sections(_census_record(**overrides))
 
 
 def test_render_report_capped_run_names_cap_and_partial_coverage():
@@ -1659,7 +1660,7 @@ def test_render_report_no_cap_renders_no_coverage_line():
     assert _saturation_lines(sections, "- coverage:") == []
     assert _saturation_lines(sections, "- operator batch cap:") == []
     assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
-    assert _section(sections, mod.SECTION_SATURATION).lines == (
+    assert _section(sections, census_report.SECTION_SATURATION).lines == (
         "",
         "## Saturation",
         "",
@@ -1674,13 +1675,13 @@ def _verification_bullets(sections):
     """The `SECTION_VERIFICATION` bullets, i.e. the section minus its heading
     and the blank lines framing it."""
     return [
-        line for line in _section(sections, mod.SECTION_VERIFICATION).lines
+        line for line in _section(sections, census_report.SECTION_VERIFICATION).lines
         if line.startswith("- ")
     ]
 
 
 def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
-    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=812, offered=150, cap=150))
+    sections = _sections(verify_coverage=census_report.VerifyCoverage(novel=812, offered=150, cap=150))
 
     bullets = _verification_bullets(sections)
     # TWO bullets: the deferral counts, and the conditional-pickup caveat that
@@ -1714,7 +1715,7 @@ def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
     # Mirror of the batch cap's "not reached" branch. With novel == verified
     # nothing was deferred and nothing went unverified, so the deferral clause
     # would be a false statement about this run.
-    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=5))
+    sections = _sections(verify_coverage=census_report.VerifyCoverage(novel=3, offered=3, cap=5))
 
     bullets = _verification_bullets(sections)
     # ONE bullet, not two: nothing was deferred, so the deferral counts line
@@ -1730,8 +1731,8 @@ def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
 
 
 def test_render_report_without_verify_coverage_renders_no_verification_section():
-    assert mod.SECTION_VERIFICATION not in _section_keys()
-    assert mod.SECTION_VERIFICATION not in _section_keys(verify_coverage=None)
+    assert census_report.SECTION_VERIFICATION not in _section_keys()
+    assert census_report.SECTION_VERIFICATION not in _section_keys(verify_coverage=None)
 
 
 _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
@@ -1740,13 +1741,13 @@ _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 def test_render_report_dry_run_filing_section_names_count_and_path():
     sections = _sections(
         filing=_filing_record(),
-        dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
+        dry_run=census_report.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
     # The two VALUES a reviewer needs, on one line, ordered: the count and the
     # file it was written to.
     assert f"12 payload(s) written to {_PAYLOADS_PATH}" in _section_text(
-        sections, mod.SECTION_FILED_TASKS
+        sections, census_report.SECTION_FILED_TASKS
     )
 
 
@@ -1759,11 +1760,11 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     dry_run_text = _section_text(
         _sections(
             filing=_filing_record(),
-            dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+            dry_run=census_report.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
         ),
-        mod.SECTION_FILED_TASKS,
+        census_report.SECTION_FILED_TASKS,
     )
-    plain_text = _section_text(_sections(filing=_filing_record()), mod.SECTION_FILED_TASKS)
+    plain_text = _section_text(_sections(filing=_filing_record()), census_report.SECTION_FILED_TASKS)
 
     assert dry_run_text != plain_text
     assert f"3 payload(s) written to {_PAYLOADS_PATH}" in dry_run_text
@@ -1774,7 +1775,7 @@ def test_render_report_filed_section_is_one_table_row_per_decision():
     # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
     rows = _filed_table(_section_text(
         _sections(filing=_filing_record("tkt_1", "tkt_2", first_task_id=40)),
-        mod.SECTION_FILED_TASKS,
+        census_report.SECTION_FILED_TASKS,
     ))
 
     assert [(row["ticket"], row["task_id"], row["step"], row["resolution"]) for row in rows] == [
@@ -1790,7 +1791,7 @@ def test_render_report_filed_tasks_section_is_the_disposition_body_under_its_hea
     # Whole-section locks: without a dry run the section is its heading over
     # disposition.filed_tasks_lines, so no dry-run clause can leak in.
     record = _census_record(filing=_filing_record("tkt_1234", "tkt_1235"))
-    filed = _section(mod.census_report_sections(record), mod.SECTION_FILED_TASKS).lines
+    filed = _section(census_report.census_report_sections(record), census_report.SECTION_FILED_TASKS).lines
     assert filed == (
         "", "## Filed Tasks", "",
         *disposition.filed_tasks_lines(record["filing"], observed_root=_RENDER_ROOT),
@@ -1798,7 +1799,7 @@ def test_render_report_filed_tasks_section_is_the_disposition_body_under_its_hea
 
     # A run that filed nothing renders the placeholder alone.
     assert _section(
-        _sections(filing=_filing_record()), mod.SECTION_FILED_TASKS
+        _sections(filing=_filing_record()), census_report.SECTION_FILED_TASKS
     ).lines == ("", "## Filed Tasks", "", "_none filed._")
 
 
@@ -1806,7 +1807,7 @@ def test_render_report_names_the_project_a_cross_project_decision_filed_into():
     harness_root = "/srv/harness"
     rows = _filed_table(_section_text(
         _sections(filing=_filing_record("tkt_7", project_root=harness_root)),
-        mod.SECTION_FILED_TASKS,
+        census_report.SECTION_FILED_TASKS,
     ))
     assert [(row["ticket"], row["project_root"]) for row in rows] == [("tkt_7", harness_root)]
 
@@ -1843,18 +1844,18 @@ def _sample_dropped_verdicts() -> tuple:
     """Two drop records covering the two shapes the section renders
     differently: one contradicting its standing candidate, one agreeing."""
     return (
-        mod.DroppedVerdict(
+        census_report.DroppedVerdict(
             verdict="rejected",
             title="Spurious pattern",
-            kind=mod.DROP_CONTRADICTION,
+            kind=census_report.DROP_CONTRADICTION,
             standing_id="cand-20260701-7",
             standing_disposition="promoted",
             standing_first_seen="2026-07-01",
         ),
-        mod.DroppedVerdict(
+        census_report.DroppedVerdict(
             verdict="verified",
             title="A pattern already promoted",
-            kind=mod.DROP_AGREEMENT,
+            kind=census_report.DROP_AGREEMENT,
             standing_id="cand-20260702-3",
             standing_disposition="promoted",
             standing_first_seen="2026-07-02",
@@ -1914,10 +1915,10 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     },
     "forced": {"force": True},
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
-    "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
+    "verify_capped": {"verify_coverage": census_report.VerifyCoverage(novel=5, offered=2, cap=2)},
     "dry_run_filing": {
         "filing": _filing_record(),
-        "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
+        "dry_run": census_report.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     },
     "unresolved_verdicts": {"dropped_verdicts": _sample_dropped_verdicts()},
 }
@@ -1929,7 +1930,7 @@ def test_census_report_sections_returns_keyed_sections_of_lines():
     assert isinstance(sections, tuple)
     assert sections, "a report always carries at least a header"
     for section in sections:
-        assert isinstance(section, mod.ReportSection)
+        assert isinstance(section, census_report.ReportSection)
         assert isinstance(section.key, str) and section.key
         assert isinstance(section.lines, tuple)
         assert all(isinstance(line, str) for line in section.lines)
@@ -1946,8 +1947,8 @@ def test_render_report_is_the_pure_join_of_its_sections(case):
     outside the structure would pass on the flagless case alone."""
     record = _census_record(**_REPORT_FLAG_CASES[case])
 
-    assert mod.render_report(record) == mod.join_report_sections(
-        mod.census_report_sections(record)
+    assert census_report.render_report(record) == census_report.join_report_sections(
+        census_report.census_report_sections(record)
     )
 
 
@@ -1959,7 +1960,7 @@ def test_render_report_renders_from_the_json_record_alone(case):
 
     parsed = json.loads(json.dumps(record))
 
-    assert mod.render_report(parsed) == mod.render_report(record)
+    assert census_report.render_report(parsed) == census_report.render_report(record)
 
 
 # ---------------------------------------------------------------------------
@@ -1968,7 +1969,7 @@ def test_render_report_renders_from_the_json_record_alone(case):
 # ---------------------------------------------------------------------------
 
 def _findings_text(**overrides) -> str:
-    return _section_text(_sections(**overrides), mod.SECTION_FINDINGS)
+    return _section_text(_sections(**overrides), census_report.SECTION_FINDINGS)
 
 
 def _table_lines(text: str) -> list[str]:
@@ -1997,9 +1998,9 @@ def test_build_census_record_defaults_to_no_findings_and_no_area_map():
 def test_findings_renders_on_every_report_between_synthesis_and_filed_tasks(case):
     sections = _sections(**_REPORT_FLAG_CASES[case])
     keys = [section.key for section in sections]
-    assert keys.index(mod.SECTION_SYNTHESIS) < keys.index(mod.SECTION_FINDINGS)
-    assert keys.index(mod.SECTION_FINDINGS) < keys.index(mod.SECTION_FILED_TASKS)
-    assert "## Findings" in _section(sections, mod.SECTION_FINDINGS).lines
+    assert keys.index(census_report.SECTION_SYNTHESIS) < keys.index(census_report.SECTION_FINDINGS)
+    assert keys.index(census_report.SECTION_FINDINGS) < keys.index(census_report.SECTION_FILED_TASKS)
+    assert "## Findings" in _section(sections, census_report.SECTION_FINDINGS).lines
 
 
 def test_findings_table_names_every_oracle_field_and_the_row():
@@ -2057,7 +2058,7 @@ def test_a_version_1_record_is_refused_naming_its_version():
     old = {key: value for key, value in record.items() if key != "synthesis"}
 
     with pytest.raises(ValueError, match="census record version 1 is not 2"):
-        mod.render_report({**old, "record_version": 1, "synthesis_md": "prose"})
+        census_report.render_report({**old, "record_version": 1, "synthesis_md": "prose"})
 
 
 _METHOD_WINDOW = census_window.MiningWindow(
@@ -2107,7 +2108,7 @@ def _method(**overrides):
         slug_tally=codebook.SlugTally(),
     )
     kwargs.update(overrides)
-    return mod.build_method(**kwargs)
+    return census_report.build_method(**kwargs)
 
 
 _ORACLE_REPORT = check_census_report.Report(
@@ -2127,7 +2128,7 @@ def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state
 
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
     assert check_census_report.check_rendered_method(
-        mod.render_report(record), _ORACLE_REPORT,
+        census_report.render_report(record), _ORACLE_REPORT,
     ) == []
     assert record["method"]["run_id"] == "census-dark_factory-20260714"
     assert record["method"]["as_of_sha"] == "a" * 40
@@ -2151,8 +2152,8 @@ def test_build_method_records_the_runs_slug_rejections():
     assert method["extra"]["slug_rejections"] == expected
     record = json.loads(json.dumps(_census_record(method=method)))
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
-    assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
-    method_section = _section_text(mod.census_report_sections(record), mod.SECTION_METHOD)
+    assert check_census_report.check_rendered_method(census_report.render_report(record), _ORACLE_REPORT) == []
+    method_section = _section_text(census_report.census_report_sections(record), census_report.SECTION_METHOD)
     block = check_census_report.method_block(method_section)
     assert isinstance(block, dict), block
     assert block["extra"]["slug_rejections"] == expected
@@ -2204,14 +2205,14 @@ def test_build_census_record_requires_the_screen_report():
     kwargs = _render_kwargs()
     del kwargs["screened"]
     with pytest.raises(TypeError, match="screened"):
-        mod.build_census_record(**kwargs)
+        census_report.build_census_record(**kwargs)
 
 
 def test_the_census_record_carries_the_screen_report_and_renders_it():
     record = json.loads(json.dumps(_census_record()))
 
     assert record["screened"] == _NOTHING_SCREENED.to_record()
-    assert "Screened" in check_census_report.level2_titles(mod.render_report(record))
+    assert "Screened" in check_census_report.level2_titles(census_report.render_report(record))
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
 
 
@@ -2219,19 +2220,19 @@ def test_build_census_record_requires_the_adjudication_report():
     kwargs = _render_kwargs()
     del kwargs["adjudication"]
     with pytest.raises(TypeError, match="adjudication"):
-        mod.build_census_record(**kwargs)
+        census_report.build_census_record(**kwargs)
 
 
 def test_the_census_record_carries_the_adjudication_report_and_renders_it_after_screened():
     record = json.loads(json.dumps(_census_record()))
 
     assert record["adjudication"] == _NOTHING_ADJUDICATED
-    keys = [section.key for section in mod.census_report_sections(record)]
-    assert keys.index(mod.SECTION_ADJUDICATION) == keys.index(mod.SECTION_SCREENED) + 1
-    assert mod.SECTION_ADJUDICATION == "adjudication"
-    lines = _section(mod.census_report_sections(record), mod.SECTION_ADJUDICATION).lines
+    keys = [section.key for section in census_report.census_report_sections(record)]
+    assert keys.index(census_report.SECTION_ADJUDICATION) == keys.index(census_report.SECTION_SCREENED) + 1
+    assert census_report.SECTION_ADJUDICATION == "adjudication"
+    lines = _section(census_report.census_report_sections(record), census_report.SECTION_ADJUDICATION).lines
     assert lines == tuple(similarity.report_lines(record["adjudication"]))
-    assert "Adjudication" in check_census_report.level2_titles(mod.render_report(record))
+    assert "Adjudication" in check_census_report.level2_titles(census_report.render_report(record))
 
 
 def test_build_method_counts_embedding_calls_attaches_and_adjudications():
@@ -2242,7 +2243,7 @@ def test_build_method_counts_embedding_calls_attaches_and_adjudications():
     assert method["extra"]["adjudicated"] == 5
     record = json.loads(json.dumps(_census_record(method=method)))
     assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
-    assert check_census_report.check_rendered_method(mod.render_report(record), _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(census_report.render_report(record), _ORACLE_REPORT) == []
 
 
 def test_build_method_evidence_comes_from_the_selection(tmp_path):
@@ -2307,35 +2308,35 @@ def test_build_method_without_a_selection_reports_null_evidence():
 
 def test_census_report_sections_flagless_key_set_and_order():
     assert _section_keys() == [
-        mod.SECTION_HEADER,
-        mod.SECTION_METHOD,
-        mod.SECTION_SATURATION,
-        mod.SECTION_SCREENED,
-        mod.SECTION_ADJUDICATION,
-        mod.SECTION_MATRIX,
-        mod.SECTION_SYNTHESIS,
-        mod.SECTION_FINDINGS,
-        mod.SECTION_FILED_TASKS,
-        mod.SECTION_STRUCTURAL,
-        mod.SECTION_DISPOSITIONS,
-        mod.SECTION_COST,
+        census_report.SECTION_HEADER,
+        census_report.SECTION_METHOD,
+        census_report.SECTION_SATURATION,
+        census_report.SECTION_SCREENED,
+        census_report.SECTION_ADJUDICATION,
+        census_report.SECTION_MATRIX,
+        census_report.SECTION_SYNTHESIS,
+        census_report.SECTION_FINDINGS,
+        census_report.SECTION_FILED_TASKS,
+        census_report.SECTION_STRUCTURAL,
+        census_report.SECTION_DISPOSITIONS,
+        census_report.SECTION_COST,
     ]
 
 
 def test_census_report_sections_force_marker_is_gated_and_positioned():
     """Positioned, not merely present: the marker qualifies the header, so it
     belongs immediately below it."""
-    assert mod.SECTION_FORCE_MARKER not in _section_keys()
+    assert census_report.SECTION_FORCE_MARKER not in _section_keys()
 
     forced = _section_keys(force=True)
-    assert forced.index(mod.SECTION_FORCE_MARKER) == forced.index(mod.SECTION_HEADER) + 1
-    assert forced.index(mod.SECTION_METHOD) == forced.index(mod.SECTION_FORCE_MARKER) + 1
+    assert forced.index(census_report.SECTION_FORCE_MARKER) == forced.index(census_report.SECTION_HEADER) + 1
+    assert forced.index(census_report.SECTION_METHOD) == forced.index(census_report.SECTION_FORCE_MARKER) + 1
 
 
 def test_census_report_method_section_is_a_yaml_fence_of_the_record_method():
     record = _census_record()
 
-    lines = _section(mod.census_report_sections(record), mod.SECTION_METHOD).lines
+    lines = _section(census_report.census_report_sections(record), census_report.SECTION_METHOD).lines
 
     assert lines[:4] == ("", "## Method", "", "```yaml")
     assert lines[-1] == "```"
@@ -2346,12 +2347,12 @@ def test_census_report_sections_verification_is_gated_and_positioned():
     """The verification section reports what the verify cap deferred, so it
     belongs between the mining report and the matrix built from what survived
     -- strictly after SATURATION and strictly before MATRIX."""
-    assert mod.SECTION_VERIFICATION not in _section_keys()
+    assert census_report.SECTION_VERIFICATION not in _section_keys()
 
-    keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2))
-    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_SCREENED)
-    assert keys.index(mod.SECTION_SCREENED) < keys.index(mod.SECTION_VERIFICATION)
-    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
+    keys = _section_keys(verify_coverage=census_report.VerifyCoverage(novel=5, offered=2, cap=2))
+    assert keys.index(census_report.SECTION_SATURATION) < keys.index(census_report.SECTION_SCREENED)
+    assert keys.index(census_report.SECTION_SCREENED) < keys.index(census_report.SECTION_VERIFICATION)
+    assert keys.index(census_report.SECTION_VERIFICATION) < keys.index(census_report.SECTION_MATRIX)
 
 
 def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
@@ -2363,19 +2364,19 @@ def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
     there being any, positioned with the other coverage disclosures -- after
     SATURATION and VERIFICATION, before the MATRIX built from what survived.
     """
-    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys()
-    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys(dropped_verdicts=())
+    assert census_report.SECTION_UNRESOLVED_VERDICTS not in _section_keys()
+    assert census_report.SECTION_UNRESOLVED_VERDICTS not in _section_keys(dropped_verdicts=())
 
     keys = _section_keys(dropped_verdicts=_sample_dropped_verdicts())
-    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_SCREENED)
-    assert keys.index(mod.SECTION_SCREENED) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
-    assert keys.index(mod.SECTION_UNRESOLVED_VERDICTS) < keys.index(mod.SECTION_MATRIX)
+    assert keys.index(census_report.SECTION_SATURATION) < keys.index(census_report.SECTION_SCREENED)
+    assert keys.index(census_report.SECTION_SCREENED) < keys.index(census_report.SECTION_UNRESOLVED_VERDICTS)
+    assert keys.index(census_report.SECTION_UNRESOLVED_VERDICTS) < keys.index(census_report.SECTION_MATRIX)
 
     keys = _section_keys(
         dropped_verdicts=_sample_dropped_verdicts(),
-        verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2),
+        verify_coverage=census_report.VerifyCoverage(novel=5, offered=2, cap=2),
     )
-    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+    assert keys.index(census_report.SECTION_VERIFICATION) < keys.index(census_report.SECTION_UNRESOLVED_VERDICTS)
 
 
 def test_census_report_unresolved_verdicts_section_names_every_record():
@@ -2386,7 +2387,7 @@ def test_census_report_unresolved_verdicts_section_names_every_record():
     phrase, exactly as the WARNING is."""
     records = _sample_dropped_verdicts()
     text = _section_text(
-        _sections(dropped_verdicts=records), mod.SECTION_UNRESOLVED_VERDICTS,
+        _sections(dropped_verdicts=records), census_report.SECTION_UNRESOLVED_VERDICTS,
     )
 
     assert str(len(records)) in text, "the section must size the run"
@@ -2404,11 +2405,11 @@ def test_section_text_names_the_key_and_the_keys_present_when_absent():
     sections = _sections()
 
     with pytest.raises(AssertionError) as excinfo:
-        _section_text(sections, mod.SECTION_VERIFICATION)
+        _section_text(sections, census_report.SECTION_VERIFICATION)
 
     message = str(excinfo.value)
-    assert mod.SECTION_VERIFICATION in message
-    assert mod.SECTION_SATURATION in message, "the keys actually present must be named"
+    assert census_report.SECTION_VERIFICATION in message
+    assert census_report.SECTION_SATURATION in message, "the keys actually present must be named"
 
 
 def test_census_report_sections_joined_are_byte_identical_to_the_golden():
@@ -2416,11 +2417,11 @@ def test_census_report_sections_joined_are_byte_identical_to_the_golden():
     views cannot drift: whatever
     test_render_report_flagless_output_is_byte_identical_golden pins for the
     prose, this pins for the partition."""
-    assert mod.join_report_sections(_sections()) == _GOLDEN_FLAGLESS_REPORT
+    assert census_report.join_report_sections(_sections()) == _GOLDEN_FLAGLESS_REPORT
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
-    report = mod.render_report(mod.build_census_record(
+    report = census_report.render_report(census_report.build_census_record(
         method=_SAMPLE_METHOD,
         date="2026-07-14",
         project_id="dark_factory",
@@ -3814,7 +3815,7 @@ def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
             )
 
     assert seen_kinds == {
-        mod.DROP_CONTRADICTION, mod.DROP_AGREEMENT,
+        census_report.DROP_CONTRADICTION, census_report.DROP_AGREEMENT,
     }, f"every kind must be exercised; reached: {seen_kinds}"
 
 
@@ -5798,7 +5799,7 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
             run_id="census-dark_factory-20260730",
             stop_reason="capped",
             gate=_passing_gate(), filing=_NOTHING_FILED,
-            dry_run=mod.DryRunFiling(path=payloads_path, payload_count=7),
+            dry_run=census_report.DryRunFiling(path=payloads_path, payload_count=7),
         )
     )
     monkeypatch.setattr(mod, "run_census", fake_run_census)
@@ -7723,7 +7724,7 @@ def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_render_report_states_the_all_rejected_outcome_without_a_verify_cap():
-    report = _render(verify_coverage=None, mass_rejection=mod.MassRejection(offered=3))
+    report = _render(verify_coverage=None, mass_rejection=census_report.MassRejection(offered=3))
 
     assert "## Verification" in report, (
         "the section must render on the mass-rejection path even with no cap"
@@ -7747,8 +7748,8 @@ def test_render_report_states_the_all_rejected_outcome_without_a_verify_cap():
 
 def test_render_report_renders_the_all_rejected_notice_before_an_existing_cap_line():
     report = _render(
-        verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=3),
-        mass_rejection=mod.MassRejection(offered=3),
+        verify_coverage=census_report.VerifyCoverage(novel=3, offered=3, cap=3),
+        mass_rejection=census_report.MassRejection(offered=3),
     )
 
     section = report.split("## Verification", 1)[1].split("\n## ", 1)[0]
@@ -7770,7 +7771,7 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
     """`mass_rejection=None` must leave the module's byte-identical-flagless
     invariant exactly as it was — that property is deliberate and documented,
     and must not be spent to buy an anomaly signal."""
-    report = mod.render_report(_census_record(mass_rejection=None))
+    report = census_report.render_report(_census_record(mass_rejection=None))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
 
@@ -8338,7 +8339,7 @@ def test_run_census_withholds_an_unremediated_singleton_but_records_it(tmp_path)
         "a withheld cluster is recorded, never lost"
     )
     assert outcome.withheld == (filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),)
-    withheld_text = _section_text(_sections(withheld=outcome.withheld), mod.SECTION_WITHHELD)
+    withheld_text = _section_text(_sections(withheld=outcome.withheld), census_report.SECTION_WITHHELD)
     assert _GATED_TITLE in withheld_text
     assert withheld_text in kwargs["report_path"].read_text(encoding="utf-8")
 
@@ -8373,14 +8374,14 @@ def test_run_census_dry_run_excludes_withheld_clusters_from_the_payloads(tmp_pat
 
 
 def test_census_report_sections_withheld_is_gated_and_positioned():
-    assert mod.SECTION_WITHHELD not in _section_keys()
-    assert mod.SECTION_WITHHELD not in _section_keys(withheld=())
+    assert census_report.SECTION_WITHHELD not in _section_keys()
+    assert census_report.SECTION_WITHHELD not in _section_keys(withheld=())
 
     keys = _section_keys(
         withheld=(filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),),
     )
-    assert keys.index(mod.SECTION_FILED_TASKS) < keys.index(mod.SECTION_WITHHELD)
-    assert keys.index(mod.SECTION_WITHHELD) < keys.index(mod.SECTION_COST)
+    assert keys.index(census_report.SECTION_FILED_TASKS) < keys.index(census_report.SECTION_WITHHELD)
+    assert keys.index(census_report.SECTION_WITHHELD) < keys.index(census_report.SECTION_COST)
 
 
 # ---------------------------------------------------------------------------
@@ -9407,18 +9408,18 @@ def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_o
 @pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
 def test_structural_renders_on_every_report_right_after_filed_tasks(case):
     record = _census_record(**_REPORT_FLAG_CASES[case])
-    keys = [section.key for section in mod.census_report_sections(record)]
-    assert keys.index(mod.SECTION_STRUCTURAL) == keys.index(mod.SECTION_FILED_TASKS) + 1
-    assert "Structural" in check_census_report.level2_titles(mod.render_report(record))
+    keys = [section.key for section in census_report.census_report_sections(record)]
+    assert keys.index(census_report.SECTION_STRUCTURAL) == keys.index(census_report.SECTION_FILED_TASKS) + 1
+    assert "Structural" in check_census_report.level2_titles(census_report.render_report(record))
 
 
 @pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
 def test_dispositions_renders_on_every_report_right_after_structural(case):
     record = _census_record(**_REPORT_FLAG_CASES[case])
-    keys = [section.key for section in mod.census_report_sections(record)]
-    assert keys.index(mod.SECTION_DISPOSITIONS) == keys.index(mod.SECTION_STRUCTURAL) + 1
-    assert keys.index(mod.SECTION_STRUCTURAL) == keys.index(mod.SECTION_FILED_TASKS) + 1
-    assert "Dispositions" in check_census_report.level2_titles(mod.render_report(record))
+    keys = [section.key for section in census_report.census_report_sections(record)]
+    assert keys.index(census_report.SECTION_DISPOSITIONS) == keys.index(census_report.SECTION_STRUCTURAL) + 1
+    assert keys.index(census_report.SECTION_STRUCTURAL) == keys.index(census_report.SECTION_FILED_TASKS) + 1
+    assert "Dispositions" in check_census_report.level2_titles(census_report.render_report(record))
 
 
 def _back_linked_dispositions() -> dict[str, Any]:
@@ -9441,7 +9442,7 @@ def _back_linked_dispositions() -> dict[str, Any]:
 def test_dispositions_section_is_the_disposition_rendering_of_the_record(linked):
     dispositions = _back_linked_dispositions() if linked else _EMPTY_DISPOSITIONS
     record = _census_record(dispositions=dispositions)
-    lines = _section(mod.census_report_sections(record), mod.SECTION_DISPOSITIONS).lines
+    lines = _section(census_report.census_report_sections(record), census_report.SECTION_DISPOSITIONS).lines
     assert record["dispositions"] == dispositions
     assert lines == tuple(disposition.dispositions_lines(record["dispositions"], observed_root=record["project_root"]))
     assert lines[:3] == ("", "## Dispositions", "")
@@ -9451,12 +9452,12 @@ def test_build_census_record_requires_the_dispositions_record():
     kwargs = _render_kwargs()
     del kwargs["dispositions"]
     with pytest.raises(TypeError, match="dispositions"):
-        mod.build_census_record(**kwargs)
+        census_report.build_census_record(**kwargs)
 
 
 def test_structural_section_is_the_disposition_rendering_of_the_record():
     record = _census_record()
-    lines = _section(mod.census_report_sections(record), mod.SECTION_STRUCTURAL).lines
+    lines = _section(census_report.census_report_sections(record), census_report.SECTION_STRUCTURAL).lines
     assert lines == tuple(disposition.structural_lines(record["filing"]))
     assert lines[:3] == ("", "## Structural", "")
     assert len(lines) == 4, "an empty run renders the placeholder alone"
@@ -11445,7 +11446,7 @@ def test_run_census_applies_a_phase_refinement_to_the_promoted_entry_and_the_mat
     assert (entry["origin_phase"], entry["manifested_phase"]) == ("merge", "review")
     report = kwargs["report_path"].read_text(encoding="utf-8")
     matrix = _report_section(report, "Origin x Manifestation Matrix")
-    assert matrix.strip() == mod.render_matrix({"merge": {"review": 1}}).strip()
+    assert matrix.strip() == census_report.render_matrix({"merge": {"review": 1}}).strip()
     applied = _run_record(kwargs)["synthesis"]["applied"]
     assert (applied["clusters_refined"], applied["entries_refined"]) == (1, 1)
 
@@ -11655,10 +11656,10 @@ def test_a_capped_candidate_is_adjudicated_from_the_next_runs_queue_under_a_rewo
 
 
 @pytest.mark.parametrize(("verdict_titles", "standing", "expected_kind"), [
-    ({"verified_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_CONTRADICTION),
-    ({"verified_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_AGREEMENT),
-    ({"rejected_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_CONTRADICTION),
-    ({"rejected_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_AGREEMENT),
+    ({"verified_titles": {_REJECTED_TITLE}}, "rejected", census_report.DROP_CONTRADICTION),
+    ({"verified_titles": {_REJECTED_TITLE}}, "promoted", census_report.DROP_AGREEMENT),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "promoted", census_report.DROP_CONTRADICTION),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "rejected", census_report.DROP_AGREEMENT),
 ], ids=["verify-vs-rejected", "verify-vs-promoted", "reject-vs-promoted", "reject-vs-rejected"])
 def test_a_surfaced_verdict_on_a_standing_candidate_is_dropped_naming_that_candidate(
     tmp_path, caplog, verdict_titles, standing, expected_kind,
