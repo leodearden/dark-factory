@@ -124,6 +124,7 @@ Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]
@@ -297,6 +298,20 @@ def test_find_drift_detects_injected_timeout_stop_sec_divergence():
     assert "TimeoutStopSec=90" in drift
 
 
+def test_find_drift_detects_missing_kill_mode():
+    """An installed unit still on the default KillMode=control-group is drift (task 9493)."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed\n", "")
+    assert mod.find_drift(unit) == ["KillMode=mixed"]
+
+
+def test_find_drift_flags_a_control_group_kill_mode():
+    """An explicit KillMode=control-group is drift too: membership is exact."""
+    mod = _load_checker()
+    unit = _CLEAN_UNIT.replace("KillMode=mixed", "KillMode=control-group")
+    assert "KillMode=mixed" in mod.find_drift(unit)
+
+
 def test_parity_checker_subprocess_exit_1_on_divergent_timeout_stop_sec(
     tmp_path: pathlib.Path,
 ):
@@ -383,6 +398,18 @@ def test_fix_unit_text_is_idempotent():
     assert once == twice
 
 
+def test_fix_unit_text_appends_kill_mode_mixed():
+    """--fix installs KillMode=mixed without touching the host-local project roots."""
+    mod = _load_checker()
+    fixed = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
+    service = mod.parse_unit_sections(fixed)["Service"]
+    assert "KillMode=mixed" in service
+    assert (
+        "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other"
+        in service
+    )
+
+
 # ---------------------------------------------------------------------------
 # find_drift / fix_unit_text tests: ExecStartPre presence (A2)
 # ---------------------------------------------------------------------------
@@ -399,6 +426,7 @@ Restart=on-failure
 RestartSec=5
 RestartSteps=4
 TimeoutStartSec=300
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]
