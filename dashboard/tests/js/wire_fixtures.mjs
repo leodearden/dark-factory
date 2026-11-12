@@ -113,24 +113,26 @@ export function openEscalationItem({ id, taskId, level = 1, ageSecs = 3600, brea
 }
 
 // The ESCALATION_ANALYTICS payload, one per_project entry per
-// `{project, openItems}`. Each lifespan block lists only its open items; the
-// origin and workflow blocks are empty, so their panels render their empty
-// states, and no escalation is terminal.
-export function escalationAnalytics(projects) {
+// `{project, openItems, origin?, workflow?, samples?}`, carrying
+// `regimeMarkers` ({date, label, tasks}, as
+// data/escalation_analytics.py::load_regime_markers serves them). Origin and
+// workflow blocks default to empty and lifespan samples to none, so those
+// panels render their empty states; no escalation is terminal.
+export function escalationAnalytics(projects, { regimeMarkers = [] } = {}) {
   return {
     generated_at: WIRE_AS_OF,
     parse_failures: 0,
-    regime_markers: [],
-    per_project: projects.map(({ project, openItems }) => ({
+    regime_markers: regimeMarkers,
+    per_project: projects.map(({ project, openItems = [], origin = {}, workflow = {}, samples = [] }) => ({
       project,
-      origin: {},
+      origin,
       lifespan: {
         percentiles_by_level: {},
         l1_to_l2_promotion: { count: 0, p50_secs: null, p90_secs: null },
-        samples: [],
+        samples,
         open_items: openItems,
       },
-      workflow: {},
+      workflow,
       terminal: 0,
     })),
   };
@@ -408,8 +410,8 @@ function qualityHeadline(kind, points, form) {
 // One QUALITY.metrics[id] entry with one point per landing. A null
 // `measuredSince` is the no-producer state (INV-13): its rule names no start
 // and its headline is unknown, saying so. The rolling band is unmeasured
-// (null) at every point, and there is no control chart unless `ewma`,
-// `alarms` or `baseline` are given.
+// (null) at every point unless `rolling` is given, and there is no control
+// chart unless `ewma`, `alarms` or `baseline` are given.
 export function qualityMetric({
   kind = 'rate',
   points,
@@ -417,6 +419,7 @@ export function qualityMetric({
   measuredSince = WIRE_AS_OF,
   source = 'rejections',
   unit = kind === 'rate' ? 'share' : kind === 'cost' ? 'usd' : 'per landing',
+  rolling = null,
   ewma = null,
   alarms = [],
   baseline = NO_BASELINE,
@@ -434,7 +437,7 @@ export function qualityMetric({
     },
     unit,
     points,
-    rolling: { center: unmeasured, lo: unmeasured, hi: unmeasured, n: points.map(() => 0) },
+    rolling: rolling ?? { center: unmeasured, lo: unmeasured, hi: unmeasured, n: points.map(() => 0) },
     ewma,
     alarms,
     baseline,
@@ -445,16 +448,103 @@ export function qualityMetric({
 }
 
 // The QUALITY Datum's value: `axis` as qualityAxis builds it, `metrics` keyed
-// by metric id (each from qualityMetric, one point per axis entry), no cost
-// model, no module rows, no before/after comparison, and a git cross-check
-// that disagrees nowhere unless `gitCheck` is given.
-export function qualityPayload({ axis, metrics, gitCheck = NO_GIT_DISAGREEMENT }) {
+// by metric id (each from qualityMetric, one point per axis entry), and a git
+// cross-check that disagrees nowhere unless `gitCheck` is given. No cost model
+// is in force unless `costModel` names some of its fields, and there are no
+// module rows (qualityModuleRow) or before/after comparisons
+// (qualityComparison) unless they are given.
+export function qualityPayload({
+  axis, metrics, gitCheck = NO_GIT_DISAGREEMENT, costModel = {}, modules = [], beforeAfter = [],
+}) {
   return {
     axis: qualityAxis(axis),
     metrics,
-    cost_model: NO_COST_MODEL,
-    modules: [],
-    before_after: [],
+    cost_model: { ...NO_COST_MODEL, ...costModel },
+    modules,
+    before_after: beforeAfter,
     git_check: gitCheck,
+  };
+}
+
+// One QUALITY.value.modules row, as quality_series.py::ModuleRow.to_wire
+// serves it (that method owns the shape); a null `module` is the no-src
+// bucket.
+export function qualityModuleRow({
+  module, landings = 10, tasks = 10, allocatedLines = 1200, allocatedUsd = 24, usdPer100Lines = 2, ranked = true,
+}) {
+  return {
+    module, landings, tasks, allocated_lines: allocatedLines, allocated_usd: allocatedUsd,
+    usd_per_100_lines: usdPer100Lines, ranked,
+  };
+}
+
+// One QUALITY.value.before_after entry, as quality_series.py::BeforeAfter.to_wire
+// serves it (that method owns the shape): measured unless `state` is 'not_yet',
+// whose effect and band are then unmeasured.
+export function qualityComparison({
+  markerId, metric, nBefore = 300, nAfter = 120, effect = 0.05, lo = 0.01, hi = 0.09,
+  state = 'measured', etaDays = null, minDetectable = null,
+}) {
+  const measured = state !== 'not_yet';
+  return {
+    marker_id: markerId, metric, n_before: nBefore, n_after: nAfter,
+    effect: measured ? effect : null, lo: measured ? lo : null, hi: measured ? hi : null,
+    state, eta_days: etaDays, min_detectable: minDetectable,
+  };
+}
+
+const NO_SNAPSHOT_PRODUCER = 'no producer has written here: the nightly quality-metrics snapshot series has no writer yet';
+
+// The whole /api/v2/dashboard/quality body, as api/quality.py::api_quality
+// serves it: `quality` (a qualityPayload value) and `markers` (a
+// qualityMarkers value) as fresh Datums, the snapshot Datum unknown because
+// its producer has not landed, and the landing window echo `window` asked
+// for and served.
+export function qualityBody({ quality, markers = qualityMarkers([]), window = '100' }) {
+  const landings = window === 'all' ? null : Number(window);
+  return {
+    QUALITY: wireDatum(quality),
+    QUALITY_MARKERS: wireDatum(markers),
+    QUALITY_SNAPSHOTS: unreadWireDatum(NO_SNAPSHOT_PRODUCER),
+    WINDOW: { requested: window, served: window, landings },
+    served_at: WIRE_AS_OF,
+  };
+}
+
+// One QUALITY_MARKERS.value.markers entry, as
+// dashboard/src/dashboard/data/quality_markers.py::Marker.to_wire serves it
+// (that method owns the shape): a derived reviewer effort change in
+// dark_factory placed at landing `ordinal`, applying to every series unless
+// `series` names some. A range (an artefact) also names its `untilOrdinal`.
+export function qualityMarker({
+  id,
+  ordinal,
+  kind = 'effort',
+  label = `marker ${id}`,
+  series = null,
+  untilOrdinal = null,
+  until = null,
+  ref = null,
+  at = WIRE_AS_OF,
+  scope = 'dark_factory',
+  source = { type: 'routing', role: 'reviewer_comprehensive' },
+  tasks = [],
+}) {
+  return { id, at, ordinal, until_ordinal: untilOrdinal, kind, scope, series, until, label, source, ref, tasks };
+}
+
+// The QUALITY_MARKERS Datum's value, as quality_markers.py::MarkerStream.to_wire
+// serves it: `markers` as given, no availability flag, prompt coverage not yet
+// written, and nothing skipped or unparsed.
+export function qualityMarkers(markers) {
+  return {
+    markers,
+    availability: [],
+    prompt_coverage: {
+      state: 'not_yet_written', since: null, roles_py_landings: null, counted_since: null,
+      reason: 'no routing decision is folded yet',
+    },
+    curated_parse_failures: 0,
+    skipped_records: 0,
   };
 }

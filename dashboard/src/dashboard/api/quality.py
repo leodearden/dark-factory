@@ -3,7 +3,9 @@
 The ``?window=`` chip counts landings, not days: ``_QUALITY_WINDOWS`` is this
 route's vocabulary, parsed by ``dashboard.api.window.parse_landing_window``.
 ``?project=`` takes the root's label or its project id in any spelling
-``shared.project_id.fold_project_token`` folds. QUALITY_MARKERS is the project's
+``shared.project_id.fold_project_token`` folds. ``?module=`` drills down: QUALITY
+serves only the landings whose lines touch that module, its freshness still read
+over the whole project (blank or absent serves every landing). QUALITY_MARKERS is the project's
 stored marker derivation plus the curated markers in its scope, placed on its
 stored landing axis; its regime events are what the QUALITY statistics split at
 and exclude. Before the project's first derivation, the curated markers in its
@@ -123,10 +125,10 @@ def _regime_events(
 
 async def _quality_series(
     config: DashboardConfig, pool: DbPool, root: Path, window_landings: int | None,
-    now: datetime, events: Sequence[RegimeEvent],
+    now: datetime, events: Sequence[RegimeEvent], module: str | None,
 ) -> Datum[Any]:
     return await read_quality_series(await pool.get(config.quality_db), root, window_landings,
-                                     now=now, events=events)
+                                     now=now, events=events, module=module)
 
 
 @router.get('/api/v2/dashboard/quality')
@@ -147,8 +149,9 @@ async def api_quality(request: Request) -> JSONResponse:
         markers = await _served('the quality marker stream', root,
                                 lambda: _marker_stream(config, pool, project_id, curated, now))
         events = _regime_events(markers, curated, project_id)
+        module = request.query_params.get('module') or None
         quality = await _served('the quality series', root, lambda: _quality_series(
-            config, pool, root, window.landings, now, events))
+            config, pool, root, window.landings, now, events, module))
     datums: dict[str, Datum[Any]] = {
         'QUALITY': quality,
         'QUALITY_MARKERS': markers,

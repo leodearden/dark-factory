@@ -3,12 +3,15 @@
 // real .jsx renders in a jsdom window (dom_harness.mjs); every expected value
 // comes from calling the helper itself, never from source text.
 //
-// All render tests live in this one file: node --test runs each file in its
-// own process, and each process pays the Babel compile once.
+// node --test runs each file in its own process, and each process pays the
+// Babel compile once, so render tests share as few files as possible: this
+// one, and jsx_render_quality.test.mjs for the quality dashboard's seams. The
+// window/act/fetch plumbing both use is _render_helpers.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
+import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
@@ -34,22 +37,6 @@ import {
 
 const PROJECT = 'p';
 const TAB_PROPS = { projectFilter: [], search: '' };
-
-// React reports a broken render (a missing key, an update outside act(), a bad
-// prop) on console.error and renders on, so every test also asserts that
-// nothing reached it, through the unmount.
-function openWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => {
-    harness.close();
-    assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
-  });
-  return harness;
-}
-
-function click(window, element) {
-  window.React.act(() => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
-}
 
 function spansDescribedBy(root, descriptor) {
   return [...root.querySelectorAll('span')].filter(
@@ -991,17 +978,9 @@ function linkedTaskRow(task) {
 }
 
 // Answers the taskProse url for `uid` with `response`, a fetch Response or a
-// promise of one, and leaves every other fetch pending, as the harness's own
-// stub does. Returns every url asked for.
+// promise of one. Returns every url asked for.
 function stubProseFetch(window, uid, response) {
-  const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
-  const asked = [];
-  window.fetch = url => {
-    asked.push(url);
-    if (url !== ON_DEMAND_KEYS.taskProse.url(uid)) return new Promise(() => {});
-    return Promise.resolve(response);
-  };
-  return asked;
+  return stubFetch(window, { [window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse.url(uid)]: response });
 }
 
 function proseResponse(window, uid, prose) {
@@ -1010,23 +989,6 @@ function proseResponse(window, uid, prose) {
 }
 
 const PROSE_UNAVAILABLE = 'The description of this task could not be fetched.';
-
-// React 18's async act() ends with one MessageChannel task, which jsdom lacks;
-// a window timer is the same macrotask hop.
-function allowAsyncAct(window) {
-  window.MessageChannel = class {
-    constructor() {
-      this.port1 = { onmessage: null };
-      this.port2 = { postMessage: () => window.setTimeout(() => this.port1.onmessage(), 0) };
-    }
-  };
-}
-
-async function settle(window) {
-  await window.React.act(async () => {
-    await new Promise(resolve => window.setTimeout(resolve, 0));
-  });
-}
 
 test("tab_escalations.jsx::EscalationSidebar renders the linked task's description from the taskProse on-demand read", async t => {
   const harness = openWindow(t);

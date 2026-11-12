@@ -4,8 +4,9 @@
 and the client decision that renders it; the suite also owns rows 20-21 of
 ``plans/dashboard-prd-lanes-prd.md``, the PRD lanes page rendered from the
 served /prds and /tasks bodies (``prd lanes #N:`` tests). The ``test_quality_sketch_N_``
-tests hold the server half of ``plans/quality-dashboard-prd.md`` rows 3, 4, 5, 10 and 12; their
-client half arrives with that PRD's render leaf. Component tests prove each half alone; this suite proves the pair agrees. ``_boundary_payloads`` drives the
+tests hold the server half of ``plans/quality-dashboard-prd.md`` rows 3, 4, 5, 9, 10 and 12;
+``js/boundary_quality.test.mjs`` holds their client half (``quality #N:`` tests), the served
+bodies read the way the Quality tab reads them. Component tests prove each half alone; this suite proves the pair agrees. ``_boundary_payloads`` drives the
 real routes over fixture substrates, and ``js/boundary_*.test.mjs`` apply
 those exact bodies through data.js's real refreshOne. This file is the node
 half's one owner: ``test_graph_layout_js.py`` does not run it.
@@ -35,6 +36,7 @@ from _boundary_payloads import (
     OFFLINE_SCHEDULER,
     QUALITY_GIT_CHECK,
     QUALITY_LATE_CLAIM,
+    QUALITY_MODULE_ORDINALS,
     QUALITY_OFF_LINE,
     QUALITY_PENDING_TRAIN,
     QUALITY_RECLAIMED_BACK,
@@ -70,13 +72,15 @@ _JS_DIR = Path(__file__).parent / 'js'
 
 _SKETCH_ROWS = frozenset(range(1, 14))
 _PRD_LANES_ROWS = frozenset({20, 21})
+_QUALITY_ROWS = frozenset({3, 4, 5, 9, 10, 12})
 
-# A top-level TAP result for a passing test named 'sketch #N: ...' or
-# 'prd lanes #N: ...'; TAP escapes the '#' because a bare one opens a
-# directive. A `not ok` line never matches, so a failing row counts as
-# uncovered.
+# A top-level TAP result for a passing test named 'sketch #N: ...',
+# 'prd lanes #N: ...' or 'quality #N: ...'; TAP escapes the '#' because a bare
+# one opens a directive. A `not ok` line never matches, so a failing row counts
+# as uncovered.
 _PASSING_ROW_RE = re.compile(r'^ok \d+ - sketch \\#(\d+):', re.MULTILINE)
 _PASSING_PRD_LANES_ROW_RE = re.compile(r'^ok \d+ - prd lanes \\#(\d+):', re.MULTILINE)
+_PASSING_QUALITY_ROW_RE = re.compile(r'^ok \d+ - quality \\#(\d+):', re.MULTILINE)
 
 
 @pytest.fixture(scope='module')
@@ -112,6 +116,7 @@ def test_the_boundary_suite_covers_every_sketch_row(served_bodies, tmp_path):
     for label, rows, pattern in (
         ('sketch', _SKETCH_ROWS, _PASSING_ROW_RE),
         ('prd lanes', _PRD_LANES_ROWS, _PASSING_PRD_LANES_ROW_RE),
+        ('quality', _QUALITY_ROWS, _PASSING_QUALITY_ROW_RE),
     ):
         covered = {int(row) for row in pattern.findall(result.stdout)}
         missing = sorted(rows - covered)
@@ -514,3 +519,31 @@ def test_quality_sketch_12_main_ahead_of_the_cursor_is_stale_until_the_next_tick
     newest = _quality(cleared)['axis'][-len(QUALITY_PENDING_TRAIN):]
     assert [point['task_id'] for point in newest] == list(QUALITY_PENDING_TRAIN)
     assert len({point['unit_id'] for point in newest}) == 1, 'a train is one verify unit'
+
+
+def _alarm_and_marker(body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The rejection rate's first alarm, and the one derived routing marker the store holds."""
+    [alarm, *_] = _quality(body)['metrics']['rejected']['alarms']
+    [marker] = [marker for marker in body['QUALITY_MARKERS']['value']['markers']
+                if marker['source']['type'] == 'routing']
+    return alarm, marker
+
+
+def test_quality_sketch_9_an_alarm_is_explained_only_by_a_marker_near_its_onset(served_bodies):
+    near, near_marker = _alarm_and_marker(served_bodies['quality_alarm_explained'])
+    far, far_marker = _alarm_and_marker(served_bodies['quality_alarm_unexplained'])
+
+    assert near['onset_ordinal'] == far['onset_ordinal'], 'one shift, two marker placements'
+    assert (near['direction'], far['direction']) == ('up', 'up')
+    assert near['onset_ordinal'] - near_marker['ordinal'] == 10
+    assert far['onset_ordinal'] - far_marker['ordinal'] == 100
+    assert near['explained_by'] == near_marker['id']
+    assert far['explained_by'] is None
+
+
+def test_quality_module_drill_down_serves_the_landings_touching_the_module(served_bodies):
+    series = _quality(served_bodies['quality_module'])
+
+    assert _ordinals(series) == list(QUALITY_MODULE_ORDINALS)
+    for metric_id, metric in series['metrics'].items():
+        assert len(metric['points']) == len(QUALITY_MODULE_ORDINALS), metric_id
