@@ -38,6 +38,7 @@ from shared.proc_group import (
     sigkill_process_group,
     snapshot_process_group,
     terminate_process_group,
+    unified_cgroup_path,
 )
 
 
@@ -2487,6 +2488,34 @@ class TestReadSessionId:
 
     def test_on_the_real_proc_it_is_our_own_session(self):
         assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+class TestUnifiedCgroupPath:
+    """The ``0::`` path of a ``/proc/<pid>/cgroup`` text."""
+
+    def test_the_unified_line_is_read_among_v1_lines(self):
+        text = '12:pids:/user.slice\n1:name=systemd:/x\n0::/user.slice/run-u7.scope\n'
+
+        assert unified_cgroup_path(text) == '/user.slice/run-u7.scope'
+
+    def test_the_root_cgroup_is_a_path(self):
+        assert unified_cgroup_path('0::/\n') == '/'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('1:name=systemd:/x\n', id='v1-only'),
+            pytest.param('0::\n', id='no-path'),
+        ],
+    )
+    def test_no_unified_path_is_none(self, text):
+        assert unified_cgroup_path(text) is None
+
+    def test_on_the_real_proc_it_is_an_absolute_path(self):
+        unified = unified_cgroup_path((Path('/proc') / str(os.getpid()) / 'cgroup').read_text())
+
+        assert unified is not None and unified.startswith('/')
 
 
 class TestCpuTicksUnderPathOnTheRealProc:
