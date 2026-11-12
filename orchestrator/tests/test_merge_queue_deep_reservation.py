@@ -248,12 +248,6 @@ def _verify_events_for(scene: _Scene, task_ids: set[str]) -> list[dict[str, Any]
     ]
 
 
-def _assert_verified_on_their_own(scene: _Scene, names: tuple[str, ...]) -> None:
-    for name in names:
-        own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
-        assert own, f'{name} was never verified on its own'
-
-
 class TestAGreenTipLandsTheReservedPrefix:
     """A1: the links stay reserved for the whole tip verify, and land via the chain."""
 
@@ -394,7 +388,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         outcomes = await _outcomes(rnd, names)
         assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
         assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names)
-        _assert_verified_on_their_own(scene, ('F1', 'F2'))
+        for name in ('F1', 'F2'):
+            own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
+            assert own, f'{name} was never verified on its own'
         landed = await _landed_task_files(scene)
         assert (landed[:2], sorted(landed[2:])) == (['H', 'P'], sorted(names))
         assert _reservations(rnd.lane) == []
@@ -458,7 +454,11 @@ async def _tip_passed_and_landed_its_head(
 
 class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
     """E: a tip that passed, torn down by the head-failure cascade before its
-    own finalize, ends its reservation; its links then land on their own."""
+    own finalize, ends its reservation; the old tip never reaches main.
+
+    Once released, a link may be chained again by a later round of its own,
+    so how F1 and F2 land is not pinned; that each lands once is.
+    """
 
     async def test_an_abandoned_p_cascades_over_the_passed_tip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -468,7 +468,7 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
         async with _deep_round(
             scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
         ) as rnd:
-            await _tip_passed_and_landed_its_head(rnd, release_s, s_entered)
+            old_tip = await _tip_passed_and_landed_its_head(rnd, release_s, s_entered)
             rnd.reqs['P'].result.cancel()
             await _until(
                 lambda: _reservations(rnd.lane) == [],
@@ -479,10 +479,10 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
             rnd.release_p.set()
             outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
             assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
-            assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(outcomes)
-            _assert_verified_on_their_own(scene, ('F1', 'F2'))
+            assert outcomes['S'].landed_via_chain is None
             landed = await _landed_task_files(scene)
             assert (landed[:1], sorted(landed[1:])) == (['H'], ['F1', 'F2', 'S'])
+            assert not await _reaches_main(scene, old_tip)
             assert _reservations(rnd.lane) == []
             assert rnd.lane.speculation_accounting_violations() == []
 

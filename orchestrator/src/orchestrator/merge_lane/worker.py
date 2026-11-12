@@ -20775,7 +20775,7 @@ class SpeculativeMergeWorker:
     async def _tear_down_inflight_entry(
         self, entry: InflightEntry, cause: VerifyCancelCause,
     ) -> InflightStatus | None:
-        """Cancel *entry*'s verify for *cause* and release its lease.
+        """End *entry*'s verify (cancelled for *cause*), its lease and its chain reservation.
 
         Returns the status the verify had already finished with, if any, so
         a caller can see a REQUEUED request that is back on the queue.  The
@@ -20784,19 +20784,22 @@ class SpeculativeMergeWorker:
         """
         status: InflightStatus | None = None
         task = entry.verify_task
-        if task is not None:
-            # A CancelledError propagates to stop the loop, rather than being
-            # suppressed the way the stop() drain paths suppress it.
-            await self._teardown_verify_task(
-                entry.lease, task, entry.item.request.task_id,
-                cancel=VerifyCancel.of(cause, entry),
-            )
-            if task.done() and not task.cancelled():
-                with contextlib.suppress(BaseException):
-                    status = getattr(task.result(), 'status', None)
-        if entry.lease is not None and self._host_allocator is not None:
-            await self._cancel_and_release_tracked(entry.lease)
-            entry.lease = None
+        try:
+            if task is not None:
+                # A CancelledError propagates to stop the loop, rather than being
+                # suppressed the way the stop() drain paths suppress it.
+                await self._teardown_verify_task(
+                    entry.lease, task, entry.item.request.task_id,
+                    cancel=VerifyCancel.of(cause, entry),
+                )
+                if task.done() and not task.cancelled():
+                    with contextlib.suppress(BaseException):
+                        status = getattr(task.result(), 'status', None)
+            if entry.lease is not None and self._host_allocator is not None:
+                await self._cancel_and_release_tracked(entry.lease)
+                entry.lease = None
+        finally:
+            self._end_chain_reservation(entry.item.request.request_id, all_landed=False)
         return status
 
     def _frontier_base_commits(self) -> tuple[set[str], set[str]]:

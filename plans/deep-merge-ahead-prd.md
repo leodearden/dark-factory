@@ -217,7 +217,9 @@ Phase 3 — observability + rollout:
     with a WARNING. The tip verify runs on, and the walk lands only what is
     still buffered.
   - **Dead tip**: when the links do not all land (tip fail or raise, abort,
-    expiry, a partial walk), the tip is recorded dead
+    expiry, a partial walk, a passed tip torn down before its finalize (the
+    head-failure cascade, or behind a gate-dispatched rebased head)), the tip
+    is recorded dead
     (`DeadBaseSite.CHAIN_RELEASED`), so INV-3 re-merges or voids anything
     stacked on it.
   - **Successor base**: what successors of a chained entry stack on is its
