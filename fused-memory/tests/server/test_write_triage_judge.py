@@ -2886,6 +2886,12 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert counter.live_count() == 0
 
 
+_UNREACHED_PROVIDER_CASES = [
+    pytest.param(connect_timeout, 'ConnectTimeout', id='connect-timeout'),
+    pytest.param(connect_error, 'ConnectError', id='connect-error'),
+]
+
+
 def _frontier_arm_judge(
     verdicts: list[TriageJudgeVerdict],
 ) -> Callable[..., Awaitable[TriageJudgeVerdict]]:
@@ -2964,8 +2970,11 @@ class TestTheFrontierArmSkipGuard:
     """`_frontier_arm_judge` skips only an unreached provider; any other judge failure fails open and stays red."""
 
     @pytest.mark.asyncio
-    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+    @pytest.mark.parametrize(('handler', 'cause'), _UNREACHED_PROVIDER_CASES)
+    async def test_an_unreached_provider_skips_naming_the_host_and_cause(
+        self, handler: Callable[[httpx.Request], httpx.Response], cause: str,
+    ) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await triage_write(
                 _mid_band_service(), content='c', project_id='p',
@@ -2974,14 +2983,13 @@ class TestTheFrontierArmSkipGuard:
 
         reason = str(excinfo.value)
         assert 'api.openai.com' in reason
-        assert 'ConnectTimeout' in reason
+        assert cause in reason
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ('construct', 'write_triage'),
         [
             pytest.param(_hanging_sdk, {'judge_timeout_seconds': 0.01}, id='budget-expiry'),
-            pytest.param(real_sdk_over(connect_error), {}, id='connect-error'),
             pytest.param(real_sdk_over(read_timeout), {}, id='read-timeout'),
             pytest.param(
                 real_sdk_over(lambda request: httpx.Response(500, request=request)), {},
@@ -3087,14 +3095,17 @@ class TestTheLiveWordingBudgetGuard:
         assert '0.01' in reason
 
     @pytest.mark.asyncio
-    async def test_a_connect_timeout_skips_naming_the_unreached_host(self) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(connect_timeout)), \
+    @pytest.mark.parametrize(('handler', 'cause'), _UNREACHED_PROVIDER_CASES)
+    async def test_an_unreached_provider_skips_naming_the_host_and_cause(
+        self, handler: Callable[[httpx.Request], httpx.Response], cause: str,
+    ) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs())
 
         reason = str(excinfo.value)
         assert 'api.openai.com' in reason
-        assert 'ConnectTimeout' in reason
+        assert cause in reason
 
     @pytest.mark.asyncio
     async def test_a_verdict_is_returned_as_is(self) -> None:
@@ -3141,17 +3152,8 @@ class TestTheLiveWordingBudgetGuard:
         assert excinfo.value is error
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'handler',
-        [
-            pytest.param(connect_error, id='connect-error'),
-            pytest.param(read_timeout, id='read-timeout'),
-        ],
-    )
-    async def test_a_connection_failure_other_than_a_connect_timeout_stays_red(
-        self, handler: Callable[[httpx.Request], httpx.Response],
-    ) -> None:
-        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
+    async def test_a_read_timeout_after_connect_stays_red(self) -> None:
+        with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(read_timeout)), \
                 _raises_without_skipping(openai.APIConnectionError):
             await _live_judge_verdict(**self._judge_kwargs())
 

@@ -49,25 +49,48 @@ def _model_not_found(request: httpx.Request) -> httpx.Response:
     )
 
 
+def _write_timeout(request: httpx.Request) -> httpx.Response:
+    """The request was sent past connect: the provider was reached."""
+    raise httpx.WriteTimeout('timed out', request=request)
+
+
+def _read_error(request: httpx.Request) -> httpx.Response:
+    """The connection dropped after connect: an APIConnectionError the provider did see."""
+    raise httpx.ReadError('connection reset by peer', request=request)
+
+
+def _server_error(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, request=request)
+
+
+@pytest.mark.parametrize(
+    ('handler', 'cause'),
+    [
+        pytest.param(connect_timeout, 'ConnectTimeout', id='connect-timeout'),
+        pytest.param(connect_error, 'ConnectError', id='connect-error'),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_connect_timeout_skips_the_live_call():
-    raised = await _raised_by(skip_if_provider_unreached(_sdk_call(connect_timeout)))
+async def test_a_connect_phase_failure_skips_the_live_call(handler, cause):
+    raised = await _raised_by(skip_if_provider_unreached(_sdk_call(handler)))
 
     assert isinstance(raised, pytest.skip.Exception), raised
     assert 'api.openai.com' in str(raised)
-    assert 'ConnectTimeout' in str(raised)
+    assert cause in str(raised)
 
 
 @pytest.mark.parametrize(
     'handler',
     [
-        pytest.param(connect_error, id='connect-error'),
         pytest.param(read_timeout, id='read-timeout'),
+        pytest.param(_write_timeout, id='write-timeout'),
+        pytest.param(_read_error, id='read-error'),
+        pytest.param(_server_error, id='provider-5xx'),
         pytest.param(_model_not_found, id='model-not-found'),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_provider_failure_other_than_a_connect_timeout_stays_red(handler):
+async def test_a_failure_after_the_connect_phase_stays_red(handler):
     raised = await _raised_by(skip_if_provider_unreached(_sdk_call(handler)))
 
     assert isinstance(raised, openai.APIError), raised
