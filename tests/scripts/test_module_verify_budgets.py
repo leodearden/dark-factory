@@ -1896,7 +1896,7 @@ def test_every_leg_running_the_family_outlasts_its_ceiling(
     WHOLE_TREE_SCAN_TEST_TIMEOUT, or it surfaces as a retried, unattributed infra_timeout
     (task 8402). It lives here because this file alone holds every leg's budget and W.
     Scope: registered module legs only; the repo-root fallback chain and
-    merge_gate_history_test_command are not checked.
+    merge_gate_history_test_command are not checked (task 9396).
     """
     published = published_pairs()
     family_running: set[str] = set()
