@@ -1,4 +1,4 @@
-"""Multi-backend agent invocation: Claude Code, Codex, Gemini, pi and ZCode CLIs.
+"""Multi-backend agent invocation: Claude Code, Codex, Gemini, pi, ZCode and MiMo Code CLIs.
 
 Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
 other subsystems (e.g. fused-memory reconciliation) can reuse it without
@@ -41,6 +41,17 @@ from shared.process_cost import ProcessCostBasis
 from shared.python_env import without_python_env_selection
 from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
 
+from orchestrator.agents.agent_run_home import operator_home
+from orchestrator.agents.mimo_backend import (
+    MimoEndpoint,
+    mimo_config_document,
+    mimo_permission_rules,
+    mimo_run_argv,
+    mimo_run_home,
+    mimo_spawn_env,
+    parse_mimo_sessions,
+    read_mimo_sessions,
+)
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 from orchestrator.agents.zcode_backend import (
     ZCodeEndpoint,
@@ -153,7 +164,7 @@ async def invoke_agent(
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
-    Dispatches to the appropriate backend (claude, codex, gemini, pi, zcode).
+    Dispatches to the appropriate backend (claude, codex, gemini, pi, zcode, mimo).
     *strict_mcp_config* (claude backend ONLY): when True, ``--strict-mcp-config``
     is emitted alongside ``--mcp-config`` so the invocation is scoped to only
     the servers in *mcp_config*, ignoring the ambient project ``.mcp.json``
@@ -177,7 +188,7 @@ async def invoke_agent(
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
-    *prices*, when set (codex/gemini/zcode backends only — claude reports native
+    *prices*, when set (codex/gemini/zcode/mimo backends only — claude reports native
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
     The codex backend maps *allowed_tools* / *disallowed_tools* onto its
@@ -235,6 +246,15 @@ async def invoke_agent(
         )
     elif backend == 'zcode':
         return await _invoke_zcode(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_turns=max_turns, max_budget_usd=max_budget_usd,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            mcp_config=mcp_config, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras, effort=effort,
+            timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
+        )
+    elif backend == 'mimo':
+        return await _invoke_mimo(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_turns=max_turns, max_budget_usd=max_budget_usd,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
@@ -1390,6 +1410,72 @@ async def _invoke_zcode(
         )
     return parse_zcode_output(
         result,
+        cost_of=lambda uncached, output, cached: _estimate_cost(
+            model, uncached + cached, output, prices, cached_input_tokens=cached,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# MiMo Code backend — its translation layer is orchestrator.agents.mimo_backend
+# ---------------------------------------------------------------------------
+
+MIMO_SESSION_READ_TIMEOUT_SECS = 120
+
+
+async def _invoke_mimo(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str,
+    max_turns: int,
+    max_budget_usd: float,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+    effort: str | None,
+    timeout_seconds: float | None,
+    env_overrides: dict[str, str] | None,
+    prices: dict[str, Any] | None,
+) -> AgentResult:
+    """Run one ``mimo run`` in a private MIMOCODE_HOME, then read its usage from that home's session store."""
+    endpoint = MimoEndpoint.from_env_overrides(env_overrides)
+    if timeout_seconds is None:
+        raise ValueError(
+            "the mimo backend needs timeout_seconds: its step cap relies on the endpoint "
+            "honouring tool_choice 'none' and it retries 429/404 without limit, so the "
+            'wall-clock watchdog is its only hard ceiling (plans/mimo-code-harness-probe-2026-11.md)',
+        )
+    logger.debug(
+        'mimo backend: max_budget_usd=%r allowed_tools=%r are not enforced by mimo',
+        max_budget_usd, allowed_tools,
+    )
+    base_env = {**os.environ, **(env_overrides or {})}
+    home_of_operator = operator_home(base_env, backend='mimo')
+    document = mimo_config_document(
+        model=model, endpoint=endpoint, mcp_config=mcp_config,
+        permission=mimo_permission_rules(disallowed_tools), max_turns=max_turns,
+    )
+    with mimo_run_home(
+        system_prompt=system_prompt, config_document=document, operator_home=home_of_operator,
+    ) as home:
+        env = mimo_spawn_env(base_env, home)
+        extras = [*(sandbox_extras or []), str(home.root)]
+
+        async def spawn(
+            argv: list[str], stdin: bytes = b'', timeout: float = MIMO_SESSION_READ_TIMEOUT_SECS,
+        ) -> _SubprocessResult:
+            cmd, wrapped_env = _sandbox_spawn(argv, env, cwd, sandbox_modules, extras)
+            return await _run_subprocess_local(
+                cmd, cwd, wrapped_env, 'mimo', model, max_budget_usd, timeout, stdin_data=stdin,
+            )
+
+        run = await spawn(mimo_run_argv(model, cwd, effort), prompt.encode(), timeout_seconds)
+        exports = await read_mimo_sessions(spawn)
+    return parse_mimo_sessions(
+        exports, run,
         cost_of=lambda uncached, output, cached: _estimate_cost(
             model, uncached + cached, output, prices, cached_input_tokens=cached,
         ),
