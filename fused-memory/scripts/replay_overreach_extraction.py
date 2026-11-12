@@ -45,9 +45,12 @@ Usage (from fused-memory/)::
         --out ../docs/ruling-overreach-lever-reopen-2026-11-10/report.json
 
 ``replay`` resumes an existing --out: recorded (arm, episode) pairs are
-skipped and failure lines are retried. Each arm runs on a client for its own
-model, so arms on different models share one --out; an --out recording an arm
-on a model other than that arm's client's is refused. ``worksheet`` interleaves
+skipped and failure lines are retried. Each arm runs on the client its
+ExtractionLlm names, one client per distinct model and reasoning effort, so
+arms on different clients share one --out; an --out recording an arm on
+another model or effort than that arm's client is refused. A record written
+before task 9065 carries no reasoning_effort and reads as None, the configured
+client's. ``worksheet`` interleaves
 every arm's edges by sha256(edge_uuid) and names no arm, for blind
 adjudication; it carries episode bodies, so it is not committed. ``score``
 validates one verdict file over every arm's edges with the audit's own
@@ -56,8 +59,8 @@ estimators, and judges each lever arm against the control by the
 pre-registered rule beside OVERREACH_RATIO_MAX.
 
 Exit codes: 0 ran; 1 the LLM or graph is unavailable, or an episode failed
-(re-run to resume); 2 an input is invalid, or an arm's client cannot replay it
-(nothing is written).
+(re-run to resume); 2 an input is invalid, or an arm's client cannot be built
+or cannot replay it (nothing is written).
 """
 from __future__ import annotations
 
@@ -837,15 +840,15 @@ def score_replay(
 
 EXIT_OK, EXIT_UNAVAILABLE, EXIT_INVALID = 0, 1, 2
 
-LlmFactory = Callable[[str | None], LLMClient | None]
+LlmFactory = Callable[[ExtractionLlm], LLMClient | None]
 ArmClients = tuple[tuple[ReplayArm, LLMClient], ...]
-"""Each selected arm with the client on its model."""
+"""Each selected arm with the client its ExtractionLlm names."""
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='replay_overreach_extraction',
-        description='Read-only replay of ruling-class extraction under lever arms (task 9040).',
+        description='Read-only replay of ruling-class extraction under lever arms (tasks 9040, 9065).',
     )
     commands = parser.add_subparsers(dest='command', required=True)
     replay = commands.add_parser('replay', help='Re-extract each worksheet episode under each arm.')
@@ -870,8 +873,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _live_llm_factory(model: str | None) -> LLMClient | None:
-    return build_arm_llm(FusedMemoryConfig(), ExtractionLlm(model))
+def _live_llm_factory(llm: ExtractionLlm) -> LLMClient | None:
+    return build_arm_llm(FusedMemoryConfig(), llm)
 
 
 def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -881,22 +884,31 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
-    """One client per distinct arm model, in first-seen order; None if any model has none."""
-    clients: dict[str | None, LLMClient] = {}
-    for model in dict.fromkeys(arm.llm.model for arm in arms):
-        client = llm_factory(model)
+    """One client per distinct arm ExtractionLlm, in first-seen order; None if any has none.
+    The factory raises ArmClientMismatch for a client it cannot build."""
+    clients: dict[ExtractionLlm, LLMClient] = {}
+    for llm in dict.fromkeys(arm.llm for arm in arms):
+        client = llm_factory(llm)
         if client is None:
-            logger.error('no extraction LLM for %s; nothing is written', model or 'the configured llm.model')
+            logger.error('no extraction LLM for %s at reasoning effort %s; nothing is written',
+                         llm.model or 'the configured llm.model', llm.reasoning_effort)
             return None
-        clients[model] = client
-    return tuple((arm, clients[arm.llm.model]) for arm in arms)
+        clients[llm] = client
+    return tuple((arm, clients[arm.llm]) for arm in arms)
 
 
-def _model_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
-    model_of = {arm.name: llm.model for arm, llm in arm_clients}
+def _record_effort(record: Mapping[str, Any]) -> str | None:
+    """A record's reasoning effort. A record written before task 9065 has no such key: its
+    client sent none, so it reads as None."""
+    return record.get('reasoning_effort')
+
+
+def _client_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
+    client_of = {arm.name: (llm.model, client_reasoning_effort(llm)) for arm, llm in arm_clients}
     return sorted({
-        f'{r["arm"]} was replayed on {r["model"]}, not {model_of[r["arm"]]}'
-        for r in kept if r['arm'] in model_of and r['model'] != model_of[r['arm']]
+        f'{r["arm"]} was replayed on {_client_axis(r["model"], _record_effort(r))}, '
+        f'not {_client_axis(*client_of[r["arm"]])}'
+        for r in kept if r['arm'] in client_of and (r['model'], _record_effort(r)) != client_of[r['arm']]
     })
 
 
@@ -939,17 +951,17 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     except (ReplayFileError, UnreadableInput, WorksheetMismatch) as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
-    arm_clients = _arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
-    if arm_clients is None:
-        return EXIT_UNAVAILABLE
     try:
-        for arm, llm in arm_clients:
+        arm_clients = _arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
+        for arm, llm in arm_clients or ():
             await check_arm_client(llm, arm)
     except (ArmClientMismatch, UnmeasurableClient) as exc:
         logger.error('an arm cannot be replayed on its client, nothing is written: %s', exc)
         return EXIT_INVALID
-    if conflicts := _model_conflicts(kept, arm_clients):
-        logger.error('this --out already holds other models, nothing is written: %s', conflicts)
+    if arm_clients is None:
+        return EXIT_UNAVAILABLE
+    if conflicts := _client_conflicts(kept, arm_clients):
+        logger.error('this --out already holds other clients, nothing is written: %s', conflicts)
         return EXIT_INVALID
     write_files_atomically({out: _jsonl(kept)})
     async with contextlib.AsyncExitStack() as opened:
@@ -1027,10 +1039,11 @@ def run(
 ) -> int:
     """Parse *argv* (default ``sys.argv[1:]``) and run one subcommand.
 
-    *llm_factory* maps each selected arm's model (None = the configured
-    llm.model) to an extraction client (default: build_arm_llm over the loaded
-    config); *reader_factory* maps a graph name to
-    a ReadOnlyGraphReader (default: FalkorDB over GRAPH.RO_QUERY).
+    *llm_factory* maps each selected arm's ExtractionLlm (model None = the
+    configured llm.model, effort None = the configured client) to an
+    extraction client (default: build_arm_llm over the loaded config);
+    *reader_factory* maps a graph name to a ReadOnlyGraphReader (default:
+    FalkorDB over GRAPH.RO_QUERY).
     """
     return asyncio.run(_run(_build_parser().parse_args(argv), llm_factory, reader_factory))
 
