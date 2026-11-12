@@ -11,8 +11,8 @@ test_memory_eval_transcript_corpus.py / test_memory_eval_retrieval_probe.py.
 
 Every test here runs against in-memory record lists or a hand-written store
 double, EXCEPT the single ``@pytest.mark.integration`` smoke, which seeds and
-deletes a throwaway graph on the scratch FalkorDB and reads it with one
-``GRAPH.RO_QUERY``. The builder's read path never writes: the store double's
+deletes a throwaway graph on the scratch FalkorDB and reads it with read-only
+``GRAPH.RO_QUERY`` queries. The builder's read path never writes: the store double's
 tripwires enforce it offline, and ``GRAPH.RO_QUERY`` enforces it server-side on
 the live path. Only that smoke's own seeding and teardown write, and only to
 its throwaway scratch graph.
@@ -46,6 +46,7 @@ from shared.testing_streams import (
 )
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphProxy, open_graph
+from fused_memory.backends.paged_read import RESULTSET_SIZE
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 
 SCRIPT_PATH = (
@@ -731,8 +732,11 @@ class _ReadOnlyViolation(AssertionError):
     """Raised by the double when the reader touches a write-capable path."""
 
 
+_PAGE_BOUNDS = re.compile(r'\bSKIP (\d+) LIMIT (\d+)\b')
+
+
 class _FalkorDouble:
-    """A FalkorDB graph handle stand-in that cannot be written through.
+    """A FalkorDB graph handle stand-in that answers like the server and cannot be written through.
 
     A real class, never MagicMock (enforced repo-wide by
     fused-memory/scripts/check_bare_magicmock_config.py) — a MagicMock would
@@ -743,16 +747,35 @@ class _FalkorDouble:
     asserted on rather than guessed at, and raises from ``query()`` — the
     write-capable command path — and from any ``execute_command`` verb other
     than ``GRAPH.RO_QUERY``.
+
+    ``ro_query`` answers the way a FalkorDB server does: a ``count(...)``
+    census gets the number of rows held, a ``SKIP s LIMIT l`` page gets that
+    slice of the rows ordered on column 0 (``uuid``, the PROJECTED_FIELDS
+    order), and anything else gets the rows as stored. Every answer is then
+    truncated SILENTLY to its first *cap* rows, as the server truncates at its
+    result-set cap — no error, no marker. *cap* defaults to the cap the
+    reader assumes, ``fused_memory/backends/paged_read.py::RESULTSET_SIZE``.
     """
 
-    def __init__(self, rows: list[list[object]] | None = None):
+    def __init__(self, rows: list[list[object]] | None = None, cap: int = RESULTSET_SIZE):
         self.rows = rows if rows is not None else []
+        self.cap = cap
         self.ro_queries: list[str] = []
         self.violations: list[str] = []
 
     async def ro_query(self, cypher, *args, **kwargs):
         self.ro_queries.append(cypher)
-        return types.SimpleNamespace(result_set=[list(row) for row in self.rows])
+        return types.SimpleNamespace(result_set=self._answer(cypher))
+
+    def _answer(self, cypher: str) -> list[list[object]]:
+        if 'count(' in cypher:
+            answer: list[list[object]] = [[len(self.rows)]]
+        elif (bounds := _PAGE_BOUNDS.search(cypher)) is not None:
+            skip, limit = int(bounds[1]), int(bounds[2])
+            answer = sorted(self.rows, key=lambda row: str(row[0]))[skip : skip + limit]
+        else:
+            answer = self.rows
+        return [list(row) for row in answer[: self.cap]]
 
     # -- tripwires: every write-capable path -------------------------------
     async def query(self, cypher, *args, **kwargs):
@@ -864,9 +887,12 @@ class TestReaderProjectionCarriesNoOutcomeSignal:
         """The projection is closed, not merely 'does not currently include'."""
         double = _FalkorDouble([_row('u1')])
         _fetch(double)
-        cypher = double.ro_queries[0]
-        returned = re.findall(r'e\.([A-Za-z_]+)', cypher)
-        assert tuple(returned) == _mod.PROJECTED_FIELDS
+        pages = [cypher for cypher in double.ro_queries if ' SKIP ' in cypher]
+        assert pages, double.ro_queries
+        for cypher in pages:
+            projection = cypher.split(' ORDER BY ')[0]
+            returned = re.findall(r'e\.([A-Za-z_]+)', projection)
+            assert tuple(returned) == _mod.PROJECTED_FIELDS, cypher
 
     def test_query_has_no_where_clause(self):
         """No filter of any kind — the population is the whole population.
@@ -879,16 +905,21 @@ class TestReaderProjectionCarriesNoOutcomeSignal:
         for cypher in double.ro_queries:
             assert 'WHERE' not in cypher.upper(), cypher
 
-    def test_query_has_no_limit(self):
-        """The FULL population is needed or the stratum denominators are wrong.
 
-        A LIMIT would silently bias the census toward whatever order the store
-        returned, and every proportional share computed from it would be wrong.
-        """
-        double = _FalkorDouble([_row('u1')])
-        _fetch(double)
-        for cypher in double.ro_queries:
-            assert 'LIMIT' not in cypher.upper(), cypher
+class TestThePopulationIsReadWholePastTheServerCap:
+    """FalkorDB truncates every answer at its result-set cap, silently.
+
+    The FULL population is needed or the stratum denominators are wrong, and
+    every proportional share computed from them would be wrong with it. On
+    2026-11-12 the unpaged read of dark_factory returned exactly 10000 rows:
+    the cap, not the population.
+    """
+
+    def test_a_population_above_the_cap_is_read_whole(self):
+        uuids = [f'u{i:05d}' for i in range(RESULTSET_SIZE + 2000)]
+        population = _fetch(_FalkorDouble([_row(uuid) for uuid in uuids]))
+        assert len(population) == len(uuids)
+        assert {record.uuid for record in population} == set(uuids)
 
 
 class TestOutcomeFailedEpisodesStayEligible:
@@ -1018,7 +1049,7 @@ class TestReaderRejectsUnusableContent:
     def test_the_error_names_the_row_and_the_episode(self):
         """Every other error in the module names its offender; so does this one."""
         with pytest.raises(_mod.CorpusBuildError) as exc:
-            _fetch(_FalkorDouble([_row('u1'), self._row_without_content('u-null')]))
+            _fetch(_FalkorDouble([_row('u-good'), self._row_without_content('u-null')]))
         assert 'u-null' in str(exc.value)
         assert 'row 1' in str(exc.value)
 
@@ -1217,9 +1248,20 @@ class TestNoOutcomeFilterStatement:
         # Existence only — the prose statement stays in the artifact's surface,
         # but its wording is not the guarantee. The asserts below are.
         assert isinstance(block['statement'], str) and block['statement']
-        assert block['population_query'] == _mod.POPULATION_CYPHER
+        template = _mod.POPULATION_READ.page_template
+        assert block['population_query'] == template
         assert 'entity_edges' not in block['population_query']
         assert 'WHERE' not in block['population_query'].upper()
+
+        double = _FalkorDouble([_row('u1')])
+        _fetch(double)
+        issued = re.escape(template)
+        for placeholder in ('{skip}', '{limit}'):
+            issued = issued.replace(re.escape(placeholder), r'\d+')
+        pages = [cypher for cypher in double.ro_queries if ' SKIP ' in cypher]
+        assert pages, double.ro_queries
+        for cypher in pages:
+            assert re.fullmatch(issued, cypher), cypher
 
     def test_records_the_stratification_dimensions_used(self):
         block = _built()['no_outcome_filter']
@@ -3566,7 +3608,7 @@ class TestBuilderScriptSatisfiesTheDeliveredCheck:
 
 
 # ===========================================================================
-# Live smoke — ONE read-only query against a seeded scratch graph
+# Live smoke — read-only queries against a seeded scratch graph
 # ===========================================================================
 #
 # Marked @pytest.mark.integration PER-TEST, never as a module-level pytestmark:
@@ -3616,7 +3658,7 @@ class _RecordingLiveGraph:
 @pytest.mark.integration
 @falkor_skipif()
 def test_live_population_read_smoke(monkeypatch):
-    """One GRAPH.RO_QUERY against a live graph seeded on the scratch FalkorDB.
+    """Read-only GRAPH.RO_QUERY reads against a live graph seeded on the scratch FalkorDB.
 
     Measures, on the real client path, that the read projects the six fields
     and places every row in its stratum, plus the two hazards: only the
@@ -3686,5 +3728,7 @@ def test_live_population_read_smoke(monkeypatch):
     assert projected == set(SEEDED_EPISODES)
     assert {_mod.stratum_key(r) for r in population} == SEEDED_STRATA
 
-    # The hazards, measured: exactly one query, on the read-only path only.
-    assert [r.commands for r in recorders] == [['ro_query']]
+    # The hazard, measured: every command went over the read-only path.
+    [recorder] = recorders
+    assert recorder.commands
+    assert all(command == 'ro_query' for command in recorder.commands), recorder.commands
