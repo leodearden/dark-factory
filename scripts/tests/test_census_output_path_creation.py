@@ -75,6 +75,16 @@ def _never_roll_back(**kwargs):
     raise AssertionError("roll_back must not run on a landed commit")
 
 
+def _done(outcome) -> mod.Done:
+    assert isinstance(outcome, mod.Done), outcome
+    return outcome
+
+
+def _deferred(outcome) -> mod.Deferred:
+    assert isinstance(outcome, mod.Deferred), outcome
+    return outcome
+
+
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """Every ``run_census`` seam, wired to trivial inline fakes, with the
     four output paths under directories that do NOT exist in *root*.
@@ -141,7 +151,7 @@ def test_run_census_creates_missing_report_parent_dir(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert kwargs["report_path"].exists()
 
 
@@ -155,7 +165,7 @@ def test_run_census_creates_missing_dry_run_payloads_parent_dir(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert payloads_path.exists()
     # An empty list is the honest content for a run with no novel clusters.
     assert json.loads(payloads_path.read_text(encoding="utf-8")) == []
@@ -174,7 +184,7 @@ def test_run_census_creates_missing_codebook_and_state_parent_dirs(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert kwargs["codebook_path"].exists()
     assert kwargs["census_state_path"].exists()
 
@@ -200,7 +210,7 @@ def test_run_census_creates_output_dirs_before_mining_begins(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert observed == [True], (
         "output parents must be created BEFORE mining pulls its first batch"
     )
@@ -218,6 +228,6 @@ def test_run_census_deferred_at_headroom_creates_no_output_dirs(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "deferred"
+    outcome = _deferred(outcome)
     assert not (tmp_path / "plans").exists()
     assert not (tmp_path / "docs" / "legibility").exists()

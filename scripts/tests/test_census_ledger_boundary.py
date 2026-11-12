@@ -222,6 +222,21 @@ def census(tmp_path):
     return _Census(tmp_path)
 
 
+def _done(outcome) -> mod.Done:
+    assert isinstance(outcome, mod.Done), outcome
+    return outcome
+
+
+def _deferred(outcome) -> mod.Deferred:
+    assert isinstance(outcome, mod.Deferred), outcome
+    return outcome
+
+
+def _unlanded(outcome) -> mod.Unlanded:
+    assert isinstance(outcome, mod.Unlanded), outcome
+    return outcome
+
+
 def _record_of(report_path: Path) -> tuple[str, dict[str, Any]]:
     text = report_path.with_suffix(".json").read_text(encoding="utf-8")
     return text, json.loads(text)
@@ -233,7 +248,7 @@ def test_the_run_writes_its_record_first_and_renders_the_report_from_it(census):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     report_path = kwargs["report_path"]
     record_path = report_path.with_suffix(".json")
     assert outcome.record_path == str(record_path)
@@ -275,7 +290,7 @@ def test_any_source_whose_selection_is_declared_is_ledgered(census):
     window_source = census.source()
     pre_rendered = list(window_source)
 
-    outcome = mod.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered))
+    outcome = _done(mod.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered)))
 
     assert outcome.ledger_rows_written == 1
     assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
@@ -290,7 +305,7 @@ def test_row1_a_trickle_coded_session_is_skipped_and_the_rest_ledgered(census):
     census.trickle_row("S-sierra")
     invoke = _Invoke()
 
-    outcome = mod.run_census(**census.kwargs(invoke=invoke))
+    outcome = _done(mod.run_census(**census.kwargs(invoke=invoke)))
 
     _, record = _record_of(census.report_path())
     assert record["method"]["evidence"]["skipped_coded"] == 1
@@ -308,9 +323,9 @@ def test_row2_a_capped_run_is_resumed_by_the_next(census):
     for sid in sessions:
         census.session(sid)
 
-    first = mod.run_census(**census.kwargs(
+    first = _done(mod.run_census(**census.kwargs(
         source=census.source(batch_size=2), max_batches=1,
-    ))
+    )))
 
     assert first.stop_reason == "capped"
     first_rows = census.ledger_rows()
@@ -358,8 +373,8 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
 
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "unlanded"
-    assert outcome.record_path is None
+    outcome = _unlanded(outcome)
+    assert not hasattr(outcome, "record_path")
     [call] = roll_back.calls
     assert str(kwargs["report_path"].with_suffix(".json")) in call["paths"]
     assert census.ledger_rows() == []
@@ -373,7 +388,7 @@ def test_row3_a_deletion_shaped_coding_is_skipped_and_never_ledgered(census):
 
     outcome = mod.run_census(**census.kwargs(invoke=_DeletingInvoke("S-sierra")))
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert [skipped.session for skipped in outcome.skipped_deletions] == ["S-sierra"]
     assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
     assert outcome.ledger_rows_written == 1
@@ -386,7 +401,7 @@ def test_a_preflight_defer_ledgers_nothing(census):
         invoke=_Invoke("You have reached your usage limit for this period."),
     ))
 
-    assert outcome.status == "deferred"
+    outcome = _deferred(outcome)
     assert session_ledger.read_ledger(census.ledger_path).total_rows is None
 
 
@@ -401,7 +416,7 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
             **census.kwargs(commit=_Recorder(_LANDED, effect=clobber_ledger)),
         )
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     assert outcome.ledger_rows_written is None
     assert outcome.ledger_write_error is not None
     assert str(census.ledger_path) in outcome.ledger_write_error
