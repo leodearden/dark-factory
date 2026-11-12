@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from typing import NamedTuple
 
@@ -40,6 +41,20 @@ class _ParkKey(NamedTuple):
     @classmethod
     def of(cls, owner: str, rank: int) -> _ParkKey:
         return cls(rank, *id_tie_break(owner))
+
+
+
+@dataclass(frozen=True)
+class UncontestedAcquisition:
+    """What a partial widen took, and each key another task holds or parks."""
+
+    acquired: tuple[str, ...]
+    contested: tuple[Blocker, ...]
+
+    def __post_init__(self) -> None:
+        both = sorted(set(self.acquired) & {blocker.module for blocker in self.contested})
+        if both:
+            raise ValueError(f'lock keys {both} cannot be both acquired and contested')
 
 
 class ModuleLockTable:
@@ -1001,3 +1016,35 @@ class ModuleLockTable:
         self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
         return True
+
+    def held_modules(self, task_id: str) -> frozenset[str]:
+        """The modules *task_id* holds now, as an immutable snapshot. A READ."""
+        return frozenset(self._held.get(task_id, ()))
+
+    def acquire_uncontested(
+        self, task_id: str, modules: Iterable[str]
+    ) -> UncontestedAcquisition:
+        """Take every free key of *modules*, name the rest, release nothing.
+
+        Keys the task already holds are skipped. The contested keys are
+        exactly :meth:`blockers`, which names what the acquire gate honours
+        (INV-5), so the free remainder must then be acquirable; a refusal is
+        an invariant breach and raises rather than returning a silent partial.
+        Never releases a lock and never touches task status.
+        """
+        depth = self._config.lock_depth
+        held = self.held_modules(task_id)
+        requested = [
+            key
+            for key in dict.fromkeys(normalize_lock(m, depth) for m in modules)
+            if key and key not in held
+        ]
+        contested = tuple(self.blockers(task_id, requested))
+        contested_keys = {blocker.module for blocker in contested}
+        free = [key for key in requested if key not in contested_keys]
+        if free and not self.try_acquire_additional(task_id, free):
+            raise RuntimeError(
+                f'Task {task_id}: try_acquire_additional refused {free}, which '
+                'blockers() reported free; INV-5 requires the two to agree'
+            )
+        return UncontestedAcquisition(acquired=tuple(free), contested=contested)
