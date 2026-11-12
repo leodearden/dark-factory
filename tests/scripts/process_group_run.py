@@ -17,6 +17,7 @@ open to its budget by a pipe a descendant still held.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import signal
 import subprocess
@@ -26,23 +27,59 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO
 
+from df_pytest_isolation import ProcState, read_proc_state
+
 _EXIT_POLL_SECS = 0.05
+_PROC = Path('/proc')
+_UNREADABLE = '?'
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupMember:
+    """A live process-group member: its ``/proc`` state, command line and each thread's wait channel.
+
+    ``thread_wchans`` lists the kernel wait channel of the main thread first,
+    then of every other thread by tid.
+    """
+
+    pid: int
+    state: ProcState
+    cmdline: str
+    thread_wchans: tuple[str, ...]
 
 
 class ProcessGroupOverrun(Exception):
     """The group leader was still running when its budget ran out."""
 
-    def __init__(self, budget_secs: float, leader_pid: int, stdout: str, stderr: str) -> None:
-        super().__init__(budget_secs, leader_pid, stdout, stderr)
+    def __init__(
+        self,
+        budget_secs: float,
+        leader_pid: int,
+        members: tuple[GroupMember, ...],
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        super().__init__(budget_secs, leader_pid, members, stdout, stderr)
         self.budget_secs = budget_secs
         self.leader_pid = leader_pid
+        self.members = members
         self.stdout = stdout
         self.stderr = stderr
 
     def __str__(self) -> str:
+        return '\n'.join([
+            f'process group {self.leader_pid} was still running after '
+            f'{self.budget_secs}s; live members at the deadline:',
+            *(self._member_line(member) for member in self.members),
+            f'stdout:\n{self.stdout}',
+            f'stderr:\n{self.stderr}',
+        ])
+
+    def _member_line(self, member: GroupMember) -> str:
+        role = ' (leader)' if member.pid == self.leader_pid else ''
         return (
-            f'process group {self.leader_pid} was still running after {self.budget_secs}s\n'
-            f'stdout:\n{self.stdout}\nstderr:\n{self.stderr}'
+            f'  pid {member.pid}{role} ppid {member.state.ppid} state {member.state.state} '
+            f'wchan {",".join(member.thread_wchans)}: {member.cmdline}'
         )
 
 
@@ -66,6 +103,7 @@ def run_process_group(
         )
         try:
             exited = _await_exit_unreaped(leader.pid, deadline=time.monotonic() + budget_secs)
+            members = () if exited else _group_members(leader.pid)
         finally:
             # Still unreaped here, so the leader's pid pins the pgid and cannot
             # have been recycled into someone else's group.
@@ -73,7 +111,7 @@ def run_process_group(
             leader.wait()
         stdout, stderr = _read_text(out), _read_text(err)
     if not exited:
-        raise ProcessGroupOverrun(budget_secs, leader.pid, stdout, stderr)
+        raise ProcessGroupOverrun(budget_secs, leader.pid, members, stdout, stderr)
     return subprocess.CompletedProcess(list(argv), leader.returncode, stdout, stderr)
 
 
@@ -85,6 +123,55 @@ def _await_exit_unreaped(pid: int, *, deadline: float) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(_EXIT_POLL_SECS)
+
+
+def _group_members(pgid: int) -> tuple[GroupMember, ...]:
+    """Every live process in group *pgid*, the leader first; a pid that vanishes mid-walk is skipped."""
+    pids = sorted(_pids_in_group(pgid), key=lambda pid: (pid != pgid, pid))
+    members = (_member(pid) for pid in pids)
+    return tuple(member for member in members if member is not None)
+
+
+def _pids_in_group(pgid: int) -> list[int]:
+    found: list[int] = []
+    for entry in os.listdir(_PROC):
+        if not entry.isdigit():
+            continue
+        with contextlib.suppress(ProcessLookupError):
+            if os.getpgid(int(entry)) == pgid:
+                found.append(int(entry))
+    return found
+
+
+def _member(pid: int) -> GroupMember | None:
+    state = read_proc_state(pid)
+    if state is None:
+        return None
+    return GroupMember(pid, state, _cmdline(pid), _thread_wchans(pid))
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        raw = (_PROC / str(pid) / 'cmdline').read_bytes()
+    except OSError:
+        return _UNREADABLE
+    return raw.rstrip(b'\0').replace(b'\0', b' ').decode('utf-8', errors='replace')
+
+
+def _thread_wchans(pid: int) -> tuple[str, ...]:
+    tasks = _PROC / str(pid) / 'task'
+    try:
+        tids = sorted((int(tid) for tid in os.listdir(tasks)), key=lambda tid: (tid != pid, tid))
+    except OSError:
+        return (_UNREADABLE,)
+    return tuple(_wchan(tasks / str(tid)) for tid in tids)
+
+
+def _wchan(task: Path) -> str:
+    try:
+        return (task / 'wchan').read_text().strip() or _UNREADABLE
+    except OSError:
+        return _UNREADABLE
 
 
 def _kill_group(pgid: int) -> None:
