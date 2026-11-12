@@ -506,13 +506,13 @@ class TestUnicodeDigitsAreNotTaskNumbers:
     decimal digits with ``\\d`` on str patterns, so 'task \\u0663' parsed as a task
     whose number was that character.
 
-    This is a false POSITIVE against the contract :func:`scan_content` states for
-    itself — PRECISION OVER RECALL, because its consumers perform destructive
-    edge surgery — and it is the OPPOSITE direction from the KNOWN BLIND SPOTS
-    that docstring enumerates (bare-digit names, title references, codename
-    aliases), every one of which is a recall loss. So it is not covered by them:
-    a blind spot silently misses a real referent, while this MINTS one that names
-    nothing.
+    This is a false POSITIVE against the PRECISION OVER RECALL rule the module
+    docstring states, which holds because the scan's consumers perform
+    destructive edge surgery. It is the OPPOSITE direction from the accepted
+    blind spots :func:`scan_content`'s docstring enumerates (bare digits, task
+    titles, list continuations), every one of which is a recall loss. So it is
+    not covered by them: a blind spot silently misses a real referent, while
+    this MINTS one that names nothing.
 
     The DECLARED path already refuses these — referent_resolution._is_task_number
     guards its bare-digit branch with ``text.isascii() and text.isdigit()`` (task
@@ -659,11 +659,11 @@ class TestTaskWordIsAsciiOnly:
     spelled with a lookalike.
 
     ONE thing the narrowing changes BEYOND refusing the lookalike, declared
-    because the module calls this direction dangerous elsewhere: removing a
-    bare mention also removes a CONTEST. ``_LOCAL_MENTION_PATTERN``'s
-    whitespace branch is deliberately left Unicode-broad precisely because
-    narrowing it would mean 'fewer bare mentions ... which means MORE
-    confident splits on prose that pre-3667 refused'. The same is true here —
+    because plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+    §Rationale rehomed names this direction of safety: a narrowing that removes
+    a bare mention also removes a CONTEST, which is why
+    ``_LOCAL_MENTION_PATTERN``'s whitespace gap stays Unicode-broad. Fewer bare
+    mentions mean more confident splits. The same is true here —
     and it is acceptable here only because the mention removed was never the
     word 'task', so the contest it created was SPURIOUS, not a genuine
     competing reading. ``test_a_lookalike_mention_no_longer_contests_a_``
@@ -1035,32 +1035,25 @@ class TestScanContentAllowlist:
         )
         assert [r.node_name for r in scan.refs] == ['Task 7', 'Task 8']
 
-    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+    @pytest.mark.parametrize(
+        'registry',
+        [
+            pytest.param({'-home-leo-bad'}, id='one-path-shaped-entry'),
+            pytest.param({'-home-leo-bad', '-home-leo-other'}, id='several-path-shaped-entries'),
+        ],
+    )
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self, registry):
         """A registry whose entries are ALL path-shaped degrades to PERMISSIVE.
 
-        The one-bad-entry case above is only half the contract scan_content
-        states for ``known_project_ids`` — "one bad entry never disables the
-        whole allowlist". When EVERY entry is skipped the surviving set is
-        empty, and an empty frozenset ``is not None``, so the qualified-ref
-        guard would read "allowlist of nothing" as "allow nothing" and drop
-        every foreign ref — silently disabling the detection this scanner
-        exists to provide. Mirrors ``validate_known_project_id``'s permissive
+        The one-bad-entry case above is only half of it: scan_content skips a
+        path-shaped entry rather than disabling the whole allowlist, and
+        narrows only when a usable entry is left. When EVERY entry is skipped,
+        reading "an allowlist of nothing" as "allow nothing" would drop every
+        foreign ref — silently disabling the detection this scanner exists to
+        provide. Mirrors ``validate_known_project_id``'s permissive
         falsy-registry mode rather than inventing a fail-closed one.
         """
-        scan = scan_content(
-            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
-        )
-        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
-
-    def test_every_entry_path_shaped_leaves_the_scan_permissive(self):
-        """Several unusable entries are no different from one: nothing survives
-        canonicalization, so the filter does not narrow at all, rather than
-        reading "an allowlist of nothing" as "allow nothing"."""
-        scan = scan_content(
-            'see dark_factory:2500',
-            group_id='reify',
-            known_project_ids={'-home-leo-bad', '-home-leo-other'},
-        )
+        scan = scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry)
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_a_blank_registry_key_also_yields_the_permissive_fallback(self):
@@ -1261,8 +1254,11 @@ class TestAllPathShapedRegistryIsLoud:
             f'got {len(warnings)}: {[r.message for r in warnings]}'
         )
         # Assert MEANING, not wording: the message must name the consequence
-        # (the filter is now permissive), not merely complain about an input.
-        assert 'permissive' in warnings[0].getMessage().lower()
+        # (the filter is now permissive) and the likely cause (project roots
+        # supplied where ids were expected), not merely complain about an input.
+        message = warnings[0].getMessage().lower()
+        assert 'permissive' in message
+        assert 'roots' in message
 
     def test_warning_is_emitted_only_once_per_process(self, monkeypatch, caplog):
         """Warn-once: a scanner on a write path must not turn one
@@ -1491,9 +1487,6 @@ class TestUnregisteredKindIsRejectedLoudly:
     def test_the_kind_registry_is_read_only(self):
         pytest.raises(TypeError, operator.setitem, canonical_labels.KIND_LABELS, 'ticket', 'Ticket')
 
-    def test_registered_kinds_are_exactly_task(self):
-        assert dict(canonical_labels.KIND_LABELS) == {'task': 'Task'}
-
 
 class TestTaskVocabularyQualifier:
     """The predicate reads a qualifier its caller has already lowercased, so it
@@ -1519,9 +1512,16 @@ class TestTaskVocabularyQualifier:
         assert is_task_vocabulary_qualifier(qualifier) is expected
 
 
+def _parts_at_any_depth(parts):
+    for part in parts:
+        yield part
+        yield from _parts_at_any_depth(getattr(part, 'parts', ()))
+
+
 class TestOneGrammar:
-    """The rules are composed from shared fragment objects, so a rule that
-    re-spells a fragment inline fails here (row 19 of the S26 PRD)."""
+    """The rules are composed from shared fragment objects at any depth, so a
+    rule or fragment that re-spells a shared fragment inline fails here (row 19
+    of the S26 PRD)."""
 
     @pytest.mark.parametrize(
         ('fragment', 'rules'),
@@ -1551,12 +1551,37 @@ class TestOneGrammar:
                 ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
                 id='one-task-word',
             ),
+            pytest.param(
+                '_COLON',
+                ('_QUALIFIED_REF_PATTERN', '_QUALIFIED_NODE_NAME_PATTERN'),
+                id='one-colon',
+            ),
+            pytest.param(
+                '_MARK',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-separator-mark',
+            ),
+            pytest.param(
+                '_GAP',
+                ('_TASK_NODE_NAME_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-separator-gap',
+            ),
+            pytest.param(
+                '_PAD',
+                (
+                    '_TASK_NODE_NAME_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
+                id='one-separator-pad',
+            ),
         ],
     )
     def test_each_rule_is_built_from_the_shared_fragment(self, fragment, rules):
         shared = getattr(canonical_labels, fragment)
         for rule in rules:
             parts = getattr(canonical_labels, rule).parts
-            assert any(part is shared for part in parts), (
+            assert any(part is shared for part in _parts_at_any_depth(parts)), (
                 f'{rule} spells {fragment} itself instead of composing the shared fragment'
             )

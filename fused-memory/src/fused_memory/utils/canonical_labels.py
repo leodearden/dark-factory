@@ -23,6 +23,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Self
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -34,14 +35,21 @@ logger = logging.getLogger(__name__)
 # Per process, not per registry: once set, a differently broken registry is silent.
 _all_path_shaped_warned: bool = False
 
-#: Each referent kind and the label its own-project node name renders.
+#: Each referent kind and the label its own-project node name renders; a new kind
+#: also needs its own rules before anything parses or scans it.
 KIND_LABELS: Mapping[str, str] = MappingProxyType({'task': 'Task'})
 
 
 class _Fragment(str):
-    """A named grammar fragment: a distinct object, so a rule's use of it is checked by identity."""
+    """A named grammar fragment that keeps the parts it was joined from, so a
+    rule's use of a shared fragment is checkable by identity at any depth."""
 
-    __slots__ = ()
+    parts: tuple[str, ...]
+
+    def __new__(cls, *parts: str) -> Self:
+        fragment = super().__new__(cls, ''.join(parts))
+        fragment.parts = parts
+        return fragment
 
 
 @dataclass(frozen=True)
@@ -58,15 +66,16 @@ def _compile(*parts: str, anchored: bool) -> _Rule:
 
 
 def _either(*branches: str) -> _Fragment:
-    return _Fragment('(?:' + '|'.join(branches) + ')')
+    alternation = [part for branch in branches for part in ('|', branch)][1:]
+    return _Fragment('(?:', *alternation, ')')
 
 
 _TASK_WORD = _Fragment(r'[Tt][Aa][Ss][Kk][Ss]?')
 _PAD = _Fragment(r'[ \t]*')
 _WIDE_PAD = _Fragment(r'\s*')
 _GAP = _Fragment(r'\s+')
-_COLON = _Fragment(_PAD + ':' + _PAD)
-_MARK = _Fragment(_PAD + '[#:]' + _PAD)
+_COLON = _Fragment(_PAD, ':', _PAD)
+_MARK = _Fragment(_PAD, '[#:]', _PAD)
 _SEPARATOR = _either(_MARK, _GAP)
 _MENTION_SEPARATOR = _either(_MARK, _GAP, r'[-/]')
 _NUMBER = _Fragment(r'([0-9]+)')
@@ -105,7 +114,7 @@ class Referent:
         if self.kind not in KIND_LABELS:
             raise ValueError(
                 f'unregistered referent kind {self.kind!r}; registered kinds are '
-                f'{sorted(KIND_LABELS)}. Register it in canonical_labels.KIND_LABELS.'
+                f'{sorted(KIND_LABELS)}. Add it to the KIND_LABELS literal in canonical_labels.py.'
             )
 
     @property
@@ -188,8 +197,9 @@ def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[s
         logger.warning(
             'cross-project ref allowlist disabled: none of the %d supplied '
             'known_project_ids is a usable project id (each was path-shaped or blank), '
-            'so the filter runs in PERMISSIVE mode. Logged once per process: re-check '
-            'the registry rather than reading a silent log as an all-clear.',
+            'so the filter runs in PERMISSIVE mode. Likely cause: the registry was wired '
+            'with project ROOTS where project IDs were expected. Logged once per process: '
+            're-check the registry rather than reading a silent log as an all-clear.',
             supplied,
         )
     return None
