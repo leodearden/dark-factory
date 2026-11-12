@@ -280,7 +280,7 @@ class TestRecordsPinBlockedRecovery:
         [(2, 'blocking'), (3, 'blocking'), (1, 'critical'), (0, 'urgent')],
     )
     def test_a_human_held_stranded_blocked_record_pins(self, level: int, severity: str) -> None:
-        """Re-pending it only re-dispatches into the gate that stops on it (task 6145)."""
+        """A re-dispatch meets the gate that stops on it; a direct merge would pass it (task 6145)."""
         records = [_ref('stranded_blocked', level=level, severity=severity)]
         assert records_pin_blocked_recovery(_TID, records, live_claimant=False) is True
 
@@ -525,7 +525,7 @@ class TestTheTwoBlockedPredicatesDivergeOnExactlyTheEnumeratedRows:
         'dead-filer-l0': (True, False),
         # On main the ask is met, so only the done-flip relaxes (task 4645).
         'lone-preexisting-main-break': (False, True),
-        # Recovery re-dispatches into the gate that stops on a human-held record; a done-flip on main does not.
+        # Recovery re-dispatches into, or merges past, a human-held record; a done-flip on main does neither.
         'human-held-remediable-l2': (False, True),
     }
 

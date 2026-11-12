@@ -201,10 +201,13 @@ def records_pin_blocked_recovery(
     silently relax a strand nobody can see.
 
     A record that needs a human (:func:`escalation.pins.needs_human`) is never
-    relaxed.  Every recovery-side remediation re-dispatches into the workflow
-    gate that stops on that record, so relaxing it loops block -> re-pend
-    (task 6145); ``orchestrator/tests/test_merge_gate_implies_sweep_pin.py``
-    pins the property.
+    relaxed (task 6145).  A re-dispatch meets the workflow gate that stops on
+    that record, so relaxing it loops block -> re-pend; a direct merge (the
+    harness's EXISTS_OFF_MAIN verified-green submit) never meets that gate and
+    would merge past the record, which repend-PRD D4 stop-the-line forbids.
+    ``orchestrator/tests/test_merge_gate_implies_sweep_pin.py`` pins the
+    property, and ``orchestrator/tests/test_stranded_verified_green_human_held.py``
+    the direct-merge consumer.
 
     NOT the predicate for a done-flip — see
     :func:`records_pin_blocked_done_flip`, its deliberately-more-conservative
@@ -244,8 +247,9 @@ def records_pin_blocked_done_flip(
       conservative, because this predicate is consumed only where the branch is
       ON MAIN and that escalation's ask is already met (task 4645);
     * a human-held merge-remediable record — the recovery predicate is MORE
-      conservative, because a re-dispatch meets the gate that stops on it
-      (task 6145); the done-flip, reached only on main, keeps relaxing it.
+      conservative, because a re-dispatch meets the gate that stops on it and
+      a direct merge would pass it (task 6145); the done-flip, reached only on
+      main, merges nothing and keeps relaxing it.
 
     The dead-L0 asymmetry is PRD D3 ("Done-flip vetoes stay maximally conservative:
     any non-info open record still vetoes MARK_DONE") and spec

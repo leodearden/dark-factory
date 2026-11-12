@@ -639,7 +639,9 @@ and are not restated here.
     records does not veto the merge it asks for. The recovery predicate
     applies it only while no record needs a human
     (`escalation/src/escalation/pins.py::needs_human`): a re-dispatch would
-    meet the workflow gate that stops on that record (task 6145). They differ
+    meet the workflow gate that stops on that record, and the off-main
+    verified-green submit goes straight to the merge queue and would merge
+    past it, which repend-PRD D4 stop-the-line forbids (task 6145). They differ
     on exactly three inputs: a dead-filer L0 holds the done-flip but not the
     recovery; a lone `preexisting_main_break` record holds the recovery but
     not the on-main done-flip; and a human-held `stranded_blocked` record
