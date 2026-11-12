@@ -333,9 +333,15 @@ The pre-registered mapping (§2.4), applied:
 * **The 9040 §6.2 R→R+O6 trigger FIRES.** Both arms pass, so the routing
   effort is **low**, the cheaper effort at an equal verdict.
 * One routing task is filed, `task_kind` deterministic and
-  `always_escalates`. It carries both arms' results and the §6 cost to Leo
-  for a spend ruling before anything is routed. Nothing is routed by this
-  task.
+  `always_escalates` with no `before_done`: a pure gate. It carries both
+  arms' results and the §6 cost to Leo for a spend ruling before anything is
+  routed. Nothing is routed by this task.
+  * Ticket `tkt_0RWXDK946QRQ7SVWBHCQYG49AF`, filed 2026-11-12 with
+    `spawned_from` 9065. The curator assigns the task id asynchronously.
+  * The routing it gates names effort low, inherits
+    `ExplicitEffortOpenAIClient`'s no-temperature and explicit-effort
+    handling promoted into `fused-memory/src/fused_memory/backends/llm_clients.py`,
+    and keeps today's `max_output_tokens` caps (§3: no call above 27%).
 
 ## 8. Residuals
 
