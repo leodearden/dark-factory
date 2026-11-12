@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from shared.merge_subject import MergeSubject, merge_subject_pattern, parse_merge_subject
+from shared.merge_subject import MergeSubject, parse_merge_subject
 from shared.task_complexity import is_simple_complexity
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
@@ -641,10 +641,10 @@ async def discover_completed_tasks(
 ) -> list[CompletedTaskCandidate]:
     """Discover completed-task merges via the git log (read-only).
 
-    Greps ``git log [--since=<since>]`` for the landing subject of
-    ``shared/src/shared/merge_subject.py::merge_subject_pattern`` under the
-    given *branch_prefix* / *main_branch*, and re-reads each subject with
-    ``parse_merge_subject``. Each landing becomes a :class:`CompletedTaskCandidate`
+    Pre-filters ``git log [--since=<since>]`` on the bare *branch_prefix* (it
+    survives a wrapped first paragraph, which ``%s`` joins), then re-reads each
+    subject with ``shared/src/shared/merge_subject.py::parse_merge_subject``
+    against *branch_prefix* / *main_branch*. Each landing becomes a :class:`CompletedTaskCandidate`
     STUB carrying ``task_id`` + ``merge_sha`` + resolved ``pre_commit`` (M^1) /
     ``post_commit`` (M). ``title`` / ``description`` / ``complexity`` /
     ``modules`` are left empty for a downstream enrichment pass (the CLI fills
@@ -657,8 +657,7 @@ async def discover_completed_tasks(
     """
     root = Path(repo_root)
     resolved_root = project_root or str(root)
-    landing = merge_subject_pattern(branch_prefix=branch_prefix, main_branch=main_branch)
-    cmd = ['git', 'log', '--extended-regexp', f'--grep={landing}', '--pretty=%H %s']
+    cmd = ['git', 'log', '--fixed-strings', f'--grep={branch_prefix}', '--pretty=%H %s']
     if since:
         cmd.insert(2, f'--since={since}')
     out = await _git_run(cmd, cwd=root)

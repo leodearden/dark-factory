@@ -26,7 +26,7 @@ from enum import StrEnum
 from typing import NamedTuple
 
 from shared.git_async import run_git
-from shared.merge_subject import MergeSubject, merge_subject_pattern, parse_merge_subject
+from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BASE_BRANCH,
@@ -205,13 +205,14 @@ async def _is_ancestor(checkout: _Checkout, older: str, newer: str) -> bool:
 
 
 async def _scan_merge_markers(checkout: _Checkout, revisions: str) -> dict[str, MarkerHit] | None:
-    """Map each branch merged in *revisions* to its NEWEST marker; only an exact SUBJECT counts."""
-    landing = merge_subject_pattern(
-        branch_prefix=checkout.branch_prefix, main_branch=checkout.main_branch,
-    )
+    """Map each branch merged in *revisions* to its NEWEST marker; only an exact SUBJECT counts.
+
+    The grep is a coarse branch-prefix pre-filter: a full-subject grep would miss
+    a wrapped first paragraph, which git's ``%s`` joins back into the subject.
+    """
     stdout = await _git_stdout(
         checkout, 'merge-marker scan',
-        'log', revisions, '--extended-regexp', f'--grep={landing}',
+        'log', revisions, '--fixed-strings', f'--grep={checkout.branch_prefix}',
         '--format=%H%x1f%ct%x1f%s', '--',
     )
     if stdout is None:

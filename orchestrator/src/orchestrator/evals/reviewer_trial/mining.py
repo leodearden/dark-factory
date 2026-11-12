@@ -24,7 +24,7 @@ from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from shared.merge_subject import MergeSubject, merge_subject_pattern, parse_merge_subject
+from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
@@ -261,23 +261,22 @@ def resolve_merge_sha_by_task_id(
     Older/legacy task rows (or logging gaps) can lack the ``merge_finalized``
     event ``mine_fn_candidates`` normally reads ``merge_sha`` from. The task's
     landing commit carries ``shared/src/shared/merge_subject.py``'s subject for
-    ``<branch_prefix><task_id>`` into *main_branch*, so this greps
-    ``git log --all`` for it as a second recovery path and re-reads each
-    candidate's SUBJECT, since git's ``--grep`` also matches a body line.
+    ``<branch_prefix><task_id>`` into *main_branch*, so this pre-filters
+    ``git log --all`` on the bare branch name (it survives a wrapped first
+    paragraph, which ``%s`` joins) as a second recovery path, then requires each
+    candidate's SUBJECT to equal it, since the grep also matches a body line, a
+    longer id or a Revert.
     Returns the most recent such commit's sha, or ``None`` (never raises) when
     none exists, *task_id* is not a git ref token, the repo path is invalid, or
     git errors.
     """
     try:
         expected = MergeSubject(f'{branch_prefix}{task_id}', main_branch)
-        landing = merge_subject_pattern(
-            branch_prefix=branch_prefix, task_id=task_id, main_branch=main_branch,
-        )
     except ValueError:
         return None
     try:
         result = subprocess.run(
-            ['git', 'log', '--all', '-E', f'--grep={landing}', '--format=%H%x1f%s'],
+            ['git', 'log', '--all', '--fixed-strings', f'--grep={expected.branch}', '--format=%H%x1f%s'],
             cwd=repo_path, capture_output=True, text=True,
         )
     except OSError:
