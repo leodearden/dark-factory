@@ -8947,7 +8947,8 @@ class TaskWorkflow:
                     return await self._mark_blocked('Verification attempts exhausted', detail=detail)
                 # Passing fall-through: the tip _enter_phase(REVIEW) records as
                 # the next run's checkpoint key (task 2752), or why it has none.
-                self._verify_green_tip_sha = await self._verified_tip('the post-verify green tip')
+                if self.event_store is not None:
+                    self._verify_green_tip_sha = await self._verified_tip('the post-verify green tip')
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)

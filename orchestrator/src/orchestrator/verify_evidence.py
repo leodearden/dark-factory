@@ -1,5 +1,6 @@
 """What a verify verdict attests: the identity of the plan it ran and the outcome
-of each unit, as typed values and as event fields."""
+of each unit, as typed values and as event fields, and the ``workflow_verify``
+row that records a branch verdict at its tip or the TipUnresolved reason it has none."""
 
 from __future__ import annotations
 
@@ -161,7 +162,9 @@ def verify_event_fields(result: VerifyEvidence | None) -> dict[str, Any]:
     }
 
 
-class VerdictEvidence(VerifyEvidence, Protocol):
+class TimedVerifyEvidence(VerifyEvidence, Protocol):
+    """VerifyEvidence plus the run's own wall time and admission wait, which a workflow_verify row records."""
+
     @property
     def duration_secs(self) -> float: ...
     @property
@@ -174,7 +177,7 @@ def workflow_verify_event_data(
     tip_sha: str | TipUnresolved,
     base_sha: str | None,
     branch: str,
-    result: VerdictEvidence | None,
+    result: TimedVerifyEvidence | None,
     site: VerifySite,
     runner: str,
 ) -> dict[str, Any]:
