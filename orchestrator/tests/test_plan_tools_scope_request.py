@@ -1,7 +1,8 @@
 """The plan-tools ``report_missing_plan_file`` tool: a writer's scope request (task 3090).
 
-The tool records a request in the LANE ``scope_requests.json`` artifact and
-never writes plan.json; the workflow applies it at the next writer boundary.
+The tool records a request for an existing worktree file in the LANE
+``scope_requests.json`` artifact and never writes plan.json; the workflow
+applies it at the next writer boundary.
 """
 
 from __future__ import annotations
@@ -13,17 +14,25 @@ import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
-from orchestrator.mcp.plan_tools import _create_plan
 from orchestrator.scope_drift import ScopeRequest
 
-_DECLARED = 'orchestrator/src/orchestrator/a.py'
+_PACKAGE = 'orchestrator/src/orchestrator'
+_DECLARED = f'{_PACKAGE}/a.py'
+_EXISTING = ('a', 'b', 'c', *(f'm{n}' for n in range(8)))
 
 
 @pytest.fixture()
 def artifacts(tmp_path) -> TaskArtifacts:
+    package = tmp_path / _PACKAGE
+    package.mkdir(parents=True)
+    for name in _EXISTING:
+        (package / f'{name}.py').write_text('')
     a = TaskArtifacts(tmp_path)
     a.init('test-1', 'Test task', 'A test')
-    _create_plan(a, 'test-1', 'Test task', 'Analysis', [_DECLARED])
+    a.write_plan({
+        'task_id': 'test-1', 'title': 'Test task', 'analysis': 'Analysis',
+        'files': [_DECLARED], 'prerequisites': [], 'steps': [],
+    })
     return a
 
 
@@ -94,6 +103,19 @@ async def test_an_invalid_request_returns_an_error_and_writes_nothing(
     assert result['status'] == 'error'
     assert result['field'] == field
     assert isinstance(result['message'], str) and result['message']
+    assert artifacts.read_scope_requests() == ()
+    assert _plan_bytes(artifacts) == before
+
+
+@pytest.mark.asyncio
+async def test_a_path_naming_no_file_returns_an_error_and_writes_nothing(artifacts):
+    before = _plan_bytes(artifacts)
+
+    result = await _report(artifacts, f'{_PACKAGE}/typo.py', 'plan omitted it')
+
+    assert result['status'] == 'error'
+    assert result['field'] == 'path'
+    assert 'typo.py' in result['message']
     assert artifacts.read_scope_requests() == ()
     assert _plan_bytes(artifacts) == before
 

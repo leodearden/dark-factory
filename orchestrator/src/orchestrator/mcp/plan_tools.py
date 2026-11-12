@@ -1876,12 +1876,22 @@ def _report_missing_plan_file(
 
     The workflow applies it at the next writer boundary
     (``workflow.py::TaskWorkflow._apply_scope_requests``). Reads the declared
-    files with ``peek_plan``, which never writes plan.json.
+    files with ``peek_plan``, which never writes plan.json. A path naming no
+    file in the worktree is refused, so a typo never reaches plan.files.
     """
     try:
         request = ScopeRequest(path, reason)
     except InvalidScopeRequest as exc:
         return {'status': 'error', 'field': exc.field, 'message': str(exc)}
+    if not (artifacts.worktree / request.path).is_file():
+        return {
+            'status': 'error',
+            'field': 'path',
+            'message': (
+                f'path {request.path!r} names no file in the worktree; '
+                'a file you create needs no report'
+            ),
+        }
     if not pending_scope_paths([request], artifacts.peek_plan().get('files', [])):
         return {'status': 'already_in_scope', 'path': request.path}
     pending = artifacts.write_scope_request(request)
