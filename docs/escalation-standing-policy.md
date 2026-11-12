@@ -416,20 +416,23 @@ decidable from a pasted report alone.
 
 ## Classes measured on a proxy act
 
-Four rows allow a deciding act that is not in the reversible-action list. A
-stamp for one of them can propose only the trailing `close_only` (or `resume`),
-so the class's agreement rate measures whether the record should close, not
-whether the deciding act should run (Leo, 2026-11-09, sitting item 522).
+Four rows allow a deciding act that is not in the reversible-action list. The
+only one of the row's acts a stamp can meaningfully propose is the trailing
+`close_only` (or `resume`), so the class's agreement rate measures whether the
+record should close, not whether the deciding act should run (Leo, 2026-11-09,
+sitting item 522). The codec checks a proposal against the reversible-action
+list only, not against the row's own acts; task 8478 adds that per-row check.
 
 - `red_main_recovery` (`recover_main`) and `b3_low_risk_unblock` (`b3_apply`) —
   file-writing, audited at 100% until n ≥ 20 (`PolicyRow.audit_full_until`;
   `plans/decision-stream-prd.md` §3 decisions 5-6). That audit is the real
   check on the act; the agreement rate is not.
 - `verify_host_reprobed` (`reprobe_quarantine`) — the verify-host monitor
-  resolves these records itself with no `resolution_action`
-  (`orchestrator/src/orchestrator/merge_lane/liveness.py::_resolve_pending_alarm`),
-  so a stamp never reaches a rate and the class's agreement rate is always
-  `None`. η cannot flip it on this measurement.
+  resolves these records itself
+  (`orchestrator/src/orchestrator/merge_lane/liveness.py::_resolve_pending_alarm`):
+  a non-human resolver, with no `resolution_action`. Every stamp therefore
+  lands in `non_human_resolver`, and the class's agreement rate is `None` while
+  the monitor closes them. η cannot flip it on this measurement.
 - `dead_letter_replayed` (`replay_dead_letters`) — not file-writing, so only the
   random audit draw checks the replay. No ruling yet names a stronger check.
 
