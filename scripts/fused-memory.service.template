@@ -116,8 +116,8 @@ RestartSteps=4
 RestartMaxDelaySec=60
 
 # A stop SIGTERMs only the main process (`uv run`, which forwards it once to
-# the server), so the server drains in-flight tool calls and ends their
-# subprocesses itself; the rest of the cgroup gets only the final SIGKILL.
+# the server), so the server drains in-flight tool calls and ends its LLM
+# subprocesses itself; any other child gets only the final SIGKILL.
 # Pinned by fused-memory/tests/test_systemd_unit_config.py::TestKillModeMixed.
 KillMode=mixed
 
