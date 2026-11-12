@@ -500,7 +500,7 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 # A budget below W + that ceiling kills the leg before a member's backstop
 # fires, turning an attributable hang into a retried infra_timeout. So the
-# binding floor is now min_leg_budget_for_family(W) = 1600, above the
-# convention-sized 1000 of SIZING. Gated by
+# binding floor is min_leg_budget_for_family(W), above the convention-sized
+# figure of SIZING, and the key below declares exactly that floor. Gated by
 # tests/scripts/test_module_verify_budgets.py::test_every_leg_running_the_family_outlasts_its_ceiling.
 verify_command_timeout_secs: 1600
