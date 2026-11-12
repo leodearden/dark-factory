@@ -69,8 +69,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -102,19 +103,8 @@ logger = logging.getLogger(__name__)
 # alternative if a second distinct misconfiguration ever needs to be visible.
 _all_path_shaped_warned: bool = False
 
-#: The registry of referent kinds and the bare node-name label each renders.
-#: Deliberately holds only 'task' today; 'escalation' is the PRD's next entry
-#: and is NOT added speculatively. Extending the vocabulary means adding an
-#: entry here, which is the whole point of routing every caller through one
-#: module.
-#:
-#: NOTE for a reader hunting the caller that emits a non-'task' kind: there
-#: isn't one. Both public entry points hardcode ``kind='task'``, and both
-#: compiled patterns hardcode the literal word 'task', so ``__post_init__``'s
-#: rejection is reachable only from a direct ``Referent(kind=...)`` call.
-#: Adding 'escalation' will need new patterns and new parse/scan branches too —
-#: this registry is where the LABEL lives, not a one-line extension point.
-_KIND_LABELS: dict[str, str] = {'task': 'Task'}
+#: Each referent kind and the label its own-project node name renders.
+KIND_LABELS: Mapping[str, str] = MappingProxyType({'task': 'Task'})
 
 #: The literal task-vocabulary WORD, as explicit ASCII case classes rather than
 #: 'tasks?' plus re.IGNORECASE. ONE spelling, interpolated into both patterns
@@ -428,7 +418,7 @@ class Referent:
     #: never invents or reformats a task number ('0132' stays '0132', and is
     #: a DIFFERENT referent from '132').
     number: str
-    #: Which registry entry this referent belongs to; see :data:`_KIND_LABELS`.
+    #: Which registry entry this referent belongs to; see :data:`KIND_LABELS`.
     kind: str = 'task'
     #: EMPTY means own-project / unqualified. A non-empty value is always
     #: ``canonicalize_project_id``-canonical and denotes a DIFFERENT project.
@@ -438,11 +428,10 @@ class Referent:
     project_id: str = ''
 
     def __post_init__(self) -> None:
-        if self.kind not in _KIND_LABELS:
+        if self.kind not in KIND_LABELS:
             raise ValueError(
                 f'unregistered referent kind {self.kind!r}; registered kinds are '
-                f'{sorted(_KIND_LABELS)}. Add it to canonical_labels._KIND_LABELS '
-                'rather than rendering an unlabelled referent.'
+                f'{sorted(KIND_LABELS)}. Register it in canonical_labels.KIND_LABELS.'
             )
 
     # Derived name is a property rather than a field so it cannot drift out of
@@ -460,7 +449,7 @@ class Referent:
         """
         if self.project_id:
             return f'{self.project_id}:{self.number}'
-        return f'{_KIND_LABELS[self.kind]} {self.number}'
+        return f'{KIND_LABELS[self.kind]} {self.number}'
 
 
 def is_task_vocabulary_qualifier(project_id: str) -> bool:
@@ -842,7 +831,7 @@ def scan_content(
     #
     # The contest is keyed on (kind, number) — the same tuple dedup uses, minus
     # project_id, which is exactly the axis being contested. Keying on the bare
-    # number alone happens to agree today only because _KIND_LABELS holds one
+    # number alone happens to agree today only because KIND_LABELS holds one
     # entry; the moment 'escalation' joins the registry, a bare 'escalation
     # 2500' mention would contest an unrelated foreign TASK ref
     # 'dark_factory:2500' and suppress a real repair. That failure could not be

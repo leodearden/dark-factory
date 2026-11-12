@@ -328,7 +328,7 @@ class ReferentFinding:
         agree only while distinct referents cannot render alike.
         :attr:`Referent.node_name` drops ``kind`` entirely for a FOREIGN
         referent (``f'{project_id}:{number}'``), so the rendering is injective
-        purely because ``canonical_labels._KIND_LABELS`` holds exactly one kind
+        purely because ``canonical_labels.KIND_LABELS`` holds exactly one kind
         today. Register a second, and a foreign citation of the new kind
         corroborates a foreign ``'task'`` endpoint of the same number — a genuine
         misattachment silently demoted to INFO and booked as corroborated, i.e.
@@ -904,7 +904,7 @@ def _implausible_target_reason(
         return ''
     if target.kind == 'task' and not target.project_id:
         # (ii) A bare own-project `Task N` referent — the dominant live shape.
-        # The `kind` test is redundant TODAY, since `_KIND_LABELS` holds exactly
+        # The `kind` test is redundant TODAY, since `KIND_LABELS` holds exactly
         # one kind, and is written anyway so that registering a second kind
         # fails CLOSED here rather than silently widening what counts as "a bare
         # own-project Task-N referent".
