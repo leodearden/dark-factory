@@ -120,7 +120,7 @@ def _chart_sites(src):
     `values_exprs` and `values_roots`.
 
     An element's props are read from its opening tag, spanned by
-    `_dashboard_helpers.py::jsx_open_tag_end`, so a chart with children
+    `_jsx_source_helpers.py::jsx_open_tag_end`, so a chart with children
     (`<LC ...>...</LC>`, say to nest a legend) is read correctly and a quoted
     `/>` cannot end it.  A nested element INSIDE the attribute list still fails
     loudly: its own props would be attributed to the chart — a spurious

@@ -14,10 +14,10 @@ from typing import NamedTuple
 # ---------------------------------------------------------------------------
 # JSX source slicing.
 #
-# There is no JS runtime in this project, so the dashboard suite asserts
-# structural contracts against the *served* .jsx text.  Nearly every such
-# assertion must first scope itself to one function's body — otherwise a token
-# appearing anywhere else in the file satisfies it and the test proves nothing.
+# These helpers serve the Python suites that assert structural contracts
+# against the *served* .jsx text.  Nearly every such assertion must first
+# scope itself to one function's body — otherwise a token appearing anywhere
+# else in the file satisfies it and the test proves nothing.
 #
 # These helpers used to be private copies in nine test modules (task 3549),
 # under two names covering FOUR distinct implementations, so a fix had to be

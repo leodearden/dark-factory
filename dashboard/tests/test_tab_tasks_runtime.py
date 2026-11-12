@@ -51,7 +51,7 @@ def tasks_tab_body(tab_tasks_jsx_body):
     Scoped away from the other component functions (TaskGraph, PrdBox,
     TaskDetail, ...) in the same file so an assertion cannot be satisfied by
     an unrelated component.  The file-local extractor this used to call was
-    promoted to ``_dashboard_helpers.extract_function_body``, whose brace walk
+    promoted to ``_jsx_source_helpers.extract_function_body``, whose brace walk
     runs over a masked copy of the source and stops at TasksTab's matching
     ``}`` — so the old caveat that this fixture ran to EOF no longer holds,
     and absence assertions over it are now genuinely scoped.
