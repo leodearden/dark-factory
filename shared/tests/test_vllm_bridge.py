@@ -712,3 +712,14 @@ class TestVllmBridgeUpstreamHeaders:
         assert upstream_headers['host'] == urlsplit(upstream_url).netloc
         assert upstream_headers['host'] != urlsplit(bridge_url).netloc
         assert upstream_headers['x-api-key'] == 'test-key'
+
+    @_BRIDGE_REQUEST_PATHS
+    async def test_client_accept_encoding_is_not_forwarded(
+        self, mock_upstream_header_capture, path
+    ):
+        """The client's Accept-Encoding offer stays on the client-to-bridge hop."""
+        upstream_url, received = mock_upstream_header_capture
+        await _post_through_bridge(upstream_url, path, {'Accept-Encoding': 'br, zstd'})
+
+        upstream_headers = _only_request_to(received, path)
+        assert upstream_headers.get('accept-encoding') != 'br, zstd'
