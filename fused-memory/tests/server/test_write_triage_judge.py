@@ -31,7 +31,7 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -43,7 +43,7 @@ import pytest
 from _mock_openai_server import mock_openai_server
 from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
-from _unreached_provider import skip_if_provider_unreached
+from _unreached_provider import FailOpenCauses, skip_if_provider_unreached
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -2892,17 +2892,24 @@ _UNREACHED_PROVIDER_CASES = [
 ]
 
 
-def _frontier_arm_judge(
-    verdicts: list[TriageJudgeVerdict],
-) -> Callable[..., Awaitable[TriageJudgeVerdict]]:
-    """`judge_write`, recording each verdict into *verdicts*; it skips only when the provider was never reached."""
+async def _frontier_arm_triage(
+    service: Any, *, content: str, verdicts: list[TriageJudgeVerdict],
+) -> BandDecision:
+    """`triage_write` through `judge_write`, recording each verdict; a fail-open skips only when its cause was an unreached provider."""
 
     async def _judge(**kwargs: Any) -> TriageJudgeVerdict:
-        verdict = await skip_if_provider_unreached(judge_write(**kwargs))
+        verdict = await judge_write(**kwargs)
         verdicts.append(verdict)
         return verdict
 
-    return _judge
+    counter = TriageFailOpenCounter()
+    causes = FailOpenCauses()
+    decision = await triage_write(
+        service, content=content, project_id='p',
+        counter=counter, judge=causes.recording(_judge),
+    )
+    causes.assert_no_fail_open_unless_unreached(counter.live_count())
+    return decision
 
 
 @pytest.mark.integration
@@ -2939,13 +2946,10 @@ class TestTheFrontierArmLive:
             config=config, search=AsyncMock(return_value=SearchResults(slate)),
         )
         verdicts: list[TriageJudgeVerdict] = []
-        counter = TriageFailOpenCounter()
-        decision = await triage_write(
-            service, content=duplicate['content'], project_id='p',
-            counter=counter, judge=_frontier_arm_judge(verdicts),
+        decision = await _frontier_arm_triage(
+            service, content=duplicate['content'], verdicts=verdicts,
         )
 
-        assert counter.live_count() == 0
         assert decision.outcome in TRIAGE_OUTCOMES
         if decision.judged_candidate_id is not None:
             assert decision.judged_candidate_id in {result.id for result in slate}
@@ -3029,8 +3033,9 @@ async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
     other 4xx and unusable answers stay red, and so does a 429 whose code is
     `insufficient_quota`: an account out of credit is a lasting fault, and skipping it would
     silently retire every wording check on every run.
-    TestTheFrontierArmLive skips only an unreached provider and keeps a judge-budget expiry
-    red: it is the live edge for the fail-open/latency dimension.
+    TestTheFrontierArmLive applies the same unreached-provider rule to the judge's fail-open
+    (`_frontier_arm_triage`) and keeps a judge-budget expiry red: it is the live edge for the
+    fail-open/latency dimension.
     """
     try:
         return await skip_if_provider_unreached(judge_write(**judge_kwargs))
