@@ -2078,7 +2078,11 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
 
 
 def _write_dry_run_payloads(
-    requested_path: Path, payloads: list[dict], *, withheld_offered: int,
+    requested_path: Path,
+    payloads: list[dict],
+    *,
+    withheld_offered: int,
+    write_text: Callable[[Path, str], object],
 ) -> DryRunFiling:
     """Write *payloads* -- what a real run would hand ``submit_fn`` -- for a
     human to review, at *requested_path* or its free sibling, and say so
@@ -2091,7 +2095,7 @@ def _write_dry_run_payloads(
             "regenerate) -- this run's payloads were written to %s instead",
             requested_path, resolved_path,
         )
-    resolved_path.write_text(json.dumps(payloads, indent=2) + "\n", encoding="utf-8")
+    write_text(resolved_path, json.dumps(payloads, indent=2) + "\n")
     # The WARNING deliberately does NOT offer a repeat census as the
     # recovery path, because that path is dead: the same confusions code as
     # `matches` against the dumped codebook, and the sessions are ledgered as
@@ -2351,6 +2355,10 @@ def _unlanded(
     )
 
 
+def _write_text(path: Path, text: str) -> None:
+    Path(path).write_text(text, encoding="utf-8")
+
+
 @dataclass(frozen=True)
 class CensusEffects:
     """Every effect run_census has on the world, each an injected seam."""
@@ -2368,6 +2376,10 @@ class CensusEffects:
     gate: Callable[[], landing_gate.GateVerdict]
     commit: Callable[..., unlanded.CommitResult]
     roll_back: Callable[..., unlanded.Rollback]
+    write_text: Callable[[Path, str], object] = _write_text
+    dump_codebook: Callable[[dict, Path | str], object] = codebook.dump
+    advance_state: Callable[..., object] = census_state.advance
+    record_codings: Callable[[Path, Sequence[session_ledger.LedgerRow]], int] = session_ledger.record_codings
 
 
 @dataclass(frozen=True)
@@ -2944,6 +2956,246 @@ def plan_filing(
     )
 
 
+def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dict, tuple[str, ...]]:
+    """The plan's codebook with every withheld entry this run routed marked
+    filed, each routed decision's back-link and the run's follow-ups; and the
+    ids of those released entries."""
+    run = plan.run
+    released_entry_ids = tuple(dict.fromkeys(
+        decision.filing.entry_id
+        for decision in disposal.decisions
+        if decision.routed and decision.filing.entry_id in plan.withheld_entry_ids
+    ))
+    cb = plan.codebook
+    for entry_id in released_entry_ids:
+        cb = codebook_lifecycle.mark_entry_filed(cb, entry_id)
+    if released_entry_ids:
+        logger.info(
+            "census: %d withheld codebook entr(ies) recurred and were routed: %s",
+            len(released_entry_ids), list(released_entry_ids),
+        )
+    cb = disposition.with_back_links(
+        cb, [link for decision in disposal.decisions if (link := decision.back_link(run.run_id)) is not None],
+    )
+    cb = disposition.with_follow_ups(
+        cb, reverified=plan.reverified, refiled=plan.refiled, decisions=disposal.decisions,
+        run_id=run.run_id, as_of_sha=run.as_of_sha,
+    )
+    return cb, released_entry_ids
+
+
+def _storm_batch_indices(mining_result: MiningResult) -> list[int]:
+    """The indices of the mined batches whose coding storm-failed, logged."""
+    indices = [s.index for s in mining_result.batch_stats if s.status == coder.CodingStatus.FAILURE]
+    if indices:
+        logger.warning(
+            "census: %d storm batch(es) (>50%% coding failures, PRD §8.6) at "
+            "indices %s -- dup_rate for those batches was excluded from the "
+            "saturation decision but is still recorded in the report",
+            len(indices), indices,
+        )
+    return indices
+
+
+def _census_record(
+    plan: FilingPlan,
+    cb: dict,
+    *,
+    filing_report: disposition.FilingReport,
+    synthesis_report: synthesis.SynthesisReport,
+    dry_run: DryRunFiling | None,
+) -> dict:
+    """The run's census record, over *cb*, the codebook it persists."""
+    run, mined, merged, verdicts, placed = plan.run, plan.mined, plan.merged, plan.verdicts, plan.placed
+    config, mining_result = run.config, mined.result
+    standings = disposition.task_standings(plan.outcomes, filing_report.disposal.resolved(
+        filing_report.resolutions,
+    ).decisions)
+    dispositions_record = disposition.OutcomeReport(
+        plan.outcomes, plan.reverified, plan.status_changes, plan.refiled,
+        disposition.entry_dispositions(cb, standings),
+    ).to_record()
+    verify_calls = len(merged.to_verify) + len(merged.offered) + dispositions_record["reverify"]["offered"]
+    probe_calls = 1 + verdicts.probes + plan.reverify_probes
+    storm_batch_indices = _storm_batch_indices(mining_result)
+    # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
+    # total -- and the per-cluster count, novel clusters plus queue clusters
+    # plus re-verifies, is precisely what an operator using
+    # --max-verify-clusters reads this line to check. headroom-probe is the
+    # run's REAL probe spend: the preflight and stage gate PLUS whatever the
+    # verifier reported spending on its own in-verify detectors.
+    cost_note = (
+        f"invoke calls: {config.models.census_miner} miner="
+        f"{sum(s.total for s in mining_result.batch_stats)}, "
+        f"{config.models.census_verify} verify={verify_calls}, "
+        f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
+        f"{config.models.trickle} headroom-probe={probe_calls}"
+    )
+    if storm_batch_indices:
+        cost_note += (
+            f"; WARNING: {len(storm_batch_indices)} storm batch(es) at indices "
+            f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
+            "signal, excluded from the saturation decision)"
+        )
+    method = build_method(
+        run_id=run.run_id,
+        as_of_sha=run.as_of_sha,
+        since=run.since,
+        selection=mined.selection,
+        mined=len(mining_result.records),
+        confirmed=len(verdicts.verified),
+        refuted=len(verdicts.rejected),
+        unverified=len(merged.novel) - len(merged.to_verify) + merged.session_screened,
+        miner_calls=sum(s.total for s in mining_result.batch_stats),
+        verify_calls=verify_calls,
+        synthesis_calls=synthesis_report.calls,
+        probe_calls=probe_calls,
+        wall_clock_secs=round(time.monotonic() - run.started, 3),
+        verify_normalisations=verdicts.normalisations,
+        reverify=dispositions_record["reverify"],
+        screened=placed.screen_report.counts(),
+        inputs_consumed=placed.screen_report.inputs.consumed,
+        inputs_consumed_note=placed.screen_report.inputs.note,
+        embedding_calls=merged.view.requests,
+        adjudication=placed.adjudication_report.counts(),
+        slug_tally=merged.merge.invariant_slugs,
+    )
+    return build_census_record(
+        method=method,
+        date=run.date,
+        project_id=run.project_id,
+        force=run.force,
+        matrix_md=plan.synthesized.matrix_md,
+        mining_result=mining_result,
+        synthesis=synthesis_report.to_record(),
+        project_root=run.project_root,
+        filing=filing_report.to_record(),
+        dispositions=dispositions_record,
+        screened=placed.screen_report.to_record(),
+        adjudication=placed.adjudication_report.to_record(),
+        cost_note=cost_note,
+        verify_coverage=merged.coverage,
+        dry_run=dry_run,
+        dropped_verdicts=tuple(placed.dropped_verdicts),
+        mass_rejection=verdicts.mass_rejection,
+        withheld=placed.withheld,
+        findings=[
+            row.to_record()
+            for row in census_findings.finding_rows(
+                cb,
+                promoted=placed.promoted,
+                refuted=placed.refuted,
+                sighted=placed.sighted,
+                run_id=run.run_id,
+                cause_of=functools.partial(codebook.entry_field, cb, field="cause"),
+                disposition_of=lambda entry: str(disposition.disposition_of(entry, standings)),
+            )
+        ],
+        area_map=mined.area_map.to_record(),
+    )
+
+
+def _landed(
+    plan: FilingPlan,
+    *,
+    filing_report: disposition.FilingReport,
+    released_entry_ids: tuple[str, ...],
+    dry_run: DryRunFiling | None,
+    gate: landing_gate.GateVerdict,
+) -> Done:
+    """The outcome the run returns once its commit lands."""
+    run = plan.run
+    decisions = filing_report.disposal.decisions
+    return Done(
+        report_path=str(run.report_path),
+        run_id=run.run_id,
+        record_path=str(Path(run.report_path).with_suffix(".json")),
+        filed_ticket_ids=tuple(decision.ticket for decision in decisions if decision.ticket is not None),
+        stop_reason=plan.mined.result.stop_reason,
+        dry_run=dry_run,
+        dropped_verdicts=tuple(plan.placed.dropped_verdicts),
+        withheld=plan.placed.withheld,
+        cross_project_tickets=tuple(
+            CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
+            for decision in decisions
+            if decision.ticket is not None and decision.filing.project_root != run.project_root
+        ),
+        released_entry_ids=released_entry_ids,
+        skipped_deletions=plan.merged.merge.skipped_deletions,
+        filing=filing_report,
+        gate=gate,
+    )
+
+
+def persist(plan: FilingPlan, effects: CensusEffects) -> Done | Unlanded:
+    """File the plan's tickets, write its record, report, codebook and census
+    state, gate and commit them or roll them back, then ledger its sessions."""
+    run = plan.run
+    disposal = disposition.dispose(
+        list(plan.filings),
+        store=effects.task_store,
+        submit=None if run.dry_run_payloads_path is not None else effects.submit_fn,
+        awaiting=plan.outcomes.awaiting,
+    )
+    dry_run = None
+    if run.dry_run_payloads_path is not None:
+        dry_run = _write_dry_run_payloads(
+            Path(run.dry_run_payloads_path),
+            [dict(filing.payload) for filing in disposal.unfiled],
+            withheld_offered=sum(1 for filing in disposal.unfiled if filing.entry_id in plan.withheld_entry_ids),
+            write_text=effects.write_text,
+        )
+    cb, released_entry_ids = _after_filing(plan, disposal)
+    cb, resolutions = disposition.resolve_tickets(cb, store=effects.task_store, run_id=run.run_id)
+    # Synthesis corrections land after filing, so this run's filing pairing
+    # and sighting counts read the codebook the run verified.
+    cb, synthesis_report = _apply_synthesis_corrections(
+        cb, plan.synthesized, standing=run.standing, run_id=run.run_id, date=run.date,
+        project_id=run.project_id, invariant_slugs=plan.mined.invariant_slugs,
+    )
+    _require_valid(cb, "filing")
+    filing_report = disposition.FilingReport(disposal, resolutions, plan.backfilled, plan.placed.structural)
+    record = _census_record(plan, cb, filing_report=filing_report, synthesis_report=synthesis_report, dry_run=dry_run)
+
+    record_path = Path(run.report_path).with_suffix(".json")
+    record_text = json.dumps(record, indent=2) + "\n"
+    effects.write_text(record_path, record_text)
+    effects.write_text(Path(run.report_path), render_report(json.loads(record_text)))
+    effects.dump_codebook(cb, run.codebook_path)
+    selection = plan.mined.selection
+    effects.advance_state(
+        run.census_state_path,
+        census_at=datetime.fromisoformat(run.date).date(),
+        run_id=run.run_id,
+        report_path=run.report_relpath,
+        as_of_sha=run.as_of_sha,
+        session_watermark=selection.window.end if selection is not None else None,
+    )
+
+    verdict = effects.gate()
+    landed = _landed(
+        plan, filing_report=filing_report, released_entry_ids=released_entry_ids, dry_run=dry_run, gate=verdict,
+    )
+    commit_paths = [str(run.report_path), str(record_path), str(run.codebook_path), str(run.census_state_path)]
+    if dry_run is not None:
+        commit_paths.append(dry_run.path)
+    unlanded_as = functools.partial(
+        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=effects.roll_back,
+        escalate_fn=effects.escalate_fn, project_id=run.project_id,
+    )
+    if not verdict.passed:
+        return unlanded_as(_gate_refusal(verdict))
+    landing = effects.commit(paths=commit_paths, message=f"legibility census {run.date}")
+    if not landing.ok:
+        return unlanded_as(_commit_refusal(landing))
+    if selection is None:
+        return landed
+    return _ledger_census_codings(
+        landed, list(plan.merged.merge.merged_records), run_id=run.run_id, ledger=selection.ledger,
+        record_codings=effects.record_codings,
+    )
+
+
 def run_census(
     *,
     effects: CensusEffects,
@@ -3251,242 +3503,7 @@ def run_census(
         return verdicts
     placed = place_verdicts(run, mined, merged, verdicts)
     synthesized = synthesize(run, effects, mined, verdicts, placed)
-    plan = plan_filing(run, effects, mined, merged, verdicts, placed, synthesized)
-
-    updated_codebook = plan.codebook
-    mining_result, selection = mined.result, mined.selection
-    invariant_slugs, area_map = mined.invariant_slugs, mined.area_map
-    merge_result, view, offered = merged.merge, merged.view, merged.offered
-    clusters_to_verify, novel_clusters = merged.to_verify, merged.novel
-    session_screened, verify_coverage = merged.session_screened, merged.coverage
-    verified, rejected = verdicts.verified, verdicts.rejected
-    mass_rejection, verify_normalisations = verdicts.mass_rejection, verdicts.normalisations
-    withheld, structural = placed.withheld, placed.structural
-    promoted, refuted, sighted = placed.promoted, placed.refuted, placed.sighted
-    dropped_verdicts = placed.dropped_verdicts
-    screen_report, adjudication_report = placed.screen_report, placed.adjudication_report
-    matrix_md = synthesized.matrix_md
-    outcomes, reverified, refiled = plan.outcomes, plan.reverified, plan.refiled
-    status_changes, backfilled = plan.status_changes, plan.backfilled
-    probe_count = 1 + verdicts.probes + plan.reverify_probes
-    report_relpath, started = run.report_relpath, run.started
-
-    # Positioned BEFORE codebook.dump()/census_state.advance() below
-    # (reviewer_comprehensive finding #4): a bug in payload construction can
-    # then only abort the run before anything is persisted, never strand an
-    # already-advanced codebook. Filing itself is best-effort per finding
-    # (disposition.dispose): a failed submit is logged and reported, never
-    # counted as filed and never fatal.
-    disposal = disposition.dispose(
-        list(plan.filings),
-        store=effects.task_store,
-        submit=None if dry_run_payloads_path is not None else effects.submit_fn,
-        awaiting=outcomes.awaiting,
-    )
-    withheld_entry_ids = plan.withheld_entry_ids
-    dry_run_filing = None
-    if dry_run_payloads_path is not None:
-        dry_run_filing = _write_dry_run_payloads(
-            Path(dry_run_payloads_path),
-            [dict(filing.payload) for filing in disposal.unfiled],
-            withheld_offered=sum(1 for filing in disposal.unfiled if filing.entry_id in withheld_entry_ids),
-        )
-
-    released_entry_ids = tuple(dict.fromkeys(
-        decision.filing.entry_id
-        for decision in disposal.decisions
-        if decision.routed and decision.filing.entry_id in withheld_entry_ids
-    ))
-    for entry_id in released_entry_ids:
-        updated_codebook = codebook_lifecycle.mark_entry_filed(updated_codebook, entry_id)
-    if released_entry_ids:
-        logger.info(
-            "census: %d withheld codebook entr(ies) recurred and were routed: %s",
-            len(released_entry_ids), list(released_entry_ids),
-        )
-    updated_codebook = disposition.with_back_links(
-        updated_codebook,
-        [link for decision in disposal.decisions if (link := decision.back_link(run_id)) is not None],
-    )
-    updated_codebook = disposition.with_follow_ups(
-        updated_codebook, reverified=reverified, refiled=refiled, decisions=disposal.decisions,
-        run_id=run_id, as_of_sha=as_of_sha,
-    )
-    updated_codebook, resolutions = disposition.resolve_tickets(
-        updated_codebook, store=effects.task_store, run_id=run_id,
-    )
-    # Synthesis corrections land after filing, so this run's filing pairing
-    # and sighting counts read the codebook the run verified.
-    updated_codebook, synthesis_report = _apply_synthesis_corrections(
-        updated_codebook, synthesized, standing=codebook_dict, run_id=run_id, date=date,
-        project_id=project_id, invariant_slugs=invariant_slugs,
-    )
-    # The backfill, back-links, resolutions and corrections changed the
-    # codebook after the merge check, so it is held to the schema again before
-    # any artifact.
-    _require_valid(updated_codebook, "filing")
-    filing_report = disposition.FilingReport(disposal, resolutions, backfilled, structural)
-    standings = disposition.task_standings(outcomes, disposal.resolved(resolutions).decisions)
-    dispositions_record = disposition.OutcomeReport(
-        outcomes, reverified, status_changes, refiled, disposition.entry_dispositions(updated_codebook, standings),
-    ).to_record()
-    verify_calls = len(clusters_to_verify) + len(offered) + dispositions_record["reverify"]["offered"]
-    filed_ticket_ids = tuple(decision.ticket for decision in disposal.decisions if decision.ticket is not None)
-    cross_project_tickets = tuple(
-        CrossProjectTicket(ticket_id=decision.ticket, project_root=decision.filing.project_root)
-        for decision in disposal.decisions
-        if decision.ticket is not None and decision.filing.project_root != project_root
-    )
-
-    storm_batch_indices = [
-        s.index for s in mining_result.batch_stats
-        if s.status == coder.CodingStatus.FAILURE
-    ]
-    if storm_batch_indices:
-        logger.warning(
-            "census: %d storm batch(es) (>50%% coding failures, PRD §8.6) at "
-            "indices %s -- dup_rate for those batches was excluded from the "
-            "saturation decision but is still recorded in the report",
-            len(storm_batch_indices), storm_batch_indices,
-        )
-
-    # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
-    # total -- and the per-cluster count, novel clusters plus queue clusters
-    # plus re-verifies, is precisely what an operator using
-    # --max-verify-clusters reads this line to check. headroom-probe is the
-    # run's REAL probe spend: this function's preflight and stage gate PLUS
-    # whatever the verifier reported spending on its own in-verify detectors.
-    cost_note = (
-        f"invoke calls: {config.models.census_miner} miner="
-        f"{sum(s.total for s in mining_result.batch_stats)}, "
-        f"{config.models.census_verify} verify={verify_calls}, "
-        f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
-        f"{config.models.trickle} headroom-probe={probe_count}"
-    )
-    if storm_batch_indices:
-        cost_note += (
-            f"; WARNING: {len(storm_batch_indices)} storm batch(es) at indices "
-            f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
-            "signal, excluded from the saturation decision)"
-        )
-    method = build_method(
-        run_id=run_id,
-        as_of_sha=as_of_sha,
-        since=since,
-        selection=selection,
-        mined=len(mining_result.records),
-        confirmed=len(verified),
-        refuted=len(rejected),
-        unverified=len(novel_clusters) - len(clusters_to_verify) + session_screened,
-        miner_calls=sum(s.total for s in mining_result.batch_stats),
-        verify_calls=verify_calls,
-        synthesis_calls=synthesis_report.calls,
-        probe_calls=probe_count,
-        wall_clock_secs=round(time.monotonic() - started, 3),
-        verify_normalisations=verify_normalisations,
-        reverify=dispositions_record["reverify"],
-        screened=screen_report.counts(),
-        inputs_consumed=screen_report.inputs.consumed,
-        inputs_consumed_note=screen_report.inputs.note,
-        embedding_calls=view.requests,
-        adjudication=adjudication_report.counts(),
-        slug_tally=merge_result.invariant_slugs,
-    )
-    record = build_census_record(
-        method=method,
-        date=date,
-        project_id=project_id,
-        force=force,
-        matrix_md=matrix_md,
-        mining_result=mining_result,
-        synthesis=synthesis_report.to_record(),
-        project_root=project_root,
-        filing=filing_report.to_record(),
-        dispositions=dispositions_record,
-        screened=screen_report.to_record(),
-        adjudication=adjudication_report.to_record(),
-        cost_note=cost_note,
-        verify_coverage=verify_coverage,
-        dry_run=dry_run_filing,
-        dropped_verdicts=tuple(dropped_verdicts),
-        mass_rejection=mass_rejection,
-        withheld=withheld,
-        findings=[
-            row.to_record()
-            for row in census_findings.finding_rows(
-                updated_codebook,
-                promoted=promoted,
-                refuted=refuted,
-                sighted=sighted,
-                run_id=run_id,
-                cause_of=functools.partial(codebook.entry_field, updated_codebook, field="cause"),
-                disposition_of=lambda entry: str(disposition.disposition_of(entry, standings)),
-            )
-        ],
-        area_map=area_map.to_record(),
-    )
-    census_at = datetime.fromisoformat(date).date()
-    # The record is written FIRST and the report rendered from that very text,
-    # so the markdown can only ever say what the record holds. Both precede
-    # codebook.dump()/census_state.advance(): a failure here leaves at most
-    # these two files touched, and a re-run starts clean
-    # (reviewer_comprehensive finding #4).
-    record_path = Path(report_path).with_suffix(".json")
-    record_text = json.dumps(record, indent=2) + "\n"
-    record_path.write_text(record_text, encoding="utf-8")
-    Path(report_path).write_text(render_report(json.loads(record_text)), encoding="utf-8")
-
-    # codebook.dump() and census_state.advance() are adjacent on purpose
-    # (reviewer_comprehensive finding #4): nothing else here can raise
-    # between them, so the ONLY way census-state.json can end up lagging
-    # behind an already-persisted codebook is a failure inside
-    # census_state.advance itself. Should that happen, recovery is a plain
-    # re-run -- see this function's docstring for why that is safe.
-    codebook.dump(updated_codebook, codebook_path)
-    census_state.advance(
-        census_state_path,
-        census_at=census_at,
-        run_id=run_id,
-        report_path=report_relpath,
-        as_of_sha=as_of_sha,
-        session_watermark=selection.window.end if selection is not None else None,
-    )
-
-    verdict = effects.gate()
-    landed = Done(
-        report_path=str(report_path),
-        run_id=run_id,
-        record_path=str(record_path),
-        filed_ticket_ids=filed_ticket_ids,
-        stop_reason=mining_result.stop_reason,
-        dry_run=dry_run_filing,
-        dropped_verdicts=tuple(dropped_verdicts),
-        withheld=withheld,
-        cross_project_tickets=cross_project_tickets,
-        released_entry_ids=released_entry_ids,
-        skipped_deletions=merge_result.skipped_deletions,
-        filing=filing_report,
-        gate=verdict,
-    )
-    commit_paths = [
-        str(report_path), str(record_path), str(codebook_path), str(census_state_path),
-    ]
-    if dry_run_filing is not None:
-        commit_paths.append(dry_run_filing.path)
-    unlanded_as = functools.partial(
-        _unlanded, landed=landed, commit_paths=commit_paths, roll_back=effects.roll_back,
-        escalate_fn=effects.escalate_fn, project_id=project_id,
-    )
-    if not verdict.passed:
-        return unlanded_as(_gate_refusal(verdict))
-    landing = effects.commit(paths=commit_paths, message=f"legibility census {date}")
-    if not landing.ok:
-        return unlanded_as(_commit_refusal(landing))
-    if selection is None:
-        return landed
-    return _ledger_census_codings(
-        landed, list(merge_result.merged_records), run_id=run_id, ledger=selection.ledger,
-    )
+    return persist(plan_filing(run, effects, mined, merged, verdicts, placed, synthesized), effects)
 
 
 def _ledger_census_codings(
@@ -3495,6 +3512,7 @@ def _ledger_census_codings(
     *,
     run_id: str,
     ledger: session_ledger.LedgerSnapshot,
+    record_codings: Callable[[Path, Sequence[session_ledger.LedgerRow]], int],
 ) -> Done:
     """Ledger every session this landed run coded, so the next census skips
     it. A failure costs only a re-mine of those sessions, so it is reported
@@ -3507,7 +3525,7 @@ def _ledger_census_codings(
         coded_at=datetime.now(UTC),
     )
     try:
-        written = session_ledger.record_codings(ledger.path, rows)
+        written = record_codings(ledger.path, rows)
     except session_ledger.LedgerError as exc:
         logger.warning(
             "census: %d coded session(s) NOT ledgered, the next census re-mines them: %s",
