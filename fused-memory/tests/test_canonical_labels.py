@@ -1472,3 +1472,10 @@ class TestUnregisteredKindIsRejectedLoudly:
     def test_error_names_the_registered_kinds(self):
         with pytest.raises(ValueError, match='task'):
             Referent(kind='escalation', number='7')
+
+    def test_the_kind_registry_is_read_only(self):
+        with pytest.raises(TypeError):
+            canonical_labels.KIND_LABELS['ticket'] = 'Ticket'  # pyright: ignore[reportIndexIssue]
+
+    def test_registered_kinds_are_exactly_task(self):
+        assert dict(canonical_labels.KIND_LABELS) == {'task': 'Task'}

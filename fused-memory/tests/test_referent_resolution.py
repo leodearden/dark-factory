@@ -835,7 +835,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
         """``declared`` is caller-supplied JSON off an MCP tool argument, so a
         confused agent can reach every one of these. An UNHASHABLE kind is the
         sharp case: ``Referent.__post_init__``'s ``self.kind not in
-        _KIND_LABELS`` membership test raises ``TypeError``, which is not a
+        KIND_LABELS`` membership test raises ``TypeError``, which is not a
         ``ValueError``, so the existing ``except ValueError`` around the
         construction structurally cannot convert it — and δ's ``except
         InputValidationError`` gate would take an unhandled exception instead of

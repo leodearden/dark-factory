@@ -1059,13 +1059,13 @@ class TestDegenerateEdges:
         already committed — precisely the half-attributed edge the gate exists
         to prevent.
 
-        `_KIND_LABELS` has exactly one entry today, which is the ONLY reason
+        `KIND_LABELS` has exactly one entry today, which is the ONLY reason
         the object comparison was not already observably wrong; registering a
         second kind is what this monkeypatch simulates, so the guarantee does
         not silently depend on that registry's size.
         """
         monkeypatch.setattr(
-            canonical_labels, '_KIND_LABELS', {'task': 'Task', 'ticket': 'Ticket'},
+            canonical_labels, 'KIND_LABELS', {'task': 'Task', 'ticket': 'Ticket'},
         )
         first = Referent(number='3127', kind='task', project_id='reify')
         second = Referent(number='3127', kind='ticket', project_id='reify')
