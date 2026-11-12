@@ -130,7 +130,7 @@ class ServerConfig(BaseModel):
     """Server configuration."""
 
     transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
-    host: str = Field(default='0.0.0.0', description='Server host')
+    host: str = Field(default='127.0.0.1', description='Bind host of the MCP and recon-report listeners (loopback by default)')
     port: int = Field(default=8002, description='Server port (canonical: 8002)')
     stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
@@ -2867,7 +2867,20 @@ class WriteTriageConfig(BaseModel):
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
             'and read as a total judge outage caused by nothing. 15 s rather '
             'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
-            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15). This budget '
+            'is the judge call\'s overall bound, and nothing retries inside it: '
+            'every judge arm builds its SDK client with max_retries=0 '
+            '(server/write_triage_judge.py::_JUDGE_SDK_MAX_RETRIES), so a '
+            'provider 5xx, 429 or connection error is raised on its first '
+            'occurrence and the fail-open record names it, instead of being '
+            'retried with backoff inside this budget and logged as a bare '
+            'TimeoutError. The SDK\'s own per-attempt timeouts still apply '
+            'within the budget: the openai and anthropic connect timeout '
+            'defaults to 5 s, so a DNS or connect stall fails open at about 5 s '
+            'as APITimeoutError, and a budget below 5 s expires first. The '
+            'accepted cost: a transient error a retry would have rescued is a '
+            'counted fail-open, and the write is still stored (contract C1). '
+            'Task 8521.'
         ),
     )
     judge_reasoning_effort: JudgeReasoningEffort | None = Field(
@@ -2915,9 +2928,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write. The same cap bounds a contesting child\'s text '
+            'middle-band write. The same cap bounds every amendment\'s text '
             'in grouped search and get_memory_by_id reads '
-            '(server/grouped_read.py::_digest_entry).'
+            '(server/grouped_read.py::amendment_text).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

@@ -11,6 +11,7 @@ import dataclasses
 import json
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 
 from orchestrator.recovery_emission import (
     STREAK_CHARGING_SITES,
@@ -437,6 +438,41 @@ class TestRecoveryVetoStreakTracker:
         tracker.observe(RecoverySite.reconcile_sweep, '3535', 'pinned|esc-1')
         assert tracker.clear(RecoverySite.reconcile_sweep, '3535') == 2
         assert tracker.clear(RecoverySite.reconcile_sweep, '3535') == 0
+
+
+class TestRecoveryVetoStreakTrackerAdopt:
+    """``adopt`` holds a key open for an alarm a PRIOR process filed."""
+
+    def test_an_adopted_key_is_tracked_at_zero_and_clears_to_zero(self):
+        tracker = _tracker()
+
+        tracker.adopt(RecoverySite.reconcile_sweep, 'T1')
+
+        assert ('reconcile_sweep', 'T1') in set(tracker.tracked())
+        assert tracker.streak(RecoverySite.reconcile_sweep, 'T1') == 0
+        assert tracker.clear(RecoverySite.reconcile_sweep, 'T1') == 0
+        assert tuple(tracker.tracked()) == ()
+
+    def test_the_first_real_observation_after_adoption_restarts_the_streak(self):
+        """So the first post-restart sweep still re-emits every live strand."""
+        tracker = _tracker()
+        tracker.adopt(RecoverySite.reconcile_sweep, 'T1')
+
+        obs = tracker.observe(RecoverySite.reconcile_sweep, 'T1', 'pinned|esc-1')
+
+        assert obs.streak == 1
+        assert obs.changed is True
+
+    def test_adopt_never_overwrites_a_live_streak(self):
+        tracker = _tracker()
+        tracker.observe(RecoverySite.reconcile_sweep, 'T1', 'pinned|esc-1')
+        tracker.observe(RecoverySite.reconcile_sweep, 'T1', 'pinned|esc-1')
+
+        tracker.adopt(RecoverySite.reconcile_sweep, 'T1')
+
+        assert tracker.streak(RecoverySite.reconcile_sweep, 'T1') == 2
+        nxt = tracker.observe(RecoverySite.reconcile_sweep, 'T1', 'pinned|esc-1')
+        assert nxt.streak == 3
 
 
 class TestRecoveryVetoStreakTrackerSpan:
@@ -1312,6 +1348,113 @@ class TestResolveStreakWrappersAndEchoes:
 
         assert _status(queue, alarm.id) != 'pending'
         assert _status(queue, wrapper.id) == 'pending'
+
+
+def _inherit(pending, *, filed_at, tracker, sites):
+    from orchestrator.recovery_emission import inherit_veto_streak_alarms
+
+    return inherit_veto_streak_alarms(
+        pending, filed_at=filed_at, tracker=tracker, sites=sites,
+    )
+
+
+_RELEASED_SITES = (RecoverySite.reconcile_sweep, RecoverySite.deterministic_recon_deploy)
+
+
+class TestInheritVetoStreakAlarms:
+    """A restarted process inherits the streak alarms its predecessor left pending.
+
+    The memo seeds the resolver's cheap gate; the adopted tracker keys are
+    what the harness's release edge iterates, so it can reach the task at all.
+    """
+
+    def test_sentinel_alarms_and_real_id_echoes_are_inherited_at_every_site(
+        self, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3535')
+        _submit(queue, 'esc-4095-1', task_id='4095', level=1, agent_role=_streak_role())
+        memo: dict[str, int] = {}
+        tracker = _tracker()
+
+        inherited = _inherit(
+            queue.get_pending(), filed_at=memo, tracker=tracker, sites=_RELEASED_SITES,
+        )
+
+        assert inherited == frozenset({'3535', '4095'})
+        assert memo == {'3535': 0, '4095': 0}
+        assert set(tracker.tracked()) == {
+            (str(site), tid) for site in _RELEASED_SITES for tid in ('3535', '4095')
+        }
+
+    def test_records_of_other_classes_are_not_inherited(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, 'esc-4096-1', task_id='4096', level=1, agent_role='implementer')
+        _submit(queue, 'esc-zp-9-1', task_id='__zero_progress_requeue__9', level=1)
+        memo: dict[str, int] = {}
+        tracker = _tracker()
+
+        inherited = _inherit(
+            queue.get_pending(), filed_at=memo, tracker=tracker, sites=_RELEASED_SITES,
+        )
+
+        assert inherited == frozenset()
+        assert memo == {}
+        assert tuple(tracker.tracked()) == ()
+
+    @pytest.mark.parametrize('null_record_role', ['fused-memory', _streak_role()])
+    def test_a_null_task_id_record_beside_a_real_alarm_is_skipped(
+        self, tmp_path, null_record_role,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        submit_null_task_escalation(queue, agent_role=null_record_role)
+        _file_alarm(queue, '3535')
+        memo: dict[str, int] = {}
+        tracker = _tracker()
+
+        inherited = _inherit(
+            queue.get_pending(), filed_at=memo, tracker=tracker, sites=_RELEASED_SITES,
+        )
+
+        assert inherited == frozenset({'3535'})
+        assert memo == {'3535': 0}
+        assert set(tracker.tracked()) == {(str(site), '3535') for site in _RELEASED_SITES}
+
+    def test_the_inherited_alarm_resolves_when_its_adopted_key_is_released(
+        self, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3535')
+        memo: dict[str, int] = {}
+        tracker = _tracker()
+        _inherit(queue.get_pending(), filed_at=memo, tracker=tracker, sites=_RELEASED_SITES)
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535',
+            recovered_streak=tracker.clear(RecoverySite.reconcile_sweep, '3535'),
+            threshold=3, filed_at=memo,
+        ) is True
+        assert _status(queue, alarm.id) == 'resolved'
+
+    def test_without_inheritance_the_same_release_strands_the_alarm(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3535')
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=0,
+            threshold=3, filed_at={},
+        ) is False
+        assert _status(queue, alarm.id) == 'pending'
 
 
 # ---------------------------------------------------------------------------

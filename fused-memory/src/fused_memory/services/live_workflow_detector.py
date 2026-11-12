@@ -207,7 +207,11 @@ from pathlib import Path
 
 from shared.git_async import run_git
 from shared.scheduler_state import SchedulerStateSnapshot
-from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    carries_claimant,
+    has_live_claimant,
+)
 from shared.task_metadata import RoutingState
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -762,7 +766,7 @@ def claimant_label(
     """
     if not isinstance(task, Mapping):
         return ClaimantLabel.UNKNOWN
-    if _has_no_claimant(task):
+    if not carries_claimant(task):
         return ClaimantLabel.NONE
     claimant = task.get('claimant_run_id')
     try:
@@ -842,7 +846,7 @@ def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) 
     """
     if not isinstance(task, Mapping) or not isinstance(dependency_statuses, Mapping):
         return False
-    if not _has_no_claimant(task) or task.get('heartbeat_at') is not None:
+    if carries_claimant(task) or task.get('heartbeat_at') is not None:
         return False
     return any(
         dependency_statuses.get(dep_id) in UNMET_DEPENDENCY_STATUSES
@@ -853,12 +857,6 @@ def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _has_no_claimant(task: Mapping) -> bool:
-    """The negation of shared/task_claimant.py::_carries_claimant."""
-    claimant = task.get('claimant_run_id')
-    return claimant is None or (isinstance(claimant, str) and not claimant.strip())
 
 
 def _task_in_scheduler_holders_or_parks(

@@ -1,4 +1,4 @@
-"""The γ2 optional ``project_root`` guard on five escalation read and write tools.
+"""The γ2 optional ``project_root`` guard on the escalation read and write tools PRD §6.3 lists.
 
 Pins the guard table of ``plans/escalation-store-ambiguity-prd.md`` §6.3 on a
 real ``create_server``: a mismatched or reconciliation-store assertion is
@@ -26,8 +26,8 @@ from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
-READS = ('get_pending_escalations', 'get_escalation', 'get_task_escalation_history')
-WRITES = ('escalate_info', 'escalate_blocker')
+READS = stores.GUARDED_READS
+WRITES = stores.GUARDED_WRITES
 TOOLS = READS + WRITES
 FILED_TASK = '77'
 _FILING = {
@@ -72,6 +72,7 @@ def kwargs_for(seeded_id: str) -> Callable[[str], dict[str, Any]]:
         'get_pending_escalations': {'task_id': '42'},
         'get_escalation': {'escalation_id': seeded_id},
         'get_task_escalation_history': {'task_id': '42'},
+        'get_task_escalations': {'task_id': '42'},
         'escalate_info': dict(_FILING),
         'escalate_blocker': dict(_FILING),
     }
@@ -319,6 +320,22 @@ class TestMismatchStormEscape:
         records = storm_records(queue)
         assert len(records) == 1
         assert records[0].dedupe_count == 0
+
+    @pytest.mark.asyncio
+    async def test_archive_inclusive_read_alone_feeds_the_streak(
+        self,
+        project_server: FastMCP,
+        queue: EscalationQueue,
+        kwargs_for: Callable[[str], dict[str, Any]],
+        other: Path,
+    ) -> None:
+        await assert_refused(project_server, kwargs_for, str(other), ['get_task_escalations'] * 4)
+        assert storm_records(queue) == []
+
+        await assert_refused(project_server, kwargs_for, str(other), ['get_task_escalations'])
+        records = storm_records(queue)
+        assert len(records) == 1
+        assert str(other) in records[0].summary
 
     @pytest.mark.asyncio
     async def test_the_storm_lands_in_the_reconciliation_queue(

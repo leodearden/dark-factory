@@ -629,6 +629,42 @@ check ran in. Single normative statement of the rule:
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`eval_regression`** (blocking) — filed at level 1 by the scheduled
+  memory-eval runner (`fused-memory/scripts/memory_eval_runner.py`, timer
+  `fused-memory-memory-eval.timer`, daily 03:15; OPERATIONS.md §"Scheduled
+  memory evals (03:15)"). The program never resolves its own escalations: you
+  are the sole closer. While a record is pending, the runner suppresses
+  re-filing its `dedupe_fingerprint`. Three shapes, told apart by summary:
+  - *Regression* — task id `memory-eval-<eval_id>`, summary `memory-eval
+    <eval_id>: <metric>[<item>] regressed at <stamp> ...`. **verify-fixed**
+    against `fused-memory/data/memory-evals/verdicts-current.json`: when its
+    `run_stamp` is later than the record's, and the entry whose `fingerprint`
+    equals this record's `dedupe_fingerprint` is no longer `alarm`,
+    `resolve_issue(..., action='resume', resolution="Verified fixed: <eval_id>
+    <metric> verdict=<v> at <run_stamp>")`. If it still alarms, or no newer run
+    carries the entry, file-a-real-task (for retrieval findings, link the
+    3111/3112/3200 fix lineage), `stamp_triage` the record with the filed task
+    id, and **leave it pending**. Never dismiss a still-alarming fingerprint:
+    the ratchet never grandfathers a regression, so the next run re-files it as
+    soon as the record closes.
+  - *Storm aggregate* — task id `memory-eval-program`, summary `memory-eval
+    storm at <stamp>: <n> alarms exceed K=<k>`. More alarms than K in one run
+    usually share one cause. **Infrastructure first**: check fused-memory,
+    Qdrant and FalkorDB health and read the run report the record names
+    before triaging any single metric. Tell the human, file a DecisionRecord
+    via `write-decision`, and leave it pending. Unlike the other two shapes,
+    its fingerprint is scoped to its run, so a storm that persists files one
+    new aggregate per run. Fold them: keep the oldest pending aggregate as the
+    one you triage, and dismiss each later one that has the same cause with
+    `resolve_issue(..., action='close_only', resolution="Same storm as
+    <oldest esc-id>")`. Dismissing one suppresses nothing, because no later run
+    reuses its fingerprint.
+  - *Runner failure* — task id `memory-eval-program`, summary `memory-eval
+    runner: <n> failure(s) at <stamp> (...)`. Handle it as `infra_issue`: tell
+    the human and leave it pending until a clean run. Its fingerprint carries
+    no stamp, so while it is pending a later failure files nothing: read the
+    journal (`journalctl --user -u fused-memory-memory-eval.service`) and the
+    run reports for those.
 - **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
   `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
   detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).

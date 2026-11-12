@@ -54,6 +54,7 @@ from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 
 logger = logging.getLogger(__name__)
 
@@ -400,7 +401,7 @@ class TimeoutsConfig(BaseModel):
 
 
 class BackendsConfig(BaseModel):
-    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi'."""
+    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi', 'zcode'."""
 
     architect: str = Field(default='claude')
     implementer: str = Field(default='claude')
@@ -1417,6 +1418,28 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class VerifyCacheConfig(BaseModel):
+    """How far the verify-result cache may act, per verify role
+    (plans/verify-result-cache-prd.md § Amendments, A3: per-role modes).
+
+    Each role's mode is its own green-tier reload leaf. The kill switch is not
+    here: it lives in the registry's policy_state.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    task_mode: CacheMode = CacheMode.OFF
+    merge_mode: CacheMode = CacheMode.OFF
+
+    def mode_for(self, role: VerifyRole) -> CacheMode:
+        """*role*'s mode; the cache has no background role, so that is always OFF."""
+        if role == 'task':
+            return self.task_mode
+        if role == 'merge':
+            return self.merge_mode
+        return CacheMode.OFF
+
+
 class MergeDeepConfig(BaseModel):
     """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
 
@@ -1689,6 +1712,44 @@ class SccacheConfig(BaseModel):
         this model instance.
         """
         return dict(self.backend_env) if self.enabled else {}
+
+
+class VerifyCgroupMemoryConfig(BaseModel):
+    """Memory limits every verify scope is spawned with, as ``systemd-run -p``
+    properties; applied only when verify_use_cgroup_scope is on, one value for
+    every role.
+
+    Leaves are integer GiB, rendered with systemd's base-1024 ``G`` suffix. An
+    unset leaf adds no property (systemd's default applies). high may not
+    exceed max.
+    """
+
+    high_gib: int | None = Field(default=None, ge=1)
+    max_gib: int | None = Field(default=None, ge=1)
+    swap_max_gib: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def _reject_high_above_max(self) -> 'VerifyCgroupMemoryConfig':
+        if (
+            self.high_gib is not None
+            and self.max_gib is not None
+            and self.high_gib > self.max_gib
+        ):
+            raise ValueError(
+                f'VerifyCgroupMemoryConfig.high_gib={self.high_gib} exceeds '
+                f'max_gib={self.max_gib}: MemoryHigh above MemoryMax never '
+                f'throttles before the kill; lower high_gib or raise max_gib.'
+            )
+        return self
+
+    def systemd_properties(self) -> tuple[str, ...]:
+        """Return ``<Property>=<n>G`` for each set leaf, in a fixed order."""
+        pairs = (
+            ('MemoryHigh', self.high_gib),
+            ('MemoryMax', self.max_gib),
+            ('MemorySwapMax', self.swap_max_gib),
+        )
+        return tuple(f'{prop}={gib}G' for prop, gib in pairs if gib is not None)
 
 
 class JobserverConfig(BaseModel):
@@ -3226,8 +3287,10 @@ _OVERRIDABLE_FIELDS = frozenset({
     'verify_command_timeout_secs',
     'verify_cold_command_timeout_secs',
     'concurrent_verify', 'sequential_lint_first', 'verify_env',
-    'scope_cargo',
+    'scope_cargo', 'verify_cache',
 })
+
+ModuleVerifyCache = Literal['default', 'never']
 
 _DISCOVERY_EXCLUDED_DIRS = frozenset({
     '.git', '.venv', 'venv', '.worktrees',
@@ -3263,6 +3326,15 @@ class ModuleConfig:
     sequential_lint_first: bool | None = None
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
+    # 'never' keeps every unit of this module out of the verify-result cache.
+    verify_cache: ModuleVerifyCache = 'default'
+
+    def __post_init__(self) -> None:
+        if self.verify_cache not in get_args(ModuleVerifyCache):
+            raise ValueError(
+                f'module {self.prefix!r}: verify_cache is {self.verify_cache!r}, '
+                f'expected one of {get_args(ModuleVerifyCache)}',
+            )
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -3378,9 +3450,22 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
             continue
         kwargs = {k: raw[k] for k in _OVERRIDABLE_FIELDS if k in raw}
         if kwargs:
-            configs[prefix] = ModuleConfig(prefix=prefix, **kwargs)
+            configs[prefix] = ModuleConfig(prefix=prefix, **_never_cache_if_unknown(prefix, kwargs))
             logger.info('Loaded module config for %r: %s', prefix, list(kwargs))
     return configs
+
+
+def _never_cache_if_unknown(prefix: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """*kwargs* with an unknown ``verify_cache`` value read as 'never': a typo in
+    one module's yaml keeps that module out of the cache, not the orchestrator down."""
+    value = kwargs.get('verify_cache', 'default')
+    if value in get_args(ModuleVerifyCache):
+        return kwargs
+    logger.error(
+        'module %r: verify_cache is %r, expected one of %s; treating it as never',
+        prefix, value, get_args(ModuleVerifyCache),
+    )
+    return {**kwargs, 'verify_cache': 'never'}
 
 
 _DEFAULT_PRICES: dict[str, dict[str, float]] = {
@@ -3393,12 +3478,11 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
-    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
-    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
-    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    # Codex sticker rates; each codex arm's cached rate is required by
+    # orchestrator/tests/test_eval_codex_pi_bundles.py::TestCodexSlatePin.
     'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
-    'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
-    'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
+    'gpt-6.1-sol': {'input_per_1m': 2.00, 'output_per_1m': 10.00, 'cached_input_per_1m': 0.10},
+    'gpt-6.1-terra': {'input_per_1m': 1.00, 'output_per_1m': 5.00, 'cached_input_per_1m': 0.05},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -4263,6 +4347,12 @@ class OrchestratorConfig(BaseSettings):
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
+    # Memory limits each verify scope is spawned with (`systemd-run -p
+    # MemoryHigh=/MemoryMax=/MemorySwapMax=`), only when verify_use_cgroup_scope
+    # is on; one value covers every role.
+    verify_cgroup_memory: VerifyCgroupMemoryConfig = Field(
+        default_factory=VerifyCgroupMemoryConfig,
+    )
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -5437,6 +5527,10 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
+    # An absent stanza is OFF for both roles.
+    verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
+
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
     # producer hook lives in TaskWorkflow._invoke's finally and resolves its
@@ -6595,6 +6689,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Read at each verify scope spawn (verify.py::_run_cmd via _scope_kw), so a
+    # reload applies from the next spawn, as the task-5205 CPUWeight knobs do.
+    _submodel_leaf_paths('verify_cgroup_memory', VerifyCgroupMemoryConfig),
     # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
     # green-tier hot-reloadable. apply_reload()'s existing post-apply
     # model_validate re-check already enforces
@@ -6645,6 +6742,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
     # (-> 0) without a restart. See MergeDeepConfig for the rest.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # Verify-result cache (task 5652): read per verify decision, so green tier;
+    # each role's mode is its own leaf, so a task-only edit applies alone.
+    _submodel_leaf_paths('verify_cache', VerifyCacheConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate

@@ -19,11 +19,20 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar, assert_never
 
 if TYPE_CHECKING:
@@ -63,6 +72,7 @@ from orchestrator.verify_admission_record import (
     legs_from_wire,
     plan_request,
 )
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -572,10 +582,34 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
 #     match.
+_PYTEST_TALLY_DECORATION = r'^(?:=+[ \t]+)?'
+_PYTEST_TALLY_TAIL = r'(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$'
 _PYTEST_FAILURE_SUMMARY_RE = re.compile(
-    r'^(?:=+[ \t]+)?\d+ failed\b(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$',
+    rf'{_PYTEST_TALLY_DECORATION}\d+ failed\b{_PYTEST_TALLY_TAIL}',
     re.MULTILINE,
 )
+# The outcome word that leads a stats line: `_pytest/terminal.py::KNOWN_TYPES`
+# in pytest's own order and plural forms, plus pytest-rerunfailures' `rerun`.
+_PYTEST_OUTCOME_WORD = (
+    r'(?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)'
+)
+# Any outcome's stats line, the line that ends a pytest session's report.
+_PYTEST_STATS_LINE_RE = re.compile(
+    rf'{_PYTEST_TALLY_DECORATION}(?:\d+ {_PYTEST_OUTCOME_WORD}|no tests ran){_PYTEST_TALLY_TAIL}',
+)
+_PYTEST_SESSION_START_RE = re.compile(r'^=+ test session starts =+$')
+# `_pytest/terminal.py::TerminalReporter._report_keyboardinterrupt`'s banner, written
+# only when the run loop ended by an exception: xdist.dsession.Interrupted (-x or
+# --maxfail under xdist) or KeyboardInterrupt. Not `stopping after N failures`:
+# a genuine xdist bailout under -x prints that one too.
+_PYTEST_INTERRUPTED_BANNER_RE = re.compile(
+    r'^!+ (?:[\w.]+\.)?(?:KeyboardInterrupt|Interrupted)(?:: .+)? !+$',
+    re.MULTILINE,
+)
+_SEGMENT_BLOCK_HEADER_LEAD = '===== segment '
+_SEGMENT_BLOCK_HEADER_RE = re.compile(rf'^{re.escape(_SEGMENT_BLOCK_HEADER_LEAD)}\d+/\d+ ')
+_PYTEST_BARRED_HEADER = r'=+ .+ =+'
+_PYTEST_SECTION_HEADER_RE = re.compile(rf'^{_PYTEST_BARRED_HEADER}$')
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_STATUS_CHAR_CLASS = r'[.FsxXEPp]'
 _PYTEST_PERCENT_FIELD = r'\[ *(\d+)%\]'
@@ -585,7 +619,8 @@ _PYTEST_PROGRESS_BARE_RE = re.compile(
 _PYTEST_PROGRESS_FILE_RE = re.compile(
     rf'^\S+\.py {_PYTEST_STATUS_CHAR_CLASS}+(?:\s+{_PYTEST_PERCENT_FIELD})?$',
 )
-# Captures a progress line's percentage for _crashed_session_stop_percent.
+# Captures a progress line's percentage for _crashed_session_stop_percent and
+# _reported_every_collected_test.
 _PYTEST_PROGRESS_PERCENT_RE = re.compile(
     rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[ \t]*{_PYTEST_PERCENT_FIELD}$',
     re.MULTILINE,
@@ -603,6 +638,12 @@ _PYTEST_PROGRESS_FAILURE_RE = re.compile(
 _PYTEST_VERBOSE_FAILURE_RE = re.compile(
     rf'^(?:\[gw\d+\] (?:{_PYTEST_PERCENT_FIELD} )?(?:FAILED|ERROR) '
     r'|\S+::.*? (?:FAILED|ERROR)\b)',
+    re.MULTILINE,
+)
+# Captures any -v xdist outcome line's percentage, the same floored progress
+# field a progress line ends with.
+_XDIST_VERBOSE_OUTCOME_PERCENT_RE = re.compile(
+    rf'^\[gw\d+\] {_PYTEST_PERCENT_FIELD} [A-Z]+ ',
     re.MULTILINE,
 )
 
@@ -632,17 +673,30 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # never label a session aborted (verify.py serves projects whose cap may be
 # non-zero).
 #
-# Not line-anchored: xdist prints the message bare through `report_line` and
-# again as ``=== xdist: <msg> ===`` in its terminal summary.
+# xdist prints the message bare on its own line through `report_line`, and
+# again as ``=== xdist: <msg> ===`` in its terminal summary:
+# _XDIST_BAILOUT_LINE_RE matches exactly those two whole lines, and truncation
+# evidence searches it over each session's own stream only, because
+# assertion text, captured output and INTERNALERROR lines can quote the
+# literal (task 5891). The bare line is the witness in practice: pytest runs
+# plugin terminal summaries after its FAILURES section, whose body the own
+# stream drops, so the barred form counts only when no report section
+# precedes it. The unanchored _XDIST_SESSION_ABORTED_RE serves only
+# _shows_xdist_worker_death, which is deliberately wider.
 #
 # Both emissions are gated on ``verbose >= 0``, so under ``-q`` (every
 # module-scoped leg in dark-factory-orchestrator.yaml) the literal is absent;
 # _crashed_session_stop_percent below is the ``-q``-robust second witness. The
 # absence of ``replacing crashed worker`` is no substitute (``-q`` suppresses it
 # too), and the crash signature alone never labels a session aborted.
-_XDIST_SESSION_ABORTED_RE = re.compile(
+_XDIST_BAILOUT_MESSAGE = (
     r"worker gw\d+ crashed and worker restarting disabled"
-    r"|maximum crashed workers reached: \d+",
+    r"|maximum crashed workers reached: \d+"
+)
+_XDIST_SESSION_ABORTED_RE = re.compile(_XDIST_BAILOUT_MESSAGE)
+_XDIST_BAILOUT_LINE_RE = re.compile(
+    rf'^(?:=+ xdist: )?(?P<message>{_XDIST_BAILOUT_MESSAGE})(?: =+)?$',
+    re.MULTILINE,
 )
 
 
@@ -655,10 +709,76 @@ _XDIST_CHANNEL_COLLAPSE_RE = re.compile(
 )
 
 
-def _crashed_session_stop_percent(output: str) -> int | None:
+def _pytest_session_own_streams(output: str) -> list[str]:
+    """Return one own stream per pytest session in *output*, minus report sections.
+
+    Report-section bodies (FAILURES, ERRORS, captured output, warnings) carry
+    test-controlled text: a nested run's progress, a quoted crash notice. A
+    body opens at a ``=``-barred header and closes at the session's stats
+    line or at pytest's interrupted-run banner, both written by pytest's
+    terminal reporter after its report sections. A session starts at pytest's
+    ``test session starts`` header or at a ``_run_segmented`` block header,
+    because each segment is its own pytest process. Header-less text, such as
+    the ``-q`` per-module join in ``_aggregate_results``, stays ONE stream,
+    where a stats line closing a body keeps last-module semantics.
+
+    Known limitations: a nested run's own stats line or interrupted-run banner
+    inside a body closes it early, and a nested default-verbosity session
+    header starts a new session.
+    In a header-less join, a body that never reaches a stats line (a module
+    killed mid-summary, or a non-pytest ``=``-barred banner) hides the run
+    stream of every chunk after it, so a truncated module there goes
+    unlabelled.
+    """
+    streams: list[list[str]] = [[]]
+    in_body = False
+    for line in output.splitlines():
+        if _PYTEST_SESSION_START_RE.match(line) or _SEGMENT_BLOCK_HEADER_RE.match(line):
+            streams.append([])
+            in_body = False
+        elif _PYTEST_STATS_LINE_RE.match(line) or _PYTEST_INTERRUPTED_BANNER_RE.match(line):
+            in_body = False
+        elif in_body:
+            continue
+        elif _PYTEST_SECTION_HEADER_RE.match(line):
+            in_body = True
+        streams[-1].append(line)
+    return ['\n'.join(stream) for stream in streams]
+
+
+def _last_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """Return *pattern*'s last match in *text*, or ``None``."""
+    matches = list(pattern.finditer(text))
+    return matches[-1] if matches else None
+
+
+def _reported_every_collected_test(stream: str) -> bool:
+    """Whether *stream*'s final progress percentage reads 100.
+
+    A progress line and a ``-v`` xdist outcome line carry the same floored
+    percentage, which reads 100 exactly when every collected test reported
+    (see ``_crashed_session_stop_percent`` for why).
+    """
+    final_lines = [
+        line
+        for line in (
+            _last_match(_PYTEST_PROGRESS_PERCENT_RE, stream),
+            _last_match(_XDIST_VERBOSE_OUTCOME_PERCENT_RE, stream),
+        )
+        if line is not None
+    ]
+    if not final_lines:
+        return False
+    final_line = max(final_lines, key=lambda line: line.start())
+    return int(final_line.group(1)) == 100
+
+
+def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
-    The ``-q``-robust truncation witness. All three facts must hold:
+    The ``-q``-robust truncation witness. All four facts must hold, each
+    read from *stream*, one session's own stream
+    (``_pytest_session_own_streams``):
 
     * An xdist crash signature (``_XDIST_WORKER_CRASH_RE``): progress below
       100% alone also describes ``-x``/``--maxfail`` stops and killed runs.
@@ -668,30 +788,35 @@ def _crashed_session_stop_percent(output: str) -> int | None:
       ``_pytest/terminal.py::TerminalReporter._get_progress_information_message``
       floors ``reported*100//collected``, so only an abandoned queue stays
       short; a recovering run reaches ``[100%]``.
-    * A pytest failure tally AFTER that line: pytest ended its own run loop and
-      printed its summary, rather than being killed mid-run.
+    * A pytest failure tally AFTER that line: pytest printed its summary,
+      rather than being killed mid-run.
+    * No interrupted-run banner (``_PYTEST_INTERRUPTED_BANNER_RE``) after that
+      line. An ``-x``/``--maxfail`` stop or a KeyboardInterrupt after xdist
+      replaced a crashed worker prints one, while xdist's
+      ``triggershutdown()`` bailout ends the loop without one, unless an
+      ``-x``/``--maxfail`` stop also fires while the surviving workers drain
+      (then the label is missed, never invented).
 
-    Returns ``None`` when any fact is missing, including when *output* has no
+    Returns ``None`` when any fact is missing, including when *stream* has no
     percentage progress line at all (``-v``, or the ``count``/``times``
     console styles): the bailout literal is then the only witness.
-
-    Known limitation: a run whose crashed worker xdist REPLACED
-    (``--max-worker-restart > 0``) and that ``-x``/``--maxfail`` then stopped
-    also satisfies all three facts. Its tally is genuinely partial; only the
-    named cause is imprecise (``VerifyResult.failure_report`` says the cap
-    was exceeded).
     """
-    if not _XDIST_WORKER_CRASH_RE.search(output):
+    if not _XDIST_WORKER_CRASH_RE.search(stream):
         return None
-    progress_lines = list(_PYTEST_PROGRESS_PERCENT_RE.finditer(output))
-    if not progress_lines:
+    final_line = _last_match(_PYTEST_PROGRESS_PERCENT_RE, stream)
+    if final_line is None:
         return None
-    final_line = progress_lines[-1]
     stop_percent = int(final_line.group(1))
-    pytest_ended_its_own_loop = (
-        _PYTEST_FAILURE_SUMMARY_RE.search(output, final_line.end()) is not None
+    after_final_line = final_line.end()
+    pytest_printed_its_tally = (
+        _PYTEST_FAILURE_SUMMARY_RE.search(stream, after_final_line) is not None
     )
-    return stop_percent if stop_percent < 100 and pytest_ended_its_own_loop else None
+    pytest_interrupted_its_loop = (
+        _PYTEST_INTERRUPTED_BANNER_RE.search(stream, after_final_line) is not None
+    )
+    if stop_percent < 100 and pytest_printed_its_tally and not pytest_interrupted_its_loop:
+        return stop_percent
+    return None
 
 
 def _worker_death_truncation_evidence(output: str) -> str | None:
@@ -701,13 +826,32 @@ def _worker_death_truncation_evidence(output: str) -> str | None:
     stopped (``_crashed_session_stop_percent``, the ``-q``-robust witness).
     Returns ``None`` when truncation is unproven. The literal is checked
     first, so every output it fires on keeps its evidence byte-for-byte.
+
+    Each pytest session is judged alone, and the first one with evidence
+    wins: the segmented fallback (``_run_segmented``) runs every segment, so
+    a truncated session need not be the last.
+
+    A final progress percentage reading 100 in that session's own stream
+    (``_reported_every_collected_test``) disproves truncation for both
+    witnesses, even when the literal printed.
     """
     if not output:
         return None
-    bailout = _XDIST_SESSION_ABORTED_RE.search(output)
+    for stream in _pytest_session_own_streams(output):
+        evidence = _session_truncation_evidence(stream)
+        if evidence is not None:
+            return evidence
+    return None
+
+
+def _session_truncation_evidence(stream: str) -> str | None:
+    """Return one session's truncation evidence, read from its own *stream*."""
+    if _reported_every_collected_test(stream):
+        return None
+    bailout = _XDIST_BAILOUT_LINE_RE.search(stream)
     if bailout is not None:
-        return bailout.group(0)
-    stop_percent = _crashed_session_stop_percent(output)
+        return bailout.group('message')
+    stop_percent = _crashed_session_stop_percent(stream)
     if stop_percent is None:
         return None
     return f'run stopped at {stop_percent}% of collected tests'
@@ -1050,7 +1194,7 @@ _XDIST_CRASH_SURFACES = (
 )
 _SUMMARY_REASON_SEPARATOR = ' - '
 _SECTION_HEADER_RE = re.compile(r'^_+ (.+?) _+$', re.MULTILINE)
-_SECTION_END_RE = re.compile(r'^(?:_+ .+ _+|=+ .+ =+)$', re.MULTILINE)
+_SECTION_END_RE = re.compile(rf'^(?:_+ .+ _+|{_PYTEST_BARRED_HEADER})$', re.MULTILINE)
 _ERROR_SECTION_PREFIX_RE = re.compile(r'^ERROR (?:at (?:setup|teardown) of|collecting) ')
 _TRACEBACK_E_PREFIX = 'E   '
 
@@ -1248,6 +1392,18 @@ def _junit_testcase_id(testcase: ET.Element) -> str:
     return strip_xdist_group_suffix(f'{owner}::{name}' if owner else name)
 
 
+def _junit_spelling(node_id: str) -> str:
+    """*node_id* as :func:`_junit_testcase_id` spells its testcase, when the rootdir is the id's root.
+
+    Mirrors ``_pytest/junitxml.py::mangle_test_address``.
+    """
+    path, bracket, params = node_id.partition('[')
+    names = path.split('::')
+    names[0] = names[0].replace('/', '.').removesuffix('.py')
+    names[-1] += bracket + params
+    return f"{'.'.join(names[:-1])}::{names[-1]}"
+
+
 def _junit_testcase_never_ran(testcase: ET.Element) -> bool:
     skipped = testcase.find('skipped')
     return (
@@ -1314,6 +1470,47 @@ def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
     }
 
 
+NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
+
+#: The status of an id named by several testcases (its parametrizations, or a
+#: test that failed and then errored in teardown): the first of these any has.
+_NODE_ID_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
+
+
+def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
+    """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
+
+    A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
+    teardown error, is ``'error'``: the test got no verdict. A test that never
+    executed is ``'skipped'``; any other testcase ran and passed. Ids use the
+    spelling of :func:`_extract_test_ids_from_junit`. pytest writes a test that
+    fails and then errors in teardown as two testcases with one id; repeats
+    fold by ``_NODE_ID_STATUS_PRECEDENCE``, so that test stays ``'fail'``.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    if root is None:
+        return None
+    statuses: dict[str, NodeIdStatus] = {}
+    for testcase in root.iter('testcase'):
+        if testcase.find('failure') is not None:
+            status: NodeIdStatus = 'fail'
+        elif testcase.find('error') is not None:
+            status = 'error'
+        elif _junit_testcase_never_ran(testcase):
+            status = 'skipped'
+        else:
+            status = 'pass'
+        testcase_id = _junit_testcase_id(testcase)
+        prior = statuses.get(testcase_id)
+        statuses[testcase_id] = status if prior is None else _NODE_ID_STATUS_PRECEDENCE[min(
+            _NODE_ID_STATUS_PRECEDENCE.index(prior), _NODE_ID_STATUS_PRECEDENCE.index(status),
+        )]
+    return statuses
+
+
 def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     """The failing half of :func:`_extract_test_ids_from_junit`; ``None`` when no report parsed."""
     ids = _extract_test_ids_from_junit(path)
@@ -1345,7 +1542,8 @@ def _extract_cause_hint(output: str) -> str:
 
     Uses a pattern ladder (first match wins):
     0. xdist WORKER-DEATH TRUNCATION — see below; pre-empts the whole ladder
-    1. ``FAILED test::name`` — pytest failure lines (start of line)
+    1. ``FAILED test::name`` — pytest failure lines (start of line), a dead
+       worker's fabricated one only when no other exists
     2. ``INTERNALERROR>`` — pytest collection / plugin errors
     3. ``===== N failed in Xs =====`` — pytest summary line
     4. ``error: …``         — cargo/clippy surface errors
@@ -1373,8 +1571,11 @@ def _extract_cause_hint(output: str) -> str:
       (esc-4176-6: ``1 failed, 728 passed`` truncated vs ``19622 passed`` on a
       clean re-run of the identical command).
 
-    Every other rung is untouched, so output with no truncation evidence takes
-    a byte-identical path to today's.
+    RUNG 1 itself skips that fabricated line (``_failed_lines_not_crash_attributed``)
+    for the same reason, outside a truncation too: after a RECOVERED crash, an
+    ``-x``/``--maxfail`` stop's real failure is named instead (task 5905). A
+    fabricated line is named only when no genuine ``FAILED`` line exists, and
+    output with no crash notice takes an unchanged path.
 
     Returns ``''`` for None, empty, or whitespace-only input.
     Result is stripped to a single line and capped at 200 chars.
@@ -1386,8 +1587,13 @@ def _extract_cause_hint(output: str) -> str:
     if truncation_evidence is not None:
         return _worker_death_cause_hint(output, truncation_evidence)
 
+    failed_lines = (
+        _failed_lines_not_crash_attributed(output) or _PYTEST_FAILED_LINE_RE.findall(output)
+    )
+    if failed_lines:
+        return failed_lines[0].strip()[:200]
+
     _HINT_PATTERNS = [
-        _PYTEST_FAILED_LINE_RE,
         _PYTEST_INTERNALERROR_RE,
         _PYTEST_FAILURE_SUMMARY_RE,
         re.compile(r'^error: .+$', re.MULTILINE),
@@ -2874,13 +3080,15 @@ def _make_infix(module_prefix: 'str | None') -> str:
 
 
 def _prepare_junit_report_path(
-    worktree: Path, module_prefix: 'str | None',
+    worktree: Path, module_prefix: 'str | None', *, group: 'str | None' = None,
 ) -> 'Path | None':
     """Build the merge-verify junit report path under *worktree*, or None.
 
     Returns the absolute ``<worktree>/.df-verify-junit/report{infix}.xml`` path
     (creating ONLY the ``.df-verify-junit`` child dir) for a live worktree, or
     None WITHOUT creating anything when the worktree is gone or unwritable.
+    A *group* adds a second infix, so a caller's own report never shares the
+    merge verify's prefix-keyed one.
 
     Shape-2 husk guard (task 2922): a late merge-role verify writer can fire
     AFTER its worktree was torn down. The previous inline
@@ -2909,7 +3117,7 @@ def _prepare_junit_report_path(
     junit_dir = worktree / '.df-verify-junit'
     try:
         junit_dir.mkdir(exist_ok=True)
-        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}.xml'
+        report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}{_make_infix(group)}.xml'
     except OSError:
         return None
     return report
@@ -2960,6 +3168,8 @@ class _JunitReportPlan:
     - ``'attributing'``: a merge verify at full breadth. One leg-level report,
       parsed into ``VerifyResult.failing_test_ids`` and archived. Never
       written per segment (task 3478).
+    - A caller-named report is ``'attributing'`` at the caller's path, whatever
+      the role and breadth.
     - ``'cost'``: a task verify with an archive destination. Archived, never
       parsed, so task-path attribution is unchanged. A segmented leg writes
       one per segment instead, at :meth:`segment_path`.
@@ -2992,10 +3202,14 @@ class _JunitReportPlan:
         attempt_id: 'int | None',
         task_id: 'str | None',
         archive_root: 'Path | None',
+        report: 'Path | None' = None,
     ) -> '_JunitReportPlan':
         kind: Literal['attributing', 'cost'] | None = None
         leg_path: Path | None = None
-        if role == 'merge' and merge_breadth_full:
+        if report is not None:
+            kind = 'attributing'
+            leg_path = report
+        elif role == 'merge' and merge_breadth_full:
             kind = 'attributing'
             # Shape-2 husk guard (task 2922): None, rather than re-creating a
             # torn-down worktree as an empty husk for a late writer.
@@ -4803,7 +5017,7 @@ class VerifyResult:
     # not recorded (an older remote, hand-built results, sentinels); () = nothing ran.
     units: tuple[verify_evidence.VerifyUnit, ...] | None = None
     # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
-    cache_mode: verify_evidence.CacheMode = verify_evidence.CacheMode.OFF
+    cache_mode: CacheMode = CacheMode.OFF
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4818,7 +5032,7 @@ class VerifyResult:
             self.admission_legs = legs_from_wire(self.admission_legs)
         if self.units is not None:
             self.units = verify_evidence.units_from_wire(self.units)
-        self.cache_mode = verify_evidence.CacheMode(self.cache_mode)
+        self.cache_mode = CacheMode(self.cache_mode)
 
     @property
     def plan_hash(self) -> str | None:
@@ -5694,6 +5908,7 @@ class _ScopeKw(TypedDict, total=False):
     use_cgroup_scope: bool
     scope_tag: str
     cpu_weight: int
+    memory_properties: tuple[str, ...]
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5845,15 +6060,22 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     )
 
 
-def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
+def _scope_launch_argv(
+    scope_unit: str,
+    cpu_weight: int | None,
+    memory_properties: tuple[str, ...] = (),
+) -> list[str]:
     """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
-    share (nice only orders threads inside the scope)."""
+    share (nice only orders threads inside the scope), and *memory_properties*
+    are the scope's memory limits (an empty tuple adds none)."""
     argv = [
         'systemd-run', '--user', '--scope', '--quiet', '--collect',
         f'--unit={scope_unit}',
     ]
     if cpu_weight is not None:
         argv += ['-p', f'CPUWeight={cpu_weight}']
+    for prop in memory_properties:
+        argv += ['-p', prop]
     return argv
 
 
@@ -5886,6 +6108,7 @@ async def _run_cmd(
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
     cpu_weight: int | None = None,
+    memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -5906,7 +6129,8 @@ async def _run_cmd(
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
     is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
-    (systemd default).
+    (systemd default). Each *memory_properties* entry is added as
+    ``-p <entry>``; the default ``()`` adds none.
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -6003,7 +6227,7 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             proc = await asyncio.create_subprocess_exec(
-                *_scope_launch_argv(scope_unit, cpu_weight),
+                *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
                 '/bin/bash', '-c', cmd,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
@@ -6443,7 +6667,7 @@ def _segment_output_block(entry: dict, total: int, out: str) -> str:
     failing segment's hint.
     """
     header = (
-        f'===== segment {entry["index"]}/{total} [{entry["label"]}] '
+        f'{_SEGMENT_BLOCK_HEADER_LEAD}{entry["index"]}/{total} [{entry["label"]}] '
         f'cwd={entry["cwd"]} rc={entry["rc"]} status={entry["status"]} '
         f'({entry["duration_secs"]:.1f}s) ====='
     )
@@ -6624,7 +6848,7 @@ def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
     *,
-    role: Literal['merge', 'task', 'background'] = 'task',
+    role: VerifyRole = 'task',
 ) -> dict[str, str]:
     """Return the effective env injected into verify commands.
 
@@ -7135,8 +7359,14 @@ async def run_verification(
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
     admission_request: AdmissionRequest | None = None,
+    junit_report: Path | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    A caller-named *junit_report* is injected into the test leg at the existing
+    chokepoint, cleared before each pytest invocation, and parsed into
+    ``failing_test_ids``/``skipped_test_ids``. It is refused with
+    *segment_chained_test*, whose segments would each overwrite it.
 
     *admission_request* places the gated test leg in the admission gate's
     order (task 5628). A caller verifying several modules as one plan passes
@@ -7207,6 +7437,11 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
+    if junit_report is not None and segment_chained_test:
+        raise ValueError(
+            f'a caller-named junit report cannot be written by a segmented test leg: '
+            f'junit_report={junit_report!r}, segment_chained_test={segment_chained_test!r}',
+        )
     if admission_request is not None and admission_request.role != role:
         raise ValueError(
             f'an admission request must carry its verify role: request role='
@@ -7249,6 +7484,7 @@ async def run_verification(
         attempt_id=attempt_id,
         task_id=task_id,
         archive_root=archive_root,
+        report=junit_report,
     )
 
     if is_merge_verify:
@@ -7459,6 +7695,7 @@ async def run_verification(
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
+                    'memory_properties': config.verify_cgroup_memory.systemd_properties(),
                 }
                 if config.verify_use_cgroup_scope
                 else {}
@@ -7484,9 +7721,11 @@ async def run_verification(
             # segments run.
             #
             # Co-occurrence guard (task 3478). An ATTRIBUTING junit report
-            # and segmentation are mutually exclusive by construction today:
-            # the former requires role=='merge' and breadth=='full', the
-            # latter `segment_chained_test=role != 'merge'`. So per-segment
+            # and segmentation do not co-occur today: a caller-named report
+            # with segment_chained_test is refused at entry, and the
+            # role-derived report requires role=='merge' and breadth=='full'
+            # while the one segmenting call site passes
+            # `segment_chained_test=role != 'merge'`. So per-segment
             # attribution junit is deliberately UNWIRED, and node-id
             # attribution on this path comes from _extract_failing_test_ids
             # over the aggregated segment stdout instead. The task-path COST
@@ -7504,11 +7743,13 @@ async def run_verification(
                 logger.warning(
                     'Segmented verify (%d segments) co-occurs with a junit report '
                     'path at %s, which will NOT be written: per-segment attribution '
-                    'junitxml is deliberately unwired (task 3478). These two were mutually '
-                    'exclusive by construction — attribution requires role==\'merge\' '
-                    'with merge_verify_breadth==\'full\', segmentation requires '
-                    'role!=\'merge\' — so reaching here means one of those gates '
-                    'changed. Do NOT resolve this by injecting one shared '
+                    'junitxml is deliberately unwired (task 3478). These two do not '
+                    'co-occur today — run_verification refuses a caller-named report '
+                    'with segment_chained_test, and the role-derived report requires '
+                    'role==\'merge\' with merge_verify_breadth==\'full\' while the one '
+                    'segmenting call site passes segment_chained_test only for '
+                    'role!=\'merge\' — so reaching here means that call site or one of '
+                    'those gates changed. Do NOT resolve this by injecting one shared '
                     '--junitxml: %d pytest runs writing one path is last-writer-wins, '
                     'a report describing only the final segment. Node-id attribution '
                     'for THIS run remains available via _extract_failing_test_ids '
@@ -8482,12 +8723,13 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
     return _list
 
 
-# Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
-# it renders into. Used by _executed_module_configs_from_plan to recover
-# which of test_command/lint_command/type_check_command a PlannedRun belongs
-# to. Keyed off `reason` (verify_plan._derive_module_runs's docstring: "Each
-# per-tool run's reason is prefixed with the tool name ... so a caller can
-# recover tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
+# Maps a PlannedRun's leg to the ModuleConfig attribute it renders into. Used
+# by _executed_module_configs_from_plan to recover which of
+# test_command/lint_command/type_check_command a PlannedRun belongs to. The
+# leg comes from verify_plan.py::planned_run_leg, which decodes the run's
+# reason prefix (verify_plan._derive_module_runs's docstring: "Each per-tool
+# run's reason is prefixed with the tool name ... so a caller can recover
+# tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
 # because an OPAQUE-parsed command — an unrecognised head, e.g. a synthetic
 # test-fixture command, or a chain invoking no recognised tool or two of them
 # — always resolves to the SAME `ToolKind.OPAQUE` regardless of which slot
@@ -8497,11 +8739,11 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
 # commands to.) A SKIPPED run's cmd
 # is None and needs no attribution, since the corresponding ModuleConfig
 # field is simply left unset (None) there.
-_MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
-    ('lint:', 'lint_command'),
-    ('pyright:', 'type_check_command'),
-    ('pytest:', 'test_command'),
-)
+_MC_ATTR_BY_LEG: dict[verify_evidence.Leg, str] = {
+    verify_evidence.Leg.LINT: 'lint_command',
+    verify_evidence.Leg.TYPE: 'type_check_command',
+    verify_evidence.Leg.TEST: 'test_command',
+}
 
 
 def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
@@ -8514,10 +8756,8 @@ def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     ``ModuleConfig`` tool slots. :func:`_mc_attr_for_run` is the raising
     variant for callers that have already excluded that shape.
     """
-    for prefix, attr in _MC_ATTR_BY_REASON_PREFIX:
-        if run.reason.startswith(prefix):
-            return attr
-    return None
+    leg = verify_plan.planned_run_leg(run)
+    return None if leg is None else _MC_ATTR_BY_LEG[leg]
 
 
 def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
@@ -10760,6 +11000,216 @@ def _group_node_ids_by_subproject(
     return groups
 
 
+def _node_id_test_config(
+    module_config: ModuleConfig,
+    node_ids: Sequence[str],
+    *,
+    tree: Path,
+    timeout_secs: int,
+) -> ModuleConfig:
+    """The module's test leg alone, scoped to *node_ids*, forced serial, with a per-test timeout."""
+    return replace(
+        module_config,
+        test_command=_with_pytest_timeout_str(
+            _serial_pytest_str(
+                _scope_to_keyword(module_config.test_command, 'pytest', list(node_ids)),
+                invocation_dir=tree,
+            ),
+            timeout_secs,
+        ),
+        lint_command=None,
+        type_check_command=None,
+    )
+
+
+#: Per-test timeout (seconds) injected into every ``run_node_ids`` run, so a
+#: hung test is bounded by it rather than by the verify command timeout.
+_NODE_ID_RUN_TIMEOUT_SECS: int = 300
+
+
+def _node_id_statuses(
+    report: Path, prefix: str, qualified_by_id: Mapping[str, str],
+) -> dict[str, NodeIdStatus] | None:
+    """The status of each id the junit *report* records; ``None`` when no report parsed.
+
+    An id names the testcase spelled from its qualified id with the rootdir at
+    the tree root or at the module dir, and a function id without parameters
+    names every parametrization of it. An id that names no testcase is left out.
+    """
+    testcases = _junit_testcase_statuses(report)
+    if testcases is None:
+        return None
+    statuses: dict[str, NodeIdStatus] = {}
+    for node_id, qualified in qualified_by_id.items():
+        spellings = {
+            _junit_spelling(qualified),
+            _junit_spelling(qualified.removeprefix(f'{prefix}/')),
+        }
+        named: list[NodeIdStatus] = [
+            status for testcase, status in testcases.items()
+            if spellings & {testcase, testcase.partition('[')[0]}
+        ]
+        if named:
+            statuses[node_id] = min(named, key=_NODE_ID_STATUS_PRECEDENCE.index)
+    return statuses
+
+
+async def _node_id_run(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path,
+) -> dict[str, NodeIdStatus] | None:
+    """One run of *qualified_by_id* into *report*, read back per reported id; ``None`` when no report was read."""
+    try:
+        await run_verification(
+            tree, config,
+            _node_id_test_config(
+                module_config, list(qualified_by_id.values()),
+                tree=tree, timeout_secs=_NODE_ID_RUN_TIMEOUT_SECS,
+            ),
+            max_retries=0, role='merge', junit_report=report,
+        )
+    except Exception:
+        logger.warning(
+            'run_node_ids: running %s in module %r raised — each reads error',
+            list(qualified_by_id), module_config.prefix, exc_info=True,
+        )
+        return None
+    return _node_id_statuses(report, module_config.prefix, qualified_by_id)
+
+
+_NodeIdSubsetRun = Callable[[Sequence[str]], Awaitable[dict[str, NodeIdStatus] | None]]
+
+
+async def _bisect_refused_run(
+    run: _NodeIdSubsetRun, refused: Sequence[str],
+) -> dict[str, NodeIdStatus]:
+    """The statuses of the *refused* ids, a run that reported none of them, found by bisection.
+
+    The halves run in turn, and a half that reports nothing is split again.
+    When the first half reports, the cause lies in the second, so the second
+    is split without being run. An id refused alone reports nothing.
+    """
+    if len(refused) < 2:
+        return {}
+    first, second = refused[:len(refused) // 2], refused[len(refused) // 2:]
+    first_statuses = await run(first)
+    if first_statuses:
+        return first_statuses | await _bisect_refused_run(run, second)
+    first_statuses = await _bisect_refused_run(run, first)
+    second_statuses = await run(second) or await _bisect_refused_run(run, second)
+    return first_statuses | second_statuses
+
+
+async def _run_node_id_group(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_config: ModuleConfig,
+    qualified_by_id: Mapping[str, str],
+    report: Path | None,
+) -> dict[str, NodeIdStatus]:
+    """Every id of one module's group, run together into *report*, which is removed afterwards.
+
+    A run whose written report records none of its ids is bisected.
+    """
+    if report is None:
+        logger.warning(
+            'run_node_ids: no junit report path in %s for module %r — %s each read error',
+            tree, module_config.prefix, list(qualified_by_id),
+        )
+        return {node_id: 'error' for node_id in qualified_by_id}
+
+    async def run(node_ids: Sequence[str]) -> dict[str, NodeIdStatus] | None:
+        subset = {node_id: qualified_by_id[node_id] for node_id in node_ids}
+        return await _node_id_run(tree, config, module_config, subset, report)
+
+    try:
+        statuses = await run(list(qualified_by_id))
+        if statuses == {}:
+            statuses = await _bisect_refused_run(run, list(qualified_by_id))
+    finally:
+        _clear_junit_report(report)
+    reported = statuses or {}
+    return {node_id: reported.get(node_id, 'error') for node_id in qualified_by_id}
+
+
+def _node_ids_by_module(
+    tree: Path, mc_by_prefix: dict[str, ModuleConfig], ids: Collection[str],
+) -> dict[str, dict[str, str]]:
+    """``{prefix: {id: qualified id}}``, each id mapped on its own; an unmappable id is left out."""
+    by_prefix: dict[str, dict[str, str]] = {}
+    for node_id in ids:
+        mapped = _group_node_ids_by_subproject(
+            tree, mc_by_prefix, [node_id], log_label='run_node_ids',
+        )
+        if mapped:
+            [(prefix, [qualified])] = mapped.items()
+            by_prefix.setdefault(prefix, {})[node_id] = qualified
+    return by_prefix
+
+
+async def run_node_ids(
+    tree: Path,
+    config: OrchestratorConfig,
+    module_configs: Sequence[ModuleConfig],
+    ids: Collection[str],
+    *,
+    concurrent_groups: bool = False,
+) -> Mapping[str, NodeIdStatus]:
+    """Run exactly the pytest node *ids* in *tree*; return each one's status, keyed as given.
+
+    ``'pass'`` and ``'fail'`` are verdicts on the test. ``'skipped'`` means it
+    never ran, which is not a pass: SKIP is not ALLOW. ``'error'`` means no
+    verdict was obtained: the id maps to no module in *module_configs*, names
+    no test function (a module or class id matches no testcase), was never
+    reported, errored in setup or teardown, or its run raised or wrote no
+    junit report.
+
+    A function id without its parameters names every parametrization:
+    ``'fail'`` if any failed, else ``'error'`` if any errored, else
+    ``'skipped'`` if any was skipped, else ``'pass'`` (every parametrization
+    passed).
+
+    Each id is mapped to its module on its own, so one unmappable id errors
+    alone. The ids of one module run together, serially, scoped and with a
+    per-test timeout, through ``_node_id_test_config`` and
+    ``run_verification``'s junit chokepoint; each group writes its own report,
+    removed after it is read. The isolated-rerun discriminator shares the
+    mapping (``_group_node_ids_by_subproject``) and ``_node_id_test_config``.
+
+    pytest refuses a whole argv for one not-found id, and a collection error
+    interrupts the session even under ``--continue-on-collection-errors``, so
+    a run whose written report records none of its ids is bisected, serially.
+    Each id that refuses a run reads ``'error'`` and costs re-runs logarithmic
+    in the group's size, not one per sibling. A run that records any of its
+    ids finished its session, so an id it does not record is ``'error'``
+    without a re-run; a group that wrote no report at all is not re-run.
+
+    *concurrent_groups* runs the module groups at once, each writing its own
+    report; the serial default is what an isolation-sensitive caller needs.
+    """
+    mc_by_prefix = {mc.prefix: mc for mc in module_configs}
+    qualified_by_prefix = _node_ids_by_module(tree, mc_by_prefix, ids)
+    token = uuid.uuid4().hex
+
+    def run_group(prefix: str) -> Awaitable[dict[str, NodeIdStatus]]:
+        return _run_node_id_group(
+            tree, config, mc_by_prefix[prefix], qualified_by_prefix[prefix],
+            _prepare_junit_report_path(tree, prefix, group=f'node-ids-{token}'),
+        )
+
+    if concurrent_groups:
+        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+    else:
+        group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
+    statuses: dict[str, NodeIdStatus] = {}
+    for one_group in group_statuses:
+        statuses.update(one_group)
+    return MappingProxyType({node_id: statuses.get(node_id, 'error') for node_id in ids})
+
+
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
@@ -10842,16 +11292,9 @@ async def _sweep_failure_reproduces_in_isolation(
             return None
 
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                _SWEEP_PREFILTER_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=worktree, timeout_secs=_SWEEP_PREFILTER_TIMEOUT_SECS,
             )
             result = await run_verification(
                 worktree, config, scoped_mc, max_retries=0, role='background',
@@ -11036,16 +11479,9 @@ async def confirm_main_tip_failure_is_real(
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=tmp_path,
-                ),
-                _SWEEP_CONFIRM_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=tmp_path, timeout_secs=_SWEEP_CONFIRM_TIMEOUT_SECS,
             )
             if not await _run_isolated_confirm_group(tmp_path, config, scoped_mc):
                 return True
@@ -11564,11 +12000,10 @@ async def confirm_isolated_rerun_verdict(
     ``git worktree add``/``remove``, no cleanup ``finally``.
 
     SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
-    re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
-    _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
-    with ``lint_command`` and ``type_check_command`` nulled, so only the named
-    tests run, serially, under the governing pyproject ``addopts`` minus xdist
-    and an explicit ``--timeout`` in place of its ini per-test default.
+    re-run through ``_node_id_test_config`` with ``policy.timeout_secs``, so
+    only the named tests run, serially, under the governing pyproject
+    ``addopts`` minus xdist and an explicit ``--timeout`` in place of its ini
+    per-test default.
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -11786,16 +12221,9 @@ async def confirm_isolated_rerun_verdict(
         # continuing and a full re-run's cost to lose.
         unconfirmable_observation: _RerunObservation | None = None
         for prefix, group_node_ids in groups.items():
-            mc = mc_by_prefix[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                policy.timeout_secs,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                mc_by_prefix[prefix], group_node_ids,
+                tree=worktree, timeout_secs=policy.timeout_secs,
             )
             observation = await policy.engine(
                 worktree, config, scoped_mc,

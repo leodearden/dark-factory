@@ -12,10 +12,11 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
+from _info_l0_router_fixtures import disposition_rows, reaper_harness, router_reaper_config
 from _orch_helpers import wait_responsive
 from _workflow_helpers import (
     AgentStub,
@@ -29,8 +30,7 @@ from test_workflow_escalated_steward_stall import _wire_resolve_callback
 
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
 from orchestrator.escalation_router import ROUTER_ID, hold_note, read_hold
-from orchestrator.event_store import EventStore, EventType
-from orchestrator.harness import Harness
+from orchestrator.event_store import EventStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import (
@@ -387,12 +387,6 @@ def _current(queue: EscalationQueue, esc: Escalation) -> Escalation:
     return current
 
 
-def _dispositions(workflow: TaskWorkflow) -> list[dict]:
-    store = workflow.event_store
-    assert store is not None
-    return [row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)]
-
-
 def _unrouted_info_notes(queue: EscalationQueue) -> list[Escalation]:
     return [
         e for e in queue.get_by_task(TASK_ID, status='pending', level=0)
@@ -403,22 +397,11 @@ def _unrouted_info_notes(queue: EscalationQueue) -> list[Escalation]:
 async def _reaper_l1s_after_aging(config: MagicMock, queue: EscalationQueue) -> list[Escalation]:
     """One orphan-reaper pass over *queue*'s directory with every note past a
     zero-second orphan timeout; returns the verbatim promotions it filed."""
-    config.orphan_l0_timeout_secs = 0.0
-    config.orphan_l0_dispatch_freshness_secs = 120.0
-    config.info_l0_router_enabled = True
-    config.info_l0_router_ticket_timeout_secs = 900.0
-    config.info_l0_router_max_conversions_per_sweep = 20
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        harness = Harness(config)
-    harness.scheduler.is_actively_held = MagicMock(return_value=False)
-    harness.scheduler.get_task = AsyncMock(return_value={'status': 'done', 'metadata': {}})
-    harness.scheduler.dispatch_tool = FakeCurator()
     reaper_queue = EscalationQueue(queue.queue_dir)
-    harness._escalation_queue = reaper_queue
+    harness = reaper_harness(
+        router_reaper_config(config, orphan_timeout_secs=0.0), reaper_queue,
+        curator=FakeCurator(), task_row={'status': 'done', 'metadata': {}},
+    )
     await harness._reap_orphan_l0_escalations()
     return [
         e for e in reaper_queue.get_pending()
@@ -463,7 +446,7 @@ class TestExitFinalizerRoutesInfoNotes:
         assert hold is not None and hold.ticket == 'tkt_1'
         assert len(curator.calls_named('submit_task')) == 1
         assert _current(queue, observation).resolution_class == 'observation-consumed'
-        rows = _dispositions(workflow)
+        rows = disposition_rows(workflow.event_store)
         assert sorted(r['class'] for r in rows) == ['convert-pending', 'observation-consumed']
         assert {(r['by'], r['exit_kind']) for r in rows} == {('workflow-finalizer', exit_kind)}
         assert await _reaper_l1s_after_aging(mock_orch_config, queue) == []
@@ -476,7 +459,7 @@ class TestExitFinalizerRoutesInfoNotes:
 
         after = _current(queue, note)
         assert (after.status, after.triaged_by) == ('pending', None)
-        (row,) = _dispositions(workflow)
+        (row,) = disposition_rows(workflow.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('defer', 'workflow-finalizer', 'requeued')
         assert curator.calls == []
 
@@ -501,7 +484,7 @@ class TestExitFinalizerRoutesInfoNotes:
 
         assert report.outcome == WorkflowOutcome.DONE
         assert read_hold(_current(queue, note)) is not None
-        (row,) = _dispositions(workflow)
+        (row,) = disposition_rows(workflow.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == (
             'convert-pending', 'workflow-finalizer', 'cancelled',
         )
@@ -518,7 +501,7 @@ class TestExitFinalizerNoOps:
 
         assert _current(queue, note).status == 'pending'
         assert curator.calls == []
-        assert _dispositions(workflow) == []
+        assert disposition_rows(workflow.event_store) == []
 
     async def test_with_the_router_disabled_the_note_is_left_alone(self, tmp_path: Path):
         workflow, queue, curator, _cleanups = _finalizer_workflow(tmp_path, router_enabled=False)
@@ -528,7 +511,7 @@ class TestExitFinalizerNoOps:
 
         assert _current(queue, note).status == 'pending'
         assert curator.calls == []
-        assert _dispositions(workflow) == []
+        assert disposition_rows(workflow.event_store) == []
 
     async def test_a_held_note_is_left_for_the_reaper(self, tmp_path: Path):
         workflow, queue, curator, _cleanups = _finalizer_workflow(tmp_path)

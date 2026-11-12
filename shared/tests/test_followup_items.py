@@ -27,6 +27,7 @@ from shared.followup_items import (
     parse_item,
     read_items,
     require_unique_item_keys,
+    task_items,
     with_derived_bundle_keys,
 )
 from shared.task_metadata import parse_metadata
@@ -290,6 +291,54 @@ class TestParseItem:
     def test_it_reads_any_mapping_as_the_strict_reader_does(self) -> None:
         element = MappingProxyType(_fields())
         assert parse_item(element) == read_items({FOLLOWUP_ITEMS_METADATA_KEY: [element]})[0]
+
+
+class TestTaskItems:
+    _LEGACY = {
+        'source': 'agent-followup',
+        'spawned_from': '8000',
+        'escalation_id': 'agent-followup-8000',
+        'suggestion_hash': 'abc123',
+    }
+
+    def test_a_bundle_is_its_stored_items_in_order(self) -> None:
+        first = observed_item(summary='second filed first', files=['pkg/b.py'], origin_task='1')
+        second = observed_item(summary='first filed second', files=['pkg/a.py'], origin_task='1')
+        metadata = {
+            **self._LEGACY,
+            FOLLOWUP_ITEMS_METADATA_KEY: [first.model_dump(mode='json'), second.model_dump(mode='json')],
+        }
+        items = task_items(title='t', files=['pkg/a.py', 'pkg/b.py'], metadata=metadata)
+        assert items == (first, second)
+        assert items == read_items(metadata)
+
+    def test_a_pre_bundle_single_is_its_one_legacy_item(self) -> None:
+        items = task_items(title='Fix the retry loop', files=['pkg/a.py'], metadata=self._LEGACY)
+        legacy = legacy_item(title='Fix the retry loop', files=['pkg/a.py'], metadata=self._LEGACY)
+        assert legacy is not None
+        assert items == (legacy,)
+        assert items[0].key == 'abc123'
+
+    def test_a_row_that_is_neither_has_no_items(self) -> None:
+        assert task_items(title='t', files=['pkg/a.py'], metadata={'source': 'steward'}) == ()
+
+    def test_a_legacy_single_without_files_has_no_items(self) -> None:
+        assert task_items(title='t', files=[], metadata=self._LEGACY) == ()
+
+    @pytest.mark.parametrize(
+        ('value', 'reason'),
+        [
+            pytest.param('not-a-list', BundleViolation.NOT_A_LIST, id='not-a-list'),
+            pytest.param([{'summary': 'no key'}], BundleViolation.INVALID_ITEM, id='invalid-element'),
+        ],
+    )
+    def test_a_malformed_stored_list_is_refused_as_read_items_refuses_it(
+        self, value: object, reason: BundleViolation,
+    ) -> None:
+        metadata = {**self._LEGACY, FOLLOWUP_ITEMS_METADATA_KEY: value}
+        with pytest.raises(FollowupBundleInvalid) as raised:
+            task_items(title='t', files=['pkg/a.py'], metadata=metadata)
+        assert raised.value.reason is reason
 
 
 class TestMetadataRegistration:

@@ -175,6 +175,14 @@ class TestCrossLayerIdentityLockstep:
 
         assert MILESTONE_CHECK_STALLED_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
 
+    def test_runner_review_due_category_is_registered_and_denied(self) -> None:
+        """The trigger chain's human gate stays denied (PRD C4), and the
+        literal the runner files is the registered category, not a copy."""
+        from orchestrator.deterministic_runner import REVIEW_DUE_CATEGORY
+
+        assert REVIEW_DUE_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert REVIEW_DUE_CATEGORY in set(EscalationCategory)
+
 
 class TestPromoteSentinelBoundRoles:
     """``PROMOTE_SENTINEL_BOUND_ROLES``: member roles whose clusters must be minted under a sentinel id.
@@ -635,6 +643,20 @@ class TestL2AutoCloseClass:
             f'Expected denylist to block curator_adjudication_missing, got: {result!r}'
         )
 
+    def test_review_due_denied_even_for_non_deterministic_role(self) -> None:
+        """'review_due' is the human gate of a trigger chain (PRD
+        completion-driven-triggers C4): Leo decides whether to run the review,
+        so the category alone blocks an auto-close under any role."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='review_due', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block review_due, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -657,6 +679,7 @@ class TestL2AutoCloseClass:
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'curator_adjudication_missing' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'review_due' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)

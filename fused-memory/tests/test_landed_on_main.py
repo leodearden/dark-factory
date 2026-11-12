@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from shared.merge_subject import format_merge_subject
 
 from fused_memory.services import landed_on_main as landed_module

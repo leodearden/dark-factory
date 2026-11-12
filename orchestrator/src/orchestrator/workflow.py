@@ -37,6 +37,7 @@ from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.pins import is_queue_handoff
 from pydantic import ValidationError
 from shared.cli_invoke import (
+    PROGRESS_TIMEOUT_RESUME_PROMPT,
     AgentFailureKind,
     AllAccountsCappedException,
     PromptBuilder,
@@ -105,6 +106,7 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
+from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
@@ -116,7 +118,14 @@ from orchestrator.dry_run_unblock import (
     investigation_task_name,
     run_dry_run_unblock,
 )
-from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
+from orchestrator.escalation_router import (
+    InfoL0Sweep,
+    RouterPorts,
+    apply_reviewer_disposition,
+    exit_kind_for,
+    reviewer_notes,
+    router_owns,
+)
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -687,10 +696,12 @@ class _BriefingLike(Protocol):
         self, reviewer_type: str, diff: str, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
         task: dict | None = ...,
+        open_info_notes: Sequence[Escalation] | None = ...,
     ) -> str: ...
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = ...,
         *, amendment_suggestions: list[dict] | None = ...,
+        open_info_notes: Sequence[Escalation] | None = ...,
     ) -> str: ...
     async def build_merger_prompt(self, conflicts: str, task_intent: str) -> str: ...
     async def build_revalidation_prompt(
@@ -741,6 +752,13 @@ ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invoca
 PROGRESS_RESUME_CHURN_REASON = (
     'infra: progress-resume churn (repeated ceiling-kill+resume of a '
     'productive session without convergence)'
+)
+
+# Appended to the task-verify inherited-break L0's detail when no fix-main task
+# could be filed or adopted, so the steward's fallback reaches it at runtime.
+INHERITED_BREAK_NO_FIX_OWNER_LINE = (
+    'No fix-main task could be filed: if the failures reproduce in isolation, '
+    're-escalate so one is filed.'
 )
 
 
@@ -968,7 +986,7 @@ class AmendmentReviewContext:
 
 
 @dataclass(frozen=True)
-class _LedgerVerdict:
+class LedgerVerdict:
     """Result of a pure anti-thrash evaluator (task 2172 / W3-ε).
 
     Bundles the updated :class:`~shared.task_metadata.RetryLedger` with the
@@ -1006,7 +1024,7 @@ def _build_retry_ledger(metadata: dict) -> RetryLedger:
         return RetryLedger()
 
 
-def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerdict:
+def evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> LedgerVerdict:
     """Pure decision core for the no-plan-failure anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1040,15 +1058,15 @@ def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerd
         'consecutive_no_plan_failures': counter,
         'total_no_plan_failures': total,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
-def _evaluate_infra_resume(
+def evaluate_infra_resume(
     ledger: RetryLedger,
     current_iter_count: int,
     recent_category: str | None,
     threshold: int,
-) -> _LedgerVerdict:
+) -> LedgerVerdict:
     """Pure decision core for the infra-resume-thrash anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1082,15 +1100,15 @@ def _evaluate_infra_resume(
         'consecutive_infra_resume_failures': counter,
         'last_infra_resume_iteration_count': current_iter_count,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
-def _evaluate_merge_thrash(
+def evaluate_merge_thrash(
     ledger: RetryLedger,
     prev_signature: str | None,
     current_signature: str,
     threshold: int,
-) -> _LedgerVerdict:
+) -> LedgerVerdict:
     """Pure decision core for the merge-outcome-thrash anti-thrash guard.
 
     Mirrors the counter arithmetic formerly inlined in
@@ -1118,7 +1136,7 @@ def _evaluate_merge_thrash(
         'consecutive_merge_thrash': counter,
         'last_merge_outcome_signature': current_signature,
     })
-    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+    return LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
 @dataclass
@@ -1592,14 +1610,19 @@ class TaskWorkflow:
         # the workflow never loops the narrowing pass on the same task.
         self._plan_tightened: bool = False
 
-        # Crash-recovery resume: when the harness detected a surviving
-        # agent-session sidecar at startup, it injects the parsed dict
-        # here.  The next _invoke whose role matches will use --resume
-        # against the original Claude session and a "continue" prompt
-        # instead of spawning a fresh agent.  Consumed (set to None) on
-        # first use so subsequent invocations are fresh.
+        # Pending resume, armed by crash recovery (the harness detected a
+        # surviving agent-session sidecar at startup and injects the parsed
+        # dict here) or by the γ progress-timeout branch of
+        # _execute_iterations.  The next _invoke whose role matches will use
+        # --resume against the original Claude session and a continuation
+        # prompt naming that cause instead of spawning a fresh agent.
+        # Consumed (set to None) on first use so subsequent invocations are
+        # fresh.
         self._pending_resume_session_id: str | None = None
         self._pending_resume_role: str | None = None
+        # The continuation the pending resume sends; None means cli_invoke's
+        # crash-recovery default, so the ctor's sidecar path never sets it.
+        self._pending_resume_prompt: str | None = None
         # Cumulative adopted-resume count carried across restarts in the v2
         # sidecar (task 2771).  β populates 'resume_count' in the recovered
         # sidecar dict; α reads it defensively (absent → 0) and applies the +1
@@ -2845,9 +2868,10 @@ class TaskWorkflow:
             # NOTE: unlike a failed branch_base_sha write (_write_branch_base_sha,
             # which keeps a valid SHA in memory because only the metadata write
             # failed), this path has no SHA to record — _base_commit is left
-            # None so consumers gating on `is not None` (e.g. the plan-files-
-            # touched check in _submit_to_merge_queue) skip cleanly instead of
-            # receiving an empty SHA.
+            # None so consumers gating on `is not None` skip cleanly. The
+            # plan-files-touched check in _submit_to_merge_queue is one, but it
+            # measures from _own_work_base() (task 7668), so for it the guard
+            # only means "setup resolved HEAD", not "this is the range base".
             if proc.returncode != 0:
                 logger.warning(
                     'Task %s: git rev-parse HEAD failed in external worktree '
@@ -3243,7 +3267,7 @@ class TaskWorkflow:
                     # implementer's briefing/_task_files never reflect the
                     # expanded scope. granted_files is read from resolved
                     # escalation records, not from the prose in `carried`.
-                    granted = self._collect_granted_files()
+                    granted = await self._collect_granted_files()
                     if granted:
                         current_files = self.plan.get('files', [])
                         new_files = current_files + [
@@ -6568,7 +6592,7 @@ class TaskWorkflow:
 
         Fix C — increments ``consecutive_no_plan_failures`` keyed by
         ``last_no_plan_main_sha`` inside the typed ``metadata.retry_ledger``
-        blob (see :func:`_evaluate_no_plan`).  When the counter hits ≥ 2
+        blob (see :func:`evaluate_no_plan`).  When the counter hits ≥ 2
         with the same main SHA, the no-plan loop has been observed and we
         escalate to a human directly (skip the steward) rather than
         letting the workflow re-pend.
@@ -6597,7 +6621,7 @@ class TaskWorkflow:
         metadata = self.task.get('metadata') or {}
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_no_plan(ledger, current_main_sha)
+        verdict = evaluate_no_plan(ledger, current_main_sha)
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
@@ -6729,7 +6753,7 @@ class TaskWorkflow:
         L0 was an ``infra_issue`` and the iteration log has not grown since
         the previous resume, increment ``consecutive_infra_resume_failures``
         inside the typed ``metadata.retry_ledger`` blob (see
-        :func:`_evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
+        :func:`evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
         route to ``_mark_blocked(escalate_to_human=True)`` instead of
         dispatching the implementer again.
 
@@ -6779,10 +6803,11 @@ class TaskWorkflow:
         # (e.g. eval mode), we cannot classify — fall through.
         recent_category: str | None = None
         if self.escalation_queue:
+            records = await asyncio.to_thread(
+                self.escalation_queue.get_by_task, self.task_id,
+            )
             resolved = [
-                e
-                for e in self.escalation_queue.get_by_task(self.task_id)
-                if e.level == 0 and e.status == 'resolved'
+                e for e in records if e.level == 0 and e.status == 'resolved'
             ]
             if resolved:
                 resolved.sort(
@@ -6796,7 +6821,7 @@ class TaskWorkflow:
 
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_infra_resume(
+        verdict = evaluate_infra_resume(
             ledger, current_iter_count, recent_category,
             self.config.max_consecutive_infra_resumes,
         )
@@ -6846,7 +6871,7 @@ class TaskWorkflow:
 
         return None
 
-    def _collect_granted_files(self) -> list[str]:
+    async def _collect_granted_files(self) -> list[str]:
         """Union ``granted_files`` across every resolved escalation for this
         task (task 2505) — the steward's structured scope-expansion grant
         stamped via ``resolve_issue(..., granted_files=[...])`` when
@@ -6863,7 +6888,10 @@ class TaskWorkflow:
             return []
         seen: set[str] = set()
         granted: list[str] = []
-        for esc in self.escalation_queue.get_by_task(self.task_id):
+        records = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
+        for esc in records:
             if esc.status != 'resolved':
                 continue
             for f in esc.granted_files:
@@ -6884,7 +6912,7 @@ class TaskWorkflow:
         returns ``REQUEUED`` (steward resolved an L0 and the loop is about
         to resubmit).  If the merge-outcome signature matches the previous
         attempt, increment ``consecutive_merge_thrash`` inside the typed
-        ``metadata.retry_ledger`` blob (see :func:`_evaluate_merge_thrash`).
+        ``metadata.retry_ledger`` blob (see :func:`evaluate_merge_thrash`).
         At ``max_consecutive_merge_thrash``, route to
         ``_mark_blocked(escalate_to_human=True)`` instead of resubmitting.
 
@@ -6913,7 +6941,7 @@ class TaskWorkflow:
 
         ledger = _build_retry_ledger(metadata)
 
-        verdict = _evaluate_merge_thrash(
+        verdict = evaluate_merge_thrash(
             ledger, prev_signature, current_signature,
             self.config.max_consecutive_merge_thrash,
         )
@@ -8807,6 +8835,7 @@ class TaskWorkflow:
             used_ctx = amendment_ctx
             amendment_ctx = None
             reviews = await self._review(amendment_ctx=used_ctx)
+            self._apply_note_dispositions(reviews)
             if reviews.errored_reviews:
                 triage = triage_reviewer_errors(reviews.errored_reviews)
                 if triage.requeue:
@@ -9530,6 +9559,7 @@ class TaskWorkflow:
                     return WorkflowOutcome.BLOCKED
                 self._pending_resume_session_id = self._last_invoke_session_id
                 self._pending_resume_role = IMPLEMENTER.name
+                self._pending_resume_prompt = PROGRESS_TIMEOUT_RESUME_PROMPT
                 logger.info(
                     'Task %s: implementer timed out with progress '
                     '(transcript_turns=%s) — resuming session %s next iteration',
@@ -10337,20 +10367,21 @@ class TaskWorkflow:
         surfaces as a VERIFY failure, never a silent green.
 
         Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
-        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
-        ``base_commit``, or any git error — a false negative here just reverts
-        to today's baseline briefing and must never sink PLAN.
+        missing collaborator (``worktree``/``git_ops``/``artifacts``) or any
+        git error — a false negative here just reverts to today's baseline
+        briefing and must never sink PLAN.
 
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
-        ``base_commit..HEAD``.
+        ``own_work_base..HEAD`` (task 7668). That range excludes everything
+        reachable from a merged-in main tip, leaving the branch's own commits
+        plus the merge commit.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
-        base = self.artifacts.read_base_commit()
-        if not base:
-            return []
         try:
-            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            commits = await self.git_ops.get_commit_subjects(
+                self.worktree, await self._own_work_base(),
+            )
             return [{'sha': sha, 'subject': subject} for sha, subject in commits]
         except Exception:
             logger.warning(
@@ -11550,16 +11581,18 @@ class TaskWorkflow:
         set, briefs the context-complete generation from it instead of *diff*.
         """
         assert self.worktree is not None and self.artifacts is not None
+        notes = self._reviewer_notes()
         if subject is None:
             build_prompt = partial(
                 self.briefing.build_reviewer_prompt,
                 role.name, diff, amendment_suggestions=amendment_suggestions,
-                task=self.task,
+                task=self.task, open_info_notes=notes,
             )
         else:
             build_prompt = partial(
                 self.briefing.build_context_complete_reviewer_prompt,
                 role.name, subject, amendment_suggestions=amendment_suggestions,
+                open_info_notes=notes,
             )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
@@ -12153,9 +12186,10 @@ class TaskWorkflow:
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             if rc == 0 and branch_head.strip():
+                own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
-                    self._base_commit,
+                    own_base,
                     branch_head.strip(),
                     self.git_ops,
                     task_id=self.task_id,
@@ -12238,7 +12272,7 @@ class TaskWorkflow:
                     from orchestrator.merge_lane import gates as _merge_gates
                     already_landed = await _merge_gates.resolve_already_landed_branch(
                         list(self._task_files),
-                        self._base_commit,
+                        own_base,
                         branch_head.strip(),
                         self.git_ops,
                         task_id=self.task_id,
@@ -12294,7 +12328,7 @@ class TaskWorkflow:
                         if rc2 == 0 and branch_head2.strip():
                             check = await _check_plan_files_touched_in_branch(
                                 list(self._task_files or []),
-                                self._base_commit,
+                                await self._own_work_base(),
                                 branch_head2.strip(),
                                 self.git_ops,
                                 task_id=self.task_id,
@@ -12852,15 +12886,20 @@ class TaskWorkflow:
         """Block a task whose verify failure is inherited from main.
 
         Ensures the break's fix-main task (task 5471) and names it on the
-        cross-task-folded L0 the task's steward reads.
+        cross-task-folded L0 the task's steward reads, which asks the steward
+        to re-run the failures in isolation before deferring to that owner, or,
+        with none, re-escalating so one is filed.
         """
         owner = await self._ensure_main_fix_owner(info['main_break'])
+        detail = owner.escalation_detail(info['detail'])
+        if owner.task_id is None:
+            detail = f'{detail}\n\n{INHERITED_BREAK_NO_FIX_OWNER_LINE}'
         return await self._mark_blocked(
             info['reason'],
-            detail=owner.escalation_detail(info['detail']),
+            detail=detail,
             category=info['category'],
             dedupe_fingerprint=info['fingerprint'],
-            suggested_action=owner.next_action(MainHealthNextAction.NO_FIX_OWNER),
+            suggested_action=MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION,
         )
 
     async def _auto_heal_main_health(
@@ -14692,9 +14731,11 @@ class TaskWorkflow:
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
         #
-        # cli_invoke owns the resume-continuation prompt swap; a fresh
-        # fallback is briefed by build_prompt, handed down as rebuild_prompt.
+        # cli_invoke owns the resume-continuation prompt swap and the pending
+        # prompt picks which continuation it sends; a fresh fallback is
+        # briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
+        resume_prompt: str | None = None
         if (
             self._pending_resume_session_id
             and self._pending_resume_role == role.name
@@ -14871,11 +14912,14 @@ class TaskWorkflow:
             # sid we just proved unreachable must not be re-attempted on every
             # subsequent invocation of this role.
             pending_count = self._pending_resume_count
+            pending_prompt = self._pending_resume_prompt
             self._pending_resume_session_id = None
             self._pending_resume_role = None
             self._pending_resume_count = 0
+            self._pending_resume_prompt = None
             if corroborated:
                 resume_session_id = session_id_val
+                resume_prompt = pending_prompt
                 # Adopted resume: bump the cumulative count off the recovered
                 # base (it was reset above, consumed-on-first-use).
                 resume_count_to_write = pending_count + 1
@@ -15002,6 +15046,7 @@ class TaskWorkflow:
                     absolute_cap_secs=self.config.invocation_timeout,
                     session_id=session_id_val,
                     resume_session_id=resume_session_id,
+                    resume_prompt=resume_prompt,
                     # Judge is safe by OMISSION from config.role_env_overrides (the
                     # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
                     # no longer gates roles by a hardcoded allow-list, so the judge
@@ -15549,8 +15594,13 @@ class TaskWorkflow:
         if pending_l2:
             raise _NoStewardApplicable(pending_l2)
         open_ids_at_entry = {e.id for e in open_at_entry}
+        resolved_at_entry = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id, status='resolved',
+        )
+        # A record still open at entry was not resolved before this round, even
+        # when a concurrent resolve lands before the scan above reads it.
         resolved_before_round = frozenset(
-            e.id for e in self.escalation_queue.get_by_task(self.task_id, status='resolved')
+            e.id for e in resolved_at_entry if e.id not in open_ids_at_entry
         )
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
@@ -15725,9 +15775,11 @@ class TaskWorkflow:
                 raise _StewardReescalated(handoffs)
             raise _NoStewardApplicable(handoffs)
 
+        records = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
         return select_carried_resolutions(
-            self.escalation_queue.get_by_task(self.task_id),
-            resolved_before_round=resolved_before_round,
+            records, resolved_before_round=resolved_before_round,
         )
 
     async def _get_head_commit(self) -> str:
@@ -18248,8 +18300,11 @@ class TaskWorkflow:
         """Write task completion summary so dependent tasks find it in briefings.
 
         The ``add_memory`` call is tagged with
-        ``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion'}``
-        so this organic completion note is findable by task_id-keyed audits.
+        ``completion_record_metadata(self.task_id)`` (task_id, source and a
+        declared kind; orchestrator/src/orchestrator/completion_record.py::completion_record_metadata)
+        so this organic completion note is findable by task_id-keyed audits and
+        is stored standalone by write triage, never as a child of another
+        task's record.
         Qdrant payload filters and the deterministic
         ``get_memories_by_metadata`` reconciliation audits match on
         ``metadata.task_id``; without the tag the note (which embeds the id only
@@ -18322,10 +18377,7 @@ class TaskWorkflow:
                         # Deliberately NO stage2_suppress: this must stay
                         # visible to the audit, not silently skip its
                         # count-gate (see method docstring).
-                        'metadata': {
-                            'task_id': str(self.task_id),
-                            'source': 'orchestrator_completion',
-                        },
+                        'metadata': completion_record_metadata(self.task_id),
                     },
                     context=f'completion memory write for task {self.task_id}',
                 )
@@ -18455,7 +18507,7 @@ class TaskWorkflow:
         # the steward-escalation fallback path.
         if self.mcp is None:
             if self.escalation_queue:
-                self._escalate_suggestions(reviews)
+                await self._escalate_suggestions(reviews)
                 # Record the hash after a successful fallback so identical
                 # re-entries skip the escalation queue entirely.  The queue's
                 # own dedup would also catch it, but the in-task fast-path
@@ -18496,7 +18548,7 @@ class TaskWorkflow:
         )
         return SuggestionDisposition.CURATOR
 
-    def _escalate_suggestions(self, reviews) -> None:
+    async def _escalate_suggestions(self, reviews) -> None:
         """Submit review suggestions as an info escalation for steward triage.
 
         Retained as the steward-escalation fallback even though the primary
@@ -18519,7 +18571,11 @@ class TaskWorkflow:
         # Content fingerprint: skip if identical suggestions already escalated.
         content_hash = review_suggestion_payload_hash(suggestions)
 
-        existing = self.escalation_queue.get_by_task(self.task_id)
+        # Only the read hops: submit() below fires Harness._on_escalation,
+        # whose asyncio.Event.set() is not thread-safe.
+        existing = await asyncio.to_thread(
+            self.escalation_queue.get_by_task, self.task_id,
+        )
         prior = find_prior_review_suggestion(existing, content_hash)
         if prior is not None:
             logger.info(
@@ -18943,6 +18999,34 @@ class TaskWorkflow:
             project_root=str(self.config.project_root),
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
+
+    def _reviewer_notes(self) -> list[Escalation]:
+        """The open info notes the reviewer is briefed to disposition (D2); a queue fault costs only the list."""
+        queue = self.escalation_queue
+        if queue is None:
+            return []
+        try:
+            return reviewer_notes(
+                queue, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: reading the open info notes for the reviewer briefing failed '
+                '(%s: %s); the reviewer runs without them',
+                self.task_id, type(exc).__name__, exc, exc_info=True,
+            )
+            return []
+
+    def _apply_note_dispositions(self, reviews: ReviewAggregation) -> None:
+        """Apply the review round's verdicts on the task's info notes (D2); a note left pending is the exit router's."""
+        queue = self.escalation_queue
+        if queue is None or not reviews.note_dispositions:
+            return
+        ports = self._router_ports(queue)
+        for note in reviews.note_dispositions:
+            apply_reviewer_disposition(
+                note, ports, task_id=self.task_id, enabled=self.config.info_l0_router_enabled,
+            )
 
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to

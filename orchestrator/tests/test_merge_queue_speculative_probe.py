@@ -1005,7 +1005,7 @@ class TestDispatchItemProbeWiring:
 
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 1
@@ -1046,7 +1046,7 @@ class TestDispatchItemProbeWiring:
 
         entry = await worker._dispatch_item(item)
 
-        assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 2

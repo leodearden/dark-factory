@@ -392,7 +392,8 @@ def test_a_submit_the_server_refuses_is_submit_rejected(repo, scratch):
 def test_a_dead_socket_at_submit_is_transport_failed(repo, scratch):
     before = _main(repo)
 
-    refusal = _refusal(repo, ClosedPort().port)
+    with ClosedPort() as closed:
+        refusal = _refusal(repo, closed.port)
 
     assert refusal.failure is LandingFailure.TRANSPORT_FAILED
     assert "merge_request" in refusal.detail, refusal.detail

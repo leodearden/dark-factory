@@ -6,7 +6,7 @@ the leaked ``openai``/``anthropic`` ``AsyncHttpxClientWrapper`` that produces
 ERROR records on the root ``asyncio`` logger, which then land in whichever
 unrelated test's ``caplog`` window happens to be open.
 
-MECHANISM — stated ONCE, in ``_fm_helpers.reap_leaked_async_httpx_clients``'s
+MECHANISM — stated ONCE, in ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``'s
 docstring, next to the code that depends on it. In a line: both libraries'
 ``AsyncHttpxClientWrapper`` defines a ``__del__`` that RESURRECTS an unclosed
 client as ``create_task(self.aclose())`` if any loop is running when it is
@@ -167,7 +167,7 @@ at the PRE-amendment tip and was not re-taken, because it needs a throwaway
 probe hooked into ``AsyncHttpxClientWrapper.__del__``. It still describes the
 shipped drain: the amendment changes no part of the reap path — same selection
 predicate, same ``aclose()``, same 10s bound (moved from a literal to
-``_fm_helpers.ASYNC_HTTPX_ACLOSE_TIMEOUT`` so it is testable at 50ms) — it only
+``_fm_httpx_leaks.ASYNC_HTTPX_ACLOSE_TIMEOUT`` so it is testable at 50ms) — it only
 adds the fallback guard, the warning, and tests. The four new tests do build
 four more wrappers, all of which they close themselves.
 
@@ -185,12 +185,12 @@ import contextlib
 import warnings
 import weakref
 
-import _fm_helpers
+import _fm_httpx_leaks
 import anthropic
 import httpx
 import openai
 import pytest
-from _fm_helpers import (
+from _fm_httpx_leaks import (
     _TRACK_SENTINEL,
     _warn_if_drain_closed_a_foreign_client,
     reap_leaked_async_httpx_clients,
@@ -327,7 +327,7 @@ async def test_reap_leaves_a_bare_httpx_client_open():
     assert '__del__' not in httpx.AsyncClient.__dict__, (
         'httpx.AsyncClient now defines __del__, so a bare client CAN resurrect '
         'itself and this exclusion is no longer safe — re-derive the reaper '
-        'predicate in _fm_helpers.reap_leaked_async_httpx_clients (task 4412).'
+        'predicate in _fm_httpx_leaks.reap_leaked_async_httpx_clients (task 4412).'
     )
 
     bare = httpx.AsyncClient()
@@ -430,7 +430,7 @@ async def test_reap_closes_a_leaked_anthropic_client():
         f'{type(inner).__module__}.{type(inner).__qualname__} no longer defines '
         f'__del__, so anthropic clients are no longer resurrect-capable and the '
         f'reaper now deliberately skips them — re-derive the predicate in '
-        f'_fm_helpers._leaked_async_httpx_clients (task 4412).'
+        f'_fm_httpx_leaks._leaked_async_httpx_clients (task 4412).'
     )
     assert inner.is_closed is False, 'expected a freshly-built AsyncAnthropic to hold an open httpx client'
 
@@ -500,7 +500,7 @@ async def test_reap_is_bounded_when_aclose_hangs(monkeypatch):
     """
     track_async_httpx_clients()
     await reap_leaked_async_httpx_clients()
-    monkeypatch.setattr(_fm_helpers, 'ASYNC_HTTPX_ACLOSE_TIMEOUT', 0.05)
+    monkeypatch.setattr(_fm_httpx_leaks, 'ASYNC_HTTPX_ACLOSE_TIMEOUT', 0.05)
 
     client = openai.AsyncOpenAI(api_key='test-key')
     inner = client._client
@@ -683,7 +683,7 @@ async def test_aaa_leaked_client_records_its_closing_loop():
     conftest teardown drain do it, and to capture where. The recording wraps
     the INSTANCE attribute ``inner.aclose`` rather than the class, because the
     reaper calls ``client.aclose()`` — an instance lookup
-    (``_fm_helpers.reap_leaked_async_httpx_clients``) — so an instance-level
+    (``_fm_httpx_leaks.reap_leaked_async_httpx_clients``) — so an instance-level
     wrapper is both sufficient and free of cross-test blast radius.
 
     Asserts nothing itself: the measurement it takes is only observable after

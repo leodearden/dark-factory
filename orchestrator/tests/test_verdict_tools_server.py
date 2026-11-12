@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp import FastMCP
+from _review_issue_fixtures import contract_issue, contract_issue_without
+from fastmcp import Client, FastMCP
+from shared.mcp_markup_middleware import OUTCOMES as MARKUP_OUTCOMES
 
 from orchestrator.agents.roles import ALL_REVIEWERS
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import verdict_tools
+from orchestrator.mcp import markup_journal, verdict_tools
 from orchestrator.mcp.verdict_tools import (
     _SINGLETON_ROLE_TOOLS,
+    IssueIntakeOutcome,
     _artifacts_from_args,
     _submit_completion_verdict,
     _submit_merge_disposition,
@@ -20,6 +25,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_triage,
     create_server,
 )
+from orchestrator.review_issue_contract import IssueField
 
 
 @pytest.fixture()
@@ -28,6 +34,11 @@ def artifacts(tmp_path):
     a = TaskArtifacts(tmp_path)
     a.init('test-1', 'Test task', 'A test')
     return a
+
+
+_NO_ACTION_NOTE = {
+    'escalation_id': 'esc-42-1', 'disposition': 'no_action', 'rationale': 'pure observation',
+}
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +107,82 @@ class TestSubmitReviewVerdict:
 
         assert artifacts.read_verdict('test_analyst') is None
         assert artifacts.read_verdict('security') is None
+
+    def test_the_sync_seam_applies_the_issue_intake(self, artifacts):
+        """Test doubles (_workflow_helpers.AgentStub) write verdicts through
+        this seam rather than the MCP tool, so it must run the intake itself.
+        """
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='ISSUES_FOUND',
+            issues=[contract_issue(severity='high')],
+            summary='x',
+        )
+
+        assert result['status'] == 'ok'
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.NORMALISED
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [contract_issue(severity='suggestion')]
+
+    def test_note_dispositions_are_written_into_the_payload(self, artifacts):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='ok',
+            note_dispositions=[dict(_NO_ACTION_NOTE)],
+        )
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['note_dispositions'] == [_NO_ACTION_NOTE]
+
+    @pytest.mark.parametrize(
+        ('note_dispositions', 'named', 'located'),
+        [
+            pytest.param(
+                [
+                    dict(_NO_ACTION_NOTE),
+                    {**_NO_ACTION_NOTE, 'escalation_id': 'esc-42-2', 'disposition': 'fixed'},
+                ],
+                "'fixed'",
+                'note_dispositions entry 1 ',
+                id='unknown-disposition',
+            ),
+            pytest.param(
+                [dict(_NO_ACTION_NOTE), {**_NO_ACTION_NOTE, 'disposition': 'work'}],
+                "'esc-42-1'",
+                'note_dispositions entries 0 and 1 ',
+                id='duplicated-id',
+            ),
+        ],
+    )
+    def test_malformed_note_dispositions_return_error_and_write_nothing(
+        self, artifacts, note_dispositions, named, located,
+    ):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='PASS',
+            issues=[],
+            summary='x',
+            note_dispositions=note_dispositions,
+        )
+        assert result['status'] == 'error'
+        assert named in result['message']
+        assert located in result['message']
+
+        assert artifacts.read_verdict('test_analyst') is None
 
 
 class TestSubmitCompletionVerdict:
@@ -229,6 +316,222 @@ class TestCreateServer:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
+
+    async def test_reviewer_tool_run_writes_note_dispositions(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        await tool.run({
+            'reviewer': 'test_analyst',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 's',
+            'note_dispositions': [dict(_NO_ACTION_NOTE)],
+        })
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['note_dispositions'] == [_NO_ACTION_NOTE]
+
+    async def test_reviewer_tool_note_dispositions_is_optional(self, artifacts):
+        server = create_server(artifacts, 'test_analyst')
+        tool = await server.get_tool('submit_review_verdict')
+        assert tool is not None
+
+        assert 'note_dispositions' in tool.parameters['properties']
+        assert 'note_dispositions' not in tool.parameters['required']
+
+
+def _journal_lines(root: Path) -> list[dict[str, Any]]:
+    """Every verdict-tools fact journalled under *root*; an absent file is no lines."""
+    path = markup_journal.journal_path(root, verdict_tools.MARKUP_SINK_SPEC.server_label)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+
+async def _call_review_tool(
+    artifacts: TaskArtifacts,
+    issues: list[Any],
+    *,
+    journal_root: Path | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Call the registered reviewer tool through an MCP client, as an agent does."""
+    artifacts.write_plan({
+        'task_id': 'test-1', 'title': 'T', 'analysis': 'A',
+        'prerequisites': [], 'steps': [],
+    })
+    server = create_server(
+        artifacts, 'test_analyst', resolve_project_root=lambda _wt: journal_root,
+    )
+    arguments = {
+        'reviewer': 'test_analyst',
+        'verdict': 'ISSUES_FOUND',
+        'issues': issues,
+        'summary': 'x',
+        **overrides,
+    }
+    async with Client(server) as client:
+        result = await client.call_tool('submit_review_verdict', arguments)
+    return result.data
+
+
+@pytest.mark.asyncio
+class TestSubmitReviewVerdictIssueIntake:
+    """The reviewer tool checks each issue against the reviewer issue contract
+    (orchestrator/review_issue_contract.py): off-contract fields are
+    normalised and reported back; only an unusable issue refuses the call.
+    """
+
+    async def test_off_contract_fields_are_normalised_and_reported(self, artifacts):
+        high = contract_issue(severity='high', title='kept')
+        file_and_line = contract_issue_without(
+            IssueField.LOCATION, file='pkg/mod.py', line=12,
+        )
+
+        result = await _call_review_tool(artifacts, [high, file_and_line])
+
+        assert result['status'] == 'ok'
+        assert result['role'] == 'test_analyst'
+        report = result['issue_contract']
+        assert report['outcome'] == IssueIntakeOutcome.NORMALISED
+        assert [d.split(':')[0] for d in report['deviations']] == [
+            'issues[0].severity', 'issues[1].location',
+        ]
+        assert 'submit_review_verdict' in result['message']
+        assert 'again' in result['message']
+
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [
+            {**high, 'severity': 'suggestion'},
+            {**file_and_line, 'location': 'pkg/mod.py:12'},
+        ]
+
+    async def test_a_description_taken_from_the_finding_text_lands(self, artifacts):
+        issue = contract_issue_without(
+            IssueField.DESCRIPTION, title='a heading', detail='the body',
+        )
+
+        result = await _call_review_tool(artifacts, [issue])
+
+        assert result['status'] == 'ok'
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == [{**issue, 'description': 'the body'}]
+
+    async def test_issue_without_description_is_refused_and_nothing_written(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue(), contract_issue_without(IssueField.DESCRIPTION)],
+        )
+
+        assert result['status'] == 'error'
+        assert 'issues[1].description' in result['message']
+        assert 'nothing was written' in result['message'].lower()
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
+        assert artifacts.read_verdict('test_analyst') is None
+
+    async def test_issue_without_severity_is_refused_naming_it(self, artifacts):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.SEVERITY)],
+        )
+
+        assert result['status'] == 'error'
+        assert 'issues[0].severity' in result['message']
+        assert result['issue_contract']['outcome'] == IssueIntakeOutcome.REFUSED
+        assert artifacts.read_verdict('test_analyst') is None
+
+    async def test_off_vocabulary_severity_alone_still_lands_the_verdict(self, artifacts):
+        """INV-6: a repairable issue must not strand the review gate."""
+        result = await _call_review_tool(artifacts, [contract_issue(severity='major')])
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_verdict('test_analyst') is not None
+
+    async def test_on_contract_issues_add_no_keys_to_the_ack(self, artifacts):
+        issues = [contract_issue(), contract_issue(severity='suggestion')]
+
+        result = await _call_review_tool(artifacts, issues)
+
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+        envelope = artifacts.read_verdict('test_analyst')
+        assert envelope is not None
+        assert envelope['verdict']['issues'] == issues
+
+    @pytest.mark.parametrize(
+        ('overrides', 'named'),
+        [
+            ({'reviewer': 'security'}, ('security', 'test_analyst')),
+            ({'verdict': 'GARBAGE'}, ('PASS', 'ISSUES_FOUND')),
+        ],
+    )
+    async def test_identity_and_verdict_checks_run_before_the_issue_check(
+        self, artifacts, overrides, named,
+    ):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.DESCRIPTION)], **overrides,
+        )
+
+        assert result['status'] == 'error'
+        for name in named:
+            assert name in result['message']
+        assert 'issues[' not in result['message']
+        assert 'issue_contract' not in result
+        assert artifacts.read_verdict('test_analyst') is None
+
+
+@pytest.mark.asyncio
+class TestIssueContractJournal:
+    """The registered tool journals every off-contract intake as one
+    ``review_issue_off_contract`` fact in the verdict-tools fact journal,
+    the durable record the markup guard's facts already land in.
+    """
+
+    async def test_a_normalised_intake_is_journalled_once(self, artifacts, tmp_path):
+        result = await _call_review_tool(
+            artifacts, [contract_issue(severity='high')], journal_root=tmp_path,
+        )
+
+        assert result['status'] == 'ok'
+        [line] = _journal_lines(tmp_path)
+        assert line['fact'] == verdict_tools.REVIEW_ISSUE_OFF_CONTRACT_FACT
+        assert (line['tool'], line['param'], line['outcome'], line['role']) == (
+            'submit_review_verdict', 'issues', IssueIntakeOutcome.NORMALISED, 'test_analyst',
+        )
+        assert line['subject_task_id'] == 'test-1'
+        assert any(d.startswith('issues[0].severity') for d in line['deviations'])
+
+    async def test_a_refused_intake_is_journalled_once(self, artifacts, tmp_path):
+        result = await _call_review_tool(
+            artifacts, [contract_issue_without(IssueField.DESCRIPTION)], journal_root=tmp_path,
+        )
+
+        assert result['status'] == 'error'
+        [line] = _journal_lines(tmp_path)
+        assert line['outcome'] == IssueIntakeOutcome.REFUSED
+        assert any(d.startswith('issues[0].description') for d in line['deviations'])
+
+    async def test_a_clean_intake_writes_no_journal_line(self, artifacts, tmp_path):
+        result = await _call_review_tool(artifacts, [contract_issue()], journal_root=tmp_path)
+
+        assert result == {'status': 'ok', 'role': 'test_analyst'}
+        assert not markup_journal.journal_path(
+            tmp_path, verdict_tools.MARKUP_SINK_SPEC.server_label,
+        ).exists()
+
+    async def test_an_unresolvable_journal_root_does_not_break_the_call(self, artifacts):
+        result = await _call_review_tool(artifacts, [contract_issue(severity='high')])
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_verdict('test_analyst') is not None
+
+
+def test_intake_outcomes_tell_a_floored_journal_line_from_a_markup_fact():
+    """``fact`` is not a journal floor key, but ``outcome`` is."""
+    assert 'outcome' in markup_journal.MARKUP_JOURNAL_FLOOR_KEYS
+    assert not {str(outcome) for outcome in IssueIntakeOutcome} & set(MARKUP_OUTCOMES)
 
 
 class TestSingletonRoleToolsDisjointFromReviewerNames:

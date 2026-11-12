@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Escalation sentinel role for illegal-transition escalations. Matches the
-# 'harness-' prefix in escalation.server._HARNESS_SENTINEL_ROLE_PREFIXES so
+# 'harness-' prefix in escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES so
 # the born-at-L2 record is exempt from the agent-role downgrade gate and
 # stays L2 (routes straight to a human). PRD Open Q4.
 ESCALATION_SENTINEL_ROLE = 'harness-lane-lifecycle'

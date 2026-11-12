@@ -359,6 +359,17 @@ proposing a rename.
 `get_escalation`, `get_task_escalation_history`, `escalate_info`,
 `escalate_blocker`.
 
+> **Amendment (2026-11-11, task 6552).** `get_task_escalations` also takes
+> `project_root: str | None = None`. The table below governs it, and its
+> refusals feed the same §6.4 streak. It is the archive-inclusive, filterable
+> read over the same `queue.get_by_task` primitive that
+> `get_task_escalation_history` wraps, and it carries the same
+> evidence-of-absence contract. `server_instructions.py` presents it as an
+> equal "every escalation ever filed" read, and the escalation-watcher-auto
+> skill calls it. Left unguarded, it kept §2.2 flavors 1 and 4 open on exactly
+> the read whose `[]` callers are told to trust. Omitting the argument is
+> unchanged. The sentence above is left as the γ2-time record.
+
 | Condition | Result |
 |---|---|
 | arg omitted | proceed, unchanged (fleet-agent path) |

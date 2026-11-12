@@ -1001,11 +1001,12 @@ class TestInstallationOrder:
 
 
 class TestReconReportServerIsNotGuarded:
-    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+    """(c) The recon-report server gets no MARKUP guard.
 
-    The recon-report server hosts the cite_* / report tools and no write tools,
-    so it has no write boundary to guard. Asserting that keeps it from being
-    wired by accident when the two call sites are next edited together.
+    It hosts the cite_* / report tools and no write tools, so it has no write
+    boundary to guard. Asserting that keeps it from being wired by accident
+    when the two call sites are next edited together. (It does get the
+    unknown-argument guard: tests/test_unknown_argument_guard_fused_memory.py.)
     """
 
     def _make_config(self) -> Any:

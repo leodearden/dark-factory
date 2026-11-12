@@ -11,14 +11,15 @@ covers BOTH failure modes:
   * **Wedged** (alive-but-hung): the unit is active but the port stopped
     answering — systemd Restart= won't fire. The watchdog forces a restart.
   * **Dead-but-enabled** (e.g. a boot-race dependency-cancel that systemd
-    never retries, or a unit that gave up after exhausting StartLimitBurst):
-    the unit is inactive. Pre-socket-activation this always meant the port
+    never retries): the unit is inactive. Pre-socket-activation this always meant the port
     wasn't listening either; under socket activation each unit's escalation
     port is held by a systemd ``.socket`` unit independent of the service, so
     a dead-but-enabled unit's port can still read LISTEN — see
     ``UNIT_DEAD_ACTIVE_STATES`` / ``_unit_active_state()``. Either way
     ``reset-failed`` + ``restart --no-block`` revives it. This is what
-    self-heals the 2026-05-27 powercut failure mode.
+    self-heals the 2026-05-27 powercut failure mode. A unit that exhausted
+    StartLimitBurst (Result=start-limit-hit) is instead left down and paged
+    (task 8270; OPERATIONS.md §8).
 
 restart_unit() deliberately never calls ``systemctl stop``: each socket-
 activated unit's ``ExecStopPost`` hook closes its socket only when the unit
@@ -62,9 +63,16 @@ from types import ModuleType
 
 # Flat siblings in scripts/, found because a directly executed script puts its
 # own directory at sys.path[0]; never run this file via `python -m` or `-I`.
+from _watchdog_crash_loop import (
+    CRASH_LOOP_SENTINEL_PREFIX,
+    UNKNOWN_RESTART_STATUS,
+    UnitRestartStatus,
+    crash_loop_pass,
+)
 from _watchdog_dashboard_parity import print_unit_parity, unit_parity_pass
 from _watchdog_state import (
     atomic_write_json,
+    min_interval_remaining_secs,
     read_clock_epoch,
     read_json_state,
     stamp_clock,
@@ -488,6 +496,25 @@ FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
     ),
 )
 
+# The orchestrator liveness revive cap (task 8270): the per-unit sibling of
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS, so a wedged unit is still revived
+# within this interval while a crash-looping one is revived at most once per
+# it. Sizing: OPERATIONS.md §8. <=0 disables the cap; env-with-fallback.
+try:
+    ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS = int(
+        os.environ["ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS"]
+    )
+except (KeyError, ValueError):
+    ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS = 900
+
+# That cap's OWN clocks, one file per unit: a separate family from every
+# deploy clock in both directions (FM_LIVENESS_RESTART_CLOCK_PATH's I5
+# reasoning), stamped only by a liveness revive and read only by its cap.
+ORCH_LIVENESS_RESTART_CLOCK_DIR = os.environ.get(
+    "ORCH_LIVENESS_RESTART_CLOCK_DIR",
+    os.path.join(REPO_DIR, "data", "orchestrator", "liveness-restart"),
+)
+
 
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``.
@@ -746,7 +773,9 @@ def restart_unit(unit: str) -> None:
       matters, against a unit that is not currently failed — it resets the
       start-rate-limit counter regardless of current state. A project whose
       *unit* has no matching ``.socket`` unit just makes that half of the
-      call exit non-zero (``check=False``), which is fine.
+      call exit non-zero (``check=False``), which is fine. main() never
+      reaches this for an orchestrator unit in start-limit-hit: it leaves that
+      unit down for a human (task 8270). fused_memory_liveness_pass still does.
     - ``restart --no-block`` re-launches *unit* without waiting for it to
       finish starting. A blocking ``restart`` on a ``Type=notify`` unit can
       take 45s+ to return, which is most of this oneshot watchdog's own 60s
@@ -1202,25 +1231,11 @@ def _within_fleet_deploy_min_interval() -> bool:
 def _pid_alive(pid) -> bool:
     """Return True iff *pid* names a live process.
 
-    A deliberate COPY of
-    orchestrator/src/orchestrator/session_registry.py::_pid_alive, contract
-    preserved verbatim. The copy is FORCED, not a second opinion: this script
-    is a stdlib-only systemd oneshot that imports no first-party package — the
-    same constraint that forces the FLEET_LEASE_PATH literal above.
-
-    - Anything that is not a positive int (including bool, which IS an int in
-      Python) returns False WITHOUT reaching os.kill. That is a hazard guard,
-      not defensiveness: os.kill(0, 0) signals the CALLER'S ENTIRE process
-      group and os.kill(-N, 0) a foreign group, so a corrupt or zero pid read
-      off disk must be rejected before the syscall rather than by catching its
-      exception. session_registry.resolve_session_pid documents the same trap.
-    - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError, or
-      an OverflowError from a pid too large for the platform's C pid_t ->
-      treated as dead. The too-large case is the one input this predicate
-      lets REACH the syscall and still answers False for: unlike pid 0 or a
-      negative one, it carries no signalling hazard, and the platform's own
-      refusal is the answer.
+    A deliberate COPY of shared/src/shared/proc_liveness.py::pid_alive, with
+    parity pinned by tests/scripts/test_watchdog_pid_alive_parity.py. The copy
+    is FORCED, not a second opinion: this script is a stdlib-only systemd
+    oneshot that imports no first-party package — the same constraint that
+    forces the FLEET_LEASE_PATH literal above.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
@@ -1610,6 +1625,29 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     return stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH, log)
 
 
+def _orch_liveness_restart_clock_path(unit: str) -> str:
+    return os.path.join(ORCH_LIVENESS_RESTART_CLOCK_DIR, f"{unit}.json")
+
+
+def _orch_liveness_revive_wait_secs(unit: str) -> float:
+    """Seconds before *unit* may be liveness-revived again; 0.0 when it may be now."""
+    path = _orch_liveness_restart_clock_path(unit)
+    return min_interval_remaining_secs(
+        ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS,
+        lambda: read_clock_epoch(path, f"{unit} liveness restart clock", log),
+    )
+
+
+def _stamp_orch_liveness_restart_clock(unit: str) -> bool:
+    """Arm *unit*'s liveness revive cap; True iff it landed.
+
+    The return value is load-bearing, as _stamp_fm_liveness_restart_clock's
+    is: nothing else rebuilds this clock, so the caller must say loudly when
+    the cap is unarmed.
+    """
+    return stamp_clock(_orch_liveness_restart_clock_path(unit), log)
+
+
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
     """Persist the current consecutive-non-healthy-verdict streak (task 3764).
 
@@ -1798,6 +1836,38 @@ def _unit_active_state(unit: str) -> str | None:
     return state or None
 
 
+def _unit_restart_status(unit: str) -> UnitRestartStatus:
+    """Return *unit*'s systemd NRestarts and Result; None in a field that cannot be read.
+
+    NRestarts counts only Restart= restarts and is flushed by any manual start
+    (task 5739 constraint 6); _watchdog_crash_loop.py::restart_growth counts
+    through the flush. Parsed by key, because systemd prints Result before
+    NRestarts whatever the --property order.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=NRestarts,Result"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return UNKNOWN_RESTART_STATUS
+        fields = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        try:
+            n_restarts = int(fields.get("NRestarts", "").strip())
+        except ValueError:
+            n_restarts = None
+        return UnitRestartStatus(
+            n_restarts=n_restarts, result=fields.get("Result", "").strip() or None
+        )
+    except Exception as exc:
+        logger.warning(f"could not read NRestarts/Result for {unit}: {exc!r}")
+        return UNKNOWN_RESTART_STATUS
+
+
 # ActiveState values under which an enabled unit counts as dead even while its
 # escalation port still listens (systemd socket activation — module
 # docstring). Deliberately NOT derived from UNIT_IN_FLIGHT_ACTIVE_STATES /
@@ -1813,8 +1883,34 @@ def _unit_active_state(unit: str) -> str | None:
 UNIT_DEAD_ACTIVE_STATES = frozenset({"inactive", "failed"})
 
 
-def main() -> None:
-    """Probe each watched unit; restart it on either of two dead signals.
+def main(
+    read_status: Callable[[str], UnitRestartStatus] = _unit_restart_status,
+) -> None:
+    """Sample every watched unit's restart status, then revive each dead one.
+
+    Phase one, crash_loop_pass (scripts/_watchdog_crash_loop.py), reads every
+    WATCHED unit's NRestarts/Result through *read_status* and pages a crash
+    loop. It runs before every liveness gate by construction, enabled and
+    startup grace included, because the grace window is what hid the
+    2026-10-26 loop. Phase two hands each unit and its status to
+    _revive_if_dead inside a per-unit guard, so one unit's failure cannot
+    leave the rest unprobed.
+    """
+    statuses = crash_loop_pass(
+        [unit for _port, unit in WATCHED],
+        read_status,
+        repo_dir=REPO_DIR,
+        log=log,
+    )
+    for port, unit in WATCHED:
+        try:
+            _revive_if_dead(port, unit, statuses.get(unit, UNKNOWN_RESTART_STATUS))
+        except Exception as exc:  # noqa: BLE001
+            log(f"watchdog error for {unit} (port {port}): {exc}")
+
+
+def _revive_if_dead(port: int, unit: str, status: UnitRestartStatus) -> None:
+    """Probe one watched unit; restart it on either of two dead signals.
 
     ``probe_port`` reads LISTEN False — the original signal: a wedged-but-
     active unit, or a dead-but-enabled one whose port was never (re)bound.
@@ -1832,75 +1928,104 @@ def main() -> None:
 
     Either signal takes the same revive path — restart_unit()'s
     reset-failed + restart --no-block — gated by the same is_unit_enabled /
-    STARTUP_GRACE_SECS / in-flight-fleet-lease checks, and the log line names
-    which signal fired.
+    STARTUP_GRACE_SECS / in-flight-fleet-lease checks and the same per-unit
+    revive cap (ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS, task 8270), and the
+    log line names which signal fired.
 
     One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
     sweep is currently restarting is skipped, because a unit mid-restart is
     indistinguishable from a dead one to either probe.
+
+    A unit whose *status* is start-limit-hit is never revived (task 8270):
+    systemd gave up on it, and crash_loop_pass has paged it for a human.
     """
-    for port, unit in WATCHED:
-        try:
-            if not is_unit_enabled(unit):
-                # Disabled (or unknown) — respect operator intent, skip silently.
-                continue
-            elapsed = _unit_start_elapsed_secs(unit)
-            if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
-                log(
-                    f"{unit} started {elapsed:.0f}s ago; "
-                    f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
-                )
-                continue
+    if not is_unit_enabled(unit):
+        # Disabled (or unknown) — respect operator intent, skip silently.
+        return
+    elapsed = _unit_start_elapsed_secs(unit)
+    if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+        log(
+            f"{unit} started {elapsed:.0f}s ago; "
+            f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
+        )
+        return
 
-            port_up = probe_port(port)
-            if port_up:
-                # Socket activation keeps the port LISTEN-ing across a dead
-                # service, so a live port no longer proves a live process —
-                # ask systemd directly. This runs on every healthy tick (the
-                # cost socket activation adds); the lease read below stays
-                # lazy regardless.
-                state = _unit_active_state(unit)
-                if state not in UNIT_DEAD_ACTIVE_STATES:
-                    continue
-                reason = (
-                    f"ActiveState={state!r} while escalation port {port} "
-                    "still listens (socket activation)"
-                )
-            else:
-                # A down port means this unit is wedged, dead — or being
-                # restarted right now by an in-flight fleet sweep, which the
-                # probe cannot tell apart from the other two precisely BECAUSE
-                # the sweep is restarting it. Measured: the probe cancelled the
-                # sweep's own restart jobs ("Job for ... canceled"), twice
-                # escalating to code=killed status=9/KILL.
-                reason = f"escalation port {port} not listening"
+    port_up = probe_port(port)
+    if port_up:
+        # Socket activation keeps the port LISTEN-ing across a dead
+        # service, so a live port no longer proves a live process —
+        # ask systemd directly. This runs on every healthy tick (the
+        # cost socket activation adds); the lease read below stays
+        # lazy regardless.
+        state = _unit_active_state(unit)
+        if state not in UNIT_DEAD_ACTIVE_STATES:
+            return
+        reason = (
+            f"ActiveState={state!r} while escalation port {port} "
+            "still listens (socket activation)"
+        )
+    else:
+        # A down port means this unit is wedged, dead — or being
+        # restarted right now by an in-flight fleet sweep, which the
+        # probe cannot tell apart from the other two precisely BECAUSE
+        # the sweep is restarting it. Measured: the probe cancelled the
+        # sweep's own restart jobs ("Job for ... canceled"), twice
+        # escalating to code=killed status=9/KILL.
+        reason = f"escalation port {port} not listening"
 
-            # The lease read is LAZY — it happens only HERE, after a dead
-            # signal has already fired, so an all-healthy tick (the
-            # overwhelmingly common case) costs zero extra I/O, and the
-            # read is maximally fresh at the decision point.
-            #
-            # Scoped to current_unit and nothing else: I5 (liveness stays
-            # uncapped, non-clock-gated and non-stamping — brokenness is
-            # not a scheduled deploy) must survive for every OTHER unit. A
-            # blanket liveness disable for the ~80 minutes of a sweep would
-            # leave a genuinely wedged unit unattended for over an hour.
-            lease = _live_fleet_lease()
-            if lease is not None and lease.get("current_unit") == unit:
-                log(
-                    f"{unit} {reason}, but an "
-                    f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
-                    "is restarting this unit; skipping the liveness restart"
-                )
-                continue
-            # Covers wedged-active, dead-enabled (boot-race cancelled, or
-            # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
-            # reset-failed + restart --no-block sequence revives every case.
-            log(f"{unit} {reason}; restarting")
-            restart_unit(unit)
-            log(f"{unit} restart issued")
-        except Exception as exc:  # noqa: BLE001
-            log(f"watchdog error for {unit} (port {port}): {exc}")
+    if status.start_limit_hit:
+        # The hold lasts until a human acts, possibly days, so bucket the line
+        # on wall-clock time like the skip lines — see SKIP_LOG_INTERVAL_SECS.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                f"{unit} {reason}, but systemd reports Result=start-limit-hit; leaving "
+                f"it down for a human (crash-loop page {CRASH_LOOP_SENTINEL_PREFIX}{unit}); "
+                "not running reset-failed or restart"
+            )
+        return
+
+    # The lease read is LAZY — it happens only HERE, after a dead
+    # signal has already fired, so an all-healthy tick (the
+    # overwhelmingly common case) costs zero extra I/O, and the
+    # read is maximally fresh at the decision point.
+    #
+    # Scoped to current_unit and nothing else: I5 (liveness is not
+    # gated by any deploy clock and never stamps one; it is capped only
+    # by its own per-unit revive clock, task 8270 — brokenness is not a
+    # scheduled deploy) must survive for every OTHER unit. A blanket
+    # liveness disable for the ~80 minutes of a sweep would leave a
+    # genuinely wedged unit unattended for over an hour.
+    lease = _live_fleet_lease()
+    if lease is not None and lease.get("current_unit") == unit:
+        log(
+            f"{unit} {reason}, but an "
+            f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+            "is restarting this unit; skipping the liveness restart"
+        )
+        return
+    wait = _orch_liveness_revive_wait_secs(unit)
+    if wait > 0:
+        log(
+            f"{unit} {reason}, but a liveness revive is capped to one per "
+            f"{ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS}s per unit; "
+            f"{wait:.0f}s remain; skipping"
+        )
+        return
+    # Covers wedged-active, dead-enabled (boot-race cancelled), and
+    # dead-but-socket-held: restart_unit's reset-failed + restart --no-block
+    # sequence revives every case.
+    log(f"{unit} {reason}; restarting")
+    try:
+        restart_unit(unit)
+        log(f"{unit} restart issued")
+    finally:
+        # Armed on the raising path too, as fused_memory_liveness_pass does.
+        if not _stamp_orch_liveness_restart_clock(unit):
+            log(
+                f"{unit} liveness revive cap could NOT be armed; further revives "
+                f"are unbounded until {_orch_liveness_restart_clock_path(unit)} "
+                "is writable"
+            )
 
 
 def fused_memory_liveness_pass() -> None:
@@ -2415,7 +2540,8 @@ def staleness_pass() -> None:
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
     _delegate_fleet_restart(). restart_unit() remains used ONLY by main()
-    (liveness stays uncapped, non-clock-gated, and non-stamping — I5:
+    (liveness is not gated by any deploy clock and never stamps one; it is
+    capped only by its own per-unit revive clock, task 8270 — I5:
     brokenness is not a scheduled deploy). Task 4755 added the single
     exception, and it is deliberately as narrow as one: main() skips the
     liveness restart of the ONE unit a live lease names as current_unit,
@@ -2571,8 +2697,8 @@ def fused_memory_staleness_pass() -> None:
     (mirroring fused_memory_liveness_pass()'s isolation) so a probe hiccup is
     logged and swallowed rather than crashing the oneshot watchdog. Uses
     _delegate_fm_restart() (detached defer-if-busy chokepoint), never
-    restart_unit() directly — liveness stays the only uncapped, non-clock-gated
-    revive path (I5: brokenness is not a scheduled deploy).
+    restart_unit() directly — liveness stays the only revive path no deploy
+    clock gates (I5: brokenness is not a scheduled deploy).
     """
     if _within_fm_deploy_min_interval():
         # Bucket on wall-clock time — see SKIP_LOG_INTERVAL_SECS. The gate
@@ -2842,6 +2968,13 @@ def report() -> int:
     defers on; idle proceeds immediately and stale/absent proceed after the
     gate's short unknown-grace.
 
+    RESTARTS is each unit's systemd NRestarts/Result (task 8270), read by
+    _unit_restart_status with ``show`` only; ``?`` marks an unreadable field.
+    It sits left of VERDICT, as one whitespace-free token, so the readers that
+    index rows by whitespace position keep their indices. NRestarts counts only
+    Restart= restarts and resets on any manual start; OPERATIONS.md §8,
+    "Crash loop", says what the detector does with it.
+
     FLEET-LEASE is a single fleet-wide LINE printed above the table (task
     4755), not an eighth column: the lease is one fact about the whole fleet,
     so a column would repeat it on every row for no gain — DEPLOY-AGE already
@@ -2872,7 +3005,8 @@ def report() -> int:
     print(f"FLEET-LEASE: {_format_fleet_lease()}")
     print(
         f"{'UNIT':<50} {'START':<24} {'CODE-SHA':<14} {'NEWEST WATCHED COMMIT':<24} "
-        f"{'VERDICT':<10} {'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} WOULD-DEFER"
+        f"{'RESTARTS':<20} {'VERDICT':<10} {'DEPLOY-AGE':<12} {'MERGE-IDLE':<12} "
+        "WOULD-DEFER"
     )
 
     any_stale = False
@@ -2889,9 +3023,11 @@ def report() -> int:
         merge_verdict = _classify_unit_heartbeat(unit, now)
         would_defer = "yes" if merge_verdict == "busy" else "no"
         code_sha = _unit_code_sha(unit)
+        restarts = _unit_restart_status(unit).render()
         print(
-            f"{unit:<50} {start_str:<24} {code_sha:<14} {commit_str:<24} {verdict:<10} "
-            f"{deploy_age_str:<12} {merge_verdict:<12} {would_defer}"
+            f"{unit:<50} {start_str:<24} {code_sha:<14} {commit_str:<24} "
+            f"{restarts:<20} {verdict:<10} {deploy_age_str:<12} {merge_verdict:<12} "
+            f"{would_defer}"
         )
 
     return 1 if any_stale else 0

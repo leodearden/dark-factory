@@ -23,22 +23,26 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from escalation.models import Escalation
+from escalation.models import Escalation, ReviewDueState
 from shared.before_done_paths import (
     BeforeDonePaths,
     resolve_before_done_paths,
     resolve_script_base,
 )
+from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
     DoneProvenance,
+    TriggerChain,
 )
+from shared.task_read import TaskRead, TaskReadFailed
 
 from orchestrator import systemd_inspect
 from orchestrator.before_done_script import (
@@ -49,6 +53,7 @@ from orchestrator.before_done_script import (
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
+    SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
     DeployState,
     IllegalDeployTransition,
@@ -73,6 +78,17 @@ from orchestrator.proc_supervision import (
     FreshPidVerify,
     RestartDisposition,
     RestartPlan,
+)
+from orchestrator.review_due import (
+    REVIEW_DUE_CATEGORY,
+    CompletionGateReading,
+    HumanGateFacts,
+    InvalidTriggerChain,
+    ReviewDueWithheld,
+    build_review_due,
+    completion_gate_reading,
+    first_completion_gate,
+    human_gate_chain,
 )
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import (
@@ -194,6 +210,14 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
 
+# The category the scheduled self-restart transient's RP-4 wrapper files a
+# fire-time failure under; the scheduled-deploy settler reads it as failure
+# evidence (orchestrator/src/orchestrator/scheduled_deploy_settle.py).
+SELF_RESTART_FAILURE_CATEGORY: str = 'infra_issue'
+
+# The actor named in this runner's own filings and their log lines.
+_RUNNER_ACTOR = 'DeterministicRunner'
+
 # Task 2803 (γ, PRD plans/operational-ask-routing-prd.md): stable, fixed
 # token emitted on a pure-gate born-at-L2 escalation's summary/detail when
 # the gate originated from an execution_class='operational' +
@@ -237,7 +261,8 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # stamp; `milestone_gate` is the gate itself; `milestone_check_failed` is a
 # failed predicate check; `milestone_check_stalled` is a re-arming predicate
 # still "not yet" at `deterministic.predicate_recheck_stall_cap` (PRD
-# plans/completion-driven-triggers-prd.md C1).
+# plans/completion-driven-triggers-prd.md C1).  The fifth, `review_due` (C4),
+# is defined with the rest of its contract in `orchestrator.review_due`.
 CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
 MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
 MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
@@ -308,6 +333,18 @@ def _snippet_project_root(scheduler) -> str:
     root = _configured_project_root(scheduler)
     return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
+
+def _configured_project_id(scheduler) -> str | None:
+    """The scheduler's configured fused-memory project_id, or None if unusable.
+
+    Never raises, for the reason ``_configured_project_root`` gives.
+    """
+    fused_memory = getattr(getattr(scheduler, 'config', None), 'fused_memory', None)
+    project_id = getattr(fused_memory, 'project_id', None)
+    if isinstance(project_id, str) and project_id.strip():
+        return project_id.strip()
+    return None
+
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
 #
@@ -370,11 +407,12 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
-def _cite_gate_escalation_id(own_records: list) -> str | None:
+def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | None:
     """Pick the escalation a `deterministic-gate` close should CITE.
 
-    Cite the GATE record — NOT merely the newest own-role one (reviewer
-    amendment, task 3341).  The standard curator remediation round-trip
+    Cite the gate record of this gate's own *gate_category*
+    (:func:`gate_escalation_category`), NOT merely the newest own-role one
+    (reviewer amendment, task 3341).  The standard curator remediation round-trip
     leaves TWO own-role records behind:
       (A) the original `milestone_gate`, resolved WITHOUT a stamp — the
           record that proves rung one, and
@@ -386,8 +424,10 @@ def _cite_gate_escalation_id(own_records: list) -> str | None:
     nothing about the gate — quietly mis-aiming the audit trail this citation
     exists to sharpen.  So filter to the gate category first and take the
     newest of those; fall back to the newest own record only when no
-    gate-category record survives (e.g. a gate filed under an older
-    category), and return ``None`` for an empty list (an empty list must
+    gate-category record survives (e.g. a human gate filed as
+    ``milestone_gate`` before ``review_due`` existed, or with its
+    ``review_due`` withheld for an unusable config), and return ``None``
+    for an empty list (an empty list must
     never be indexed; ``_build_done_provenance``'s ``exclude_none=True`` then
     simply drops the key).
 
@@ -397,10 +437,11 @@ def _cite_gate_escalation_id(own_records: list) -> str | None:
     Neither arm can actually reach the ``None`` return: both run only after
     the zero-record strand branch has re-filed the gate and returned BLOCKED.
 
-    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record
-    and test_pure_gate_resume_cites_the_gate_record_not_the_newest.
+    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record,
+    test_pure_gate_resume_cites_the_gate_record_not_the_newest and
+    test_human_gate_cites_its_review_due_over_a_newer_milestone_gate.
     """
-    gate_records = [e for e in own_records if e.category == 'milestone_gate']
+    gate_records = [e for e in own_records if e.category == gate_category]
     citable = gate_records or own_records
     if not citable:
         return None
@@ -551,64 +592,225 @@ def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
     provenance = metadata.get('done_provenance')
     if (
         isinstance(provenance, dict)
-        and provenance.get('kind') == 'deterministic-deploy-scheduled'
+        and provenance.get('kind') == SCHEDULED_DEPLOY_PROVENANCE_KIND
     ):
         return True
     return bool(metadata.get('before_done_scheduled_at'))
 
 
-def build_milestone_gate_escalation_fields(
-    task: dict | None, metadata: dict,
-) -> tuple[str, str, list]:
-    """Build ``(summary, detail, options)`` for a born-at-L2 ``milestone_gate``.
+def file_illegal_deploy_transition(
+    escalation_queue: EscalationQueue,
+    task_id: str,
+    old: DeployPhase,
+    new: DeployPhase,
+    *,
+    actor: str,
+) -> None:
+    """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge *actor* attempted.
 
-    THE single seam both born-at-L2 pure-gate producers route through:
-      - the runner's own gate filing
-        (``DeterministicRunner._file_milestone_gate_and_block``), and
-      - the harness recon-sweep's strand recovery
-        (``Harness._recover_stranded_deterministic_gate``, task 2954).
+    Wired into ``enforce_transition``'s ``escalation_sink`` — files BEFORE
+    ``enforce_transition`` raises ``IllegalDeployTransition``, so an illegal
+    edge is never silently swallowed (D2).  Mirrors the other
+    escalation-filing helpers' construction (sentinel role keeps level=2 past
+    the server downgrade gate) but is unconditional — no dedup guard — since
+    an illegal transition is itself a bug signal that must never be
+    suppressed by an unrelated pending escalation.
+    """
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category='illegal_deploy_transition',
+        summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
+        detail=(
+            f'{actor} attempted an illegal deploy-phase '
+            f'transition {old!r} -> {new!r} for task {task_id}. This '
+            f'indicates a bug in {actor} or corrupted deploy_state metadata — '
+            'investigate before resuming.'
+        ),
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.error(
+        '%s: filed L2 illegal_deploy_transition escalation '
+        '%s for task %s (%s -> %s)',
+        actor, esc.id, task_id, old, new,
+    )
 
-    Extracted (task 2954 amendment) so a re-filed gate is byte-identical to
-    what the runner would have filed.  Critically this includes the
-    operational-LLM token prefix (task 2803 γ): a naive re-build in the sweep
-    would DROP the ``OPERATIONAL_LLM_NEEDS_LANE_TOKEN`` on summary+detail and
-    misroute the human handling lane, so centralizing the construction keeps
-    the two producers in lockstep.
 
-    ``detail`` = description + a "Landed dependencies:" line when the task has
-    dependencies; ``summary`` = ``title[:200]``.  For an operational-LLM gate
-    (``_is_operational_llm_gate``) both are token-prefixed (token-first so the
-    token survives the summary's ``[:200]`` truncation and any tail-only log
-    scrape; ``detail`` itself is not truncated).  Plain gates (marker absent)
-    are byte-unchanged.  ``options`` is the task's ``gate_options`` (empty list
-    when absent).  None/empty *task* is tolerated (defensive; the sweep's task
-    dict is read back from the scheduler).
+def file_deterministic_escalation(
+    escalation_queue: EscalationQueue,
+    task_id: str,
+    *,
+    actor: str,
+    summary: str,
+    detail: str,
+    category: str = 'infra_issue',
+) -> str | None:
+    """File a born-at-L2 escalation unless one of ours is pending; its id, or None when skipped.
+
+    *actor* names the filer in the log lines.  Dedup rationale:
+    ``DeterministicRunner._file_infra_issue_and_block``.
+    """
+    existing_pending = escalation_queue.get_by_task(
+        task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+    )
+    if existing_pending:
+        logger.info(
+            '%s: task %s already has %d pending escalation(s) — '
+            'skipping re-file (%s dedup guard)',
+            actor, task_id, len(existing_pending), category,
+        )
+        return None
+    esc = Escalation(
+        id=escalation_queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=DETERMINISTIC_AGENT_ROLE,
+        severity='critical',
+        category=category,
+        summary=summary[:200],
+        detail=detail,
+        level=2,
+    )
+    escalation_queue.submit(esc)
+    logger.info(
+        '%s: filed L2 %s escalation %s for task %s',
+        actor, category, esc.id, task_id,
+    )
+    return esc.id
+
+
+@dataclass(frozen=True)
+class GateEscalationFields:
+    """The fields of a pure gate's born-at-L2 escalation that depend on the task."""
+
+    category: str
+    summary: str
+    detail: str
+    options: tuple[str, ...]
+    review_due: ReviewDueState | None
+
+
+def _dependency_ids(task: dict) -> list[str]:
+    deps = task.get('dependencies', []) or []
+    return [str(d.get('id', d) if isinstance(d, dict) else d) for d in deps]
+
+
+def gate_escalation_category(metadata: dict) -> str:
+    """The category a pure gate's done provenance cites: ``review_due`` for a valid human-gate chain."""
+    if isinstance(human_gate_chain(metadata), TriggerChain):
+        return REVIEW_DUE_CATEGORY
+    return MILESTONE_GATE_CATEGORY
+
+
+def build_gate_escalation_fields(
+    task: dict | None,
+    metadata: dict,
+    human_gate: HumanGateFacts | ReviewDueWithheld | None,
+    *,
+    escalation_id: str,
+    fired_at: str,
+) -> GateEscalationFields:
+    """The one builder both pure-gate producers file through.
+
+    ``DeterministicRunner._file_milestone_gate_and_block`` and
+    ``Harness._recover_stranded_deterministic_gate`` both call it with
+    *human_gate* from :func:`read_human_gate_facts`, so a recovered gate
+    matches the runner's filing. ``HumanGateFacts`` files ``review_due``
+    (plans/completion-driven-triggers-prd.md C4); anything else files
+    ``milestone_gate``, a ``ReviewDueWithheld`` with a detail line saying why.
+    The operational-LLM token prefix applies to either.
     """
     task = task or {}
-    title = task.get('title', '')
-    description = task.get('description', '')
-    deps = task.get('dependencies', []) or []
-    dep_ids = [
-        str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-    ]
-    detail_parts = [description]
+    dep_ids = _dependency_ids(task)
+    detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+    category = MILESTONE_GATE_CATEGORY
+    summary = task.get('title', '')
+    payload: ReviewDueState | None = None
+    if isinstance(human_gate, ReviewDueWithheld):
+        detail_parts.append(human_gate.detail_line())
+    elif human_gate is not None:
+        due = build_review_due(
+            human_gate, human_gate_task_id=str(task.get('id')),
+            escalation_id=escalation_id, fired_at=fired_at,
+        )
+        category = REVIEW_DUE_CATEGORY
+        summary = due.summary
+        payload = due.payload
+        detail_parts.extend(due.detail_lines)
     detail = '\n'.join(detail_parts)
-    summary = title[:200]
     if _is_operational_llm_gate(metadata):
-        # Task 2803 (γ): token-first prefix/build so the token survives
-        # downstream truncation (the summary's [:200] slice) and any
-        # tail-only log scrape; detail itself is not truncated. Plain
-        # gates (marker absent) are byte-unchanged.
+        # Task 2803 (γ): token-first so the token survives the summary's
+        # [:200] slice and any tail-only log scrape.
         detail = (
             f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
             'LLM-operational handling; no automated lane exists yet — resolve '
             'by hand.\n\n'
         ) + detail
-        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
-    options = list(metadata.get('gate_options') or [])
-    return summary, detail, options
+        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {summary}'
+    return GateEscalationFields(
+        category=category,
+        summary=summary[:200],
+        detail=detail,
+        options=tuple(metadata.get('gate_options') or ()),
+        review_due=payload,
+    )
+
+
+async def read_human_gate_facts(
+    scheduler, task: dict | None, metadata: dict,
+) -> HumanGateFacts | ReviewDueWithheld | None:
+    """A human gate's chain and facts, or why it withholds ``review_due``; ``None`` for any other gate.
+
+    Both producers call it before :func:`build_gate_escalation_fields`, so
+    they cannot read the chain, the project or the completion gate
+    differently. Nothing is read for a gate that is not a human gate.
+    """
+    chain = human_gate_chain(metadata)
+    if chain is None:
+        return None
+    if isinstance(chain, InvalidTriggerChain):
+        return ReviewDueWithheld(f'trigger_chain is invalid: {chain.reason}')
+    project_id = _configured_project_id(scheduler)
+    project_root = _configured_project_root(scheduler)
+    if project_id is None or project_root is None:
+        unusable = ' and '.join(
+            name for name, value in (
+                ('fused_memory.project_id', project_id), ('project_root', project_root),
+            ) if value is None
+        )
+        return ReviewDueWithheld(f'the orchestrator config has no usable {unusable}')
+    return HumanGateFacts(
+        chain=chain,
+        project_id=project_id,
+        project_root=str(project_root),
+        completion_gate=await _read_completion_gate(scheduler, task or {}),
+    )
+
+
+async def _read_completion_gate(scheduler, task: dict) -> CompletionGateReading:
+    """Every dependency, read concurrently, then :func:`first_completion_gate` in dependency order."""
+    dep_ids = _dependency_ids(task)
+    reads = await asyncio.gather(
+        *(_read_dependency(scheduler, task.get('id'), dep_id) for dep_id in dep_ids),
+    )
+    return first_completion_gate(
+        completion_gate_reading(dep_id, read) for dep_id, read in zip(dep_ids, reads, strict=True)
+    )
+
+
+async def _read_dependency(scheduler, task_id: object, dep_id: str) -> TaskRead:
+    try:
+        return await scheduler.read_task(dep_id)
+    except Exception as exc:
+        logger.warning(
+            'DeterministicRunner: task %s dependency %s read raised %s: %s',
+            task_id, dep_id, type(exc).__name__, exc,
+        )
+        return TaskReadFailed(f'{type(exc).__name__}: {exc}')
 
 
 class DeterministicRunner:
@@ -670,8 +872,10 @@ class DeterministicRunner:
             ``deterministic.predicate_recheck_stall_cap``; the default is
             ``orchestrator.config.PREDICATE_RECHECK_STALL_CAP``.
         clock: Optional callable ``() -> datetime`` (aware, UTC) timing a
-            predicate check: the re-arm, its streak record and the verdict
-            filer's ``gate_escalated_at``.  Defaults to ``datetime.now(UTC)``.
+            predicate check (the re-arm, its streak record and the verdict
+            filer's ``gate_escalated_at``) and a pure gate's filing (its
+            ``gate_escalated_at`` and ``review_due.fired_at``).  Defaults to
+            ``datetime.now(UTC)``.
             Injected in tests for exact ``milestone.at`` assertions.
     """
 
@@ -880,7 +1084,7 @@ class DeterministicRunner:
                 f'journalctl --user -u {transient_unit}'
             ),
             severity='critical',
-            category='infra_issue',
+            category=SELF_RESTART_FAILURE_CATEGORY,
             agent_role=DETERMINISTIC_AGENT_ROLE,
         )
 
@@ -1110,31 +1314,10 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        file_deterministic_escalation(
+            self.escalation_queue, task_id,
+            actor=_RUNNER_ACTOR, summary=summary, detail=detail, category=category,
         )
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (%s dedup guard)',
-                task_id, len(existing_pending), category,
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=DETERMINISTIC_AGENT_ROLE,
-                severity='critical',
-                category=category,
-                summary=summary[:200],
-                detail=detail,
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 %s escalation %s for task %s',
-                category, esc.id, task_id,
-            )
 
         if metadata is not None and metadata.get('before_done') is not None:
             _current_deploy_state = DeployState.from_metadata(metadata)
@@ -1405,38 +1588,8 @@ class DeterministicRunner:
     def _deploy_transition_escalation_sink(
         self, task_id: str, old: DeployPhase, new: DeployPhase,
     ) -> None:
-        """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
-
-        Wired into every ``_advance_deploy_phase`` call via
-        ``enforce_transition``'s ``escalation_sink`` — files BEFORE
-        ``enforce_transition`` raises ``IllegalDeployTransition``, so an
-        illegal edge is never silently swallowed (D2).  Mirrors the other
-        escalation-filing helpers' construction (sentinel role keeps level=2
-        past the server downgrade gate) but is unconditional — no dedup
-        guard — since an illegal transition is itself a bug signal that must
-        never be suppressed by an unrelated pending escalation.
-        """
-        esc = Escalation(
-            id=self.escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=DETERMINISTIC_AGENT_ROLE,
-            severity='critical',
-            category='illegal_deploy_transition',
-            summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
-            detail=(
-                f'DeterministicRunner attempted an illegal deploy-phase '
-                f'transition {old!r} -> {new!r} for task {task_id}. This '
-                'indicates a runner bug or corrupted deploy_state metadata — '
-                'investigate before resuming.'
-            ),
-            level=2,
-        )
-        self.escalation_queue.submit(esc)
-        logger.error(
-            'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
-            '%s for task %s (%s -> %s)',
-            esc.id, task_id, old, new,
-        )
+        """DS-2 sink for every ``_advance_deploy_phase``: see :func:`file_illegal_deploy_transition`."""
+        file_illegal_deploy_transition(self.escalation_queue, task_id, old, new, actor=_RUNNER_ACTOR)
 
     def _compute_deploy_phase_advance(
         self,
@@ -1777,7 +1930,10 @@ class DeterministicRunner:
     async def _file_milestone_gate_and_block(
         self, task_id: str, task: dict, metadata: dict
     ) -> WorkflowOutcome:
-        """File a born-at-L2 ``milestone_gate`` escalation and block the task.
+        """File the gate's born-at-L2 escalation and block the task.
+
+        The record comes from :func:`build_gate_escalation_fields`:
+        ``milestone_gate``, or ``review_due`` for a ``trigger_chain`` human gate.
 
         Encapsulates section 3's gate-filing logic for reuse by:
         - The pure-gate path (section 3) in ``run()``.
@@ -1829,13 +1985,9 @@ class DeterministicRunner:
         Returns:
             ``WorkflowOutcome.BLOCKED``
         """
-        # Task 2954 amendment: summary/detail/options built via the shared
-        # `build_milestone_gate_escalation_fields` seam so the harness recon-
-        # sweep's strand recovery re-files a byte-identical gate (including the
-        # operational-LLM token prefix) and the two producers stay in lockstep.
-        summary, detail, gate_options = build_milestone_gate_escalation_fields(
-            task, metadata,
-        )
+        # One instant: the review_due payload's fired_at and the
+        # gate_escalated_at stamp, which strand recovery re-files with.
+        now_iso = self._clock().isoformat()
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
@@ -1850,21 +2002,28 @@ class DeterministicRunner:
                 task_id, len(existing_pending),
             )
         else:
+            # The shared builder, so strand recovery re-files the same gate.
+            human_gate = await read_human_gate_facts(self.scheduler, task, metadata)
+            esc_id = self.escalation_queue.make_id(task_id)
+            fields = build_gate_escalation_fields(
+                task, metadata, human_gate, escalation_id=esc_id, fired_at=now_iso,
+            )
             esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
+                id=esc_id,
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category=MILESTONE_GATE_CATEGORY,
-                summary=summary,
-                detail=detail,
-                options=list(gate_options),
+                category=fields.category,
+                summary=fields.summary,
+                detail=fields.detail,
+                options=list(fields.options),
                 level=2,
+                review_due=fields.review_due,
             )
             self.escalation_queue.submit(esc)
             logger.info(
-                'DeterministicRunner: filed L2 milestone gate escalation %s for task %s',
-                esc.id, task_id,
+                'DeterministicRunner: filed L2 %s gate escalation %s for task %s',
+                fields.category, esc.id, task_id,
             )
 
         # Stamp gate_escalated_at AFTER successful escalation submit.  ζ: on the
@@ -1873,7 +2032,6 @@ class DeterministicRunner:
         # self-restart crash-resume re-file), this atomically advances
         # deploy_state.phase to ESCALATED too (DS-1). A pure gate
         # (before_done=None) is not a deploy and gets no deploy_state.
-        now_iso = datetime.now(UTC).isoformat()
         if metadata.get('before_done') is not None:
             # Task 4048 amendment: pre-bind so both names are defined on every
             # path into `except` below, including one raised by the
@@ -1989,31 +2147,10 @@ class DeterministicRunner:
         Returns:
             WorkflowOutcome.BLOCKED
         """
-        existing_pending = self.escalation_queue.get_by_task(
-            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        file_deterministic_escalation(
+            self.escalation_queue, task_id,
+            actor=_RUNNER_ACTOR, summary=summary, detail=detail, category=category,
         )
-        if existing_pending:
-            logger.info(
-                'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (%s dedup guard)',
-                task_id, len(existing_pending), category,
-            )
-        else:
-            esc = Escalation(
-                id=self.escalation_queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=DETERMINISTIC_AGENT_ROLE,
-                severity='critical',
-                category=category,
-                summary=summary[:200],
-                detail=detail,
-                level=2,
-            )
-            self.escalation_queue.submit(esc)
-            logger.info(
-                'DeterministicRunner: filed L2 %s escalation %s for task %s',
-                category, esc.id, task_id,
-            )
 
         # Stamp gate_escalated_at AFTER successful escalation submit (file-before-stamp
         # ordering, same as _file_milestone_gate_and_block) so a stamp failure re-files
@@ -2074,8 +2211,9 @@ class DeterministicRunner:
         - ``rc == 75`` (``os.EX_TEMPFAIL``) on a gate declaring
           ``before_done.recheck_secs`` with a dated milestone -> "not yet"
           (PRD ``plans/completion-driven-triggers-prd.md`` C1): ONE merge
-          write advances ``milestone.at`` by ``recheck_secs`` and stamps the
-          streak record and verdict, then a best-effort ``pending`` ->
+          write advances ``milestone.at`` by ``recheck_secs``, keeping the
+          link's scheduled fire time (``shared.milestone_rearm``), and
+          stamps the streak record and verdict, then a best-effort ``pending`` ->
           ``WorkflowOutcome.REQUEUED``.  A refused write files the
           no-verdict category and blocks instead.  The 75 that brings the
           streak to ``deterministic.predicate_recheck_stall_cap`` does not
@@ -2405,17 +2543,35 @@ class DeterministicRunner:
         recheck_secs: int,
         no_verdict_category: str,
     ) -> WorkflowOutcome:
-        """Advance the dated ``milestone.at`` to *record*'s next check and re-pend.
+        """Advance ``milestone.at`` to *record*'s next check, keep the fire time, re-pend.
 
         ONE merge write carries the advanced milestone, the streak record and
         the verdict.  It comes first, so a lost trailing status write leaves a
         task whose advanced ``at`` already withholds re-dispatch.  A REFUSED
         write is escalated instead: with ``at`` not advanced, re-pending would
-        re-dispatch at once into the same 75, a loop with no escape.
+        re-dispatch at once into the same 75, a loop with no escape.  So is a
+        milestone with no readable scheduled fire time, which
+        ``rearmed_milestone`` refuses before anything is written.
         """
         next_check_at = record.next_check_at.isoformat()
+        try:
+            milestone = rearmed_milestone(metadata['milestone'], next_check_at)
+        except ValueError as exc:
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate re-arm refused (rc=75)',
+                detail='\n'.join([
+                    f'The predicate answered "not yet" (exit 75) and should have re-armed '
+                    f'to next_check_at={next_check_at}, but the milestone was refused: {exc}',
+                    'Blocked rather than re-pended: nothing was written, so a re-dispatch '
+                    'would re-run the check at once into the same verdict.',
+                    'Repair milestone.scheduled_fire_at (or remove it so milestone.at is '
+                    'the fire time), then resume to re-run the check.',
+                ]),
+                category=no_verdict_category,
+            )
         stamps = {
-            'milestone': {**metadata['milestone'], 'at': next_check_at},
+            'milestone': milestone,
             **verdict_stamps(metadata, verdict, record, always_stamp_verdict=True),
         }
         if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):
@@ -2856,7 +3012,8 @@ class DeterministicRunner:
                     # rung-one evidence via done_provenance.escalation_id.  The
                     # `bool(...)` semantics below are byte-identical to task
                     # 2954's original expression.
-                    own_records = self.escalation_queue.get_by_task(
+                    own_records = await asyncio.to_thread(
+                        self.escalation_queue.get_by_task,
                         task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                     )
                     own_escalation_resolved = bool(own_records)
@@ -2971,7 +3128,9 @@ class DeterministicRunner:
                                 'human curator gate: per-entry content '
                                 f'adjudication confirmed at {_stamp_for_note}'
                             ),
-                            escalation_id=_cite_gate_escalation_id(own_records),
+                            escalation_id=_cite_gate_escalation_id(
+                                own_records, gate_escalation_category(metadata),
+                            ),
                         ),
                     )
                 else:
@@ -2991,7 +3150,9 @@ class DeterministicRunner:
                         done_provenance=_build_done_provenance(
                             'deterministic-gate',
                             note='pure gate resolved',
-                            escalation_id=_cite_gate_escalation_id(own_records),
+                            escalation_id=_cite_gate_escalation_id(
+                                own_records, gate_escalation_category(metadata),
+                            ),
                         ),
                     )
                 return WorkflowOutcome.DONE
@@ -3057,7 +3218,8 @@ class DeterministicRunner:
                 # unrelated escalation sharing this task_id (e.g. a starvation-
                 # watchdog filing) must never alias as proof a human resolved
                 # THIS runner's failure (task 2120).
-                own_escalation_resolved = bool(self.escalation_queue.get_by_task(
+                own_escalation_resolved = bool(await asyncio.to_thread(
+                    self.escalation_queue.get_by_task,
                     task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                 ))
                 # ζ D3 (finding 4.0): bare escalation existence is not proof
@@ -3121,7 +3283,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=_sched.get('transient_unit', ''),
                                 fire_delay_secs=_sched.get('fire_delay_secs', 0),
@@ -3505,7 +3667,7 @@ class DeterministicRunner:
                             task_id,
                             'done',
                             done_provenance=_build_done_provenance(
-                                'deterministic-deploy-scheduled',
+                                SCHEDULED_DEPLOY_PROVENANCE_KIND,
                                 unit=target_unit,
                                 transient_unit=transient_unit,
                                 fire_delay_secs=on_active_secs,

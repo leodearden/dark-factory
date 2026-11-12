@@ -11,8 +11,9 @@ These tables constrain ONLY identified callers whose identity is a key of
 connection (no X-Escalation-Identity) — the esc-2087-2 human-channel
 guarantee — is NEVER narrowed by this module and keeps full authority.
 Policy is DATA at module scope (mirrors the existing RESOLVE_ACTIONS /
-_DISMISS_ACTIONS / _HARNESS_SENTINEL_ROLE_PREFIXES convention in
-``escalation.server``), not an ``if resolved_by == watcher`` fork.
+_DISMISS_ACTIONS convention in ``escalation.server`` and
+``escalation/models.py::HARNESS_SENTINEL_ROLE_PREFIXES``), not an
+``if resolved_by == watcher`` fork.
 
 Layer direction: ``escalation`` is the lower fleet-wide package and must NOT
 module-level import ``orchestrator`` (the existing orchestrator imports in
@@ -38,9 +39,8 @@ done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
 the born-at-L2 human gates (the design_concern / milestone_gate /
 milestone_check_failed / milestone_check_stalled / curator_adjudication_missing
-categories, and the ``orchestrator-deterministic`` sentinel role) are never
-auto-closable even
-when a class predicate would otherwise match. That guarantee belongs to the
+/ review_due categories, and the ``orchestrator-deterministic`` sentinel role)
+are never auto-closable even when a class predicate would otherwise match. That guarantee belongs to the
 MCP ``resolve_issue`` path. Direct-queue paths also auto-close L2s, gated by
 MEMBERSHIP rather than by class, so the category denylist does not bind them:
 
@@ -161,10 +161,11 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # resolution text said the curator work was "deliberately NOT executed"). Like
 # 'milestone_check_failed' it is ALSO covered today by L2_AUTO_CLOSE_DENY_ROLES
 # (it files under agent_role='orchestrator-deterministic'), and is listed here
-# for that same defense-in-depth reason.
+# for that same defense-in-depth reason. 'review_due' is the runner-filed human
+# gate of a trigger chain, held for the same reason.
 #
 # Every member is spelled through the registry, so a misspelling fails at
-# import instead of silently ending the denial. The four RUNNER-FILED members
+# import instead of silently ending the denial. The five RUNNER-FILED members
 # are additionally held in lockstep with their named constants in
 # ``orchestrator.deterministic_runner`` by the function-local orchestrator
 # imports in ``tests/test_authority.py``, per the layer-direction rule in this
@@ -177,6 +178,8 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
     # The stall escalation of a re-arming predicate (PRD completion-driven-triggers C1).
     EscalationCategory.MILESTONE_CHECK_STALLED,
     EscalationCategory.CURATOR_ADJUDICATION_MISSING,
+    # The human gate of a trigger chain (PRD completion-driven-triggers C4).
+    EscalationCategory.REVIEW_DUE,
 })
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —

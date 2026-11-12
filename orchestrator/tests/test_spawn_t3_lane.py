@@ -13,6 +13,7 @@ thread list, read and wait results).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -39,16 +40,17 @@ from _fake_t3_server import (
     replies_in_turn,
 )
 from _process_identity_variants import own_identity
+from _process_tree_fakes import claude_process_tree
 from shared.process_identity import ProcessIdentity
 
+from orchestrator import session_hooks, t3_mcp_client
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
-from orchestrator import t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 _PKG_SRC = Path(lane.__file__).resolve().parents[1]
 
-THREAD_ID = '6f0c2a3e-7489-4c11-9a51-0d6c1f3b2a10'
+THREAD_ID = 'mcp:launch:' + '6f0c2a3e74894c119a510d6c1f3b2a10' * 2
 PROJECT_ID = '5a05e1d3-5bd0-40e5-8ce7-24b2cd160300'
 RUN_ID = 'b2c4e6f8-0a1c-4e3a-8b5d-7f9e1a2b3c4d'
 SESSION_ID = '15fbcf7c-12af-481c-a641-9b00c03a741e'
@@ -252,6 +254,8 @@ def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
 
 
 def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
+    """A spawn's launching record, with the result file ``_run_launching`` gives every spawn."""
+    record_dir = sr.record_path_for_slug(slug, root=env.fleet).parent
     sr.write_record(
         sr.SessionRecord(
             session_slug=slug,
@@ -259,18 +263,40 @@ def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
             cwd=str(env.project),
             launcher_pid=4242,
             start_ts=datetime.now(UTC).isoformat(),
+            result_file=str(record_dir / sr.RESULT_FILENAME),
         ),
         root=env.fleet,
     )
-    return str(sr.record_path_for_slug(slug, root=env.fleet).parent)
+    return str(record_dir)
 
 
-def stale_t3_record(env: Env) -> str:
-    """A live t3 record of ``env.project`` whose thread no listing names."""
-    record_dir = spawn_record(env, 'sibling-df-1-1')
-    sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
+def stale_t3_record(
+    env: Env,
+    *,
+    environment_id: str | None = None,
+    slug: str = 'sibling-df-1-1',
+    thread_id: str = 'th-vanished',
+) -> str:
+    """A live, indexed t3 record of ``env.project`` whose thread no listing names."""
+    record_dir = spawn_record(env, slug)
+    record = sr.read_record(slug, root=env.fleet)
+    record.display = sr.Display(
+        kind='t3', t3_thread_id=thread_id, t3_environment_id=environment_id
+    )
+    sr.write_record(record, root=env.fleet)
+    sr.write_t3_thread_pointer(thread_id, slug, root=env.fleet)
     time.sleep(0.01)
     return record_dir
+
+
+def sweep_line_levels(caplog: pytest.LogCaptureFixture) -> list[int]:
+    """The level of each index-size line ``mark_t3_sessions_exited`` logged."""
+    return [
+        record.levelno
+        for record in caplog.records
+        if record.name == 'orchestrator.session_registry'
+        and record.getMessage().startswith('mark_t3_sessions_exited: marked')
+    ]
 
 
 def prompt_file(tmp_path: Path, text: str) -> str:
@@ -592,16 +618,92 @@ class TestLaunch:
         assert t3.tool_calls('t3_thread_launch') == [] and t3.tool_calls('t3_thread_list') == []
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
-    def test_launch_first_sweeps_the_projects_records_whose_thread_is_gone(
+    def test_launch_first_sweeps_the_environments_records_whose_thread_is_gone(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = ToolFailure('thread_not_found', 'Thread th-vanished was not found.')
 
         launch_line(capsys, tmp_path, env.project)
 
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        assert t3.tool_calls('t3_thread_list') == [{'projectId': PROJECT_ID, 'limit': 100}]
+        assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_an_unlisted_thread_whose_read_archives_it_is_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = thread_read(threadId='th-vanished', archived=True)
+
+        launch_line(capsys, tmp_path, env.project)
+
+        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+
+    def test_an_unlisted_thread_that_still_reads_present_is_not_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """T3 v0.1.6 lists no side chat (``ThreadManagementService.ts::listProjectThreads``), yet it is live."""
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = thread_read(threadId='th-vanished')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+            Path(stale_dir).name
+        )
+        assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-vanished', 'limit': 1}]
+
+    def test_an_unlisted_thread_whose_read_fails_is_not_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = ToolFailure('orchestration_error', 'busy')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
+    def test_after_one_unreachable_read_the_sweep_asks_about_no_further_thread(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        first = stale_t3_record(env, slug='sibling-df-1-1', thread_id='th-a')
+        second = stale_t3_record(env, slug='sibling-df-1-2', thread_id='th-b')
+        t3.tool_replies['t3_thread_read'] = ToolFailure('orchestration_error', 'busy')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-a', 'limit': 1}]
+        for record_dir in (first, second):
+            assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
+    def test_launch_logs_its_sweeps_index_line_at_info(
+        self,
+        env: Env,
+        t3: FakeT3Server,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            launch_line(capsys, tmp_path, env.project)
+
+        assert sweep_line_levels(caplog) == [logging.INFO]
+
+    def test_a_record_of_another_environment_is_left_to_its_own_sweep(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env, environment_id='env-elsewhere')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+            Path(stale_dir).name
+        )
+        assert t3.tool_calls('t3_thread_read') == []
 
     def test_an_incomplete_thread_listing_sweeps_nothing(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -977,7 +1079,7 @@ class TestAwaitStarted:
 
         line = self._await(capsys, env, record_dir, since=time.time() - 60)
 
-        assert line == f'started sid={SESSION_ID} hand_slug={hand_slug} bound=yes'
+        assert line == f'started sid={SESSION_ID} hand_slug={hand_slug} bound=yes via=transcript'
         slug = Path(record_dir).name
         record = sr.read_record(slug, root=env.fleet)
         assert (record.claude_session_id, record.claude_launch_session_id) == (SESSION_ID, SESSION_ID)
@@ -1011,7 +1113,7 @@ class TestAwaitStarted:
 
         line = self._await(capsys, env, record_dir)
 
-        assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes'
+        assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes via=transcript'
         assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_owner_pid is None
 
     def test_a_session_already_pointing_at_the_spawn_record_folds_nothing(
@@ -1028,7 +1130,7 @@ class TestAwaitStarted:
 
         line = self._await(capsys, env, record_dir)
 
-        assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes'
+        assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes via=transcript'
         assert sr.read_record(slug, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_started_with_no_transcript_naming_the_record_is_unbound(
@@ -1043,7 +1145,7 @@ class TestAwaitStarted:
 
         line = self._await(capsys, env, record_dir, timeout='1', since=time.time() - 60)
 
-        assert line == 'started sid=none hand_slug=none bound=no'
+        assert line == 'started sid=none hand_slug=none bound=no via=none'
         assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
 
     def test_started_without_a_record_skips_discovery(
@@ -1051,7 +1153,7 @@ class TestAwaitStarted:
     ) -> None:
         t3.tool_replies['t3_thread_read'] = thread_read(status='completed')
 
-        assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no'
+        assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no via=none'
 
     @pytest.mark.parametrize('status', sorted(lane.STARTUP_FAILURE_STATUSES))
     def test_a_failure_status_before_any_transcript_is_failed_to_start(
@@ -1070,7 +1172,7 @@ class TestAwaitStarted:
         write_transcript(env, SESSION_ID, trailer(record_dir))
 
         assert self._await(capsys, env, record_dir) == (
-            f'started sid={SESSION_ID} hand_slug=none bound=yes'
+            f'started sid={SESSION_ID} hand_slug=none bound=yes via=transcript'
         )
 
     def test_an_interrupted_run_is_started(
@@ -1078,7 +1180,7 @@ class TestAwaitStarted:
     ) -> None:
         t3.tool_replies['t3_thread_read'] = thread_read(status='interrupted')
 
-        assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no'
+        assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no via=none'
 
     def test_a_thread_that_never_leaves_preparation_times_out(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
@@ -1111,6 +1213,35 @@ class TestAwaitStarted:
         assert self._await(capsys, env, '', timeout='1.0') == 'timeout'
         assert time.monotonic() - started < STALL_CAP_SECS / 2
 
+    def test_started_folds_a_hand_record_that_claimed_the_thread_after_the_stamp(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
+        record_dir = spawn_record(env)
+        slug = Path(record_dir).name
+        sr.update_display(slug, root=env.fleet, kind='t3', t3_thread_id=THREAD_ID)
+        hand = t3_session_start(env)
+
+        line = self._await(capsys, env, record_dir)
+
+        assert line == (
+            f'started sid={SESSION_ID} hand_slug={hand.session_slug} bound=yes via=thread-pointer'
+        )
+        assert_folded_into(env, slug, hand)
+
+    def test_started_reports_a_record_its_hook_bound_through_the_thread_pointer(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
+        record_dir = spawn_record(env)
+        launch_line(capsys, tmp_path, env.project, record=record_dir)
+        adopted = t3_session_start(env)
+
+        line = self._await(capsys, env, record_dir)
+
+        assert adopted.session_slug == Path(record_dir).name
+        assert line == f'started sid={SESSION_ID} hand_slug=none bound=yes via=thread-pointer'
+
     def test_the_read_names_the_thread(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1120,6 +1251,86 @@ class TestAwaitStarted:
 
         reads = t3.tool_calls('t3_thread_read')
         assert reads and all(read['threadId'] == THREAD_ID for read in reads)
+
+
+T3_CLAUDE_PID = 424242
+
+
+def t3_session_start(env: Env) -> sr.SessionRecord:
+    """The real SessionStart hook of claude ``T3_CLAUDE_PID`` in thread ``THREAD_ID``, as T3 starts it."""
+    return session_hooks.run_session_start(
+        {'session_id': SESSION_ID, 'cwd': str(env.project)},
+        {'T3CODE_THREAD_ID': THREAD_ID},
+        root=env.fleet,
+        process_tree=claude_process_tree(T3_CLAUDE_PID),
+    )
+
+
+def assert_folded_into(env: Env, slug: str, hand: sr.SessionRecord) -> None:
+    """The spawn record *slug* carries *hand*'s session and owner, every pointer names it, and *hand* is folded."""
+    record = sr.read_record(slug, root=env.fleet)
+    assert (record.claude_session_id, record.claude_launch_session_id) == (SESSION_ID, SESSION_ID)
+    assert (record.claude_owner_pid, record.claude_owner_identity) == (
+        T3_CLAUDE_PID,
+        hand.claude_owner_identity,
+    )
+    folded = sr.read_record(hand.session_slug, root=env.fleet)
+    assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
+    assert sr.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == slug
+    assert sr.resolve_session_slug_for_claude_session_id(SESSION_ID, root=env.fleet) == slug
+    assert sr.resolve_session_slug_for_pid(T3_CLAUDE_PID, root=env.fleet) == slug
+
+
+class TestThreadPointerReconcile:
+    def test_launch_folds_a_hand_record_whose_session_start_claimed_the_thread_first(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        hands: list[sr.SessionRecord] = []
+
+        def launch_while_the_child_starts(arguments: Mapping[str, Any]) -> ToolSuccess:
+            hands.append(t3_session_start(env))
+            return ToolSuccess(THREAD_LAUNCH_JSON)
+
+        t3.tool_replies['t3_thread_launch'] = launch_while_the_child_starts
+        record_dir = spawn_record(env)
+
+        launch_line(capsys, tmp_path, env.project, record=record_dir)
+
+        [hand] = hands
+        assert sr.is_t3_record(hand)
+        assert_folded_into(env, Path(record_dir).name, hand)
+
+    def test_a_thread_pointer_another_spawn_holds_is_left_alone(self, env: Env) -> None:
+        record_dir = spawn_record(env)
+        other_dir = spawn_record(env, 'review-df-7000-777')
+        other = sr.read_record('review-df-7000-777', root=env.fleet)
+        other.display = sr.Display(kind='t3', t3_thread_id=THREAD_ID)
+        other.claude_session_id, other.status = SESSION_ID, sr.Status.RUNNING
+        sr.write_record(other, root=env.fleet)
+        sr.write_t3_thread_pointer(THREAD_ID, 'review-df-7000-777', root=env.fleet)
+
+        binding = lane.bind_thread_pointer(record_dir, THREAD_ID)
+
+        assert (binding.bound, binding.via) == (False, lane.BindingSource.NONE)
+        assert sr.read_record(Path(other_dir).name, root=env.fleet).status == sr.Status.RUNNING
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
+        assert sr.resolve_session_slug_for_t3_thread(THREAD_ID, root=env.fleet) == (
+            'review-df-7000-777'
+        )
+
+    def test_the_transcript_path_folds_a_hand_launched_t3_record(self, env: Env) -> None:
+        record_dir = spawn_record(env)
+        hand = t3_session_start(env)
+
+        binding = lane.bind_session(record_dir, lane.Transcript(SESSION_ID, Path('unused'), 0.0))
+
+        assert (binding.bound, binding.hand_slug, binding.via) == (
+            True,
+            hand.session_slug,
+            lane.BindingSource.TRANSCRIPT,
+        )
+        folded = sr.read_record(hand.session_slug, root=env.fleet)
+        assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
 
 
 def test_a_spilled_launch_message_is_discovered(env: Env) -> None:
@@ -1395,14 +1606,36 @@ class TestWait:
         assert wait_for(env, record_dir, clock) == 'finished code=0'
         assert clock.sleeps == [lane.SETTLED_RECHECK_SECS] * 2
 
-    def test_each_pass_sweeps_the_read_threads_project(self, env: Env, t3: FakeT3Server) -> None:
+    def test_each_pass_sweeps_the_environment_wide_listing(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)
-        t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId='project-of-the-read')
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId=None)
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        assert t3.tool_calls('t3_thread_list') == [{'projectId': 'project-of-the-read', 'limit': 100}]
+        assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_a_pass_whose_sweep_marks_nothing_logs_its_line_at_debug(
+        self, env: Env, t3: FakeT3Server, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.session_registry'):
+            assert wait_for(env, '', FakeClock()) == 'finished code=0'
+
+        assert sweep_line_levels(caplog) == [logging.DEBUG]
+
+    def test_a_pass_leaves_an_unlisted_thread_that_still_reads_present(self, env: Env, t3: FakeT3Server) -> None:
+        stale_dir = stale_t3_record(env)
+
+        def read_per_thread(arguments: Mapping[str, Any]) -> ToolSuccess:
+            thread_id = arguments['threadId']
+            return thread_read(threadId=thread_id, archived=thread_id == THREAD_ID)
+
+        t3.tool_replies['t3_thread_read'] = read_per_thread
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=0'
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_an_incomplete_listing_sweeps_nothing_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)

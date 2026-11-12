@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _curator_helpers import answer_each_with, curator_returning, serve_existing_task
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask

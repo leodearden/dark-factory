@@ -10,7 +10,8 @@ from typing import Any
 
 import pytest
 import redis.exceptions
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
+from _import_closure import SRC, modules_loaded_by_importing
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 
@@ -24,7 +25,7 @@ from fused_memory.backends.falkor_read_only import (
     ReadOnlyGraphReader,
     open_graph,
 )
-from fused_memory.backends.graphiti_client import (
+from fused_memory.backends.paged_read import (
     INCOMPLETE_STRUCTURAL_REFUSAL,
     PagedRead,
 )
@@ -335,6 +336,29 @@ class TestTheGuardedHandle:
                 getattr(guarded, primitive)
 
 
+_DRIVER_LOADING_MODULES = ('graphiti_core', 'fused_memory.backends.graphiti_client')
+
+
+def _driver_loading_imports(source: str, *, package: str) -> list[str]:
+    """Every module an import in *source* can load that is, or sits under, one of _DRIVER_LOADING_MODULES.
+
+    A relative import is resolved against *package*, and each ``from X import name``
+    also counts ``X.name``, since that name may itself be a submodule.
+    """
+    names: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            anchor = package.rsplit('.', node.level - 1)[0] if node.level else ''
+            base = '.'.join(part for part in (anchor, node.module) if part)
+            names += [base, *(f'{base}.{alias.name}' for alias in node.names)]
+    return [
+        name for name in names
+        if any(name == root or name.startswith(f'{root}.') for root in _DRIVER_LOADING_MODULES)
+    ]
+
+
 class TestOpening:
     def test_a_reader_opens_nothing_until_its_first_read(self) -> None:
         """FalkorDB's constructor probes the server synchronously, so a refused port surfaces at first use."""
@@ -353,26 +377,49 @@ class TestOpening:
         with pytest.raises(ValueError, match='uri'):
             open_graph('g', uri='redis://x', **address)
 
-    def test_the_module_never_constructs_or_directly_imports_the_graphiti_driver(self) -> None:
-        """graphiti's FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write.
+    def test_importing_the_seam_never_loads_the_graphiti_driver(self) -> None:
+        """FalkorDriver.__init__ fire-and-forgets build_indices_and_constraints(), a write, so the seam must not even load the driver's module."""
+        probe = modules_loaded_by_importing(
+            'fused_memory.backends.falkor_read_only',
+            (
+                'graphiti_core.driver.falkordb_driver',
+                'graphiti_core',
+                'fused_memory.backends.graphiti_client',
+            ),
+        )
 
-        Direct imports only: graphiti_client, which this module imports, loads
-        the driver module transitively.
-        """
-        tree = ast.parse(Path(falkor_read_only.__file__).read_text(encoding='utf-8'))
+        assert Path(probe.file).resolve() == SRC / 'fused_memory' / 'backends' / 'falkor_read_only.py'
+        assert probe.loaded == ()
+
+    def test_the_module_never_constructs_or_lazily_imports_the_graphiti_driver(self) -> None:
+        """Catches what the import probe cannot see: a FalkorDriver construction, or a function-local import of graphiti_core or graphiti_client."""
+        source = Path(falkor_read_only.__file__).read_text(encoding='utf-8')
         calls = [
-            node.lineno for node in ast.walk(tree)
+            node.lineno for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.Call)
             and (getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)) == 'FalkorDriver'
         ]
-        imported = [
-            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
-            for alias in node.names
-        ] + [
-            node.module or '' for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-        ]
         assert calls == []
-        assert [name for name in imported if name.split('.')[0] == 'graphiti_core'] == []
+        assert _driver_loading_imports(source, package=falkor_read_only.__name__.rpartition('.')[0]) == []
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            'import graphiti_core.driver.falkordb_driver',
+            'from graphiti_core.driver.falkordb_driver import FalkorDriver',
+            'from fused_memory.backends.graphiti_client import PagedRead',
+            'from fused_memory.backends import graphiti_client',
+            'from . import graphiti_client',
+            'from ..backends import graphiti_client',
+            'def lazy():\n    from .graphiti_client import PagedRead',
+        ],
+    )
+    def test_the_import_scan_flags_every_spelling_that_loads_the_driver(self, source: str) -> None:
+        assert _driver_loading_imports(source, package='fused_memory.backends') != []
+
+    def test_the_import_scan_passes_the_graphiti_free_leaf(self) -> None:
+        source = 'from .paged_read import PagedRead\nfrom fused_memory.backends.paged_read import paged_ro_query'
+        assert _driver_loading_imports(source, package='fused_memory.backends') == []
 
 
 class _OpenedGraph(_CappedGraph):

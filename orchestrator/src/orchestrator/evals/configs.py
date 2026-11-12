@@ -30,7 +30,7 @@ class EvalConfig:
     """One model/backend configuration for evaluation."""
 
     name: str
-    backend: str          # 'claude' | 'codex' | 'gemini'
+    backend: str          # 'claude' | 'codex' | 'gemini' | 'pi' | 'zcode'
     model: str            # model name for that backend
     effort: str | None    # backend-specific effort/reasoning level
     # Which ROLE this candidate puts under test (eval-revival θ / C4 OFAT
@@ -478,8 +478,8 @@ ARCHITECT_EVAL_CONFIGS = [
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
-    ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
-    bundles are searched LAST, and built only when no static config matched:
+    ν's ``claude_endpoint_candidates()``, ξ's ``codex_pi_candidates()`` and
+    ω's ``zcode_candidates()`` bundles are searched LAST, and built only when no static config matched:
     they are built fresh per call, and building a ν bundle logs a WARNING for
     each missing credential or base URL, which a static lookup must not emit.
     This stays the single by-name resolver for every eval config family
@@ -529,6 +529,7 @@ def _find_registered(name: str) -> EvalConfig | None:
         lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
         claude_endpoint_candidates,
         codex_pi_candidates,
+        zcode_candidates,
     )
     for build_family in families:
         for cfg in build_family():
@@ -665,11 +666,12 @@ KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
 
 # Z.ai GLM access is a GLM Coding Plan (Leo, 2026-09-11), and a Coding Plan key
 # answers ONLY on the Plan's two coding endpoints: GLM_BASE_URL, the Anthropic
-# protocol the claude-harness bundles drive, and ZAI_CODING_BASE_URL, the
-# OpenAI protocol asserted at startup by
-# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint
-# and used by the ZCode arm (task 5399). The general /api/paas/v4 errors with
-# a Coding Plan key, so it is deliberately not a constant.
+# protocol that both the claude-harness bundles and the ZCode arm drive (ZCode's
+# own Coding Plan template uses it; plans/zcode-harness-probe-2026-11.md), and
+# ZAI_CODING_BASE_URL, the OpenAI protocol asserted at startup by
+# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint.
+# The general /api/paas/v4 errors with a Coding Plan key, so it is deliberately
+# not a constant.
 GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
 ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
 
@@ -693,7 +695,7 @@ MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
 # stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
-MINIMAX_MODEL = 'MiniMax-M3'
+MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
@@ -751,11 +753,18 @@ def _claude_endpoint_config(
     )
 
 
+def _glm_endpoint_config() -> EvalConfig:
+    return _claude_endpoint_config(
+        'glm-5.3-endpoint', GLM_MODEL,
+        base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+    )
+
+
 def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
     MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
     endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
@@ -773,13 +782,10 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
-            'minimax-m3-endpoint', MINIMAX_MODEL,
+            'minimax-m3.1-flash-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
-        _claude_endpoint_config(
-            'glm-5.3-endpoint', GLM_MODEL,
-            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
-        ),
+        _glm_endpoint_config(),
         _claude_endpoint_config(
             'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
@@ -823,9 +829,9 @@ class CandidateEndpointPrice:
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
 # GLM access is a GLM Coding Plan, so both GLM rows are SUBSCRIPTION: imputed.
 CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
-    # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
-    # deliberately not used.
-    MINIMAX_MODEL: CandidateEndpointPrice(0.30, 1.20, CostBasis.METERED),
+    # MiniMax's native list rate from the 2026-11-01 frontier check (task
+    # 8086), no long-context surcharge.
+    MINIMAX_MODEL: CandidateEndpointPrice(0.15, 0.60, CostBasis.METERED),
     GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
@@ -876,17 +882,19 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Codex model ids from the 2026-09-10 live market check (task 5384); list
-# prices live in config.py::_DEFAULT_PRICES.
+# Codex model ids from the 2026-11-01 frontier check (task 8086); list prices
+# live in config.py::_DEFAULT_PRICES.
 #   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
 #   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
 #     14 — Claude leads the only Rust-bearing public benchmarks and open-model
 #     Rust evidence is thin, so no architect-role variant and no production
-#     wiring). Its rate is promotional through at least 2026-11-21.
+#     wiring).
 #   - Terra is the mid-price control.
+# A candidate name embeds its model id and is never re-pointed:
+# plans/live-shadow-eval-prd.md decision 12.
 CODEX_ASTRA_MODEL = 'gpt-6-astra'
-CODEX_SOL_MODEL = 'gpt-5.6-sol'
-CODEX_TERRA_MODEL = 'gpt-5.6-terra'
+CODEX_SOL_MODEL = 'gpt-6.1-sol'
+CODEX_TERRA_MODEL = 'gpt-6.1-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
 # vs claude delta attributes cleanly to harness effect rather than a model
@@ -907,10 +915,10 @@ def codex_pi_candidates() -> list[EvalConfig]:
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend
@@ -919,3 +927,8 @@ def codex_pi_candidates() -> list[EvalConfig]:
             'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         ),
     ]
+
+
+def zcode_candidates() -> list[EvalConfig]:
+    """GLM-5.3 on ZCode, its official harness; glm-5.3-endpoint is its mandatory paired control."""
+    return [replace(_glm_endpoint_config(), name='glm-5.3-zcode', backend='zcode')]

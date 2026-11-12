@@ -249,7 +249,8 @@ rebased path rebases the branch onto main and fast-forwards main to the rebased 
 commit is written, every branch commit is rewritten, and the task ref is retained at its
 pre-rebase tip, because `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by sha.
 It reaches [step 4](#step-4) at rc=1; its arm is [the rebased-solo-landing
-arm](#rebased-solo-landing).
+arm](#rebased-solo-landing). `merge_status`'s git tier now resolves this shape on a
+`branch`/`task_id` poll, through its patch-id arm.
 
 Aborting on an empty search alone would abandon merged work un-stamped — and at several call
 sites you are already holding a server-issued `done`/`already_merged` verdict, which you must
@@ -454,8 +455,10 @@ A polled request_id-arm `done` from the event-store tier carries no top-level `m
 request's recorded landing sha is `last_outcome.merge_sha`, valid when `last_outcome.state` is
 `done` and `last_outcome.branch` names `task/<TASK_ID>`
 (`escalation/src/escalation/merge_status_answer.py::LastOutcome`); on the rebased path it is the
-rebased tip. **Never** take the sha from a `branch`/`task_id`-arm answer: those resolve to the
-newest record for the branch, which can be a prior round's.
+rebased tip. **Never** take the sha from a record-sourced `branch`/`task_id`-arm answer
+(`last_outcome`, event-store rows): those resolve to the newest record for the branch, which can
+be a prior round's. A `source: "git"` `found_on_main` answer is not record-sourced; the
+no-request-scoped-`done` bullet below says how to use it.
 
 Holding that sha as `<MERGE_SHA>`, run all four lines:
 
@@ -494,17 +497,39 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
   commit edited near the branch's change gives the rebased image a different patch id. It can
   also be a commit added to the branch after the landing. Only a reader can tell which, and the
   server-issued `done` must not be overridden ([step 3](#step-3)).
-- **You hold no request-scoped `done`** → run `git cherry main task/<TASK_ID>` alone.
-  - Non-empty with every line `-`: the content is on main with no sha you can attribute:
-    **landing-unattributable**.
-  - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
-    confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
-  - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
-    (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry` prints
-    no `-` line: all `+`, or empty output). What to do with it is the call site's own disposition
-    (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts). It never
-    licenses `merge_cancel`: a single-commit branch that landed rebased with context drift prints
-    exactly one `+` line, which is this same output, so `git cherry` alone cannot exclude a landing.
+- **You hold no request-scoped `done`** → first poll `merge_status(branch="task/<TASK_ID>")`. Its
+  patch-id arm (`escalation/src/escalation/git_authority.py::probe_landing`, deciding through
+  `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) decides
+  containment with `patch_content_contained`, behind the degeneracy and empty-net-diff guards, and
+  attributes a sha WITHOUT a request: the task's most recent subject-citing commit on main, else
+  the branch tip's patch-id twin on main. That is check (c) WITHOUT its empty-output rule, because
+  the server reads empty `git cherry` output as contained. So run `git cherry main task/<TASK_ID>`
+  whatever the server answers. If it prints nothing, treat the server's answer as "any other
+  answer" below. With a recorded `branch_base_sha`, a branch whose only commit beyond main is a
+  sync merge passes the server's empty-net-diff guard. It can then come back `found_on_main` at an
+  earlier round's citing commit, or `landing_unattributable`. That is residual (b) in
+  `escalation/src/escalation/git_authority.py::found_on_main_response`.
+  - `state: "done"`, `kind: "found_on_main"`, `source: "git"` → landed. Stamp
+    `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "rebased solo landing confirmed by
+    merge_status's git tier (patch-id arm); branch tip <git rev-parse task/<TASK_ID>>"}`. This
+    `merge_sha` may legitimately differ from a request-scoped M (the citing commit rather than the
+    rebased tip). Both are commits on main carrying this task's rebased work, so neither is
+    "corrected" into the other.
+  - `reason: "landing_unattributable"` → this ladder's **landing-unattributable**.
+  - Any other answer leaves the decision to `git cherry main task/<TASK_ID>` alone. A non-done
+    answer is never a not-landed verdict by itself: a `+` from context drift makes the arm
+    under-report.
+    - Non-empty with every line `-`: the content is on main with no sha you can attribute:
+      **landing-unattributable**.
+    - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
+      confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
+    - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
+      (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry`
+      prints no `-` line: all `+`, or empty output). What to do with it is the call site's own
+      disposition (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk`
+      aborts). It never licenses `merge_cancel`: a single-commit branch that landed rebased with
+      context drift prints exactly one `+` line, which is this same output, so `git cherry` alone
+      cannot exclude a landing.
 - **No `last_outcome.merge_sha`** (absent or null, e.g. the rebase+fast-forward no-marker shape)
   is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
   (`git cherry` all `-` plus a diff check).

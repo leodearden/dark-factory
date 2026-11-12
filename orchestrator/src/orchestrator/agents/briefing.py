@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
+from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.review_briefing import (
     ReviewSubject,
@@ -55,6 +57,65 @@ def _implementer_action(variant: ImplementerBriefVariant) -> str:
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
+
+
+OPEN_INFO_NOTES_HEADING = '# Implementer notes (open info escalations)'
+"""The heading of the reviewer's notes block; the reviewer contract in roles.py names it."""
+
+OPEN_INFO_NOTES_LIMIT = 20
+"""Max notes one reviewer briefing lists, the most recent kept; the rest stay pending for the exit router."""
+
+
+def _open_info_notes_section(
+    notes: Sequence[Escalation], *, reviewer_type: str, detail_chars: int,
+) -> str:
+    """The reviewer's notes block (plans/info-l0-disposition-router-prd.md D2).
+
+    It closes on the verdict call with ``note_dispositions``, so the last call
+    the reviewer is shown names the field.
+    """
+    by_age = sorted(notes, key=lambda note: note.timestamp or '')
+    listed = by_age[-OPEN_INFO_NOTES_LIMIT:]
+    entries = '\n'.join(_open_info_note_entry(note, detail_chars) for note in listed)
+    unlisted = len(by_age) - len(listed)
+    overflow = (
+        f'{unlisted} older note(s) are not listed; they stay pending for the exit router.\n\n'
+        if unlisted else ''
+    )
+    return f"""\
+{OPEN_INFO_NOTES_HEADING}
+
+These info notes were filed against this task while it was worked.
+
+{entries}
+{overflow}Disposition every id above as `addressed`, `no_action` or `work`, as your
+contract defines them, in the `note_dispositions` of your verdict call:
+`submit_review_verdict(reviewer="{reviewer_type}", verdict=..., issues=..., summary=..., note_dispositions=[...])`
+"""
+
+
+def _open_info_note_entry(note: Escalation, detail_chars: int) -> str:
+    full_detail = note.detail or ''
+    detail = full_detail[:detail_chars]
+    quoted = '\n'.join(f'> {line}' for line in detail.splitlines()) or '> (none)'
+    if len(full_detail) > detail_chars:
+        quoted += f'\n[detail truncated at {detail_chars} characters]'
+    return f"""\
+## {note.id}
+
+- filed by: {_one_line(note.agent_role)}
+- filed at: {note.timestamp}
+- summary: {_one_line(note.summary)}
+- suggested action: {_one_line(note.suggested_action) or '(none)'}
+- detail:
+
+{quoted}
+"""
+
+
+def _one_line(text: str | None) -> str:
+    """*text* with its line breaks collapsed, so a field cannot start a heading of its own; null reads as empty."""
+    return ' '.join((text or '').split())
 
 COMMIT_BULLET_LIMIT = 40
 """Max commit bullets rendered in one briefing section (task 3033 amendment).
@@ -112,14 +173,15 @@ _TEXT_DRIFT_NOTICES = {
         '## The Task Text Has Changed\n\n'
         'The description or details under # Task have been amended since this '
         'plan was authored. Re-read them and change the plan to cover the '
-        'amended scope; call confirm_plan() only if it already does.'
+        'amended scope, then call confirm_plan(); if it already covers it, '
+        'confirm it unchanged.'
     ),
     TaskTextDrift.UNSTAMPED: (
         '## The Task Text May Have Changed\n\n'
         'This plan carries no record of the task text it was authored against, '
         'so the description or details under # Task may have been amended '
-        'since. Re-read them and change the plan if its scope has moved; call '
-        'confirm_plan() only if it already covers it.'
+        'since. Re-read them and change the plan if its scope has moved, then '
+        'call confirm_plan(); if it already covers it, confirm it unchanged.'
     ),
 }
 
@@ -668,6 +730,10 @@ and either confirm it, update it, or recreate it from scratch.
    human ratification marker. A revalidation that drops a done step without
    that record, or newly marks a step done at another done step's commit, is
    refused.
+6. Once the plan is valid, after (a), (b) or (c) alike, call `confirm_plan()`
+   as your FINAL action. Editing the step set (b) or calling `create_plan` (c)
+   clears the plan's confirmation, so a revalidation that stops without it
+   leaves an unconfirmed plan.
 """
 
     async def build_plan_completion_prompt(
@@ -931,6 +997,8 @@ The implementation was reviewed and blocking issues were found.
 4. Keep every existing step in place, in order: do not remove or reorder
    steps, and do not call `create_plan` — it replaces the plan wholesale and
    would discard completed steps.
+5. Call `confirm_plan()` as your FINAL action. Adding steps clears the plan's
+   confirmation, so a replan that stops without it leaves an unconfirmed plan.
 """
 
     async def build_simple_task_prompt(
@@ -1274,6 +1342,7 @@ This task holds locks for the following modules:
         *, amendment_suggestions: list[dict] | None = None,
         task: dict | None = None,
         diff_cap_chars: int = DIFF_ONLY_DIFF_CAP_CHARS,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build prompt for a reviewer agent.
 
@@ -1295,6 +1364,9 @@ This task holds locks for the following modules:
 
         *diff_cap_chars* is where the diff is cut; ``0`` inlines it whole.
         Production callers leave the default.
+
+        *open_info_notes* lists the task's open info notes for the reviewer to
+        disposition; none leaves the prompt byte-identical.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(task), 'reviewer')
@@ -1320,25 +1392,40 @@ This task holds locks for the following modules:
         if amendment_suggestions:
             prompt += '\n' + amendment_scope_section(amendment_suggestions)
 
-        return prompt
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
 
     async def build_context_complete_reviewer_prompt(
         self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
         *, amendment_suggestions: list[dict] | None = None,
+        open_info_notes: Sequence[Escalation] | None = None,
     ) -> str:
         """Build the context-complete (D2) reviewer prompt for *subject*.
 
         Memory is scoped to the task exactly as :meth:`build_reviewer_prompt`
         scopes it; the rendering lives in ``agents/review_briefing.py``.
+        *open_info_notes* is appended exactly as :meth:`build_reviewer_prompt`
+        appends it.
         """
         if context is None:
             context = await self._get_memory_context(BriefingScope.from_task(subject.task), 'reviewer')
-        return render_context_complete_review(
+        prompt = render_context_complete_review(
             reviewer_type=reviewer_type,
             subject=subject,
             context=context,
             task_block=self._format_task(subject.task, include_test_strategy=True),
             amendment_suggestions=amendment_suggestions,
+        )
+        return self._with_open_info_notes(prompt, reviewer_type, open_info_notes)
+
+    def _with_open_info_notes(
+        self, prompt: str, reviewer_type: str, notes: Sequence[Escalation] | None,
+    ) -> str:
+        """*prompt* with the reviewer's notes block appended; no notes leave it byte-identical."""
+        if not notes:
+            return prompt
+        return prompt + '\n' + _open_info_notes_section(
+            notes, reviewer_type=reviewer_type,
+            detail_chars=self.config.info_l0_note_detail_chars,
         )
 
     async def build_completion_judge_prompt(
@@ -1496,6 +1583,10 @@ where the previous agent left off.
             )
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
+        already_merged = already_merged_step(
+            LandedShaSearches.for_task(str(task.get('id', '?')), self.config.git),
+        )
+
         return f"""\
 {preamble}
 
@@ -1512,7 +1603,7 @@ where the previous agent left off.
 # Action
 
 1. Understand the escalation and the task context.
-2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree; `git log --oneline main | head -20` is a sanity glance ONLY — never read a sha off it for `done_provenance`, per `skills/_shared/deriving-landed-sha.md`'s "never from HEAD or an eyeballed listing" rule). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **`done_provenance` must always include `kind`**: pass `done_provenance={{"kind": "found_on_main", "commit": "<landing-sha-on-main>", "note": "<one-sentence explanation>"}}` (both `commit` and `note` are required for this kind — there is no commit-less fallback), e.g. note "covered by sibling task" or "already merged prior to this session". If there is no distinct merge commit to cite (e.g. a fast-forward merge, or work covered by a sibling task), do **not** use the branch's own tip commit SHA — `git merge-base --is-ancestor` passes trivially for a branch that never advanced, whose tip is `main`'s own OLD base commit and carries none of this task's work. Cite instead the commit on `main` that actually carries or cites the work (this branch's own commit whose subject cites the task, or the sibling's landing commit), and record the branch tip in `note` (e.g. "landing confirmed by task citation on main; no separate merge commit (branch tip <tip-sha>)"). Derive that sha with the citation gate — `git log main --extended-regexp --format='%H %s' --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\\(\\b<TASK_ID>\\b[):]|.*\\btask/<TASK_ID>\\b)|^Merge task/<TASK_ID> into |\\(#?<TASK_ID>\\)|\\(task <TASK_ID>\\)'` — walking the rows most-recent-first and taking the first whose **subject** (the `%s` field) cites the task: `--grep` matches the whole message, so a body line can match spuriously. Prefer, among the rows that qualify, one whose diff touches this task's declared `metadata.files`. `skills/_shared/deriving-landed-sha.md`'s step-4 citation gate is the full ladder, including the case where NO row cites the task — that is a phantom branch, not a landing, so do not stamp anything and report it as not-landed instead. `escalation/src/escalation/server.py::_found_on_main_response` resolves the same question the same way — task 3103 changed its live-branch path from the branch tip to the citation commit for exactly this reason. If the landing commit came from this session calling `merge_request`, use `done_provenance={{"kind": "merged", "commit": "<merge-sha>"}}` instead. Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+2. {already_merged}
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.

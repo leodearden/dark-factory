@@ -21,15 +21,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
-    QDRANT_URL,
-    falkor_skipif,
     lease_dir_fixture,  # noqa: F401  # debt: task 6997
     load_script_module,
-    qdrant_skipif,
 )
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from fused_memory.config.schema import FusedMemoryConfig

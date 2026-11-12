@@ -13,6 +13,7 @@ from shared.followup_items import (
 from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
@@ -25,6 +26,7 @@ from orchestrator.agents.harness_guidance import (
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.review_issue_contract import IssueSeverity
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -1092,6 +1094,8 @@ git add -- .
 # specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
+_SEVERITY_CHOICES = ' or '.join(f'`"{severity}"`' for severity in IssueSeverity)
+
 _REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
 
@@ -1107,10 +1111,17 @@ Call `submit_review_verdict` with these fields:
 - **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
   this exactly, or your verdict is rejected.
 - **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
-- **issues**: a list of objects, each with `severity` (`"blocking"` or
-  `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
-  `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
+- **issues**: a list of objects, each with `severity` (""" + _SEVERITY_CHOICES + """),
+  `location` (e.g. `"src/foo.py:42"`), `category`, a `description`, and a
+  `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
+- **note_dispositions**: one object per id listed under
+  `{notes_heading}` in your briefing, each with
+  `escalation_id`, `disposition` and a one-sentence `rationale`. The
+  `disposition` is `"addressed"` (the change on this branch fixes what the
+  note describes, and you verified it), `"no_action"` (a pure observation,
+  nothing to do) or `"work"` (follow-up work this branch does not do; it
+  becomes a task). Omit it when the briefing lists no notes.
 """
 
 REVIEWER_INV12_BLOCKERS = """
@@ -1199,11 +1210,11 @@ _REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
 # Each generation has its own, so a pinned incumbent artifact can never
 # resolve for the context-complete role, whose prompt_id is the same.
-_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v2'
 
 _REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
     ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
-    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v1',
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v2',
 }
 
 
@@ -1220,7 +1231,9 @@ def build_reviewer_prompt_spec(
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
         contract=(
-            _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
+            _REVIEWER_CONTRACT_TEMPLATE.format(
+                name=name, specialization=specialization, notes_heading=OPEN_INFO_NOTES_HEADING,
+            )
             + REVIEWER_INV12_BLOCKERS
         ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(

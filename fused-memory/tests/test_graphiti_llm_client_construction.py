@@ -253,10 +253,10 @@ class TestBuildLLMClientOpenAIGenericPath:
 # guards red.
 MAX_TOKENS_SENTINEL = 2048
 
-# Every arm of build_llm_client that reads cfg.llm.max_tokens. Kept as one list
-# so a future arm added without the kwarg goes red automatically — the hazard
-# named at graphiti_client.py's generic-arm comment ("two copies of the argument
-# list are how one arm silently drifts from the other when a kwarg is added").
+# Every arm of build_llm_client that reads cfg.llm.max_tokens. A listed arm
+# rebuilt without the kwarg goes red here; a new arm is guarded only once it is
+# added to this tuple, and an OpenAI-shaped one also to the parametrize list of
+# test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire.
 MAX_TOKENS_ARMS = (
     'openai',
     'openai_generic/auto',
@@ -323,25 +323,8 @@ class TestConfiguredMaxTokensReachesEveryArm:
     ):
         """The configured value must survive construction on EVERY arm.
 
-        Measured against the installed graphiti-core 0.28.2 wheel:
-
-        - ``OpenAIGenericClient.__init__`` (openai_generic_client.py:61-66,88)
-          declares its own ``max_tokens: int = 16384`` and, immediately after
-          ``super().__init__(config, cache)`` has correctly set
-          ``self.max_tokens = config.max_tokens`` (client.py:80),
-          unconditionally re-assigns ``self.max_tokens = max_tokens``.
-          ``_generate_response`` then sends ``max_tokens=self.max_tokens``,
-          ignoring the per-call argument.
-        - ``BaseOpenAIClient.__init__`` (openai_base_client.py:51-67) — the base
-          of ``OpenAIClient``, i.e. the SHIPPED DEFAULT arm — performs the
-          IDENTICAL override, and ``_generate_response`` sends
-          ``max_tokens or self.max_tokens`` (:176,187).
-
-        So on both OpenAI-shaped arms the constructor kwarg is the ONLY lever
-        that reaches the wire: a client built with ``config=`` alone asks for
-        upstream's default output-token budget no matter what the operator
-        configured. Task 3715 fixed that for the generic arm; task 3864 fixed
-        the default arm, which had silently ignored the knob since inception.
+        Why the OpenAI-shaped arms need the ``max_tokens=`` constructor kwarg:
+        fused-memory/tests/test_local_endpoint_base_url_integration.py::TestGraphitiLLMPathReachesConfiguredEndpoint::test_configured_max_tokens_reaches_the_wire.
 
         The anthropic arm is already green — ``AnthropicClient.__init__``
         overrides ``config.max_tokens`` only when ``config is None``, so a

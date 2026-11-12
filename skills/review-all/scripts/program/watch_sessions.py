@@ -22,6 +22,7 @@ import apply_return
 import sessions
 import state
 from sessions import SpawnedSession, Standing
+from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness
 from shared.session_liveness import judge
 
@@ -38,7 +39,6 @@ from orchestrator.session_registry import (
     SessionRecord,
     parse_result_outcome,
     parse_spawn_identity,
-    pid_alive,
     read_record,
     record_path_for_slug,
     sessions_dir,

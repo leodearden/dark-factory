@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 from orchestrator import session_registry as sr
 
+from cockpit.panes.spawn_tree import build_spawn_forest, is_outstanding
+
 
 def _make_record(**overrides):
     """Mirrors test_app.py's/test_session_table.py's _make_record convention."""
@@ -49,8 +51,6 @@ def _flatten(forest):
 
 class TestBuildSpawnForest:
     def test_renders_parent_child_structure(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child1 = _make_record(
             session_slug='child-1', parent_session_id='root-1', status=sr.Status.RUNNING
@@ -67,8 +67,6 @@ class TestBuildSpawnForest:
         assert {child.slug for child in root_node.children} == {'child-1', 'child-2'}
 
     def test_grandchildren_nest_correctly(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child1 = _make_record(session_slug='child-1', parent_session_id='root-1')
         grandchild = _make_record(session_slug='grandchild-1', parent_session_id='child-1')
@@ -86,8 +84,6 @@ class TestBuildSpawnForest:
 
 class TestIsOutstanding:
     def test_non_terminal_statuses_are_outstanding(self):
-        from cockpit.panes.spawn_tree import is_outstanding
-
         running = _make_record(status=sr.Status.RUNNING)
         awaiting = _make_record(status=sr.Status.AWAITING_INPUT)
 
@@ -95,8 +91,6 @@ class TestIsOutstanding:
         assert is_outstanding(awaiting) is True
 
     def test_terminal_statuses_are_not_outstanding(self):
-        from cockpit.panes.spawn_tree import is_outstanding
-
         exited = _make_record(status=sr.Status.EXITED)
         failed = _make_record(status=sr.Status.FAILED_TO_START)
 
@@ -104,8 +98,6 @@ class TestIsOutstanding:
         assert is_outstanding(failed) is False
 
     def test_unknown_status_degrades_to_false(self):
-        from cockpit.panes.spawn_tree import is_outstanding
-
         foreign = _make_record(status='some-foreign-status')
 
         assert is_outstanding(foreign) is False
@@ -113,8 +105,6 @@ class TestIsOutstanding:
 
 class TestOutstandingFlag:
     def test_non_terminal_child_is_outstanding(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(session_slug='root-1', parent_session_id=None, status=sr.Status.IDLE)
         child = _make_record(
             session_slug='child-1', parent_session_id='root-1', status=sr.Status.RUNNING
@@ -125,8 +115,6 @@ class TestOutstandingFlag:
         assert _find_node(forest, 'child-1').outstanding is True
 
     def test_terminal_child_is_not_outstanding(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child = _make_record(
             session_slug='child-1', parent_session_id='root-1', status=sr.Status.EXITED
@@ -144,8 +132,6 @@ class TestOutstandingFlag:
         structurally-promoted root (orphan/cycle) is NOT covered by this
         test -- see test_orphan_promoted_root_is_outstanding_when_non_terminal
         and test_cycle_promoted_root_is_outstanding_when_non_terminal."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(
             session_slug='root-1', parent_session_id=None, status=sr.Status.RUNNING
         )
@@ -159,8 +145,6 @@ class TestOutstandingFlag:
         the record set) IS someone's child whose parent record is gone, so
         it stays outstanding when non-terminal -- unlike a natural root,
         which is never outstanding."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         orphan = _make_record(
             session_slug='orphan-1', parent_session_id='ghost-parent', status=sr.Status.RUNNING
         )
@@ -176,8 +160,6 @@ class TestOutstandingFlag:
         test_terminal_child_is_not_outstanding). Pins the
         `and is_outstanding(record)` conjunct against a degenerate
         `outstanding = parent_session_id is not None`."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         orphan = _make_record(
             session_slug='orphan-1', parent_session_id='ghost-parent', status=sr.Status.EXITED
         )
@@ -197,8 +179,6 @@ class TestOutstandingFlag:
         single slug) since only the promoted member is suppressed by
         today's bug; the other cycle member is already built as a non-root
         descendant and is already outstanding."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         a = _make_record(session_slug='cycle-a', parent_session_id='cycle-b')
         b = _make_record(session_slug='cycle-b', parent_session_id='cycle-a')
 
@@ -220,8 +200,6 @@ class TestOutstandingFlag:
         without a test catching the rendered-output change (see
         test_self_parented_record_does_not_vanish_or_hang in
         TestForestTotality for this same case's totality guarantee)."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         selfie = _make_record(
             session_slug='selfie-1', parent_session_id='selfie-1', status=sr.Status.RUNNING
         )
@@ -231,8 +209,6 @@ class TestOutstandingFlag:
         assert forest[0].outstanding is True
 
     def test_foreign_child_status_is_fail_soft_not_outstanding(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         root = _make_record(session_slug='root-1', parent_session_id=None)
         child = _make_record(
             session_slug='child-1', parent_session_id='root-1', status='some-foreign-status'
@@ -250,8 +226,6 @@ class TestForestTotality:
         """A child whose parent_session_id names a slug NOT in the record
         set (a vanished/never-registered parent) surfaces as a root rather
         than silently vanishing."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         orphan = _make_record(session_slug='orphan-1', parent_session_id='ghost-parent')
 
         forest = build_spawn_forest([orphan])
@@ -262,8 +236,6 @@ class TestForestTotality:
     def test_self_parented_record_does_not_vanish_or_hang(self):
         """A record naming itself as its own parent must not infinite-loop
         and must still appear exactly once in the forest."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         selfie = _make_record(session_slug='selfie-1', parent_session_id='selfie-1')
 
         forest = build_spawn_forest([selfie])
@@ -276,8 +248,6 @@ class TestForestTotality:
         """A 2-cycle (A's parent is B, B's parent is A) must not
         infinite-loop, and both records must still appear exactly once
         across the whole forest."""
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         a = _make_record(session_slug='cycle-a', parent_session_id='cycle-b')
         b = _make_record(session_slug='cycle-b', parent_session_id='cycle-a')
 
@@ -287,6 +257,4 @@ class TestForestTotality:
         assert slugs == ['cycle-a', 'cycle-b']
 
     def test_empty_input_returns_empty_list(self):
-        from cockpit.panes.spawn_tree import build_spawn_forest
-
         assert build_spawn_forest([]) == []

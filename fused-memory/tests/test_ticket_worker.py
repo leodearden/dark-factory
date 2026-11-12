@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _curator_helpers import answer_each_with, serve_existing_task, submit_as_one_batch
-from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
+from _fm_helpers import pydantic_spec
+from _fm_polling import poll_until, poll_until_stable
 from shared.async_sqlite_base import CheckpointResult
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
@@ -203,7 +204,7 @@ class TestPollTicketResolvedHelper:
     stay well inside the helper's 10s poll budget, so it cannot flake
     toward failure under load. Generic ``poll_until`` machinery
     (truthy-return, timeout raise, awaitable-predicate handling) is
-    already covered by ``TestPollUntil`` in test_fm_helpers.py:787+ (task
+    already covered by ``test_fm_polling.py::TestPollUntil`` (task
     2377); these tests pin only what is new here: the ticket-row
     predicate, its re-evaluation over time, and the descriptive failure
     message.

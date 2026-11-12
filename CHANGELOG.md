@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `update_task` with none of `prompt`, `metadata`, `title`, `description`, `details`, `priority` or `dependencies` now raises `NoFieldsToUpdateError` (wire `error_type='NoFieldsToUpdateError'`) instead of bumping `updated_at` and returning `updated: True`; `dependencies=[]` and `metadata='{}'` still write (task 4867).
+- fused-memory's primary and recon-report MCP servers now refuse a tool call naming an argument the tool does not declare, instead of silently dropping it: a structured `ToolError` with `code='unknown_argument'`, each unknown name with its `closest_declared` name (a spelling guess, so no ready-to-resubmit call is offered) and the `declared` list. Nothing runs, and the server logs one WARNING per refusal. The declared set is read live from the tool's schema; the guard lets the call through unchecked when there is no usable schema. Fixed the in-repo callers that relied on the drop: the dashboard's Unpin no longer clears the whole override row (it sent `fields`; now one `field` per call), and its pin-queue reorder sends `ordered_task_ids` (task 4867).
+
 ### Added
 
 #### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)

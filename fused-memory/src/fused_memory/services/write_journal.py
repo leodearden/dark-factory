@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -448,6 +449,24 @@ class Mem0IntentStatus(StrEnum):
 
 def _schedule_timestamp(moment: datetime) -> str:
     return moment.isoformat(timespec='microseconds')
+
+
+def decode_mem0_intent_metadata(intent: Mapping[str, Any]) -> dict[str, Any]:
+    """The metadata a ``mem0_intents`` row journaled: the one decoder of that column."""
+    return json.loads(intent.get('metadata') or '{}')
+
+
+@dataclass(frozen=True)
+class Mem0RetryBacklog:
+    """One project's ``retrying`` Mem0 intents, as ``WriteJournal.get_mem0_retry_backlog`` reads them."""
+
+    project_id: str | None
+    count: int
+    oldest_created_at: datetime
+    max_attempts: int
+
+    def age(self, now: datetime) -> timedelta:
+        return now - self.oldest_created_at
 
 
 class WriteJournal:
@@ -1165,6 +1184,27 @@ class WriteJournal:
             (Mem0IntentStatus.RETRYING, _schedule_timestamp(now), limit),
         )
         return [dict(row) for row in rows]
+
+    async def get_mem0_retry_backlog(self) -> list[Mem0RetryBacklog]:
+        """Summarise the ``retrying`` intents per project, ordered by project.
+
+        Raises on a read error: the caller chooses the fallback.
+        """
+        rows = await self._require_access().read_all(
+            'SELECT project_id, COUNT(*), MIN(created_at), MAX(attempts) '
+            'FROM mem0_intents WHERE status = ? '
+            'GROUP BY project_id ORDER BY project_id',
+            (Mem0IntentStatus.RETRYING,),
+        )
+        return [
+            Mem0RetryBacklog(
+                project_id=row[0],
+                count=row[1],
+                oldest_created_at=datetime.fromisoformat(row[2]),
+                max_attempts=row[3],
+            )
+            for row in rows
+        ]
 
     async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
         """Count intents created at or after ``since``, keyed by status in sorted order.

@@ -819,7 +819,7 @@ class EpisodeReader:
 def _falkor_host_from_env() -> str:
     """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
 
-    Same env vars and defaults as ``fused-memory/tests/_fm_helpers.py``, so an
+    Same env vars and defaults as ``fused-memory/tests/_fm_falkor_live.py``, so an
     operator who has pointed the test suite at a FalkorDB has pointed this
     script at the same one.
     """

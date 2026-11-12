@@ -2649,7 +2649,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         # The stubbed _remerge registers NOTHING, so every ledger entry left
         # behind at the end is a stranded RU'd worktree and nothing else.
-        async def _fake_remerge(request, started_monotonic):
+        async def _fake_remerge(request, started_monotonic, claim=None):
             return RealMergeItem(
                 request=request,
                 merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
@@ -2793,7 +2793,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         observed: dict = {}
 
-        async def _spy_remerge(request, started_monotonic):
+        async def _spy_remerge(request, started_monotonic, claim=None):
             observed['in_ledger'] = old_wt in worker._owned_merge_worktrees
             # DecidedItem is structurally worktree-less: no merge_wt field.
             return DecidedItem(

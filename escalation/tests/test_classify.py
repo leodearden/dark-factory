@@ -18,8 +18,9 @@ from escalation.classify import (
     effective_benign,
     info_l0_mechanical_class,
     is_done_step_commit_orphan,
+    is_harness_filed,
 )
-from escalation.models import Escalation
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 
 def _make_escalation(
@@ -314,3 +315,54 @@ class TestInfoL0MechanicalClass:
         rather than close silently as status-info.
         """
         assert info_l0_mechanical_class(info_scope_divergence()) is None
+
+
+class TestIsHarnessFiled:
+    """Whether a record was filed by the harness rather than by an agent."""
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            pytest.param(
+                info_l0_note(
+                    agent_role='orchestrator',
+                    category='infra_issue',
+                    suggested_action='investigate_log_corruption',
+                ),
+                id='corruption',
+            ),
+            pytest.param(
+                info_l0_note(agent_role='orchestrator', category='review_suggestions'),
+                id='suggestions-fallback',
+            ),
+            pytest.param(done_step_tripwire(), id='done-step-tripwire'),
+            pytest.param(info_l0_note(agent_role='orchestrator-workflow'), id='orchestrator-prefixed'),
+            pytest.param(info_l0_note(agent_role='harness-orphan-reaper'), id='harness-prefixed'),
+        ],
+    )
+    def test_a_harness_filing_shape_is_harness_filed(self, record: Escalation):
+        assert is_harness_filed(record) is True
+
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
+    def test_every_mechanical_role_is_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is True
+
+    @pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
+    def test_every_sentinel_prefix_is_harness_filed(self, prefix: str):
+        assert is_harness_filed(info_l0_note(agent_role=prefix + 'anything')) is True
+
+    @pytest.mark.parametrize(
+        'role',
+        [
+            'implementer',
+            'architect',
+            'debugger',
+            'deep_reviewer',
+            'reviewer_comprehensive',
+            'steward',
+            'orchestrators',
+            '',
+        ],
+    )
+    def test_an_agent_role_is_not_harness_filed(self, role: str):
+        assert is_harness_filed(info_l0_note(agent_role=role)) is False

@@ -1420,7 +1420,12 @@ def extract_df_data_block(src: str, key: str) -> str:
 # JSX opening-tag walk.
 #
 # Spans one opening tag, attributes included, so a probe can confine itself to
-# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# that element.  `jsx_open_tag_end` is the walk from one known `<`;
+# `jsx_open_tags` reads every opening tag a pattern finds, comment-stripped;
+# `jsx_prop_expr` reads one prop's expression out of such a tag.
+# Contracts: test_jsx_source_helpers.py::TestJsxOpenTagEnd,
+# test_jsx_source_helpers.py::TestJsxOpenTags and
+# test_jsx_source_helpers.py::TestJsxPropExpr.
 # ---------------------------------------------------------------------------
 
 
@@ -1464,6 +1469,52 @@ def jsx_open_tag_end(src: str, start: int) -> int | None:
         elif depth == 0 and c == '<':
             return None
         i += 1
+    return None
+
+
+def jsx_open_tags(src: str, pattern: re.Pattern[str]) -> list[str]:
+    """Return every opening tag *pattern* finds in comment-stripped *src*, in order.
+
+    A tag with children is returned as its opening tag, which carries every
+    attribute; ``tag[-2:] == '/>'`` tells a self-closing one.  Each match must
+    start at the tag's ``<`` (else `jsx_open_tag_end`'s ``ValueError``), and a
+    tag the walk cannot close raises rather than being dropped.
+    """
+    code = strip_js_comments(src)
+    tags: list[str] = []
+    for m in pattern.finditer(code):
+        end = jsx_open_tag_end(code, m.start())
+        if end is None:
+            raise AssertionError(
+                f'jsx_open_tags: a {pattern.pattern!r} tag never closes, or a '
+                f'bare `<` or a stray `}}` comes first, so no probe over its span '
+                f'would mean anything: {code[m.start() : m.start() + 80]!r}'
+            )
+        tags.append(code[m.start() : end])
+    return tags
+
+
+def jsx_prop_expr(opening_tag: str, prop: str) -> str | None:
+    """Return the expression inside *opening_tag*'s own ``prop={...}``, stripped.
+
+    ``None`` when the tag passes no braced *prop*.  The search and the brace
+    walk run over the `_mask_js` text, so a quoted brace or a quoted
+    ``prop={`` is not code, and only a prop at brace depth 0 counts: a nested
+    element's ``prop={...}`` is not this tag's.  Raises when the expression
+    never closes.  *opening_tag* is a `jsx_open_tags` result.
+    """
+    spans = _scan_js(opening_tag)
+    _assert_js_lexable(opening_tag, spans)
+    code = _mask_js(opening_tag, spans)
+    for m in re.finditer(rf'\b{re.escape(prop)}=\{{', code):
+        if code.count('{', 0, m.start()) != code.count('}', 0, m.start()):
+            continue
+        open_at = m.end() - 1
+        braced = walk_balanced(code, open_at)
+        assert braced, (
+            f'jsx_prop_expr: {prop}={{...}} never closes in {opening_tag[:80]!r}'
+        )
+        return opening_tag[open_at + 1 : open_at + len(braced) - 1].strip()
     return None
 
 

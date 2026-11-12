@@ -19,10 +19,12 @@ from _curator_helpers import (
     submit_as_one_batch,
     zot_agent_result,
 )
-from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
+from _fm_git_repos import ScriptedGitRunner, _init_git_repo
+from _fm_helpers import make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from _fm_polling import poll_until
 from shared.async_sqlite_base import CheckpointResult
-from shared.task_metadata_wire import coerce_task_metadata
+from shared.git_async import GitResult, run_git
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
@@ -1727,7 +1729,7 @@ async def test_curator_combine_fingerprint_normalization(
 
 # The escalation-gate stamp as written at the submit boundary by
 # operational_routing_guard.inject_operational_routing /
-# TaskInterceptor._inject_deterministic_pure_gate, plus two ordinary
+# shared/src/shared/pure_gate_provenance.py::pure_gate_stamped, plus two ordinary
 # submit-time keys that the 'replace' write destroyed just as thoroughly.
 _GATE_TARGET_METADATA = {
     'execution_class': 'operational',
@@ -2048,7 +2050,7 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
 ):
     """Unparseable candidate metadata is treated as ungated, never raised on.
 
-    Matches _extract_metadata_dict's degrade contract: the shape warning is
+    Matches extract_metadata_dict's degrade contract: the shape warning is
     emitted there, and the guard falls back to the permissive answer rather
     than turning a malformed blob into a hard failure of the combine path.
     """
@@ -4260,7 +4262,7 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
 
 @pytest.mark.asyncio
 async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
-    tmp_path, event_buffer, monkeypatch, caplog,
+    tmp_path, event_buffer, caplog,
 ):
     """Coverage gap fix (reviewer follow-up on task 2674): distinguishes the
     transient-git-failure fail-closed path (``evidence_dt`` is None because
@@ -4270,10 +4272,10 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
 
     By the time ``_check_reopen_freshness`` runs, ``_validate_done_provenance``
     has already resolved + ancestor-checked the cited commit, so a genuine
-    "commit does not exist" scenario can never reach the gate --
-    ``_resolve_commit_committed_at`` is monkeypatched to simulate a ``git
-    show`` failure (binary hiccup, timeout) on an otherwise perfectly
-    valid, on-main commit, isolating the gate's OWN resolution step.
+    "commit does not exist" scenario can never reach the gate -- the
+    interceptor's runner scripts a timed-out ``git show`` on an otherwise
+    perfectly valid, on-main commit, isolating the gate's OWN resolution
+    step.
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
     from fused_memory.config.schema import TaskmasterConfig
@@ -4288,7 +4290,12 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
     await backend.start()
     try:
         await backend.add_task(project_root=project_root, title='T')
-        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+        # rev-parse and merge-base still run for real; the first done write
+        # never reaches `git show`, because there is no reopen_at yet.
+        runner = ScriptedGitRunner(
+            {'show': GitResult(124, '', 'timed out after 5.0s', timed_out=True)},
+        )
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg, git_runner=runner)
 
         first_done = await interceptor.set_task_status(
             '1', 'done', project_root,
@@ -4304,21 +4311,12 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
         reopen_at = reopened_task['metadata']['reopen_at']
 
         # A perfectly valid, resolvable, on-main commit -- NOT actually
-        # unresolvable. The monkeypatch below is what makes the gate's own
-        # `git show` step fail, isolated from commit resolution/ancestor
-        # checking in _validate_done_provenance (which runs first and would
-        # otherwise reject a genuinely bad commit before the gate even
-        # sees it).
+        # unresolvable. The scripted `git show` is what makes the gate's own
+        # date step fail, isolated from commit resolution/ancestor checking
+        # in _validate_done_provenance (which runs first and would otherwise
+        # reject a genuinely bad commit before the gate even sees it).
         evidence_sha = _commit_on_main(
             tmp_path, 'transient_failure_evidence.txt', '2099-01-01T00:00:00+00:00',
-        )
-
-        async def _simulate_git_failure(project_root, sha):
-            return None
-
-        monkeypatch.setattr(
-            'fused_memory.middleware.task_interceptor._resolve_commit_committed_at',
-            _simulate_git_failure,
         )
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
@@ -4332,6 +4330,7 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
                 agent_id='claude-interactive',
             )
 
+        assert any(call.subcommand == 'show' for call in runner.calls), runner.calls
         assert result['success'] is False
         assert result['error'] == 'done_evidence_stale'
         assert result['task_id'] == '1'
@@ -4880,6 +4879,7 @@ async def test_validate_done_provenance_accepts_operational_verified(tmp_path):
         str(tmp_path),
         require=False,
         is_recon_stage=False,
+        git_runner=run_git,
     )
 
     assert err is None
@@ -4903,6 +4903,7 @@ async def test_validate_done_provenance_operational_verified_requires_escalation
         str(tmp_path),
         require=False,
         is_recon_stage=False,
+        git_runner=run_git,
     )
 
     assert resolved is None
@@ -4922,6 +4923,7 @@ async def test_validate_done_provenance_operational_verified_requires_note(tmp_p
         str(tmp_path),
         require=False,
         is_recon_stage=False,
+        git_runner=run_git,
     )
 
     assert resolved is None
@@ -4942,6 +4944,7 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
         str(tmp_path),
         require=False,
         is_recon_stage=True,
+        git_runner=run_git,
     )
 
     assert resolved is None
@@ -5012,6 +5015,7 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
             # this table tests the SHAPE contract rather than the caller bar,
             # which TestDeterministicProvenanceCallerBar owns.
             agent_id='orchestrator', config=FusedMemoryConfig(),
+            git_runner=run_git,
         )
         assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
         assert resolved is not None, f'kind={kind!r} resolved to None with no error'
@@ -5415,259 +5419,226 @@ class TestDeterministicProvenanceCallerBar:
 
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
 #
-# These tests pin the message prefix `_validate_done_provenance` emits for
-# each failure branch of its two git probes. The authoritative contract
-# lives in the probes' docstrings (`_resolve_commit_sha`,
-# `_verify_commit_on_main`): git-issued verdicts get the assertive wording
-# ("not found in" / "is not on main"), everything else gets the honest
-# NOT-YET-CONFIRMED wording. Each test fakes ONLY the probe under test, so
-# the other git call still runs for real.
+# These tests pin the refusal reason a done write gets for each failure
+# branch of the two git probes behind `_validate_done_provenance`. The
+# authoritative contract lives in the probes' docstrings
+# (`_resolve_commit_sha`, `_verify_commit_on_main`): git-issued verdicts get
+# the assertive wording ("not found in" / "is not on main"), everything else
+# gets the honest NOT-YET-CONFIRMED wording. Each test hands the interceptor
+# a ScriptedGitRunner that fakes ONLY the probe under test, so the other git
+# call still runs for real.
 
 
-class _FakeGitProc:
-    """Stand-in for a git subprocess with a fixed rc/stdout/stderr."""
-
-    def __init__(self, returncode, stdout=b'', stderr=b''):
-        self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
-
-    async def communicate(self):
-        return self._stdout, self._stderr
-
-    def kill(self):
-        pass
+_TIMED_OUT = GitResult(124, '', 'timed out after 5.0s', timed_out=True)
 
 
-class _TimeoutGitProc:
-    """Stand-in whose ``communicate()`` raises as if `wait_for` timed out."""
-
-    returncode = None
-
-    async def communicate(self):
-        raise TimeoutError
-
-    def kill(self):
-        pass
-
-
-# Back-compat alias: the merge-base tests below only ever need rc + stderr.
-_FakeMergeBaseProc = _FakeGitProc
-_TimeoutMergeBaseProc = _TimeoutGitProc
+def _probe_warnings(caplog, subcommand):
+    """WARNING records the interceptor logged for an unexpected exception
+    from the git *subcommand* probe."""
+    return [
+        r for r in caplog.records
+        if r.name == 'fused_memory.middleware.task_interceptor'
+        and r.levelno == logging.WARNING
+        and f'git {subcommand} probe' in r.getMessage()
+    ]
 
 
-def _patch_git_subcommand(monkeypatch, subcommand, fake_proc=None, raise_exc=None):
-    """Patch ``asyncio.create_subprocess_exec`` so only ``subcommand`` is
-    faked; any other git invocation goes to the real subprocess. Keeps the
-    untouched probe honest -- e.g. when faking `merge-base`, the earlier
-    `git rev-parse` in `_resolve_commit_sha` still resolves the SHA for
-    real, so execution genuinely reaches the ancestor check."""
-    real_create_subprocess_exec = asyncio.create_subprocess_exec
-
-    async def fake_exec(*args, **kwargs):
-        if subcommand in args:
-            if raise_exc is not None:
-                raise raise_exc
-            return fake_proc
-        return await real_create_subprocess_exec(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, 'create_subprocess_exec', fake_exec)
-
-
-def _patch_merge_base(monkeypatch, fake_proc=None, raise_exc=None):
-    """Fake only the `git merge-base --is-ancestor` call."""
-    _patch_git_subcommand(monkeypatch, 'merge-base', fake_proc=fake_proc, raise_exc=raise_exc)
-
-
-def _patch_rev_parse(monkeypatch, fake_proc=None, raise_exc=None):
-    """Fake only the `git rev-parse --verify` call."""
-    _patch_git_subcommand(monkeypatch, 'rev-parse', fake_proc=fake_proc, raise_exc=raise_exc)
+async def _refused_merged_done_reason(
+    taskmaster, reconciler, event_buffer, project_root, commit, git_runner=None,
+):
+    """Drive a kind='merged' done write through set_task_status; return the
+    refusal's reason. ``git_runner=None`` keeps the production default."""
+    runner_kwargs = {} if git_runner is None else {'git_runner': git_runner}
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, **runner_kwargs)
+    result = await interceptor.set_task_status(
+        '1', 'done', project_root, done_provenance={'kind': 'merged', 'commit': commit},
+    )
+    assert result.get('error') == 'done_provenance_invalid', result
+    return result['reason']
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_merge_base_rc1_reports_not_on_main(tmp_path, monkeypatch):
+async def test_merge_base_rc1_reports_not_on_main(taskmaster, reconciler, event_buffer, tmp_path):
     """rc=1 is the ONLY branch that genuinely means off-main; keep the
     "is not on main" prefix for it."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(monkeypatch, fake_proc=_FakeMergeBaseProc(1))
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+        ScriptedGitRunner({'merge-base': GitResult(1, '', '')}),
     )
 
-    assert resolved is None
-    assert err is not None
-    assert 'is not on main:' in err['reason']
-    assert 'commit is not an ancestor of main' in err['reason']
-    assert 'could not be confirmed' not in err['reason']
+    assert 'is not on main:' in reason
+    assert 'commit is not an ancestor of main' in reason
+    assert 'could not be confirmed' not in reason
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_merge_base_git_error_reports_unconfirmed(tmp_path, monkeypatch):
+async def test_merge_base_git_error_reports_unconfirmed(taskmaster, reconciler, event_buffer, tmp_path):
     """A non-1 git exit (e.g. rc=128, unresolvable `main` ref) is NOT a
     not-on-main verdict -- the check never actually completed."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(
-        monkeypatch,
-        fake_proc=_FakeMergeBaseProc(128, stderr=b'fatal: Not a valid object name main\n'),
+
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+        ScriptedGitRunner(
+            {'merge-base': GitResult(128, '', 'fatal: Not a valid object name main')},
+        ),
     )
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
-    )
-
-    assert resolved is None
-    assert err is not None
-    assert 'could not be confirmed on main:' in err['reason']
-    assert 'fatal: Not a valid object name main' in err['reason']
-    assert 'is not on main:' not in err['reason']
+    assert 'could not be confirmed on main:' in reason
+    assert 'fatal: Not a valid object name main' in reason
+    assert 'is not on main:' not in reason
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_merge_base_timeout_reports_unconfirmed(tmp_path, monkeypatch):
-    """A merge-base timeout is NOT-YET-CONFIRMED, not off-main."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
+async def test_merge_base_timeout_reports_unconfirmed(taskmaster, reconciler, event_buffer, tmp_path):
+    """A merge-base timeout is NOT-YET-CONFIRMED, not off-main, and the probe
+    asks its runner for a bounded wait, so a hanging git child is bounded."""
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(monkeypatch, fake_proc=_TimeoutMergeBaseProc())
+    runner = ScriptedGitRunner({'merge-base': _TIMED_OUT})
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha, runner,
     )
 
-    assert resolved is None
-    assert err is not None
-    assert 'could not be confirmed on main:' in err['reason']
-    assert 'git merge-base timed out' in err['reason']
-    assert 'is not on main:' not in err['reason']
+    assert 'could not be confirmed on main: git merge-base timed out' in reason
+    assert 'is not on main:' not in reason
+    merge_base_timeouts = [call.timeout for call in runner.calls if call.subcommand == 'merge-base']
+    assert merge_base_timeouts == [5.0]
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_merge_base_missing_binary_reports_unconfirmed(
-    tmp_path, monkeypatch
+async def test_merge_base_missing_binary_reports_unconfirmed(
+    taskmaster, reconciler, event_buffer, tmp_path,
 ):
     """A missing git binary is NOT-YET-CONFIRMED, not off-main."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(monkeypatch, raise_exc=FileNotFoundError('git'))
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+        ScriptedGitRunner({'merge-base': FileNotFoundError('git')}),
     )
 
-    assert resolved is None
-    assert err is not None
-    assert 'could not be confirmed on main:' in err['reason']
-    assert 'git binary not found' in err['reason']
-    assert 'is not on main:' not in err['reason']
+    assert 'could not be confirmed on main:' in reason
+    assert 'git binary not found' in reason
+    assert 'is not on main:' not in reason
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('fake_proc', 'raise_exc', 'expected_detail'),
+    ('outcome', 'expected_detail', 'expected_warnings'),
     [
-        (_FakeGitProc(128, stderr=b''), None, 'merge-base failed'),
-        (None, PermissionError('denied'), 'PermissionError: denied'),
+        (GitResult(128, '', ''), 'merge-base failed', 0),
+        (PermissionError('denied'), 'PermissionError: denied', 1),
     ],
     ids=['git-error-empty-stderr', 'unexpected-exception'],
 )
-async def test_validate_done_provenance_merge_base_residual_failures_report_unconfirmed(
-    tmp_path, monkeypatch, fake_proc, raise_exc, expected_detail
+async def test_merge_base_residual_failures_report_unconfirmed(
+    taskmaster, reconciler, event_buffer, tmp_path, caplog,
+    outcome, expected_detail, expected_warnings,
 ):
     """The two fallback branches -- a non-1 exit with EMPTY stderr (detail
-    falls back to 'merge-base failed') and the catch-all `except Exception`
-    -- are NOT-YET-CONFIRMED too, not off-main verdicts."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
+    falls back to 'merge-base failed') and an unexpected exception -- are
+    NOT-YET-CONFIRMED too, not off-main verdicts. Only the exception is
+    logged: git's own answer is not a fault of the probe."""
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(monkeypatch, fake_proc=fake_proc, raise_exc=raise_exc)
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
-    )
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        reason = await _refused_merged_done_reason(
+            taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+            ScriptedGitRunner({'merge-base': outcome}),
+        )
 
-    assert resolved is None
-    assert err is not None
-    assert f'could not be confirmed on main: {expected_detail}' in err['reason']
-    assert 'is not on main:' not in err['reason']
+    assert f'could not be confirmed on main: {expected_detail}' in reason
+    assert 'is not on main:' not in reason
+    assert len(_probe_warnings(caplog, 'merge-base')) == expected_warnings
 
 
 @pytest.mark.asyncio
-async def test_validate_done_provenance_rev_parse_rejection_reports_not_found(tmp_path):
-    """CONTROL for step 1: a ref git actually evaluated and rejected keeps
-    the assertive "not found in" wording."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
+async def test_rev_parse_rejection_reports_not_found(taskmaster, reconciler, event_buffer, tmp_path):
+    """CONTROL: a ref git actually evaluated and rejected keeps the assertive
+    "not found in" wording."""
     _init_git_repo(tmp_path)
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'},
-        str(tmp_path),
-        require=True,
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path),
+        'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', run_git,
     )
 
-    assert resolved is None
-    assert err is not None
-    assert 'not found in' in err['reason']
-    assert 'could not be resolved in' not in err['reason']
+    assert 'not found in' in reason
+    assert 'could not be resolved in' not in reason
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('fake_proc', 'raise_exc', 'expected_detail'),
+    ('outcome', 'expected_detail', 'expected_warnings'),
     [
-        (_TimeoutGitProc(), None, 'git rev-parse timed out'),
-        (None, FileNotFoundError('git'), 'git binary not found'),
-        (None, PermissionError('denied'), 'PermissionError: denied'),
-        (_FakeGitProc(0, stdout=b'\n'), None, 'empty rev-parse output'),
+        (_TIMED_OUT, 'git rev-parse timed out', 0),
+        (FileNotFoundError('git'), 'git binary not found', 0),
+        (PermissionError('denied'), 'PermissionError: denied', 1),
+        (GitResult(0, '', ''), 'empty rev-parse output', 0),
     ],
     ids=['timeout', 'missing-binary', 'unexpected-exception', 'empty-output'],
 )
-async def test_validate_done_provenance_rev_parse_failure_reports_unresolved(
-    tmp_path, monkeypatch, fake_proc, raise_exc, expected_detail
+async def test_rev_parse_failure_reports_unresolved(
+    taskmaster, reconciler, event_buffer, tmp_path, caplog,
+    outcome, expected_detail, expected_warnings,
 ):
     """A rev-parse that never rendered a verdict on the ref (timeout,
     missing binary, unexpected error, empty output) must NOT be reported as
     "not found in <project_root>" -- same honesty contract as the ancestor
-    check one step later."""
-    from fused_memory.middleware.task_interceptor import _validate_done_provenance
-
+    check one step later. Only the unexpected exception is logged."""
     sha = _init_git_repo(tmp_path)
-    _patch_rev_parse(monkeypatch, fake_proc=fake_proc, raise_exc=raise_exc)
 
-    err, resolved = await _validate_done_provenance(
-        '1',
-        {'kind': 'merged', 'commit': sha},
-        str(tmp_path),
-        require=True,
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        reason = await _refused_merged_done_reason(
+            taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+            ScriptedGitRunner({'rev-parse': outcome}),
+        )
+
+    assert 'could not be resolved in' in reason
+    assert expected_detail in reason
+    assert 'not found in' not in reason
+    assert len(_probe_warnings(caplog, 'rev-parse')) == expected_warnings
+
+
+@pytest.mark.asyncio
+async def test_repair_seam_probes_through_the_constructor_runner(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """The done->done repair seam (_repair_done_provenance_same_status) runs
+    its probes through the constructor's runner too: the commit IS on main,
+    so only the scripted rc=1 merge-base can refuse the repair."""
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), sha,
+        ScriptedGitRunner({'merge-base': GitResult(1, '', '')}),
     )
 
-    assert resolved is None
-    assert err is not None
-    assert 'could not be resolved in' in err['reason']
-    assert expected_detail in err['reason']
-    assert 'not found in' not in err['reason']
+    assert 'is not on main:' in reason
+    taskmaster.stamp_audit_metadata.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_nul_commit_is_refused_as_unresolved_not_raised(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """``commit`` is caller-supplied free text, and an embedded NUL makes the
+    spawn itself raise ValueError. The production runner's write is still
+    refused with the honest "could not be resolved" wording rather than
+    crashing the MCP call."""
+    _init_git_repo(tmp_path)
+
+    reason = await _refused_merged_done_reason(
+        taskmaster, reconciler, event_buffer, str(tmp_path), 'abc\x00def',
+    )
+
+    assert 'could not be resolved in' in reason
+    assert 'ValueError' in reason
+    assert 'not found in' not in reason
 
 
 # ── Tests for the server-written `stamped_at` field (task 3576) ──
@@ -5704,6 +5675,7 @@ async def test_validate_done_provenance_stamps_found_on_main(tmp_path, frozen_pr
         {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
         str(tmp_path),
         require=False,
+        git_runner=run_git,
     )
 
     assert err is None
@@ -5729,6 +5701,7 @@ async def test_validate_done_provenance_stamp_is_tz_aware_utc_iso8601(tmp_path):
         {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
         str(tmp_path),
         require=False,
+        git_runner=run_git,
     )
 
     assert err is None
@@ -5756,6 +5729,7 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_p
         {'kind': 'merged', 'commit': sha},
         str(tmp_path),
         require=False,
+        git_runner=run_git,
     )
 
     assert err is None
@@ -5794,6 +5768,7 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
         is_recon_stage=False,
         agent_id='orchestrator',
         config=FusedMemoryConfig(),
+        git_runner=run_git,
     )
 
     assert err is None, f'expected acceptance but got: {err}'
@@ -5828,6 +5803,7 @@ async def test_validate_done_provenance_discards_caller_supplied_stamp(
             },
             str(tmp_path),
             require=False,
+            git_runner=run_git,
         )
 
     assert err is None
@@ -5857,6 +5833,7 @@ async def test_validate_done_provenance_no_stamp_warning_when_absent(
             {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
             str(tmp_path),
             require=False,
+            git_runner=run_git,
         )
 
     assert err is None
@@ -7094,21 +7071,6 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     assert status_result.get('success') or status_result.get('no_op')
     taskmaster.add_task.assert_called_once()
     taskmaster.set_task_status.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# step-15: _is_ticket_id helper
-# ---------------------------------------------------------------------------
-def test_is_ticket_id_recognises_tkt_prefix():
-    """_is_ticket_id() returns True for tkt_-prefixed strings, False otherwise."""
-    from fused_memory.middleware.task_interceptor import _is_ticket_id
-
-    assert _is_ticket_id('tkt_0000000000000000000000000000') is True
-    assert _is_ticket_id('tkt_abc') is True
-    assert _is_ticket_id('') is False
-    assert _is_ticket_id('123') is False
-    assert _is_ticket_id('1.2') is False
-    assert _is_ticket_id(None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -12303,46 +12265,6 @@ async def test_commit_planning_cancelled_does_not_index(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _looks_like_task_id helper
-# ─────────────────────────────────────────────────────────────────────
-
-
-def test_looks_like_task_id_accepts_numeric_strings():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert _looks_like_task_id('42')
-    assert _looks_like_task_id('  42  ')
-    assert _looks_like_task_id('0')
-
-
-def test_looks_like_task_id_accepts_int():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert _looks_like_task_id(42)
-    assert _looks_like_task_id(0)
-
-
-def test_looks_like_task_id_rejects_bool():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert not _looks_like_task_id(True)
-    assert not _looks_like_task_id(False)
-
-
-def test_looks_like_task_id_rejects_negative_and_non_numeric():
-    from fused_memory.middleware.task_interceptor import _looks_like_task_id
-
-    assert not _looks_like_task_id(-1)
-    assert not _looks_like_task_id('-1')
-    assert not _looks_like_task_id('abc')
-    assert not _looks_like_task_id('')
-    assert not _looks_like_task_id('   ')
-    assert not _looks_like_task_id(None)
-    assert not _looks_like_task_id('tkt_abc')
-    assert not _looks_like_task_id('1.5')
-
-
-# ─────────────────────────────────────────────────────────────────────
 # planning_mode end-to-end: decompose batch → set deps → commit
 # ─────────────────────────────────────────────────────────────────────
 
@@ -14076,6 +13998,7 @@ async def test_get_tasks_threads_statuses(interceptor, taskmaster):
 # ── task-1810 step-11/12: _extract_metadata_files WARNING on present-but-malformed ──
 
 _TI_LOGGER = 'fused_memory.middleware.task_interceptor'
+_MD_LOGGER = 'fused_memory.middleware.metadata_dict'
 
 
 class TestExtractMetadataFilesWarns:
@@ -14195,39 +14118,25 @@ class TestExtractMetadataFilesWarns:
         assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
 
 
-# ── task 2166 step-5: _parse_metadata / _extract_metadata_dict discard WARN ──
+# ── task 2166 step-5: _parse_metadata discard WARN ──
 #
-# Both helpers delegate their malformed-input policy to
-# shared.task_metadata.parse_metadata(direction='read') and must emit a
-# task_metadata.schema_warning WARNING on a genuine whole-metadata discard
-# (unparseable JSON / non-object) while staying silent for legitimate
-# curator-internal extras (spawned_from, spawn_context, files_to_modify) and
-# valid JSON-string metadata — those aren't discards, so no census line.
+# _parse_metadata resolves through metadata_dict.py::raw_metadata_dict, so its
+# task_metadata.schema_warning census line is emitted on the metadata_dict
+# logger. It must fire on a genuine whole-metadata discard (unparseable JSON /
+# non-object) and stay silent for legitimate curator-internal extras
+# (spawned_from, spawn_context, files_to_modify) and valid JSON-string
+# metadata — those aren't discards, so no census line.
 
 
 class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
     def test_parse_metadata_unparseable_string_warns_and_returns_empty_dict(self, caplog):
         """RED: _parse_metadata currently coerces 'garbage{{{' to {} silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': 'garbage{{{'})
         assert result == {}
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_unparseable_string_warns_and_returns_none(self, caplog):
-        """RED: _extract_metadata_dict currently coerces 'garbage{{{' to None silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict('garbage{{{')
-        assert result is None
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert any('task_metadata.schema_warning' in r.message for r in warns), (
             f'expected a task_metadata.schema_warning WARNING; got '
@@ -14240,29 +14149,12 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             'files': ['a.py'], 'files_to_modify': ['b.py'],
             'spawned_from': '42', 'spawn_context': 'auto',
         }
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': meta})
         assert result == meta
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_curator_extras_no_warning(self, caplog):
-        """Curator-internal extras are legitimate, not a discard — zero warnings."""
-        meta = {
-            'files': ['a.py'], 'files_to_modify': ['b.py'],
-            'spawned_from': '42', 'spawn_context': 'auto',
-        }
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(meta)
-        assert result == meta
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, (
             f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
@@ -14271,27 +14163,12 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
     def test_parse_metadata_valid_json_string_no_warning(self, caplog):
         """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
         meta = {'files': ['a.py'], 'spawned_from': '42'}
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': json.dumps(meta)})
         assert result == meta
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'valid JSON-string metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_valid_json_string_no_warning(self, caplog):
-        """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
-        meta = {'files': ['a.py'], 'spawned_from': '42'}
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(json.dumps(meta))
-        assert result == meta
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, (
             f'valid JSON-string metadata must not emit a WARNING; got '
@@ -14304,66 +14181,25 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard —
         '' must not emit a task_metadata.schema_warning census line.
         """
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': ''})
         assert result == {}
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, (
             f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_empty_string_no_warning(self, caplog):
-        """Amendment: an empty-string metadata is benign-absent, not a discard."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict('')
-        assert result == {}
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    def test_extract_metadata_dict_none_is_empty_dict_no_warning(self, caplog):
-        """Absent metadata resolves to {} under the shared wire rule, silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(None)
-        assert result == {}
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'absent metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
-        )
-
-    @pytest.mark.parametrize('raw', [['a'], 42, True, 3.5])
-    def test_extract_metadata_dict_non_str_non_dict_warns(self, raw, caplog):
-        """A present non-str non-dict value is a discard — it must reach the census."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(raw)
-        assert result is None
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'metadata={raw!r} must emit a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
         )
 
     def test_parse_metadata_non_dict_value_warns(self, caplog):
         """A list-valued metadata collapses to {} loudly, not silently."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             result = TaskInterceptor._parse_metadata({'metadata': ['some', 'list']})
         assert result == {}
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert any('task_metadata.schema_warning' in r.message for r in warns), (
             f'expected a task_metadata.schema_warning WARNING; got '
@@ -14372,17 +14208,15 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
 
     def test_inject_helpers_do_not_warn_on_empty_string_metadata(self, caplog):
         """'' is absent, so the inject/attach helpers have nothing to discard."""
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override('', 'why')
-            gated = TaskInterceptor._inject_deterministic_pure_gate('')
             kwargs: dict[str, Any] = {'metadata': ''}
             TaskInterceptor._attach_cross_repo_marker(kwargs, 'other')
         assert routed == {'routing_override_reason': 'why'}
-        assert gated == {'task_kind': 'deterministic', 'always_escalates': True}
         assert kwargs['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         warns = [
             r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         assert not warns, (
             f"metadata='' must not emit a discard WARNING; got {[r.message for r in warns]!r}"
@@ -14396,24 +14230,21 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         verdict = PathGuardVerdict(
             outcome='rejection', matched_paths=('x/',), suggested_project='other'
         )
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+        with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
             routed = TaskInterceptor._inject_routing_override(raw, 'why')
-            gated = TaskInterceptor._inject_deterministic_pure_gate(raw)
             scoped: dict[str, Any] = {'metadata': raw}
             TaskInterceptor._attach_possible_scope_mismatch(scoped, verdict)
             marked: dict[str, Any] = {'metadata': raw}
             TaskInterceptor._attach_cross_repo_marker(marked, 'other')
         assert routed == {'routing_override_reason': 'why'}
-        assert gated == {'task_kind': 'deterministic', 'always_escalates': True}
         assert list(scoped['metadata']) == ['possible_scope_mismatch']
         assert marked['metadata'] == {'cross_repo': True, 'cross_repo_project': 'other'}
         messages = [
             r.getMessage() for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+            if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
         ]
         for site in (
             'routing-override',
-            'deterministic-pure-gate',
             'scope-mismatch-advisory',
             'cross-repo-marker',
         ):
@@ -14421,36 +14252,14 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
                 f'{site} must name itself in the discard WARNING; got {messages!r}'
             )
         census = [m for m in messages if 'task_metadata.schema_warning' in m]
-        assert len(census) == 4, f'one census line per helper call; got {messages!r}'
+        assert len(census) == 3, f'one census line per helper call; got {messages!r}'
 
     def test_inject_helpers_copy_rather_than_mutate_a_dict_input(self):
         """A readable dict input is shallow-copied, never stamped in place."""
         original = {'keep': 1}
         routed = TaskInterceptor._inject_routing_override(original, 'why')
-        gated = TaskInterceptor._inject_deterministic_pure_gate(original)
         assert routed == {'keep': 1, 'routing_override_reason': 'why'}
-        assert gated == {'keep': 1, 'task_kind': 'deterministic', 'always_escalates': True}
         assert original == {'keep': 1}
-
-    @pytest.mark.parametrize(
-        'raw',
-        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
-    )
-    def test_extract_metadata_dict_matches_shared_wire_rule(self, raw, caplog):
-        """The interceptor reads metadata by the shared rule, warning exactly on unreadable."""
-        expected = coerce_task_metadata(raw)
-        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
-            result = TaskInterceptor._extract_metadata_dict(raw)
-        assert result == expected
-        warns = [
-            r for r in caplog.records
-            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
-            and 'task_metadata.schema_warning' in r.message
-        ]
-        assert bool(warns) == (expected is None), (
-            f'metadata={raw!r}: census WARNING must fire exactly when the shared rule '
-            f'says unreadable; got {[r.message for r in warns]!r}'
-        )
 
 
 # ── task 2189 step-9/10: candidate_key collision → combined (create-dispatch) ──
@@ -14598,6 +14407,48 @@ async def test_dispatch_route_deterministic_overrides_incoming_metadata_variants
     assert 'before_done' not in stamped_metadata
     if isinstance(incoming_metadata, dict):
         assert stamped_metadata.get('foo') == 'bar', 'other keys must survive the stamp'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_route_deterministic_discards_unreadable_metadata_naming_its_site(
+    interceptor, taskmaster, caplog,
+):
+    """Unreadable curator metadata becomes the bare pure gate, discarded loudly under its site."""
+    from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
+
+    with caplog.at_level(logging.WARNING, logger=_MD_LOGGER):
+        await interceptor._dispatch_ticket_decision(
+            ticket_id='t1',
+            project_root='/project',
+            project_id=resolve_project_id('/project'),
+            candidate=None,
+            decision=CuratorDecision(
+                action='route_deterministic',
+                justification='operational-ask-registry: x: y',
+            ),
+            kwargs={'title': 'Run prune_recon_cycle_summaries --apply'},
+            metadata='{not json',
+            curator=None,
+        )
+
+    taskmaster.add_task.assert_awaited_once()
+    _, call_kwargs = taskmaster.add_task.call_args
+    assert json.loads(call_kwargs['metadata']) == pure_gate_stamped(
+        {}, PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
+    )
+    messages = [
+        r.getMessage() for r in caplog.records
+        if r.name == _MD_LOGGER and r.levelno >= logging.WARNING
+    ]
+    site_lines = [
+        m for m in messages if m.startswith('deterministic-pure-gate: non-dict metadata discarded')
+    ]
+    census = [
+        m for m in messages
+        if m.startswith('task_metadata.schema_warning source=deterministic-pure-gate ')
+    ]
+    assert len(site_lines) == 1, f'expected one site-named discard WARNING; got {messages!r}'
+    assert len(census) == 1, f'expected one census line naming the site; got {messages!r}'
 
 
 @pytest.mark.asyncio

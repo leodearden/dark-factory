@@ -10,8 +10,10 @@ The escape chain this file pins, one layer per test class:
    branch was not freed".
 3. ``Harness._reconcile_lane_checkouts`` calls it at three sites
    (dup-checkout, deleted-id, terminal) and handles only the False return.
-4. ``Harness.run`` startup step 2c2 awaits the sweep; an exception escaping
-   it ends the orchestrator process on every restart.
+4. ``Harness.run`` runs the sweep as startup step 2c2 through the startup-step
+   runner (``orchestrator/src/orchestrator/startup_steps.py``), which reports an
+   escaping exception and carries on; that layer is pinned in
+   ``test_harness_startup_steps.py``.
 
 A conflicted lane can never be detached anyway (``git checkout --detach``
 refuses on an unmerged index), so the correct outcome at every layer is:
@@ -21,17 +23,17 @@ leave the checkout attached, keep or restore the pin, warn, and carry on.
 from __future__ import annotations
 
 import logging
+import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from _workflow_helpers import _build_harness, _init_git_repo
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, WorktreeConflictError, _run
-from orchestrator.harness import Harness
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.startup_steps import EntryFailures
 
 _BARE_ID = '3965'
 _TASK_BRANCH = f'task/{_BARE_ID}'
@@ -185,69 +187,61 @@ class TestReconcileLaneCheckoutsConflictedLane:
         ), caplog.text
 
 
-@pytest.fixture
-def startup_harness(tmp_path: Path, mock_orch_config: MagicMock) -> Harness:
-    """A Harness whose run() exercises only the startup block, then stops at acquire_next."""
-    mock_orch_config.max_concurrent_tasks = 2
-    mock_orch_config.fused_memory.project_id = 'test'
-
-    with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
-         patch('orchestrator.harness.Scheduler'), \
-         patch('orchestrator.harness.BriefingAssembler'):
-        h = Harness(mock_orch_config)
-
-    mock_mcp = mock_mcp_cls.return_value
-    mock_mcp.start = AsyncMock()
-    mock_mcp.stop = AsyncMock()
-
-    h.git_ops = MagicMock()
-    h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
-    h.git_ops.worktree_base = tmp_path / '.worktrees'
-    h.git_ops.disable_shared_repo_auto_maintenance = AsyncMock()
-
-    h._start_escalation_server = AsyncMock()
-    h._start_merge_worker = AsyncMock()
-    h._dismiss_stale_escalations = AsyncMock()
-    h._tag_task_modules = AsyncMock()
-    h._recover_crashed_tasks = AsyncMock()
-    h._reconcile_lane_checkouts = AsyncMock()
-    h._reconcile_stranded_in_progress = AsyncMock()
-    h._tag_prd_metadata = AsyncMock()
-
-    h.scheduler = MagicMock()
-    h.scheduler.get_tasks = AsyncMock(return_value=[{'id': '99', 'status': 'pending'}])
-    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
-    h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.acquire_next = AsyncMock(
-        side_effect=RuntimeError('__loop_reached_sentinel__'),
-    )
-    return h
-
-
-class TestStartupSurvivesLaneCheckoutReconcileFailure:
-    """Startup step 2c2 is non-fatal: whatever escapes the sweep, startup carries on."""
+class TestReconcileLaneCheckoutsPerLaneGuard:
+    """One lane whose detach raises does not stop the sweep (task 7701)."""
 
     @pytest.mark.asyncio
-    async def test_escaping_sweep_error_is_logged_and_startup_continues(
-        self,
-        startup_harness: Harness,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
+    async def test_removed_lane_is_repinned_and_the_other_lane_is_still_detached(
+        self, tmp_path: Path,
     ):
-        h = startup_harness
-        reconcile = AsyncMock(
-            side_effect=WorktreeConflictError(tmp_path / '_lane-5', ['README.md']),
+        config, git_ops, _first = await _pool_with_lane(tmp_path, lane_name='_lane-1')
+        repo = git_ops.project_root
+        second = git_ops.worktree_base / '_lane-2'
+        await _git(repo, 'worktree', 'add', str(second), '-b', 'task/3966', 'main')
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None and len(checkouts) == 2
+        faulty_id, faulty_lane = next(iter(checkouts.items()))
+        [(other_id, other_lane)] = [(k, v) for k, v in checkouts.items() if k != faulty_id]
+        shutil.rmtree(faulty_lane)
+        still_listed = await git_ops.lane_branch_checkouts()
+        assert still_listed is not None and faulty_id in still_listed
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({faulty_id: 'done', other_id: 'done'}, None),
         )
-        h._reconcile_lane_checkouts = reconcile
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), \
-             pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
-            await h.run(prd_path=None)
+        failures = await harness._reconcile_lane_checkouts()
 
-        reconcile.assert_awaited_once()
-        cast(AsyncMock, h._reconcile_stranded_in_progress).assert_awaited()
-        assert any(
-            'lane checkouts' in record.getMessage() and 'README.md' in record.getMessage()
-            for record in caplog.records
-            if record.name == 'orchestrator.harness' and record.levelno == logging.WARNING
-        ), caplog.text
+        rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=other_lane)
+        assert rc != 0, 'the healthy lane must still be detached'
+        assert pool.assignment_for(faulty_id) == faulty_lane
+        assert isinstance(failures, EntryFailures)
+        assert len(failures.failures) == 1
+        assert faulty_id in failures.failures[0].entry
+
+    @pytest.mark.asyncio
+    async def test_failed_duplicate_detach_keeps_the_trusted_pin(self, tmp_path: Path):
+        config, git_ops, lane = await _pool_with_lane(tmp_path)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        trusted_pin = git_ops.worktree_base / '_lane-2'
+        pool.restore_assignment(_BARE_ID, trusted_pin)
+        git_ops.detach_lane_checkout = AsyncMock(side_effect=OSError('boom'))
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({_BARE_ID: 'in-progress'}, None),
+        )
+
+        failures = await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for(_BARE_ID) == trusted_pin
+        assert isinstance(failures, EntryFailures)
+        [failure] = failures.failures
+        assert _BARE_ID in failure.entry and lane.name in failure.entry

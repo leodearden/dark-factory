@@ -839,9 +839,9 @@ class TestB5OperatorHalt:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 

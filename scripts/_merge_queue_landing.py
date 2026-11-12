@@ -13,8 +13,7 @@ docs session lands its new or edited documents the same way:
 
 lands every path as ONE commit through ONE merge request on the queue of the
 orchestrator whose escalation MCP listens on 127.0.0.1:*port*. `land_file` is
-its single-path form, and `land_or_exit` that form exiting through
-`_config_reload_gate.die` on a refusal.
+its single-path form.
 
 Paths are relative to the checkout *repo*; an absolute path inside it is
 accepted. The content is the caller's, authored outside the target checkout,
@@ -74,7 +73,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+from _config_reload_gate import load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
@@ -206,15 +205,6 @@ def land_file(
         repo, {path: content}, base_sha, port=port, label=label, message=message,
         timeout_secs=timeout_secs, main_branch=main_branch, clock=clock,
     )
-
-
-def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
-                 **kwargs: Any) -> Landing:
-    """`land_file`, exiting through `die` with the refusal's detail."""
-    try:
-        return land_file(repo, path, base_sha, content, **kwargs)
-    except LandingNotConfirmed as exc:
-        die(prog, exc.detail)
 
 
 def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,

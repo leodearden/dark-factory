@@ -87,11 +87,13 @@ class EventType(StrEnum):
     # One info-severity L0 was dispositioned by the router or the reviewer leg
     # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
     # the fact's home; this row is telemetry naming it, keyed on the subject's
-    # REAL task_id.
+    # REAL task_id (a reviewer-leg row on the reviewing task's, which is the
+    # subject's own whenever the disposition is applied).
     # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
     #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
     #   member when the record closed); by: the dispositioning actor;
-    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   exit_kind: an escalation.disposition.ExitKind value, or null for a
+    #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
 
@@ -670,6 +672,14 @@ class EventType(StrEnum):
     # agent?".
     session_resume_failed = 'session_resume_failed'
 
+    # Boot reap of a zombie agent_session.json (plans/session-resume-eligibility-seam-prd.md
+    # γ/D7), producer harness.py::Harness._reap_zombie_sidecars. One row per
+    # cleared sidecar; data: {sidecar_path, task_id, owner_pid, age_secs, status}.
+    sidecar_reaped = 'sidecar_reaped'
+    # One row per boot scan, zero-reap boots included; data:
+    # agent_session_reaper.py::ReapTally.event_data.
+    sidecar_reap_summary = 'sidecar_reap_summary'
+
     # Scheduler fairness
     task_skipped = 'task_skipped'
     # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
@@ -1080,6 +1090,13 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.
     strand_converted = 'strand_converted'
 
+    # A validate_landing_evidence reject at one of the two call sites that
+    # file no escalation (the already-landed gate's ancestry arm, the reconcile
+    # sweep's MARK_DONE arm).  data = the verdict probe verbatim plus
+    # site/task_status; transition-gated per (site, task_id).  Canonical WHY:
+    # orchestrator/src/orchestrator/landing_reject_emission.py (module docstring).
+    landing_evidence_rejected = 'landing_evidence_rejected'
+
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
     # §5/E11; task theta 3542).  The canonical WHY lives in
@@ -1155,6 +1172,13 @@ class EventType(StrEnum):
     shadow_cell_skipped = 'shadow_cell_skipped'
     shadow_cell_settled = 'shadow_cell_settled'
     shadow_cell_ended = 'shadow_cell_ended'
+
+    # startup_step_failed — one row per startup step whose outcome is not ok
+    #   (plans/startup-hardening-prd.md §3.1). Producer:
+    #   orchestrator/src/orchestrator/startup_steps.py::run_startup_step. Payload:
+    #   {step, status ('failed'|'partial'), exception_type, message,
+    #    failed_entries: [{entry, exception_type, message}]}
+    startup_step_failed = 'startup_step_failed'
 
 
 def cli_resume_failed_data(

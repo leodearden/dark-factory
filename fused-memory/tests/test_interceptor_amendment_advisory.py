@@ -19,7 +19,8 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from _curator_helpers import answer_each_with, curator_returning
-from _fm_helpers import _init_git_repo, submit_and_resolve
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import submit_and_resolve
 from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend

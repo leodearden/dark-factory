@@ -6728,7 +6728,7 @@ class TestIsValidMarkerTaskId:
         assert _is_valid_marker_task_id('-1') is False, "'-1' must be rejected"
 
     def test_rejects_float_string(self):
-        """'1.5' — dot is not a digit (mirrors _looks_like_task_id dot-rejecting convention)."""
+        """'1.5' — dot is not a digit (mirrors shared/src/shared/task_submit.py::looks_like_task_id dot-rejecting convention)."""
         from fused_memory.reconciliation.flag_dedup import _is_valid_marker_task_id
 
         assert _is_valid_marker_task_id('1.5') is False, "'1.5' must be rejected"

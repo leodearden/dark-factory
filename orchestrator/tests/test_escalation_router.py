@@ -21,6 +21,7 @@ from escalation.disposition import (
     ObservationConsumed,
     PromoteReason,
     PromoteWithHint,
+    ReviewerDisposition,
     StatusInfo,
 )
 from escalation.models import Escalation
@@ -31,6 +32,7 @@ from orchestrator.escalation_router import (
     AGGREGATE_ROLE,
     FALLBACK_ACTION,
     OVERFLOW_SENTINEL,
+    REVIEWER_LEG_ID,
     ROUTER_ID,
     Applied,
     Converted,
@@ -38,19 +40,26 @@ from orchestrator.escalation_router import (
     InfoL0Sweep,
     Outcome,
     Refused,
+    ReviewerMark,
     RouteContext,
     RouterHold,
     RouterPorts,
     Undecided,
     apply,
+    apply_reviewer_disposition,
     classify_ticket,
     exit_kind_for,
     hold_note,
     read_hold,
+    read_reviewer_mark,
+    reviewer_mark_note,
+    reviewer_note_refusal,
+    reviewer_notes,
     router_owns,
     status_info_sentinel,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.review_payload import NoteDisposition
 from orchestrator.workflow_types import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -167,6 +176,40 @@ class TestRouterHold:
         with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
             assert read_hold(record) is None
         assert any(record.id in r.getMessage() for r in caplog.records)
+
+
+class TestReviewerMark:
+    MARK = ReviewerMark(ReviewerDisposition.WORK, 'needs its own task')
+
+    def test_reviewer_mark_note_round_trips_through_read_reviewer_mark(self):
+        record = _record(triaged_by=REVIEWER_LEG_ID, triage_note=reviewer_mark_note(self.MARK))
+        assert read_reviewer_mark(record) == self.MARK
+
+    def test_unstamped_record_has_no_mark(self):
+        assert read_reviewer_mark(_record()) is None
+
+    def test_record_triaged_by_someone_else_has_no_mark(self):
+        record = _record(triaged_by=ROUTER_ID, triage_note=reviewer_mark_note(self.MARK))
+        assert read_reviewer_mark(record) is None
+
+    @pytest.mark.parametrize('note', [
+        '',
+        'verified: still relevant',
+        'reviewer verdict: not json',
+        'reviewer verdict: ["work"]',
+        'reviewer verdict: {"rationale": "r"}',
+        'reviewer verdict: {"disposition": "work"}',
+        'reviewer verdict: {"disposition": "later", "rationale": "r"}',
+        'reviewer verdict: {"disposition": "work", "rationale": 7}',
+    ])
+    def test_reviewer_stamp_with_a_foreign_note_reads_as_no_mark_and_warns(self, note, caplog):
+        record = _record(triaged_by=REVIEWER_LEG_ID, triage_note=note)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
+            assert read_reviewer_mark(record) is None
+        assert any(
+            record.id in r.getMessage() and 'reviewer mark' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 class TestClassifyTicket:
@@ -300,6 +343,18 @@ def _break_resolve(
     monkeypatch.setattr(queue, 'resolve', resolve)
 
 
+def _steward_closes_first(queue: EscalationQueue, monkeypatch, *, loser: str) -> None:
+    """Let a steward close the record just before *loser*'s own ``resolve`` lands."""
+    real_resolve = queue.resolve
+
+    def steward_wins(escalation_id, *args, **kwargs):
+        if kwargs.get('resolved_by') == loser:
+            real_resolve(escalation_id, 'steward fixed it', resolved_by='claude-task-42-steward')
+        return real_resolve(escalation_id, *args, **kwargs)
+
+    monkeypatch.setattr(queue, 'resolve', steward_wins)
+
+
 def _convert(record: Escalation) -> ConvertViaCurator:
     return ConvertViaCurator(CuratorCandidate(
         title=record.summary, description=f'Escalation: {record.id}',
@@ -360,6 +415,21 @@ class TestApplyCloses:
         after = _current(queue, record.id)
         assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
         assert _dispositions(events) == []
+
+    @pytest.mark.asyncio
+    async def test_a_record_closed_between_its_read_and_its_close_reports_already_terminal(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _steward_closes_first(queue, monkeypatch, loser=ROUTER_ID)
+
+        applied = await apply(Addressed(), record, ports, CONTEXT)
+
+        assert applied.outcome is Outcome.ALREADY_TERMINAL
+        after = _current(queue, record.id)
+        assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
+        (row,) = _dispositions(events)
+        assert row['data']['class'] == 'already-terminal'
 
 
 class TestApplyConverts:
@@ -478,14 +548,7 @@ class TestApplyPromotes:
         self, queue, events, ports, monkeypatch,
     ):
         record = _seed(queue)
-        real_resolve = queue.resolve
-
-        def steward_wins(escalation_id, *args, **kwargs):
-            if kwargs.get('resolved_by') == ROUTER_ID:
-                real_resolve(escalation_id, 'steward fixed it', resolved_by='claude-task-42-steward')
-            return real_resolve(escalation_id, *args, **kwargs)
-
-        monkeypatch.setattr(queue, 'resolve', steward_wins)
+        _steward_closes_first(queue, monkeypatch, loser=ROUTER_ID)
         applied = await apply(PromoteWithHint(PromoteReason.CONVERSION_CAP), record, ports, CONTEXT)
 
         assert applied.outcome is Outcome.ALREADY_TERMINAL
@@ -601,6 +664,14 @@ def _hold(queue: EscalationQueue, record: Escalation, ticket: str, filed_at: dat
     return _current(queue, record.id)
 
 
+def _mark(queue: EscalationQueue, record: Escalation, rationale: str) -> Escalation:
+    queue.stamp_triage(
+        record.id, triaged_by=REVIEWER_LEG_ID,
+        triage_note=reviewer_mark_note(ReviewerMark(ReviewerDisposition.WORK, rationale)),
+    )
+    return _current(queue, record.id)
+
+
 class TestSweepRoute:
     @pytest.mark.asyncio
     async def test_a_work_note_is_decided_by_route_info_l0_and_converted(self, queue, ports, curator):
@@ -653,6 +724,20 @@ class TestSweepRoute:
         reasons = [row['data']['reason'] for row in _dispositions(events)]
         assert reasons == ['ticket_failed'] * 3
         assert all(_current(queue, r.id).status == 'dismissed' for r in records)
+
+    @pytest.mark.asyncio
+    async def test_a_reviewer_work_mark_converts_an_authors_no_action_note_with_its_rationale(
+        self, queue, ports, curator,
+    ):
+        record = _mark(queue, _seed(queue, suggested_action='no action needed'), 'split helper X out')
+        sweep = _sweep(ports)
+
+        await sweep.route(record, exit_kind=ExitKind.DONE, task_status='done')
+
+        (arguments,) = curator.calls_named('submit_task')
+        assert arguments['metadata']['escalation_id'] == record.id
+        assert f'Reviewer rationale ({REVIEWER_LEG_ID}): split helper X out' in arguments['description']
+        assert read_hold(_current(queue, record.id)) is not None
 
 
 class TestSweepStatusInfoAggregates:
@@ -874,3 +959,266 @@ class TestSweepFinishHold:
         assert await sweep.finish_hold(first, first_hold, now=now, timeout_secs=self.TIMEOUT_SECS) is None
         assert await sweep.finish_hold(second, second_hold, now=now, timeout_secs=self.TIMEOUT_SECS) is None
         assert len(curator.calls_named('resolve_ticket')) == 1
+
+
+# ---------------------------------------------------------------------------
+# The reviewer leg (D2): the reviewer dispositions its own task's notes mid-run
+# ---------------------------------------------------------------------------
+
+EVAL_WORKTREE = '/home/leo/src/dark-factory/.eval-worktrees/2339/df_task_2339'
+ORPHAN_FIELDS = {
+    'agent_role': 'orchestrator', 'category': 'infra_issue',
+    'suggested_action': 'verify_wip_reconciliation',
+}
+CORRUPTION_FIELDS = {
+    'agent_role': 'orchestrator', 'category': 'infra_issue',
+    'suggested_action': 'investigate_log_corruption',
+}
+SUGGESTIONS_FIELDS = {'agent_role': 'orchestrator', 'category': 'review_suggestions'}
+
+
+def _seed_in_eval_worktree(queue: EscalationQueue) -> Escalation:
+    record = _record(esc_id=queue.make_id('42'))
+    record.worktree = EVAL_WORKTREE
+    queue.submit(record)
+    return record
+
+
+def _review_note(
+    esc_id: str, disposition: ReviewerDisposition, rationale: str = 'fixed in foo.py',
+) -> NoteDisposition:
+    return NoteDisposition(esc_id, disposition, rationale)
+
+
+def _apply_review(ports: RouterPorts, note: NoteDisposition) -> Applied:
+    return apply_reviewer_disposition(note, ports, task_id='42', enabled=True)
+
+
+class TestReviewerNotes:
+    def test_lists_exactly_the_task_s_open_agent_filed_info_l0s(self, queue):
+        implementer = _seed(queue)
+        deep_reviewer = _seed(queue, agent_role='deep_reviewer')
+        _seed(queue, severity='blocking')
+        _seed(queue, level=1)
+        _seed(queue, task_id='99')
+        _seed(queue, agent_role=STARVATION)
+        _seed(queue, **ORPHAN_FIELDS)
+        _seed(queue, **CORRUPTION_FIELDS)
+        _seed(queue, **SUGGESTIONS_FIELDS)
+        _seed(queue, agent_role='orchestrator-workflow')
+        _seed(queue, agent_role='harness-orphan-reaper')
+        _hold(queue, _seed(queue), 'tkt_9', datetime.now(UTC))
+        _seed_in_eval_worktree(queue)
+        resolved = _seed(queue)
+        queue.resolve(resolved.id, 'steward fixed it', resolved_by='claude-task-42-steward')
+
+        notes = reviewer_notes(queue, task_id='42', enabled=True)
+
+        assert sorted(note.id for note in notes) == sorted([implementer.id, deep_reviewer.id])
+
+    def test_a_disabled_router_lists_nothing(self, queue):
+        _seed(queue)
+
+        assert reviewer_notes(queue, task_id='42', enabled=False) == []
+
+
+class TestReviewerNoteRefusal:
+    def test_an_eligible_note_is_not_refused(self):
+        assert reviewer_note_refusal(_record(), task_id='42', enabled=True) is None
+
+    def test_a_missing_record_is_refused(self):
+        assert reviewer_note_refusal(None, task_id='42', enabled=True) == 'no such escalation'
+
+    @pytest.mark.parametrize(('fields', 'named'), [
+        ({'task_id': '99'}, '99'),
+        ({'severity': 'blocking'}, 'blocking'),
+        ({'level': 1}, 'level 1'),
+        ({'agent_role': STARVATION}, STARVATION),
+        (ORPHAN_FIELDS, 'done-step-commit-orphan'),
+        (
+            {'triaged_by': ROUTER_ID, 'triage_note': hold_note('tkt_9', datetime.now(UTC))},
+            'tkt_9',
+        ),
+        (CORRUPTION_FIELDS, "'orchestrator'"),
+        (SUGGESTIONS_FIELDS, "'orchestrator'"),
+        ({'agent_role': 'orchestrator-workflow'}, 'orchestrator-workflow'),
+        ({'agent_role': 'harness-orphan-reaper'}, 'harness-orphan-reaper'),
+    ], ids=[
+        'foreign-task', 'blocking', 'level-1', 'mechanical-role', 'orphan', 'router-held',
+        'harness-corruption', 'harness-suggestions', 'harness-prefixed', 'harness-reaper',
+    ])
+    def test_an_ineligible_note_is_refused_naming_the_offending_value(self, fields, named):
+        reason = reviewer_note_refusal(_record(**fields), task_id='42', enabled=True)
+
+        assert reason is not None
+        assert named in reason
+
+    def test_a_closed_note_is_refused_naming_its_status(self):
+        record = _record()
+        record.status = 'dismissed'
+
+        reason = reviewer_note_refusal(record, task_id='42', enabled=True)
+
+        assert reason is not None
+        assert 'dismissed' in reason
+
+    def test_an_eval_lane_note_is_refused(self):
+        record = _record()
+        record.worktree = EVAL_WORKTREE
+
+        assert reviewer_note_refusal(record, task_id='42', enabled=True) is not None
+
+    def test_a_disabled_router_refuses_every_note(self):
+        reason = reviewer_note_refusal(_record(), task_id='42', enabled=False)
+
+        assert reason is not None
+        assert 'disabled' in reason
+
+
+class TestApplyReviewerDisposition:
+    def test_the_leg_is_attributed_to_the_comprehensive_reviewer(self):
+        assert REVIEWER_LEG_ID == 'reviewer-comprehensive/workflow'
+
+    @pytest.mark.parametrize(('disposition', 'resolution_class'), [
+        (ReviewerDisposition.ADDRESSED, 'addressed'),
+        (ReviewerDisposition.NO_ACTION, 'observation-consumed'),
+    ])
+    def test_a_closing_disposition_dismisses_with_the_alpha_class(
+        self, queue, events, ports, curator, disposition, resolution_class,
+    ):
+        record = _seed(queue)
+
+        applied = _apply_review(ports, _review_note(record.id, disposition))
+
+        assert (applied.outcome, applied.resolution_class) == (Outcome.CLOSED, resolution_class)
+        closed = _current(queue, record.id)
+        assert (closed.status, closed.resolved_by, closed.resolution_class) == (
+            'dismissed', REVIEWER_LEG_ID, resolution_class,
+        )
+        assert 'fixed in foo.py' in (closed.resolution or '')
+        (row,) = _dispositions(events)
+        assert row['task_id'] == '42'
+        assert {key: row['data'][key] for key in (
+            'escalation_id', 'class', 'by', 'exit_kind', 'task_id', 'ticket',
+        )} == {
+            'escalation_id': record.id, 'class': resolution_class, 'by': REVIEWER_LEG_ID,
+            'exit_kind': None, 'task_id': '42', 'ticket': None,
+        }
+        assert curator.calls == []
+
+    def test_work_leaves_the_note_pending_and_marked_for_the_exit_router(
+        self, queue, events, ports, curator,
+    ):
+        record = _seed(queue)
+
+        applied = _apply_review(
+            ports, _review_note(record.id, ReviewerDisposition.WORK, 'needs its own task'),
+        )
+
+        assert (applied.outcome, applied.reason) == (Outcome.DEFERRED, 'work')
+        after = _current(queue, record.id)
+        assert (after.status, after.resolution) == ('pending', None)
+        assert read_reviewer_mark(after) == ReviewerMark(ReviewerDisposition.WORK, 'needs its own task')
+        assert read_hold(after) is None
+        (row,) = _dispositions(events)
+        assert (row['data']['class'], row['data']['reason']) == ('defer', 'work')
+        assert (row['data']['by'], row['data']['exit_kind']) == (REVIEWER_LEG_ID, None)
+        assert curator.calls == []
+
+    @pytest.mark.parametrize('case', [
+        'unknown-id', 'foreign-task', 'blocking', 'info-l1', 'mechanical-role', 'dismissed',
+        'harness-filed',
+    ])
+    def test_an_ineligible_disposition_is_rejected_and_writes_nothing(
+        self, queue, events, ports, curator, caplog, case,
+    ):
+        esc_id = {
+            'unknown-id': lambda: 'esc-42-999',
+            'foreign-task': lambda: _seed(queue, task_id='99').id,
+            'blocking': lambda: _seed(queue, severity='blocking').id,
+            'info-l1': lambda: _seed(queue, level=1).id,
+            'mechanical-role': lambda: _seed(queue, agent_role=STARVATION).id,
+            'dismissed': lambda: _dismissed(queue).id,
+            'harness-filed': lambda: _seed(queue, **CORRUPTION_FIELDS).id,
+        }[case]()
+        disposition = (
+            ReviewerDisposition.NO_ACTION if case == 'harness-filed' else ReviewerDisposition.ADDRESSED
+        )
+        before = queue.get(esc_id)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
+            applied = _apply_review(ports, _review_note(esc_id, disposition))
+
+        assert applied.outcome is Outcome.REJECTED
+        assert queue.get(esc_id) == before
+        (row,) = _dispositions(events)
+        assert row['data']['class'] == 'rejected_disposition'
+        assert row['data']['reason'] == applied.reason
+        assert row['data']['task_id'] == '42'
+        assert row['task_id'] == '42'
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(esc_id in message and str(applied.reason) in message for message in warnings)
+        assert curator.calls == []
+
+    def test_a_later_round_still_lists_a_work_marked_note_and_may_close_it(
+        self, queue, events, ports, curator,
+    ):
+        record = _seed(queue)
+        _apply_review(ports, _review_note(record.id, ReviewerDisposition.WORK, 'needs a task'))
+
+        assert [note.id for note in reviewer_notes(queue, task_id='42', enabled=True)] == [record.id]
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.CLOSED
+        closed = _current(queue, record.id)
+        assert (closed.status, closed.resolved_by, closed.resolution_class) == (
+            'dismissed', REVIEWER_LEG_ID, 'addressed',
+        )
+        assert [row['data']['class'] for row in _dispositions(events)] == ['defer', 'addressed']
+        assert curator.calls == []
+
+    def test_a_failed_close_leaves_the_note_pending_and_never_raises(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _break_resolve(queue, record.id, monkeypatch)
+
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.ROUTER_ERROR
+        assert _current(queue, record.id).status == 'pending'
+        assert _router_l1s(queue, '42') == []
+        (row,) = _dispositions(events)
+        assert row['data']['class'] == 'router-error'
+
+    def test_a_note_closed_between_its_check_and_its_close_reports_already_terminal(
+        self, queue, events, ports, monkeypatch,
+    ):
+        record = _seed(queue)
+        _steward_closes_first(queue, monkeypatch, loser=REVIEWER_LEG_ID)
+
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.ALREADY_TERMINAL
+        after = _current(queue, record.id)
+        assert (after.status, after.resolved_by) == ('resolved', 'claude-task-42-steward')
+        (row,) = _dispositions(events)
+        assert (row['data']['class'], row['data']['by']) == ('already-terminal', REVIEWER_LEG_ID)
+
+    def test_without_an_event_store_the_disposition_still_applies(self, queue, curator):
+        record = _seed(queue)
+        ports = RouterPorts(
+            queue=queue, event_store=None, dispatch_tool=curator,
+            project_root='/srv/project', filing_claimant_run_id=FILER_RUN_ID,
+        )
+
+        applied = _apply_review(ports, _review_note(record.id, ReviewerDisposition.ADDRESSED))
+
+        assert applied.outcome is Outcome.CLOSED
+        assert _current(queue, record.id).status == 'dismissed'
+
+
+def _dismissed(queue: EscalationQueue) -> Escalation:
+    record = _seed(queue)
+    queue.resolve(record.id, 'steward closed it', dismiss=True, resolved_by='claude-task-42-steward')
+    return _current(queue, record.id)

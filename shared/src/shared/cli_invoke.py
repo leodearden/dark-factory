@@ -23,6 +23,7 @@ from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import agent_subprocess_env
+from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -244,8 +245,8 @@ CAP_HIT_RESUME_PROMPT = (
     'Continue where you left off and complete your task.'
 )
 # Prompt sent to a session that the orchestrator is resuming after a crash.
-# Kept separate from CAP_HIT_RESUME_PROMPT because the cause differs
-# (orchestrator restart, not a usage-cap interrupt) and the agent message
+# Kept separate from its siblings because the cause differs (orchestrator
+# restart, not a usage-cap interrupt or a watchdog kill) and the agent message
 # should stay a short crash-recovery continuation prompt rather than mentioning usage limits.
 CRASH_RECOVERY_RESUME_PROMPT = (
     'You were interrupted by an orchestrator restart. '
@@ -253,6 +254,20 @@ CRASH_RECOVERY_RESUME_PROMPT = (
     'git/worktree state, then continue where you left off. '
     'Any escalation you filed before the restart may have been auto-dismissed '
     'as stale — re-raise it if it is still relevant.'
+)
+# Prompt sent to a session the orchestrator resumes after its own watchdog
+# killed it mid-progress (the workflow's is_timed_out_with_progress path).
+# Kept separate from CRASH_RECOVERY_RESUME_PROMPT because no restart happened.
+PROGRESS_TIMEOUT_RESUME_PROMPT = (
+    'Your previous run was stopped at an orchestrator time limit while you '
+    'were still making progress: it reached the wall-clock cap for a single '
+    'invocation, or went too long without a new turn (a long-running '
+    'foreground command can cause this). '
+    'This was not an orchestrator restart, so no escalation you filed was '
+    'auto-dismissed; do not re-raise one. '
+    'Your branch may have been rebased onto main since you stopped, with any '
+    'uncommitted work first saved as a WIP commit, so check git status and '
+    'git log, then continue where you left off.'
 )
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
@@ -270,6 +285,7 @@ __all__ = [
     'BUDGET_EXHAUSTED_SUBTYPE',
     'CAP_HIT_RESUME_PROMPT',
     'CRASH_RECOVERY_RESUME_PROMPT',
+    'PROGRESS_TIMEOUT_RESUME_PROMPT',
     'AgentFailureClass',
     'AgentFailureKind',
     'AgentResult',
@@ -2532,6 +2548,7 @@ async def invoke_with_cap_retry(
     max_cap_retries: int | None = None,
     rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
+    resume_prompt: str | None = None,
     resume_on_cap_hit: bool = True,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -2634,6 +2651,13 @@ async def invoke_with_cap_retry(
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
 
+    *resume_prompt* is the continuation a caller-initiated resume's first
+    dispatch sends in place of ``prompt``; ``None`` (the default) means
+    ``CRASH_RECOVERY_RESUME_PROMPT``.  It is consulted only when
+    ``resume_session_id`` is preset, ``prompt`` is still kept as
+    ``original_prompt`` for fresh-fallback, and it is mutually exclusive with
+    *resume_delivers_prompt* (passing both raises ``ValueError``).
+
     *resume_on_cap_hit*, when ``True`` (the default), applies the two-part
     resume rule above.  ``False`` makes every cap-hit re-dispatch fresh, for
     a stateless caller whose retry would preserve nothing worth keeping.  It
@@ -2672,13 +2696,22 @@ async def invoke_with_cap_retry(
     # Caller-initiated resume contract: when the caller pre-sets resume_session_id
     # (e.g. orchestrator crash recovery), they pass the real task prompt as `prompt`
     # so that `original_prompt` captures it for fresh-fallback restoration.  We
-    # immediately overwrite `invoke_kwargs['prompt']` with CRASH_RECOVERY_RESUME_PROMPT
-    # so the first subprocess invocation uses the short continuation string.  The
+    # immediately overwrite `invoke_kwargs['prompt']` with the continuation named by
+    # `resume_prompt` (CRASH_RECOVERY_RESUME_PROMPT when None) so the first
+    # subprocess invocation uses the short continuation string.  The
     # resume-rejection branch (below) then correctly restores `original_prompt`
     # (the real task prompt) for any subsequent fresh invocation.
     # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
-    # this swap: its resumed session must receive the real prompt, not the short
-    # crash-recovery continuation prompt.
+    # this swap: its resumed session must receive the real prompt, not a short
+    # continuation prompt.
+    if resume_delivers_prompt and resume_prompt is not None:
+        raise ValueError(
+            f'{label}: resume_delivers_prompt and resume_prompt are mutually '
+            "exclusive: resume_delivers_prompt sends the caller's prompt, "
+            'resume_prompt names a continuation in its place'
+        )
+    if resume_prompt is not None:
+        require_non_blank_prompt(resume_prompt, context=f'{label} resume_prompt')
     if invoke_kwargs.get('resume_session_id'):
         # ONE exception type for "blank prompt" (task 3143 amendment): this
         # branch used to raise its own hand-rolled TypeError, so the SAME
@@ -2700,7 +2733,9 @@ async def invoke_with_cap_retry(
             ),
         )
         if not resume_delivers_prompt:
-            invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
+            invoke_kwargs['prompt'] = (
+                CRASH_RECOVERY_RESUME_PROMPT if resume_prompt is None else resume_prompt
+            )
     else:
         # Non-resume invocation: the prompt IS the whole request, so a blank one
         # is always a caller bug.  Raised here — before any invoke_slot is
@@ -3627,6 +3662,8 @@ def build_claude_argv(
     plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
     owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
+    Files a killed caller never unlinked are reclaimed by
+    ``shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
     already created during this call are unlinked before the exception
@@ -3696,7 +3733,7 @@ def build_claude_argv(
         # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
         # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
         # recon-verify is tool-list templated.
-        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        fd, sysprompt_path = SYSPROMPT_TEMP_NAME.mkstemp()
         temp_files.append(sysprompt_path)
         with open(fd, 'w') as f:
             f.write(system_prompt)
@@ -3735,7 +3772,7 @@ def build_claude_argv(
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
-            fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
+            fd, mcp_config_path = MCP_CONFIG_TEMP_NAME.mkstemp()
             temp_files.append(mcp_config_path)
             with open(fd, 'w') as f:
                 json.dump(mcp_config, f)

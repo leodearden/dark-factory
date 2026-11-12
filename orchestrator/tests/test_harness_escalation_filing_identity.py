@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _escalation_server_capture import create_server_kwargs
 from escalation.models import Escalation
 from escalation.pins import _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
@@ -203,8 +204,12 @@ class TestHarnessFilingsCarryTheIdentity:
         assert report.vetoes_done_flip is True  # ...but the done-flip veto holds
 
 
-def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
-    """Every ``Escalation(...)`` construction in *module_path*.
+_FILING_CALLABLES = frozenset({'Escalation', 'file_or_refresh'})
+
+
+def _filing_call_sites(module_path: Path) -> list[ast.Call]:
+    """Every filing site in *module_path*: an ``Escalation(...)`` construction,
+    or a ``file_or_refresh(...)`` call, which builds the Escalation for its caller.
 
     MUST be ``ast``, never a regex: ``harness.py`` carries docstring and
     comment prose mentioning ``Escalation(...)``, which a regex would report
@@ -215,7 +220,7 @@ def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == 'Escalation'
+        and node.func.id in _FILING_CALLABLES
     ]
 
 
@@ -228,21 +233,25 @@ class TestEveryHarnessFilingSiteIsStamped:
     to 0 would silently lose the stamp — which is how this defect arose.
     """
 
-    def test_all_escalation_constructions_pass_filing_claimant_run_id(self) -> None:
-        calls = _escalation_call_sites(_HARNESS_SRC_PATH)
+    def test_every_filing_site_passes_filing_claimant_run_id(self) -> None:
+        calls = _filing_call_sites(_HARNESS_SRC_PATH)
         # Baseline at the time of writing; a drop means sites moved out of
         # this module and the tripwire's coverage silently shrank.  Raised
         # 27 -> 28 when this branch rebased onto main: task 3172 step-14 added
         # _file_stale_l0_strand_escalation, a 28th filing site, which this
-        # rebase stamps like the other 27.
-        assert len(calls) >= 28, f'expected >=28 Escalation(...) sites, found {len(calls)}'
+        # rebase stamps like the other 27.  A filing routed through
+        # escalation.file_or_refresh is counted at its call (task 8926).
+        assert len(calls) >= 28, (
+            f'expected >=28 Escalation(...) or file_or_refresh(...) sites, '
+            f'found {len(calls)}'
+        )
 
         unstamped = [
             node.lineno for node in calls
             if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
         ]
         assert not unstamped, (
-            f'{_HARNESS_SRC_PATH.name}: Escalation(...) without '
+            f'{_HARNESS_SRC_PATH.name}: Escalation(...) or file_or_refresh(...) without '
             f'filing_claimant_run_id at lines {unstamped} — every filing site '
             f'must stamp the filing incarnation (task 3550); use '
             f'self._filing_claimant_run_id.'
@@ -319,35 +328,7 @@ class TestEscalationServerWiring:
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 0
 
-        # The server task must look alive, or _start_escalation_server's
-        # did-it-crash check re-raises from a MagicMock 'exception'.
-        serve_task = MagicMock()
-        serve_task.done.return_value = False
-
-        # Patching asyncio.create_task means the _serve() coroutine is built
-        # but never scheduled or awaited.  Capture and close it: a coroutine
-        # GC'd un-awaited raises an *unraisable* exception at collection time,
-        # which pytest attributes to whichever test happens to be running in
-        # this xdist worker when the GC fires — a spurious failure in an
-        # unrelated file (observed against
-        # test_harness_already_landed_gate_wiring.py).  close() on a
-        # never-started coroutine is the sanctioned way to retire it.
-        created_coros: list = []
-
-        def _capture_task(coro, **kwargs):
-            created_coros.append(coro)
-            return serve_task
-
-        with patch('orchestrator.harness.create_server') as mock_create, \
-             patch('asyncio.create_task', side_effect=_capture_task), \
-             patch('asyncio.sleep', new=AsyncMock()):
-            await h._start_escalation_server()
-
-        for coro in created_coros:
-            coro.close()
-
-        assert mock_create.called, '_start_escalation_server did not reach create_server'
-        kwargs = mock_create.call_args.kwargs
+        kwargs = await create_server_kwargs(h)
         assert 'task_claimant_lookup' in kwargs, (
             f'task_claimant_lookup not passed to create_server; got {sorted(kwargs)}'
         )

@@ -60,9 +60,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import (
+    is_orchestrator_completion_record,
+    normalize_supersedes,
+)
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
+from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
 from fused_memory.server.grouped_read import (
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
@@ -249,12 +253,12 @@ def attach_write_durable(result: Any) -> bool:
     :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
     deferred for server-side retry: the queued intent already carries the
     triage-stamped parent link, so the retry creates exactly the child the ack
-    names.
+    names. A real response is read through ``AddMemoryResponse.mem0_write_state``;
+    anything else keeps :func:`attach_write_landed`'s lenient reading.
     """
-    pending = getattr(result, 'stores_pending_retry', None)
-    return attach_write_landed(result) or (
-        isinstance(pending, list | tuple) and SourceStore.mem0 in pending
-    )
+    if isinstance(result, AddMemoryResponse):
+        return result.mem0_write_state is not Mem0WriteState.NOT_LANDED
+    return attach_write_landed(result)
 
 
 # --- config defaults --------------------------------------------------------
@@ -542,6 +546,25 @@ def declares_supersession(metadata: Any) -> bool:
     if not isinstance(metadata, dict):
         return False
     return bool(normalize_supersedes(metadata.get('supersedes')))
+
+
+def is_orchestrator_completion_write(metadata: Any) -> bool:
+    """True when *metadata* is an orchestrator task-completion record's.
+
+    The LEGACY fallback for the completion record's declared
+    ``kind='task_completion'``, which :func:`declares_attach_keys` already
+    force-stores. It covers orchestrators not yet redeployed and any other
+    writer that emits the completion source without the kind.
+
+    It matches the one source constant ``memory_metadata`` owns, by equality
+    and never by parsing, and deliberately not by ``task_id``: an agent
+    memory's ``task_id`` is provenance, not its subject (task 6956).
+
+    Retire it once no writer emits the completion source without the kind:
+    each write it decides logs one ``legacy completion record`` INFO line, so
+    the condition is that those lines stop.
+    """
+    return isinstance(metadata, dict) and is_orchestrator_completion_record(metadata)
 
 
 def canonical_id_of(result: MemoryResult) -> str:
@@ -912,6 +935,7 @@ async def triage_write(
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
     caller_declares_supersession: bool = False,
+    caller_is_completion_record: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
@@ -932,12 +956,13 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_owns_attach_keys* and
-    *caller_declares_supersession* are passed IN rather than recomputed:
-    ``add_memory`` already derives them from the metadata it holds, and a
-    second derivation here is a second place for them to disagree about who is
-    exempt. :func:`declares_attach_keys` and :func:`declares_supersession` are
-    the one spellings of the last two predicates.
+    *allow_near_duplicate*, *caller_owns_attach_keys*,
+    *caller_declares_supersession* and *caller_is_completion_record* are
+    passed IN rather than recomputed: ``add_memory`` already derives them from
+    the metadata it holds, and a second derivation here is a second place for
+    them to disagree about who is exempt. :func:`declares_attach_keys`,
+    :func:`declares_supersession` and :func:`is_orchestrator_completion_write`
+    are the one spellings of the last three predicates.
 
     There is deliberately no recon-stage arm. It was retired by task 3134
     (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
@@ -976,6 +1001,15 @@ async def triage_write(
         #
         # Returned before retrieval for the same reason as the flag above: no
         # candidate can change the answer, so no round-trip is spent asking.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if caller_is_completion_record:
+        # A legacy completion record with no kind; see is_orchestrator_completion_write.
+        logger.info(
+            'write_triage legacy completion record force-stored: project=%s; '
+            'its writer declared no kind',
+            project_id,
+        )
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     if caller_declares_supersession:

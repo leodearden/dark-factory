@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from _tasks_db_fixture import task_row, write_tasks_db
+from shared.milestone_rearm import rearmed_milestone
 from shared.task_statuses import TaskStatus
 from shared.task_tags import DEFAULT_TAG
 
@@ -104,8 +105,13 @@ def test_a_naive_fire_time_is_read_as_utc(at, expected):
 
 @pytest.mark.parametrize(
     'milestone',
-    [None, {'mode': 'delayed', 'after_secs': 60}, {'mode': 'dated', 'at': 'not-a-date'}],
-    ids=['absent', 'delayed', 'unparseable'],
+    [
+        None,
+        {'mode': 'delayed', 'after_secs': 60},
+        {'mode': 'dated', 'at': 'not-a-date'},
+        {'mode': 'dated', 'at': (NOW + HOUR).isoformat(), 'scheduled_fire_at': 'not-a-date'},
+    ],
+    ids=['absent', 'delayed', 'unparseable', 'unparseable-scheduled'],
 )
 def test_an_unreadable_fire_time_is_overdue(milestone):
     task = _with_milestone(link(1, 'pending'), milestone)
@@ -136,6 +142,22 @@ def test_every_status_resolves_to_exactly_one_state(status, at):
 )
 def test_extreme_fire_times_and_intervals_still_resolve(at, interval_secs, expected):
     assert chain_state(link(1, 'pending', at, interval_secs=interval_secs), now=NOW) is expected
+
+
+def _rearming_link(link_id: int, scheduled: datetime) -> dict[str, Any]:
+    """A pending link whose predicate re-arm moved its check to NOW + 1h, past *scheduled*."""
+    milestone = rearmed_milestone(
+        {'mode': 'dated', 'at': scheduled.isoformat()}, (NOW + HOUR).isoformat(),
+    )
+    return _with_milestone(link(link_id, 'pending', interval_secs=3600), milestone)
+
+
+@pytest.mark.parametrize(
+    ('scheduled', 'expected'),
+    [(NOW - 2 * HOUR, ChainState.OVERDUE), (NOW - timedelta(minutes=30), ChainState.SCHEDULED)],
+)
+def test_a_rearming_link_is_judged_by_its_scheduled_fire_time(scheduled, expected):
+    assert chain_state(_rearming_link(1, scheduled), now=NOW) is expected
 
 
 def raw(task: dict[str, Any]) -> dict[str, Any]:
@@ -265,6 +287,12 @@ def test_an_entry_without_a_fire_time_or_escalation_lookup_on_the_wire():
     assert wire['state'] == 'overdue'
     assert wire['at'] is None
     assert wire['pending_escalation_ids'] is None
+
+
+def test_a_rearming_links_entry_reports_its_scheduled_fire_time():
+    scheduled = NOW - 2 * HOUR
+    (entry,) = _classify(_rearming_link(4, scheduled))
+    assert (entry.state, entry.at) == (ChainState.OVERDUE, scheduled.isoformat())
 
 
 def _db_path(root: Path) -> Path:

@@ -7,7 +7,7 @@ misattached.  Between them sits a durable SQLite queue: the write boundary that
 knows the content and metadata is not the code that talks to Graphiti.  So the
 resolved set rides the identical channel `temporal_context` and
 `unverified_claim` already ride (task 3142) — one additional key on the
-existing `add_episode` / `add_memory_graphiti` payloads, popped by the executor.
+existing `add_episode` / `add_memory_graphiti` values, read by the executor.
 
 No `payload_version` and no migration: an old consumer ignores one unknown key,
 and a new consumer reading an old row finds it absent and treats it as "no
@@ -25,11 +25,20 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import MockNode, poll_until
+from _fm_helpers import MockNode
+from _fm_polling import poll_until
+from _queued_write_fixtures import enqueued, queued
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import (
+    DecodedReferents,
+    QueueCallback,
+    QueuedEpisodeWrite,
+    QueuedGraphitiMemoryWrite,
+    QueuedWrite,
+)
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import ReferentResolution
 
@@ -75,485 +84,18 @@ def _graphiti_payload(**overrides):
     return payload
 
 
-class TestReferentWireCodec:
-    """The happy-path round trip: resolution -> JSON-safe blob -> resolution."""
+def _graphiti_value(**overrides):
+    return queued('add_episode', _graphiti_payload(**overrides))
 
-    def test_encode_emits_plain_json_scalars(self):
-        from fused_memory.services.memory_service import _encode_referents
 
-        blob = _encode_referents(ReferentResolution(
-            source='derived',
-            referents=(
-                Referent(number='3127'),
-                Referent(number='2500', project_id='reify'),
-            ),
-            ambiguous=(Referent(number='6379', project_id='reify'),),
-        ))
+def _stamped(svc):
+    """The Graphiti-bound value the most recent producer call enqueued."""
+    return _graphiti_bound(enqueued(svc.durable_queue.enqueue)[-1][0])
 
-        assert blob == {
-            'source': 'derived',
-            'refs': [
-                {'kind': 'task', 'project_id': '', 'number': '3127'},
-                {'kind': 'task', 'project_id': 'reify', 'number': '2500'},
-            ],
-            'ambiguous': [
-                {'kind': 'task', 'project_id': 'reify', 'number': '6379'},
-            ],
-        }
 
-    def test_encoded_blob_survives_a_json_round_trip(self):
-        """The durable queue persists payloads as JSON TEXT in SQLite, so a
-        non-JSON-safe value here would only ever fail in production."""
-        from fused_memory.services.memory_service import _encode_referents
-
-        blob = _encode_referents(ReferentResolution(
-            source='metadata', referents=(Referent(number='3129'),),
-        ))
-
-        assert json.loads(json.dumps(blob)) == blob
-
-    def test_empty_resolution_encodes_to_an_explicit_empty_set(self):
-        from fused_memory.services.memory_service import _encode_referents
-
-        assert _encode_referents(ReferentResolution(source='none')) == {
-            'source': 'none', 'refs': [], 'ambiguous': [],
-        }
-
-    def test_ambiguity_is_threaded(self):
-        """`.ambiguous` RIDES the wire; `.conflicts` still does not.
-
-        This is task 3670's `test_ambiguity_is_deliberately_not_threaded`,
-        rewritten rather than repaired — it was written to go red exactly here,
-        routing this author through `_encode_referents`' docstring instead of
-        past it.
-
-        WHY IT CHANGED. Gamma excludes ambiguous referents from `.referents` on
-        purpose ("recorded, not guessed"), so a consumer reading only `refs`
-        sees an ambiguous endpoint as a plain non-member — indistinguishable
-        from a genuine conflation, which leaf eta would repair by destructively
-        repointing the edge. Zeta used to recover the set by RE-DERIVING it from
-        `payload['content']`/`payload['group_id']`; that is a second scan site,
-        the INV-5 lockstep duplication canonical_labels exists to prevent, and
-        it desynchronizes the moment the producer scans with a project registry
-        the consumer no longer has. Threading the producer's actual set makes
-        the two INCAPABLE of disagreeing.
-
-        `.conflicts` STAYS DROPPED, and that is not an oversight either: a
-        conflict is a property of what the CALLER DECLARED versus what the prose
-        says — it is reported to the caller at resolution time and has no
-        consumer downstream of the queue. Zeta asks "did this edge land on
-        something the write was about"; a conflict answers a different question.
-        """
-        from fused_memory.services.memory_service import _encode_referents
-
-        blob = _encode_referents(ReferentResolution(
-            source='derived',
-            referents=(Referent(number='3127'),),
-            ambiguous=(Referent(number='9'),),
-            conflicts=(Referent(number='42'),),
-        ))
-
-        assert set(blob) == {'source', 'refs', 'ambiguous'}
-        assert blob['refs'] == [{'kind': 'task', 'project_id': '', 'number': '3127'}]
-        assert blob['ambiguous'] == [
-            {'kind': 'task', 'project_id': '', 'number': '9'},
-        ]
-        assert 'conflicts' not in blob
-
-    def test_decode_rebuilds_the_exact_referent_tuple(self):
-        from fused_memory.services.memory_service import (
-            _decode_referents,
-            _encode_referents,
-        )
-
-        resolution = ReferentResolution(
-            source='derived',
-            referents=(
-                Referent(number='3127'),
-                Referent(number='2500', project_id='reify'),
-            ),
-            ambiguous=(
-                Referent(number='6379'),
-                Referent(number='4242', project_id='reify'),
-            ),
-        )
-        payload = {'referents': _encode_referents(resolution)}
-
-        assert _decode_referents(payload) == (
-            (Referent(number='3127'), Referent(number='2500', project_id='reify')),
-            'derived',
-            (Referent(number='6379'), Referent(number='4242', project_id='reify')),
-        )
-
-    def test_digits_survive_verbatim(self):
-        """'0132' is a DIFFERENT referent from '132' (Referent's own contract);
-        a wire codec that int-normalized would silently retarget the node."""
-        from fused_memory.services.memory_service import (
-            _decode_referents,
-            _encode_referents,
-        )
-
-        blob = _encode_referents(ReferentResolution(
-            source='declared', referents=(Referent(number='0132'),),
-        ))
-        assert blob['refs'][0]['number'] == '0132'
-
-        referents, source, ambiguous = _decode_referents({'referents': blob})
-        assert referents == (Referent(number='0132'),)
-        assert referents[0].number == '0132'
-        assert source == 'declared'
-        assert ambiguous == ()
-
-    def test_decode_pops_the_key(self):
-        """Matches how `_execute_graphiti_write` already treats
-        temporal_context / unverified_claim / reference_time."""
-        from fused_memory.services.memory_service import (
-            _decode_referents,
-            _encode_referents,
-        )
-
-        payload = {'referents': _encode_referents(
-            ReferentResolution(source='derived', referents=(Referent(number='7'),)),
-        )}
-
-        _decode_referents(payload)
-
-        assert 'referents' not in payload
-
-
-#: Every way the wire value can be unreadable.  Each must decode to exactly
-#: ``((), 'none')`` — never a partial set.
-_UNREADABLE_PAYLOADS = [
-    pytest.param({}, id='key-absent'),
-    pytest.param({'referents': None}, id='explicit-none'),
-    pytest.param({'referents': 'garbage'}, id='non-dict'),
-    pytest.param({'referents': ['derived']}, id='list-not-dict'),
-    pytest.param(
-        {'referents': {'refs': []}}, id='source-missing',
-    ),
-    pytest.param(
-        {'referents': {'source': 'declared_v2', 'refs': []}},
-        id='source-outside-vocabulary',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': 'not-a-list'}},
-        id='refs-not-a-list',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': ['3127']}},
-        id='entry-not-a-dict',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [{'kind': 'task'}]}},
-        id='entry-lacks-number',
-    ),
-    # `Referent.__post_init__` validates `kind` ONLY — `number`/`project_id`
-    # take any object at all, so the constructor alone does not harden them and
-    # each of these would otherwise mint a bogus referent rather than degrade.
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': 3127},
-        ]}},
-        id='int-number-compares-unequal-to-its-str-twin',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': None},
-        ]}},
-        id='none-number-would-name-the-node-Task-None',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': ['3127']},
-        ]}},
-        id='unhashable-number-would-raise-inside-a-consumer-set',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': '3127', 'project_id': None},
-        ]}},
-        id='none-project-id',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': '3127', 'project_id': 7},
-        ]}},
-        id='int-project-id',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': '3127'},
-            {'kind': 'task', 'number': 9},
-        ]}},
-        id='partially-mistyped-set',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [
-            {'kind': 'task', 'number': '3127'},
-            {'kind': 'unregistered_kind', 'number': '9'},
-        ]}},
-        id='partially-malformed-set',
-    ),
-    # The `'ambiguous'` key is decoded through the SAME validation as `refs`,
-    # so every shape above has a twin here. All-or-nothing spans BOTH lists:
-    # a good `refs` beside an unreadable `ambiguous` is the half-decoded blob
-    # `_decode_referents`' docstring argues is worse than no blob at all —
-    # zeta would then read a genuinely ambiguous endpoint as a conflation and
-    # eta would repoint the edge, which is precisely what threading the key
-    # exists to prevent.
-    pytest.param(
-        {'referents': {
-            'source': 'derived', 'refs': [], 'ambiguous': 'not-a-list',
-        }},
-        id='ambiguous-not-a-list',
-    ),
-    # JSON `null` is the one non-list shape that could pass for the LEGACY
-    # blob, because a plain `.get('ambiguous')` answers `None` for both. It
-    # must not: this row's `refs` came from a NARROWED producer, so answering
-    # it with the legacy permissive re-derivation would hand zeta an ambiguity
-    # set the producer never computed — quietly, with readable refs attached.
-    pytest.param(
-        {'referents': {
-            'source': 'derived',
-            'refs': [{'kind': 'task', 'number': '3127'}],
-            'ambiguous': None,
-        }},
-        id='ambiguous-explicit-null',
-    ),
-    pytest.param(
-        {'referents': {
-            'source': 'derived', 'refs': [], 'ambiguous': ['6379'],
-        }},
-        id='ambiguous-entry-not-a-dict',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
-            {'kind': 'task', 'number': 6379},
-        ]}},
-        id='ambiguous-int-number',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
-            {'kind': 'task', 'number': '6379', 'project_id': 7},
-        ]}},
-        id='ambiguous-int-project-id',
-    ),
-    pytest.param(
-        {'referents': {'source': 'derived', 'refs': [], 'ambiguous': [
-            {'kind': 'unregistered_kind', 'number': '6379'},
-        ]}},
-        id='ambiguous-unregistered-kind',
-    ),
-    pytest.param(
-        {'referents': {
-            'source': 'derived',
-            'refs': [{'kind': 'task', 'number': '3127'}],
-            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
-        }},
-        id='good-refs-beside-a-malformed-ambiguous',
-    ),
-]
-
-
-class TestReferentWireCodecDegradation:
-    """ONE degradation story: every unreadable blob decodes to exactly
-    ``((), 'none')``, never a partial set.
-
-    A partial set is WORSE than no set for the consumer this exists to serve.
-    Leaf zeta reads "endpoint not in the referent set" as a conflation and leaf
-    eta repairs it by repointing the edge — so a referent silently dropped by a
-    lenient decoder would manufacture a false conflation and drive destructive
-    edge surgery onto the wrong node, the precise failure this PRD exists to
-    prevent.  Hence the `partially-malformed-set` case: the one salvageable
-    referent must NOT survive.
-
-    Degrading rather than raising is equally deliberate: raising inside the
-    queue executor would route the item to `_handle_failure` and eventually
-    dead-letter it, LOSING the memory.  Degradation is safe here only because
-    the 'none' bucket makes it loud (INV-4).
-    """
-
-    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
-    def test_unreadable_blob_degrades_to_the_empty_set(self, payload):
-        from fused_memory.services.memory_service import _decode_referents
-
-        assert _decode_referents(dict(payload)) == ((), 'none', None)
-
-    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
-    def test_key_is_popped_in_every_case(self, payload):
-        from fused_memory.services.memory_service import _decode_referents
-
-        mutable = dict(payload)
-
-        _decode_referents(mutable)
-
-        assert 'referents' not in mutable
-
-    @pytest.mark.parametrize(
-        'payload',
-        [p for p in _UNREADABLE_PAYLOADS if p.id not in ('key-absent', 'explicit-none')],
-    )
-    def test_malformed_blob_warns(self, payload, caplog):
-        """Mirrors the invalid-`reference_time` WARNING-and-degrade arm already
-        in `_execute_graphiti_write`: degradation is loud, not silent."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        with caplog.at_level('WARNING'):
-            _decode_referents(dict(payload))
-
-        assert any(
-            rec.levelname == 'WARNING' and 'referents' in rec.getMessage()
-            for rec in caplog.records
-        ), f'no WARNING naming the payload key; got {[r.getMessage() for r in caplog.records]}'
-
-    def test_absent_key_does_not_warn(self, caplog):
-        """The old-format row is the LOAD-BEARING back-compat case, not an
-        anomaly — warning on it would drown the log during a drain of a queue
-        written before this feature."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        with caplog.at_level('WARNING'):
-            _decode_referents({})
-
-        assert not caplog.records
-
-    def test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None(self):
-        """A row written before `'ambiguous'` was threaded: `refs` decode
-        normally, and the third value is `None` — NOT `()`.
-
-        `None` is the load-bearing sentinel and the two are NOT
-        interchangeable. `None` means "the producer did not tell us", which is
-        the only state in which a consumer may re-derive the set; `()` means
-        "the producer told us: nothing was ambiguous", which it must believe.
-        Collapsing the distinction to a truthiness test would make an honest
-        empty answer trigger a spurious re-scan — reopening the producer /
-        consumer drift that threading the key closes, and doing it silently.
-        """
-        from fused_memory.services.memory_service import _decode_referents
-
-        referents, source, ambiguous = _decode_referents({'referents': {
-            'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
-        }})
-
-        assert referents == (Referent(number='3127'),)
-        assert source == 'derived'
-        assert ambiguous is None
-
-    def test_a_legacy_two_key_blob_does_not_warn(self, caplog):
-        """The same argument as the absent key one register down: a two-key
-        blob is every row enqueued before this change, not an anomaly. It is
-        READABLE — its refs are used — so warning would be both wrong and
-        loud."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        with caplog.at_level('WARNING'):
-            _decode_referents({'referents': {
-                'source': 'derived', 'refs': [{'kind': 'task', 'number': '3127'}],
-            }})
-
-        assert not caplog.records
-
-    def test_an_explicitly_empty_ambiguous_is_not_None(self):
-        """The other side of the sentinel: a post-change producer that found
-        nothing ambiguous sends `[]`, and that must decode to `()`."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        _, _, ambiguous = _decode_referents({'referents': {
-            'source': 'derived',
-            'refs': [{'kind': 'task', 'number': '3127'}],
-            'ambiguous': [],
-        }})
-
-        assert ambiguous == ()
-        assert ambiguous is not None
-
-    def test_an_explicitly_null_ambiguous_is_not_the_legacy_blob(self, caplog):
-        """The third state, named separately because it is the one that LOOKS
-        like the first.
-
-        `test_a_legacy_two_key_blob_decodes_its_refs_and_answers_None` above
-        shows the absent key keeping its refs and answering `None` in silence.
-        A key present as JSON `null` decodes to `None` through a plain
-        `.get(...)` too, so without the `_ABSENT` sentinel it would take that
-        same arm — a corrupt row wearing the back-compat path's clothes,
-        handing the consumer a permissive re-derivation over refs a NARROWED
-        producer wrote, with nothing in the log to say so. It is a malformed
-        field, so it warns and takes the refs down with it like every other.
-        """
-        from fused_memory.services.memory_service import _decode_referents
-
-        with caplog.at_level('WARNING'):
-            decoded = _decode_referents({'referents': {
-                'source': 'derived',
-                'refs': [{'kind': 'task', 'number': '3127'}],
-                'ambiguous': None,
-            }})
-
-        assert decoded == ((), 'none', None)
-        assert caplog.records
-
-    def test_a_malformed_ambiguous_takes_the_good_refs_down_with_it(self):
-        """Named separately from the parametrized sweep for the same reason
-        `test_the_one_salvageable_referent_does_not_escape` is: all-or-nothing
-        spans BOTH lists, and a readable `refs` beside an unreadable
-        `ambiguous` is the exact half-decode that would let zeta read an
-        ambiguous endpoint as a conflation."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        referents, source, ambiguous = _decode_referents({'referents': {
-            'source': 'derived',
-            'refs': [{'kind': 'task', 'number': '3127'}],
-            'ambiguous': [{'kind': 'unregistered_kind', 'number': '6379'}],
-        }})
-
-        assert referents == ()
-        assert source == 'none'
-        assert ambiguous is None
-
-    def test_the_one_salvageable_referent_does_not_escape(self):
-        """Named separately from the parametrized sweep because it is the whole
-        reason the decode is all-or-nothing."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        referents, source, ambiguous = _decode_referents({'referents': {
-            'source': 'derived',
-            'refs': [
-                {'kind': 'task', 'number': '3127'},
-                {'kind': 'unregistered_kind', 'number': '9'},
-            ],
-        }})
-
-        assert referents == ()
-        assert source == 'none'
-        assert ambiguous is None
-        assert Referent(number='3127') not in referents
-
-    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
-    def test_no_decoded_referent_is_ever_unhashable(self, payload):
-        """`Referent` validates `kind` only, so an unhashable wire `number`
-        would mint a Referent that raises TypeError the moment leaf zeta puts
-        it in a set — a raise INSIDE the queue executor, i.e. the
-        dead-letter-and-lose-the-memory outcome the decoder's
-        degrade-rather-than-raise design exists to prevent."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        referents, _, _ = _decode_referents(dict(payload))
-
-        assert set(referents) == set()
-
-    def test_a_mistyped_number_is_not_silently_coerced(self):
-        """An int `number` must NOT decode to `Referent(number='3127')` either:
-        coercing would hide a producer writing the wrong type, and the value it
-        would produce is indistinguishable from a correctly-encoded row."""
-        from fused_memory.services.memory_service import _decode_referents
-
-        referents, source, ambiguous = _decode_referents({'referents': {
-            'source': 'derived', 'refs': [{'kind': 'task', 'number': 3127}],
-        }})
-
-        assert referents == ()
-        assert source == 'none'
-        assert ambiguous is None
+def _graphiti_bound(value: QueuedWrite) -> QueuedEpisodeWrite | QueuedGraphitiMemoryWrite:
+    assert isinstance(value, QueuedEpisodeWrite | QueuedGraphitiMemoryWrite)
+    return value
 
 
 class TestAddMemoryStampsReferents:
@@ -571,8 +113,8 @@ class TestAddMemoryStampsReferents:
             project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
             'ambiguous': [],
@@ -590,8 +132,8 @@ class TestAddMemoryStampsReferents:
             metadata={'task_id': 3129},
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
             'ambiguous': [],
@@ -607,8 +149,8 @@ class TestAddMemoryStampsReferents:
             project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
+        value = _stamped(service)
+        assert value.referents.to_wire() == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_mem0_only_write_never_enqueues_at_all(self, service):
@@ -631,8 +173,8 @@ class TestAddMemoryStampsReferents:
             project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+        value = _stamped(service)
+        assert json.loads(json.dumps(value.referents.to_wire())) == value.referents.to_wire()
 
     @pytest.mark.asyncio
     async def test_preexisting_payload_keys_are_untouched(self, service):
@@ -643,13 +185,15 @@ class TestAddMemoryStampsReferents:
             project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['name'] == 'memory_decisions_and_rationale'
-        assert payload['content'] == 'the fix for Task 3127 landed'
-        assert payload['source'] == 'text'
-        assert payload['source_description'] == 'add_memory:decisions_and_rationale'
-        assert '_causation_id' in payload
-        assert '_write_op_id' in payload
+        value = _stamped(service)
+        wire = json.loads(value.to_json())
+        assert wire['name'] == 'memory_decisions_and_rationale'
+        assert wire['content'] == 'the fix for Task 3127 landed'
+        assert wire['source'] == 'text'
+        assert wire['source_description'] == 'add_memory:decisions_and_rationale'
+        assert '_causation_id' in wire
+        assert '_write_op_id' in wire
+        assert value.envelope.write_op_id is not None
 
 
 class TestAddMemoryStampsDeclaredReferents:
@@ -675,8 +219,8 @@ class TestAddMemoryStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
             'ambiguous': [],
@@ -696,8 +240,8 @@ class TestAddMemoryStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3127}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
             'ambiguous': [],
@@ -716,8 +260,8 @@ class TestAddMemoryStampsDeclaredReferents:
             declared_referents=[],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
+        value = _stamped(service)
+        assert value.referents.to_wire() == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -740,14 +284,14 @@ class TestAddMemoryStampsDeclaredReferents:
                 **extra,
                 **kwargs,
             )
-            payload = service.durable_queue.enqueue.call_args[1]['payload']
-            assert payload['referents'] == {
+            value = _stamped(service)
+            assert value.referents.to_wire() == {
                 'source': source,
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
                 'ambiguous': [],
-            }, f'{extra!r}: {payload["referents"]!r}'
+            }, f'{extra!r}: {value.referents.to_wire()!r}'
 
         service.durable_queue.enqueue.reset_mock()
         await service.add_memory(
@@ -756,8 +300,8 @@ class TestAddMemoryStampsDeclaredReferents:
             project_id='dark_factory',
             **kwargs,
         )
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
+        value = _stamped(service)
+        assert value.referents.to_wire() == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_declared_digits_are_verbatim(self, service):
@@ -770,8 +314,8 @@ class TestAddMemoryStampsDeclaredReferents:
             declared_referents=[{'id': '0132'}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents']['refs'][0]['number'] == '0132'
+        value = _stamped(service)
+        assert value.referents.to_wire()['refs'][0]['number'] == '0132'
 
     @pytest.mark.asyncio
     async def test_the_declared_blob_is_json_safe(self, service):
@@ -782,8 +326,8 @@ class TestAddMemoryStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+        value = _stamped(service)
+        assert json.loads(json.dumps(value.referents.to_wire())) == value.referents.to_wire()
 
 
 class TestADeclarationIsScopedToTheGraphitiLeg:
@@ -876,8 +420,8 @@ class TestADeclarationIsScopedToTheGraphitiLeg:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
             'ambiguous': [],
@@ -896,8 +440,8 @@ class TestAddEpisodeStampsReferents:
             content='Task 3127 was merged', project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'derived',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
             'ambiguous': [],
@@ -909,8 +453,8 @@ class TestAddEpisodeStampsReferents:
             content='the merge-lane hardening work', project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'none', 'refs': [], 'ambiguous': []}
+        value = _stamped(service)
+        assert value.referents.to_wire() == {'source': 'none', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     async def test_never_reaches_the_metadata_source(self, service):
@@ -932,9 +476,9 @@ class TestAddEpisodeStampsReferents:
             service.durable_queue.enqueue.reset_mock()
             await service.add_episode(content=content, project_id='dark_factory')
 
-            payload = service.durable_queue.enqueue.call_args[1]['payload']
-            assert payload['referents']['source'] == expected_source, (
-                f'{content!r} resolved to {payload["referents"]["source"]!r}, '
+            value = _stamped(service)
+            assert value.referents.to_wire()['source'] == expected_source, (
+                f'{content!r} resolved to {value.referents.to_wire()["source"]!r}, '
                 f'expected {expected_source!r}'
             )
 
@@ -952,7 +496,8 @@ class TestAddEpisodeStampsReferents:
             unverified_claim=True,
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        value = _stamped(service)
+        wire = json.loads(value.to_json())
         # 'uuid' is deliberately absent: task 3561 removed it from the enqueue
         # payload (a fresh uuid means "load this node" to graphiti_core).
         for key in (
@@ -960,17 +505,17 @@ class TestAddEpisodeStampsReferents:
             'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
             'temporal_context', 'unverified_claim', 'reference_time',
         ):
-            assert key in payload, f'{key} was dropped from the payload'
-        assert payload['content'] == 'Task 3127 was merged'
-        assert payload['source'] == 'text'
-        assert payload['source_description'] == 'notes'
-        assert payload['project_id'] == 'dark_factory'
-        assert payload['agent_id'] == 'a1'
-        assert payload['session_id'] == 's1'
-        assert payload['_causation_id'] == 'c1'
-        assert payload['temporal_context'] == 'planning'
-        assert payload['unverified_claim'] is True
-        assert payload['reference_time'] is None
+            assert key in wire, f'{key} was dropped from the payload'
+        assert wire['content'] == 'Task 3127 was merged'
+        assert wire['source'] == 'text'
+        assert wire['source_description'] == 'notes'
+        assert wire['project_id'] == 'dark_factory'
+        assert wire['agent_id'] == 'a1'
+        assert wire['session_id'] == 's1'
+        assert wire['_causation_id'] == 'c1'
+        assert wire['temporal_context'] == 'planning'
+        assert wire['unverified_claim'] is True
+        assert wire['reference_time'] is None
 
     @pytest.mark.asyncio
     async def test_the_stamped_blob_is_json_safe(self, service):
@@ -978,8 +523,8 @@ class TestAddEpisodeStampsReferents:
             content='Task 3127 was merged', project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+        value = _stamped(service)
+        assert json.loads(json.dumps(value.referents.to_wire())) == value.referents.to_wire()
 
 
 class TestAddEpisodeStampsDeclaredReferents:
@@ -1000,8 +545,8 @@ class TestAddEpisodeStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {
+        value = _stamped(service)
+        assert value.referents.to_wire() == {
             'source': 'declared',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
             'ambiguous': [],
@@ -1018,8 +563,8 @@ class TestAddEpisodeStampsDeclaredReferents:
             declared_referents=[],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents'] == {'source': 'declared', 'refs': [], 'ambiguous': []}
+        value = _stamped(service)
+        assert value.referents.to_wire() == {'source': 'declared', 'refs': [], 'ambiguous': []}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
@@ -1037,14 +582,14 @@ class TestAddEpisodeStampsDeclaredReferents:
             await service.add_episode(
                 content=content, project_id='dark_factory', **kwargs,
             )
-            payload = service.durable_queue.enqueue.call_args[1]['payload']
-            assert payload['referents'] == {
+            value = _stamped(service)
+            assert value.referents.to_wire() == {
                 'source': source,
                 'refs': [
                     {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
                 ],
                 'ambiguous': [],
-            }, f'{content!r}: {payload["referents"]!r}'
+            }, f'{content!r}: {value.referents.to_wire()!r}'
 
     @pytest.mark.asyncio
     async def test_the_metadata_rung_stays_structurally_unreachable(self, service):
@@ -1094,7 +639,8 @@ class TestAddEpisodeStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        value = _stamped(service)
+        wire = json.loads(value.to_json())
         # 'uuid' is deliberately absent: task 3561 removed it from the enqueue
         # payload (a fresh uuid means "load this node" to graphiti_core).
         for key in (
@@ -1102,11 +648,11 @@ class TestAddEpisodeStampsDeclaredReferents:
             'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
             'temporal_context', 'unverified_claim', 'reference_time',
         ):
-            assert key in payload, f'{key} was dropped from the payload'
-        assert payload['temporal_context'] == 'planning'
-        assert payload['unverified_claim'] is True
-        assert payload['reference_time'] is None
-        assert payload['referents']['source'] == 'declared'
+            assert key in wire, f'{key} was dropped from the payload'
+        assert wire['temporal_context'] == 'planning'
+        assert wire['unverified_claim'] is True
+        assert wire['reference_time'] is None
+        assert value.referents.to_wire()['source'] == 'declared'
 
     @pytest.mark.asyncio
     async def test_declared_digits_are_verbatim(self, service):
@@ -1116,8 +662,8 @@ class TestAddEpisodeStampsDeclaredReferents:
             declared_referents=[{'id': '0132'}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['referents']['refs'][0]['number'] == '0132'
+        value = _stamped(service)
+        assert value.referents.to_wire()['refs'][0]['number'] == '0132'
 
     @pytest.mark.asyncio
     async def test_the_declared_blob_is_json_safe(self, service):
@@ -1127,16 +673,14 @@ class TestAddEpisodeStampsDeclaredReferents:
             declared_referents=[{'kind': 'task', 'id': 3129}],
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+        value = _stamped(service)
+        assert json.loads(json.dumps(value.referents.to_wire())) == value.referents.to_wire()
 
 
 def _encoded(source, *referents, ambiguous=()):
-    from fused_memory.services.memory_service import _encode_referents
-
-    return _encode_referents(ReferentResolution(
+    return DecodedReferents.from_resolution(ReferentResolution(
         source=source, referents=tuple(referents), ambiguous=tuple(ambiguous),
-    ))
+    )).to_wire()
 
 
 #: The exact kwargs `_execute_graphiti_write` hands the backend today, for
@@ -1166,7 +710,8 @@ class TestExecuteGraphitiWriteConsumesReferents:
         reaches Graphiti with exactly today's kwargs."""
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         assert service.graphiti.add_episode.call_count == 1
         assert service.graphiti.add_episode.call_args[1] == {
@@ -1179,8 +724,7 @@ class TestExecuteGraphitiWriteConsumesReferents:
         """Epsilon stops at the executor. Handing the set to the backend is
         leaf zeta's business, not this leaf's."""
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
 
         assert 'referents' not in service.graphiti.add_episode.call_args[1]
@@ -1188,8 +732,7 @@ class TestExecuteGraphitiWriteConsumesReferents:
     @pytest.mark.asyncio
     async def test_new_format_row_executes_with_the_same_backend_kwargs(self, service):
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
 
         assert service.graphiti.add_episode.call_args[1] == {
@@ -1197,22 +740,10 @@ class TestExecuteGraphitiWriteConsumesReferents:
         }
 
     @pytest.mark.asyncio
-    async def test_the_key_is_popped_off_the_payload(self, service):
-        """The observable proof the executor CONSUMED the blob rather than
-        passing it through to the backend."""
-        payload = _graphiti_payload(
-            referents=_encoded('derived', Referent(number='3127')),
-        )
-
-        await service._execute_graphiti_write('add_episode', payload)
-
-        assert 'referents' not in payload
-
-    @pytest.mark.asyncio
     async def test_a_malformed_blob_still_completes_the_write(self, service):
         """Never dead-letters: a telemetry field must not cost a memory."""
         await service._execute_graphiti_write(
-            'add_episode', _graphiti_payload(referents='garbage'),
+            _graphiti_value(referents='garbage'),
         )
 
         assert service.graphiti.add_episode.call_count == 1
@@ -1243,7 +774,8 @@ class TestReferentSourceCounter:
     async def test_an_old_format_row_increments_only_none(self, service):
         """The explicit INV-4 requirement: the absent path is COUNTED, never a
         silent fallthrough."""
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         counts = service.referent_source_counts()
         assert counts['none'] == 1
@@ -1255,7 +787,7 @@ class TestReferentSourceCounter:
     async def test_a_malformed_blob_lands_in_none(self, service):
         """Degrading is only safe because the anomaly is loud somewhere."""
         await service._execute_graphiti_write(
-            'add_episode', _graphiti_payload(referents={'source': 'derived', 'refs': 3}),
+            _graphiti_value(referents={'source': 'derived', 'refs': 3}),
         )
 
         assert service.referent_source_counts()['none'] == 1
@@ -1266,8 +798,7 @@ class TestReferentSourceCounter:
         """Bucketing every source is what gives leaf iota a DENOMINATOR, so it
         can compute a rate rather than only see an absolute none-count."""
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded(source, Referent(number='3127'))),
+            _graphiti_value(referents=_encoded(source, Referent(number='3127'))),
         )
 
         counts = service.referent_source_counts()
@@ -1278,14 +809,16 @@ class TestReferentSourceCounter:
     async def test_the_accessor_returns_a_copy(self, service):
         """A caller mutating the returned dict must not corrupt the escape
         hatch's own state."""
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         snapshot = service.referent_source_counts()
         snapshot['none'] = 9999
 
         assert service.referent_source_counts()['none'] == 1
 
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         assert service.referent_source_counts()['none'] == 2
 
@@ -1298,10 +831,10 @@ class TestReferentSourceCounter:
         service._write_journal = None
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         counts = service.referent_source_counts()
         assert counts['derived'] == 1
@@ -1311,7 +844,7 @@ class TestReferentSourceCounter:
     async def test_a_failed_write_is_still_counted(self, service):
         """The buckets count write ATTEMPTS, not completed writes, and that is
         deliberate: `DurableWriteQueue._process_item` re-invokes this executor
-        on every RETRY with a freshly parsed payload, so retries land in the
+        on every RETRY with the decoded value, so retries land in the
         buckets and an item that eventually dead-letters is still counted.
 
         Counting only successes would instead make the escape go dark during a
@@ -1321,13 +854,13 @@ class TestReferentSourceCounter:
         without re-reading `referent_source_counts`' docstring.
         """
         service.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('backend down'))
-        payload = _graphiti_payload(
+        value = _graphiti_value(
             referents=_encoded('derived', Referent(number='3127')),
         )
 
         for _ in range(3):  # the same item, retried
             with pytest.raises(RuntimeError):
-                await service._execute_graphiti_write('add_episode', dict(payload))
+                await service._execute_graphiti_write(value)
 
         assert service.referent_source_counts()['derived'] == 3
 
@@ -1356,8 +889,7 @@ class TestReferentSourceIsJournaled:
     @pytest.mark.asyncio
     async def test_a_new_format_row_journals_its_source_and_count(self, journaling_service):
         await journaling_service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded(
+            _graphiti_value(referents=_encoded(
                 'derived', Referent(number='3127'), Referent(number='2500'),
             )),
         )
@@ -1369,7 +901,7 @@ class TestReferentSourceIsJournaled:
     @pytest.mark.asyncio
     async def test_an_old_format_row_journals_none_and_zero(self, journaling_service):
         await journaling_service._execute_graphiti_write(
-            'add_episode', _graphiti_payload(),
+            _graphiti_value(),
         )
 
         payload = _backend_op_payload(journaling_service)
@@ -1381,7 +913,7 @@ class TestReferentSourceIsJournaled:
         """The durable channel and the in-process counter agree because both
         read the same decode — a malformed blob is 'none' in both."""
         await journaling_service._execute_graphiti_write(
-            'add_episode', _graphiti_payload(referents='garbage'),
+            _graphiti_value(referents='garbage'),
         )
 
         payload = _backend_op_payload(journaling_service)
@@ -1393,8 +925,7 @@ class TestReferentSourceIsJournaled:
     async def test_the_existing_journal_keys_are_unchanged(self, journaling_service):
         """Additive: content stays truncated to 200 and group_id stays put."""
         await journaling_service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(
+            _graphiti_value(
                 content='x' * 500,
                 group_id='dark_factory',
                 referents=_encoded('metadata', Referent(number='3129')),
@@ -1432,9 +963,9 @@ class TestReplayFromStoreStampsReferents:
         count = await service.replay_from_store('dark_factory')
 
         assert count == 3
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        batch = enqueued(service.durable_queue.enqueue_batch)
         assert len(batch) == 3
-        assert all('referents' in item['payload'] for item in batch)
+        assert all('referents' in json.loads(value.to_json()) for value, _ in batch)
 
     @pytest.mark.asyncio
     async def test_task_naming_rows_resolve_derived(self, service):
@@ -1447,8 +978,8 @@ class TestReplayFromStoreStampsReferents:
         await service.replay_from_store('dark_factory')
 
         blobs = [
-            item['payload']['referents']
-            for item in service.durable_queue.enqueue_batch.call_args[0][0]
+            _graphiti_bound(value).referents.to_wire()
+            for value, _ in enqueued(service.durable_queue.enqueue_batch)
         ]
         assert blobs[0] == {
             'source': 'derived',
@@ -1473,7 +1004,7 @@ class TestReplayFromStoreStampsReferents:
 
         await service.replay_from_store('dark_factory')
 
-        blob = service.durable_queue.enqueue_batch.call_args[0][0][0]['payload']['referents']
+        blob = _graphiti_bound(enqueued(service.durable_queue.enqueue_batch)[0][0]).referents.to_wire()
         assert blob == {
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
@@ -1497,11 +1028,11 @@ class TestReplayFromStoreStampsReferents:
             count = await service.replay_from_store('dark_factory')
 
         assert count == 2
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
-        assert [item['payload']['content'] for item in batch] == [
+        batch = enqueued(service.durable_queue.enqueue_batch)
+        assert [_graphiti_bound(value).content for value, _ in batch] == [
             'Task 3127 landed', 'Task 2500 landed',
         ]
-        assert all(item['payload']['referents']['source'] == 'derived' for item in batch)
+        assert all(_graphiti_bound(value).referents.source == 'derived' for value, _ in batch)
         assert sum(
             'not a string' in rec.getMessage() for rec in caplog.records
         ) == 2, f'expected one WARNING per skipped record; got {[r.getMessage() for r in caplog.records]}'
@@ -1514,16 +1045,16 @@ class TestReplayFromStoreStampsReferents:
 
         await service.replay_from_store('dark_factory')
 
-        item = service.durable_queue.enqueue_batch.call_args[0][0][0]
-        assert item['group_id'] == 'dark_factory'
-        assert item['operation'] == 'add_memory_graphiti'
-        assert item['callback_type'] == 'refresh_entity_summaries'
-        assert item['payload']['name'] == 'replay_temporal_facts'
-        assert item['payload']['content'] == 'Task 3127 landed'
-        assert item['payload']['source'] == 'text'
-        assert item['payload']['group_id'] == 'dark_factory'
-        assert item['payload']['source_description'] == 'replay_from_mem0:temporal_facts'
-        assert json.loads(json.dumps(item['payload'])) == item['payload']
+        value, callback = enqueued(service.durable_queue.enqueue_batch)[0]
+        assert value.envelope.group_id == 'dark_factory'
+        assert value.operation.value == 'add_memory_graphiti'
+        assert callback == QueueCallback.REFRESH_ENTITY_SUMMARIES
+        wire = json.loads(value.to_json())
+        assert wire['name'] == 'replay_temporal_facts'
+        assert wire['content'] == 'Task 3127 landed'
+        assert wire['source'] == 'text'
+        assert wire['group_id'] == 'dark_factory'
+        assert wire['source_description'] == 'replay_from_mem0:temporal_facts'
 
 
 async def _completed_count_is(queue, expected: int) -> bool:
@@ -1562,9 +1093,7 @@ class TestReferentsSurviveTheRealQueue:
         self, real_queue, service,
     ):
         await real_queue.enqueue(
-            group_id='dark_factory',
-            operation='add_episode',
-            payload=_graphiti_payload(
+            _graphiti_value(
                 group_id='dark_factory',
                 referents=_encoded(
                     'derived', Referent(number='3127'), Referent(number='2500'),
@@ -1589,9 +1118,7 @@ class TestReferentsSurviveTheRealQueue:
         """The load-bearing back-compat signal, all the way through: a row
         written before task 3670 drains to 'completed' and counts only 'none'."""
         await real_queue.enqueue(
-            group_id='dark_factory',
-            operation='add_episode',
-            payload=_graphiti_payload(group_id='dark_factory'),
+            _graphiti_value(group_id='dark_factory'),
         )
 
         await poll_until(
@@ -1636,9 +1163,7 @@ class TestReferentsSurviveTheRealQueue:
         ))
 
         await real_queue.enqueue(
-            group_id='dark_factory',
-            operation='add_episode',
-            payload=_graphiti_payload(
+            _graphiti_value(
                 group_id='dark_factory',
                 referents=_encoded(
                     'derived', Referent(number='3127'),
@@ -1656,32 +1181,6 @@ class TestReferentsSurviveTheRealQueue:
             'lost somewhere between enqueue and zeta'
         )
 
-    @pytest.mark.asyncio
-    async def test_the_callback_still_sees_the_key_the_executor_popped(
-        self, real_queue, service,
-    ):
-        """Pins the durable_queue._process_item contract that makes popping
-        safe: the executor gets one parsed_payload() and the callback a SECOND,
-        FRESH one.  A future queue refactor that reused one dict would silently
-        starve _dual_write_callback, and only this test would notice."""
-        seen: list[dict] = []
-
-        async def _spy(callback_type, result, payload):
-            seen.append(payload)
-
-        real_queue.register_callback('dual_write_episode', _spy)
-        blob = _encoded('derived', Referent(number='3127'))
-
-        await real_queue.enqueue(
-            group_id='dark_factory',
-            operation='add_episode',
-            payload=_graphiti_payload(group_id='dark_factory', referents=blob),
-            callback_type='dual_write_episode',
-        )
-
-        await poll_until(lambda: seen, message='the callback never fired')
-        assert seen[0]['referents'] == blob
-
 
 class TestExecuteGraphitiWriteHandsReferentsToZeta:
     """The executor hands the DECODED set to the verification sub-pass (task
@@ -1696,8 +1195,7 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
 
         assert service._reconcile_episode_identity.call_args[1]['referents'] == (
@@ -1709,7 +1207,8 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         """The load-bearing back-compat path, still executing unchanged."""
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(
+            _graphiti_value())
 
         assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
 
@@ -1721,8 +1220,7 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents={'source': 'derived', 'refs': 'not-a-list'}),
+            _graphiti_value(referents={'source': 'derived', 'refs': 'not-a-list'}),
         )
 
         assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
@@ -1743,8 +1241,7 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded(
+            _graphiti_value(referents=_encoded(
                 'derived', Referent(number='3127'),
                 ambiguous=(Referent(number='6379'),),
             )),
@@ -1762,8 +1259,7 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         service._reconcile_episode_identity = AsyncMock(return_value={})
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
 
         assert service.graphiti.add_episode.call_args[1] == {
@@ -1796,8 +1292,7 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         service._reconcile_episode_identity = AsyncMock(side_effect=_probe)
 
         await service._execute_graphiti_write(
-            'add_episode',
-            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+            _graphiti_value(referents=_encoded('derived', Referent(number='3127'))),
         )
 
         assert observed['locked'] is True
@@ -1850,7 +1345,7 @@ class TestDeclaredReferentsEndToEnd:
 
     @staticmethod
     def _referents(service) -> dict:
-        return service.durable_queue.enqueue.call_args[1]['payload']['referents']
+        return _stamped(service).referents.to_wire()
 
     @pytest.mark.asyncio
     async def test_declared_and_corroborated_lands_as_declared(self, server, service):

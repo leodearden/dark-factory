@@ -27,6 +27,7 @@ from shared.cli_invoke import (
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
     CRASH_RECOVERY_RESUME_PROMPT,
+    PROGRESS_TIMEOUT_RESUME_PROMPT,
     AgentResult,
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -3789,6 +3790,94 @@ class TestCapRetryResumeDeliversPrompt:
         first = mock_inv.call_args_list[0]
         assert first.kwargs.get('prompt') == CRASH_RECOVERY_RESUME_PROMPT
         assert first.kwargs.get('resume_session_id') == 'sess-x'
+
+
+# ===================================================================
+# TestCapRetryResumePrompt  (task 3985)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryResumePrompt:
+    """resume_prompt names the continuation a caller-initiated resume's first
+    dispatch sends in place of ``prompt``; ``prompt`` stays the real briefing
+    for any fresh fallback.
+    """
+
+    async def test_resume_prompt_replaces_prompt_on_caller_resume(self):
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[make_result()]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='REAL TASK PROMPT',
+                resume_session_id='sess-x',
+                resume_prompt=PROGRESS_TIMEOUT_RESUME_PROMPT,
+            )
+        first = mock_inv.call_args_list[0]
+        assert first.kwargs.get('prompt') == PROGRESS_TIMEOUT_RESUME_PROMPT
+        assert first.kwargs.get('resume_session_id') == 'sess-x'
+
+    async def test_resume_prompt_fresh_fallback_restores_real_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        with (
+            patch(
+                _INVOKE_PATCH, new_callable=AsyncMock,
+                side_effect=[measured_resume_rejection('sess-1'), make_result()],
+            ) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='REAL TASK PROMPT',
+                resume_session_id='sess-1',
+                resume_prompt='CONTINUE-X',
+            )
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REAL TASK PROMPT'
+        assert 'resume_session_id' not in second.kwargs
+
+    async def test_resume_prompt_with_resume_delivers_prompt_raises(self):
+        gate = _mock_gate(account_count=1, active_account_name='acct')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(ValueError, match='resume_prompt'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='REAL TASK PROMPT',
+                resume_session_id='sess-x',
+                resume_delivers_prompt=True,
+                resume_prompt='X',
+            )
+        mock_inv.assert_not_awaited()
+
+    async def test_blank_resume_prompt_raises(self):
+        gate = _mock_gate(account_count=1, active_account_name='acct')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(ValueError, match='lbl resume_prompt'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='REAL TASK PROMPT',
+                resume_session_id='sess-x',
+                resume_prompt='   ',
+            )
+        mock_inv.assert_not_awaited()
 
 
 # ===================================================================

@@ -23,7 +23,9 @@ THE THREE CLASSES.
 
 - ``SPEC_CARRIED``: the dispatcher's value rides the spec and wins on the
   remote leg.  Each such row is checked by a behavioural probe below, which goes
-  through ``run_merge_verify_on_worktree`` and the wire codec.
+  through ``run_merge_verify_on_worktree`` and the wire codec.  A
+  ``HOST_DECIDING`` row may still have carried sub-reads; each is probed the
+  same way in ``_CARRIED_SUB_READ_PROBES``.
 - ``MERGE_NEUTRAL``: the host supplies the value, but no value of it can turn a
   failing verify into a passing one.  Scheduling, fan-out caps and timeouts that
   fail closed are in this class.
@@ -85,6 +87,10 @@ _ADMISSION = (
     'Verify admission scheduling: it decides when a run starts and at what priority, never what it selects.'
 )
 _CGROUP_SHAPING = 'cgroup CPU shaping: it weights the run against other work and leaves its commands alone.'
+_CGROUP_MEMORY_LIMITS = (
+    'cgroup memory limits: MemoryHigh only slows a run and a MemoryMax kill leaves a killed leg '
+    'with no passing verdict, so no value turns a failing verify green.'
+)
 _FAILS_CLOSED_TIMEOUT = (
     'A timeout only ends a run timed_out, which the merge path fails closed: the scoped verify does '
     'not pass, and the unscoped gate runs with block_on_timeout=True.'
@@ -112,23 +118,20 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
         "Task 6127: a non-empty spec value replaces the host's, and '' keeps the host's own by design "
         '(plans/remote-task-leg-verify-prd.md §4.1).',
     ),
-    # HOST_DECIDING
     'scope_cargo': Classified(
-        Fidelity.HOST_DECIDING,
-        "Gates verify.py::_apply_cargo_scope's --workspace to -p rewrite, including the zero-module "
-        'cargo-scoped route. MergeVerifySpec does not carry it.',
-        follow_ups=('agent-followup-5295-scope-cargo',),
+        Fidelity.SPEC_CARRIED,
+        "Task 7465: rides MergeVerifySpec.scope_cargo via apply_spec_to_host_config's field_overrides. "
+        "A per-module override the spec cannot carry collapses it to False, which only widens the "
+        "remote's cargo scope.",
     ),
+    # HOST_DECIDING
     'git': Classified(
         Fidelity.HOST_DECIDING,
-        'git.merge_config_only_full_gate_globs forces the full gate for a config-only diff and is never '
-        "carried. git.main_branch drives the remote's _derive_task_files_from_git whenever "
+        "git.main_branch drives the remote's _derive_task_files_from_git whenever "
         'spec.task_files is None: merge_lane/drift.py ships None, and so does the serial route when '
-        "the dispatcher's own derivation comes back empty.",
-        follow_ups=(
-            'agent-followup-5295-config-only-globs',
-            'agent-followup-5295-remote-task-files-derivation',
-        ),
+        "the dispatcher's own derivation comes back empty. git.merge_config_only_full_gate_globs "
+        'rides the spec (task 7465), checked by _CARRIED_SUB_READ_PROBES.',
+        follow_ups=('agent-followup-5295-remote-task-files-derivation',),
     ),
     'test_command': Classified(
         Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
@@ -164,6 +167,7 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     'verify_cgroup_cpu_weight_background': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_cgroup_cpu_weight_merge': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_cgroup_cpu_weight_task': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_cgroup_memory': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_MEMORY_LIMITS),
     'verify_use_cgroup_scope': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_clock_stop_enabled': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
     'verify_clock_stop_heartbeat_idle_max': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
@@ -515,6 +519,13 @@ _CARRIED_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
         observe=lambda cfg: cfg.verify_cold_preprovision_command,
         expected=_on_every_route('echo dispatcher'),
     ),
+    # The false-green direction: the host scopes cargo narrower than the dispatcher.
+    'scope_cargo': _CarriedProbe(
+        dispatcher={'scope_cargo': False},
+        host={'scope_cargo': True},
+        observe=lambda cfg: cfg.scope_cargo,
+        expected=_on_every_route(False),
+    ),
     # Task 4536's hole: the host discovers a module of its own while the dispatcher ships the route's set.
     'module_configs_or_empty': _CarriedProbe(
         dispatcher={},
@@ -526,10 +537,24 @@ _CARRIED_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
 })
 
 
+# Carried leaves of a row that stays HOST_DECIDING for its other leaves, keyed '<row>.<leaf>'.
+_CARRIED_SUB_READ_PROBES: Mapping[str, _CarriedProbe] = MappingProxyType({
+    'git.merge_config_only_full_gate_globs': _CarriedProbe(
+        dispatcher={'git': {'merge_config_only_full_gate_globs': ['dark-factory-orchestrator.yaml']}},
+        host={'git': {'merge_config_only_full_gate_globs': []}},
+        observe=lambda cfg: list(cfg.git.merge_config_only_full_gate_globs),
+        expected=_on_every_route(['dark-factory-orchestrator.yaml']),
+    ),
+})
+
+
 def test_every_spec_carried_row_has_a_probe() -> None:
     assert set(_CARRIED_PROBES) == set(_rows(Fidelity.SPEC_CARRIED))
-    unrouted = sorted(row for row, probe in _CARRIED_PROBES.items() if set(probe.expected) != set(_ROUTES))
+    all_probes = {**_CARRIED_PROBES, **_CARRIED_SUB_READ_PROBES}
+    unrouted = sorted(name for name, probe in all_probes.items() if set(probe.expected) != set(_ROUTES))
     assert not unrouted, f'These probes do not state an expected value for every route: {unrouted}'
+    unrowed = sorted(key for key in _CARRIED_SUB_READ_PROBES if key.split('.')[0] not in MERGE_PATH_CONFIG_READS)
+    assert not unrowed, f'These sub-read probes name no MERGE_PATH_CONFIG_READS row: {unrowed}'
 
 
 def _load_host_config(root: Path, probe: _CarriedProbe, monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
@@ -578,13 +603,35 @@ async def _config_the_remote_bundle_receives(
 async def test_spec_carried_read_takes_the_dispatchers_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str, route: str
 ) -> None:
-    probe = _CARRIED_PROBES[row]
+    await _assert_the_remote_takes_the_dispatchers_value(tmp_path, monkeypatch, row, _CARRIED_PROBES[row], route)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('sub_read', 'route'),
+    [
+        pytest.param(sub_read, route, id=f'{sub_read}-{route}')
+        for sub_read in _CARRIED_SUB_READ_PROBES
+        for route in _ROUTES
+    ],
+)
+async def test_carried_sub_read_takes_the_dispatchers_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sub_read: str, route: str
+) -> None:
+    await _assert_the_remote_takes_the_dispatchers_value(
+        tmp_path, monkeypatch, sub_read, _CARRIED_SUB_READ_PROBES[sub_read], route
+    )
+
+
+async def _assert_the_remote_takes_the_dispatchers_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, probe: _CarriedProbe, route: str
+) -> None:
     expected = probe.expected[route]
     host_root = tmp_path / 'host'
     host_root.mkdir()
     host = _load_host_config(host_root, probe, monkeypatch)
     assert probe.observe(host) != expected, (
-        f'{row} on the {route} route: the host already holds {expected!r}, so the case cannot '
+        f'{name} on the {route} route: the host already holds {expected!r}, so the case cannot '
         'tell the dispatcher value from the host value. Give the probe a host value that differs.'
     )
     worktree = tmp_path / 'merge-worktree'
@@ -593,6 +640,6 @@ async def test_spec_carried_read_takes_the_dispatchers_value(
         worktree, OrchestratorConfig.model_validate(dict(probe.dispatcher)), host, _ROUTES[route]
     )
     assert probe.observe(received) == expected, (
-        f'{row} on the {route} route: the remote bundle saw {probe.observe(received)!r}, '
+        f'{name} on the {route} route: the remote bundle saw {probe.observe(received)!r}, '
         f'not the dispatcher value {expected!r}. Reclassify the row; do not change production.'
     )

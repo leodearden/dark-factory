@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import MockNode, install_identity_mocks
+from _queued_write_fixtures import queued
 from test_referent_verification import (
     _WRITE_PRIMITIVES,
     _edge,
@@ -2847,7 +2848,7 @@ class TestEndToEndThroughTheWritePath:
             {'uuid': 'e-other'},
         ])
 
-        await service._execute_graphiti_write('add_episode', self._payload())
+        await service._execute_graphiti_write(queued('add_episode', self._payload()))
 
         service.graphiti.ensure_entity_node.assert_awaited_once_with(
             'Task 3127', group_id='dark_factory', merge_duplicates=False,
@@ -2885,7 +2886,7 @@ class TestEndToEndThroughTheWritePath:
             return_value=[{'uuid': 'e-other'}],
         )
 
-        await service._execute_graphiti_write('add_episode', self._payload())
+        await service._execute_graphiti_write(queued('add_episode', self._payload()))
 
         stats, = recorded
         assert isinstance(stats.repair_stats, ReferentRepairStats)
@@ -2925,7 +2926,7 @@ class TestEndToEndThroughTheWritePath:
             return_value=[{'uuid': 'e-other'}],
         )
 
-        await service._execute_graphiti_write('add_episode', self._payload())
+        await service._execute_graphiti_write(queued('add_episode', self._payload()))
 
         assert held == [True], (
             'ensure_entity_node ran OUTSIDE the per-group identity lock — '

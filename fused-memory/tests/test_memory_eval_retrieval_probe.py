@@ -21,15 +21,18 @@ booleans and on flips. ``k`` appears only as a metric parameterisation.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import functools
 import json
+import os
 import sqlite3
 import types
 from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
 from shared.testing_streams import closed_pipe_stdout
 
@@ -4363,11 +4366,6 @@ class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
 #   - queue.data_dir comes from mock_config's tmp_path, so the durable queue
 #     never touches the live one.
 # ---------------------------------------------------------------------------
-
-import contextlib  # noqa: E402
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 

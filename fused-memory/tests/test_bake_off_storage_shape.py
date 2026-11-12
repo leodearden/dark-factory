@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import subprocess
 import tempfile
@@ -40,6 +41,7 @@ from collections.abc import Container
 from pathlib import Path
 
 from _fm_helpers import lease_isolated_monkeypatch, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -9172,10 +9174,6 @@ class TestMain:
 # Marked PER-TEST, never via a module `pytestmark`: fused-memory's
 # `addopts = -m 'not integration'` would otherwise deselect the ~200 pure
 # tests above from the merge lane along with this one.
-
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 @pytest.mark.integration

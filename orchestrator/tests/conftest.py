@@ -41,6 +41,9 @@ if str(_ESCALATION_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
 # fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
@@ -1218,6 +1221,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
+    # Gates both the deterministic recon sweep and the scheduled-deploy
+    # settler, which share this interval.
+    config.deterministic_recon_sweep_enabled = False
+    config.deterministic_recon_sweep_interval_secs = 900.0
+    # Always-on services (task 5344): no enable gate, so the interval must be real.
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
     # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
     # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
     # is a @property on OrchestratorConfig (see config.py) and Harness wires

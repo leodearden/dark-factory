@@ -21,8 +21,8 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 from orchestrator.verify_admission_record import AdmissionLeg
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_evidence import (
-    CacheMode,
     UnitOutcome,
     UnitTier,
     VerifyUnit,

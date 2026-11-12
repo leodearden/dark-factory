@@ -28,7 +28,7 @@ import contextlib
 import os
 
 import pytest
-from _fm_helpers import QDRANT_URL, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import VectorParams

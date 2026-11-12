@@ -242,10 +242,74 @@ test('signalCell: an unrecognised mark shows the raw mark rather than guess', ()
   assert.equal(signalCell({ mark: 'withdrawn', cause: null, reason: null, leaves: [] }).text, 'withdrawn');
 });
 
-test('signalCell: the detail is the served reason, else null', () => {
+test('signalCell: with no leaves, the detail is the served reason, else null', () => {
   const unknown = { mark: 'unknown', cause: 'no_sidecar', reason: 'no capability-manifest sidecar', leaves: [] };
   assert.equal(signalCell(unknown).detail, 'no capability-manifest sidecar');
   assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves: [] }).detail, null);
+});
+
+test('signalCell: a delivered mark names its done leaf with the done kind', () => {
+  const leaves = [{ label: 'epsilon', task_id: 2581, status: 'done', done_kind: 'merged' }];
+  assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves }).detail, 'epsilon #2581 done (merged)');
+});
+
+test('signalCell: a partial mark lists its leaves in served order', () => {
+  const leaves = [
+    { label: 'η', task_id: 8531, status: 'done', done_kind: 'merged' },
+    { label: 'ι', task_id: 8532, status: 'pending', done_kind: null },
+  ];
+  assert.equal(signalCell({ mark: 'partial', cause: null, reason: null, leaves }).detail, 'η #8531 done (merged)\nι #8532 pending');
+});
+
+test('signalCell: a not_yet mark names its pending leaf, and the figure title puts it above the rule', () => {
+  const leaves = [{ label: 'θ', task_id: 4652, status: 'pending', done_kind: null }];
+  const { detail } = signalCell({ mark: 'not_yet', cause: null, reason: null, leaves });
+  assert.equal(detail, 'θ #4652 pending');
+  assert.equal(figureTitle('RULE', detail), 'θ #4652 pending\n\nRULE');
+});
+
+test('signalCell: a done leaf with no served done kind shows no parenthesis', () => {
+  const leaves = [{ label: 'a', task_id: 1, status: 'done', done_kind: null }];
+  assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves }).detail, 'a #1 done');
+});
+
+test('signalCell: an unbound_label mark puts its reason first, then each leaf, an unbound one as its label alone', () => {
+  const reason = "signal leaf bound to no task: label 'γ'";
+  const leaves = [
+    { label: 'γ', task_id: null, status: null, done_kind: null },
+    { label: 'δ', task_id: 1234, status: 'pending', done_kind: null },
+  ];
+  const { detail } = signalCell({ mark: 'unknown', cause: 'unbound_label', reason, leaves });
+  const expected = "signal leaf bound to no task: label 'γ'\nγ\nδ #1234 pending";
+  assert.equal(detail, expected);
+  assert.equal(figureTitle('RULE', detail), `${expected}\n\nRULE`);
+});
+
+test('signalCell: an external_leaf mark shows the external leaf as its label alone, leaving the why to the reason', () => {
+  const reason = "signal leaf is an external task: label 'γ' is bound to reify:12";
+  const leaves = [{ label: 'γ', task_id: null, status: null, done_kind: null }];
+  assert.equal(
+    signalCell({ mark: 'unknown', cause: 'external_leaf', reason, leaves }).detail,
+    "signal leaf is an external task: label 'γ' is bound to reify:12\nγ",
+  );
+});
+
+test('signalCell: a served done kind shows in parentheses whatever the leaf status, the server owning when it is sent', () => {
+  const leaves = [{ label: 'a', task_id: 1, status: 'in-progress', done_kind: 'merged' }];
+  assert.equal(signalCell({ mark: 'not_yet', cause: null, reason: null, leaves }).detail, 'a #1 in-progress (merged)');
+});
+
+test('signalCell: a signal serving no leaves list throws rather than hide the leaves', () => {
+  assert.throws(() => signalCell({ mark: 'delivered', cause: null, reason: null }), TypeError);
+});
+
+test('signalCell: a leaf_not_in_store mark names the bound id of a leaf the store does not hold', () => {
+  const reason = "signal leaf task absent from the store: label 'γ' is bound to task 99";
+  const leaves = [{ label: 'γ', task_id: 99, status: null, done_kind: null }];
+  assert.equal(
+    signalCell({ mark: 'unknown', cause: 'leaf_not_in_store', reason, leaves }).detail,
+    "signal leaf task absent from the store: label 'γ' is bound to task 99\nγ #99 not in the store",
+  );
 });
 
 // ── (f) The contention line ──

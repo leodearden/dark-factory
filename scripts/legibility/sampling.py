@@ -36,7 +36,7 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import detectors, digest  # noqa: E402  # debt: task 6760
+from legibility import detectors, digest, layout  # noqa: E402  # debt: task 6760
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
@@ -765,7 +765,7 @@ def main(argv: Sequence[str]) -> int:
     deliberately still the raw transcript size — informational, and a
     different question from what the record costs the budget.
     """
-    default_config = Path(__file__).resolve().parent.parent.parent / 'docs' / 'legibility' / 'legibility.yaml'
+    default_config = layout.config_path(Path(__file__).resolve().parents[2])
     parser = argparse.ArgumentParser(
         description='Sample yesterday\'s confusion-signal sessions for the nightly digest.'
     )

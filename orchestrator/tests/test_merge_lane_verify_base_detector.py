@@ -27,7 +27,10 @@ from orchestrator.merge_lane.types import (
     MergeRequest,
     QueuedBranch,
     RealMergeItem,
+    RemergeBase,
+    RemergeReason,
     VerifyBaseDivergence,
+    VerifyBaseDivergenceKind,
 )
 from orchestrator.merge_lane.verify_base_detector import (
     VERIFY_BASE_DIVERGENCE_SENTINEL,
@@ -35,7 +38,9 @@ from orchestrator.merge_lane.verify_base_detector import (
     detect_verify_base_divergence,
 )
 
-_WIRE_KEYS = {'request_id', 'task_id', 'base_sha', 'expected_tip', 'verify_depth', 'observed_at'}
+_WIRE_KEYS = {
+    'request_id', 'task_id', 'base_sha', 'expected_tip', 'verify_depth', 'observed_at', 'kind',
+}
 
 
 @pytest.fixture
@@ -58,7 +63,7 @@ def _request(config: OrchestratorConfig, task_id: str = 't-1') -> MergeRequest:
 
 
 def _real_item(
-    config: OrchestratorConfig, *, base_sha: str, remerge_recovery: bool = False,
+    config: OrchestratorConfig, *, base_sha: str, remerge_base: RemergeBase | None = None,
 ) -> RealMergeItem:
     return RealMergeItem(
         request=_request(config),
@@ -66,7 +71,7 @@ def _real_item(
         merge_wt=Path('/fake/merge-wt'),
         base_sha=base_sha,
         speculative=False,
-        remerge_recovery=remerge_recovery,
+        remerge_base=remerge_base,
     )
 
 
@@ -108,9 +113,40 @@ class TestDetectVerifyBaseDivergence:
     ) -> None:
         assert _detect(_real_item(config, base_sha=''), 'sha-tip') is None
 
-    async def test_recovery_remerge_is_carved_out(self, config: OrchestratorConfig) -> None:
-        item = _real_item(config, base_sha='real-main', remerge_recovery=True)
+    async def test_recovery_remerge_on_main_is_carved_out(self, config: OrchestratorConfig) -> None:
+        item = _real_item(
+            config, base_sha='real-main', remerge_base=RemergeBase(None, RemergeReason.NO_TIP),
+        )
         assert _detect(item, 'sha-tip') is None
+
+    async def test_a_recovery_remerge_that_fell_to_main_is_exempt_whatever_its_reason(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        for reason in RemergeReason:
+            if reason is RemergeReason.LIVE_TIP:
+                continue
+            item = _real_item(config, base_sha='real-main', remerge_base=RemergeBase(None, reason))
+            assert _detect(item, 'sha-tip') is None, reason
+
+    async def test_an_ordinary_stacked_item_off_the_tip_is_off_frozen_tip(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        divergence = _detect(_real_item(config, base_sha='sha-spec'), 'sha-tip')
+        assert divergence is not None
+        assert divergence.kind is VerifyBaseDivergenceKind.OFF_FROZEN_TIP
+
+    async def test_a_live_tip_reanchor_off_the_tip_is_reanchor_onto_dead_tip(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        """Its tip died or was vacated between re-merge and dispatch
+        (plans/merge-lane-policy-prd.md D12)."""
+        item = _real_item(
+            config, base_sha='sha-old-tip',
+            remerge_base=RemergeBase('sha-old-tip', RemergeReason.LIVE_TIP),
+        )
+        divergence = _detect(item, 'sha-tip')
+        assert divergence is not None
+        assert divergence.kind is VerifyBaseDivergenceKind.REANCHOR_ONTO_DEAD_TIP
 
     async def test_base_on_the_tip_is_no_divergence(self, config: OrchestratorConfig) -> None:
         assert _detect(_real_item(config, base_sha=' sha-tip\n'), 'sha-tip') is None
@@ -146,6 +182,7 @@ class TestDetectVerifyBaseDivergence:
         assert json.loads(json.dumps(wire)) == wire
         assert wire['request_id'] == divergence.request_id
         assert wire['verify_depth'] == 2
+        assert wire['kind'] == 'off_frozen_tip'
 
 
 @pytest.mark.asyncio
@@ -168,8 +205,24 @@ class TestAlarmVerifyBaseDivergence:
         assert filed.task_id == VERIFY_BASE_DIVERGENCE_SENTINEL
         assert filed.level == 1
         assert filed.category == 'merge_verify_base_divergence'
-        for needle in (divergence.request_id, 'sha-spec', 'sha-tip'):
+        for needle in (divergence.request_id, 'sha-spec', 'sha-tip', 'off_frozen_tip'):
             assert needle in filed.summary
+
+    async def test_the_l1_names_a_reanchor_hit_by_its_kind(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        escalations = RecordingEscalations()
+        item = _real_item(
+            config, base_sha='sha-old-tip',
+            remerge_base=RemergeBase('sha-old-tip', RemergeReason.LIVE_TIP),
+        )
+        divergence = _detect(item, 'sha-tip')
+        assert divergence is not None
+
+        alarm_verify_base_divergence(escalations, divergence)
+
+        [filed] = escalations.filed
+        assert 'reanchor_onto_dead_tip' in filed.summary
 
     async def test_filing_emits_one_self_describing_event(
         self, config: OrchestratorConfig,

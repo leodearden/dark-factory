@@ -1,6 +1,6 @@
 """A one-commit git repo whose head sha no sibling repo shares.
 
-``_fm_helpers._init_git_repo`` makes byte-identical commits when it is called
+``_fm_git_repos._init_git_repo`` makes byte-identical commits when it is called
 twice within the same second, so two repos built with it can share a head sha.
 A cross-repo commit lookup then cannot show which repo answered. Writing a
 file named after the repo makes each sha distinct.
@@ -12,7 +12,7 @@ tests/conftest.py, which puts this directory on ``sys.path`` for ``tests/`` and
 
 from pathlib import Path
 
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 
 
 def init_distinct_git_repo(root: Path) -> str:

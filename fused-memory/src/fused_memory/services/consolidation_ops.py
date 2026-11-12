@@ -49,9 +49,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, is_canonical
+from fused_memory.models.memory import Mem0WriteState
 from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.topic_anchor import select_canonical_payload
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'TOPIC_MEMBER_LIMIT',
+    'MemoryUpdater',
     'RetainArmApplied',
     'RetainArmRefused',
     'TopicClosure',
@@ -129,8 +131,26 @@ class RetainArmRefused:
     response: dict[str, Any]
 
 
+class MemoryUpdater(Protocol):
+    """The ``update_memory`` member that :func:`patch_memory_metadata` calls."""
+
+    async def update_memory(
+        self,
+        *,
+        memory_id: str,
+        project_id: str,
+        content: str | None,
+        metadata_patch: dict[str, Any] | None,
+        metadata_mode: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+    ) -> object: ...
+
+
 async def patch_memory_metadata(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     *,
     memory_id: str,
     project_id: str,
@@ -424,15 +444,10 @@ async def apply_retain_arm(
             metadata=canonical_meta,
             causation_id=causation_id,
             _source=source,
+            defer_transient_mem0_failure=False,
         )
-        # `AddMemoryResponse` is a pydantic model whose `memory_ids` can come
-        # back EMPTY without raising — a write that landed nothing while
-        # reporting no failure. Indexing it blindly would either raise an
-        # IndexError flattened into an unreadable error, or (worse, had this
-        # been a dict lookup) carry a None canonical id into the delete loop
-        # and reap a live cluster in favour of a record that does not exist.
-        minted_id = written.memory_ids[0] if written.memory_ids else None
-        if not minted_id:
+        # Landed or not is AddMemoryResponse.mem0_write_state's call, never a read of memory_ids.
+        if written.mem0_write_state is not Mem0WriteState.LANDED:
             return RetainArmRefused({
                 'error': (
                     'consolidate_memories: the canonical write returned no memory '
@@ -443,7 +458,7 @@ async def apply_retain_arm(
                 'topic': topic,
                 'supersedes': list(canonical_meta.get('supersedes') or []),
             })
-        canonical_id = minted_id
+        canonical_id = written.memory_ids[0]
     else:
         # TAG-ONLY (PRD D14). NOTHING is written to the incumbent:
         # `content_amend=False` is load-bearing, and an incumbent that

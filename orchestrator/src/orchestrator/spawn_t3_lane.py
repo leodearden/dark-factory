@@ -483,7 +483,7 @@ def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy
 def _stamp_launched_record(
     record_dir: str, title: str, launched: LaunchedThread, environment_id: str, parent: str | None
 ) -> None:
-    """One read-modify-write: the t3 display, status running, and the parent when given."""
+    """One read-modify-write: the t3 display, status running, and the parent when given; then the thread pointer's reconcile."""
     slug, root = _record_key(record_dir)
     try:
         record = session_registry.read_record(slug, root=root)
@@ -499,6 +499,7 @@ def _stamp_launched_record(
             session_registry.apply_refresh(slug, record, status=session_registry.Status.RUNNING),
             root=root,
         )
+        bind_thread_pointer(record_dir, launched.thread_id)
     except Exception as exc:
         logger.warning(f'registry stamp failed for {record_dir}: {exc}')
 
@@ -562,7 +563,7 @@ def launch(
     if model and choice.enabled is False:
         return _provider_verdict(choice)
 
-    _sweep_listed_threads(client, project.project_id, cwd)
+    _sweep_listed_threads(client, routine=False)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
     strategy = WorkspaceStrategy.for_cwd(project, cwd)
     arguments = _launch_arguments(
@@ -674,16 +675,36 @@ def _transcript_mtime(cwd: str, session_id: str) -> float | None:
     return None
 
 
+class BindingSource(StrEnum):
+    """How the spawn record reached its session; the ``started`` verdict's ``via=``."""
+
+    THREAD_POINTER = 'thread-pointer'
+    TRANSCRIPT = 'transcript'
+    NONE = 'none'
+
+
 @dataclass(frozen=True)
 class Binding:
-    session_id: str
+    session_id: str | None
     hand_slug: str | None
     bound: bool
+    via: BindingSource = BindingSource.NONE
+
+
+_UNBOUND = Binding(None, None, bound=False)
 
 
 def _is_hand_launched(record: session_registry.SessionRecord) -> bool:
     """A spawn's record always has a result file; a hooks-made hand-launched one never does."""
-    return record.result_file is None and not session_registry.is_t3_record(record)
+    return record.result_file is None
+
+
+def _read_record_softly(slug: str, root: Path, role: str) -> session_registry.SessionRecord | None:
+    try:
+        return session_registry.read_record(slug, root=root)
+    except (OSError, session_registry.CorruptSessionRecord) as exc:
+        logger.warning('cannot read %s record %s: %s', role, slug, exc)
+        return None
 
 
 def _record_vouching_for(
@@ -693,11 +714,7 @@ def _record_vouching_for(
     slug = session_registry.resolve_session_slug_for_claude_session_id(session_id, root=root)
     if slug is None or slug == spawn_slug:
         return None
-    try:
-        return session_registry.read_record(slug, root=root)
-    except (OSError, session_registry.CorruptSessionRecord) as exc:
-        logger.warning('cannot read hand-launched record %s: %s', slug, exc)
-        return None
+    return _read_record_softly(slug, root, 'hand-launched')
 
 
 def _fold(hand: session_registry.SessionRecord, root: Path) -> None:
@@ -707,17 +724,18 @@ def _fold(hand: session_registry.SessionRecord, root: Path) -> None:
         logger.warning('cannot fold hand-launched record %s: %s', hand.session_slug, exc)
 
 
-def bind_session(record_dir: str, transcript: Transcript) -> Binding:
-    """Bind *transcript*'s session to the spawn record, then fold its hand-launched record.
+def _bind_to(
+    record_dir: str, session_id: str, hand: session_registry.SessionRecord | None, via: BindingSource
+) -> Binding:
+    """Bind *session_id* to the spawn record, then fold *hand*, the hand-launched record that held it.
 
     A session another spawn's record already owns is left alone, unbound.
 
-    The spawn record and both pointers are written before the fold, so a hook
-    event landing in between already resolves to the spawn record.
+    The spawn record and every pointer naming it (session id, owner pid, and
+    its T3 thread when it is t3) are written before the fold, so a hook event
+    landing in between already resolves to the spawn record.
     """
     slug, root = _record_key(record_dir)
-    session_id = transcript.session_id
-    hand = _record_vouching_for(session_id, slug, root)
     if hand is not None and not _is_hand_launched(hand):
         logger.warning(
             'session %s belongs to spawn record %s; not binding it to %s',
@@ -744,9 +762,43 @@ def bind_session(record_dir: str, transcript: Transcript) -> Binding:
     session_registry.write_claude_session_pointer(session_id, slug, root=root)
     if owner_pid is not None:
         session_registry.write_session_pointer(owner_pid, slug, root=root)
+    thread_id = session_registry.t3_thread_of(record)
+    if thread_id is not None:
+        session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
     if hand is not None:
         _fold(hand, root)
-    return Binding(session_id, hand_slug, bound=True)
+    return Binding(session_id, hand_slug, bound=True, via=via)
+
+
+def bind_session(record_dir: str, transcript: Transcript) -> Binding:
+    """Bind *transcript*'s session to the spawn record, folding the record its session-id pointer names."""
+    slug, root = _record_key(record_dir)
+    hand = _record_vouching_for(transcript.session_id, slug, root)
+    return _bind_to(record_dir, transcript.session_id, hand, BindingSource.TRANSCRIPT)
+
+
+def bind_thread_pointer(record_dir: str, thread_id: str) -> Binding:
+    """Bind the spawn record through *thread_id*'s pointer, which ends naming it.
+
+    A hand-launched record holding the pointer won the race to the thread:
+    its session is bound to the spawn record and it is folded. Another
+    spawn's record is left alone. With no other holder the pointer is
+    written for a t3 spawn record of *thread_id*, bound once a hook bound it.
+    """
+    slug, root = _record_key(record_dir)
+    holder_slug = session_registry.resolve_session_slug_for_t3_thread(thread_id, root=root)
+    if holder_slug is not None and holder_slug != slug:
+        holder = _read_record_softly(holder_slug, root, 'thread-pointer holder')
+        if holder is None or not holder.claude_session_id:
+            return _UNBOUND
+        return _bind_to(record_dir, holder.claude_session_id, holder, BindingSource.THREAD_POINTER)
+    record = _read_record_softly(slug, root, 'spawn')
+    if record is None or session_registry.t3_thread_of(record) != thread_id:
+        return _UNBOUND
+    session_registry.write_t3_thread_pointer(thread_id, slug, root=root)
+    if not record.claude_session_id:
+        return _UNBOUND
+    return Binding(record.claude_session_id, None, bound=True, via=BindingSource.THREAD_POINTER)
 
 
 def _needs_binding(record: session_registry.SessionRecord, cwd: str, found: Transcript) -> bool:
@@ -797,12 +849,13 @@ def await_started(
         time.sleep(min(STARTED_POLL_SECS, remaining))
     if verdict != 'started':
         return _verdict(verdict)
-    binding = _bind_within(record_dir, cwd, since, deadline) if record_dir else None
+    binding = _bind_within(record_dir, thread_id, cwd, since, deadline) if record_dir else None
     return _verdict(
         'started',
         sid=binding.session_id if binding else None,
         hand_slug=binding.hand_slug if binding else None,
         bound='yes' if binding and binding.bound else 'no',
+        via=binding.via if binding else BindingSource.NONE,
     )
 
 
@@ -820,8 +873,12 @@ def _started_verdict(
     return 'started'
 
 
-def _bind_within(record_dir: str, cwd: str, since: float, deadline: float) -> Binding | None:
+def _bind_within(record_dir: str, thread_id: str, cwd: str, since: float, deadline: float) -> Binding | None:
+    """Per poll, the thread pointer first and transcript discovery second, until one binds or *deadline* passes."""
     while True:
+        by_pointer = bind_thread_pointer(record_dir, thread_id)
+        if by_pointer.bound:
+            return by_pointer
         found = discover_transcript(cwd, record_dir, since)
         if found is not None:
             return bind_session(record_dir, found)
@@ -841,6 +898,9 @@ class ThreadState(StrEnum):
     ARCHIVED = 'archived'
     GONE = 'gone'
     UNREACHABLE = 'unreachable'
+
+
+ENDED_THREAD_STATES = frozenset({ThreadState.GONE, ThreadState.ARCHIVED})
 
 
 @dataclass(frozen=True)
@@ -918,13 +978,17 @@ def wait(
 def _observe(
     client: t3_mcp_client.T3McpClient | None, thread_id: str, cwd: str, record_dir: str
 ) -> ThreadObservation:
-    """The thread's state, after one sweep of its project and the binding's upkeep."""
-    thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
-    project_id = None if isinstance(thread, ThreadUnread) else thread.get('projectId')
-    if client is not None and isinstance(project_id, str):
-        _sweep_listed_threads(client, project_id, cwd)
+    """The thread's state, then one sweep of its environment and the binding's upkeep."""
+    observation = _observe_thread(client, thread_id)
+    if client is not None:
+        _sweep_listed_threads(client, routine=True)
     if record_dir:
         _maintain_binding_softly(record_dir, cwd)
+    return observation
+
+
+def _observe_thread(client: t3_mcp_client.T3McpClient | None, thread_id: str) -> ThreadObservation:
+    thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
     if isinstance(thread, ThreadUnread):
         return ThreadObservation(ThreadState.GONE if thread.gone else ThreadState.UNREACHABLE)
     if thread.get('archived') is True:
@@ -946,22 +1010,49 @@ def _needs_pause(slice_held: bool, record_dir: str) -> bool:
     return not slice_held and not result_is_final(record_dir)
 
 
-def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, project_id: str, cwd: str) -> None:
-    """Sweep *cwd*'s t3 records against the project's active threads, only from a complete listing."""
+def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, *, routine: bool) -> None:
+    """Sweep this environment's indexed t3 records against its active threads, only from a complete listing.
+
+    An unlisted thread's record is marked only once a read finds the thread
+    gone or archived. A *routine* sweep, one pass of ``wait``, logs its index
+    line at DEBUG unless it marked a record.
+    """
     listed_at = datetime.now(UTC)
-    threads = _paged(client, 't3_thread_list', {'projectId': project_id}, 'threads')
+    threads = _paged(client, 't3_thread_list', {'allProjects': True}, 'threads')
     thread_ids = None if isinstance(threads, Incomplete) else [thread.get('threadId') for thread in threads]
     if thread_ids is None or not all(isinstance(thread_id, str) for thread_id in thread_ids):
-        logger.warning(f't3 session sweep skipped: no complete thread listing of project {project_id}')
+        logger.warning('t3 session sweep skipped: no complete thread listing of this environment')
         return
-    _sweep_project(cwd, dict.fromkeys(map(str, thread_ids), False), listed_at)
-
-
-def _sweep_project(cwd: str, known: Mapping[str, bool], listed_at: datetime) -> None:
     try:
-        session_registry.mark_t3_sessions_exited(cwd, known, listed_at=listed_at)
+        session_registry.mark_t3_sessions_exited(
+            client.environment_id,
+            frozenset(map(str, thread_ids)),
+            listed_at=listed_at,
+            thread_ended=_ThreadEndConfirmer(client),
+            routine=routine,
+        )
     except Exception as exc:
         logger.warning(f't3 session sweep failed: {exc}')
+
+
+class _ThreadEndConfirmer:
+    """One sweep's ``thread_ended``: whether a read finds the thread gone or archived.
+
+    After one unreachable read it reads no further thread and answers "not
+    confirmed", as an unreachable read itself does: each such read can cost a
+    full ``CALL_TIMEOUT_SECS``, and ``launch`` waits on its sweep.
+    """
+
+    def __init__(self, client: t3_mcp_client.T3McpClient) -> None:
+        self._client = client
+        self._unreachable = False
+
+    def __call__(self, thread_id: str) -> bool:
+        if self._unreachable:
+            return False
+        state = _observe_thread(self._client, thread_id).state
+        self._unreachable = state is ThreadState.UNREACHABLE
+        return state in ENDED_THREAD_STATES
 
 
 def _maintain_binding_softly(record_dir: str, cwd: str) -> None:
@@ -1177,5 +1268,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    logging.basicConfig(stream=sys.stderr, format='spawn_t3_lane: %(message)s')
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='spawn_t3_lane: %(message)s')
     sys.exit(main(sys.argv[1:]))

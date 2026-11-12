@@ -117,7 +117,10 @@ Following ``zero_progress_requeue.py`` member-for-member:
   :func:`build_recovery_payload`) — no I/O, every collaborator injected;
 * :func:`emit_recovery_event` — the fire-and-forget event wrapper;
 * :class:`RecoveryVetoStreakTracker` — pure in-memory streak + span tracking;
-* the fail-open escalation filer and its mandatory recovery half.
+* the fail-open escalation filer and its mandatory recovery half;
+* :func:`inherit_veto_streak_alarms` — the restart-surviving half of the
+  caller's filed-at memo and tracker: it seeds both from the alarms a prior
+  process left pending, so the release edge can still stand them down.
 """
 
 from __future__ import annotations
@@ -151,6 +154,7 @@ __all__ = [
     'emit_recovery_event',
     'emit_recovery_veto_streak_escalation',
     'escalation_ages_secs',
+    'inherit_veto_streak_alarms',
     'pending_holder_candidates',
     'pin_buckets',
     'render_shape',
@@ -667,6 +671,12 @@ class Observation:
     changed: bool
 
 
+#: The signature of an :meth:`RecoveryVetoStreakTracker.adopt`-ed entry.
+#: :func:`veto_signature` always emits two ``|`` separators, so no observed
+#: veto can equal it, and the first real observation restarts the streak.
+_ADOPTED_SIGNATURE = ''
+
+
 @dataclass
 class _Streak:
     """One ``(site, task_id)``'s live veto streak."""
@@ -697,7 +707,8 @@ class RecoveryVetoStreakTracker:
     Deliberately NOT durable.  A fleet restart re-arms every signature, so the
     first post-deploy sweep re-emits for every live strand — precisely the D5
     "name each currently-stranded task's pinning escalation ids" signal, not a
-    lost-state bug.
+    lost-state bug.  The one thing a restart must not lose — which tasks hold
+    a filed alarm — comes back from the pending queue through :meth:`adopt`.
 
     Args:
         clock: Monotonic seconds source, injected for testability.
@@ -754,6 +765,21 @@ class RecoveryVetoStreakTracker:
             signature=signature,
             streak=count,
             changed=changed,
+        )
+
+    def adopt(self, site: RecoverySite | str, task_id: str) -> None:
+        """Hold ``(site, task_id)`` open for an alarm a PRIOR process filed.
+
+        The release edge iterates :meth:`tracked`, so without a key it never
+        visits the task and never stands the inherited alarm down.  The prior
+        streak's count is unknown, hence ``0``; the placeholder signature
+        equals no real one, so the first observation restarts the streak with
+        ``changed=True`` and the re-emission contract above is unchanged.  A
+        live entry is never overwritten.
+        """
+        self._streaks.setdefault(
+            self._key(site, task_id),
+            _Streak(signature=_ADOPTED_SIGNATURE, count=0, started_at=self._clock()),
         )
 
     def streak(self, site: RecoverySite | str, task_id: str) -> int:
@@ -881,6 +907,24 @@ _STREAK_CATEGORY = 'risk_identified'
 #: real task id, and ``sentinel_alarm_wrappers.discharge_sentinel_wrappers``
 #: reads it to recognise a wrapper's members.  Rename both sides together.
 RECOVERY_VETO_STREAK_ROLE = 'orchestrator-recovery-veto-streak'
+
+
+def _streak_sentinel(task_id: str) -> str:
+    """Return the synthetic task id this detector files *task_id*'s alarm under."""
+    return f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+
+
+def _alarm_subject(esc_task_id: str | None) -> str | None:
+    """Return the real task id behind a :func:`_streak_sentinel` id, else ``None``.
+
+    Also ``None`` for a record with no task_id.
+    """
+    if esc_task_id is None:
+        return None
+    subject = esc_task_id.removeprefix(RECOVERY_VETO_STREAK_SENTINEL_PREFIX)
+    if subject == esc_task_id or not subject:
+        return None
+    return subject
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -1018,7 +1062,7 @@ def emit_recovery_veto_streak_escalation(
             )
         return False
 
-    sentinel = f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+    sentinel = _streak_sentinel(task_id)
 
     try:
         # The memo answers the dedup for free on the sweep path; we only go to
@@ -1165,9 +1209,10 @@ def resolve_recovery_veto_streak_escalation(
 
     # Cheap gate FIRST — every swept task calls this, and touching the
     # filesystem here would make a healthy fleet pay a pending-queue scan per
-    # task per sweep.  Go to disk only when THIS process filed (memo hit), or
-    # when the streak that just broke was long enough that a PRIOR process
-    # could have filed for it before a restart.
+    # task per sweep.  Go to disk only when the memo names the task (this
+    # process filed, or inherit_veto_streak_alarms found a prior process's
+    # alarm at startup), or when the streak that just broke was long enough
+    # to have filed one.
     was_filed = filed_at is not None and task_id in filed_at
     if not was_filed and recovered_streak < threshold:
         return False
@@ -1175,11 +1220,14 @@ def resolve_recovery_veto_streak_escalation(
     if filed_at is not None:
         filed_at.pop(task_id, None)
 
-    sentinel = f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
+    sentinel = _streak_sentinel(task_id)
+    observed = (
+        f' after {recovered_streak} identical veto(es) observed by this process'
+        if recovered_streak else ''
+    )
     resolution = (
-        f'Task {task_id} is no longer held: the '
-        f'{recovered_streak}-observation recovery veto streak '
-        'broke (the pinning escalation cleared, a claimant took '
+        f'Task {task_id} is no longer held: its recovery veto streak '
+        f'broke{observed} (the pinning escalation cleared, a claimant took '
         'the task, or the sweep reached a mapped action).  '
         'Auto-resolved by the recovery-emission detector; it will '
         're-file if the hold recurs.'
@@ -1209,8 +1257,9 @@ def resolve_recovery_veto_streak_escalation(
         return False
 
     logger.info(
-        'Recovery veto streak alarm resolved for task %s after a '
-        '%d-observation streak broke (%d alarm(s), %d wrapper(s))',
+        'Recovery veto streak alarm resolved for task %s: streak broke after '
+        '%d identical veto(es) observed by this process '
+        '(%d alarm(s), %d wrapper(s))',
         task_id, recovered_streak, alarms, wrappers,
     )
     return True
@@ -1223,6 +1272,53 @@ def _is_own_streak_alarm(esc: Any, *, task_id: str, sentinel: str) -> bool:
     if esc.task_id == sentinel:
         return True
     return esc.task_id == task_id and esc.agent_role == RECOVERY_VETO_STREAK_ROLE
+
+
+def inherit_veto_streak_alarms(
+    pending: Iterable[Any],
+    *,
+    filed_at: dict[str, int],
+    tracker: RecoveryVetoStreakTracker,
+    sites: Iterable[RecoverySite],
+) -> frozenset[str]:
+    """Seed a fresh process's memo and tracker from alarms a prior process filed.
+
+    After a restart neither the memo nor the tracker names a task whose alarm
+    is still ``pending``, so the release edge never visits it and the
+    resolver's cheap gate never opens.  The pending queue is the durable
+    record of what was filed.  A task is inherited when a record sits under
+    its sentinel (any level, so a sentinel-bound L2 wrapper counts) or is a
+    real-id echo filed under :data:`RECOVERY_VETO_STREAK_ROLE`; each is seeded
+    in the memo at ``0`` (a live entry keeps its value) and adopted at every
+    site in *sites*.
+
+    The disk record does not say which site charged the alarm, so *sites*
+    must be every charging site some sweep in this process releases: the
+    release then resolves only once all of them have passed without observing
+    the task.  An adopted site that nothing releases would hold the alarm
+    open forever.
+
+    Returns:
+        The real task ids inherited.
+    """
+    subjects = frozenset(
+        subject for esc in pending if (subject := _inherited_subject(esc)) is not None
+    )
+    release_sites = tuple(sites)
+    for task_id in subjects:
+        filed_at.setdefault(task_id, 0)
+        for site in release_sites:
+            tracker.adopt(site, task_id)
+    return subjects
+
+
+def _inherited_subject(esc: Any) -> str | None:
+    subject = _alarm_subject(esc.task_id)
+    if subject is not None:
+        return subject
+    if esc.agent_role == RECOVERY_VETO_STREAK_ROLE:
+        return esc.task_id
+    return None
 
 
 #: How many pinning escalation ids the sweep summary NAMES before it renders

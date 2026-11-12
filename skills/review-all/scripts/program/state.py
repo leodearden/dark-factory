@@ -23,7 +23,7 @@ from typing import Any, NamedTuple, Protocol, TextIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / 'shared' / 'src'))
 
-from shared import mcp_post, task_statuses
+from shared import mcp_post, mcp_unknown_arguments, task_statuses
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[4]
 
@@ -1084,14 +1084,9 @@ def read_rulings(home: Home) -> tuple[Mapping[str, Any], ...]:
 
 MCP_CLIENT_NAME = 'review-all-program'
 _TASK_NOT_FOUND = 'TaskNotFoundError'
-def _undeclared_argument(argument: str) -> re.Pattern[str]:
-    """FastMCP's refusal of an argument its tool does not declare: pydantic's extra_forbidden."""
-    return re.compile(rf'^{re.escape(argument)}\n\s+Extra inputs are not permitted', re.MULTILINE)
-
-
-_CAPABILITY_REFUSALS: Mapping[str, re.Pattern[str]] = types.MappingProxyType({
-    'include_rows': _undeclared_argument('include_rows'),
-})
+#: Arguments the reader sends to probe for a server capability; a server that
+#: refuses one as undeclared lacks the capability (INV-11).
+_CAPABILITY_ARGUMENTS: frozenset[str] = frozenset({'include_rows'})
 FIND_PAGE_LIMIT = 100
 
 
@@ -1221,9 +1216,11 @@ def _raise_for_failure(tool: str, reply: Mapping[str, Any], sent_args: Mapping[s
     if failure is None:
         return
     text, error_type = failure
-    for argument, refusal in _CAPABILITY_REFUSALS.items():
-        if argument in sent_args and refusal.search(text):
-            raise StoreReaderUnsupported(argument, f'{tool} does not declare the argument: {text}')
+    refused = mcp_unknown_arguments.refused_arguments(text)
+    if refused and refused <= _CAPABILITY_ARGUMENTS & set(sent_args):
+        raise StoreReaderUnsupported(
+            ', '.join(sorted(refused)), f'{tool} does not declare the argument: {text}',
+        )
     raise _ToolRefused(tool, text, error_type)
 
 

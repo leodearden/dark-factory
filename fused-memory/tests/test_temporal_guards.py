@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import MockAddEpisodeResult
+from _queued_write_fixtures import queued
 
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+from fused_memory.services.queued_writes import QueuedEpisodeWrite
 
 
 @pytest_asyncio.fixture
@@ -90,7 +92,7 @@ class TestTemporalGuardRoundTrip:
             'source_description': '[temporal:planning] PRD content',
             'temporal_context': 'planning',
         }
-        await svc._execute_graphiti_write('add_episode', payload)
+        await svc._execute_graphiti_write(queued('add_episode', payload))
 
         assert await reg.is_planned(ep_uuid), (
             f'Episode {ep_uuid!r} should be in planned registry after planning write'
@@ -121,7 +123,7 @@ class TestTemporalGuardRoundTrip:
             'source_description': 'observed fact',
             # No temporal_context key
         }
-        await svc._execute_graphiti_write('add_episode', payload)
+        await svc._execute_graphiti_write(queued('add_episode', payload))
 
         assert not await reg.is_planned(ep_uuid), (
             f'Episode {ep_uuid!r} should NOT be in planned registry for non-planning write'
@@ -258,7 +260,7 @@ class TestTemporalGuardRoundTrip:
             'source_description': '[temporal:planning] PRD',
             'temporal_context': 'planning',
         }
-        await svc._execute_graphiti_write('add_episode', payload)
+        await svc._execute_graphiti_write(queued('add_episode', payload))
 
         # Verify registered
         assert await reg.is_planned(ep_uuid)
@@ -325,9 +327,9 @@ class TestBatchPlanAutoTagRoundTrip:
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
         # within this test (mirrors the real dual_write_episode callback path).
-        async def _inline_enqueue(**kwargs):
-            if kwargs.get('operation') == 'add_episode':
-                await svc._execute_graphiti_write('add_episode', kwargs['payload'])
+        async def _inline_enqueue(value, *, callback=None):
+            if isinstance(value, QueuedEpisodeWrite):
+                await svc._execute_graphiti_write(value)
             return 1
 
         svc.durable_queue.enqueue = AsyncMock(side_effect=_inline_enqueue)
@@ -422,9 +424,9 @@ class TestProposedResolutionAutoTagRoundTrip:
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
         # within this test (mirrors the real dual_write_episode callback path).
-        async def _inline_enqueue(**kwargs):
-            if kwargs.get('operation') == 'add_episode':
-                await svc._execute_graphiti_write('add_episode', kwargs['payload'])
+        async def _inline_enqueue(value, *, callback=None):
+            if isinstance(value, QueuedEpisodeWrite):
+                await svc._execute_graphiti_write(value)
             return 1
 
         svc.durable_queue.enqueue = AsyncMock(side_effect=_inline_enqueue)

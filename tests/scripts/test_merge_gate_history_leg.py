@@ -63,6 +63,10 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
     'dashboard/tests/test_tab_tasks_deferral.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
     'dashboard/tests/test_tab_tasks_invariant_chip.py': _PARSES_CACHE_BUSTER_TEXT_ONLY,
+    'escalation/tests/_rebased_landing_git.py': (
+        'every builder takes a caller-built repo root and caps discovery there'
+    ),
+    'escalation/tests/test_merge_status_git_authority.py': _SEEDS_ITS_OWN_REPO,
     'fused-memory/tests/server/test_topic_cluster_store.py': (
         'the match is memory-text prose passed to pytest.param; no git runs'
     ),
@@ -85,6 +89,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_warm_lane_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_info_l0_router_boundary.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_landlock.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_chain_unstack.py': 'GitOps over a tmp_path repo',
     'orchestrator/tests/test_merge_gate_already_on_main.py': _SEEDS_ITS_OWN_REPO,
@@ -98,6 +103,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
     'orchestrator/tests/test_merge_queue.py': 'GitOps over the tmp_path git_repo fixture',
     'orchestrator/tests/test_merge_queue_build_chain.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_merge_queue_chain_intact.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_dispatch.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_merge_queue_deep_landing.py': _SEEDS_ITS_OWN_REPO,

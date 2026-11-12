@@ -161,6 +161,55 @@ class TestPermitLedgerRelease:
         assert ledger.live == frozenset()
 
 
+@pytest.mark.asyncio
+class TestPermitLedgerTryAcquire:
+    """``try_acquire`` takes a free slot without ever waiting (task 8524): a
+    recovery re-merge on the verifier must not block on the merger's slot."""
+
+    async def test_a_free_slot_yields_a_live_token(self) -> None:
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+
+        ledger = PermitLedger(asyncio.Semaphore(2), 2)
+
+        permit = ledger.try_acquire()
+
+        assert permit is not None
+        assert permit.released is False
+        assert permit in ledger.live
+        assert ledger.slot_available == 1
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+    async def test_no_free_slot_yields_none(self) -> None:
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+        held = await ledger.acquire()
+
+        assert ledger.try_acquire() is None
+        assert ledger.live == frozenset({held})
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+    async def test_a_parked_waiter_keeps_the_freed_slot(self) -> None:
+        """A slot freed while the merger waits in ``acquire`` is the merger's."""
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+        held = await ledger.acquire()
+        waiter = asyncio.create_task(ledger.acquire())
+        await asyncio.sleep(0)
+
+        assert ledger.try_acquire() is None
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+        ledger.release(held)
+        assert ledger.try_acquire() is None
+
+        merger_permit = await waiter
+        assert ledger.live == frozenset({merger_permit})
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+        ledger.release(merger_permit)
+
+
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN (task 2161, merge-queue-reliability PRD scope-3
 # theta -- distinct from the older MQ-refactor theta/task 1993

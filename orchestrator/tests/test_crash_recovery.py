@@ -23,6 +23,7 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -54,6 +55,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # restore" safe path (harness.py:1718-1719); all warm-lane RED tests assert
     # restore/preserve, none assert release.
     h.scheduler.get_status = AsyncMock(return_value=None)
+    # These tests model a task still in-progress at crash time, which the
+    # sidecar reaper must keep (plans/session-resume-eligibility-seam-prd.md D7's second conjunct).
+    h.scheduler.get_statuses = AsyncMock(
+        side_effect=lambda ids=None: ({i: 'in-progress' for i in (ids or [])}, None),
+    )
     h.scheduler._dispatched = set()
     # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
     # (module-level, not a Scheduler method — task 2121) directly on
@@ -741,6 +747,34 @@ class TestRecoverCrashedTasks:
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
         assert len(cleanup_calls) == 2
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksEntryIsolation:
+    async def test_one_failing_entry_does_not_stop_the_sweep(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+        wt41 = _setup_worktree(base, '41')
+        wt42 = _setup_worktree(base, '42')
+
+        async def fail_41(entry: Path, task_id: str) -> None:
+            if entry.name == '41':
+                raise OSError('boom')
+
+        cleanup = AsyncMock(side_effect=fail_41)
+        harness.git_ops.cleanup_worktree = cleanup
+
+        with caplog.at_level(logging.ERROR):
+            failures = await harness._recover_crashed_tasks()
+
+        cleaned = {c.args[0] for c in cleanup.await_args_list}
+        assert cleaned == {wt41, wt42}
+        assert isinstance(failures, EntryFailures)
+        assert [(f.entry, f.exception_type) for f in failures.failures] == [('41', 'OSError')]
+        assert any(
+            r.levelno == logging.ERROR and '41' in r.getMessage() for r in caplog.records
+        )
 
 
 

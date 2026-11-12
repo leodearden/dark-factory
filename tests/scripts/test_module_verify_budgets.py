@@ -57,7 +57,7 @@ see drift between. This file now imports ``min_budget``,
 ``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
 ``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
 ``systemd_unit_invariants`` precedent already established in this directory —
-reads ``BudgetCensus`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
+reads ``RULED_BUDGET_CENSUS`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
 ``verify_budget_census_records`` (task 6172), and takes its setup from the
 ``root_config`` / ``discover_module_configs`` / ``executed_for_touched``
 fixtures in ``tests/scripts/conftest.py``. Every guard in the family still
@@ -391,15 +391,6 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
 CENSUS_FLOOR_REFUSAL_CEILING = 7200
 
 
-# Keyed by prefix, like every other justification dict here, so the
-# parametrized branch below stays total rather than special-casing one name.
-# Each record is IMPORTED from tests/scripts/verify_budget_census_records.py,
-# its single home, which test_fallback_verify_config.py reads too.
-RULED_BUDGET_CENSUS: dict[str, census_records.BudgetCensus] = {
-    'orchestrator': census_records.ORCHESTRATOR_BUDGET_CENSUS,
-}
-
-
 # RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
 # the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
 # MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
@@ -605,7 +596,7 @@ def test_module_carries_its_own_measured_verify_budget(
         # something. root_warm is operator-tunable and currently sits ON this
         # module's ruled figure; the floor that actually holds the budget up
         # is the measurement assertion below, not this one.
-        census = RULED_BUDGET_CENSUS[prefix]
+        census = census_records.RULED_BUDGET_CENSUS[prefix]
 
         # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
         # feeds, because a straddling window makes every figure below describe
@@ -1770,19 +1761,40 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
 
 
 def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
-    """The excepted branch reads the ONE census record, not a local copy of it.
+    """The ruled table's entry IS the record the fleet table reads, not a re-literalised copy.
 
-    Task 6172. ``RULED_BUDGET_CENSUS`` and
+    Task 6172. ``verify_budget_census_records.py::RULED_BUDGET_CENSUS`` and
     ``test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`` both consume
-    task 3353's orchestrator census. Asserted by IDENTITY rather than equality:
-    a re-introduced local copy carrying equal values today is exactly the drift
+    task 3353's orchestrator census through ``ORCHESTRATOR_BUDGET_CENSUS``.
+    Asserted by IDENTITY rather than equality: a second ``BudgetCensus(...)``
+    literal inside the table, carrying equal values today, is exactly the drift
     a single home exists to prevent, and equality would pass it.
     """
-    assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
-        "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
+    ruled = census_records.RULED_BUDGET_CENSUS['orchestrator']
+    assert ruled is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+        "tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS"
+        "['orchestrator'] is not the record at "
         'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
         '(task 6172). That record is the single home the fleet table also reads; '
-        'import it, never copy it'
+        'reference it, never copy it'
+    )
+
+
+def test_the_ruled_census_table_and_the_ruled_exceptions_name_the_same_modules() -> None:
+    """The census report and this gate pick the D17 modules from one key set.
+
+    Task 7929.
+    """
+    census_keys = set(census_records.RULED_BUDGET_CENSUS)
+    exception_keys = set(RULED_INTERIM_BUDGET_EXCEPTIONS)
+    assert census_keys == exception_keys, (
+        'tests/scripts/verify_budget_census_records.py::RULED_BUDGET_CENSUS and '
+        'tests/scripts/test_module_verify_budgets.py::RULED_INTERIM_BUDGET_EXCEPTIONS '
+        f'name different modules: {sorted(census_keys ^ exception_keys)} (task 7929). '
+        'scripts/verify_budget_census.py decides which modules get the D17 census '
+        'floor from RULED_BUDGET_CENSUS, while this gate branches on '
+        'RULED_INTERIM_BUDGET_EXCEPTIONS, so the census report would state one '
+        'floor while the gate enforces another'
     )
 
 

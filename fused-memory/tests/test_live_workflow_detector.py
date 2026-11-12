@@ -16,7 +16,7 @@ import pytest
 # RED in step-1: module does not exist yet; import will fail until step-2.
 from _fm_helpers import as_async_run_git as _as_async_run_git
 from shared.scheduler_state import SchedulerStateSnapshot
-from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, carries_claimant
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
@@ -1100,6 +1100,11 @@ def _awaiting_task(**overrides: object) -> dict:
     return task
 
 
+# Claimant values covering None, blank strings, a non-str value and a real id;
+# the detector must read them as shared.task_claimant.carries_claimant does.
+_CLAIMANT_SHAPES = [None, '', '   ', '\t\n', 0, 'run-x/y/pid=1']
+
+
 class TestIsUnclaimedAwaitingDependency:
     """is_unclaimed_awaiting_dependency: positive evidence that a task has no claimant,
     no heartbeat and at least one local dependency the scheduler cannot count satisfied.
@@ -1177,6 +1182,13 @@ class TestIsUnclaimedAwaitingDependency:
     def test_int_and_str_dep_ids_match_the_string_key(self, dep_id):
         task = _awaiting_task(dependencies=[dep_id])
         assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is True
+
+    @pytest.mark.parametrize('claimant', _CLAIMANT_SHAPES)
+    def test_no_claimant_reading_is_the_shared_one(self, claimant):
+        task = _awaiting_task(claimant_run_id=claimant)
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) == (
+            not carries_claimant({'claimant_run_id': claimant})
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2155,13 @@ class TestClaimantLabel:
 
     def test_empty_task_is_none(self):
         assert self._label({}) is ClaimantLabel.NONE
+
+    @pytest.mark.parametrize('claimant', _CLAIMANT_SHAPES)
+    def test_none_label_follows_the_shared_reading(self, claimant):
+        label = self._label({'claimant_run_id': claimant, 'heartbeat_at': None})
+        assert (label is ClaimantLabel.NONE) == (
+            not carries_claimant({'claimant_run_id': claimant})
+        )
 
     @pytest.mark.parametrize('unreadable', [None, 'task 3254'])
     def test_unreadable_task_is_unknown_never_none(self, unreadable: object):

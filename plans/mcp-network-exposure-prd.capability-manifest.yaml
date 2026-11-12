@@ -167,8 +167,9 @@ tasks:
     binding: behaviour — after the stop/start, scripts/check_network_exposure.py exits 0 on the workstation (refused on 192.168.1.105 / 100.107.28.56 / global IPv6 for 8002, 8003, 8103, 81xx, 6379, 6333, 6334; accepted on 127.0.0.1).
     verdict: PASS
     delivered_check:
-      kind: manual
-      reason: scripts/check_network_exposure.py is produced by α and absent on main, so a delivered_check that execs it would ERROR forever (shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets); the deploy runs the probe and the runner stamps the result
+      kind: script
+      script: scripts/check_network_exposure.py
+      timeout_secs: 60
   - name: fused-memory-restarted-on-new-socket-unit
     binding: capability→producer — DeterministicRunner verifies a fresh MainPID/ActiveEnterTimestamp on fused-memory.service (docs/task-authoring.md section 5) and stamps done_provenance.kind deterministic-deploy.
     verdict: PASS

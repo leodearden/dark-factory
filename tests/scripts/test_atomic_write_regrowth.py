@@ -327,13 +327,6 @@ _ALLOWED_RENAMERS = {
         'This is NOT a blanket \'scripts/ cannot import shared\': '
         'scripts/legibility/census.py does exactly that, via a '
         '__file__-relative sys.path insert.',
-    ('scripts/legibility/census.py', 'advance_census_state'):
-        'Out of task 3223 enumerated scope; left alone deliberately. '
-        'mkstemp(prefix=\'.census-state-\') + os.replace. This module is '
-        'census-state.json\'s SOLE writer, so a migration must keep the '
-        'always-present ``last_census_done_count`` key — serialised as JSON '
-        'null when the count could not be observed, never omitted as falsy — '
-        'which is what lets zeta\'s compute_tasks_landed fail safe.',
     ('scripts/legibility/codebook.py', 'dump'):
         'Out of task 3223 enumerated scope; left alone deliberately. '
         'mkstemp(prefix=\'.codebook-\') + os.replace of a canonical '

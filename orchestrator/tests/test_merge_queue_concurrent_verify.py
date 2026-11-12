@@ -71,12 +71,14 @@ from _wait_hygiene_scan import (
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.types import QueuedBranch, RemergeBase, RemergeReason
 from orchestrator.merge_lane.verify_cancellation import VerifyCancel, VerifyCancelCause
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
+    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify import VerifyResult
@@ -139,6 +141,37 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
+
+
+RemergeCall = tuple[str, RemergeClaim, SpeculativeItem]
+
+
+def _record_remerges(
+    worker: SpeculativeMergeWorker, monkeypatch: pytest.MonkeyPatch,
+) -> list[RemergeCall]:
+    """Wrap the worker's re-merge to record each call's task id, claim and
+    replacement (task 8524); the re-merge itself runs unchanged."""
+    calls: list[RemergeCall] = []
+    original = worker._remerge
+
+    async def _recording(
+        req: MergeRequest, started: float | None, *, claim: RemergeClaim,
+    ) -> SpeculativeItem:
+        out = await original(req, started, claim=claim)
+        calls.append((req.task_id, claim, out))
+        return out
+
+    monkeypatch.setattr(worker, '_remerge', _recording)
+    return calls
+
+
+def _one_remerge(
+    calls: list[RemergeCall], task_id: str,
+) -> tuple[RemergeClaim, SpeculativeItem]:
+    """The single re-merge of *task_id*: its claim and its replacement."""
+    mine = [(claim, out) for tid, claim, out in calls if tid == task_id]
+    assert len(mine) == 1, calls
+    return mine[0]
 
 
 # THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
@@ -2224,6 +2257,7 @@ class TestChainInvalidationUnderOverlap:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """N's local verify fails; N+1's remote verify is aborted and re-verified.
 
@@ -2262,6 +2296,7 @@ class TestChainInvalidationUnderOverlap:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, gated_remote)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2325,6 +2360,13 @@ class TestChainInvalidationUnderOverlap:
             'GREEN (step-20): head-failure cascade clears _inflight, '
             're-dispatches N+1 via the redispatch park → "done".'
         )
+        # The head failed and the cascade cleared _inflight, so no live tip
+        # was left: N+1's replacement fell to main, holding no permit, with
+        # the reason on the item (plans/merge-lane-policy-prd.md D1).
+        claim, replacement = _one_remerge(remerges, 'ci-b')
+        assert claim.anchor.tip is None and claim.permit is None, claim
+        assert replacement.remerge_base == claim.anchor
+        assert replacement.speculative is False
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
         # Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
@@ -2450,10 +2492,10 @@ class TestChainInvalidationUnderOverlap:
         mid_remerge_state: list[Any] = []
         original_remerge = worker._remerge
 
-        async def _spying_remerge(req_: Any, started: Any) -> Any:
+        async def _spying_remerge(req_: Any, started: Any, claim: Any = None) -> Any:
             if req_.request_id == req_b.request_id:
                 mid_remerge_state.append(worker._lifecycle.current(req_b.request_id))
-            return await original_remerge(req_, started)
+            return await original_remerge(req_, started, claim=claim)
 
         worker._remerge = _spying_remerge  # type: ignore[method-assign]
 
@@ -2623,9 +2665,9 @@ class TestHaltAndUnavailable:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
@@ -2679,6 +2721,7 @@ class TestHaltAndUnavailable:
         git_repo: Path,
         git_config: GitConfig,
         config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """RUNNER_UNAVAILABLE mid-overlap: host quarantined, item re-dispatched on LOCAL.
 
@@ -2725,6 +2768,7 @@ class TestHaltAndUnavailable:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q, verifier=verifier)
         _inject_two_host_allocator(worker, dead_remote)
+        remerges = _record_remerges(worker, monkeypatch)
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -2768,6 +2812,13 @@ class TestHaltAndUnavailable:
                 req_b.result,
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
+            # N had landed by N+1's finalize, so nothing was left to stack on:
+            # N+1's replacement fell to main and its permit was freed, not
+            # carried (plans/merge-lane-policy-prd.md D1).
+            claim, replacement = _one_remerge(remerges, 'unav-b')
+            assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
+            assert claim.permit is None and replacement.permit is None
+            assert worker.speculation_accounting_violations() == []
         finally:
             await stop_merge_worker(worker, worker_task)
 
@@ -4080,13 +4131,13 @@ class TestCascadeErrorContainment:
         # Simulates merge_to_main → _create_merge_worktree failing under ENOSPC.
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'cas-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/cas-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 

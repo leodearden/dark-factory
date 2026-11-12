@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _curator_fake import FakeCurator
+from _info_l0_router_fixtures import disposition_rows, reaper_harness, router_reaper_config
 from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -38,27 +39,12 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     """A real Harness over a real queue and event store; only the reaper and
     the amnesty are driven, so ``Harness.start()`` is bypassed and the
     scheduler is a mock whose ``dispatch_tool`` is the curator double."""
-    mock_orch_config.orphan_l0_reaper_enabled = True
-    mock_orch_config.orphan_l0_timeout_secs = 60.0
-    mock_orch_config.orphan_l0_check_interval_secs = 1.0
-    mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
-    mock_orch_config.info_l0_router_enabled = True
-    mock_orch_config.info_l0_router_ticket_timeout_secs = TICKET_TIMEOUT_SECS
-    mock_orch_config.info_l0_router_max_conversions_per_sweep = 20
-
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        h = Harness(mock_orch_config)
-
-    h.scheduler.is_actively_held = MagicMock(return_value=False)
-    h.scheduler.get_task = AsyncMock(return_value={'status': 'in-progress', 'metadata': {}})
-    h.scheduler.dispatch_tool = FakeCurator()
-    h.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
-    h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
-    return h
+    return reaper_harness(
+        router_reaper_config(mock_orch_config, ticket_timeout_secs=TICKET_TIMEOUT_SECS),
+        EscalationQueue(tmp_path / 'escalations'),
+        curator=FakeCurator(),
+        event_store=EventStore(tmp_path / 'runs.db', run_id='run-test'),
+    )
 
 
 def _queue(harness: Harness) -> EscalationQueue:
@@ -123,12 +109,6 @@ def _aggregates(harness: Harness, sentinel: str) -> list[Escalation]:
     ]
 
 
-def _dispositions(harness: Harness) -> list[dict]:
-    store = harness.event_store
-    assert store is not None
-    return [row['data'] for row in store.fetch_events_by_type(EventType.info_l0_dispositioned)]
-
-
 @pytest.mark.asyncio
 class TestReaperFinishesHolds:
     async def test_a_created_ticket_converts_the_held_record(self, harness: Harness):
@@ -183,36 +163,8 @@ class TestReaperFinishesHolds:
         assert [e for e in _queue(harness).get_pending() if e.level == 1] == []
 
 
-def _seed_storm(harness: Harness, first_task: int, n: int) -> list[Escalation]:
-    """*n* aged starvation-watchdog notes; durable writes are not under test here."""
-    with patch('os.fsync'):
-        return [
-            _submit_aged(harness, str(first_task + i), agent_role=STARVATION, category='infra_issue')
-            for i in range(n)
-        ]
-
-
 @pytest.mark.asyncio
 class TestReaperRoutesInfoOrphans:
-    async def test_a_mechanical_storm_closes_status_info_under_one_aggregate(self, harness: Harness):
-        harness.event_store = None  # 489 durable event commits cost seconds and are not under test
-        storm = _seed_storm(harness, 10_000, 489)
-
-        await harness._reap_orphan_l0_escalations()
-
-        assert all(_current(harness, e.id).resolution_class == 'status-info' for e in storm)
-        (aggregate,) = _aggregates(harness, status_info_sentinel(STARVATION))
-        assert all(e.id in aggregate.detail for e in storm)
-        assert _l1s(harness, agent_role='harness-orphan-reaper') == []
-        assert _curator(harness).calls == []
-
-        later = _seed_storm(harness, 20_000, 3)
-        await harness._reap_orphan_l0_escalations()
-
-        (still,) = _aggregates(harness, status_info_sentinel(STARVATION))
-        assert still.id == aggregate.id
-        assert all(e.id in still.amendments[-1]['detail'] for e in later)
-
     async def test_the_curator_candidate_names_the_subject_status(self, harness: Harness):
         harness.scheduler.get_task = AsyncMock(return_value={'status': 'done', 'metadata': {}})
         _submit_aged(harness, '42')
@@ -232,7 +184,7 @@ class TestReaperRoutesInfoOrphans:
         assert held.status == 'pending'
         hold = read_hold(held)
         assert hold is not None and hold.ticket == 'tkt_1'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('convert-pending', 'orphan-reaper', 'orphan')
 
     async def test_an_open_l1_of_another_category_does_not_swallow_an_info_note(
@@ -268,7 +220,7 @@ class TestReaperRoutesInfoOrphans:
         after = _current(harness, esc.id)
         assert (after.status, after.triaged_by) == ('pending', None)
         assert _curator(harness).calls == []
-        assert _dispositions(harness) == []
+        assert disposition_rows(harness.event_store) == []
 
     async def test_an_eval_lane_info_note_is_still_dismissed_by_the_eval_rule(self, harness: Harness):
         esc = _submit_aged(harness, '2339', worktree=EVAL_WORKTREE)
@@ -372,7 +324,7 @@ class TestStartupAmnestyRoutesInfoNotes:
         assert (held.status, held.resolved_by) == ('pending', None)
         hold = read_hold(held)
         assert hold is not None and hold.ticket == 'tkt_1'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['by'], row['exit_kind']) == ('convert-pending', 'startup-amnesty', 'restart')
         assert _strand_events(harness) == []
 
@@ -395,7 +347,7 @@ class TestStartupAmnestyRoutesInfoNotes:
         await harness._dismiss_stale_escalations()
 
         assert _current(harness, esc.id).resolution_class == 'converted'
-        (row,) = _dispositions(harness)
+        (row,) = disposition_rows(harness.event_store)
         assert (row['class'], row['exit_kind']) == ('converted', 'restart')
 
     async def test_an_undecided_hold_from_before_the_restart_stays_pending(self, harness: Harness):
@@ -446,4 +398,4 @@ class TestStartupAmnestyRoutesInfoNotes:
                 'dismissed', 'auto-dismissed',
             )
         assert _curator(harness).calls == []
-        assert _dispositions(harness) == []
+        assert disposition_rows(harness.event_store) == []

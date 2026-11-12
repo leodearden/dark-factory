@@ -75,6 +75,7 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import ACTIVE
 from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
@@ -104,11 +105,15 @@ from fused_memory.middleware.curator_types import (
     PreparedCandidate,
     RewrittenTask,
     clip_for_prompt,
+    declared_scope_of,
     embedding_text,
     empty_pool_sizes,
     exception_summary,
-    is_combine_eligible_status,
+    is_combine_eligible,
+    item_count_of,
+    render_declared_scope,
 )
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.operational_ask_registry import load_operational_registry
 from fused_memory.middleware.operational_ask_registry import (
     match_candidate as match_operational_ask,
@@ -448,15 +453,18 @@ _CURATOR_HEURISTICS = """\
    to the lock set, refuse and "create" instead.
 3. Planning budget. The rewritten task can be planned by one architect in one \
    session: ≤ 15 files_to_modify, ≤ 5 distinct concerns at bullet level, combined \
-   details under ~8000 chars.
+   details under ~8000 chars. Each follow-up item a task carries (its \
+   followup_items count, or its listed items) is one concern toward that ≤ 5.
 4. No critical-path drag. If the target is high-priority and on a milestone critical \
    path, the candidate must itself be critical or tightly coupled to the target's \
    correctness. Do NOT weigh critical work down with adjacent nice-to-haves.
 
 ## Positive signals (bias toward combining when the above hold)
 
-- Either task alone is tiny (< 300 chars of real detail, or < 3 files). Tiny tasks \
-  have orchestrator overhead disproportionate to the work delivered.
+- Either task's declared-scope band is `narrow` (shown as `declared_scope: narrow` \
+  or `band=narrow`): it declared small work when it was filed, so its orchestrator \
+  overhead is disproportionate to the work. The band says what a task declared, not \
+  what it will cost, and an `unstamped` band carries no information either way.
 - The two tasks share a root cause or subsystem concept — fixing both together \
   means the implementer loads context once.
 - They will serialize on the same module lock anyway (scheduler already serializes \
@@ -687,6 +695,8 @@ def _render_candidate_section(
         lines.append(f'  details: {clip_for_prompt(candidate.details, details_cap)}')
     if candidate.files_to_modify:
         lines.append('  files_to_modify: ' + ', '.join(candidate.files_to_modify))
+    lines.append(f'  declared_scope: {render_declared_scope(candidate.declared_scope)}')
+    lines.append(f'  followup_items: {len(candidate.items)}')
     lines.append('')
 
     lines.append(f'# {headings.pool} ({len(pool)} tasks)')
@@ -2738,6 +2748,9 @@ class TaskCurator:
     ) -> PoolEntry | None:
         """Fetch a full task for an embedding neighbour or a sibling, falling back to *payload*.
 
+        The fallback is for an inconclusive read only: a row that was read and
+        that ``_to_pool_entry`` rejects (a follow-up holder) is excluded.
+
         ``get_task`` is called without a ``tag`` — it resolves to
         ``DEFAULT_TAG``. That does NOT match the Qdrant corpus's own scope:
         the corpus is keyed by ``project_id`` ALONE (see the tag-scope
@@ -2759,9 +2772,7 @@ class TaskCurator:
         if self._taskmaster is not None:
             try:
                 task = await self._taskmaster.get_task(tid, project_root)
-                entry = _to_pool_entry(task, source=source, lock_depth=lock_depth)
-                if entry is not None:
-                    return entry
+                return _to_pool_entry(task, source=source, lock_depth=lock_depth)
             except TaskNotFoundError:
                 # Zero-row absence under DEFAULT_TAG: usually the task was
                 # removed and this Qdrant point is an orphan, but it also
@@ -2773,7 +2784,7 @@ class TaskCurator:
                 return None
             except Exception:
                 # Inconclusive (e.g. TASKMASTER_UNAVAILABLE, a raw driver
-                # error, or _to_pool_entry rejecting a malformed task): bias
+                # error, or _to_pool_entry raising on a malformed task): bias
                 # to the cheap failure and keep the conservative thin entry
                 # built below, rather than risk dropping a live candidate.
                 pass
@@ -3359,23 +3370,11 @@ _SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'
 _SIBLING_LOOKUP_PAGE = 100
 
 
-def _spawned_from_id(value: object) -> str | None:
-    """The parent id a ``spawned_from`` value names, or ``None`` when it names none.
-
-    The live store holds str, int and dict values; only the first two name a task.
-    """
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return None
-
-
 def _followup_parent_id(candidate: CandidateTask) -> str | None:
     """The parent whose follow-ups form *candidate*'s sibling stream, if it has one."""
     if candidate.spawn_context != _SIBLING_STREAM_SPAWN_CONTEXT:
         return None
-    return _spawned_from_id(candidate.spawned_from)
+    return candidate.spawned_from
 
 
 def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
@@ -3390,13 +3389,14 @@ def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
 def _to_pool_entry(
     task: dict | None, *, source: str, lock_depth: int,
 ) -> PoolEntry | None:
-    if not task or not isinstance(task, dict):
+    if not task or not isinstance(task, dict) or is_holder(task):
         return None
     tid = str(task.get('id', ''))
     if not tid:
         return None
     status = str(task.get('status', 'unknown'))
     files = _task_files(task)
+    metadata = coerce_task_metadata(task.get('metadata')) or {}
     return PoolEntry(
         task_id=tid,
         title=str(task.get('title', '')),
@@ -3407,7 +3407,9 @@ def _to_pool_entry(
         status=status,
         priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
-        combine_eligible=is_combine_eligible_status(status),
+        combine_eligible=is_combine_eligible(task),
+        item_count=item_count_of(metadata),
+        declared_scope=declared_scope_of(metadata),
     )
 
 

@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypedDict, get_args
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
@@ -26,11 +26,14 @@ from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FollowupBundleInvalid,
     FollowupItem,
-    read_items,
+    merge_items,
+    task_items,
     with_derived_bundle_keys,
 )
+from shared.git_async import GitResult, run_git
 from shared.mcp_envelope import write_failure_reason
-from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
+from shared.task_metadata import DoneProvenance
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
@@ -54,13 +57,11 @@ from fused_memory.backends.task_backend_errors import (
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
-    TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import (
     AmendmentAdvisory,
     MetadataLookupResult,
-    MetadataLookupRow,
 )
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
@@ -79,12 +80,14 @@ from fused_memory.middleware.curation_deferral import (
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_types import (
-    NON_CANCELLED_STATUSES,
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
+    declared_scope_of,
     exception_summary,
-    is_combine_eligible_status,
+    followup_items_of,
+    is_combine_eligible,
+    spawned_from_of,
 )
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
@@ -97,6 +100,7 @@ from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_PROVENANCE_KINDS,
     resolve_deterministic_provenance_authorization,
 )
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -106,12 +110,14 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
-
-# NOTE: safe top-level import — operational_routing_guard has NO top-level
-# task_interceptor import (it lazily imports TaskInterceptor inside its
-# function to break the cycle), so this does not create a circular import.
+from fused_memory.middleware.metadata_dict import (
+    extract_metadata_dict,
+    fresh_metadata_copy,
+    raw_metadata_dict,
+)
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
+    pure_gate_routing_notice,
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
@@ -123,6 +129,13 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.r4_idempotency import (
+    DroppedItem,
+    R4Lookup,
+    R4Verdict,
+    check_r4,
+    metadata_keeping,
+)
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcome,
@@ -186,22 +199,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not resolve any dict at all.
-# Only these are loud from the read-path parsers below; 'unknown_key' /
-# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
-# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
-# and belong to the write boundary (W3-β's _emit_schema_warning census),
-# not these read-path helpers — emitting them here would flood the
-# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
-# for zero lines against schema-clean metadata.
-_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
-
 # The escalation-gate stamp, named once so the writers stay greppably
 # coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
 # (the declared execution_class='operational'|'decision' boundary coercion)
-# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
-# route_deterministic fallback), which between them set every key below.
+# and ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (via the
+# curator's route_deterministic fallback), which between them set every key below.
 #
 # NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
 # does NOT consult this constant — its gate predicate is deliberately
@@ -226,28 +228,6 @@ class _CombineRewrite(TypedDict):
     details: str
 
 
-def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
-
-    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
-    readable metadata, and ``(None, warnings)`` for present-but-unreadable
-    metadata. *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
-    its ``unparseable_json`` / ``not_an_object`` codes cover every value
-    ``coerce_task_metadata`` rejects, so the list is never empty.
-
-    ``parse_metadata`` runs only on that failure path, for its diagnosis.
-    The returned dict is never ``parse_metadata(...).model_dump()``, so
-    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
-    gaining ``TaskMetadata``'s typed-field defaults.
-    """
-    meta = coerce_task_metadata(metadata)
-    if meta is not None:
-        return meta, []
-    _, warnings = parse_metadata(metadata, direction='read')
-    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-
-
 def _has_branch_base_sha(metadata: Any) -> bool:
     """True when *metadata* records a non-blank ``branch_base_sha``.
 
@@ -255,20 +235,9 @@ def _has_branch_base_sha(metadata: Any) -> bool:
     (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
     Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
     """
-    meta, _warnings = _parse_metadata_value(metadata)
+    meta = coerce_task_metadata(metadata)
     sha = (meta or {}).get('branch_base_sha')
     return isinstance(sha, str) and sha.strip() != ''
-
-
-def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
-    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
-    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
-    logger.warning(
-        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
-        source,
-        reason,
-        type(metadata).__name__,
-    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -300,9 +269,9 @@ def _resolve_backend_label(taskmaster: Any) -> str:
     return 'unknown'
 
 
-# Terminal statuses the server refuses to exit without a reopen_reason.
-# Re-exported from shared.task_statuses (PRD task-status-authority C1/C2) —
-# the single source of truth, imported above as TERMINAL_STATUSES.
+# Terminal statuses the server refuses to exit without a reopen_reason:
+# shared.task_statuses.TERMINAL (PRD task-status-authority C1/C2), the single
+# source of truth, imported above as TERMINAL_STATUSES.
 #
 # 'merge-deferred' is deliberately NOT in this set — a property of
 # shared.TERMINAL, not this module. It is a non-terminal holding state for
@@ -319,9 +288,6 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # rather than imported, since the interceptor only ever forwards these values
 # and never compares them to the backend's sentinel.
 _UNSET = object()
-
-# One R4 lookup page; a suggestion_hash shared past it is paged, not missed.
-_R4_LOOKUP_PAGE = 100
 
 
 def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
@@ -372,37 +338,8 @@ def _claimant_exception_entry(
     }
 
 
-def _is_ticket_id(value: object) -> bool:
-    """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
-    return isinstance(value, str) and value.startswith('tkt_')
-
-
 class TicketStoreNotConfiguredError(RuntimeError):
     """Raised by a read that needs the ticket store when the interceptor has none."""
-
-
-def _looks_like_task_id(value: object) -> bool:
-    """Return True when *value* parses as a non-negative integer task id.
-
-    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
-    trimmed). Rejects empty strings, negatives, and non-numeric strings.
-
-    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
-    task id that came back from ``submit_task(planning_mode=True)`` — the
-    planning-mode path returns the id synchronously, so the two-step
-    submit/resolve dance does not apply, but agents may still call it blindly.
-    """
-    if isinstance(value, bool):
-        # bool is a subclass of int in Python; reject explicitly.
-        return False
-    if isinstance(value, int):
-        return value >= 0
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return False
-        return stripped.isdigit()
-    return False
 
 
 @dataclasses.dataclass
@@ -431,6 +368,25 @@ class _PreparedTicket:
     candidate: CandidateTask | None
     prepared: PreparedCandidate | None
     attribution: CreationAttribution
+    r4_dropped: tuple[DroppedItem, ...] = ()
+
+    def keeping(self, verdict: R4Verdict) -> '_PreparedTicket':
+        """This ticket filing only the verdict's kept items, carrying what R4 dropped."""
+        candidate = (
+            None if self.candidate is None
+            else dataclasses.replace(self.candidate, items=verdict.kept)
+        )
+        prepared = (
+            None if self.prepared is None or candidate is None
+            else dataclasses.replace(self.prepared, candidate=candidate)
+        )
+        return dataclasses.replace(
+            self,
+            metadata=metadata_keeping(coerce_task_metadata(self.metadata) or {}, verdict),
+            candidate=candidate,
+            prepared=prepared,
+            r4_dropped=verdict.dropped,
+        )
 
     @property
     def prompt_tokens(self) -> int:
@@ -630,19 +586,6 @@ def _with_derived_bundle_keys(metadata: Any) -> Any:
     return with_derived_bundle_keys(readable)
 
 
-def _candidate_items(meta: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
-    """The candidate's follow-up items; () with a census line when a stored list is malformed."""
-    try:
-        return read_items(meta)
-    except FollowupBundleInvalid as exc:
-        logger.warning(
-            'task_metadata.schema_warning source=%s error=%s; candidate items discarded',
-            '_candidate_items',
-            exc,
-        )
-        return ()
-
-
 class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
 
@@ -672,8 +615,11 @@ class TaskInterceptor:
         path_scope_adjudicator: 'PathScopeAdjudicator | None' = None,
         curator: TaskCurator | None = None,
         proc_root: Path = process_identity.PROC_ROOT,
+        git_runner: 'GitProbeRunner' = run_git,
     ):
         self.taskmaster = taskmaster
+        # Runs the done-provenance git probes (see _git_probe).
+        self._git_runner = git_runner
         # Where the deferral gate reads a held_by_session holder's /proc entries.
         self._proc_root = proc_root
         self.reconciler = targeted_reconciler
@@ -974,7 +920,10 @@ class TaskInterceptor:
         scroll = self._consolidation_scroll
         if scroll is None:
             return None
-        meta = self._extract_metadata_dict(before.get('metadata') if isinstance(before, dict) else None)
+        meta = extract_metadata_dict(
+            before.get('metadata') if isinstance(before, dict) else None,
+            source='TaskInterceptor._consolidation_closure_error',
+        )
         if not meta or meta.get('operational_mode') != 'gate':
             return None
         block = meta.get(GATE_METADATA_KEY)
@@ -1752,6 +1701,7 @@ class TaskInterceptor:
                         is_recon_stage=is_recon_stage_write,
                         agent_id=agent_id,
                         config=self._config,
+                        git_runner=self._git_runner,
                     )
                     # This seam had NO journal row at all before 5241: a
                     # repair of an already-`done` task was invisible to the
@@ -1873,6 +1823,7 @@ class TaskInterceptor:
                     is_recon_stage=is_recon_stage_write,
                     agent_id=agent_id,
                     config=self._config,
+                    git_runner=self._git_runner,
                 )
                 if validation_err is not None:
                     # Task 5241: the done-provenance VERDICT is journaled with
@@ -1913,6 +1864,7 @@ class TaskInterceptor:
                     agent_id,
                     is_recon_stage_write,
                     self._reject_stale_done_evidence_mode(),
+                    git_runner=self._git_runner,
                 )
                 if _reopen_freshness_err is not None:
                     return _reopen_freshness_err
@@ -2536,17 +2488,11 @@ class TaskInterceptor:
         callers such as :meth:`_extract_meta_files` and
         :meth:`_build_candidate` can read keys without additional guarding.
 
-        The absent/readable/unreadable rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`. Unreadable metadata emits a
-        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
-        — I4: this replaces a silent ``{}`` coercion.
+        Resolved by ``fused_memory/middleware/metadata_dict.py::raw_metadata_dict``,
+        so unreadable metadata emits a ``task_metadata.schema_warning`` WARNING
+        before collapsing to ``{}`` — I4: this replaces a silent ``{}`` coercion.
         """
-        metadata = kwargs.get('metadata')
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
-        return parsed if parsed is not None else {}
+        return raw_metadata_dict(kwargs.get('metadata'), source='TaskInterceptor._parse_metadata')
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -2699,10 +2645,11 @@ class TaskInterceptor:
             details=str(kwargs.get('details') or ''),
             files_to_modify=files,
             priority=str(kwargs.get('priority') or 'medium'),
-            spawned_from=meta.get('spawned_from'),
+            spawned_from=spawned_from_of(meta),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
-            items=_candidate_items(meta),
+            items=followup_items_of(meta),
+            declared_scope=declared_scope_of(meta),
         )
 
     def _files_scope_check(
@@ -3493,6 +3440,8 @@ class TaskInterceptor:
         project_root: str,
         decision: CuratorDecision,
         *,
+        candidate: CandidateTask,
+        ticket_id: str,
         candidate_metadata: Any = None,
     ) -> dict | None:
         """Apply a curator combine decision to the target task.
@@ -3500,17 +3449,26 @@ class TaskInterceptor:
         Returns the update_task result on success, None on failure (caller
         falls back to create). Combine is implemented via Taskmaster's
         ``update_task``, writing the curator's rewrite as structured fields
-        and MERGING a three-key combine marker into the target's existing
-        metadata blob (``metadata_mode='merge'``) — it does not replace that
-        blob. See the comment at the write for why (task 3446).
+        and MERGING the combine's keys into the target's existing metadata
+        blob (``metadata_mode='merge'``) — it does not replace that blob. See
+        the comment at the write for why (task 3446). Those keys are the three
+        ``curator_*`` markers, the ``declared_scope`` re-stamped from the
+        rewrite (``basis='combine'``, the one sanctioned re-stamp, written
+        backend-direct), and ``followup_items``: the order-preserving union of
+        the target's and the candidate's items, written when non-empty. It
+        never writes ``metadata.files``. A malformed stored bundle on either
+        side aborts, unaudited, a combine every other guard would let
+        through; an eligibility refusal of that target is still audited, with
+        no items recorded.
 
         Before writing, verifies the decision found its target and that the
         target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
         fingerprint (curator targeted the wrong task) aborts first, so a
         misdirected decision can never be recorded as an eligibility refusal
         against a row it never meant. Eligibility is then the shared
-        ``is_combine_eligible_status`` (task_curator) — the same predicate the
-        curator's selection snapshot uses, so the two cannot drift apart —
+        ``curator_types.is_combine_eligible`` — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart, and
+        a follow-up holder refuses under its own token (``target_is_holder``) —
         conjoined with an execution-only check the snapshot cannot make: a
         target carrying a ``claimant_run_id`` stamp is refused even when its
         status is pending (task 4035). That conjunct tests only for a present,
@@ -3525,8 +3483,9 @@ class TaskInterceptor:
         token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
-        declaring an escalation gate while the live target does not. The
-        candidate's own metadata is never written anywhere by this path, so
+        declaring an escalation gate while the live target does not. Apart
+        from its follow-up items, the candidate's own metadata is never
+        written anywhere by this path, so
         such a combine would silently strip a human decision gate — the
         target-side ``'merge'`` above cannot help. Refusing degrades to
         ``create``, which files the gate as its own task (task 3446).
@@ -3587,9 +3546,23 @@ class TaskInterceptor:
             )
             return None
 
+        target_metadata = target.get('metadata')
+        target_meta = coerce_task_metadata(target_metadata)
+        candidate_meta = (
+            extract_metadata_dict(candidate_metadata, source='TaskInterceptor._execute_combine') or {}
+        )
+        audit_context, items_after = _combine_fold(
+            decision,
+            ticket_id=ticket_id,
+            target_title=target_title,
+            target_meta=target_meta or {},
+            candidate=candidate,
+            candidate_meta=candidate_meta,
+        )
+
         # ── Guard: the target must still be combine-ELIGIBLE right now ──
-        # Shared with the curator's selection snapshot (task_curator's
-        # is_combine_eligible_status) so the two cannot drift apart again —
+        # Shared with the curator's selection snapshot (curator_types'
+        # is_combine_eligible) so the two cannot drift apart again —
         # the hand-copied `status == 'pending'` that used to live here as
         # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
         # that had moved on since selection (task 4035).
@@ -3610,16 +3583,16 @@ class TaskInterceptor:
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
 
-        # Single read shared by the eligibility chain and the gate guard.
-        target_metadata = target.get('metadata')
-
-        if not is_combine_eligible_status(target_status):
-            refused_reason = COMBINE_REFUSED_NOT_PENDING
+        if not is_combine_eligible(target):
+            refused_reason = (
+                COMBINE_REFUSED_HOLDER if is_holder(target) else COMBINE_REFUSED_NOT_PENDING
+            )
             logger.warning(
-                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'combine-guard: target %s is not combine-eligible (status=%r, %s) — '
                 'aborting combine to avoid silently losing candidate work',
                 decision.target_id,
                 target_status,
+                refused_reason,
             )
         elif target_is_claimed:
             # Status alone has the same TOCTOU shape one level down: a target
@@ -3661,6 +3634,7 @@ class TaskInterceptor:
                 new_title=rt.title,
                 new_description=rt.description,
                 justification=decision.justification,
+                context=audit_context,
                 refused_reason=refused_reason,
             )
             return None
@@ -3692,17 +3666,14 @@ class TaskInterceptor:
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target_metadata
         ):
-            candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
             # _is_gate_metadata answers False both when the target genuinely
             # has no gate AND when its metadata blob is unparseable/corrupt
             # (permissive-on-parse-failure by design). Distinguish the two in
-            # the log text — a shape-level re-check via _parse_metadata_value
-            # (not _extract_metadata_dict, to avoid a second schema_warning
-            # emission for the same blob) is enough. The refuse-and-degrade
-            # decision itself is unchanged either way. Re-checks the SAME
-            # `target_metadata` the condition above consulted, deliberately.
-            target_meta, _target_warnings = _parse_metadata_value(target_metadata)
+            # the log text: `target_meta`, parsed above from the SAME
+            # `target_metadata` this condition consulted, is None exactly for
+            # the unreadable blob. The refuse-and-degrade decision itself is
+            # unchanged either way.
             if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
@@ -3717,6 +3688,18 @@ class TaskInterceptor:
             )
             return None
 
+        # Unaudited, like the gate guard: a combine that cannot keep every
+        # item must not write, but only a combine every guard above passed
+        # reaches here, so an eligibility refusal stays counted.
+        if items_after is None:
+            logger.warning(
+                'combine-guard: target %s or its candidate carries a malformed follow-up '
+                'bundle — aborting combine, which could not keep every item. Degrading '
+                'to create.',
+                decision.target_id,
+            )
+            return None
+
         # The curator already produced the coherent rewrite — push it to the
         # backend as structured fields. No prompt, no LLM rewrite at the
         # write boundary; sqlite writes the columns directly. The
@@ -3725,13 +3708,19 @@ class TaskInterceptor:
         # kept for compatibility with existing parsers).
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         details_with_files = f'FILES_TO_MODIFY:\n{files_block}\n\nDETAILS:\n{rt.details}'
-        combine_metadata = json.dumps(
-            {
-                'curator_action': 'combine',
-                'curator_justification': decision.justification[:500],
-                'combined_at': datetime.now(UTC).isoformat(),
-            }
-        )
+        combine_keys: dict[str, Any] = {
+            'curator_action': 'combine',
+            'curator_justification': decision.justification[:500],
+            'combined_at': datetime.now(UTC).isoformat(),
+            DECLARED_SCOPE_METADATA_KEY: derive_declared_scope(
+                rt.files_to_modify, rt.description, rt.details, basis='combine',
+            ).model_dump(),
+        }
+        if items_after:
+            combine_keys[FOLLOWUP_ITEMS_METADATA_KEY] = [
+                item.model_dump(mode='json') for item in items_after
+            ]
+        combine_metadata = json.dumps(combine_keys)
 
         # ── Audit: persist old-vs-new BEFORE the mutation so we can
         # recover if the write crashes mid-flight.
@@ -3744,6 +3733,7 @@ class TaskInterceptor:
             new_title=rt.title,
             new_description=rt.description,
             justification=decision.justification,
+            context=audit_context,
         )
 
         rewrite = _CombineRewrite(
@@ -3758,7 +3748,7 @@ class TaskInterceptor:
                     # Combine MERGES its marker keys into the target's blob; it
                     # does NOT overwrite the blob. Shallow last-write-wins
                     # ({**old, **new}, sqlite_task_backend._merge_metadata) keeps
-                    # the three keys above authoritative while everything else
+                    # the keys above authoritative while everything else
                     # already on the target survives: the escalation-gate stamp
                     # (execution_class / operational_mode / task_kind /
                     # always_escalates / gate_escalated_at) plus source,
@@ -3863,47 +3853,10 @@ class TaskInterceptor:
         return lock
 
     @staticmethod
-    def _extract_metadata_dict(metadata) -> dict | None:
-        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
-
-        None means present-but-unreadable, and in that case the
-        ``task_metadata.schema_warning`` census WARNING has already been
-        emitted — I4: this replaces a silent ``None`` coercion. The rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`.
-        """
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
-        return parsed
-
-    @staticmethod
-    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
-        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
-
-        Absent metadata gives a fresh ``{}``, and a readable dict is
-        shallow-copied, so the caller's dict is never mutated. Unreadable
-        metadata is DISCARDED for a fresh ``{}``. On top of the census line
-        :meth:`_extract_metadata_dict` already emitted, a second WARNING
-        prefixed with *site* is logged: two log lines for one failure, so the
-        discard can be grepped by caller.
-        """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
-                site,
-                type(metadata).__name__,
-                metadata,
-            )
-            return {}
-        return dict(meta)
-
-    @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
         """True when *metadata* declares an escalation gate (task 3446).
 
-        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        Normalises through ``metadata_dict.py::extract_metadata_dict`` so a JSON-string
         blob, a dict, and ``None`` are all handled by the one shared shape
         policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
         metadata answers False (ungated): the shape WARNING is already emitted
@@ -3918,7 +3871,7 @@ class TaskInterceptor:
         intent. Reading the same keys loosely here would let a task the guard
         considers ungated be treated as gated (and vice versa).
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._is_gate_metadata')
         if not meta:
             return False
         return (
@@ -3931,7 +3884,7 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        Builds on ``metadata_dict.py::fresh_metadata_copy`` to normalise the incoming
         shape (absent or unreadable → fresh dict) before writing the key, so
         the result is always a plain dict ready for JSON serialisation.
 
@@ -3943,31 +3896,8 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
+        meta = fresh_metadata_copy(metadata, site='routing-override')
         meta['routing_override_reason'] = reason
-        return meta
-
-    @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any) -> dict:
-        """Return a metadata dict stamped as a deterministic PURE-GATE.
-
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
-        shape (absent or unreadable → fresh dict) before writing the keys, so
-        the result is always a plain dict ready for JSON serialisation —
-        mirrors :meth:`_inject_routing_override`.
-
-        Unconditionally sets ``task_kind='deterministic'`` and
-        ``always_escalates=True``, and DELETES any ``before_done`` key so the
-        result always satisfies the pure-gate invariant enforced by
-        :func:`deterministic_task_guard.deterministic_task_error` — a
-        deterministic task with no action must always escalate, never be an
-        ill-formed no-op. This holds regardless of what task_kind/before_done
-        the recon LLM originally supplied in metadata.
-        """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
-        meta['task_kind'] = 'deterministic'
-        meta['always_escalates'] = True
-        meta.pop('before_done', None)
         return meta
 
     @staticmethod
@@ -3981,7 +3911,7 @@ class TaskInterceptor:
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
         — normalises the existing ``kwargs['metadata']`` (via
-        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
+        ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable → fresh dict,
         unreadable input discarded with a WARNING, same as the override path)
         into a plain dict, sets ``possible_scope_mismatch``, and writes the
         result back into ``kwargs['metadata']`` in place.
@@ -3991,8 +3921,9 @@ class TaskInterceptor:
         ticket blob — so this in-place mutation is sufficient to carry the
         marker onto the task the curator creates from that ticket, when one
         is created, with no new plumbing.  It does not reach a ``combine``
-        target: :meth:`_execute_combine` merges only the ``curator_*`` keys
-        onto the existing task (task 4159).
+        target: :meth:`_execute_combine` never copies a candidate's
+        ``possible_scope_mismatch``; it writes only the ``curator_*`` markers,
+        ``declared_scope`` and ``followup_items`` (task 4159).
 
         *source* names the PROVENANCE of the finding and is the marker's only
         discriminator between them: ``'prose'`` (the default, so every
@@ -4006,9 +3937,7 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(
-            kwargs.get('metadata'), 'scope-mismatch-advisory'
-        )
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='scope-mismatch-advisory')
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -4025,7 +3954,7 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
+        normalisation (via ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable
         → fresh dict, unreadable input discarded with a WARNING) and, like
         it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
@@ -4036,7 +3965,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
@@ -4044,99 +3973,36 @@ class TaskInterceptor:
     async def _check_escalation_idempotency(
         self,
         *,
+        lookup: R4Lookup | None,
         project_root: str,
         metadata,
-    ) -> tuple[dict | None, bool]:
-        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
-        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
-        matches a non-cancelled task, and ``check_failed`` is ``True`` when the
-        metadata lookup or its confirming read raised (so callers can fall
-        through to CREATE rather than treating a failure as a clean no-hit).
+    ) -> R4Verdict:
+        """R4 for one ticket's metadata (``r4_idempotency.py::check_r4``); no hit when it cannot run.
 
-        The store is asked for the tasks carrying the ``suggestion_hash``, and
-        each match's ``escalation_id`` is confirmed with one read, so the check
-        is bounded by the matching rows, not by the task tree.
-
-        R4: authoritative and cheap — no LLM, no embedding lookup.
-        Works even when the curator is disabled or broken, which is
-        exactly the regime that triggered the duplicate Type::Error
-        tasks (esc-1912-179 → esc-1912-190).
+        *lookup* is the batch's, None without a backend. A lookup that raised falls through to
+        CREATE with every item, logged here.
         """
-        meta = self._extract_metadata_dict(metadata)
-        if not meta:
-            return (None, False)
-        esc_id = meta.get('escalation_id')
-        sug_hash = meta.get('suggestion_hash')
-        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return (None, False)
-        if not esc_id or not sug_hash:
-            return (None, False)
-
-        if self.taskmaster is None:
-            return (None, False)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._check_escalation_idempotency')
+        if not meta or lookup is None:
+            return R4Verdict()
         try:
-            row = await self._escalation_match(self.taskmaster, project_root, esc_id, sug_hash)
+            verdict = await check_r4(lookup, project_root, meta)
         except Exception:
             logger.warning(
                 'r4: metadata lookup failed during idempotency check',
                 exc_info=True,
             )
-            return (None, True)
-        if row is None:
-            return (None, False)
-        tid = str(row['task_id'])
-        logger.warning(
-            'r4: idempotency hit — returning existing task %s for '
-            'escalation_id=%s suggestion_hash=%s',
-            tid,
-            esc_id,
-            sug_hash,
-        )
-        return (
-            {
-                'id': tid,
-                'title': str(row['title']),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            },
-            False,
-        )
-
-    async def _escalation_match(
-        self,
-        taskmaster: TaskBackendProtocol,
-        project_root: str,
-        esc_id: str,
-        sug_hash: str,
-    ) -> MetadataLookupRow | None:
-        """The first non-cancelled task carrying *sug_hash* whose ``escalation_id`` is *esc_id*."""
-        offset = 0
-        while True:
-            page = await taskmaster.find_tasks_by_metadata(
-                project_root, key='suggestion_hash', value=sug_hash,
-                statuses=list(NON_CANCELLED_STATUSES), limit=_R4_LOOKUP_PAGE, offset=offset,
+            return R4Verdict()
+        if verdict.hit is not None:
+            logger.warning(
+                'r4: idempotency hit — returning existing task %s (%s) for '
+                'escalation_id=%s suggestion_hash=%s',
+                verdict.hit.task_id,
+                verdict.match,
+                meta.get('escalation_id'),
+                meta.get('suggestion_hash'),
             )
-            rows = list(page['results'])
-            if not rows:
-                return None
-            for row in rows:
-                if await self._carries_escalation(taskmaster, project_root, row['task_id'], esc_id):
-                    return row
-            offset += len(rows)
-            if offset >= page['total']:
-                return None
-
-    async def _carries_escalation(
-        self, taskmaster: TaskBackendProtocol, project_root: str, task_id: int, esc_id: str,
-    ) -> bool:
-        """Whether task *task_id* still exists and its metadata names *esc_id*."""
-        try:
-            task = await taskmaster.get_task(str(task_id), project_root)
-        except TaskNotFoundError:
-            return False
-        task_meta = self._extract_metadata_dict(task.get('metadata'))
-        return bool(task_meta) and task_meta.get('escalation_id') == esc_id
+        return verdict
 
     async def submit_task(
         self, project_root: str, *, agent_id: str | None = None, **kwargs: Any
@@ -4242,22 +4108,29 @@ class TaskInterceptor:
         # tools.py). Idempotent, so for MCP-tool callers — where tools.py has
         # already coerced before delegating — re-running here is a no-op; the
         # twin's real job is the direct caller. Distinct from
-        # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
+        # _dispatch_ticket_decision's pure_gate_stamped call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
+        # The routing notice is derived here so it is right whichever layer
+        # (tools.py or this twin) converted; the curator's route_deterministic
+        # converts after this response is built, so it never carries one.
         metadata = inject_operational_routing(metadata)
+        routing_notice = pure_gate_routing_notice(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
         metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
-            return await self._submit_task_planning_mode(
+            result = await self._submit_task_planning_mode(
                 project_root=project_root,
                 project_id=project_id,
                 kwargs=kwargs,
                 metadata=metadata,
                 attribution=attribution,
             )
+            if routing_notice and interceptor_write_succeeded(result):
+                return {**result, **routing_notice}
+            return result
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
@@ -4285,7 +4158,7 @@ class TaskInterceptor:
             candidate_json=blob,
         )
         self._enqueue_ticket(project_id, ticket_id)
-        return {'ticket': ticket_id}
+        return {'ticket': ticket_id, **routing_notice}
 
     async def _submit_task_planning_mode(
         self,
@@ -4949,16 +4822,20 @@ class TaskInterceptor:
                 result_dict,
             )
 
-        if decision is not None and decision.action == 'combine' and decision.target_id:
+        if (
+            decision is not None and decision.action == 'combine' and decision.target_id
+            and candidate is not None
+        ):
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
-                # submission metadata — the same object stamped by
-                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # submission metadata — the same value stamped by
+                # pure_gate_stamped and serialised into tm.add_task
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
-                    project_root, decision, candidate_metadata=metadata,
+                    project_root, decision,
+                    candidate=candidate, ticket_id=ticket_id, candidate_metadata=metadata,
                 )
             if combine_result is not None:
                 if decision.rewritten_task is not None and curator is not None:
@@ -4996,7 +4873,10 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(metadata)
+            metadata = pure_gate_stamped(
+                fresh_metadata_copy(metadata, site='deterministic-pure-gate'),
+                PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
+            )
 
         # ── Create task ───────────────────────────────────────────────
         status: str = TicketStatus.FAILED
@@ -5008,7 +4888,7 @@ class TaskInterceptor:
         skipped_reason = _dedupe_skipped_reason(decision, curator_unavailable=curator_unavailable)
         if skipped_reason is not None:
             metadata = {
-                **self._fresh_metadata_copy(metadata, 'dedupe-skipped-marker'),
+                **fresh_metadata_copy(metadata, site='dedupe-skipped-marker'),
                 **dedupe_skipped_marker(skipped_reason, at=datetime.now(UTC)),
             }
 
@@ -5377,36 +5257,33 @@ class TaskInterceptor:
             curator = await self._get_curator()
 
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
-            # Tickets that match an existing non-cancelled task are resolved
-            # 'combined' immediately and excluded from the curate call.
+            # A ticket whose work a live task already carries resolves
+            # 'combined' onto it and is excluded from the curate call; one
+            # carrying some live items is filed with the rest. No task is
+            # written between these checks, so they share one R4Lookup and
+            # its single scan of the live follow-up items.
+            r4_lookup = None if self.taskmaster is None else R4Lookup(self.taskmaster)
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                # _idem_check_failed is intentionally unused today: both
-                # check_failed=True and check_failed=False with hit=None fall
-                # through to CREATE — retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=t.project_root,
-                        metadata=t.metadata,
-                    )
+                verdict = await self._check_escalation_idempotency(
+                    lookup=r4_lookup,
+                    project_root=t.project_root,
+                    metadata=t.metadata,
                 )
-                if idempotency_hit is not None:
-                    existing_id = str(idempotency_hit.get('id', ''))
+                if verdict.hit is not None:
                     await self._persist_worker_terminal(
                         t.ticket_id,
                         status=TicketStatus.COMBINED,
-                        task_id=existing_id or None,
+                        task_id=str(verdict.hit.task_id),
                         reason='idempotency_hit',
-                        result_dict=idempotency_hit,
+                        result_dict=verdict.hit_result(),
                         caller='add_tickets_batch_idempotency',
                         project_root=t.project_root,
                         attribution=t.attribution,
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
-                    # check_failed=True (get_tasks raised) → fall through to
-                    # CREATE; WARNING already emitted at source.
-                    active_ticket_data.append(t)
+                    active_ticket_data.append(t.keeping(verdict) if verdict.partial else t)
             ticket_data = active_ticket_data
 
             if not ticket_data:
@@ -5604,6 +5481,17 @@ class TaskInterceptor:
                         task_id = None
                         result_dict = None
 
+                    if t.r4_dropped:
+                        result_dict = {
+                            **(result_dict or {}),
+                            'idempotency_dropped_items': [d.to_record() for d in t.r4_dropped],
+                        }
+                        logger.info(
+                            'r4: ticket %s filed without %d item(s) already live: %s',
+                            t.ticket_id, len(t.r4_dropped),
+                            ', '.join(f'{d.key}->{d.owner.task_id}' for d in t.r4_dropped),
+                        )
+
                     await self._persist_worker_outcome(
                         t.ticket_id,
                         decision=effective_decision,
@@ -5725,6 +5613,12 @@ class TaskInterceptor:
            ``DeclaredScopeWriteAuthorityError.to_error_dict()``. It is here, not in the
            backend floor, to leave room for the ``basis='combine'`` re-stamp that task
            8415 adds in ``_execute_combine``, which writes through the backend directly.
+
+        A call with no mutating argument raises
+        :class:`~fused_memory.backends.task_backend_errors.NoFieldsToUpdateError`
+        out of the backend. Like ``AppendUnsupportedFieldError`` it is NOT caught
+        below: it propagates raw to ``mcp_tool_errors``, which reports
+        ``error_type='NoFieldsToUpdateError'`` (task 4867).
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
@@ -6617,6 +6511,24 @@ _KIND_REQUIRED_REASON = (
 # NamedTuple whose leading field names that distinction, so the semantics
 # travel with the value instead of living in a call-site variable name.
 # The authoritative branch-by-branch contract is each probe's docstring.
+# The never-completed outcome is itself a carrier, _ProbeUnavailable,
+# produced in one place (_git_probe); each probe maps it onto its own
+# honest not-yet-confirmed arm.
+
+
+_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+class GitProbeRunner(Protocol):
+    """Runs one git argv for the done-provenance probes; production passes ``shared.git_async.run_git``."""
+
+    async def __call__(self, cmd: Sequence[str], *, timeout: float | None = None) -> GitResult: ...
+
+
+class _ProbeUnavailable(NamedTuple):
+    """A git probe never rendered a verdict. See _git_probe."""
+
+    detail: str
 
 
 class _CommitResolutionFailure(NamedTuple):
@@ -6631,6 +6543,34 @@ class _AncestorCheckFailure(NamedTuple):
 
     confirmed_off_main: bool
     detail: str
+
+
+async def _git_probe(
+    git_runner: GitProbeRunner, project_root: str, *args: str,
+) -> GitResult | _ProbeUnavailable:
+    """Run ``git -C <project_root> <args>`` within the probe timeout.
+
+    Returns git's answer, whatever its exit code, or a
+    :class:`_ProbeUnavailable` when git never answered: a missing binary, a
+    timeout, or any other exception from the runner. The catch is broad on
+    purpose: ``args`` can carry caller-supplied text, and an embedded NUL
+    makes the spawn raise ``ValueError``.
+    """
+    try:
+        result = await git_runner(
+            ['git', '-C', project_root, *args], timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return _ProbeUnavailable('git binary not found')
+    except Exception as exc:
+        logger.warning(
+            'git %s probe in %s raised; reporting the check as unavailable',
+            args[0], project_root, exc_info=True,
+        )
+        return _ProbeUnavailable(f'{type(exc).__name__}: {exc}')
+    if result.timed_out:
+        return _ProbeUnavailable(f'git {args[0]} timed out')
+    return result
 
 
 def _provenance_kind(raw: object) -> str | None:
@@ -6743,6 +6683,7 @@ async def _validate_done_provenance(
     is_recon_stage: bool = False,
     agent_id: str | None = None,
     config: Any = None,
+    git_runner: GitProbeRunner,
 ) -> tuple[dict | None, dict | None]:
     """Authorize, parse and resolve done_provenance for set_task_status(done).
 
@@ -6843,7 +6784,7 @@ async def _validate_done_provenance(
     resolved = provenance.recorded_evidence()
     commit_input = provenance.commit
     if commit_input is not None:
-        sha_or_err = await _resolve_commit_sha(project_root, commit_input)
+        sha_or_err = await _resolve_commit_sha(project_root, commit_input, git_runner=git_runner)
         if isinstance(sha_or_err, _CommitResolutionFailure):
             # Only a git-issued rejection is a "not found" verdict; see
             # _resolve_commit_sha for the branch-by-branch contract.
@@ -6857,7 +6798,9 @@ async def _validate_done_provenance(
             resolved['commit_input'] = commit_input
         # The ancestor backstop applies to every kind that cites a commit,
         # not only the kinds that require one.
-        ancestor_result = await _verify_commit_on_main(project_root, sha_or_err)
+        ancestor_result = await _verify_commit_on_main(
+            project_root, sha_or_err, git_runner=git_runner,
+        )
         if ancestor_result is not None:
             # rc=1 is the only confirmed off-main verdict; every other
             # failure is NOT-YET-CONFIRMED and carries the opposite remedy.
@@ -6916,7 +6859,9 @@ async def _validate_done_provenance(
     return None, resolved
 
 
-async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckFailure | None:
+async def _verify_commit_on_main(
+    project_root: str, sha: str, *, git_runner: GitProbeRunner,
+) -> _AncestorCheckFailure | None:
     """Verify ``sha`` is reachable from ``main`` via ``merge-base --is-ancestor``.
 
     Returns None on success (commit is on main). On failure, returns an
@@ -6939,41 +6884,24 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckF
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'merge-base',
-            '--is-ancestor',
-            sha,
-            'main',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _AncestorCheckFailure(False, 'git merge-base timed out')
-    except FileNotFoundError:
-        return _AncestorCheckFailure(False, 'git binary not found')
-    except Exception as e:
-        return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
+    result = await _git_probe(git_runner, project_root, 'merge-base', '--is-ancestor', sha, 'main')
+    if isinstance(result, _ProbeUnavailable):
+        return _AncestorCheckFailure(False, result.detail)
 
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
     #   1 — sha is NOT reachable from main
     #   other — git error (e.g. unknown ref `main`)
-    if proc.returncode == 0:
+    if result.returncode == 0:
         return None
-    if proc.returncode == 1:
+    if result.returncode == 1:
         return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
-    msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return _AncestorCheckFailure(False, msg)
+    return _AncestorCheckFailure(False, result.stderr or 'merge-base failed')
 
 
-async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
+async def _resolve_commit_sha(
+    project_root: str, commit: str, *, git_runner: GitProbeRunner,
+) -> str | _CommitResolutionFailure:
     """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
 
     Returns the SHA on success, or a :class:`_CommitResolutionFailure` whose
@@ -6993,34 +6921,14 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'rev-parse',
-            '--verify',
-            f'{commit}^{{commit}}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _CommitResolutionFailure(False, 'git rev-parse timed out')
-    except FileNotFoundError:
-        return _CommitResolutionFailure(False, 'git binary not found')
-    except Exception as e:
-        return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
-
-    if proc.returncode != 0:
-        msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return _CommitResolutionFailure(True, msg)
-    sha = stdout.decode('utf-8', errors='replace').strip()
-    if not sha or len(sha) < 7:
+    result = await _git_probe(git_runner, project_root, 'rev-parse', '--verify', f'{commit}^{{commit}}')
+    if isinstance(result, _ProbeUnavailable):
+        return _CommitResolutionFailure(False, result.detail)
+    if result.returncode != 0:
+        return _CommitResolutionFailure(True, result.stderr or 'no such ref')
+    if len(result.stdout) < 7:
         return _CommitResolutionFailure(False, 'empty rev-parse output')
-    return sha
+    return result.stdout
 
 
 # ── Reopen-freshness gate (task 2674, PRD task alpha) ───────────────────
@@ -7032,66 +6940,32 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
 # (task 2649 stamps this atomically on every terminal-exit reopen).
 
 
-async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | None:
+async def _resolve_commit_committed_at(
+    project_root: str, sha: str, *, git_runner: GitProbeRunner,
+) -> str | None:
     """Resolve a commit's committer date via ``git show -s --format=%cI``.
 
     Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
     success, or None on any failure (git binary missing, non-zero exit,
-    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
-    subprocess/timeout/error-handling shape for consistent semantics.
+    timeout, empty output). Runs through :func:`_git_probe`, like the other
+    done-provenance probes, so it shares their timeout and error handling.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'show',
-            '-s',
-            '--format=%cI',
-            sha,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            # Reap the killed child promptly rather than leaving it as a
-            # transient zombie until GC finalizes the Process object.
-            await proc.wait()
-            return None
-    except FileNotFoundError:
+    result = await _git_probe(git_runner, project_root, 'show', '-s', '--format=%cI', sha)
+    if isinstance(result, _ProbeUnavailable) or not result.ok:
         return None
-    except Exception:
-        # Loud fail-safe (silent-fallthrough gate, sig-b): an unexpected error
-        # in this best-effort committer-date probe must surface in the log
-        # rather than vanish. Behaviour is unchanged (still returns None); the
-        # WARN just makes the swallow observable, matching the "loud over
-        # silent" directive the gate enforces.
-        logger.warning(
-            '_resolve_commit_committed_at: unexpected error resolving committer '
-            'date for %s; returning None',
-            sha,
-            exc_info=True,
-        )
-        return None
-
-    if proc.returncode != 0:
-        return None
-    committed_at = stdout.decode('utf-8', errors='replace').strip()
-    return committed_at or None
+    return result.stdout or None
 
 
 def _extract_reopen_at(before: Any) -> str | None:
     """Return ``metadata.reopen_at`` from a Taskmaster ``before`` snapshot.
 
-    Uses :func:`_parse_metadata_value` so a JSON-string metadata blob is
-    handled identically to an already-parsed dict. Returns None when
-    absent, empty, or unresolvable — callers treat that as "never
+    Uses ``shared.task_metadata_wire.coerce_task_metadata`` so a JSON-string
+    metadata blob is handled identically to an already-parsed dict. Returns
+    None when absent, empty, or unresolvable — callers treat that as "never
     reopened" (the reopen-freshness gate stays inert).
     """
     raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, _warnings = _parse_metadata_value(raw)
+    parsed = coerce_task_metadata(raw)
     if not isinstance(parsed, dict):
         return None
     reopen_at = parsed.get('reopen_at')
@@ -7192,6 +7066,8 @@ async def _check_reopen_freshness(
     agent_id: str | None,
     is_recon_stage: bool,
     mode: str,
+    *,
+    git_runner: GitProbeRunner,
 ) -> dict | None:
     """Reject (enforce) or no-op (warn) a done-write citing PRE-reopen evidence.
 
@@ -7266,7 +7142,9 @@ async def _check_reopen_freshness(
     if not reopen_at:
         return None
 
-    evidence_committed_at = await _resolve_commit_committed_at(project_root, evidence_commit)
+    evidence_committed_at = await _resolve_commit_committed_at(
+        project_root, evidence_commit, git_runner=git_runner,
+    )
     if evidence_committed_at is None:
         # Distinguishable from a genuine date-based staleness verdict: this
         # fires whenever `git show` itself failed (binary missing, timeout,
@@ -7329,6 +7207,7 @@ async def _repair_done_provenance_same_status(
     is_recon_stage: bool = False,
     agent_id: str | None = None,
     config: Any = None,
+    git_runner: GitProbeRunner,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -7371,6 +7250,7 @@ async def _repair_done_provenance_same_status(
         is_recon_stage=is_recon_stage,
         agent_id=agent_id,
         config=config,
+        git_runner=git_runner,
     )
     if validation_err is not None:
         return validation_err
@@ -7517,15 +7397,81 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
-# Refusal-reason vocabulary for the combine audit (task 4035). Three stable
+# Refusal-reason vocabulary for the combine audit (task 4035). Four stable
 # coarse tokens, deliberately NOT one per status: an operator greps these to
 # compute the refusal rate, while the record's own old.status field supplies
 # the per-status breakdown for free. A token per status would make this
 # vocabulary track the status enum and force a consumer update every time a
-# status is added. The third marks a target already dispatched into a branch.
+# status is added. The third marks a target already dispatched into a branch;
+# the fourth a follow-up holder, which is pending forever and never a target.
 COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
 COMBINE_REFUSED_CLAIMED = 'target_claimed'
 COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
+COMBINE_REFUSED_HOLDER = 'target_is_holder'
+
+
+@dataclasses.dataclass(frozen=True)
+class _CombineAuditContext:
+    """What one combine folded and on whose behalf: the audit's candidate and item fields."""
+
+    candidate_ticket_id: str
+    candidate_source: str | None
+    candidate_spawned_from: str | None
+    batch_internal: bool
+    items_before: tuple[str, ...]
+    items_after: tuple[str, ...]
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            'candidate_ticket_id': self.candidate_ticket_id,
+            'candidate_source': self.candidate_source,
+            'candidate_spawned_from': self.candidate_spawned_from,
+            'batch_internal': self.batch_internal,
+            'items_before': list(self.items_before),
+            'items_after': list(self.items_after),
+        }
+
+
+def _combine_fold(
+    decision: CuratorDecision,
+    *,
+    ticket_id: str,
+    target_title: str,
+    target_meta: Mapping[str, Any],
+    candidate: CandidateTask,
+    candidate_meta: Mapping[str, Any],
+) -> tuple[_CombineAuditContext, tuple[FollowupItem, ...] | None]:
+    """What a combine folds: its audit context, and the union of items it leaves on the target.
+
+    The union is None when a stored bundle on either side is malformed, logged here: no combine
+    can keep every item, and the context then records no items, so a refusal is still auditable.
+    """
+    items_after: tuple[FollowupItem, ...] | None
+    try:
+        items_before = task_items(
+            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
+        )
+        extra = task_items(
+            title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta,
+        )
+        items_after = merge_items(items_before, extra)
+    except FollowupBundleInvalid as exc:
+        logger.warning(
+            'combine-guard: a follow-up bundle on target=%s or its candidate is malformed (%s)',
+            decision.target_id,
+            exc,
+        )
+        items_before, items_after = (), None
+    candidate_source = candidate_meta.get('source')
+    context = _CombineAuditContext(
+        candidate_ticket_id=ticket_id,
+        candidate_source=candidate_source if isinstance(candidate_source, str) else None,
+        candidate_spawned_from=candidate.spawned_from,
+        batch_internal=decision.batch_target_index is not None,
+        items_before=tuple(item.key for item in items_before),
+        items_after=tuple(item.key for item in items_after or ()),
+    )
+    return context, items_after
 
 
 def _append_combine_audit(
@@ -7538,14 +7484,15 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    context: _CombineAuditContext,
     refused_reason: str | None = None,
 ) -> None:
     """Append a one-line JSON record documenting a combine.
 
     Records both about-to-happen combines (``refused_reason=None``) and
     REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
-    success records alone. When *refused_reason* is None the emitted record is
-    byte-for-byte the historical shape, so existing records stay parseable and
+    success records alone. The historical keys keep their shape, so existing
+    records stay parseable; *context* adds the candidate and item fields, and
     ``rec.get('refused_reason')`` cleanly partitions refusal from success.
 
     The ``new`` block is populated on a refusal too: it records the title and
@@ -7571,6 +7518,7 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    record.update(context.to_record())
     if refused_reason is not None:
         record['refused_reason'] = refused_reason
     path = _combine_audit_path()

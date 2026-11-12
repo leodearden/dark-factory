@@ -113,7 +113,7 @@ Modules touched: <list>
         # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
         "files": ["<path/to/file.py>", ...],
         # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
-        # "execution_class": "operational" | "decision",  # only if this leaf is genuinely non-code work
+        # "execution_class": "operational" | "decision",  # only if a HUMAN must execute this leaf (a ruling, an operator action) — it becomes an always-escalates pure gate
     },
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True

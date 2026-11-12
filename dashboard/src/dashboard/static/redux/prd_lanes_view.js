@@ -105,11 +105,24 @@ function doneOfTotal(row) {
   };
 }
 
+function storeStatusText(status) {
+  return status === null ? 'not in the store' : status;
+}
+
+// A leaf bound to no local task has no store status to show; the served
+// reason line above it says why.
+function signalLeafText(leaf) {
+  if (leaf.task_id === null) return leaf.label;
+  const kind = leaf.done_kind === null ? '' : ` (${leaf.done_kind})`;
+  return `${leaf.label} #${leaf.task_id} ${storeStatusText(leaf.status)}${kind}`;
+}
+
 function signalCell(signal) {
   const text = Object.prototype.hasOwnProperty.call(SIGNAL_MARK_TEXT, signal.mark)
     ? SIGNAL_MARK_TEXT[signal.mark]
     : signal.mark;
-  return { text, detail: signal.reason || null };
+  const lines = [signal.reason, ...signal.leaves.map(signalLeafText)].filter(Boolean);
+  return { text, detail: lines.length === 0 ? null : lines.join('\n') };
 }
 
 // ── The contention line ──
@@ -118,7 +131,7 @@ function contentionEntryText(entry) {
   const holder = entry.holder;
   const held = holder === null
     ? 'no holder'
-    : `held by #${holder.task_id} (${holder.status === null ? 'not in the store' : holder.status})`;
+    : `held by #${holder.task_id} (${storeStatusText(holder.status)})`;
   return `${entry.key} · ${entry.wanted_by_ready} ready want it · ${held}`;
 }
 

@@ -3,7 +3,8 @@
 Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
-conftests under `sys.modules['conftest']`.
+conftests under `sys.modules['conftest']`, and in the `_fm_*.py` siblings
+that `_fm_helpers`' module docstring lists.
 
 Testing a `scripts/` script? `scripts/` is not a package and is not on
 PYTHONPATH, so import it with `from _fm_helpers import
@@ -75,15 +76,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from _fm_helpers import (  # noqa: E402
-    _leaked_async_httpx_clients,
-    _warn_if_drain_closed_a_foreign_client,
     complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
-    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
-    track_async_httpx_clients,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -118,11 +115,14 @@ def pytest_configure(config):
     module import time are tracked too and can be reaped like any other
     (task 4412).
 
-    ``shared.usage_gate`` is imported here because a module-level import after
-    this file's ``sys.path`` setup would need a new ``E402`` suppression.
+    ``shared.usage_gate`` here, and ``_fm_httpx_leaks`` here and in the two
+    httpx-reaping fixtures, are imported function-locally because a
+    module-level import after this file's ``sys.path`` setup would need a new
+    ``E402`` suppression, which ``scripts/inline_suppressions.py`` refuses.
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
+    from _fm_httpx_leaks import track_async_httpx_clients
     from shared import usage_gate
 
     arm_usage_gate_sweep_confinement(config, usage_gate)
@@ -457,7 +457,7 @@ async def _reap_leaked_ticket_workers():
 # a real defence for a hypothetical one is the wrong way round, so the
 # constraint is enforced by DISCOVERABILITY instead: the sync arm snapshots
 # the already-leaked clients at SETUP and warns via
-# _fm_helpers._warn_if_drain_closed_a_foreign_client whenever the drain closed
+# _fm_httpx_leaks._warn_if_drain_closed_a_foreign_client whenever the drain closed
 # one that pre-dated the current test — naming the trap at the teardown that
 # sprang it, instead of leaving it to be diagnosed from the far-away symptom.
 # ---------------------------------------------------------------------------
@@ -471,7 +471,7 @@ def _reap_leaked_async_httpx_clients_sync():
     exception was never retrieved`` ERROR into some unrelated test's ``caplog``
     window, and why closing it at teardown makes that record unreachable, see
     the ONE canonical write-up of the mechanism —
-    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``. It is deliberately not
     restated here.
 
     THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
@@ -505,6 +505,12 @@ def _reap_leaked_async_httpx_clients_sync():
     innocent test's teardown. A warning keeps it loud without letting the
     BACKSTOP arm become a flake source itself.
     """
+    from _fm_httpx_leaks import (
+        _leaked_async_httpx_clients,
+        _warn_if_drain_closed_a_foreign_client,
+        reap_leaked_async_httpx_clients,
+    )
+
     # Snapshot at SETUP (this arm is set up first, before the test body runs):
     # the clients already leaked by someone else. Weak refs, so the snapshot
     # never keeps a client alive or changes its GC timing.
@@ -519,7 +525,7 @@ def _reap_leaked_async_httpx_clients_sync():
                 f'closes clients from a throwaway asyncio.run loop, so an '
                 f'exception type beyond the suppressed TimeoutError/'
                 f'RuntimeError reached it — widen the suppression in '
-                f'_fm_helpers.reap_leaked_async_httpx_clients or fix the '
+                f'_fm_httpx_leaks.reap_leaked_async_httpx_clients or fix the '
                 f'ordering that sent this client to the fallback (task 4412).',
                 stacklevel=2,
             )
@@ -530,7 +536,7 @@ def _reap_leaked_async_httpx_clients_sync():
 async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    Task 4412 — mechanism in ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``,
     same as the sync arm above.
 
     THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
@@ -545,9 +551,11 @@ async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync
     ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
 
     Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
-    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    ``_fm_httpx_leaks.py``: it never fails a test, and is a cheap no-op for the
     vast majority of tests that leak nothing.
     """
+    from _fm_httpx_leaks import reap_leaked_async_httpx_clients
+
     yield
     await reap_leaked_async_httpx_clients()
 
@@ -701,7 +709,7 @@ def make_graph_mock():
     defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
     ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
     columns BY NAME (``GraphitiBackend.list_indices``, and
-    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``_fm_falkor_live.await_index_operational`` before it) iterates
     ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
     call would raise ``TypeError`` instead of exercising the code under test.
     The ``[]`` default is safe because no existing consumer of this fixture
@@ -924,10 +932,10 @@ def _integration_collection_lease(request):
     ``-m 'not integration'``) never writes into the machine-global lease
     directory the live cron reads.
 
-    The reaper is loaded LAZILY here rather than at conftest import time, for
-    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
-    probe: a session that never runs an integration test must not pay for
-    it.  Via ``load_script_module`` — do not add another local
+    The reaper is loaded LAZILY here rather than at conftest import time, so
+    a session that never runs an integration test does not pay for it — the
+    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.
+    Via ``load_script_module`` — do not add another local
     ``spec_from_file_location`` loader (tasks 3738/3895).
     """
     if request.node.get_closest_marker('integration') is None:
