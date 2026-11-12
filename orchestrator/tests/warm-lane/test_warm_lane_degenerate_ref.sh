@@ -681,6 +681,10 @@ assert "O2: summary flagged=2 (both unknown treated as non-terminal)" \
 #      -> `degenerate <sha>`, exit 0
 # M3 — the script and its lib copied where no shared/src sits three levels up
 #      -> exit 2 (wiring), stderr names shared.merge_subject
+# M4 — the lib called in reify's three-argument form, with no merge head/into,
+#      on a body line that merely starts with the id -> refuses, rc 2, rather
+#      than citing; the five-argument call on the same message answers rc 1
+# M5 — task_citation_peer_ids in reify's two-argument form -> rc 2, no ids
 # ─────────────────────────────────────────────────────────────────────────────
 M_SHARED_SRC="$(cd "$WARM_LANE_SCRIPTS_DIR/../../.." && pwd)/shared/src"
 
@@ -732,5 +736,31 @@ assert "M3: no shared/src three levels above the relocated script exits 2 (wirin
     test "$M3_RC" -eq 2
 assert "M3: stderr names shared.merge_subject" \
     bash -c 'printf "%s\n" "$1" | grep -qF "shared.merge_subject"' _ "$M3_ERR"
+
+M_LIB="$WARM_LANE_SCRIPTS_DIR/lib_task_citation.sh"
+M_BODY_MSG=$'chore: tidy\n\n6101 files touched'
+M_HEAD_INTO="$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from shared.merge_subject import rendered_prefix; print("\n".join(rendered_prefix(sys.argv[2])))' \
+    "$M_SHARED_SRC" feat/)"
+M_HEAD_RE="${M_HEAD_INTO%%$'\n'*}"
+M_INTO_RE="${M_HEAD_INTO#*$'\n'}"
+
+M4_RC=0
+M4_ERR="$(bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>&1 >/dev/null)" || M4_RC=$?
+assert "M4: a three-argument call refuses with rc 2 rather than citing" \
+    test "$M4_RC" -eq 2
+assert "M4: stderr names the missing merge head/into" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "<merge_head_re> and <merge_into_re>"' _ "$M4_ERR"
+assert "M4: control — the five-argument call on the same message does not cite (rc 1)" \
+    bash -c 'source "$1"; task_citation_message_cites "$2" 6101 "feat\\/" "$3" "$4"; [ "$?" -eq 1 ]' \
+    _ "$M_LIB" "$M_BODY_MSG" "$M_HEAD_RE" "$M_INTO_RE"
+
+M5_RC=0
+M5_OUT="$(bash -c 'source "$1"; task_citation_peer_ids "$2" "feat\\/"' \
+    _ "$M_LIB" "$M_BODY_MSG" 2>/dev/null)" || M5_RC=$?
+assert "M5: a two-argument task_citation_peer_ids refuses with rc 2" \
+    test "$M5_RC" -eq 2
+assert "M5: and names no peer id" \
+    test -z "$M5_OUT"
 
 test_summary

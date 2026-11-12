@@ -1682,7 +1682,10 @@ itself, so it was a second definition.
   `(head, into)`. Its own docstring defines that line form, so the arm stays a
   prefix match: a superset of `git_ops.py`'s anchored `{merge_subject}` arm,
   which the header's arm-by-arm comparison now says. The purity contract is
-  unchanged. The pair is a parameter, and the lib does not validate it.
+  unchanged. The pair is a parameter, and both entry points refuse an empty
+  one: they print one line naming the two parameters to stderr and return 2,
+  with no verdict. Without that check an empty pair would turn the arm into
+  `^<id>`, which cites any line that starts with the id's digits.
 - **`warm-lane-degenerate-ref-check.sh`** renders the pair once, after argument
   validation and before the structural preflight. It locates `shared/src` three
   levels above `SCRIPT_DIR` by path arithmetic (no `dirname` fork, Delta 7),
@@ -1703,7 +1706,7 @@ not-degenerate.
 This ends Delta 11's "byte-identical to reify" for `lib_task_citation.sh`. A
 re-sync of either file from reify must re-apply this delta. reify's consumers
 call the three-argument form, and this copy's two extra parameters are not
-optional.
+optional: a three-argument call returns 2 rather than a verdict.
 
 **Pinned by** `orchestrator/tests/warm-lane/test_warm_lane_degenerate_ref.sh`
 Block M (tests README Delta 9), and by

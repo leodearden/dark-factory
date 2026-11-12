@@ -62,8 +62,11 @@
 # and friends are passed in, never read), no argv parsing, no `set -e` /
 # `pipefail` side effect on a sourcing script, no stdout beyond the documented
 # result. That is what makes this file safe to `source` from anywhere. The
-# merge arm's head and into are parameters too, and this file does not validate
-# them: its caller renders and checks them.
+# merge arm's head and into are parameters too: its caller renders them, and
+# both entry points refuse (stderr, return 2) when either is empty, because an
+# empty pair degrades the merge arm to `^<id>`, which cites any line that merely
+# starts with the id's digits — reify's three-argument call form does exactly
+# that.
 #
 # The converse of that contract is the reason for the feeding idiom below: this
 # file does not set `pipefail`, but every consumer does, so a pipeline's status
@@ -84,6 +87,7 @@
 #                                                                         -> exit 0/1
 #   task_citation_peer_ids      <message> <escaped_prefix> <merge_head_re> <merge_into_re>
 #                                                                         -> ids (stdout)
+# Both exit 2, with no verdict, when <merge_head_re> or <merge_into_re> is empty.
 
 # Source guard — prevent double-sourcing when two consumers meet in one shell.
 if [ "${_REIFY_LIB_TASK_CITATION_SH_SOURCED:-}" = "1" ]; then
@@ -108,6 +112,16 @@ task_citation_regex_escape() {
     printf '%s' "$1" | sed -e 's/[^a-zA-Z0-9_]/\\&/g'
 }
 
+# _task_citation_require_merge_arm <caller> <merge_head_re> <merge_into_re>
+# Returns 0 iff both are non-empty; otherwise names <caller> on stderr and
+# returns 2 (see the purity contract above for why an empty pair is refused).
+_task_citation_require_merge_arm() {
+    [ -n "$2" ] && [ -n "$3" ] && return 0
+    printf '%s: <merge_head_re> and <merge_into_re> are required (shared.merge_subject.rendered_prefix)\n' \
+        "$1" >&2
+    return 2
+}
+
 # task_citation_message_cites <message> <id> <escaped_prefix> <merge_head_re> <merge_into_re>
 # True iff <message> cites task <id> under the grammar documented above.
 # <escaped_prefix> must already have been through task_citation_regex_escape;
@@ -126,6 +140,8 @@ task_citation_regex_escape() {
 task_citation_message_cites() {
     local msg="$1" id="$2" prefix_re="$3" merge_head_re="$4" merge_into_re="$5"
     local line subject="" kind_ref
+    _task_citation_require_merge_arm task_citation_message_cites \
+        "$merge_head_re" "$merge_into_re" || return
     if grep -qE "^${merge_head_re}${id}${merge_into_re}" <<<"$msg"; then
         return 0
     fi
@@ -166,6 +182,8 @@ task_citation_message_cites() {
 task_citation_peer_ids() {
     local msg="$1" prefix_re="$2" merge_head_re="$3" merge_into_re="$4" run i id
     local -A seen=()
+    _task_citation_require_merge_arm task_citation_peer_ids \
+        "$merge_head_re" "$merge_into_re" || return
     {
         while IFS= read -r run; do
             for ((i = 0; i < ${#run}; i++)); do
