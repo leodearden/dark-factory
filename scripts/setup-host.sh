@@ -64,9 +64,10 @@ _parity_verdict() {
   fi
 }
 
-# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
-# section-12 health check ask exactly the same question, and a copy at each site
-# is how the two drift apart.
+# Does FalkorDB answer? ONE probe, every caller — the section-2 wait loops and the
+# section-11 health check ask exactly the same question, and a copy at each site
+# is how they drift apart. The optional argument names the compose service
+# (default `falkordb`; the scratch server is `falkordb-scratch`).
 #
 # The verdict is read from the captured REPLY, not from a pipeline's exit
 # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
@@ -88,8 +89,8 @@ _parity_verdict() {
 # `local` confines the reply to the call, so neither caller can ever read a
 # verdict the other left behind in the shared shell scope.
 falkordb_pings() {
-  local out
-  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  local service="${1:-falkordb}" out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T "$service" redis-cli ping 2>/dev/null)" || true
   [[ "$out" == *PONG* ]]
 }
 
@@ -181,6 +182,22 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && fail "Qdrant did not become healthy in 30s"
   sleep 1
 done
+
+# The scratch FalkorDB that tests, the offline lane and evals write to
+# (OPERATIONS.md "The scratch FalkorDB"). Production does not depend on it, so
+# every failure here is a warning.
+if docker compose -f "$COMPOSE_FILE" up -d --no-deps falkordb-scratch; then
+  for i in $(seq 1 30); do
+    if falkordb_pings falkordb-scratch; then
+      ok "Scratch FalkorDB healthy"
+      break
+    fi
+    [ "$i" -eq 30 ] && warn "Scratch FalkorDB did not become healthy in 30s"
+    sleep 1
+  done
+else
+  warn "Scratch FalkorDB did not start; start it with: docker compose -f $COMPOSE_FILE up -d --no-deps falkordb-scratch"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Python workspace — uv sync --all-packages

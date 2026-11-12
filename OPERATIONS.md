@@ -2609,6 +2609,89 @@ gate refuses to create one. Here the AOF was written moments ago from the
 loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
 counts match.
 
+### The scratch FalkorDB
+
+Integration tests, the offline lane and the local-memory-models eval harness
+write to a second FalkorDB, never to production (task 7792). It is the compose
+service `falkordb-scratch` in `fused-memory/docker/docker-compose.yml`, on
+`127.0.0.1:6380`. It runs the same pinned image and `FALKORDB_ARGS` as
+`falkordb`, and a test pins the two equal. Its data lives in the named volume
+`falkordb-scratch-data`, not a bind mount, and it persists by RDB only
+(`--appendonly no --save 3600 1`). Everything on it is disposable except the
+seeded reference graph below.
+
+**Who starts it.** `scripts/setup-host.sh` starts it on a fresh host. On an
+existing host, start it once by hand:
+
+```bash
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch
+```
+
+`--no-deps` leaves every other service alone. Because the volume is named,
+every checkout's compose file reaches the same container and data (compose
+project `docker`, volume `docker_falkordb-scratch-data`). Use the main
+checkout's anyway, as for `falkordb`.
+
+**Who keeps it running.** Docker does, through `restart: unless-stopped`,
+across crashes, daemon restarts and reboots. A `docker stop` keeps it down
+until someone starts it again. The fused-memory unit does not start it. Its
+gate brings up `falkordb` and `qdrant` and a second hook brings up `embedder`.
+Another hook would break the unit's start budget (280 s + 15 s = 295 s <
+`TimeoutStartSec=300`, `scripts/fused-memory.service.template`), and a scratch
+outage must never hold up production's start.
+
+**How tests reach it.** Through `FALKOR_HOST`/`FALKOR_PORT`, default
+`localhost:6380`, resolved by
+`fused-memory/src/fused_memory/config/falkordb_endpoints.py::scratch_falkordb_from_env`.
+At session start a fused-memory test session sets `FALKORDB_URI` to the same
+address
+(`fused-memory/tests/_fm_falkor_live.py::prepare_scratch_falkordb_session`),
+so config-built backends follow it too.
+
+**What fails loudly.**
+
+- A test session whose `FALKOR_HOST`/`FALKOR_PORT` aim at production (`:6379`
+  on a loopback host) exits 4 at session start, inside the lane or out of it.
+- Under the offline lane (`DF_VERIFY_ROLE=offline`), an unreachable scratch
+  server ends the session at start, so a pass cannot go green by skipping
+  every FalkorDB test. The lane's outage probe
+  (`fused-memory/scripts/lane_dependency_probe.py`) checks FalkorDB on the
+  scratch server too, so the pass is recorded as an outage whose line starts
+  `falkordb: `. Outside the lane, an unreachable server still skips the
+  FalkorDB tests.
+
+**The reference graph.** The eval harness's embedding runs and `probe-set`
+copy and read `evalmem_lme_ref_incumbent_a`, so it must exist on scratch. Seed
+it from `fused-memory/`, and seed it again after a `docker compose down -v` or
+a rebuilt reference:
+
+```bash
+uv run python scripts/seed_scratch_reference_graph.py
+```
+
+The script reads the graph from the FalkorDB the config names (`FALKORDB_URI`,
+production) with `DUMP` and read-only queries. It `RESTORE`s the graph on
+scratch under the same name, checks the copy's topology hash and index
+definitions against the source, and saves. A graph's name travels inside its
+`DUMP` payload, so a restore under any other name is not a faithful copy.
+The script refuses a graph the scratch server already holds: remove that one
+first with `GRAPH.DELETE`. Exit 3 is a refusal. Exit 4 is a copy that did not
+match its source; the copy has been deleted again. Exit 1 is a server it
+could not reach.
+
+**The harness reads production and writes scratch.** `harness.py` reads its
+corpus (`dark_factory`, over `GRAPH.RO_QUERY`) from the FalkorDB the config
+names, the only store that holds it. Every write, copy, index build and
+teardown goes to scratch (`fused-memory/scripts/local_memory_models_eval/README.md`).
+
+Check it:
+
+```bash
+docker exec docker-falkordb-scratch-1 redis-cli ping              # PONG
+docker exec docker-falkordb-scratch-1 redis-cli CONFIG GET save    # save / 3600 1
+docker exec docker-falkordb-scratch-1 redis-cli GRAPH.LIST         # lists evalmem_lme_ref_incumbent_a
+```
+
 ### The local embedder (`embedder` compose service)
 
 `embedder` is a service in `fused-memory/docker/docker-compose.yml`, beside
@@ -3009,6 +3092,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | Reconciliation escalation queue looks permanently poisoned for a project | The project's `project_id` was never registered on fused-memory's `DASHBOARD_KNOWN_PROJECT_ROOTS` before its first task was queued | This must be prevented, not fixed after the fact — always complete project registration (factory-init Stage 6) before queuing any task. If it's already happened, this needs an operator-level fused-memory intervention, not a task-level fix |
 | A task blocks at VERIFY with failures unrelated to its own changes | Verification currently runs test/lint/typecheck **repo-wide** by default, not scoped to the task's own modules | Check whether the failures are pre-existing on main outside the task's scope; if so, fix main's cleanliness first (module-scoped verification is planned but not yet implemented) |
 | An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An interactive session inherits its launching shell's environment, often the MAIN checkout's `VIRTUAL_ENV`, so a first-party `import` resolves main's editable source rather than the worktree's edits. Dispatched agents are scrubbed of Python-env selection (`shared/src/shared/python_env.py::without_python_env_selection`, which Claude spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so they hit this only by naming main's `.venv/bin/python` in a worktree without its own `.venv`; a bare `python` there is the system interpreter, which fails the import instead. A worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. In a dispatched agent, name the worktree's own `.venv/bin/python`. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
+| A fused-memory offline-lane pass is recorded as an outage on the line `falkordb: write graph: ConnectionError`, or a fused-memory test session under the lane ends at start with `the scratch FalkorDB at redis://localhost:6380 is not reachable` | The scratch FalkorDB (compose service `falkordb-scratch`, `127.0.0.1:6380`) is not running. Docker restarts it on its own unless someone stopped it, and nothing else starts it; see [§8 The scratch FalkorDB](#the-scratch-falkordb) | `docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch`, then `docker exec docker-falkordb-scratch-1 redis-cli ping`. If `GRAPH.LIST` there lacks `evalmem_lme_ref_incumbent_a`, seed it with `scripts/seed_scratch_reference_graph.py`. The next lane pass runs normally |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
 | Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |

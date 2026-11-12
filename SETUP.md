@@ -209,6 +209,10 @@ docker compose up -d falkordb qdrant
   - After setup, the fused-memory unit brings FalkorDB up through
     `scripts/falkordb_aof_gate.py`, which recreates the container only onto a
     current AOF (`OPERATIONS.md` "FalkorDB settings and the recreate gate").
+  - Integration tests, the offline lane and evals write to a second,
+    disposable FalkorDB, `falkordb-scratch` on `127.0.0.1:6380`, which
+    `setup-host.sh` starts, Docker keeps running, and nothing else starts
+    (`OPERATIONS.md` "The scratch FalkorDB").
 - **Qdrant** (vector store for Mem0) on `6333` (HTTP) / `6334` (gRPC).
 
 A third compose service, `fused-mcp`, builds and runs fused-memory itself
