@@ -7,7 +7,9 @@ here (INV-13). Detail and counts are stored as JSON. A record a run read is
 kept whole as a content-addressed :class:`RecordSnapshot`, stored once per
 distinct state. Every plan run records one examination per link it decided,
 committed with its planned rows; :meth:`LinkHealLedger.run_records` joins them
-into the run's :class:`CandidateRecord` view. Nothing here is ever pruned.
+into the run's :class:`CandidateRecord` view. A calibration of the adjudicator
+is kept per model and prompt version, so the gate on writes asks for exactly the
+adjudicator it would write with. Nothing here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -60,6 +62,8 @@ class RunSource(StrEnum):
     #: A plan whose heals rest on the deterministic rows alone.
     DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
+    #: The adjudicator scored against rated pairs; it never plans or writes a heal.
+    CALIBRATION = 'calibration'
 
 
 class RunKind(StrEnum):
@@ -71,6 +75,8 @@ class RunKind(StrEnum):
     def of(cls, source: RunSource, *, writes: bool) -> RunKind:
         if source is RunSource.UNDO:
             return cls.UNDO
+        if source is RunSource.CALIBRATION:
+            return cls.PLAN
         return cls.APPLY if writes else cls.PLAN
 
 
@@ -189,6 +195,17 @@ CREATE TABLE IF NOT EXISTS examinations (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS examinations_by_run ON examinations (run_id);
+CREATE TABLE IF NOT EXISTS calibrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_sha256 TEXT NOT NULL,
+    population_sha256 TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calibrations_by_prompt ON calibrations (model, prompt_sha256);
 """
 
 #: Columns added after their table first shipped: an older ledger gains them in place.
@@ -342,6 +359,21 @@ class AdjudicationRow:
     run_id: str
     at: str
     record: AdjudicationRecord
+
+
+@dataclass(frozen=True)
+class CalibrationRow:
+    """One calibration of the adjudicator: the model and prompt version it scored,
+    the population it was scored on, whether it passed, and its report."""
+
+    calibration_id: int
+    run_id: str
+    model: str
+    prompt_sha256: str
+    population_sha256: str
+    passed: bool
+    report: Mapping[str, Any]
+    at: str
 
 
 @dataclass(frozen=True)
@@ -849,6 +881,35 @@ class LinkHealLedger:
         )
         return [Verdict(verdict) for (verdict,) in rows]
 
+    def add_calibration(
+        self,
+        run_id: str,
+        *,
+        model: str,
+        prompt_sha256: str,
+        population_sha256: str,
+        passed: bool,
+        report: Mapping[str, Any],
+    ) -> int:
+        with self._conn:
+            return _lastrowid(self._conn.execute(
+                'INSERT INTO calibrations (run_id, model, prompt_sha256, population_sha256, '
+                'passed, report_json, at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (
+                    run_id, model, prompt_sha256, population_sha256, int(passed),
+                    json.dumps(report, sort_keys=True), _now(),
+                ),
+            ))
+
+    def latest_calibration(self, model: str, prompt_sha256: str) -> CalibrationRow | None:
+        """The newest calibration of *model* asked under exactly *prompt_sha256*."""
+        row = self._conn.execute(
+            'SELECT * FROM calibrations WHERE model = ? AND prompt_sha256 = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (model, prompt_sha256),
+        ).fetchone()
+        return None if row is None else _calibration_row(row)
+
     def snapshot(self, project_id: str, record: LiveRecord) -> int:
         """The id of *record*'s snapshot, stored now unless this exact state already is."""
         with self._conn:
@@ -910,6 +971,19 @@ def _snapshot(row: sqlite3.Row) -> RecordSnapshot:
         metadata_sha256=row['metadata_sha256'],
         created_at=row['created_at'],
         updated_at=row['updated_at'],
+    )
+
+
+def _calibration_row(row: sqlite3.Row) -> CalibrationRow:
+    return CalibrationRow(
+        calibration_id=row['id'],
+        run_id=row['run_id'],
+        model=row['model'],
+        prompt_sha256=row['prompt_sha256'],
+        population_sha256=row['population_sha256'],
+        passed=bool(row['passed']),
+        report=json.loads(row['report_json']),
+        at=row['at'],
     )
 
 

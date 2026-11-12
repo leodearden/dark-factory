@@ -106,6 +106,7 @@ WRITE_FAILURE_ANCHOR = 'link-heal-write-failure'
 MISFILE_SHARE_ANCHOR = 'link-heal-misfile-share'
 CORRECTS_SHARE_ANCHOR = 'link-heal-corrects-share'
 ADJUDICATOR_ANCHOR = 'link-heal-adjudicator'
+CALIBRATION_ANCHOR = 'link-heal-calibration'
 
 #: A share ceiling judges only a run with at least this many adjudicated pairs.
 SHARE_ESCAPE_MIN_PAIRS = 20
@@ -325,6 +326,16 @@ _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
             'The link adjudicator\'s Claude CLI shards kept failing (the detail\'s labels '
             'name how). Check that the CLI is logged in and that link_heal.adjudicator_model '
             'names a usable model, then re-run `link_heal.py plan --from-adjudicator`.'
+        ),
+    ),
+    CALIBRATION_ANCHOR: _EscapeRoute(
+        category='risk_identified',
+        suggested_action=(
+            'Read the calibration report the detail names: it gives each failed floor and '
+            'the confusion behind it. Either fix the adjudicator (its model or the rater '
+            'brief) and re-run `link_heal.py calibrate`, or deliberately re-base '
+            'link_heal.calibration_kappa_margin. Sweeps do not write until a calibration '
+            'of the exact model and prompt passes.'
         ),
     ),
 })

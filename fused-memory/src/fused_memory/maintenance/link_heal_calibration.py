@@ -11,6 +11,13 @@ the same ratings file (the second rater against the primary, over the rows both
 rated), less a margin. The gate holds when every gated scope clears its floors
 and few enough pairs went unanswered. The pool is always gated; a project is
 gated once it has enough rated items to make its kappa meaningful.
+
+:func:`run_calibration` asks the adjudicator about the rated texts as a
+non-writing ledger run, ledgers its verdicts as adjudications at those texts'
+hashes (the ledger is their one home), and records the result against the
+adjudicator's model and prompt version. A sweep writes only once the ledger
+holds a passing calibration for exactly the adjudicator it would write with. A
+failed calibration escalates under :data:`CALIBRATION_ANCHOR`.
 """
 
 from __future__ import annotations
@@ -18,15 +25,30 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
+from shared.safe_io import atomic_write_text
+
+from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, LinkPair, LinkVerdict
 from fused_memory.maintenance.link_heal import MISFILE_VERDICTS, Verdict
+from fused_memory.maintenance.link_heal_executor import CALIBRATION_ANCHOR, Escape, EscapeFiler
+from fused_memory.maintenance.link_heal_ledger import (
+    AdjudicationRecord,
+    LinkHealLedger,
+    RunSource,
+)
+from fused_memory.maintenance.link_heal_store import text_sha256
+
+if TYPE_CHECKING:
+    from fused_memory.config.schema import LinkHealConfig
 
 POOLED = 'pooled'
 DEFAULT_MAX_UNANSWERED_SHARE = 0.05
+CALIBRATION_FORMAT = 'link-heal-calibration/1'
 
 
 class CalibrationInputError(ValueError):
@@ -424,3 +446,253 @@ def _verdict(row: Mapping[str, Any], field_name: str, where: str) -> Verdict:
         raise CalibrationInputError(
             f'{where}: {field_name} {value!r} is not one of the brief\'s verdict words',
         ) from exc
+
+
+@dataclass(frozen=True)
+class CalibrationSettings:
+    """The gate's leaves: the margin under the raters' kappa, the size from which a
+    project is gated, and the share of pairs that may go unanswered."""
+
+    margin: float
+    min_project_items: int
+    max_unanswered_share: float = DEFAULT_MAX_UNANSWERED_SHARE
+
+    @classmethod
+    def from_config(cls, config: LinkHealConfig) -> CalibrationSettings:
+        return cls(
+            margin=config.calibration_kappa_margin,
+            min_project_items=config.calibration_min_project_items,
+        )
+
+
+@dataclass(frozen=True)
+class CalibrationReport:
+    """One calibration run: its result, the report files it wrote, and its escalation."""
+
+    run_id: str
+    result: CalibrationResult
+    json_path: Path
+    markdown_path: Path
+    escalation_id: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.result.passed
+
+
+async def run_calibration(
+    population: Sequence[CalibrationItem],
+    *,
+    adjudicate: LinkAdjudicator,
+    ledger: LinkHealLedger,
+    settings: CalibrationSettings,
+    filer: EscapeFiler,
+    reports_dir: Path,
+    population_sha256: str,
+) -> CalibrationReport:
+    """Score *adjudicate* on *population* and record the score for its model and prompt.
+
+    Every question is asked before the run row exists. A pair the adjudicator
+    gave no verdict on is unanswered: counted, never ledgered.
+    """
+    verdicts = await adjudicate([_pair(item) for item in population])
+    answered = {
+        item.key: _adjudication(item, verdict, adjudicate.prompt_sha256)
+        for item, verdict in zip(population, verdicts, strict=True)
+        if not verdict.failed
+    }
+    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+    ledger.add_adjudications(run_id, list(answered.values()))
+    result = assess_calibration(
+        population,
+        {key: record.verdict for key, record in answered.items()},
+        margin=settings.margin,
+        min_project_items=settings.min_project_items,
+        max_unanswered_share=settings.max_unanswered_share,
+    )
+    identity = _CalibrationIdentity(
+        run_id=run_id,
+        model=adjudicate.model,
+        prompt_sha256=adjudicate.prompt_sha256,
+        population_sha256=population_sha256,
+    )
+    document = {**identity.as_json(), **result.as_json()}
+    json_path, markdown_path = _write_reports(reports_dir, identity, result, document)
+    ledger.finish_run(run_id, counts=_run_counts(len(population), len(answered), result))
+    ledger.add_calibration(
+        run_id,
+        model=identity.model,
+        prompt_sha256=identity.prompt_sha256,
+        population_sha256=population_sha256,
+        passed=result.passed,
+        report=document,
+    )
+    escalation_id = None if result.passed else filer(
+        _calibration_escape(identity, result, json_path=json_path, markdown_path=markdown_path),
+    )
+    return CalibrationReport(
+        run_id=run_id,
+        result=result,
+        json_path=json_path,
+        markdown_path=markdown_path,
+        escalation_id=escalation_id,
+    )
+
+
+def _pair(item: CalibrationItem) -> LinkPair:
+    return LinkPair(key=item.key, child_text=item.child_text, parent_text=item.parent_text)
+
+
+def _adjudication(
+    item: CalibrationItem, verdict: LinkVerdict, prompt_sha256: str,
+) -> AdjudicationRecord:
+    if verdict.verdict is None:
+        raise ValueError(f'{item.key}: an unanswered pair has no adjudication to ledger')
+    return AdjudicationRecord(
+        project_id=item.project,
+        child_id=item.child_id,
+        parent_id=item.parent_id,
+        child_sha256=text_sha256(item.child_text),
+        parent_sha256=text_sha256(item.parent_text),
+        verdict=verdict.verdict,
+        reason=verdict.reason,
+        model=verdict.model,
+        prompt_sha256=prompt_sha256,
+    )
+
+
+def _run_counts(pairs: int, answered: int, result: CalibrationResult) -> dict[str, Any]:
+    return {
+        'pairs': pairs,
+        'answered': answered,
+        'adjudication_failed': pairs - answered,
+        'passed': result.passed,
+    }
+
+
+@dataclass(frozen=True)
+class _CalibrationIdentity:
+    """What a calibration scored: the run, the adjudicator's model and prompt, the population."""
+
+    run_id: str
+    model: str
+    prompt_sha256: str
+    population_sha256: str
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            'format': CALIBRATION_FORMAT,
+            'run_id': self.run_id,
+            'model': self.model,
+            'prompt_sha256': self.prompt_sha256,
+            'population_sha256': self.population_sha256,
+        }
+
+
+def _calibration_escape(
+    identity: _CalibrationIdentity,
+    result: CalibrationResult,
+    *,
+    json_path: Path,
+    markdown_path: Path,
+) -> Escape:
+    """The escape a failed calibration files, naming each failure and the report."""
+    return Escape(
+        anchor=CALIBRATION_ANCHOR,
+        summary=(
+            f'link adjudicator ({identity.model}) failed calibration run {identity.run_id[:8]}: '
+            f'{len(result.failures)} gate(s) missed'
+        ),
+        detail={
+            **identity.as_json(),
+            'failures': [failure.describe() for failure in result.failures],
+            'report': str(markdown_path),
+            'report_json': str(json_path),
+        },
+    )
+
+
+def _write_reports(
+    reports_dir: Path,
+    identity: _CalibrationIdentity,
+    result: CalibrationResult,
+    document: Mapping[str, Any],
+) -> tuple[Path, Path]:
+    stem = f'link-heal-calibration-{datetime.now(UTC).date().isoformat()}-{identity.run_id[:8]}'
+    json_path = reports_dir / f'{stem}.json'
+    markdown_path = reports_dir / f'{stem}.md'
+    atomic_write_text(json_path, json.dumps(document, sort_keys=True, indent=2) + '\n', mkdir=True)
+    atomic_write_text(markdown_path, _render_markdown(identity, result), mkdir=True)
+    return json_path, markdown_path
+
+
+_SHARED_FAMILY_CAVEAT = (
+    'The primary raters were opus, and opus is the adjudicator\'s default model. When the '
+    'adjudicator is an opus model the two share a model family, so their agreement may be '
+    'inflated.'
+)
+
+
+def _render_markdown(identity: _CalibrationIdentity, result: CalibrationResult) -> str:
+    verdict = 'PASSED' if result.passed else 'FAILED'
+    lines = [
+        f'# Link-heal calibration {identity.run_id[:8]}: {verdict}',
+        '',
+        f'- run: `{identity.run_id}`',
+        f'- model: `{identity.model}`',
+        f'- prompt sha256: `{identity.prompt_sha256}`',
+        f'- population sha256: `{identity.population_sha256}`',
+        f'- pairs: {result.pooled.items}, answered {result.pooled.answered}, '
+        f'unanswered share {result.unanswered_share:.3f} (bound {result.max_unanswered_share:.3f})',
+        f'- margin under the raters\' kappa: {result.margin:.3f}; '
+        f'projects gated from {result.min_project_items} rated items',
+        '',
+        '## Gate failures',
+        '',
+        *([f'- {failure.describe()}' for failure in result.failures] or ['None.']),
+        '',
+        '## The raters\' own agreement (second rater against the primary, rows both rated)',
+        '',
+        '| binary | n | kappa | floor | both yes | second only | primary only | both no |',
+        '|---|---|---|---|---|---|---|---|',
+        *(
+            _rater_line(binary, result.rater[binary], result.pooled.binaries[binary].floor)
+            for binary in Binary
+        ),
+        '',
+        '## The adjudicator against the final rater verdict',
+        '',
+        '| scope | gated | items | answered | binary | kappa | floor | clears | '
+        'both yes | adjudicator only | rater only | both no |',
+        '|---|---|---|---|---|---|---|---|---|---|---|---|',
+        *(
+            _scope_line(scope, binary)
+            for scope in (result.pooled, *(result.projects[name] for name in sorted(result.projects)))
+            for binary in Binary
+        ),
+        '',
+        '## Caveat',
+        '',
+        _SHARED_FAMILY_CAVEAT,
+        '',
+    ]
+    return '\n'.join(lines)
+
+
+def _rater_line(binary: Binary, agreement: BinaryAgreement, floor: float | None) -> str:
+    return (
+        f'| {binary} | {agreement.n} | {_number(agreement.kappa)} | {_number(floor)} | '
+        f'{agreement.both_yes} | {agreement.adjudicator_only} | {agreement.rater_only} | '
+        f'{agreement.both_no} |'
+    )
+
+
+def _scope_line(scope: ScopeScore, binary: Binary) -> str:
+    score = scope.binaries[binary]
+    agreement = score.agreement
+    return (
+        f'| {scope.scope} | {"yes" if scope.gated else "no"} | {scope.items} | {scope.answered} | '
+        f'{binary} | {_number(agreement.kappa)} | {_number(score.floor)} | '
+        f'{"yes" if score.clears_floor else "no"} | {agreement.both_yes} | '
+        f'{agreement.adjudicator_only} | {agreement.rater_only} | {agreement.both_no} |'
+    )
