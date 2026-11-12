@@ -84,7 +84,7 @@ import re
 from dataclasses import dataclass
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 
 @dataclass(frozen=True)

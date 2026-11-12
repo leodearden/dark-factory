@@ -29,7 +29,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from _dashboard_helpers import strip_js_comments, walk_balanced
+from _jsx_source_helpers import strip_js_comments, walk_balanced
 
 from dashboard.data.census import TONES
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     destructure_bindings,

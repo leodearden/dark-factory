@@ -38,7 +38,7 @@ import pathlib
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     extract_function_body,
     find_function_params,
     jsx_open_tag_end,

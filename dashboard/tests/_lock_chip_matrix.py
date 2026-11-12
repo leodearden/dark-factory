@@ -21,7 +21,8 @@ import subprocess
 from collections.abc import Iterable
 from typing import Any
 
-from _dashboard_helpers import extract_function_body, find_function_params, node_path
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import extract_function_body, find_function_params
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux'
 SCHED_UTILS_PATH = str(_REDUX_DIR / 'scheduler_utils.jsx')

@@ -37,7 +37,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from _dashboard_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
+from _jsx_source_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
