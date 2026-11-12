@@ -448,17 +448,66 @@ export function qualityMetric({
 }
 
 // The QUALITY Datum's value: `axis` as qualityAxis builds it, `metrics` keyed
-// by metric id (each from qualityMetric, one point per axis entry), no cost
-// model, no module rows, no before/after comparison, and a git cross-check
-// that disagrees nowhere unless `gitCheck` is given.
-export function qualityPayload({ axis, metrics, gitCheck = NO_GIT_DISAGREEMENT }) {
+// by metric id (each from qualityMetric, one point per axis entry), and a git
+// cross-check that disagrees nowhere unless `gitCheck` is given. No cost model
+// is in force unless `costModel` names some of its fields, and there are no
+// module rows (qualityModuleRow) or before/after comparisons
+// (qualityComparison) unless they are given.
+export function qualityPayload({
+  axis, metrics, gitCheck = NO_GIT_DISAGREEMENT, costModel = {}, modules = [], beforeAfter = [],
+}) {
   return {
     axis: qualityAxis(axis),
     metrics,
-    cost_model: NO_COST_MODEL,
-    modules: [],
-    before_after: [],
+    cost_model: { ...NO_COST_MODEL, ...costModel },
+    modules,
+    before_after: beforeAfter,
     git_check: gitCheck,
+  };
+}
+
+// One QUALITY.value.modules row, as quality_series.py::ModuleRow.to_wire
+// serves it (that method owns the shape); a null `module` is the no-src
+// bucket.
+export function qualityModuleRow({
+  module, landings = 10, tasks = 10, allocatedLines = 1200, allocatedUsd = 24, usdPer100Lines = 2, ranked = true,
+}) {
+  return {
+    module, landings, tasks, allocated_lines: allocatedLines, allocated_usd: allocatedUsd,
+    usd_per_100_lines: usdPer100Lines, ranked,
+  };
+}
+
+// One QUALITY.value.before_after entry, as quality_series.py::BeforeAfter.to_wire
+// serves it (that method owns the shape): measured unless `state` is 'not_yet',
+// whose effect and band are then unmeasured.
+export function qualityComparison({
+  markerId, metric, nBefore = 300, nAfter = 120, effect = 0.05, lo = 0.01, hi = 0.09,
+  state = 'measured', etaDays = null, minDetectable = null,
+}) {
+  const measured = state !== 'not_yet';
+  return {
+    marker_id: markerId, metric, n_before: nBefore, n_after: nAfter,
+    effect: measured ? effect : null, lo: measured ? lo : null, hi: measured ? hi : null,
+    state, eta_days: etaDays, min_detectable: minDetectable,
+  };
+}
+
+const NO_SNAPSHOT_PRODUCER = 'no producer has written here: the nightly quality-metrics snapshot series has no writer yet';
+
+// The whole /api/v2/dashboard/quality body, as api/quality.py::api_quality
+// serves it: `quality` (a qualityPayload value) and `markers` (a
+// qualityMarkers value) as fresh Datums, the snapshot Datum unknown because
+// its producer has not landed, and the landing window echo `window` asked
+// for and served.
+export function qualityBody({ quality, markers = qualityMarkers([]), window = '100' }) {
+  const landings = window === 'all' ? null : Number(window);
+  return {
+    QUALITY: wireDatum(quality),
+    QUALITY_MARKERS: wireDatum(markers),
+    QUALITY_SNAPSHOTS: unreadWireDatum(NO_SNAPSHOT_PRODUCER),
+    WINDOW: { requested: window, served: window, landings },
+    served_at: WIRE_AS_OF,
   };
 }
 

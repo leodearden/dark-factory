@@ -66,7 +66,7 @@ test('every mapped endpoint is a real endpointsFor() path', () => {
 
 test('every mapped tab id is one of app.jsx\'s tab ids', () => {
   const ids = appTabIds();
-  assert.equal(ids.length, 13, `expected app.jsx's 13 tabs, got ${ids.length}: ${ids.join(', ')}`);
+  assert.equal(ids.length, 14, `expected app.jsx's 14 tabs, got ${ids.length}: ${ids.join(', ')}`);
   for (const tab of Object.keys(TAB_ENDPOINTS)) {
     assert.ok(ids.includes(tab),
       `TAB_ENDPOINTS has tab id ${tab}, which app.jsx does not render: ${ids.join(', ')}`);
@@ -80,6 +80,12 @@ test('every app.jsx tab is mapped — a tab with no entry is silently unmonitore
       `app.jsx renders tab ${tab} but TAB_ENDPOINTS has no entry for it, so ` +
       'a wedge behind that tab would show no indicator at all');
   }
+});
+
+test('the quality tab polls only /orchestrators, for its project selector', () => {
+  // Its own read, /quality, is on demand (data.js::ON_DEMAND_KEYS.quality),
+  // never polled: one read costs about a second and carries ?project=.
+  assert.deepEqual([...TAB_ENDPOINTS.quality], [`${DASH}/orchestrators`]);
 });
 
 test('TAB_ENDPOINTS and each of its entries are frozen', () => {

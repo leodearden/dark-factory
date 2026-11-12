@@ -1957,6 +1957,7 @@ _DEPENDENCY_FREE_MODULES = {
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
         'tab_tasks.jsx',
+        'tab_quality.jsx',
     ),
     'render_failure.js': ('app.jsx',),
     'poll_scope.js': ('data.js', 'app.jsx'),
@@ -2009,16 +2010,19 @@ def test_dependency_free_module_loads_before_its_consumers(
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: classic modules that destructure other classic modules'
-# globals at module scope are served, versioned, and load after every module
-# they read and before every consumer that reads them (task 8461)
+# Regression guard: modules that destructure other modules' globals at module
+# scope are served, versioned, and load after every module they read and
+# before every consumer that reads them (task 8461)
 #
 # One row per module: (the modules whose globals it reads, its consumers).
 # Each edge is its own case, because each blanks a different surface.
+# tab_quality.jsx's other two reads are pinned without a row here:
+# persisted_state.js in _DEPENDENCY_FREE_MODULES, datum.js through data.js.
 # ---------------------------------------------------------------------------
 
 _READING_MODULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    'quality_view.js': (('chart_marks.js',), ()),
+    'quality_view.js': (('chart_marks.js',), ('tab_quality.jsx',)),
+    'tab_quality.jsx': (('charts.jsx', 'shell.jsx', 'data.js', 'window_chip.js'), ('app.jsx',)),
 }
 _READING_MODULE_EDGES = [
     edge

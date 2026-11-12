@@ -40,6 +40,7 @@ const {
   indexMarkers,
   alarmVerdict,
   beforeAfterText,
+  costModelReadings,
   qualityMarks,
 } = view;
 const { markHover } = loadedWindow.DF_CHART_MARKS;
@@ -53,8 +54,8 @@ const CATALOGUE_IDS = [
 test('quality_view.js assigns window.DF_QUALITY_VIEW to its module surface', () => {
   assert.equal(loadedWindow.DF_QUALITY_VIEW, view);
   assert.deepEqual(Object.keys(view).sort(), [
-    'QUALITY_LAYOUT', 'alarmVerdict', 'beforeAfterText', 'chartSeries', 'headlineText',
-    'indexMarkers', 'qualityMarks', 'ruleCaption',
+    'QUALITY_LAYOUT', 'alarmVerdict', 'beforeAfterText', 'chartSeries', 'costModelReadings',
+    'headlineText', 'indexMarkers', 'qualityMarks', 'ruleCaption',
   ]);
 });
 
@@ -252,6 +253,25 @@ test('a not-yet comparison omits what the server did not measure', () => {
   });
 
   assert.equal(beforeAfterText(entry, 'cost'), 'n 250 → 40');
+});
+
+// ── The cost model in force ───────────────────────────────────────────────
+
+test('a cost model in force reads its reference cost in dollars and its signed median residual', () => {
+  const costModel = { a: 0.4, b: 0.7, reference_cost_100: 1.837, residual_median: -0.1204, state: 'frozen' };
+
+  assert.deepEqual(costModelReadings(costModel).map(({ key, label, text, hint }) => [key, label, text, hint]), [
+    ['reference_cost_100', 'Reference cost at 100 lines', '$1.84', 'frozen baseline'],
+    ['residual_median', 'Median log residual', '-0.120', 'frozen baseline'],
+  ]);
+  assert.equal(costModelReadings({ ...costModel, residual_median: 0.05, state: 'provisional' })[1].text, '+0.050');
+  assert.equal(costModelReadings({ ...costModel, state: 'provisional' })[0].hint, 'provisional baseline');
+});
+
+test('with no cost model in force both readings are unmeasured and unhinted', () => {
+  const none = qualityPayload({ axis: [], metrics: {} }).cost_model;
+
+  assert.deepEqual(costModelReadings(none).map(({ text, hint }) => [text, hint]), [[null, null], [null, null]]);
 });
 
 // ── Marks on a metric's chart ─────────────────────────────────────────────

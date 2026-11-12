@@ -15,9 +15,12 @@ import {
   escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  qualityBody,
+  qualityComparison,
   qualityMarker,
   qualityMarkers,
   qualityMetric,
+  qualityModuleRow,
   qualityPayload,
   schedulerLockRow,
   schedulerModule,
@@ -170,6 +173,33 @@ test('a QUALITY series, a measured and a no-producer metric included, is built o
   assertSameKeys(measured.headline.value, servedMetrics.rejected.headline.value, 'a measured headline value');
   assert.equal(servedMetrics.reverts.rule.measured_since, null, 'this check expects reverts to have no producer');
   assert.equal(unproduced.headline.state, servedMetrics.reverts.headline.state);
+});
+
+test('a whole /quality body, its cost model and a before/after comparison are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_alarm_explained');
+  const [servedComparison] = served.QUALITY.value.before_after;
+  const comparison = qualityComparison({ markerId: 'routing:reviewer_comprehensive:1', metric: 'rejected', state: 'not_yet' });
+  const body = qualityBody({
+    quality: qualityPayload({ axis: [{}], metrics: {}, costModel: { reference_cost_100: 1.5 }, beforeAfter: [comparison] }),
+  });
+
+  assertSameKeys(body, served, 'the /quality body');
+  assertSameKeys(body.WINDOW, served.WINDOW, 'the /quality WINDOW echo');
+  assertSameKeys(body.QUALITY_SNAPSHOTS, served.QUALITY_SNAPSHOTS, 'the QUALITY_SNAPSHOTS Datum');
+  assert.equal(body.QUALITY_SNAPSHOTS.state, served.QUALITY_SNAPSHOTS.state);
+  assertSameKeys(body.QUALITY.value.cost_model, served.QUALITY.value.cost_model, 'QUALITY.value.cost_model');
+  assert.ok(servedComparison, 'this check expects quality_alarm_explained to serve a before/after comparison');
+  assertSameKeys(comparison, servedComparison, 'QUALITY.value.before_after[0]');
+  assert.equal(comparison.state, servedComparison.state);
+});
+
+// No boundary scenario serves a module row yet (each one's modules is []), so
+// qualityModuleRow is held to quality_series.py::ModuleRow.to_wire's field
+// list only; this pins that the builder's keys stay that one list.
+test('a module row is built with the seven keys ModuleRow.to_wire serves', () => {
+  assert.deepEqual(Object.keys(qualityModuleRow({ module: 'dashboard' })).sort(), [
+    'allocated_lines', 'allocated_usd', 'landings', 'module', 'ranked', 'tasks', 'usd_per_100_lines',
+  ]);
 });
 
 test('a QUALITY_MARKERS stream and its derived marker are built with exactly the keys /quality serves', () => {
