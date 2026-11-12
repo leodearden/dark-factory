@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 from urllib.parse import urlsplit
 
 import pytest
@@ -679,14 +681,17 @@ _BRIDGE_REQUEST_PATHS = pytest.mark.parametrize(
 )
 
 
-async def _post_through_bridge(upstream_url, path, headers):
+_MESSAGES_JSON = json.dumps({'model': 'x', 'messages': []}).encode()
+
+
+async def _post_through_bridge(upstream_url, path, headers, data=_MESSAGES_JSON):
     async with (
         VllmBridge(upstream_url=upstream_url) as bridge,
         aiohttp.ClientSession() as session,
         session.post(
             bridge.url + path,
-            json={'model': 'x', 'messages': []},
-            headers=headers,
+            data=data,
+            headers={'Content-Type': 'application/json', **headers},
         ) as resp,
     ):
         assert resp.status == 200
@@ -726,3 +731,16 @@ class TestVllmBridgeUpstreamHeaders:
 
         upstream_headers = _only_request_to(received, path)
         assert coding_no_aiohttp_build_decodes not in upstream_headers.get('accept-encoding', '')
+
+    @_BRIDGE_REQUEST_PATHS
+    async def test_client_content_encoding_is_not_forwarded(
+        self, mock_upstream_header_capture, path
+    ):
+        """The bridge forwards the body it decoded, so the client's coding no longer applies."""
+        upstream_url, received = mock_upstream_header_capture
+        await _post_through_bridge(
+            upstream_url, path, {'Content-Encoding': 'gzip'}, data=gzip.compress(_MESSAGES_JSON)
+        )
+
+        upstream_headers = _only_request_to(received, path)
+        assert 'content-encoding' not in upstream_headers
