@@ -260,9 +260,10 @@ class _FakeClock:
 class TestOperatorStopCallbackForceExit:
     """The first stop signal drains; a repeat inside the window is the same stop
     delivered twice (task 9493: a systemd restart under the default
-    KillMode=control-group delivers 2-4 SIGTERMs within ~0.3 s); a later second
-    signal still forces exit, which is uvicorn's deliberate-second-Ctrl-C escape
-    hatch, lost otherwise because ``install_signal_handlers`` is neutered.
+    KillMode=control-group delivered 2-4 SIGTERMs, the latest 1.542 s after the
+    first); a later second signal still forces exit, which is uvicorn's
+    deliberate-second-Ctrl-C escape hatch, lost otherwise because
+    ``install_signal_handlers`` is neutered.
     """
 
     def _make_fake_server(self) -> SimpleNamespace:
@@ -285,12 +286,14 @@ class TestOperatorStopCallbackForceExit:
         assert s1.force_exit is False
         assert s2.force_exit is False
 
-    def test_repeat_within_milliseconds_still_drains(self):
+    @pytest.mark.parametrize('repeat_at', [0.005, 1.5, 1.542])
+    def test_repeat_inside_the_window_still_drains(self, repeat_at):
+        """1.542 s is the latest repeat measured over 40 live restarts."""
         s1, s2 = self._make_fake_server(), self._make_fake_server()
         clock = _FakeClock()
         cb = _make_operator_stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 0.005)
+        self._signal_at(clock, cb, 0.0, repeat_at)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
@@ -302,7 +305,7 @@ class TestOperatorStopCallbackForceExit:
         clock = _FakeClock()
         cb = _make_operator_stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 1.5)
+        self._signal_at(clock, cb, 0.0, 3.5)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
@@ -315,11 +318,11 @@ class TestOperatorStopCallbackForceExit:
         clock = _FakeClock()
         cb = _make_operator_stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 0.6)
+        self._signal_at(clock, cb, 0.0, 2.0)
         assert s1.force_exit is False
         assert s2.force_exit is False
 
-        self._signal_at(clock, cb, 1.2)
+        self._signal_at(clock, cb, 3.2)
         assert s1.force_exit is True
         assert s2.force_exit is True
 
@@ -328,7 +331,7 @@ class TestOperatorStopCallbackForceExit:
         clock = _FakeClock()
         cb = _make_operator_stop_callback(s1, s2, clock=clock)
 
-        self._signal_at(clock, cb, 0.0, 1.5, 2.0)
+        self._signal_at(clock, cb, 0.0, 3.5, 4.0)
 
         assert s1.should_exit is True
         assert s2.should_exit is True
