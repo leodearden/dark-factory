@@ -486,7 +486,7 @@ before this prefix may be used, and for the three traps a naive version misses.
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(#?{tid}([ ,/][^)]*)?\)!?:'
-    r'|^Merge task/{tid} into '
+    r'|{merge_subject}'
 )
 r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
@@ -522,7 +522,9 @@ scope``).  Anything this template misses falls through to the UNCHANGED
 ``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
-``find_task_citation_commit`` requires of any override.
+``find_task_citation_commit`` requires of any override; its ``{merge_subject}``
+arm is filled by ``orchestrator/src/orchestrator/git_ops.py::render_citation_pattern``
+from the GitOps config.
 """
 
 

@@ -181,8 +181,10 @@ SCRIPT_COVERAGE = {
 #: ``61 passed, 14 failed``.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
-    'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+    'test_warm_lane_degenerate_ref.sh': 95,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
                                              # + 3 (U8, task 5940)
+                                             # + 6 (M1-M3: merge arm from shared.merge_subject, task 6716)
+                                             # + 5 (M4-M5: the lib refuses an empty merge arm, task 6716)
     'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
     'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)

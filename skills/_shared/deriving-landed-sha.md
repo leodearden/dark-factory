@@ -97,12 +97,12 @@ to each line of the message separately while `%s` joins a wrapped first paragrap
 a full-subject pattern misses a marker whose subject wraps, and a branch name, which has no
 whitespace, survives. `--fixed-strings` keeps the branch name literal, and the search is
 **substring-safe** because of the `awk` equality against the exact subject from
-`orchestrator/src/orchestrator/git_ops.py::_merge_subject` (canonical form
+`shared/src/shared/merge_subject.py::format_merge_subject` (canonical form
 `Merge <full-branch> into <main-branch>`): the `task/1` pre-filter does match inside `task/10`, but
 `Merge task/10 into main` is not equal to `Merge task/1 into main`. Do **not** put the full subject
 back into `--grep`. If a project overrides `git.branch_prefix` (default `task/`) or
 `git.main_branch`, build the branch and the subject from config, the subject from
-`_merge_subject`, rather than hardcoding them.
+`format_merge_subject(branch, main_branch)`, rather than hardcoding them.
 
 **Substring-safety is not subject-scoping, and the `--grep` half gives you neither.**
 `git log --grep` matches the **whole commit message**, not the subject, so the `--grep` half alone
@@ -119,7 +119,7 @@ subject equality rules out the `task/1`-inside-`task/10` collision and a body ma
 else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
 [step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
 no further check, so this selection is the only thing standing between a body match and a stamped
-`done_provenance`. Equality is against the `_merge_subject` string bound to `S`; nothing weaker
+`done_provenance`. Equality is against the `format_merge_subject` string bound to `S`; nothing weaker
 (prefix, substring, case-folded) counts.
 
 **Select the newest subject-matching hit — do not take the newest hit and then test it.** These
@@ -162,7 +162,7 @@ substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
 command explicitly mirrors (`GitOps.find_merge_marker`, on both its index and scan paths, selects
-the newest commit on main whose SUBJECT equals `_merge_subject`, and does not restrict to merge
+the newest commit on main whose SUBJECT equals `format_merge_subject(branch, main_branch)`, and does not restrict to merge
 commits — `orchestrator/src/orchestrator/git_ops.py::_merge_markers_by_branch`), whose whole value
 is that writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
 measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker

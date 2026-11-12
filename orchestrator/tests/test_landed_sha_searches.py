@@ -166,7 +166,10 @@ def test_citation_walk_lists_the_commit_find_task_citation_commit_cites(
 
     walk = LandedShaSearches.for_task(TASK_ID, cfg).citation_walk
     assert isinstance(walk, str)
-    pattern = task_citation_pattern(TASK_ID, cfg.commit_citation_pattern)
+    pattern = task_citation_pattern(
+        TASK_ID, cfg.commit_citation_pattern,
+        branch_prefix=cfg.branch_prefix, main_branch=cfg.main_branch,
+    )
     assert pattern is not None
     cites = re.compile(pattern)
     rows = [line.partition(' ') for line in _run_rendered(root, walk).splitlines()]
@@ -196,7 +199,7 @@ _UNRENDERABLE_TEMPLATES = [
 @pytest.mark.parametrize('template', _UNRENDERABLE_TEMPLATES)
 def test_an_unrenderable_project_pattern_is_one_typed_error(template: str) -> None:
     with pytest.raises(CitationPatternInvalid):
-        task_citation_pattern(TASK_ID, template)
+        task_citation_pattern(TASK_ID, template, branch_prefix='task/', main_branch='main')
 
 
 @pytest.mark.parametrize('template', _UNRENDERABLE_TEMPLATES)
