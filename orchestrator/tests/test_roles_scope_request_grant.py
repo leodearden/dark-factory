@@ -1,8 +1,10 @@
 """Only the writers that the workflow briefs on scope requests may file one (task 3090).
 
-``workflow.py::TaskWorkflow._apply_scope_requests`` applies requests after
-implementer and debugger sessions only, so those two roles hold the grant and
-no other role does.
+Every session of a role granted the tool is followed by
+``workflow.py::TaskWorkflow._apply_scope_requests``: the execute iteration, the
+escalation resume and the amendment pass for IMPLEMENTER, and each debug-fix
+attempt for DEBUGGER. No other role's session reaches that boundary, so no
+other role holds the grant.
 """
 
 from __future__ import annotations

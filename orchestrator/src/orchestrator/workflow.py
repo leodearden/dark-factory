@@ -3342,6 +3342,9 @@ class TaskWorkflow:
                         )
 
                     await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
+                    await self._apply_scope_requests(
+                        role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+                    )
                     continue
                 if outcome != WorkflowOutcome.DONE:
                     return outcome
@@ -5005,13 +5008,19 @@ class TaskWorkflow:
     async def _apply_scope_requests(self, *, role: str, iteration: int) -> None:
         """Lock and declare the paths a writer reported missing from plan.files.
 
-        Runs after each implementer/debugger session on the requests
-        ``mcp/plan_tools.py::report_missing_plan_file`` left in
-        ``scope_requests.json``.  Free paths advance plan.files, metadata.files,
-        the held locks and ``self.modules`` together; a contested path advances
+        Runs on the requests ``mcp/plan_tools.py::report_missing_plan_file``
+        left in ``scope_requests.json``, after every session of a role holding
+        that grant: the execute iteration, the escalation resume and the
+        amendment pass for the implementer, and each debug-fix attempt for the
+        debugger.  Free paths advance plan.files, metadata.files, the held
+        locks and ``self.modules`` together; a contested path advances
         nothing.  The outcome is emitted as ``scope_drift`` and briefed to the
         next writer.  Never re-pends, releases or escalates (task 3090 ruling);
         a failure keeps the requests for the next boundary.
+
+        A plan this session no longer owns is never widened: ``set_plan_files``
+        would restamp it to this session and hide the overwrite from the
+        caller's own ``validate_plan_owner`` check, so the requests are kept.
         """
         assert self.artifacts is not None
         self._scope_drift_report = None
@@ -5019,6 +5028,13 @@ class TaskWorkflow:
             requests = self.artifacts.read_scope_requests()
             declared = list(self.artifacts.read_plan().get('files') or [])
             paths = pending_scope_paths(requests, declared)
+            if paths and not self.artifacts.validate_plan_owner(self.session_id):
+                logger.warning(
+                    'Task %s: plan.json is not owned by this session after the %s '
+                    'session; scope requests for %s kept unapplied',
+                    self.task_id, role, list(paths),
+                )
+                return
             if paths:
                 self._scope_drift_report = await self._widen_scope_uncontested(
                     paths, declared, role=role, iteration=iteration,
@@ -12023,6 +12039,9 @@ class TaskWorkflow:
             self._escalate_plan_overwrite()
             return False
 
+        await self._apply_scope_requests(
+            role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+        )
         return True
 
     async def _try_narrow_plan(self, not_touched: list[str]) -> bool:
