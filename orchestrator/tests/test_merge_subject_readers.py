@@ -193,6 +193,36 @@ class TestEvalMinersFollowTheConfiguredSubject:
         assert _resolve_feat_trunk('a b', feat_trunk.repo) is None
 
 
+def _commit_wrapped_landing(repo: Path, tid: str) -> str:
+    """Land ``feat/<tid>`` with its subject wrapped onto two lines, which git's %s joins."""
+    wrapped = format_merge_subject(f'feat/{tid}', 'trunk').replace(' into ', '\ninto ', 1)
+    _git(repo, 'commit', '--allow-empty', '--no-verify', '-m', wrapped)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+class TestEveryReaderSeesAWrappedLanding:
+    @pytest.mark.asyncio
+    async def test_the_marker_reader_sees_it(self, feat_trunk: FeatTrunk) -> None:
+        wrapped_sha = _commit_wrapped_landing(feat_trunk.repo, '53')
+        marker = await feat_trunk.git_ops.find_merge_marker('feat/53', gate_on_existing_ref=False)
+        assert marker == wrapped_sha
+
+    @pytest.mark.asyncio
+    async def test_the_sampler_sees_it(self, feat_trunk: FeatTrunk) -> None:
+        wrapped_sha = _commit_wrapped_landing(feat_trunk.repo, '53')
+        candidates = await discover_completed_tasks(
+            feat_trunk.repo, since=None, project='dark_factory',
+            branch_prefix='feat/', main_branch='trunk',
+        )
+        assert [(c.task_id, c.merge_sha) for c in candidates] == [
+            ('53', wrapped_sha), ('50', feat_trunk.merge_sha),
+        ]
+
+    def test_mining_sees_it(self, feat_trunk: FeatTrunk) -> None:
+        wrapped_sha = _commit_wrapped_landing(feat_trunk.repo, '53')
+        assert _resolve_feat_trunk('53', feat_trunk.repo) == wrapped_sha
+
+
 _LIB_CITES = (
     'source "$1"; prefix_re="$(task_citation_regex_escape "$2")"; '
     'task_citation_message_cites "$3" "$4" "$prefix_re" "$5" "$6"'

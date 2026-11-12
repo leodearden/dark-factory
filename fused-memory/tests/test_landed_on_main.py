@@ -440,3 +440,26 @@ async def test_revert_subject_for_an_unlanded_task_is_not_a_landing(trunk_repo: 
     )
 
     assert await _probe_feat_trunk(trunk_repo, '51') == LandingVerdict.not_landed()
+
+
+@pytest.mark.asyncio
+async def test_wrapped_first_paragraph_landing_into_trunk_is_landed(trunk_repo: Path) -> None:
+    _git(trunk_repo, 'checkout', '-q', '-b', 'feat/53', 'trunk')
+    _commit(trunk_repo, 'feat-53.txt', 'work for the wrapped landing', when=T0)
+    _git(trunk_repo, 'checkout', '-q', 'trunk')
+    wrapped = format_merge_subject('feat/53', 'trunk').replace(' into ', '\ninto ', 1)
+    _git(
+        trunk_repo, 'merge', '-q', '--no-ff', '-m', wrapped, 'feat/53',
+        when=T0 + timedelta(hours=1),
+    )
+    merge_sha = _git(trunk_repo, 'rev-parse', 'HEAD')
+    _git(trunk_repo, 'branch', '-q', '-D', 'feat/53')
+    assert _git(trunk_repo, 'show', '-s', '--format=%s', merge_sha) == format_merge_subject(
+        'feat/53', 'trunk',
+    )
+
+    verdict = await _probe_feat_trunk(trunk_repo, '53')
+
+    assert verdict.landed is True
+    assert verdict.evidence is LandingEvidence.MERGE_MARKER
+    assert verdict.commit == merge_sha
