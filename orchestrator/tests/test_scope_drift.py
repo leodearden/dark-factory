@@ -248,6 +248,17 @@ class TestScopeDriftBrief:
         brief.settle(delivered=delivered)
         assert brief.pending_contested() == _contested_report()
 
+    def test_a_resumed_session_never_receives_it_even_when_rebuilt_on_a_cap_hit(self):
+        brief = ScopeDriftBrief()
+        brief.record(_contested_report())
+        brief.render(resuming=True)
+        brief.render(resuming=False)
+        brief.settle(delivered=True)
+        assert brief.pending_contested() == _contested_report()
+        assert brief.render(resuming=False) is not None
+        brief.settle(delivered=True)
+        assert brief.pending_contested() is None
+
     def test_a_later_report_is_merged_into_one_no_writer_received(self):
         brief = ScopeDriftBrief()
         brief.record(_contested_report())

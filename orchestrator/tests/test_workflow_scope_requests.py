@@ -763,3 +763,48 @@ async def test_the_follow_up_is_a_fresh_session_not_a_dangling_progress_resume(
     assert resumed_ids[1] is None
     [followup_call] = rig.followup_prompt.await_args_list
     assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)
+
+
+@pytest.mark.asyncio
+async def test_a_cap_hit_rebuild_of_a_resumed_session_does_not_consume_the_brief(
+    tmp_path, monkeypatch
+):
+    rig = _make_workflow(tmp_path)
+    wf, scheduler = rig.wf, rig.scheduler
+    scheduler.contested_modules = {_REQUESTED: _HOLDER}
+    _write_dispatched_plan(wf, steps=1)
+    _stub_loop_collaborators(wf, monkeypatch)
+    wf.usage_gate = make_gate_mock(
+        account_count=2,
+        detect_cap_hit=MagicMock(side_effect=lambda *args, **_kw: 'CAPPED' in args),
+        scope_capacity_snapshot=MagicMock(return_value={}),
+    )
+    assert wf.artifacts is not None
+    artifacts = wf.artifacts
+    resumed_ids: list[object] = []
+
+    async def agent(**kwargs) -> AgentResult:
+        resumed_ids.append(kwargs.get('resume_session_id'))
+        call = len(resumed_ids)
+        if call == 1:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+            return _timed_out(transcript_turns=5)
+        if call == 2:
+            return AgentResult(
+                success=False, output='CAPPED', cost_usd=0.1, turns=2, duration_ms=1_000,
+                session_id='sess-capped',
+            )
+        if call == 3:
+            artifacts.update_step_status('step-1', 'done', None)
+        return _success()
+
+    with (
+        patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        outcome = await wf._execute_iterations()
+
+    assert outcome == WorkflowOutcome.DONE
+    assert resumed_ids[2] == 'sess-capped'
+    [followup_call] = rig.followup_prompt.await_args_list
+    assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)

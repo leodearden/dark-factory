@@ -192,11 +192,19 @@ class ScopeDriftBrief:
     def __init__(self) -> None:
         self._report: ScopeDriftReport | None = None
         self._rendered = False
+        self._resumed = False
         self._followups = 0
 
     def render(self, *, resuming: bool) -> ScopeDriftReport | None:
-        """The report for a writer prompt; a *resuming* dispatch sends a continuation instead."""
-        if not resuming:
+        """The report for a writer prompt; a *resuming* dispatch sends a continuation instead.
+
+        A session whose first dispatch resumed never counts as received:
+        cli_invoke's later cap-hit re-dispatches build the prompt only to ask
+        whether to retry, and keep their own continuation.
+        """
+        if resuming:
+            self._resumed = True
+        elif not self._resumed:
             self._rendered = True
         return self._report
 
@@ -205,6 +213,7 @@ class ScopeDriftBrief:
         if delivered and self._rendered:
             self._report = None
         self._rendered = False
+        self._resumed = False
 
     def record(self, report: ScopeDriftReport) -> None:
         """Fold a boundary's report into the one still waiting for a writer."""

@@ -5069,15 +5069,19 @@ class TaskWorkflow:
         A dispatch that resumes a *role* session sends cli_invoke's
         continuation prompt instead of the rendered one, so it does not count.
         """
-        resuming = bool(self._pending_resume_session_id) and self._pending_resume_role == role.name
-        return self._scope_drift_brief.render(resuming=resuming)
+        return self._scope_drift_brief.render(resuming=self._pending_resume_for(role) is not None)
 
-    def _drop_pending_resume(self, role: AgentRole) -> None:
-        if self._pending_resume_role == role.name:
-            self._pending_resume_session_id = None
-            self._pending_resume_role = None
-            self._pending_resume_count = 0
-            self._pending_resume_prompt = None
+    def _pending_resume_for(self, role: AgentRole) -> str | None:
+        """The session the next *role* dispatch of :meth:`_invoke` resumes, if any."""
+        if self._pending_resume_role != role.name:
+            return None
+        return self._pending_resume_session_id or None
+
+    def _clear_pending_resume(self) -> None:
+        self._pending_resume_session_id = None
+        self._pending_resume_role = None
+        self._pending_resume_count = 0
+        self._pending_resume_prompt = None
 
     async def _brief_contested_scope_drift(self) -> bool:
         """Run a fresh session to deliver a contested report no writer received; True when one ran.
@@ -5098,7 +5102,8 @@ class TaskWorkflow:
                 )
             return False
         self._scope_drift_brief.start_followup()
-        self._drop_pending_resume(IMPLEMENTER)
+        if self._pending_resume_for(IMPLEMENTER) is not None:
+            self._clear_pending_resume()
         contested = sorted(path for path, _holder in report.contested)
         assert self.worktree is not None
 
@@ -14946,11 +14951,9 @@ class TaskWorkflow:
         # briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
         resume_prompt: str | None = None
-        if (
-            self._pending_resume_session_id
-            and self._pending_resume_role == role.name
-        ):
-            session_id_val = self._pending_resume_session_id
+        pending_session_id = self._pending_resume_for(role)
+        if pending_session_id is not None:
+            session_id_val = pending_session_id
             # REHYDRATE FIRST, then corroborate — the order is load-bearing, so
             # the check below sees the restored state rather than vetoing a
             # session we could have saved.
@@ -15123,10 +15126,7 @@ class TaskWorkflow:
             # subsequent invocation of this role.
             pending_count = self._pending_resume_count
             pending_prompt = self._pending_resume_prompt
-            self._pending_resume_session_id = None
-            self._pending_resume_role = None
-            self._pending_resume_count = 0
-            self._pending_resume_prompt = None
+            self._clear_pending_resume()
             if corroborated:
                 resume_session_id = session_id_val
                 resume_prompt = pending_prompt
