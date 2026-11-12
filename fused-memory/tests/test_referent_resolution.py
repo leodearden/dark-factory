@@ -1922,8 +1922,8 @@ class TestKnownProjectIdsNarrowing:
         self, registry_kwargs, declared, metadata, content, expected_source
     ):
         """Omitted, None and ``{}`` are byte-identical to HEAD. The
-        empty-registry permissiveness belongs to ``_canonical_allowlist`` and
-        needs no second emptiness check here."""
+        empty-registry permissiveness belongs to ``scan_content``'s
+        ``known_project_ids`` and needs no second emptiness check here."""
         baseline = resolve_referents(
             declared=declared, metadata=metadata, content=content, group_id=GROUP
         )

@@ -407,9 +407,8 @@ class TestKnownProjectIdsAllowlist:
         disable cross-project detection entirely on a registry misconfigured
         with project ROOTS where project IDs were expected.
 
-        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
-        ("one bad entry never disables the whole allowlist") at the public API,
-        and mirrors ``validate_known_project_id``'s permissive falsy-registry
+        Enforces scan_content's permissive fallback ("one bad entry never
+        disables the whole allowlist") at the public API, and mirrors ``validate_known_project_id``'s permissive falsy-registry
         mode.
         """
         scan = find_cross_project_task_refs(

@@ -22,7 +22,6 @@ from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
-    _canonical_allowlist,
     parse_node_name,
     scan_content,
 )
@@ -1031,8 +1030,8 @@ class TestScanContentAllowlist:
     def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
         """A registry whose entries are ALL path-shaped degrades to PERMISSIVE.
 
-        The one-bad-entry case above is only half the contract
-        ``_canonical_allowlist`` states — "one bad entry never disables the
+        The one-bad-entry case above is only half the contract scan_content
+        states for ``known_project_ids`` — "one bad entry never disables the
         whole allowlist". When EVERY entry is skipped the surviving set is
         empty, and an empty frozenset ``is not None``, so the qualified-ref
         guard would read "allowlist of nothing" as "allow nothing" and drop
@@ -1045,11 +1044,16 @@ class TestScanContentAllowlist:
         )
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
-    def test_canonical_allowlist_returns_none_when_every_entry_is_path_shaped(self):
-        """``is None`` SPECIFICALLY, not merely falsy: an empty frozenset is
-        falsy too, and ``allowlist is not None`` is the exact property the
-        qualified-ref filter reads to decide whether to narrow at all."""
-        assert _canonical_allowlist({'-home-leo-bad', '-home-leo-other'}) is None
+    def test_every_entry_path_shaped_leaves_the_scan_permissive(self):
+        """Several unusable entries are no different from one: nothing survives
+        canonicalization, so the filter does not narrow at all, rather than
+        reading "an allowlist of nothing" as "allow nothing"."""
+        scan = scan_content(
+            'see dark_factory:2500',
+            group_id='reify',
+            known_project_ids={'-home-leo-bad', '-home-leo-other'},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_a_blank_registry_key_also_yields_the_permissive_fallback(self):
         """The path-shaped case is only one of TWO ways the surviving allowlist
@@ -1061,10 +1065,6 @@ class TestScanContentAllowlist:
         qualifier), so it is skipped like a path-shaped key and feeds the same
         permissive fallback.
         """
-        assert _canonical_allowlist({'', '-home-leo-bad'}) is None
-
-    def test_blank_registry_key_does_not_drop_foreign_refs_at_the_scan_boundary(self):
-        """The same contract at the boundary a caller actually uses."""
         scan = scan_content(
             'see dark_factory:2500', group_id='reify', known_project_ids={'', '-home-leo-bad'}
         )
@@ -1082,17 +1082,17 @@ class TestScanContentAllowlist:
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_a_non_sized_registry_does_not_crash_on_the_degraded_path(self):
-        """The parameter is advertised as "any collection", which invites a
-        generator. A generator is truthy (so it passes the empty-registry
-        guard) but NOT Sized, so counting the entries with a trailing ``len()``
-        would raise TypeError from a memory write path — on the one branch
-        whose whole purpose is to degrade gracefully."""
+        """A generator is a legal registry. It is truthy (so it passes the
+        empty-registry guard) but NOT Sized, so counting the entries with a
+        trailing ``len()`` would raise TypeError from a memory write path — on
+        the one branch whose whole purpose is to degrade gracefully."""
 
         def registry():
             yield '-home-leo-bad'
             yield ''
 
-        assert _canonical_allowlist(registry()) is None
+        scan = scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry())
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
     def test_mixed_registry_still_narrows_after_bad_entries_skipped(self):
         """Regression guard, green before AND after the permissive fallback:
@@ -1246,7 +1246,7 @@ class TestAllPathShapedRegistryIsLoud:
         this line."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'-home-leo-bad'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING for an all-path-shaped registry; '
@@ -1261,8 +1261,8 @@ class TestAllPathShapedRegistryIsLoud:
         misconfiguration into a per-call log storm."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'-home-leo-bad'})
-            _canonical_allowlist({'-home-leo-other'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-other'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warnings) == 1, (
             f'Expected exactly 1 WARNING across two calls (warn-once); '
@@ -1278,7 +1278,7 @@ class TestAllPathShapedRegistryIsLoud:
         misconfigured path is loud."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist(registry)
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids=registry)
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert warnings == [], f'Empty/None registry must stay silent; got {[r.message for r in warnings]}'
 
@@ -1286,7 +1286,7 @@ class TestAllPathShapedRegistryIsLoud:
         """Only the DEGRADED path is loud — a working registry logs nothing."""
         monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
         with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
-            _canonical_allowlist({'dark_factory'})
+            scan_content('see dark_factory:2500', group_id='reify', known_project_ids={'dark_factory'})
         warnings = [r for r in caplog.records if r.levelname == 'WARNING']
         assert warnings == [], f'A usable registry must stay silent; got {[r.message for r in warnings]}'
 
