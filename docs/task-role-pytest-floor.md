@@ -35,8 +35,13 @@ The full-suite floor survives as the fallback in two cases:
 Its reason then ends ` — not narrowed: <why>`.
 
 Known gap: a module's family is enumerated from `<prefix>/tests` only, so the
-scripts leg's family is scripts/tests alone, and the marked tests/scripts guards
-do not run at task role (ticket tkt_0RWM5TWWA72QYKZSZVSF3RCZDY).
+scripts leg's family is scripts/tests alone. Until task 8402 gave scripts/tests
+a family, a scripts/ diff fell back to the full scripts suite, tests/scripts
+included; now the marked tests/scripts guards do not run at task role for it,
+so for that leg this is a coverage regression, caught only at the merge gate.
+Task 8503 owns the fix;
+`tests/scripts/test_task_role_floor_narrows_every_leg.py::test_the_scripts_floor_runs_the_tests_scripts_guards`
+is a strict xfail that turns red when it lands.
 
 Merge role is unchanged. Under `merge_verify_breadth: full` the merge gate still
 runs the full suite.

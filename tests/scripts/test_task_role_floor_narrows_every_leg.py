@@ -80,7 +80,6 @@ def _task_role_pytest_run(mc: ModuleConfig, touched: str) -> PlannedRun:
     pytest.param('orchestrator', 10, id='orchestrator'),
     pytest.param('shared', 20, id='shared'),
     pytest.param('fused-memory', 68, id='fused-memory'),
-    # Enumerates scripts/tests only; tests/scripts is ticket tkt_0RWM5TWWA72QYKZSZVSF3RCZDY.
     pytest.param('scripts', 63, id='scripts'),
 ])
 def test_the_task_role_floor_narrows_to_the_guard_family(
@@ -104,4 +103,24 @@ def test_the_task_role_floor_narrows_to_the_guard_family(
     assert len(run.scoped_targets) >= min_family_size, (
         f'{prefix} narrowed to only {len(run.scoped_targets)} guard-family module(s) for '
         f'{touched} (floor {min_family_size}): {list(run.scoped_targets)}'
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        'known gap, task 8503: the scripts leg enumerates its family from scripts/tests '
+        'only, though its test_command also collects tests/scripts. Fixing it XPASSes '
+        'this test; then drop the xfail.'
+    ),
+)
+def test_the_scripts_floor_runs_the_tests_scripts_guards(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    mc = discover_module_configs()['scripts']
+
+    run = _task_role_pytest_run(mc, _first_production_file('scripts'))
+
+    assert any(target.startswith('tests/scripts/') for target in run.scoped_targets), (
+        list(run.scoped_targets)
     )
