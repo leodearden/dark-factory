@@ -990,18 +990,26 @@ function linkedTaskRow(task) {
   return escalationRow({ id: `esc-${PROSE_TASK}-1`, taskId: PROSE_TASK, summary: 'needs a ruling', project: PROJECT, task });
 }
 
-// Answers the taskProse url for `uid` with `prose` and leaves every other
-// fetch pending, as the harness's own stub does. Returns every url asked for.
-function stubProseFetch(window, uid, prose) {
+// Answers the taskProse url for `uid` with `response`, a fetch Response or a
+// promise of one, and leaves every other fetch pending, as the harness's own
+// stub does. Returns every url asked for.
+function stubProseFetch(window, uid, response) {
   const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
   const asked = [];
   window.fetch = url => {
     asked.push(url);
     if (url !== ON_DEMAND_KEYS.taskProse.url(uid)) return new Promise(() => {});
-    return Promise.resolve({ ok: true, status: 200, json: async () => ({ [ON_DEMAND_KEYS.taskProse.key(uid)]: prose }) });
+    return Promise.resolve(response);
   };
   return asked;
 }
+
+function proseResponse(window, uid, prose) {
+  const { key } = window.DF_DATA_LOADER.ON_DEMAND_KEYS.taskProse;
+  return { ok: true, status: 200, json: async () => ({ [key(uid)]: prose }) };
+}
+
+const PROSE_UNAVAILABLE = 'The description of this task could not be fetched.';
 
 // React 18's async act() ends with one MessageChannel task, which jsdom lacks;
 // a window timer is the same macrotask hop.
@@ -1025,7 +1033,7 @@ test("tab_escalations.jsx::EscalationSidebar renders the linked task's descripti
   const { window } = harness;
   allowAsyncAct(window);
   const uid = `${PROJECT}/T-${PROSE_TASK}`;
-  const asked = stubProseFetch(window, uid, { description: 'why it exists', details: '' });
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
   const row = linkedTaskRow(undefined);
   assert.equal('description' in row.task.value, false, 'the card itself must carry no description');
 
@@ -1043,7 +1051,8 @@ test('tab_escalations.jsx::EscalationSidebar requests no taskProse for a card th
   const harness = openWindow(t);
   const { window } = harness;
   allowAsyncAct(window);
-  const asked = stubProseFetch(window, `${PROJECT}/T-${PROSE_TASK}`, { description: 'why it exists', details: '' });
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  const asked = stubProseFetch(window, uid, proseResponse(window, uid, { description: 'why it exists', details: '' }));
   const row = linkedTaskRow(wireDatum(null, { state: 'unknown', reason: 'the task could not be read' }));
 
   const dialog = openSidebar(harness, row);
@@ -1051,6 +1060,38 @@ test('tab_escalations.jsx::EscalationSidebar requests no taskProse for a card th
 
   assert.ok(dialog.textContent.includes('the task could not be read'), dialog.textContent);
   assert.deepEqual(asked.filter(url => url.startsWith(PROSE_URL_PREFIX)), []);
+});
+
+test("tab_escalations.jsx::EscalationSidebar shows loading… until the linked task's taskProse read answers", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  let answer;
+  stubProseFetch(window, uid, new Promise(resolve => { answer = resolve; }));
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('loading…'), dialog.textContent);
+
+  answer(proseResponse(window, uid, { description: 'why it exists', details: '' }));
+  await settle(window);
+  assert.ok(dialog.textContent.includes('why it exists'), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
+});
+
+test("tab_escalations.jsx::EscalationSidebar says the linked task's description could not be fetched when its taskProse read fails", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  allowAsyncAct(window);
+  const uid = `${PROJECT}/T-${PROSE_TASK}`;
+  stubProseFetch(window, uid, { ok: false, status: 503, json: async () => ({}) });
+
+  const dialog = openSidebar(harness, linkedTaskRow(undefined));
+  await settle(window);
+
+  assert.ok(dialog.textContent.includes(PROSE_UNAVAILABLE), dialog.textContent);
+  assert.equal(dialog.textContent.includes('loading…'), false, dialog.textContent);
 });
 
 // ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
