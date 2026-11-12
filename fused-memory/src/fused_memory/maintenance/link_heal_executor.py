@@ -559,7 +559,7 @@ class _Candidate:
             self.state.child.text_sha256, self.parent.text_sha256,
         )
 
-    def record(self, verdict: LinkVerdict) -> AdjudicationRecord | None:
+    def record(self, verdict: LinkVerdict, prompt_sha256: str) -> AdjudicationRecord | None:
         if verdict.verdict is None:
             return None
         return AdjudicationRecord(
@@ -571,6 +571,7 @@ class _Candidate:
             verdict=verdict.verdict,
             reason=verdict.reason,
             model=verdict.model,
+            prompt_sha256=prompt_sha256,
         )
 
 
@@ -626,7 +627,10 @@ async def _adjudicate(
         if asked
         else []
     )
-    answered = (candidate.record(verdict) for candidate, verdict in zip(asked, verdicts, strict=True))
+    answered = (
+        candidate.record(verdict, adjudicate.prompt_sha256)
+        for candidate, verdict in zip(asked, verdicts, strict=True)
+    )
     records = tuple(record for record in answered if record is not None)
     return _Adjudicated(
         reused=tuple(reused),

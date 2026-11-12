@@ -300,7 +300,11 @@ class UndoTarget:
 
 @dataclass(frozen=True)
 class AdjudicationRecord:
-    """The adjudicator's verdict on one (child, parent) pair, at the text hashes it judged."""
+    """The adjudicator's verdict on one (child, parent) pair, at the text hashes it judged.
+
+    ``prompt_sha256`` is the prompt version it was asked under; ``None`` on a
+    verdict ledgered before versions were recorded.
+    """
 
     project_id: str
     child_id: str
@@ -310,6 +314,7 @@ class AdjudicationRecord:
     verdict: Verdict
     reason: str
     model: str
+    prompt_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, Verdict):
@@ -381,7 +386,9 @@ class CandidateRecord:
     ``action_taken`` is the linked heal's action once it applied, else
     :data:`NO_ACTION_TAKEN`. ``after_child`` is the child as the applying write's
     verification read it, the before-state when nothing applied, and ``None`` for
-    an applied heal whose after-state went unrecorded.
+    an applied heal whose after-state went unrecorded. The verdict fields are
+    joined from the adjudication an adjudicator basis names, and are ``None``
+    for any other basis.
     """
 
     run_id: str
@@ -398,6 +405,11 @@ class CandidateRecord:
     action_taken: str
     after_child: RecordSnapshot | None
     at: str
+    adjudication_id: int | None = None
+    verdict: Verdict | None = None
+    reason: str | None = None
+    model: str | None = None
+    prompt_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -535,10 +547,15 @@ class LinkHealLedger:
         """Every link plan run *run_id* examined, in the order it examined them."""
         rows = self._conn.execute(
             'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
-            'actions.after_child_snapshot_id AS after_child_snapshot_id FROM examinations '
+            'actions.after_child_snapshot_id AS after_child_snapshot_id, '
+            'adjudications.id AS adjudication_id, adjudications.verdict AS adjudicated_verdict, '
+            'adjudications.reason AS adjudicated_reason, adjudications.model AS adjudicated_model, '
+            'adjudications.prompt_sha256 AS adjudicated_prompt_sha256 FROM examinations '
             'LEFT JOIN actions ON actions.id = examinations.action_id '
+            'LEFT JOIN adjudications ON examinations.basis_source = ? '
+            'AND adjudications.id = CAST(examinations.basis_key AS INTEGER) '
             'WHERE examinations.run_id = ? ORDER BY examinations.id',
-            (run_id,),
+            (BasisSource.ADJUDICATOR.value, run_id),
         ).fetchall()
         return [self._candidate_record(row) for row in rows]
 
@@ -570,6 +587,14 @@ class LinkHealLedger:
             action_taken=row['action_value'] if applied else NO_ACTION_TAKEN,
             after_child=after_child,
             at=row['at'],
+            adjudication_id=row['adjudication_id'],
+            verdict=(
+                None if row['adjudicated_verdict'] is None
+                else Verdict(row['adjudicated_verdict'])
+            ),
+            reason=row['adjudicated_reason'],
+            model=row['adjudicated_model'],
+            prompt_sha256=row['adjudicated_prompt_sha256'],
         )
 
     def _insert_all_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
@@ -716,12 +741,12 @@ class LinkHealLedger:
             ids = [
                 _lastrowid(self._conn.execute(
                     'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
-                    'parent_sha256, verdict, reason, model, run_id, at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'parent_sha256, verdict, reason, model, prompt_sha256, run_id, at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         record.project_id, record.child_id, record.parent_id,
                         record.child_sha256, record.parent_sha256, record.verdict.value,
-                        record.reason, record.model, run_id, at,
+                        record.reason, record.model, record.prompt_sha256, run_id, at,
                     ),
                 ))
                 for record in records
@@ -880,6 +905,7 @@ def _adjudication_row(row: sqlite3.Row) -> AdjudicationRow:
             verdict=Verdict(row['verdict']),
             reason=row['reason'],
             model=row['model'],
+            prompt_sha256=row['prompt_sha256'],
         ),
     )
 
