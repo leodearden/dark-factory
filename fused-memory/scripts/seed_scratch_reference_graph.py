@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
 from enum import IntEnum
@@ -86,7 +87,15 @@ class TargetGraphExists(Exception):
 
 
 class SeedMismatch(Exception):
-    """The restored copy differs from its source; it has been deleted again."""
+    """The restored copy differs from its source."""
+
+
+class CopyLeftBehind(Exception):
+    """A copy that failed verification could not be deleted; the scratch server still holds it."""
+
+
+class CopyNotSaved(Exception):
+    """A verified copy is live on the scratch server, but SAVE failed, so a restart would lose it."""
 
 
 @dataclass(frozen=True)
@@ -121,7 +130,12 @@ async def read_source(client: FalkorDB, name: str) -> SourceGraph:
 
 
 async def restore_graph(client: FalkorDB, source: SourceGraph) -> GraphIdentity:
-    """Restore *source* under its own name, verify it, and save; leaves a verified copy or none."""
+    """Restore *source* under its own name, verify it, and save.
+
+    Leaves a verified copy or none, unless an exception says otherwise:
+    ``CopyLeftBehind`` for an unverified copy whose delete failed,
+    ``CopyNotSaved`` for a verified copy SAVE did not persist.
+    """
     name = require_scratch_name(source.name, checkpoint=GuardCheckpoint.GRAPH_COPY)
     if name in await client.list_graphs() or await client.connection.exists(name):
         raise TargetGraphExists(
@@ -131,22 +145,45 @@ async def restore_graph(client: FalkorDB, source: SourceGraph) -> GraphIdentity:
     await client.connection.restore(name, 0, source.payload)
     graph = client.select_graph(name)
     try:
-        await _await_indexes_serving(graph, name)
-        identity = await _identity(graph, name)
-        if identity != source.identity:
-            raise SeedMismatch(
-                f'restored {name!r} differs from its source: {_summary(identity)} against '
-                f'{_summary(source.identity)}; the copy was deleted'
-            )
-    except Exception:
-        await graph.delete()
+        identity = await _verified_identity(graph, source)
+    except Exception as error:
+        await _delete_unverified_copy(graph, name, error)
         raise
-    await client.connection.save()
+    try:
+        await client.connection.save()
+    except RedisError as error:
+        raise CopyNotSaved(
+            f'restored {name!r} matches its source, but SAVE failed ({type(error).__name__}: '
+            f'{error}); the copy is live but a restart would lose it, so run SAVE on the '
+            f'scratch server'
+        ) from error
     return identity
 
 
 async def seed_graph(source_client: FalkorDB, target_client: FalkorDB, name: str) -> GraphIdentity:
     return await restore_graph(target_client, await read_source(source_client, name))
+
+
+async def _verified_identity(graph: AsyncGraph, source: SourceGraph) -> GraphIdentity:
+    await _await_indexes_serving(graph, source.name)
+    identity = await _identity(graph, source.name)
+    if identity != source.identity:
+        raise SeedMismatch(
+            f'restored {source.name!r} differs from its source: {_summary(identity)} against '
+            f'{_summary(source.identity)}'
+        )
+    return identity
+
+
+async def _delete_unverified_copy(graph: AsyncGraph, name: str, cause: Exception) -> None:
+    try:
+        await graph.delete()
+    except Exception as error:
+        raise CopyLeftBehind(
+            f'{cause}; deleting the unverified copy then failed ({type(error).__name__}: '
+            f'{error}), so the scratch server still holds {name!r}: delete it there '
+            f'(GRAPH.DELETE {name})'
+        ) from cause
 
 
 async def _identity(graph: AsyncGraph, name: str) -> GraphIdentity:
@@ -174,7 +211,7 @@ async def _await_indexes_serving(graph: AsyncGraph, name: str) -> None:
         if time.monotonic() >= deadline:
             raise IndexCatalogUnsettledError(
                 f'restored {name!r} still has indexes that are not OPERATIONAL after '
-                f'{SETTLE_TIMEOUT_S:.0f}s: {unsettled!r}; the copy was deleted'
+                f'{SETTLE_TIMEOUT_S:.0f}s: {unsettled!r}'
             )
         await asyncio.sleep(SETTLE_POLL_INTERVAL_S)
 
@@ -201,15 +238,15 @@ def resolve_servers() -> Servers:
 
 
 async def _seed(servers: Servers, name: str) -> GraphIdentity:
-    source_client = FalkorDB(
-        host=servers.source.host, port=servers.source.port, password=servers.source_password
-    )
-    target_client = FalkorDB(host=servers.target.host, port=servers.target.port)
-    try:
+    """Each client is closed even when the other's constructor, which dials, raises."""
+    async with contextlib.AsyncExitStack() as clients:
+        source_client = FalkorDB(
+            host=servers.source.host, port=servers.source.port, password=servers.source_password
+        )
+        clients.push_async_callback(source_client.aclose)
+        target_client = FalkorDB(host=servers.target.host, port=servers.target.port)
+        clients.push_async_callback(target_client.aclose)
         return await seed_graph(source_client, target_client, name)
-    finally:
-        await source_client.aclose()
-        await target_client.aclose()
 
 
 def build_parser() -> LoudArgumentParser:
@@ -239,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     except (SourceGraphMissing, TargetGraphExists) as error:
         return _report(Exit.REFUSED, error)
     except (SeedMismatch, IndexCatalogUnsettledError) as error:
-        return _report(Exit.MISMATCH, error)
+        return _report(Exit.MISMATCH, f'{error}; the copy was deleted')
+    except (CopyLeftBehind, CopyNotSaved) as error:
+        return _report(Exit.FAILED, error)
     except (RedisError, OSError) as error:
         return _report(Exit.FAILED, f'{type(error).__name__}: {error}')
     print(f'seeded {name} on {servers.target.uri} from {servers.source.uri}: {_summary(identity)}')

@@ -9,10 +9,12 @@ run them with ``uv run pytest -m integration tests/test_seed_scratch_reference_g
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
@@ -20,6 +22,8 @@ from _fm_helpers import load_script_module
 from _fm_sockets import refused_port
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
 
 from fused_memory.arm_harness.topology import read_topology, topology_hash
 from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
@@ -96,6 +100,115 @@ def test_a_source_that_is_the_scratch_server_is_refused(monkeypatch, capsys):
     assert code != 0
     assert 'source and target are the same server' in err
     assert 'Traceback' not in err
+
+
+# --- what a restore leaves behind when it cannot finish -------------------------------
+
+
+class _EmptyGraph:
+    """A restored graph with no nodes, edges or indexes, whose delete can be made to fail."""
+
+    def __init__(self, delete_error: Exception | None = None) -> None:
+        self.delete_error = delete_error
+        self.deleted = False
+
+    async def ro_query(self, query: str, *args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(header=[[1, 'label'], [1, 'status']], result_set=[])
+
+    async def delete(self) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted = True
+
+
+class _EmptyScratchServer:
+    def __init__(self, graph: _EmptyGraph, save_error: Exception | None = None) -> None:
+        self.graph = graph
+        self.save_error = save_error
+        self.restored: list[str] = []
+        self.saves = 0
+        self.connection = self
+
+    async def list_graphs(self) -> list[str]:
+        return []
+
+    async def exists(self, name: str) -> int:
+        return 0
+
+    async def restore(self, name: str, ttl: int, payload: bytes) -> None:
+        self.restored.append(name)
+
+    async def save(self) -> None:
+        self.saves += 1
+        if self.save_error is not None:
+            raise self.save_error
+
+    def select_graph(self, name: str) -> _EmptyGraph:
+        return self.graph
+
+
+EMPTY_GRAPH_IDENTITY = SEED.GraphIdentity(
+    node_count=0, edge_count=0, topology_hash=topology_hash((), ()), index_definitions=()
+)
+OTHER_GRAPH_IDENTITY = SEED.GraphIdentity(
+    node_count=1, edge_count=0, topology_hash='0' * 64, index_definitions=()
+)
+
+
+def _restore(server: _EmptyScratchServer, name: str, identity) -> object:
+    return asyncio.run(SEED.restore_graph(server, SEED.SourceGraph(name, b'dump', identity)))
+
+
+def test_a_copy_that_differs_from_its_source_is_deleted_and_never_saved():
+    name = _scratch_name()
+    server = _EmptyScratchServer(_EmptyGraph())
+
+    with pytest.raises(SEED.SeedMismatch, match='differs from its source'):
+        _restore(server, name, OTHER_GRAPH_IDENTITY)
+
+    assert server.restored == [name]
+    assert server.graph.deleted
+    assert server.saves == 0
+
+
+def test_an_unverified_copy_that_cannot_be_deleted_is_named_with_both_errors():
+    name = _scratch_name()
+    server = _EmptyScratchServer(_EmptyGraph(delete_error=RedisConnectionError('connection lost')))
+
+    with pytest.raises(SEED.CopyLeftBehind) as raised:
+        _restore(server, name, OTHER_GRAPH_IDENTITY)
+
+    message = str(raised.value)
+    assert 'differs from its source' in message
+    assert 'connection lost' in message
+    assert f'GRAPH.DELETE {name}' in message
+    assert isinstance(raised.value.__cause__, SEED.SeedMismatch)
+    assert server.saves == 0
+
+
+def test_a_failed_save_leaves_the_verified_copy_and_says_it_is_unsaved():
+    name = _scratch_name()
+    server = _EmptyScratchServer(
+        _EmptyGraph(), save_error=ResponseError('Background save already in progress')
+    )
+
+    with pytest.raises(SEED.CopyNotSaved) as raised:
+        _restore(server, name, EMPTY_GRAPH_IDENTITY)
+
+    message = str(raised.value)
+    assert name in message
+    assert 'Background save already in progress' in message
+    assert 'SAVE' in message
+    assert not server.graph.deleted
+
+
+def test_a_verified_copy_is_saved():
+    name = _scratch_name()
+    server = _EmptyScratchServer(_EmptyGraph())
+
+    assert _restore(server, name, EMPTY_GRAPH_IDENTITY) == EMPTY_GRAPH_IDENTITY
+    assert server.saves == 1
+    assert not server.graph.deleted
 
 
 # --- live round trips on the scratch server -------------------------------------------

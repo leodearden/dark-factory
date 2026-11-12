@@ -2676,8 +2676,10 @@ definitions against the source, and saves. A graph's name travels inside its
 `DUMP` payload, so a restore under any other name is not a faithful copy.
 The script refuses a graph the scratch server already holds: remove that one
 first with `GRAPH.DELETE`. Exit 3 is a refusal. Exit 4 is a copy that did not
-match its source; the copy has been deleted again. Exit 1 is a server it
-could not reach.
+match its source; the copy has been deleted again. Exit 1 is a run that could
+not complete: an unreachable server, a bad `FALKORDB_URI`, a copy that failed
+verification and could not be deleted (the message names it), or a failed
+`SAVE` (the verified copy is live but unsaved; run `SAVE` on scratch).
 
 **The harness reads production and writes scratch.** `harness.py` reads its
 corpus (`dark_factory`, over `GRAPH.RO_QUERY`) from the FalkorDB the config
