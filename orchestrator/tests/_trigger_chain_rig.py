@@ -35,6 +35,7 @@ from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 from shared.mcp_envelope import parse_tool_result
+from shared.task_statuses import TERMINAL
 
 from orchestrator.config import (
     PREDICATE_RECHECK_STALL_CAP,
@@ -213,6 +214,24 @@ class FakeClock:
         return self.now.timestamp()
 
 
+class StatusWriteFailing:
+    """*scheduler*, except that each ``set_task_status`` to *status* raises as an exhausted transport retry does."""
+
+    def __init__(self, scheduler: Scheduler, status: str) -> None:
+        self._scheduler = scheduler
+        self._status = status
+        self.refused: list[tuple[str, str]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._scheduler, name)
+
+    async def set_task_status(self, task_id: str, status: str, **kwargs: Any) -> None:
+        if status == self._status:
+            self.refused.append((task_id, status))
+            raise RuntimeError('connection severed')
+        await self._scheduler.set_task_status(task_id, status, **kwargs)
+
+
 @dataclass(frozen=True)
 class Chain:
     completion_id: str
@@ -343,6 +362,55 @@ class TriggerChainRig:
         self.queue.resolve(escalation.id, resolution, resolution_action=action, resolved_by='lambda-e2e')
         if effect.target_status is not None:
             await self.scheduler.set_task_status(escalation.task_id, effect.target_status)
+
+    async def set_status(self, task_id: str, status: str) -> None:
+        await self.call_ok('set_task_status', id=task_id, status=status, project_root=str(self.root))
+
+    async def supersede(self, old: Chain, new_run_id: str, *, launched_from: str | None) -> None:
+        """Retire *old* for run *new_run_id* in the snippet's §5 order: mark both, the human gate, then the completion gate."""
+        for task_id in (old.human_id, old.completion_id):
+            chain = (await self.task(task_id))['metadata']['trigger_chain']
+            await self.call_ok(
+                'update_task',
+                id=task_id,
+                project_root=str(self.root),
+                metadata={'trigger_chain': {**chain, 'superseded_by': new_run_id}},
+            )
+        await self._retire_human_gate(old.human_id, new_run_id, launched_from)
+        await self._retire_completion_gate(old.completion_id, new_run_id)
+
+    async def _retire_human_gate(self, task_id: str, new_run_id: str, launched_from: str | None) -> None:
+        status = (await self.task(task_id))['status']
+        if status in ('pending', 'deferred'):
+            await self.set_status(task_id, 'cancelled')
+            return
+        if status != 'blocked':
+            raise AssertionError(f'human gate {task_id} is {status!r}; §5 retires only pending, deferred or blocked')
+        escalation = self._one_pending(task_id)
+        answered = escalation.id == launched_from
+        await self.resolve(
+            escalation, 'resume', f'ran as {new_run_id}' if answered else f'superseded by {new_run_id}'
+        )
+        assignment, outcome = await self.dispatch()
+        if assignment is None or assignment.task_id != task_id or outcome != WorkflowOutcome.DONE:
+            raise AssertionError(f'resuming human gate {task_id} dispatched {assignment!r} -> {outcome!r}')
+
+    async def _retire_completion_gate(self, task_id: str, new_run_id: str) -> None:
+        status = (await self.task(task_id))['status']
+        if status == 'pending':
+            await self.set_status(task_id, 'cancelled')
+        elif status == 'blocked':
+            await self.resolve(self._one_pending(task_id), 'abandon', f'superseded by {new_run_id}')
+        elif status not in TERMINAL:
+            raise AssertionError(f'completion gate {task_id} is {status!r}; §5 re-reads it later')
+
+    def _one_pending(self, task_id: str) -> Escalation:
+        (escalation,) = self.own_escalations(task_id, status='pending')
+        return escalation
+
+    def status_write_failing(self, status: str) -> StatusWriteFailing:
+        """This rig's Scheduler, except that its writes of *status* are lost."""
+        return StatusWriteFailing(self.scheduler, status)
 
     def own_escalations(self, task_id: str, status: str | None = None) -> list[Escalation]:
         return self.queue.get_by_task(task_id, status=status, agent_role=DETERMINISTIC_AGENT_ROLE)
