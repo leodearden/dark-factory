@@ -94,9 +94,10 @@ const NARROWED_POLL_URLS = Object.freeze({
 // by the one value its caller already holds. Two declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
-// `?terminal=<project>`, and `taskProse`, the Task Detail pane's
-// description/details for the selected task, addressed by the row's own uid
-// (`<project>/T-<id>`).
+// `?terminal=<project>`, and `taskProse`, a task's description/details
+// addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
+// pane reads for the selected task and the Escalations drawer for the linked
+// one.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
