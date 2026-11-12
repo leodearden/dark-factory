@@ -607,7 +607,9 @@ class TestStaleL0StrandEscalationSurvivesRestart:
 
         await strand_harness._dismiss_stale_escalations()
 
-        (agg,) = _aggregate_escalations(strand_harness)
+        pending_l1s = [e for e in queue.get_pending() if e.level == 1]
+        assert len(pending_l1s) == 1, pending_l1s
+        (agg,) = pending_l1s
         assert agg.task_id == STALE_L0_STRAND_SENTINEL
         assert agg.root_cause == STALE_L0_STRAND_ROOT_CAUSE
         assert agg.agent_role == STALE_L0_STRAND_ROLE
