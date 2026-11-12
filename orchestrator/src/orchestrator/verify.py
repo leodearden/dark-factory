@@ -793,7 +793,9 @@ def _crashed_session_stop_percent(stream: str) -> int | None:
     * No interrupted-run banner (``_PYTEST_INTERRUPTED_BANNER_RE``) after that
       line. An ``-x``/``--maxfail`` stop or a KeyboardInterrupt after xdist
       replaced a crashed worker prints one, while xdist's
-      ``triggershutdown()`` bailout ends the loop without one.
+      ``triggershutdown()`` bailout ends the loop without one, unless an
+      ``-x``/``--maxfail`` stop also fires while the surviving workers drain
+      (then the label is missed, never invented).
 
     Returns ``None`` when any fact is missing, including when *stream* has no
     percentage progress line at all (``-v``, or the ``count``/``times``
@@ -1540,7 +1542,8 @@ def _extract_cause_hint(output: str) -> str:
 
     Uses a pattern ladder (first match wins):
     0. xdist WORKER-DEATH TRUNCATION — see below; pre-empts the whole ladder
-    1. ``FAILED test::name`` — pytest failure lines (start of line)
+    1. ``FAILED test::name`` — pytest failure lines (start of line), a dead
+       worker's fabricated one only when no other exists
     2. ``INTERNALERROR>`` — pytest collection / plugin errors
     3. ``===== N failed in Xs =====`` — pytest summary line
     4. ``error: …``         — cargo/clippy surface errors
@@ -1568,8 +1571,11 @@ def _extract_cause_hint(output: str) -> str:
       (esc-4176-6: ``1 failed, 728 passed`` truncated vs ``19622 passed`` on a
       clean re-run of the identical command).
 
-    Every other rung is untouched, so output with no truncation evidence takes
-    a byte-identical path to today's.
+    RUNG 1 itself skips that fabricated line (``_failed_lines_not_crash_attributed``)
+    for the same reason, outside a truncation too: after a RECOVERED crash, an
+    ``-x``/``--maxfail`` stop's real failure is named instead (task 5905). A
+    fabricated line is named only when no genuine ``FAILED`` line exists, and
+    output with no crash notice takes an unchanged path.
 
     Returns ``''`` for None, empty, or whitespace-only input.
     Result is stripped to a single line and capped at 200 chars.
@@ -1581,8 +1587,13 @@ def _extract_cause_hint(output: str) -> str:
     if truncation_evidence is not None:
         return _worker_death_cause_hint(output, truncation_evidence)
 
+    failed_lines = (
+        _failed_lines_not_crash_attributed(output) or _PYTEST_FAILED_LINE_RE.findall(output)
+    )
+    if failed_lines:
+        return failed_lines[0].strip()[:200]
+
     _HINT_PATTERNS = [
-        _PYTEST_FAILED_LINE_RE,
         _PYTEST_INTERNALERROR_RE,
         _PYTEST_FAILURE_SUMMARY_RE,
         re.compile(r'^error: .+$', re.MULTILINE),

@@ -30,6 +30,7 @@ from _xdist_crash_fixtures import (
     XDIST_PARTIAL_TALLY,
     XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT,
     XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
+    XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
     XDIST_Q_RECOVERED_OUTPUT,
     XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
     XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
@@ -3642,6 +3643,20 @@ class TestExtractCauseHint:
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
+    def test_non_truncated_crash_hint_names_the_real_failure_first(self):
+        """Rung 1 skips the report xdist fabricated for the crashed test when
+        a genuine FAILED line follows it, so a recovered session's hint does
+        not send the debugger after a failure that never happened."""
+        real_failure = 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError'
+        output = (
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + real_failure + '\n'
+            + '========== 2 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == real_failure, f'Unexpected hint: {hint!r}'
+
     @pytest.mark.parametrize(
         'surviving_line',
         [
@@ -4259,17 +4274,27 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         )
 
     @pytest.mark.parametrize(
-        'output',
+        ('output', 'expected_hint'),
         [
-            XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
-            XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+            (
+                XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
+                XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip(),
+            ),
+            (
+                XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+                f'FAILED {XDIST_IN_FLIGHT_NODEID}',
+            ),
         ],
         ids=['maxfail-stop', 'keyboard-interrupt'],
     )
-    def test_an_interrupted_run_after_a_recovered_crash_is_not_labelled(self, output):
+    def test_an_interrupted_run_after_a_recovered_crash_is_not_labelled(
+        self, output, expected_hint,
+    ):
         """task 5905: the stop came from pytest's interrupted run loop, not
         from xdist abandoning the queue, so failure_report must not claim the
-        --max-worker-restart cap was exceeded."""
+        --max-worker-restart cap was exceeded. The hint names the real failure
+        that stopped an -x run, never the report xdist fabricated for the
+        crashed test; with no real failure, that report is all there is."""
         result = _test_leg_result(output)
         assert result.summary == 'Failures: tests failed', (
             f'Unexpected summary: {result.summary!r}'
@@ -4277,7 +4302,7 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         report = result.failure_report()
         assert self.HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
-        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+        assert hint == expected_hint, f'Unexpected hint: {hint!r}'
 
     def test_a_bailout_that_maxfail_also_counted_is_still_labelled(self):
         """task 5905: a genuine bailout under -x prints pytest's 'stopping
