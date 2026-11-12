@@ -40,10 +40,10 @@ class TestFalkorEndpoint:
 
 class TestKnownServers:
     def test_production_is_localhost_6379(self):
-        assert PRODUCTION_FALKORDB == FalkorEndpoint('localhost', 6379)
+        assert FalkorEndpoint('localhost', 6379) == PRODUCTION_FALKORDB
 
     def test_scratch_is_localhost_6380(self):
-        assert SCRATCH_FALKORDB == FalkorEndpoint('localhost', 6380)
+        assert FalkorEndpoint('localhost', 6380) == SCRATCH_FALKORDB
 
 
 class TestScratchFalkorDBFromEnv:
