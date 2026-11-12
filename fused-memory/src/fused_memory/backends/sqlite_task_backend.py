@@ -46,6 +46,7 @@ from shared.task_metadata import (
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_timestamp import format_task_timestamp
 
 from fused_memory.backends.defect_records import (
     DEFECT_RECORD_KEYS,
@@ -206,20 +207,15 @@ class _StatusWriteNotPersisted(Exception):
 
 
 def task_timestamp_now() -> str:
-    """The current UTC instant in the task store's timestamp format.
+    """The current UTC instant in the task store's timestamp form.
 
-    Exactly ``%Y-%m-%dT%H:%M:%S.mmmZ`` — millisecond precision, literal ``Z``
-    suffix — matching the Taskmaster ``updatedAt`` format, which is the shape
-    every timestamp this store writes must carry: ``updated_at``,
-    ``heartbeat_at``, and ``metadata.pending_since``.
+    The form itself lives in ``shared/src/shared/task_timestamp.py::format_task_timestamp``.
 
-    PUBLIC because that format is a CONTRACT, not an implementation detail.
+    PUBLIC because that form is a CONTRACT, not an implementation detail.
     ``TaskInterceptor``'s CSV ``set_task_status`` branch computes one value
     here and threads it through ``pending_since_now`` so a whole batch lands
     on one instant (task 3816, PRD §C1 rule 5); it must not substitute its own
-    ``datetime.now(UTC).isoformat()`` helper, whose offset-suffixed
-    microsecond shape would give the live-stamped and the back-filled
-    populations two incommensurable string shapes for one column.
+    ``datetime.now(UTC).isoformat()`` helper.
 
     ONE clock reading, deliberately: composing the value from two
     ``datetime.now(UTC)`` calls can straddle a second boundary and emit a
@@ -227,8 +223,7 @@ def task_timestamp_now() -> str:
     milliseconds from the next second), which the anchor's
     monotone-non-decreasing invariant cannot tolerate.
     """
-    reading = datetime.now(UTC)
-    return reading.strftime('%Y-%m-%dT%H:%M:%S.') + f'{reading.microsecond // 1000:03d}Z'
+    return format_task_timestamp(datetime.now(UTC))
 
 
 def _parse_task_id(raw: str | int) -> int:
