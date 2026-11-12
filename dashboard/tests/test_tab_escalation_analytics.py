@@ -647,10 +647,10 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         slicing to the payload's `generated_at` — NOT the browser clock
         (`Date.now`).
     (c) A `parse_failures` warning chip, rendered only when `> 0`.
-    (d) A reusable `RegimeMarkers` (or `ChartMarkers`) overlay component fed
-        the payload's real `regime_markers` data (not just the
-        empty-defaults literal), plus a `TimeChart` wrapper that composes it
-        with a chart primitive.
+    (d) The payload's real `regime_markers` data is read (not just the
+        empty-defaults literal). That every time chart draws it through
+        charts.jsx::MarkedChart is a render test, in
+        js/jsx_render_quality.test.mjs.
     """
     body = tab_analytics_jsx_body
 
@@ -699,24 +699,11 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'add the helper that filters date-keyed daily buckets down to the active window.'
     )
 
-    # (d) Reusable regime-marker overlay, fed the real regime_markers field,
-    # plus the TimeChart wrapper every panel chart will render through.
-    assert (
-        'function RegimeMarkers(' in body or 'function ChartMarkers(' in body
-    ), (
-        'tab_escalation_analytics.jsx does not define a RegimeMarkers/ChartMarkers '
-        'overlay component — add one so time charts can render vertical regime '
-        'markers without modifying charts.jsx.'
-    )
+    # (d) The regime_markers field is read off the payload.
     assert re.search(r'\.regime_markers\b', body), (
         'tab_escalation_analytics.jsx never dot-references `.regime_markers` off the '
         'analytics payload — the marker overlay must be fed the real '
         'analytics.regime_markers data, not just the empty-defaults literal.'
-    )
-    assert 'function TimeChart(' in body, (
-        'tab_escalation_analytics.jsx does not define `function TimeChart(` — add the '
-        'wrapper that composes a chart primitive with the RegimeMarkers overlay so '
-        'every panel chart gets regime markers consistently.'
     )
 
 

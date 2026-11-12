@@ -11,6 +11,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { openWindow } from './_render_helpers.mjs';
+import { seedDashboardData } from './dom_harness.mjs';
+import { escalationAnalytics, receiptsFor } from './wire_fixtures.mjs';
 
 // Arrays built inside the window belong to its realm, so a helper's result is
 // spread into a node array before a deepStrictEqual against the DOM.
@@ -296,4 +298,86 @@ test('charts.jsx::MarkedChart renders its chart and the overlay in one relativel
     overlayOf(harness, marks).firstElementChild.innerHTML,
     'then the Markers overlay for the same marks',
   );
+});
+
+// ── Escalation analytics through the shared overlay (sketch row 21) ───────
+
+// The three 2026-07-15 entries of dashboard/regime-markers.yaml, as
+// data/escalation_analytics.py::load_regime_markers serves them.
+const JULY_15_MARKERS = [
+  { date: '2026-07-15', label: 'Starvation threshold raised to 72h', tasks: [2631] },
+  { date: '2026-07-15', label: 'Auto-watcher benign closes', tasks: [2630] },
+  { date: '2026-07-15', label: 'Verify-scope flip', tasks: [2593] },
+];
+
+function mountAnalyticsAcrossJuly15(harness) {
+  const { window } = harness;
+  const byDay = value => Object.fromEntries(REGIME_LABELS.map((day, i) => [day, value(i)]));
+  window.localStorage.setItem('df.escanalytics.window', JSON.stringify('all'));
+  seedDashboardData(window, {
+    ESCALATION_ANALYTICS: escalationAnalytics(
+      [{
+        project: 'p',
+        origin: { daily_by_source: byDay(i => ({ steward: i + 1 })), sources: [] },
+        workflow: {
+          churn_daily: byDay(i => i),
+          esc_per_done_daily: REGIME_LABELS.map((date, i) => ({ date, ratio: i / 4 })),
+          done_counts_read: true,
+        },
+        samples: [['2026-07-15', 'human', 1, 3600], ['2026-07-16', 'steward', 1, 86400]],
+      }],
+      { regimeMarkers: JULY_15_MARKERS },
+    ),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['ESCALATION_ANALYTICS']),
+  });
+  return harness.mount(window.DF_TABS.EscalationAnalyticsTab, { projectFilter: [] }).container;
+}
+
+function chartName(C, chart) {
+  if (chart.type === C.StackedAreaChart) return 'origin filings';
+  const [first] = chart.props.series;
+  return { churn: 'workflow churn', ratio: 'escalations per done' }[first.key] ?? 'lifespan ecdf';
+}
+
+test('tab_escalation_analytics.jsx hands every time chart to MarkedChart with dateLabelMarks of its own labels', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const C = window.DF_CHARTS;
+  const { dateLabelMarks } = window.DF_CHART_MARKS;
+  const real = C.MarkedChart;
+  const handed = [];
+  C.MarkedChart = props => {
+    handed.push(props);
+    return window.React.createElement(real, props);
+  };
+  t.after(() => { C.MarkedChart = real; });
+
+  mountAnalyticsAcrossJuly15(harness);
+
+  const byChart = Object.fromEntries(handed.map(props => [chartName(C, props.children), props]));
+  assert.deepEqual(
+    Object.keys(byChart).sort(),
+    ['escalations per done', 'lifespan ecdf', 'origin filings', 'workflow churn'],
+  );
+  for (const name of ['origin filings', 'workflow churn', 'escalations per done']) {
+    const { marks, children } = byChart[name];
+    assert.deepEqual(marks, dateLabelMarks(children.props.labels, JULY_15_MARKERS), name);
+    assert.equal(marks.length, 3, `${name} marks all three regime changes`);
+  }
+  const ecdf = byChart['lifespan ecdf'].marks;
+  assert.equal(ecdf.length, 1);
+  assert.equal(ecdf[0].label, '6h');
+  assert.ok(ecdf[0].fraction > 0 && ecdf[0].fraction < 1, 'the 6h mark sits inside the threshold grid');
+});
+
+test('tab_escalation_analytics.jsx still draws the three 2026-07-15 regime markers on each date chart', t => {
+  const harness = openWindow(t);
+  const container = mountAnalyticsAcrossJuly15(harness);
+  const july15Left = plotLeft(harness.window, REGIME_LABELS.indexOf('2026-07-15') / (REGIME_LABELS.length - 1));
+
+  for (const { label } of JULY_15_MARKERS) {
+    const drawn = [...container.querySelectorAll('span')].filter(span => span.textContent === label);
+    assert.equal(drawn.length, 3, `${label}: once on each of the three date charts`);
+    for (const span of drawn) assert.equal(span.parentElement.style.left, july15Left, label);
+  }
 });

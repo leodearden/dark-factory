@@ -113,24 +113,26 @@ export function openEscalationItem({ id, taskId, level = 1, ageSecs = 3600, brea
 }
 
 // The ESCALATION_ANALYTICS payload, one per_project entry per
-// `{project, openItems}`. Each lifespan block lists only its open items; the
-// origin and workflow blocks are empty, so their panels render their empty
-// states, and no escalation is terminal.
-export function escalationAnalytics(projects) {
+// `{project, openItems, origin?, workflow?, samples?}`, carrying
+// `regimeMarkers` ({date, label, tasks}, as
+// data/escalation_analytics.py::load_regime_markers serves them). Origin and
+// workflow blocks default to empty and lifespan samples to none, so those
+// panels render their empty states; no escalation is terminal.
+export function escalationAnalytics(projects, { regimeMarkers = [] } = {}) {
   return {
     generated_at: WIRE_AS_OF,
     parse_failures: 0,
-    regime_markers: [],
-    per_project: projects.map(({ project, openItems }) => ({
+    regime_markers: regimeMarkers,
+    per_project: projects.map(({ project, openItems = [], origin = {}, workflow = {}, samples = [] }) => ({
       project,
-      origin: {},
+      origin,
       lifespan: {
         percentiles_by_level: {},
         l1_to_l2_promotion: { count: 0, p50_secs: null, p90_secs: null },
-        samples: [],
+        samples,
         open_items: openItems,
       },
-      workflow: {},
+      workflow,
       terminal: 0,
     })),
   };
