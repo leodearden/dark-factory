@@ -355,15 +355,14 @@ class TriggerChainRig:
     async def dispatch(
         self, *, runner: DeterministicRunner | None = None
     ) -> tuple[TaskAssignment | None, WorkflowOutcome | None]:
-        """One scheduler tick; a deterministic assignment runs and is released as the harness slot does."""
+        """One tick; a deterministic assignment runs and is released with requeued=False, as Harness._run_slot's deterministic return leaves it."""
         assignment = await self.scheduler.acquire_next()
         if assignment is None:
             return None, None
-        outcome: WorkflowOutcome | None = None
         try:
             outcome = await (runner or self.runner()).run(assignment)
         finally:
-            self.scheduler.release(assignment.task_id, requeued=outcome == WorkflowOutcome.REQUEUED)
+            self.scheduler.release(assignment.task_id)
         return assignment, outcome
 
     async def resolve(self, escalation: Escalation, action: str, resolution: str) -> None:
