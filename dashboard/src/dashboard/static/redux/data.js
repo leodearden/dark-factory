@@ -220,7 +220,8 @@ window.DF_DATA = {
   //   server-side from the claim columns via shared.task_claimant.is_stranded.
   //   `created_at` is the filing time and `created_at_source` names its proxy
   //   (shared/src/shared/task_created_at.py::CreatedAtSource); both are null
-  //   on a row from a store that predates them.
+  //   when the store predates the columns or the row is not yet backfilled
+  //   (dashboard/src/dashboard/data/tasks.py::_shape_task).
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},

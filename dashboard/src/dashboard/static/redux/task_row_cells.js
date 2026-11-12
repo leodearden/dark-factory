@@ -10,10 +10,10 @@
 //   4. the filed cell (filedCellState), at one site: tab_tasks.jsx::TaskDetail's
 //      'filed' kv row — the task's filing time and its named proxy.
 //
-// THE THIRD ONE ARRIVED LAST AND FOR THE SAME REASON THE FIRST TWO DID. The
+// THE LOCKS CELL JOINED FOR THE SAME REASON THE FIRST TWO ARE HERE. The
 // Locks column is a cell of the identical task row, and its decision was a
 // branch inside tabs.jsx — un-executable JSX, which is how its offline-
-// scheduler arm came to be un-asserted at all. Housing the row's three render
+// scheduler arm came to be un-asserted at all. Housing the row's render
 // decisions together is what makes a change to the row visible in ONE diff,
 // the same argument agentCellState's note below makes for the first two. It
 // also keeps tabs.jsx (at its soft size ceiling) from growing a branch.

@@ -35,8 +35,9 @@ fetches them for the selected task from
                                     # claimant (null/blank claimant, or a heartbeat older than
                                     # DEFAULT_CLAIMANT_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
-        'created_at': '2026-11-12T09:10:17.253Z',  # FILING TIME (tasks.created_at); None if the
-                                                   # store predates it
+        'created_at': '2026-11-12T09:10:17.253Z',  # FILING TIME (tasks.created_at); None when
+                                                   # the store predates the columns or the row
+                                                   # is not yet backfilled
         'created_at_source': 'stamped',  # its PROXY: how that time was learned —
                                          # shared/src/shared/task_created_at.py::CreatedAtSource
         'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
@@ -420,7 +421,8 @@ def _build_task_row(
     ``status == 'in-progress'``).
 
     Every row also carries the filing-time pair ``created_at``/
-    ``created_at_source``, ``None`` when the store predates it.
+    ``created_at_source``, ``None`` when the store predates the columns or
+    the row is not yet backfilled (see ``tasks.py::_shape_task``).
 
     ``stranded`` is deliberately independent of ``agent``: see the comment at
     the ``agent`` assignment in :func:`_runtime_fields`.
