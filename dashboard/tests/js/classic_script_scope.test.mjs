@@ -83,6 +83,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
   'deferral_cell.js': 'DF_DEFERRAL_CELL',
   'render_failure.js': 'DF_RENDER_FAILURE',
+  'chart_marks.js': 'DF_CHART_MARKS',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an

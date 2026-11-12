@@ -1960,6 +1960,7 @@ _DEPENDENCY_FREE_MODULES = {
     ),
     'render_failure.js': ('app.jsx',),
     'poll_scope.js': ('data.js', 'app.jsx'),
+    'chart_marks.js': ('charts.jsx',),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)
