@@ -1503,6 +1503,69 @@ class TestEmptyContainmentIsRefused:
         assert verdict.probe['patch_id_containment'] == containment
 
 
+@pytest.mark.asyncio
+class TestCitationPatternIsHonoured:
+    """The citation tier uses the project's ``git.commit_citation_pattern``.
+
+    Every test starts from B3's uncited rebase landing, whose evidence is the
+    tip's patch-id twin on main, then adds commits on main whose subjects the
+    default pattern and an override read differently.
+    """
+
+    SQUASH_SUBJECT = f'Fix an unrelated thing (#{TASK_ID})'
+    OVERRIDE = r'^\[{tid}\]'
+
+    async def _verdict(
+        self, git_ops: GitOps, sc: Scenario, *, pattern_template: str,
+    ) -> LandingVerdict:
+        return await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+            pattern_template=pattern_template,
+        )
+
+    async def test_the_default_pattern_reads_a_squash_subject_as_a_citation(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        squash = repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': _numbered('squash', 6)})
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.evidence_sha == squash, verdict.probe
+
+    async def test_an_opted_out_project_attributes_by_patch_id_twin(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        twin = sc.landed_sha
+        repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': _numbered('squash', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template='')
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.evidence_sha == twin
+        assert verdict.probe['citation'] is None
+        assert verdict.probe['evidence_source'] == 'patch_id_equivalent'
+
+    async def test_an_override_that_does_not_match_falls_to_the_twin(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        twin = sc.landed_sha
+        repo.commit(self.SQUASH_SUBJECT, {'pkg/squash.py': _numbered('squash', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template=self.OVERRIDE)
+        assert verdict.evidence_sha == twin, verdict.probe
+
+    async def test_an_override_that_matches_names_its_commit(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        cited = repo.commit(f'[{TASK_ID}] release note', {'pkg/note.py': _numbered('note', 6)})
+        verdict = await self._verdict(git_ops, sc, pattern_template=self.OVERRIDE)
+        assert verdict.evidence_sha == cited, verdict.probe
+        assert verdict.probe['evidence_source'] == 'citation'
+
+
 # --------------------------------------------------------------------------
 # Contract invariant 4 — fail-closed, and git_error is never not_landed
 # (step-11).

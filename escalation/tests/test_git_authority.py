@@ -913,14 +913,16 @@ def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def _probe_repo(
     repo: Path, tid: str, *, metadata: dict[str, Any] | None = None, read_raises: bool = False,
+    commit_citation_pattern: str | None = None,
 ) -> GitAuthorityVerdict:
     """Probe *tid*'s branch in the real repo at *repo*.
 
     The task read answers *metadata* (none by default), or raises when
-    *read_raises*.
+    *read_raises*.  *commit_citation_pattern* is the project's
+    ``git.commit_citation_pattern``.
     """
     from orchestrator.git_ops import GitOps
-    config = _config(repo)
+    config = _config(repo, commit_citation_pattern=commit_citation_pattern)
     return await probe_landing(
         GitOps(config.git, repo), tid, orch_config=config,
         harness=_harness(read=TaskFound({'metadata': metadata or {}}), raises=read_raises),
@@ -1128,6 +1130,34 @@ class TestProbeLandingPatchIdArm:
         assert verdict.outcome is GitAuthorityOutcome.no_signal, verdict
         assert verdict.reason == 'not_landed'
         assert verdict.merge_sha is None
+
+    async def test_an_opted_out_project_answers_at_the_patch_id_twin_not_the_citing_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=True)
+
+        verdict = await _probe_repo(landing.repo, '6978', commit_citation_pattern='')
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main, verdict
+        assert verdict.arm is GitAuthorityArm.patch_id
+        assert verdict.merge_sha == landing.main_tip
+        assert verdict.merge_sha != landing.citing_sha
+        assert verdict.merge_sha_fully_guarded is True
+        assert verdict.citation_gate_skipped is False
+
+    async def test_a_project_override_pattern_decides_the_patch_id_arms_citation(
+        self, tmp_path: Path,
+    ) -> None:
+        landing = build_rebased_solo_landing(tmp_path / 'repo', '6978', cited=False)
+        squash = landing_commit(landing.repo, 'Fix an unrelated thing (#6978)', 'squash.txt')
+
+        overridden = await _probe_repo(
+            landing.repo, '6978', commit_citation_pattern=r'^\[{tid}\]',
+        )
+        default = await _probe_repo(landing.repo, '6978')
+
+        assert overridden.merge_sha == landing.main_tip, overridden
+        assert default.merge_sha == squash, default
 
 
 class TestGitAuthorityVerdict:
