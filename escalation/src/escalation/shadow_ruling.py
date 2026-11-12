@@ -48,6 +48,8 @@ from escalation.authority import (
     L2_AUTO_CLOSE_DENY_CATEGORIES,
     L2_AUTO_CLOSE_DENY_ROLES,
     POLICY_TABLE,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
 )
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
@@ -68,25 +70,21 @@ SHADOW_RULING_MARKER = 'x_shadow_ruling:'
 #: this set by ``tests/scripts/test_shadow_ruling_doc_contract.py``.
 FIRST_TRANCHE_CLASSES: frozenset[str] = frozenset(row.policy_class for row in POLICY_TABLE)
 
-#: The reversible actions the ratified skeleton permits. A SUPERSET of the C1
-#: ``resolution_action`` vocabulary: ``close_only`` and ``resume`` are C1 values
-#: a resolved record records, while ``add_dependency``, ``update_task_amendment``
-#: and ``file_task`` are task-side operations that leave ``resolution_action``
-#: unset — which is why the weekly count needs a third ``not_comparable``
-#: outcome rather than folding them into agreement or divergence.
+#: The actions a stamp may propose, DERIVED from
+#: ``escalation/src/escalation/authority.py``'s ``REVERSIBLE_POLICY_ACTIONS`` and
+#: ``REVERSIBILITY_WAIVED_ACTIONS``, so the codec and ``PolicyRow.reversible``
+#: read one list. A SUPERSET of the C1 ``resolution_action`` vocabulary:
+#: ``close_only`` and ``resume`` are C1 values a resolved record records, while
+#: ``add_dependency``, ``update_task_amendment`` and ``file_task`` are task-side
+#: operations that leave ``resolution_action`` unset — which is why the weekly
+#: count needs a third ``not_comparable`` outcome rather than folding them into
+#: agreement or divergence.
 #:
-#: ``done_flip`` is not reversible in itself; it is listed under the
-#: reversibility waiver (Leo, 2026-11-04; ``plans/decision-stream-prd.md`` §3
-#: decision 7) and scored as the ``close_only`` it ends in
+#: ``done_flip`` is the waived member, scored as the ``close_only`` it ends in
 #: (:data:`_TRAILING_RESOLUTION_ACTION`).
-REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
-    'close_only',
-    'resume',
-    'add_dependency',
-    'update_task_amendment',
-    'file_task',
-    'done_flip',
-})
+REVERSIBLE_ACTIONS: frozenset[str] = frozenset(
+    action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
+)
 
 #: The seven classes of decision that stay with the human FOREVER, whatever any
 #: shadow measurement shows. Only the first two have a record-level signal; see
