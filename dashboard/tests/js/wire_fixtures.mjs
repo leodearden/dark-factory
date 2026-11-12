@@ -29,6 +29,16 @@ export function taskCensus(counts, vocab) {
   return { counts: all, total: sum(vocab.MEMBERS), views: sums(vocab.VIEWS), sub_views: sums(vocab.SUB_VIEWS) };
 }
 
+// One TASKS_SNAPSHOT[project].rows entry as active_tasks.py::_build_task_row
+// emits it, holding only the keys the render tests read.
+export function taskRow(overrides = {}) {
+  return {
+    id: '42', project: 'p', title: 'TT', status: 'in-progress', agent: null, stranded: false, deps: [],
+    created_at: '2026-10-14T09:00:00.000Z', created_at_source: 'stamped',
+    ...overrides,
+  };
+}
+
 // One TASKS_SNAPSHOT[project] entry: the five keys
 // data/task_snapshot.py::TaskSnapshot.to_wire() emits, census and rows each a
 // Datum measured at the same instant.

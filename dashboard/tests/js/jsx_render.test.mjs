@@ -31,6 +31,7 @@ import {
   schedulerModule,
   schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
@@ -50,7 +51,7 @@ function spansDescribedBy(root, descriptor) {
 // ── Decision 1: the stranded badge (task_row_cells.js::strandBadgeState) ──
 
 function inProgressTask(stranded) {
-  return { id: '42', project: PROJECT, title: 'TT', status: 'in-progress', agent: 'impl', stranded, deps: [] };
+  return taskRow({ project: PROJECT, agent: 'impl', stranded });
 }
 
 // One running orchestrator for one project holding one task, as the
@@ -148,6 +149,54 @@ for (const { site, options, render } of STRAND_SITES) {
     assert.equal(strandBadgeState(task, options), null);
     const wouldRender = strandBadgeState({ ...task, stranded: true }, options);
     assert.deepEqual(spansDescribedBy(element, wouldRender), [], `${site} rendered a stranded badge for a live task`);
+  });
+}
+
+// ── Decision 12: the filed cell (task_row_cells.js::filedCellState) ──
+
+// TaskDetail's 'filed' kv row: its key span and the value span beside it.
+function filedRowOf(detail) {
+  const key = [...detail.querySelectorAll('.kv > span.k')].find(span => span.textContent === 'filed');
+  return { key, value: key?.nextElementSibling };
+}
+
+const FILED_CASES = [
+  {
+    name: 'a recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: '2026-11-12T09:10:17.253Z', created_at_source: 'first_event' }),
+    recorded: true,
+  },
+  {
+    name: 'no recorded filing time',
+    task: () => ({ ...inProgressTask(false), created_at: null, created_at_source: null }),
+    recorded: false,
+  },
+];
+
+for (const { name, task: buildTask, recorded } of FILED_CASES) {
+  test(`tab_tasks.jsx::TaskDetail renders the filed row filedCellState describes, for ${name}`, t => {
+    const harness = openWindow(t);
+    const task = buildTask();
+    seedOneTask(harness.window, task);
+    const detail = taskDetailOf(harness, task);
+    assert.ok(detail, 'the detail pane never opened on the task');
+
+    const expected = harness.window.DF_TASK_ROW_CELLS.filedCellState(task);
+    const { key, value } = filedRowOf(detail);
+    assert.ok(key, "TaskDetail renders no 'filed' kv key");
+    assert.equal(value?.textContent, expected.text);
+    assert.equal(value?.title, expected.title);
+    const statusKey = key.previousElementSibling?.previousElementSibling;
+    assert.ok(statusKey?.matches('span.k'), "the 'filed' row does not follow a kv row");
+    assert.equal(statusKey.textContent, 'status', "the 'filed' row is not directly after the status row");
+
+    if (recorded) {
+      assert.notEqual(expected.text, harness.window.DF_DATUM.EM_DASH, 'fixture: the filing time is recorded');
+      assert.ok(
+        !detail.querySelector('.sub').textContent.includes(expected.text),
+        "the filing time is rendered on the .sub line beside fmtAge's unlabelled reading",
+      );
+    }
   });
 }
 

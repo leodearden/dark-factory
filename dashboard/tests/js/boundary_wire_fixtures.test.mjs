@@ -26,6 +26,7 @@ import {
   schedulerModule,
   schedulerSnapshot,
   taskCensus,
+  taskRow,
   tasksSnapshotEntry,
   wireDatum,
 } from './wire_fixtures.mjs';
@@ -69,6 +70,13 @@ test('a TASKS_SNAPSHOT entry is built with exactly the keys /tasks serves for on
   for (const part of ['counts', 'views', 'sub_views']) {
     assertSameKeys(built.census.value[part], served.census.value[part], `census.value.${part}`);
   }
+});
+
+test('a TASKS_SNAPSHOT row is built only with keys /tasks serves on one', () => {
+  const served = payload('census_fresh').TASKS_SNAPSHOT['dark-factory'].rows.value;
+  assert.ok(served.length > 0, 'the census_fresh body serves no task rows to check the builder against');
+
+  assertBuiltKeysServed(taskRow(), served[0], 'TASKS_SNAPSHOT[project].rows.value[0]');
 });
 
 test('a burndown block is built only with keys /burndown serves, in the aggregate and per project', () => {
