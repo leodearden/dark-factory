@@ -1280,9 +1280,10 @@ class TestB2SyncMergeTip:
             branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
         )
         assert verdict.reason is not LandingReason.no_op_landing, verdict.probe
-        assert verdict.probe.get('patch_id_containment') == 'contained', (
+        assert verdict.probe.get('patch_id_containment') == 'vacuous', (
             'the patch-id arm must actually have run and answered'
         )
+        assert verdict.probe.get('containment_by_ancestry') is True
 
     async def test_an_unmerged_sync_merge_branch_is_still_not_landed(
         self, git_ops: GitOps, repo: _Repo,
@@ -1437,6 +1438,7 @@ class TestEmptyContainmentIsRefused:
         assert verdict.reason is LandingReason.not_landed
         assert verdict.evidence_sha is None
         assert verdict.probe['patch_id_containment'] == 'vacuous'
+        assert verdict.probe['containment_by_ancestry'] is False
 
     async def test_without_a_recorded_base_the_no_op_guard_still_answers_first(
         self, git_ops: GitOps, repo: _Repo,
@@ -1447,6 +1449,44 @@ class TestEmptyContainmentIsRefused:
             branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert verdict.reason is LandingReason.no_op_landing, verdict.probe
+
+    async def test_a_tip_already_on_main_prints_nothing_and_is_contained_by_ancestry(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Check (c)'s rule applies only off the ancestor arm.
+
+        ``git cherry main <tip>`` lists nothing for any tip main already
+        contains, so a genuine merged landing prints the same empty output.
+        """
+        sc = build_merged_landing(repo)
+        assert repo.git('cherry', 'main', sc.branch_tip_sha) == ''
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.probe['patch_id_containment'] == 'vacuous'
+        assert verdict.probe['containment_by_ancestry'] is True
+
+    async def test_an_unreadable_ancestry_answer_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sc = build_merged_landing(repo)
+        real = git_ops.is_ancestor_checked
+
+        async def _unreadable_against_main(ancestor: str, descendant: str) -> bool | None:
+            if (ancestor, descendant) == (sc.branch_tip_sha, 'main'):
+                return None
+            return await real(ancestor, descendant)
+
+        monkeypatch.setattr(git_ops, 'is_ancestor_checked', _unreadable_against_main)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.probe['git_error_stage'] == 'patch_id_containment'
+        assert verdict.probe['containment_by_ancestry'] is None
 
     @pytest.mark.parametrize(
         ('build', 'containment'),
