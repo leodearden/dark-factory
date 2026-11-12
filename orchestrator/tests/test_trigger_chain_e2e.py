@@ -35,7 +35,7 @@ from fused_memory.middleware.deterministic_task_guard import (
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, parse_metadata
 
-pytestmark = [pytest.mark.usefixtures('code_default_config')]
+pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
 
 RUN = 'review-lambda-20261112-1'
 
@@ -171,6 +171,6 @@ class TestSubmitBoundary:
 
         assert refused['error_type'] == 'ValidationError'
         assert 'scripts/check_run_completion.py' in refused['error']
-        assert str(rig.root) in refused['error']
+        assert 'does not exist under project_root' in refused['error']
         assert 'task_id' not in refused
         assert accepted.get('task_id')
