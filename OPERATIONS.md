@@ -4115,7 +4115,7 @@ Without `--sweep-state`, a worktree run reads its own absent
 
 | Block, in report order | Meaning |
 |---|---|
-| `grandfathered (unowned): N` | Inline suppressions the baseline holds with no disposition. This number may only fall. |
+| `grandfathered (unowned): N` | Inline suppressions the baseline holds with no disposition. The baseline only shrinks, so this number may only fall, except when a new bare marker re-uses a `baseline slack` key; `--tighten` closes that. |
 | `ratification table: …, N rows` | Rows of `docs/legibility/exception-ratifications.yaml`, the only ids a `Policy` may cite. |
 | `governed lists: N declarations` | One block per declaration: `list_id` and `path:line`, its `rule`, its `default` disposition with how many keys it `covers`, and each per-key override. |
 | `unregistered candidates (report-only)` | Allow-list-shaped symbols that no declaration governs. This is a review docket, not a failure. |
@@ -4123,7 +4123,7 @@ Without `--sweep-state`, a worktree run reads its own absent
 | `baseline excess` | Keys the tree holds beyond the baseline. Non-zero is the merge gate's red. |
 | `baseline slack` | Keys the baseline holds that the tree no longer uses. `--tighten` removes them. |
 | `violations: N` | A `Policy` naming no table row, or a malformed disposition. Each is also printed on stderr. |
-| `last sweep: …` | The owner sweep stamp's age and `ok`, `STALE` past 48 h, or `never run`. |
+| `last sweep: …` | The owner sweep stamp's age with `(ok)` or `(FAILED)`, and `STALE` past 48 h; or `unreadable stamp`; or `never run`. A `FAILED` stamp under 48 h old still exits 0, so read `journalctl` and the sweep's `infra_issue` escalation. |
 
 Exit codes: 0 clean; 1 violations; 2 an instrument failure, or a sweep stamp
 that is stale past 48 h or unreadable. A sweep that has never run is not a
@@ -4132,8 +4132,10 @@ sweep reads.
 
 The report does not check owner liveness. To list dead owners now, run
 `uv run --project shared python scripts/exception_owner_sweep.py --dry-run`. It
-reads the main checkout's task store from any checkout, prints one verdict and
-planned action per (scope, owner), and writes, files and escalates nothing.
+reads the main checkout's task store from any checkout, but measures the
+citations in the checkout it runs from: pass `--root /home/leo/src/dark-factory`
+to measure main's. It prints one verdict and planned action per (scope, owner),
+and writes, files and escalates nothing.
 
 ### The seed cutover, and what a red branch sees
 
@@ -4185,16 +4187,16 @@ PRD D11 accepts this. If the timer stops firing, only someone who runs
 Each finding has a key, and a run skips a finding whose key a live task or a
 pending escalation already carries.
 
-- **Dead owner, inline scope:** a task carrying `x_inv12_finding`. It asks the
-  implementer to re-own each site with a live task or ticket, or to fix the
-  suppression. It never asks them to cite their own task.
+- **Dead owner, inline scope:** a task carrying `x_inv12_finding`. Its remedy
+  is `scripts/exception_owner_sweep.py::_DEAD_OWNER_REMEDY`: re-own each site
+  or fix the suppression, and never cite your own task.
 - **Dead owner, named list:** a `design_concern` info escalation whose
   `task_id` is `inv12-finding:dead_owner:<list_id>:<owner>`. The decision is
   the operator's: re-own the declaration, or rule a `Policy` row.
 - **Non-zero baseline slack:** a tighten task (run `--tighten`, then commit the
   baseline). It recurs by design.
-- **More than 10 outputs in one run:** one roll-up escalation. The rest wait
-  for the next run.
+- **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
+  in one run:** one roll-up escalation. The rest wait for the next run.
 - **A closed dead-owner task whose owner is still dead:** an escalation, never
   a re-file.
 - **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
@@ -4202,13 +4204,11 @@ pending escalation already carries.
 **Known gap.** The sweep treats a named-list finding as already raised only
 while its escalation is pending (`scripts/exception_owner_sweep.py::decide`).
 The info-L0 router dismisses info notes within about ten minutes, so the same
-note is filed again every night until the entry is re-owned. Measured: the dead
-task-6201 citation in `_WALL_CLOCK_DEADLINE_DEBT` has been escalated nightly
-since 2026-10-29 (15 L0 notes and 3 L1s by 2026-11-12). Task 7693 owns
-re-owning it. Separately, the finding bodies say to run `--report` to see the
-findings, but `--report` lists none: use `--dry-run`. Task 5611 filed both
-problems as follow-up ticket tkt_0RWX3F1EYVMWQW1SH6YSWKJ4J7. Whoever fixes them
-updates this paragraph.
+note is filed again every night until the entry is re-owned. The dead task-6201
+citation in `_WALL_CLOCK_DEADLINE_DEBT` has been escalated nightly since
+2026-10-29; task 7693 owns re-owning it. Separately, the finding bodies say to
+run `--report` to see the findings, but `--report` lists none: use `--dry-run`.
+Task 9468 owns both fixes, and updates this paragraph when either lands.
 
 ---
 
