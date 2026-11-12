@@ -1,4 +1,4 @@
-"""Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs.
+"""Multi-backend agent invocation: Claude Code, Codex, Gemini, pi and ZCode CLIs.
 
 Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
 other subsystems (e.g. fused-memory reconciliation) can reuse it without
@@ -42,6 +42,14 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
 
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
+from orchestrator.agents.zcode_backend import (
+    ZCodeEndpoint,
+    parse_zcode_output,
+    zcode_argv,
+    zcode_operator_home,
+    zcode_run_home,
+    zcode_spawn_env,
+)
 
 # MCP startup-timeout injection (bounded drop-on-fail for all projects)
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
@@ -145,7 +153,7 @@ async def invoke_agent(
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
-    Dispatches to the appropriate backend (claude, codex, gemini, pi).
+    Dispatches to the appropriate backend (claude, codex, gemini, pi, zcode).
     *strict_mcp_config* (claude backend ONLY): when True, ``--strict-mcp-config``
     is emitted alongside ``--mcp-config`` so the invocation is scoped to only
     the servers in *mcp_config*, ignoring the ambient project ``.mcp.json``
@@ -169,7 +177,7 @@ async def invoke_agent(
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
-    *prices*, when set (codex/gemini backends only — claude reports native
+    *prices*, when set (codex/gemini/zcode backends only — claude reports native
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
     The codex backend maps *allowed_tools* / *disallowed_tools* onto its
@@ -224,6 +232,15 @@ async def invoke_agent(
             oauth_token=oauth_token, resume_session_id=resume_session_id,
             session_id=session_id, timeout_seconds=timeout_seconds,
             env_overrides=env_overrides, prices=prices,
+        )
+    elif backend == 'zcode':
+        return await _invoke_zcode(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_turns=max_turns, max_budget_usd=max_budget_usd,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            mcp_config=mcp_config, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras, effort=effort,
+            timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
@@ -1322,6 +1339,61 @@ def _warn_if_pi_mcp_cache_unwarmed(server_names: Iterable[str]) -> None:
             'see _write_pi_mcp_config)',
             cache_path, ', '.join(names),
         )
+
+
+# ---------------------------------------------------------------------------
+# ZCode backend — its translation layer is orchestrator.agents.zcode_backend
+# ---------------------------------------------------------------------------
+
+async def _invoke_zcode(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str,
+    max_turns: int,
+    max_budget_usd: float,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+    effort: str | None,
+    timeout_seconds: float | None,
+    env_overrides: dict[str, str] | None,
+    prices: dict[str, Any] | None,
+) -> AgentResult:
+    """Invoke the ZCode CLI in a private run home; the wall clock is its only bound."""
+    endpoint = ZCodeEndpoint.from_env_overrides(env_overrides)
+    if timeout_seconds is None:
+        raise ValueError(
+            'the zcode backend needs timeout_seconds: ZCode has no turn or cost bound, so the '
+            'wall-clock watchdog is its only ceiling (plans/zcode-harness-probe-2026-11.md)',
+        )
+    logger.debug(
+        'zcode backend: max_turns=%r max_budget_usd=%r effort=%r allowed_tools=%r are not '
+        'enforced or expressible by zcode; only the wall clock (timeout_seconds=%r) bounds it',
+        max_turns, max_budget_usd, effort, allowed_tools, timeout_seconds,
+    )
+    base_env = {**os.environ, **(env_overrides or {})}
+    operator_home = zcode_operator_home(base_env)
+    with zcode_run_home(
+        system_prompt=system_prompt, model=model, endpoint=endpoint, mcp_config=mcp_config,
+        operator_home=operator_home,
+    ) as home:
+        cmd, env = _sandbox_spawn(
+            zcode_argv(prompt, cwd, disallowed_tools),
+            zcode_spawn_env(base_env, home),
+            cwd, sandbox_modules, [*(sandbox_extras or []), str(home.root)],
+        )
+        result = await _run_subprocess_local(
+            cmd, cwd, env, 'zcode', model, max_budget_usd, timeout_seconds,
+        )
+    return parse_zcode_output(
+        result,
+        cost_of=lambda uncached, output, cached: _estimate_cost(
+            model, uncached + cached, output, prices, cached_input_tokens=cached,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

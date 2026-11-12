@@ -3,7 +3,8 @@
 WHY THIS FILE LIVES HERE AND NOT IN ``scripts/tests/``.
 ``scripts/check_consolidation_closure.py`` imports ``TaskInterceptor`` at
 MODULE scope — that is the INV-5 single-sourcing of
-``_CONSOLIDATION_SCROLL_LIMIT`` and ``_extract_metadata_dict`` which makes
+``_CONSOLIDATION_SCROLL_LIMIT`` (and, beside it, the seam's own
+``metadata_dict.py::extract_metadata_dict``) which makes
 "the same mechanical check" literally true rather than aspirational.  That
 import transitively pulls in ``services.memory_service`` and therefore
 ``graphiti_core``, which is absent from the ``shared`` venv that runs

@@ -856,7 +856,7 @@ architect path regardless of `complexity`.
 
 `metadata.execution_class` answers **who executes the task at dispatch**, not
 what kind of edit it is. `'operational'` (and `'decision'`) are converted **at
-submit** by `TaskInterceptor._inject_deterministic_pure_gate` into
+submit** by `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped` into
 `task_kind='deterministic'` + `always_escalates=True` — a pure gate whose only
 dispatch action is a born-at-L2 escalation **to a human**. Human attention is
 the bottleneck; use these values only for work that genuinely requires an
@@ -1588,7 +1588,7 @@ Three of the entries belong to the completion-driven trigger chain
 
 `pure_gate_from` is machine-written at conversion, never author-supplied: the
 `submit_task` tool drops a caller-supplied value (metadata cloned from
-`get_task`, say), and `TaskInterceptor._inject_deterministic_pure_gate`
+`get_task`, say), and `shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`
 stamps it with a
 `shared/src/shared/pure_gate_provenance.py::PureGateTrigger` value (§4). It
 is written only when the conversion rewrote the submission's routing: a

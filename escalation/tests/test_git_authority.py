@@ -19,6 +19,7 @@ import dataclasses
 import enum
 import logging
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -491,6 +492,28 @@ class TestProbeLanding:
             'must not claim the gate was SKIPPED — that flag means the '
             'commit_citation_pattern opt-out weakened merge_sha'
         )
+
+    @pytest.mark.parametrize('make_git_ops', [
+        pytest.param(lambda: _marker_git_ops(marker='d' * 40), id='marker'),
+        pytest.param(
+            lambda: _ancestor_git_ops(tip='a' * 40, citation='c' * 40), id='ancestor',
+        ),
+    ])
+    @pytest.mark.parametrize('key', ['801', 'task/801'], ids=['bare', 'prefixed'])
+    async def test_metadata_is_read_by_the_bare_task_id_for_either_key_shape(
+        self, tmp_path: Path, key: str,
+        make_git_ops: Callable[[], types.SimpleNamespace],
+    ) -> None:
+        """probe_landing derives the task id it reads metadata by from either key shape."""
+        git_ops = make_git_ops()
+        harness = _harness(read=TaskFound({'metadata': {'branch_base_sha': 'b' * 40}}))
+
+        verdict = await probe_landing(
+            git_ops, key, orch_config=_config(tmp_path), harness=harness,
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.found_on_main
+        harness.scheduler.read_task.assert_awaited_once_with('801')
 
     async def test_citation_gate_opt_out_arm(self, tmp_path: Path) -> None:
         """``commit_citation_pattern == ''`` — the ONLY path that answers

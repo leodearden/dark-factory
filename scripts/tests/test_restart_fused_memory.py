@@ -4,7 +4,9 @@
 invocation into a shared JSON state file so tests can assert the recon-busy
 defer gate, the --drain SIGUSR1 signal + drained-marker wait, and the
 post-start /health verification — never touching a live systemd or
-fused-memory. Template: test_deploy_w5_recon_reliability.py.
+fused-memory. One test runs the committed scripts/check_network_exposure.py
+with systemctl and ip faked; it makes loopback-only TCP connects to the
+host's factory ports. Template: test_deploy_w5_recon_reliability.py.
 
 The test owns BOTH sides of the /health-body contract (the fake curl serves
 a busy/idle body it controls) and the journalctl drained-marker contract
@@ -17,11 +19,23 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPT = Path(__file__).parent.parent / "restart-fused-memory.sh"
+SOCKET_TEMPLATE = SCRIPT.parent / "fused-memory.socket.template"
 UNIT = "fused-memory"
+STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
+STALENESS_PROBE = ["is-active", STALENESS_REDEPLOY_UNIT]
+STOP_THEN_START = [["stop", UNIT], ["start", "fused-memory.socket", UNIT]]
+DRAIN_SIGNAL = ["kill", "--kill-who=main", "--signal=SIGUSR1", UNIT]
+_FAKE_CHECK_NAME = "fake_check_network_exposure.py"
 
 # The drained marker the script greps journalctl for (task 2702's converging
 # drain). The fake journalctl emits this exact literal, so the test pins the
@@ -31,11 +45,23 @@ DRAIN_MARKER = "Harness fully drained"
 
 _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake systemctl: record every call (minus --user); snapshot the curl-call
-count at the (single) restart so a test can prove the recon gate polled
-before the restart. Always succeeds."""
+count at the first `restart` or `start` so a test can prove the recon gate
+polled before the service came back.
+
+`is-active UNIT` answers from the `unit_states` map (absent -> "inactive"):
+it prints the state and exits 0 for "active", 3 otherwise; a null state
+prints nothing and exits 1 (no answer). A list answers its states in order,
+repeating the last. `daemon-reload` snapshots the installed socket unit's
+text (null if absent) as `socket_unit_at_daemon_reload`, and the curl-call
+count as `curl_calls_at_daemon_reload`. Every other call succeeds."""
 import json
 import os
 import sys
+
+SOCKET_UNIT = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "systemd", "user", "fused-memory.socket",
+)
 
 STATE_PATH = os.environ["FAKE_STATE_PATH"]
 
@@ -50,14 +76,40 @@ def _save(state):
         json.dump(state, f)
 
 
+def _read_socket_unit():
+    try:
+        with open(SOCKET_UNIT) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def _next_unit_state(state, unit):
+    answer = state.get("unit_states", {}).get(unit, "inactive")
+    if not isinstance(answer, list):
+        return answer
+    return answer.pop(0) if len(answer) > 1 else answer[0]
+
+
 def main(argv):
     state = _load()
     call = [a for a in argv[1:] if a != "--user"]
     state.setdefault("systemctl_calls", []).append(call)
-    if call and call[0] == "restart" and "curl_calls_at_restart" not in state:
+    verb = call[0] if call else None
+    if verb in ("restart", "start") and "curl_calls_at_restart" not in state:
         state["curl_calls_at_restart"] = len(state.get("curl_calls", []))
+    if verb == "daemon-reload":
+        state["socket_unit_at_daemon_reload"] = _read_socket_unit()
+        state["curl_calls_at_daemon_reload"] = len(state.get("curl_calls", []))
+    if verb != "is-active":
+        _save(state)
+        return 0
+    unit_state = _next_unit_state(state, call[1])
     _save(state)
-    return 0
+    if unit_state is None:
+        return 1
+    sys.stdout.write(unit_state + "\\n")
+    return 0 if unit_state == "active" else 3
 
 
 if __name__ == "__main__":
@@ -65,7 +117,8 @@ if __name__ == "__main__":
 '''
 
 _FAKE_CURL_SRC = '''#!/usr/bin/env python3
-"""Fake curl. Two phases, discriminated by whether a restart has happened:
+"""Fake curl. Two phases, discriminated by whether a systemctl `restart` or
+`start` has happened:
 
 BEFORE restart -> recon-gate body fetch (`curl -s --max-time N URL`):
   - curl_unreachable True  -> emit nothing, exit 1 (endpoint unreachable)
@@ -118,7 +171,7 @@ def main(argv):
     state = _load()
     state.setdefault("curl_calls", []).append(argv[1:])
     restart_done = any(
-        c and c[0] == "restart" for c in state.get("systemctl_calls", [])
+        c and c[0] in ("restart", "start") for c in state.get("systemctl_calls", [])
     )
     if not restart_done:
         if state.get("curl_unreachable"):
@@ -198,6 +251,29 @@ if __name__ == "__main__":
 '''
 
 
+_FAKE_CHECK_NETWORK_EXPOSURE_SRC = '''#!/usr/bin/env python3
+"""Fake scripts/check_network_exposure.py: record when it ran (the systemctl
+call count and the post-start health successes so far), print one tagged
+line, exit `check_rc`."""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_STATE_PATH"]
+
+with open(STATE_PATH) as f:
+    state = json.load(f)
+state.setdefault("check_calls", []).append({
+    "systemctl_calls": len(state["systemctl_calls"]),
+    "health_success_count": state.get("health_success_count", 0),
+})
+with open(STATE_PATH, "w") as f:
+    json.dump(state, f)
+print("[network_exposure] [fake] check ran")
+sys.exit(state["check_rc"])
+'''
+
+
 def _state_path(tmp_path):
     return tmp_path / "fake_state.json"
 
@@ -212,6 +288,8 @@ def _write_fakes(
     journalctl_marker="",
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
+    unit_states=None,
+    check_rc=0,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -219,6 +297,7 @@ def _write_fakes(
         ("systemctl", _FAKE_SYSTEMCTL_SRC),
         ("curl", _FAKE_CURL_SRC),
         ("journalctl", _FAKE_JOURNALCTL_SRC),
+        (_FAKE_CHECK_NAME, _FAKE_CHECK_NETWORK_EXPOSURE_SRC),
     ):
         fake = bin_dir / name
         fake.write_text(src)
@@ -236,12 +315,19 @@ def _write_fakes(
         "journalctl_marker": journalctl_marker,
         "journalctl_marker_after": journalctl_marker_after,
         "journalctl_marker_padding_bytes": journalctl_marker_padding_bytes,
+        "unit_states": unit_states or {},
+        "check_rc": check_rc,
+        "check_calls": [],
     }))
     return bin_dir, state_path
 
 
 def _state(tmp_path):
     return json.loads(_state_path(tmp_path).read_text())
+
+
+def _socket_unit_path(tmp_path):
+    return tmp_path / "config" / "systemd" / "user" / "fused-memory.socket"
 
 
 def _run_script(
@@ -255,6 +341,8 @@ def _run_script(
     journalctl_marker="",
     journalctl_marker_after=0,
     journalctl_marker_padding_bytes=0,
+    unit_states=None,
+    check_rc=0,
 ):
     bin_dir, state_path = _write_fakes(
         tmp_path,
@@ -265,7 +353,11 @@ def _run_script(
         journalctl_marker=journalctl_marker,
         journalctl_marker_after=journalctl_marker_after,
         journalctl_marker_padding_bytes=journalctl_marker_padding_bytes,
+        unit_states=unit_states,
+        check_rc=check_rc,
     )
+    _socket_unit_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "home").mkdir(exist_ok=True)
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_STATE_PATH"] = str(state_path)
@@ -276,8 +368,13 @@ def _run_script(
     full_env.setdefault("DRAIN_POLL_INTERVAL", "0")
     full_env.setdefault("HEALTH_TIMEOUT", "3")
     full_env.setdefault("CURL_MAX_TIME", "2")
+    full_env["NETWORK_EXPOSURE_CHECK"] = str(bin_dir / _FAKE_CHECK_NAME)
     if env:
         full_env.update(env)
+    # Unconditional, after `env`: no run may install into the live
+    # ~/.config/systemd/user/fused-memory.socket.
+    full_env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+    full_env["HOME"] = str(tmp_path / "home")
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         env=full_env,
@@ -500,3 +597,258 @@ def test_exits_nonzero_when_health_never_ready(tmp_path):
         f"the restart must still have occurred; the failure is the verify gate; "
         f"state={state!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# (g) argument parsing: two orthogonal axes, gate (--now|--drain) and
+# --rebind-socket; an unknown flag or two gates is a usage error (exit 2)
+# ---------------------------------------------------------------------------
+
+def test_unknown_argument_prints_usage_naming_rebind_socket_and_exits_2(tmp_path):
+    result = _run_script(tmp_path, "--bogus")
+    assert result.returncode == 2, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "--bogus" in result.stderr, f"stderr={result.stderr!r}"
+    usage = [line for line in result.stderr.splitlines() if line.startswith("Usage:")]
+    assert usage and "--rebind-socket" in usage[0], f"stderr={result.stderr!r}"
+    assert _state(tmp_path)["systemctl_calls"] == []
+
+
+def test_now_and_drain_are_mutually_exclusive(tmp_path):
+    result = _run_script(tmp_path, "--now", "--drain")
+    assert result.returncode == 2, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "--now" in result.stderr and "--drain" in result.stderr, (
+        f"stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["systemctl_calls"] == []
+
+
+# ---------------------------------------------------------------------------
+# (h) --rebind-socket, before the service comes back: refuse while a
+# staleness redeploy runs, before the gate and again after it; keep the
+# chosen gate; then install the committed socket template, reload, and stop
+# and start instead of restarting
+# ---------------------------------------------------------------------------
+
+def _stops_then_starts(calls):
+    return any(calls[i:i + 2] == STOP_THEN_START for i in range(len(calls)))
+
+
+@pytest.mark.parametrize("redeploy_state", ["active", "activating", "deactivating", None])
+def test_rebind_refuses_while_staleness_redeploy_is_in_flight(tmp_path, redeploy_state):
+    result = _run_script(
+        tmp_path, "--rebind-socket",
+        unit_states={STALENESS_REDEPLOY_UNIT: redeploy_state},
+    )
+    assert result.returncode == 3, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    read_state = redeploy_state or "no answer"
+    refusals = [
+        line for line in (result.stdout + result.stderr).splitlines()
+        if line.startswith("rebind_socket:")
+        and STALENESS_REDEPLOY_UNIT in line and read_state in line
+    ]
+    assert refusals, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert _state(tmp_path)["systemctl_calls"] == [STALENESS_PROBE]
+    assert not _socket_unit_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("redeploy_state", ["inactive", "failed"])
+def test_rebind_proceeds_when_staleness_redeploy_is_not_running(tmp_path, redeploy_state):
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        unit_states={STALENESS_REDEPLOY_UNIT: redeploy_state},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _stops_then_starts(_state(tmp_path)["systemctl_calls"])
+
+
+def test_rebind_installs_the_template_verbatim_then_reloads(tmp_path):
+    installed = _socket_unit_path(tmp_path)
+    installed.parent.mkdir(parents=True)
+    installed.write_text("[Socket]\nListenStream=0.0.0.0:8002\n")
+    installed.chmod(0o600)
+    result = _run_script(tmp_path, "--rebind-socket", "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert installed.read_bytes() == SOCKET_TEMPLATE.read_bytes()
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+    assert _state(tmp_path)["socket_unit_at_daemon_reload"] == SOCKET_TEMPLATE.read_text()
+
+
+def test_rebind_stops_then_starts_instead_of_restarting(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["systemctl_calls"] == [
+        STALENESS_PROBE, STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("args", "gate_calls"),
+    [(["--rebind-socket"], []), (["--rebind-socket", "--drain"], [DRAIN_SIGNAL])],
+    ids=["recon-gate", "drain"],
+)
+def test_rebind_rechecks_the_staleness_redeploy_after_the_gate(tmp_path, args, gate_calls):
+    result = _run_script(
+        tmp_path, *args,
+        recon_busy_remaining=1,
+        journalctl_marker=DRAIN_MARKER,
+        unit_states={STALENESS_REDEPLOY_UNIT: ["inactive", "active"]},
+    )
+    assert result.returncode == 3, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["systemctl_calls"] == [STALENESS_PROBE, *gate_calls, STALENESS_PROBE], (
+        f"state={state!r}"
+    )
+    assert not _socket_unit_path(tmp_path).exists()
+
+
+def test_rebind_reloads_the_socket_unit_only_after_the_recon_gate(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", recon_busy_remaining=2)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["curl_calls_at_daemon_reload"] >= 3, f"state={state!r}"
+    assert state["curl_calls_at_daemon_reload"] == state["curl_calls_at_restart"], (
+        f"state={state!r}"
+    )
+
+
+def test_rebind_keeps_the_recon_gate(tmp_path):
+    result = _run_script(tmp_path, "--rebind-socket", recon_busy_remaining=2)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state.get("curl_calls_at_restart", 0) >= 3, f"state={state!r}"
+    assert "deferring" in result.stdout, f"stdout={result.stdout!r}"
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--rebind-socket", "--now"], ["--now", "--rebind-socket"]],
+    ids=["rebind-first", "now-first"],
+)
+def test_rebind_composes_with_now_in_either_order(tmp_path, args):
+    result = _run_script(tmp_path, *args, recon_busy_remaining=5)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state.get("curl_calls_at_restart") == 0, f"state={state!r}"
+    assert "recon_gate:" not in result.stdout, f"stdout={result.stdout!r}"
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--rebind-socket", "--drain"], ["--drain", "--rebind-socket"]],
+    ids=["rebind-first", "drain-first"],
+)
+def test_rebind_composes_with_drain_in_either_order(tmp_path, args):
+    result = _run_script(
+        tmp_path, *args,
+        journalctl_marker=DRAIN_MARKER,
+        journalctl_marker_after=1,
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["systemctl_calls"] == [
+        STALENESS_PROBE, DRAIN_SIGNAL, STALENESS_PROBE, ["daemon-reload"], *STOP_THEN_START,
+    ], f"state={state!r}"
+    assert len(state["journalctl_calls"]) == 2, f"state={state!r}"
+    assert DRAIN_MARKER.lower() in result.stdout.lower(), f"stdout={result.stdout!r}"
+
+
+@pytest.mark.parametrize("args", [[], ["--now"]], ids=["default", "now"])
+def test_plain_modes_leave_the_socket_unit_alone(tmp_path, args):
+    result = _run_script(tmp_path, *args)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = _state(tmp_path)["systemctl_calls"]
+    socket_verbs = {"is-active", "daemon-reload", "stop", "start"}
+    assert not [c for c in calls if c[0] in socket_verbs], f"calls={calls!r}"
+    assert not _socket_unit_path(tmp_path).exists()
+    assert ["restart", UNIT] in calls, f"calls={calls!r}"
+
+
+# ---------------------------------------------------------------------------
+# (i) --rebind-socket's post-condition: once /health answers, the exposure
+# check runs last and its status is the script's
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("check_rc", [0, 1])
+def test_rebind_exits_with_the_exposure_check_status(tmp_path, check_rc):
+    result = _run_script(tmp_path, "--rebind-socket", "--now", check_rc=check_rc)
+    assert result.returncode == check_rc, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert len(state["check_calls"]) == 1, f"state={state!r}"
+    check_call = state["check_calls"][0]
+    assert check_call["health_success_count"] >= 1, f"state={state!r}"
+    assert check_call["systemctl_calls"] == len(state["systemctl_calls"]), f"state={state!r}"
+    assert "[network_exposure]" in result.stdout, f"stdout={result.stdout!r}"
+
+
+def test_rebind_does_not_run_the_check_when_health_never_comes_up(tmp_path):
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        health_fail_remaining=100_000,
+        env={"HEALTH_TIMEOUT": "1"},
+    )
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), f"expected a diagnostic on stderr; got {result.stderr!r}"
+    state = _state(tmp_path)
+    assert _stops_then_starts(state["systemctl_calls"]), f"state={state!r}"
+    assert state["check_calls"] == [], f"state={state!r}"
+
+
+def test_rebind_runs_the_committed_exposure_check_by_default(tmp_path):
+    """The fake systemctl prints nothing for `list-sockets -o json`, so the
+    REAL scripts/check_network_exposure.py reports that source and exits 1 on
+    any host; the fake `ip` lists no address, so it connects only to
+    127.0.0.1."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_ip = bin_dir / "ip"
+    fake_ip.write_text("#!/bin/sh\necho '[]'\n")
+    fake_ip.chmod(0o755)
+    result = _run_script(
+        tmp_path, "--rebind-socket", "--now",
+        env={"NETWORK_EXPOSURE_CHECK": ""},
+    )
+    assert result.returncode == 1, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert (
+        "[network_exposure] [source-error] systemctl --user list-sockets -o json"
+        in result.stdout
+    ), f"stdout={result.stdout!r}"
+
+
+def test_plain_modes_never_run_the_exposure_check(tmp_path):
+    result = _run_script(tmp_path, "--now")
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _state(tmp_path)["check_calls"] == []

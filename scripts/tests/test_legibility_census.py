@@ -42,6 +42,7 @@ from legibility import (
     census_window,
     check_census_report,
     codebook,
+    codebook_lifecycle,
     coder,
     disposition,
     embeddings,
@@ -988,223 +989,6 @@ def test_build_task_payloads_priority_defaults_to_the_default_severity():
 
 
 # ---------------------------------------------------------------------------
-# amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
-# codebook.apply_coding_records groups new candidates BY TITLE
-# (codebook.py::_apply_coding_record), so verification must operate on the
-# same set of resolvable titles -- a second cluster for an already-seen title
-# can never resolve to a second
-# "pending" candidate id in codebook.pending_titled, wasting a Sonnet
-# verify call and diverging the matrix from the codebook
-# (reviewer_comprehensive finding #3).
-# ---------------------------------------------------------------------------
-
-def _novel_record(session, *, candidates):
-    return {"session": session, "matches": [], "candidates": candidates}
-
-
-def test_novel_clusters_deduplicates_candidates_sharing_a_title():
-    records = [
-        _novel_record(
-            "sess-1",
-            candidates=[
-                {
-                    "title": "Silent no-op subagent contract",
-                    "cause": "first sighting",
-                    "origin_phase": "implement",
-                    "manifested_phase": "verify",
-                }
-            ],
-        ),
-        _novel_record(
-            "sess-2",
-            candidates=[
-                {
-                    "title": "Silent no-op subagent contract",
-                    "cause": "second sighting, same title",
-                    "origin_phase": "implement",
-                    "manifested_phase": "verify",
-                }
-            ],
-        ),
-    ]
-
-    clusters = mod._novel_clusters(records)
-
-    assert len(clusters) == 1, (
-        "a second candidate sharing an already-seen title must not spend a "
-        "second verify slot -- apply_coding_records would collapse it into "
-        "the same pending codebook candidate as the first"
-    )
-    assert clusters[0]["title"] == "Silent no-op subagent contract"
-    assert clusters[0]["sightings"][0]["session"] == "sess-1", "first occurrence wins"
-
-
-def test_novel_clusters_skips_titleless_candidates():
-    records = [
-        _novel_record("sess-1", candidates=[{"title": "", "cause": "empty title"}]),
-        _novel_record("sess-2", candidates=[{"cause": "title key entirely absent"}]),
-    ]
-
-    clusters = mod._novel_clusters(records)
-
-    assert clusters == [], (
-        "apply_coding_records requires a title to key its merge on -- a "
-        "titleless candidate must be skipped, mirroring that requirement"
-    )
-
-
-def test_novel_clusters_distinct_titles_each_get_their_own_cluster():
-    records = [
-        _novel_record("sess-1", candidates=[{"title": "Cause A"}]),
-        _novel_record("sess-2", candidates=[{"title": "Cause B"}]),
-    ]
-
-    clusters = mod._novel_clusters(records)
-
-    assert {c["title"] for c in clusters} == {"Cause A", "Cause B"}
-
-
-# ---------------------------------------------------------------------------
-# step-11: RED — promote_candidate() / reject_candidate() / retire_entry()
-# in-place codebook lifecycle transforms (never-delete, PRD decision 3)
-# ---------------------------------------------------------------------------
-
-def _codebook_with_candidate():
-    """Mirrors test_codebook.py's _minimal_v2() base shape, plus one
-    pending candidate carrying a real sighting -- the fixture promote/
-    reject tests build on."""
-    cb = _minimal_v2_codebook()
-    cb["candidates"] = [
-        {
-            "id": "cand-20260714-1",
-            "title": "A novel confusion shape",
-            "first_seen": "2026-07-14",
-            "disposition": "pending",
-            "sightings": [
-                {
-                    "date": "2026-07-14",
-                    "project": "dark_factory",
-                    "session": "sess-1",
-                    "origin_phase": "implement",
-                    "manifested_phase": "verify",
-                },
-            ],
-        }
-    ]
-    return cb
-
-
-def test_promote_candidate_appends_entry_and_stamps_disposition():
-    before = _codebook_with_candidate()
-    entry_fields = {
-        "id": "new-entry-a",
-        "title": "A novel confusion shape",
-        "severity": "medium",
-        "status": "open",
-        "origin_phase": "implement",
-        "manifested_phase": "verify",
-    }
-
-    result = mod.promote_candidate(before, "cand-20260714-1", entry_fields)
-
-    new_entry = next(e for e in result["entries"] if e["id"] == "new-entry-a")
-    assert new_entry["sightings"] == before["candidates"][0]["sightings"]
-
-    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
-    assert candidate["disposition"] == "promoted"
-    assert candidate.get("promoted_to") == "new-entry-a", "must name the new entry id"
-    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)  # must not raise
-
-    # never mutates the input codebook
-    assert before["candidates"][0]["disposition"] == "pending"
-    assert len(before["entries"]) == 1
-
-
-_PROMOTION_ENTRY_FIELDS = {
-    "id": "new-entry-a",
-    "title": "A novel confusion shape",
-    "severity": "medium",
-    "status": "open",
-    "origin_phase": "implement",
-    "manifested_phase": "verify",
-}
-
-
-def _promotion_identity(anchor: str, primary_tag: str = "h13") -> census_findings.FindingIdentity:
-    return census_findings.FindingIdentity.mint("orchestrator", anchor, (primary_tag, verdict.KIND_TAG))
-
-
-def _promoted_pair(cb: dict, finding: census_findings.FindingIdentity) -> tuple[dict, dict]:
-    result = mod.promote_candidate(cb, "cand-20260714-1", dict(_PROMOTION_ENTRY_FIELDS), finding=finding)
-    assert codebook.validate(result) == []
-    return result["candidates"][0], next(e for e in result["entries"] if e["id"] == "new-entry-a")
-
-
-def _identity_and_supersedes(record: dict) -> dict:
-    return {field: record[field] for field in (*codebook.FINDING_IDENTITY_FIELDS, "supersedes")}
-
-
-def test_a_promoted_entry_carries_its_unkeyed_candidates_new_identity():
-    finding = _promotion_identity("orchestrator/x.py::f")
-    candidate, entry = _promoted_pair(_codebook_with_candidate(), finding)
-    assert _identity_and_supersedes(entry) == {**finding.to_fields(), "supersedes": []}
-    assert candidate["finding_key"] == entry["finding_key"]
-
-
-def test_a_promoted_entry_keeps_the_key_its_candidate_already_stands_on():
-    cb = _codebook_with_candidate()
-    standing = _promotion_identity("orchestrator/x.py::f", primary_tag="h13")
-    cb["candidates"][0].update(standing.to_fields())
-    candidate, entry = _promoted_pair(cb, _promotion_identity("orchestrator/x.py::f", primary_tag="h4"))
-    assert entry["finding_key"] == candidate["finding_key"] == standing.key
-    assert _identity_and_supersedes(entry) == _identity_and_supersedes({**candidate, "supersedes": []})
-
-
-def test_a_promoted_entry_carries_the_supersedes_chain_its_moved_candidate_records():
-    cb = _codebook_with_candidate()
-    prior = finding_key("orchestrator", "orchestrator/x.py::older", "h13")
-    standing = _promotion_identity("orchestrator/x.py::old_name")
-    cb["candidates"][0].update({**standing.to_fields(), "supersedes": [prior]})
-    moved = _promotion_identity("orchestrator/x.py::new_name")
-    candidate, entry = _promoted_pair(cb, moved)
-    assert entry["finding_key"] == candidate["finding_key"] == moved.key
-    assert entry["supersedes"] == candidate["supersedes"] == [prior, standing.key]
-
-
-def test_reject_candidate_stamps_disposition_retained():
-    before = _codebook_with_candidate()
-
-    result = mod.reject_candidate(before, "cand-20260714-1")
-
-    candidate = next(c for c in result["candidates"] if c["id"] == "cand-20260714-1")
-    assert candidate["disposition"] == "rejected"
-    assert len(result["candidates"]) == len(before["candidates"]), "candidate is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["candidates"][0]["disposition"] == "pending"
-
-
-def test_retire_entry_sets_status_retained():
-    before = _minimal_v2_codebook()
-
-    result = mod.retire_entry(before, "entry-a")
-
-    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
-    assert entry["status"] == "retired"
-    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["entries"][0]["status"] == "open"
-
-
-# ---------------------------------------------------------------------------
 # step-15: RED — render_report() dated markdown assembly
 # ---------------------------------------------------------------------------
 
@@ -1299,7 +1083,7 @@ _NO_INSTRUMENT_RECORDS_NOTE = (
 """The inputs note of a project carrying no other instrument's record."""
 
 _NOTHING_SCREENED = prescreen.ScreenReport(
-    screen=prescreen.Screen((), (), ()),
+    screen=prescreen.Screen(records=(), to_verify=(), uncatalogued=(), screened=(), surfaced=()),
     surfaced_by_key=(),
     attached=(),
     re_observed=(),
@@ -1314,7 +1098,6 @@ def test_the_golden_inputs_note_is_what_a_project_without_instrument_records_rea
 _NOTHING_ADJUDICATED = similarity.AdjudicationReport(
     view=similarity.View(settings=config_mod.Adjudication(), depth=(0, 0)),
     attached=(),
-    unattached=(),
     offered=(),
     adjudicated=(),
     inconclusive=None,
@@ -2050,7 +1833,7 @@ def test_build_census_record_carries_the_filing_record_and_the_observed_root():
 # render outside the structure.
 def _sample_dropped_verdicts() -> tuple:
     """Two drop records covering the two shapes the section renders
-    differently: one with a standing record, one without."""
+    differently: one contradicting its standing candidate, one agreeing."""
     return (
         mod.DroppedVerdict(
             verdict="rejected",
@@ -2062,8 +1845,11 @@ def _sample_dropped_verdicts() -> tuple:
         ),
         mod.DroppedVerdict(
             verdict="verified",
-            title="A title the merge never saw",
-            kind=mod.DROP_NO_STANDING,
+            title="A pattern already promoted",
+            kind=mod.DROP_AGREEMENT,
+            standing_id="cand-20260702-3",
+            standing_disposition="promoted",
+            standing_first_seen="2026-07-02",
         ),
     )
 
@@ -3583,21 +3369,11 @@ def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
 
 
 # ---------------------------------------------------------------------------
-# task 5279 W2: a REJECT verdict that resolves to no pending candidate must
-# name itself.
-#
-# Post-4144 `codebook.pending_titled` returning None is a NORMAL outcome:
-# when a re-mined title's only same-title candidate is already adjudicated,
-# `codebook.apply_coding_records` deliberately declines to fabricate a pending
-# twin (codebook.py:429-455 -- fabricating one is how rejected
-# cand-20260722-28 came back as pending cand-20260724-2 in the live codebook).
-# The prior verdict standing is CORRECT. The defect is the silence: the
-# `for cluster in rejected:` loop's implicit else discarded a verdict this run
-# PAID a Sonnet call for and said nothing.
-#
-# Seeding an already-adjudicated same-title candidate is sufficient to drive
-# that None through the REAL merge path, so these tests need no hand-built
-# codebook state the merger would never produce.
+# task 5279 W2: a verdict whose offered candidate is no longer pending must
+# name itself. A cluster re-observing a fixed entry is surfaced and verified,
+# and the merge routes its payload to the standing adjudicated candidate of
+# its title rather than fabricate a pending twin (task 4144), so the verdict
+# is dropped, against that candidate.
 # ---------------------------------------------------------------------------
 
 _REJECTED_TITLE = "Spurious pattern"
@@ -3627,44 +3403,9 @@ def _codebook_with_adjudicated_candidate(disposition, *, promoted_to=None, extra
     return cb
 
 
-_SPURIOUS_CLUSTER = {
-    "title": _REJECTED_TITLE,
-    "summary": _REJECTED_TITLE,
-    "cause": None,
-    "area": None,
-    "origin_phase": "review",
-    "manifested_phase": "merge",
-    "evidence": [],
-    "sightings": [{"session": "novel-rejected", "origin_phase": "review", "manifested_phase": "merge"}],
-}
-"""The cluster the "novel-rejected" digest mines, as the census offers it to
-its verifier."""
-
-
-def _answering_the_mined_spurious_cluster(**fake_kwargs):
-    """`_make_fake_verify_fn(**fake_kwargs)` that also answers
-    `_SPURIOUS_CLUSTER` when the run's first verify call did not offer it.
-
-    Over a codebook already carrying `_REJECTED_TITLE`, the pre-screen
-    (plans/census-incremental-prd.md L6) attaches the re-mined cluster with no
-    verify call. Answering it anyway is what still drives a verdict onto the
-    standing record in the runs that pin that path; a run that offers the
-    cluster gets exactly the plain fake's answer."""
-    fake = _make_fake_verify_fn(**fake_kwargs)
-
-    def verify_fn(clusters, *, model):
-        offered = {cluster.get("title") for cluster in clusters}
-        unoffered = [] if fake.calls or _REJECTED_TITLE in offered else [copy.deepcopy(_SPURIOUS_CLUSTER)]
-        return fake([*clusters, *unoffered], model=model)
-
-    verify_fn.calls = fake.calls
-    return verify_fn
-
-
 def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     """`run_census` kwargs for a single-cluster run over the `_REJECTED_TITLE`
-    cluster, whose DEFAULT `verify_fn` rejects it, offered or not
-    (`_answering_the_mined_spurious_cluster`).
+    cluster, whose DEFAULT `verify_fn` rejects it when it is offered.
 
     The verdict is chosen by `verify_fn` alone, not by this builder --
     *overrides* win, so `_verified_run_kwargs` below is this same run with the
@@ -3672,7 +3413,7 @@ def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
     defaults = dict(
         invoke=_make_fake_invoke(_happy_invoke_response),
         batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
-        verify_fn=_answering_the_mined_spurious_cluster(rejected_titles={_REJECTED_TITLE}),
+        verify_fn=_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}),
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         commit=_make_fake_commit(),
@@ -3688,7 +3429,7 @@ def _verified_run_kwargs(tmp_path, codebook_dict, **overrides):
     defaults would drift."""
     return _rejected_run_kwargs(
         tmp_path, codebook_dict,
-        **{"verify_fn": _answering_the_mined_spurious_cluster(verified_titles={_REJECTED_TITLE}), **overrides},
+        **{"verify_fn": _make_fake_verify_fn(verified_titles={_REJECTED_TITLE}), **overrides},
     )
 
 
@@ -3719,41 +3460,44 @@ def _codebook_with_standing(disposition):
     return _codebook_with_adjudicated_candidate(disposition)
 
 
-def _codebook_with_duplicate_standing_candidates(*, promoted_to="entry-spurious"):
-    """The live codebook's KNOWN duplicate-title shape: a `promoted`
-    same-title candidate followed by a `rejected` one (the task-4144
-    cand-20260722-28 / cand-20260724-2 pair the module docstrings cite).
-
-    Order is the whole point -- `rejected` is LAST, so a bare "last same-title
-    match" tie-break picks it while the merger routes the recurrence sighting
-    to the promoted record's live ENTRY. *promoted_to* is parameterised so the
-    same shape can be built with a `promoted_to` that resolves to NO entry,
-    which is the case the merger itself falls through on."""
-    cb = _codebook_with_adjudicated_candidate(
-        "promoted", promoted_to=promoted_to, extra_entry=_promoted_entry(),
-    )
-    cb["candidates"].append({
-        "id": "cand-20260724-2",
-        "title": _REJECTED_TITLE,
-        "first_seen": "2026-07-24",
-        "disposition": "rejected",
+def _with_surfaced_standing(cb: dict, title: str, disposition: str, *, candidate_id: str, entry_id: str) -> dict:
+    """*cb* plus a FIXED entry carrying *title*, so its re-mined cluster is
+    surfaced and verified, and a standing candidate of that exact title the
+    merge routes the payload to: promoted to that entry, or rejected."""
+    cb["entries"].append({**_promoted_entry(), "id": entry_id, "title": title, "status": "fixed"})
+    candidate = {
+        "id": candidate_id,
+        "title": title,
+        "first_seen": "2026-07-01",
+        "disposition": disposition,
         "sightings": [],
-    })
+    }
+    if disposition == "promoted":
+        candidate["promoted_to"] = entry_id
+    cb["candidates"].append(candidate)
     return cb
 
 
-def _verify_fn_with_unknown_titles(*, verified=(), rejected=()):
-    """A verifier whose verdicts name titles the merge never saw -- the
-    shortest route to N dropped verdicts in one run, on EITHER adjudication
-    loop or both at once, independent of any codebook seeding."""
-    def fake_verify_fn(clusters, *, model):
-        return {
-            "verified": [{"title": t, "sightings": []} for t in verified],
-            "rejected": [{"title": t, "sightings": []} for t in rejected],
-            "fixed": [],
-        }
+def _surfaced_standing_codebook(disposition: str) -> dict:
+    return _with_surfaced_standing(
+        _minimal_v2_codebook(), _REJECTED_TITLE, disposition, candidate_id="cand-20260701-7", entry_id="entry-spurious",
+    )
 
-    return fake_verify_fn
+
+def _two_surfaced_drops_kwargs(tmp_path, verify_fn):
+    """A run mining `_L6_NOVEL_TITLE` and `_REJECTED_TITLE`, each surfaced
+    onto a standing candidate, so every verdict *verify_fn* gives is dropped."""
+    cb = _with_surfaced_standing(
+        _surfaced_standing_codebook("promoted"), _L6_NOVEL_TITLE, "rejected",
+        candidate_id="cand-20260701-8", entry_id="entry-silent",
+    )
+    return _rejected_run_kwargs(
+        tmp_path, cb, verify_fn=verify_fn,
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+    )
 
 
 def _dropped_verdict_warnings(caplog):
@@ -3796,316 +3540,6 @@ def _one_dropped(outcome):
     return records[0]
 
 
-def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
-    tmp_path, caplog,
-):
-    """The worse case this workstream exists for: a LIVE codebook entry stands
-    while the census's fresh reject verdict is discarded.
-
-    An operator has to know, because only a hand re-open will change it --
-    nothing in the system reconciles a standing promotion against a later
-    verdict that the title is unfounded."""
-    kwargs = _rejected_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "rejected"
-    assert record.title == _REJECTED_TITLE
-    # The marker that separates this from the agreement case below. A live
-    # ENTRY standing against a fresh reject is the thing to act on.
-    assert record.kind == mod.DROP_CONTRADICTION
-    # All three facts an operator needs to find the standing record by hand.
-    assert record.standing_id == "cand-20260701-7"
-    assert record.standing_disposition == "promoted"
-    assert record.standing_first_seen == "2026-07-01"
-    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
-
-    # Surfacing the drop must not change what is persisted.
-    assert outcome.status == "done"
-    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def test_run_census_dropped_reject_over_a_rejected_candidate_is_agreement(
-    tmp_path, caplog,
-):
-    """The agreement case: the standing verdict already says rejected, so the
-    fresh one is a genuine no-op and only the paid-for Sonnet call was wasted.
-
-    It still gets a line -- a recurring non-zero count is the cue that a title
-    keeps being re-mined and re-verified against a verdict that will never
-    change -- but it must be DISTINGUISHABLE from the contradiction above, or
-    an operator scanning the journal cannot tell "nothing to do" from "a live
-    entry was just judged unfounded"."""
-    codebook_dict = _codebook_with_adjudicated_candidate("rejected")
-    kwargs = _rejected_run_kwargs(tmp_path, codebook_dict)
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "rejected"
-    assert record.title == _REJECTED_TITLE
-    # Asserted against the key the promoted case asserts, so the two cases
-    # cannot converge on one classification later.
-    assert record.kind == mod.DROP_AGREEMENT
-    assert record.standing_id == "cand-20260701-7"
-    assert record.standing_disposition == "rejected"
-    assert record.standing_first_seen == "2026-07-01"
-    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
-
-    assert outcome.status == "done"
-    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
-    tmp_path, caplog,
-):
-    """The stranger case: no same-title candidate exists at all, so there is
-    no standing verdict to explain the drop -- the merge and this run's cluster
-    list disagree about the title. Reached here by a verifier that returns a
-    title the merge never saw.
-
-    The message must say that plainly rather than inventing a standing record;
-    an explanation that is fabricated is worse than an admitted gap."""
-    def verify_fn_inventing_a_title(clusters, *, model):
-        return {
-            "verified": [],
-            "rejected": [{"title": "A title the merge never saw", "sightings": []}],
-            "fixed": [],
-        }
-
-    kwargs = _rejected_run_kwargs(
-        tmp_path, _minimal_v2_codebook(), verify_fn=verify_fn_inventing_a_title,
-    )
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "rejected"
-    assert record.title == "A title the merge never saw"
-    assert record.kind == mod.DROP_NO_STANDING
-    # All three standing fields are None exactly when there is no standing
-    # record -- the absence is carried, not explained away with a fabricated
-    # one.
-    assert (
-        record.standing_id,
-        record.standing_disposition,
-        record.standing_first_seen,
-    ) == (None, None, None)
-    assert _drop_warnings_naming(caplog, record.title), "the drop must be announced"
-
-    assert outcome.status == "done"
-    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-# ---------------------------------------------------------------------------
-# task 5279 review remedy (a): the SAME drop on the `verified` loop.
-#
-# The reject loop above got its three branches; the verified loop kept a bare
-# `if cand_id is None: continue`. That half is the more consequential one: a
-# confusion pattern the census just paid a Sonnet call to CONFIRM never enters
-# the codebook, no entry records it, and the operator-facing tally reports a
-# clean run. Every later census codes against ENTRIES, so a confirmed pattern
-# with no entry is invisible from then on.
-#
-# `promoted` and `rejected` swap roles between the two loops -- see
-# `test_dropped_verdict_contradiction_marker_inverts_between_the_loops`, which
-# pins both directions so the two branch ladders can never be "unified".
-# ---------------------------------------------------------------------------
-
-def test_run_census_dropped_verify_over_a_rejected_candidate_is_a_contradiction(
-    tmp_path, caplog,
-):
-    """A standing REJECT holds against a fresh VERIFY: this run PAID to
-    confirm the pattern and the confirmation is discarded.
-
-    Only a hand re-open changes it -- nothing reconciles a standing rejection
-    against a later verdict that the title is real."""
-    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("rejected"))
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "verified"
-    assert record.title == _REJECTED_TITLE
-    assert record.kind == mod.DROP_CONTRADICTION
-    # The same three facts the reject branches carry, so an operator finds the
-    # standing record by hand from either loop's drop.
-    assert record.standing_id == "cand-20260701-7"
-    assert record.standing_disposition == "rejected"
-    assert record.standing_first_seen == "2026-07-01"
-    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
-
-    # WHAT WAS ACTUALLY LOST. The reject-side trio has no analogue for this
-    # assertion, and it is the one that would have caught the silence: a
-    # pattern this run CONFIRMED never became a codebook entry.
-    persisted = codebook.load(kwargs["codebook_path"])
-    assert [e["id"] for e in persisted["entries"]] == ["entry-a"], (
-        "the confirmed pattern silently failed to enter the codebook -- that "
-        "loss is exactly what the WARNING has to announce"
-    )
-    assert outcome.status == "done"
-    assert codebook.validate(persisted) == []
-
-
-def test_run_census_dropped_verify_over_a_promoted_candidate_is_agreement(
-    tmp_path, caplog,
-):
-    """The agreement case on this loop: the title is ALREADY a live codebook
-    entry, so a fresh VERIFY confirms what stands. Nothing is lost but the
-    verify call.
-
-    It still gets a line -- a recurring count is the cue that a title keeps
-    being re-mined and re-confirmed against an entry that already records it
-    -- but it must be DISTINGUISHABLE from the contradiction above."""
-    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "verified"
-    assert record.title == _REJECTED_TITLE
-    # Asserted against the key the contradiction case asserts, so the two
-    # cases cannot converge on one classification later.
-    assert record.kind == mod.DROP_AGREEMENT
-    assert record.standing_id == "cand-20260701-7"
-    assert record.standing_disposition == "promoted"
-    assert record.standing_first_seen == "2026-07-01"
-    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
-
-    assert outcome.status == "done"
-    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path, caplog):
-    """`promoted` and `rejected` swap roles between the two adjudication
-    loops: a standing PROMOTION contradicts a fresh REJECT, and a standing
-    REJECT contradicts a fresh VERIFY.
-
-    Both directions pinned in ONE test, because the failure this guards
-    against is an edit that copies one loop's branch conditions verbatim into
-    the other -- which passes every single-direction test while mislabelling
-    every drop it touches. Asserted here so that edit fails at the inversion
-    rather than in an operator's journal."""
-    cases = [
-        ("fresh VERIFY vs standing reject",
-         _verified_run_kwargs, "rejected", mod.DROP_CONTRADICTION),
-        ("fresh VERIFY vs standing promotion",
-         _verified_run_kwargs, "promoted", mod.DROP_AGREEMENT),
-        ("fresh REJECT vs standing promotion",
-         _rejected_run_kwargs, "promoted", mod.DROP_CONTRADICTION),
-        ("fresh REJECT vs standing reject",
-         _rejected_run_kwargs, "rejected", mod.DROP_AGREEMENT),
-    ]
-    for label, build_kwargs, standing, expected_kind in cases:
-        caplog.clear()
-        kwargs = build_kwargs(
-            tmp_path / label.replace(" ", "-"), _codebook_with_standing(standing),
-        )
-        with caplog.at_level(logging.WARNING):
-            outcome = mod.run_census(**kwargs)
-
-        record = _one_dropped(outcome)
-        assert record.kind == expected_kind, (
-            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
-            f"the two loops invert; `contradicting_disposition` at the call site "
-            f"is the one value that inverts. Record: {record}"
-        )
-        assert record.standing_disposition == standing
-        assert outcome.status == "done"
-        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
-    tmp_path, caplog,
-):
-    """When TWO adjudicated candidates share a title, the one that stands is
-    the one the MERGER treats as authoritative -- a `promoted` record whose
-    entry exists wins over a later `rejected` one.
-
-    Reading the list-order last match instead inverts the label on exactly
-    this shape: a live codebook entry stands while the census's fresh REJECT
-    is discarded (the CONTRADICTION an operator must act on), and the drop
-    would be announced as an AGREEMENT with a standing rejection. Seeded in
-    the order that makes the two answers differ, which is the order the live
-    codebook is known to carry (task 4144).
-
-    The second case pins the fall-through the merger also performs: a
-    `promoted` record whose `promoted_to` names no existing entry is NOT
-    authoritative, because no entry exists to carry the signal -- so the
-    later `rejected` record stands and the drop really is an agreement."""
-    cases = [
-        ("promoted_to resolves",
-         "entry-spurious", "cand-20260701-7", mod.DROP_CONTRADICTION),
-        ("promoted_to dangles",
-         "entry-that-never-existed", "cand-20260724-2", mod.DROP_AGREEMENT),
-    ]
-    for label, promoted_to, expected_id, expected_kind in cases:
-        caplog.clear()
-        kwargs = _rejected_run_kwargs(
-            tmp_path / label.replace(" ", "-"),
-            _codebook_with_duplicate_standing_candidates(promoted_to=promoted_to),
-        )
-        with caplog.at_level(logging.WARNING):
-            outcome = mod.run_census(**kwargs)
-
-        record = _one_dropped(outcome)
-        assert record.standing_id == expected_id, (
-            f"{label}: the standing record must be the one the merger routes "
-            f"to ({expected_id}); record: {record}"
-        )
-        assert record.kind == expected_kind, (
-            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
-            f"record: {record}"
-        )
-        assert outcome.status == "done"
-        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def test_run_census_dropped_verify_with_no_standing_candidate_says_so_plainly(
-    tmp_path, caplog,
-):
-    """No same-title candidate exists at all, so there is no standing verdict
-    to explain the drop -- the merge and this run's cluster list disagree about
-    the title.
-
-    The message must say that plainly rather than inventing a standing record;
-    an explanation that is fabricated is worse than an admitted gap."""
-    ghost = "A verified title the merge never saw"
-    kwargs = _rejected_run_kwargs(
-        tmp_path, _minimal_v2_codebook(),
-        verify_fn=_verify_fn_with_unknown_titles(verified=(ghost,)),
-    )
-
-    with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**kwargs)
-
-    record = _one_dropped(outcome)
-    assert record.verdict == "verified"
-    assert record.title == ghost
-    assert record.kind == mod.DROP_NO_STANDING
-    assert (
-        record.standing_id,
-        record.standing_disposition,
-        record.standing_first_seen,
-    ) == (None, None, None)
-    assert _drop_warnings_naming(caplog, ghost), "the drop must be announced"
-
-    assert outcome.status == "done"
-    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
-
-
-def _verify_fn_rejecting_unknown_titles(*titles):
-    """The reject-only spelling of `_verify_fn_with_unknown_titles`, kept
-    because its call sites read better named for the verdict they drive."""
-    return _verify_fn_with_unknown_titles(rejected=titles)
-
-
 def _run_summary_records(caplog):
     """The run-summary WARNING(s) sizing the run, as distinct from the
     per-cluster warnings (which say "resolved to no pending candidate")."""
@@ -4123,9 +3557,8 @@ def test_run_census_dropped_rejects_emit_exactly_one_run_summary(tmp_path, caplo
     Exactly one summary record, asserted as an exact count rather than a
     presence, so a second summary mechanism added later fails here rather than
     quietly doubling the line."""
-    kwargs = _rejected_run_kwargs(
-        tmp_path, _minimal_v2_codebook(),
-        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    kwargs = _two_surfaced_drops_kwargs(
+        tmp_path, _make_fake_verify_fn(rejected_titles={_REJECTED_TITLE, _L6_NOVEL_TITLE}),
     )
 
     with caplog.at_level(logging.WARNING):
@@ -4169,9 +3602,8 @@ def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, ca
     of log prose -- assertable structurally, exactly like
     `unverified_clusters`. Asserted on both a dropping and a clean run so the
     field cannot be a constant."""
-    dropping = _rejected_run_kwargs(
-        tmp_path / "dropping", _minimal_v2_codebook(),
-        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    dropping = _two_surfaced_drops_kwargs(
+        tmp_path / "dropping", _make_fake_verify_fn(rejected_titles={_REJECTED_TITLE, _L6_NOVEL_TITLE}),
     )
     clean = _rejected_run_kwargs(tmp_path / "clean", _minimal_v2_codebook())
 
@@ -4199,9 +3631,7 @@ def test_run_census_persists_the_dropped_verdicts_in_the_report(tmp_path, caplog
     what an operator reads afterwards. A `render_report` that renders the
     section correctly while `run_census` passes it nothing satisfies every
     other test in this file."""
-    kwargs = _rejected_run_kwargs(
-        tmp_path, _codebook_with_standing("promoted"),
-    )
+    kwargs = _rejected_run_kwargs(tmp_path, _surfaced_standing_codebook("promoted"))
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -4235,19 +3665,14 @@ def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
     What must hold is that a drop is announced and names the standing record
     an operator would have to go and find; every other word is free to be
     reworded, which is the point of moving the contradiction/agreement
-    distinction onto `kind`. Covers all three kinds and both loops, since the
+    distinction onto `kind`. Covers both kinds and both loops, since the
     message builder branches on exactly those."""
-    ghost = "A title the merge never saw"
     cases = {
         "contradiction": _rejected_run_kwargs(
-            tmp_path / "contradiction", _codebook_with_standing("promoted"),
+            tmp_path / "contradiction", _surfaced_standing_codebook("promoted"),
         ),
         "agreement": _verified_run_kwargs(
-            tmp_path / "agreement", _codebook_with_standing("promoted"),
-        ),
-        "no-standing": _rejected_run_kwargs(
-            tmp_path / "no-standing", _minimal_v2_codebook(),
-            verify_fn=_verify_fn_rejecting_unknown_titles(ghost),
+            tmp_path / "agreement", _surfaced_standing_codebook("promoted"),
         ),
     }
     seen_kinds = set()
@@ -4265,15 +3690,13 @@ def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
             "standing_disposition", "standing_first_seen",
         ):
             value = getattr(record, field_name)
-            if value is None:
-                continue
             assert str(value) in messages[0], (
                 f"{label}: the WARNING does not name {field_name}={value!r}, so an "
                 f"operator cannot find the record it is about. Message: {messages[0]}"
             )
 
     assert seen_kinds == {
-        mod.DROP_CONTRADICTION, mod.DROP_AGREEMENT, mod.DROP_NO_STANDING,
+        mod.DROP_CONTRADICTION, mod.DROP_AGREEMENT,
     }, f"every kind must be exercised; reached: {seen_kinds}"
 
 
@@ -4287,17 +3710,12 @@ def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, capl
     mixed run is the only shape that can tell the two apart: one dropped
     VERIFY plus one dropped REJECT must tally to 2 on ONE counter and emit ONE
     summary line, and a verify-only run must reach a non-zero count at all."""
-    mixed = _rejected_run_kwargs(
-        tmp_path / "mixed", _minimal_v2_codebook(),
-        verify_fn=_verify_fn_with_unknown_titles(
-            verified=("Ghost verified",), rejected=("Ghost rejected",),
-        ),
+    mixed = _two_surfaced_drops_kwargs(
+        tmp_path / "mixed",
+        _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE}, rejected_titles={_REJECTED_TITLE}),
     )
-    verify_only = _rejected_run_kwargs(
-        tmp_path / "verify-only", _minimal_v2_codebook(),
-        verify_fn=_verify_fn_with_unknown_titles(
-            verified=("Ghost verified one", "Ghost verified two"),
-        ),
+    verify_only = _two_surfaced_drops_kwargs(
+        tmp_path / "verify-only", _make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE, _REJECTED_TITLE}),
     )
 
     with caplog.at_level(logging.WARNING):
@@ -5040,7 +4458,7 @@ _THREE_NOVEL_TITLES = ("novel one", "novel two", "novel three")
 
 def _three_novel_invoke(prompt, model):
     """Fake coder-LLM reply chooser yielding THREE distinct novel candidate
-    titles, one per `nov-N` digest, so `_novel_clusters` produces exactly
+    titles, one per `nov-N` digest, so the census verifies exactly
     three clusters in a deterministic mining order. Every other prompt
     (including the headroom probe) is a matches-only duplicate carrying no
     banner marker."""
@@ -5323,8 +4741,8 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
 # ACTUALLY left behind. A dry run is NOT a no-op that can be replayed: the
 # codebook merge, the promotions, codebook.dump and census_state.advance all
 # really happened, so re-running the census files NOTHING (the same confusions
-# now code as `matches` against the advanced codebook, `_novel_clusters` comes
-# back empty, build_task_payloads returns [], and the mined sessions are
+# now code as `matches` against the advanced codebook, no novel cluster comes
+# back, build_task_payloads returns [], and the mined sessions are
 # ledgered as coded, so no later census mines them again). Advertising a re-run
 # as the recovery path sends the operator down a road that silently drops the
 # remediation work.
@@ -8248,15 +7666,9 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# task 4879 step-13: RED — W-D. `run_census`'s promote loop does
-# `cand_id = codebook.pending_titled(...)` / `if cand_id is None: continue`
-# — dropping a verify verdict the census PAID FOR with no log and no counter.
-# Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
-# a re-mined title whose only same-title candidate is already adjudicated,
-# `apply_coding_records` correctly declines to fabricate a pending twin (that
-# fabrication is how rejected cand-20260722-28 came back as pending
-# cand-20260724-2 in the live codebook). The standing prior verdict is the
-# right outcome; the SILENCE is the defect.
+# task 4879 step-13: W-D. A verify verdict the census PAID FOR whose candidate
+# is already adjudicated is never dropped in silence; the standing prior
+# verdict is the right outcome (task 4144).
 # ---------------------------------------------------------------------------
 
 _STANDING_CANDIDATE_ID = "cand-20260701-9"
@@ -8910,7 +8322,7 @@ def test_run_census_marks_a_withheld_promotion_in_the_codebook(tmp_path):
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
 
 
 @pytest.mark.parametrize(
@@ -8925,7 +8337,7 @@ def test_run_census_leaves_a_fileable_promotion_unmarked(tmp_path, gate_override
 
     mod.run_census(**kwargs)
 
-    assert mod.ENTRY_FILING_KEY not in _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
+    assert codebook.ENTRY_FILING_KEY not in _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
 
 
 def _codebook_with_withheld_entry():
@@ -8939,38 +8351,15 @@ def _codebook_with_withheld_entry():
             "origin_phase": "implement",
             "manifested_phase": "verify",
             "sightings": [],
-            mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD,
+            codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
         }
     )
     return cb
 
 
-def test_mark_entry_filed_flips_the_marker_retained():
-    before = _codebook_with_withheld_entry()
-
-    result = mod.mark_entry_filed(before, "entry-withheld")
-
-    entry = next(e for e in result["entries"] if e["id"] == "entry-withheld")
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
-    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
-    assert next(e for e in result["entries"] if e["id"] == "entry-a") == before["entries"][0]
-
-    assert codebook.validate(result) == []
-    codebook.assert_no_deletion(before, result)
-
-    assert before["entries"][1][mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD, (
-        "the input is never mutated"
-    )
-
-
-def test_mark_entry_filed_rejects_an_unknown_entry_id():
-    with pytest.raises(ValueError, match="entry-nope"):
-        mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-nope")
-
-
 def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     path = tmp_path / "confusion-codebook.yaml"
-    marked = mod.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")
+    marked = codebook_lifecycle.mark_entry_filed(_codebook_with_withheld_entry(), "entry-withheld")
 
     codebook.dump(marked, path)
     first_bytes = path.read_bytes()
@@ -8978,8 +8367,8 @@ def test_entry_filing_marker_round_trips_through_the_codebook_file(tmp_path):
     codebook.dump(loaded, path)
 
     entry = next(e for e in loaded["entries"] if e["id"] == "entry-withheld")
-    assert type(entry[mod.ENTRY_FILING_KEY]) is str
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert type(entry[codebook.ENTRY_FILING_KEY]) is str
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
     assert path.read_bytes() == first_bytes
 
 
@@ -9040,8 +8429,8 @@ def test_run_census_files_a_withheld_entry_once_a_matches_op_makes_it_recur(tmp_
     assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.released_entry_ids == (entry_id,)
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_FILED
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_FILED
 
 
 def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_path):
@@ -9103,8 +8492,8 @@ def test_run_census_files_a_miscoded_recurrence_once_and_releases_the_entry(tmp_
 
     assert len(second["submit_fn"].calls) == 1, "one ticket per title, never two"
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_FILED
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_FILED
 
 
 def _make_rejecting_submit_fn():
@@ -9130,8 +8519,8 @@ def test_run_census_keeps_the_marker_when_the_release_filing_fails(tmp_path, cap
     assert len(second["submit_fn"].calls) == 1
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
     assert any(
         r.levelno == logging.WARNING and _GATED_TITLE in r.getMessage() for r in caplog.records
     )
@@ -9159,8 +8548,8 @@ def test_run_census_dry_run_offers_a_released_entry_but_leaves_it_withheld(tmp_p
     [payload] = json.loads(payloads_path.read_text(encoding="utf-8"))
     assert payload["title"] == f"[legibility census] {_GATED_TITLE}"
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
 
 
 def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
@@ -9174,8 +8563,8 @@ def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
     assert second["submit_fn"].calls == []
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
-        mod.ENTRY_FILING_KEY
-    ] == mod.ENTRY_FILING_WITHHELD
+        codebook.ENTRY_FILING_KEY
+    ] == codebook.ENTRY_FILING_WITHHELD
 
 
 def test_run_census_does_not_release_an_entry_retired_this_run(tmp_path):
@@ -9735,7 +9124,7 @@ def test_run_census_looks_up_and_resolves_a_harness_filing_in_the_harness_projec
 
 def test_run_census_links_a_recurrence_to_its_standing_promotions_entry_not_a_same_title_one(tmp_path):
     cb = _codebook_with_standing("promoted")
-    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title"})
+    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title", "status": "fixed"})
     kwargs = _verified_run_kwargs(tmp_path, cb)
 
     outcome = mod.run_census(**kwargs)
@@ -9826,7 +9215,7 @@ def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_o
     [filed] = kwargs["submit_fn"].calls
     assert filed["title"] == disposition.task_title(_PROMOTED_TITLE)
     structural = _persisted_entry(kwargs["codebook_path"], _STRUCTURAL_TITLE)
-    assert mod.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
+    assert codebook.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
     assert "filed_tickets" not in structural
     assert _run_record(kwargs)["filing"]["structural"] == [{
         "entry_id": structural["id"],
@@ -9920,7 +9309,7 @@ def test_run_census_records_a_verdictless_unremediated_cluster_as_structural(tmp
     assert kwargs["submit_fn"].calls == []
     assert outcome.withheld == ()
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
-    assert mod.ENTRY_FILING_KEY not in entry
+    assert codebook.ENTRY_FILING_KEY not in entry
     assert [item["entry_id"] for item in _run_record(kwargs)["filing"]["structural"]] == [entry["id"]]
 
 
@@ -10661,7 +10050,7 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_while_its_ticket
 
 def test_run_census_files_no_second_ticket_for_a_recurrence_whose_entry_awaits_the_curator(tmp_path):
     cb = _codebook_with_standing("promoted")
-    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title"})
+    cb["entries"].append({**_promoted_entry(), "id": "entry-same-title", "status": "fixed"})
     pending_row = {
         "ticket": "tkt_0", "project_root": str(tmp_path), "run_id": _EARLIER_RUN, "finding_key": None,
         "task_id": None, "resolution": None, "step": "curator",
@@ -10794,7 +10183,7 @@ def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tm
         for session in ("s-old-1", "s-old-2")
     ]
     kwargs = _outcome_kwargs(
-        tmp_path, "present", sightings=sightings, **{mod.ENTRY_FILING_KEY: mod.ENTRY_FILING_WITHHELD},
+        tmp_path, "present", sightings=sightings, **{codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD},
     )
 
     outcome = mod.run_census(**kwargs)
@@ -10811,8 +10200,8 @@ def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tm
 
 
 # ---------------------------------------------------------------------------
-# task 6405 (census PRD leaf L6): the pre-screen runs between _novel_clusters
-# and verify. A title already catalogued (PRD §4.8 row 11) or a session
+# task 6405 (census PRD leaf L6): the pre-screen runs between mining and
+# verify. A title already catalogued (PRD §4.8 row 11) or a session
 # already sighted costs no verify call; a fixed entry re-observed is surfaced
 # and verified; the verify cap counts only what the screen leaves.
 # ---------------------------------------------------------------------------
@@ -11173,7 +10562,7 @@ def test_a_held_back_verdict_that_attaches_by_key_is_reported_withheld(tmp_path)
 
     assert outcome.status == "done"
     entry = _row5_entry(kwargs)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_WITHHELD
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
     record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert record["withheld"] == [
@@ -11199,7 +10588,7 @@ def test_a_key_attach_that_raises_a_withheld_entry_to_two_sightings_files_and_re
 
     assert outcome.status == "done"
     entry = _row5_entry(kwargs)
-    assert entry[mod.ENTRY_FILING_KEY] == mod.ENTRY_FILING_FILED
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
     assert {s["session"] for s in entry["sightings"]} == {"novel-verified", "novel-rejected"}
     record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["key"] == 1
@@ -11907,3 +11296,468 @@ def test_run_census_makes_no_synthesis_call_when_nothing_is_new_or_re_observed(t
     assert record["method"]["cost"]["synthesis_calls"] == 0
     assert "synthesis=0" in record["cost_note"]
     assert (record["synthesis"]["outcome"], record["synthesis"]["calls"]) == ("skipped", 0)
+
+
+# ---------------------------------------------------------------------------
+# task 6750 (Legibility S21 η): every verdict resolves to the candidate id the
+# merge minted for the payloads it was offered, never by title.
+# ---------------------------------------------------------------------------
+
+_SHARED_TITLE = "Two causes share one novel title"
+
+
+def _shared_title_response(prompt, model):
+    if "twin-one" in prompt or "twin-two" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _SHARED_TITLE,
+            "cause": "Two sessions mined the same shape.",
+            "area": "orchestrator",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "evidence_quote": "the same shape again",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def _offered_ids(verify_fn) -> list[list[str | None]]:
+    return [[cluster.get(mod.CANDIDATE_KEY) for cluster in call["clusters"]] for call in verify_fn.calls]
+
+
+def _candidate_titled(cb: dict, title: str) -> dict:
+    [candidate] = [candidate for candidate in cb["candidates"] if candidate["title"] == title]
+    return candidate
+
+
+def _rewording(fake):
+    """*fake* whose every returned cluster carries a rewritten title, as an
+    LLM rewrite or a between-runs correction gives it."""
+    def verify_fn(clusters, *, model):
+        result = fake(clusters, model=model)
+        return {
+            **result,
+            "verified": [{**c, "title": f"Reworded: {c['title']}"} for c in result["verified"]],
+            "rejected": [{**c, "title": f"Reworded: {c['title']}"} for c in result["rejected"]],
+        }
+
+    verify_fn.calls = fake.calls
+    return verify_fn
+
+
+def test_two_sessions_mining_one_novel_title_are_one_cluster_named_by_its_candidate_id(tmp_path):
+    verify_fn = _make_fake_verify_fn(verified_titles={_SHARED_TITLE})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_shared_title_response),
+        batch_source=[[_hand_digest("twin-one", "first sighting"), _hand_digest("twin-two", "second sighting")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    candidate = _candidate_titled(persisted, _SHARED_TITLE)
+    [call] = verify_fn.calls
+    [cluster] = call["clusters"]
+    assert cluster[mod.CANDIDATE_KEY] == candidate["id"]
+    assert sorted(sighting["session"] for sighting in cluster["sightings"]) == ["twin-one", "twin-two"]
+    assert candidate["disposition"] == "promoted"
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["verify_calls"] == len({cid for ids in _offered_ids(verify_fn) for cid in ids}) == 1
+    assert outcome.dropped_verdicts == ()
+    assert record["dropped_verdicts"] == []
+    assert codebook.validate(persisted) == []
+
+
+def test_a_reworded_reply_still_promotes_and_rejects_its_candidates_by_id(tmp_path):
+    verify_fn = _rewording(_make_fake_verify_fn(
+        verified_titles={_L6_NOVEL_TITLE}, rejected_titles={_REJECTED_TITLE},
+    ))
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    verified = _candidate_titled(persisted, _L6_NOVEL_TITLE)
+    rejected = _candidate_titled(persisted, _REJECTED_TITLE)
+    assert _offered_ids(verify_fn) == [[verified["id"], rejected["id"]]]
+    assert verified["disposition"] == "promoted"
+    assert rejected["disposition"] == "rejected"
+    assert outcome.dropped_verdicts == ()
+    assert _run_record(kwargs)["dropped_verdicts"] == []
+    assert codebook.validate(persisted) == []
+
+
+def test_a_capped_candidate_is_adjudicated_from_the_next_runs_queue_under_a_reworded_reply(tmp_path):
+    first = _run_census_kwargs(
+        tmp_path / "first",
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+            _hand_digest("novel-rejected", "a spurious one-off"),
+        ]],
+        verify_fn=_rewording(_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        max_verify_clusters=1,
+    )
+    assert mod.run_census(**first).status == "done"
+    carried = codebook.load(first["codebook_path"])
+    left = _candidate_titled(carried, _REJECTED_TITLE)
+    assert left["disposition"] == "pending"
+
+    verify_fn = _rewording(_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}))
+    second = _run_census_kwargs(
+        tmp_path / "second",
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=carried,
+        config=_census_config(tmp_path / "second", max_clusters_per_run=10),
+    )
+
+    outcome = mod.run_census(**second)
+
+    assert outcome.status == "done"
+    assert [left["id"]] in _offered_ids(verify_fn)
+    persisted = codebook.load(second["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == "rejected"
+    assert outcome.dropped_verdicts == ()
+    assert codebook.validate(persisted) == []
+
+
+@pytest.mark.parametrize(("verdict_titles", "standing", "expected_kind"), [
+    ({"verified_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_CONTRADICTION),
+    ({"verified_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_AGREEMENT),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "promoted", mod.DROP_CONTRADICTION),
+    ({"rejected_titles": {_REJECTED_TITLE}}, "rejected", mod.DROP_AGREEMENT),
+], ids=["verify-vs-rejected", "verify-vs-promoted", "reject-vs-promoted", "reject-vs-rejected"])
+def test_a_surfaced_verdict_on_a_standing_candidate_is_dropped_naming_that_candidate(
+    tmp_path, caplog, verdict_titles, standing, expected_kind,
+):
+    verify_fn = _make_fake_verify_fn(**verdict_titles)
+    kwargs = _rejected_run_kwargs(tmp_path, _surfaced_standing_codebook(standing), verify_fn=verify_fn)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _offered_ids(verify_fn) == [["cand-20260701-7"]]
+    record = _one_dropped(outcome)
+    assert record.verdict == ("verified" if "verified_titles" in verdict_titles else "rejected")
+    assert record.kind == expected_kind
+    assert (record.standing_id, record.standing_disposition, record.standing_first_seen) == (
+        "cand-20260701-7", standing, "2026-07-01",
+    )
+    assert len(_dropped_verdict_warnings(caplog)) == 1
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == standing
+    assert codebook.validate(persisted) == []
+
+
+def test_a_reply_naming_no_offered_candidate_is_discarded_with_a_warning(tmp_path, caplog):
+    ghost, foreign = "A title the merge never saw", "A cluster under a foreign id"
+
+    def verify_fn(clusters, *, model):
+        return {
+            "verified": [{"title": ghost, "sightings": []}],
+            "rejected": [{"title": foreign, mod.CANDIDATE_KEY: "cand-20990101-1", "sightings": []}],
+            "fixed": [],
+        }
+
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook(), verify_fn=verify_fn)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.dropped_verdicts == ()
+    for title in (ghost, foreign):
+        naming = [r for r in caplog.records if r.levelno == logging.WARNING and title in r.getMessage()]
+        assert len(naming) == 1, naming
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _candidate_titled(persisted, _REJECTED_TITLE)["disposition"] == "pending"
+    assert [entry["id"] for entry in persisted["entries"]] == ["entry-a"]
+    assert codebook.validate(persisted) == []
+
+
+_SURFACED_PENDING = "A pending shape a fixed entry also carries"
+_QUEUE_NEIGHBOUR = "Its queue neighbour"
+
+
+def _surfaced_pending_response(prompt, model):
+    if "surfaced-twin" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _SURFACED_PENDING,
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified_once(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({**_promoted_entry(), "id": "entry-fixed", "title": _SURFACED_PENDING, "status": "fixed"})
+    cb["candidates"] = [
+        _backlog_candidate("cand-20260701-1", _SURFACED_PENDING, "s-backlog-1"),
+        _backlog_candidate("cand-20260705-1", _QUEUE_NEIGHBOUR, "s-backlog-2", first_seen="2026-07-05"),
+    ]
+    kwargs, _ = _similarity_kwargs(
+        tmp_path,
+        {_SURFACED_PENDING: [0.0, 1.0, 0.0], _QUEUE_NEIGHBOUR: [0.0, 0.99, math.sqrt(1 - 0.99 ** 2)]},
+        codebook_dict=cb,
+        batch=[_hand_digest("surfaced-twin", "the fixed shape is back")],
+    )
+    verify_fn = _make_fake_verify_fn(verified_titles={_SURFACED_PENDING, _QUEUE_NEIGHBOUR})
+    kwargs.update(invoke=_make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    offered = [cid for ids in _offered_ids(verify_fn) for cid in ids]
+    assert offered.count("cand-20260701-1") == 1
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert _persisted_record(kwargs, "cand-20260701-1")["disposition"] == "promoted"
+    assert codebook.validate(persisted) == []
+
+
+def _without_titles(fake):
+    """*fake* whose every returned cluster has lost its title."""
+    def untitled(replies):
+        return [{key: value for key, value in reply.items() if key != "title"} for reply in replies]
+
+    def verify_fn(clusters, *, model):
+        result = fake(clusters, model=model)
+        return {**result, "verified": untitled(result["verified"]), "rejected": untitled(result["rejected"])}
+
+    verify_fn.calls = fake.calls
+    return verify_fn
+
+
+@pytest.mark.parametrize("restating", [_rewording, _without_titles], ids=["reworded", "titleless"])
+def test_a_promoted_entry_carries_its_candidates_title_whatever_the_reply_restates(tmp_path, restating):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=restating(_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE})),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    candidate = _candidate_titled(persisted, _L6_NOVEL_TITLE)
+    assert candidate["disposition"] == "promoted"
+    assert _persisted_record(kwargs, candidate["promoted_to"])["title"] == _L6_NOVEL_TITLE
+
+
+def test_an_entry_reported_fixed_twice_or_already_retired_is_retired_once(tmp_path, caplog):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append({**cb["entries"][0], "id": "entry-gone", "status": "retired", "sightings": []})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        codebook_dict=cb,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=_make_fake_verify_fn(
+            verified_titles={_L6_NOVEL_TITLE}, fixed_entry_ids=("entry-a", "entry-a", "entry-gone"),
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert _persisted_record(kwargs, "entry-a")["status"] == "retired"
+    assert _persisted_record(kwargs, "entry-gone")["status"] == "retired"
+    assert [
+        record.getMessage() for record in caplog.records if "already retired" in record.getMessage()
+    ] == ["census: the verifier reported entry 'entry-gone' fixed, but it is already retired"]
+
+
+_NEAR_ENTRY_A_TITLES = tuple(f"Near entry a, shape {n}" for n in range(1, 7))
+
+
+def _near_entry_a_response(prompt, model):
+    if "many-near" in prompt:
+        return json.dumps({"matches": [], "candidates": [
+            {
+                "title": title,
+                "cause": "A shape entry a already names.",
+                "area": "orchestrator",
+                "origin_phase": "implement",
+                "manifested_phase": "verify",
+                "evidence_quote": f"evidence for {title}",
+            }
+            for title in _NEAR_ENTRY_A_TITLES
+        ]})
+    return _happy_invoke_response(prompt, model)
+
+
+def test_screened_novel_candidates_attach_in_mining_order(tmp_path):
+    kwargs, _ = _similarity_kwargs(
+        tmp_path,
+        {
+            _ENTRY_A_TEXT: _ENTRY_AXIS,
+            **{f"{title} — A shape entry a already names.": _NEAR for title in _NEAR_ENTRY_A_TITLES},
+        },
+        batch=[_hand_digest("many-near", "six shapes near entry a")],
+    )
+    kwargs["invoke"] = _make_fake_invoke(_near_entry_a_response)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    mined_ids = [_candidate_titled(persisted, title)["id"] for title in _NEAR_ENTRY_A_TITLES]
+    assert [row["candidate_id"] for row in _run_record(kwargs)["adjudication"]["attached"]] == mined_ids
+
+
+# ---------------------------------------------------------------------------
+# task 6750: filing pairs a cluster with a withheld entry, and counts the
+# sessions it is gated at, by the id of the record it landed on.
+# ---------------------------------------------------------------------------
+
+_PAIRING_TITLE = "A withheld cause and a fresh one share a title"
+
+
+def _pairing_response(prompt, model):
+    if "fresh-twin" in prompt:
+        return json.dumps({"matches": [], "candidates": [{
+            "title": _PAIRING_TITLE,
+            "cause": "A fresh cause under an old title.",
+            "area": "orchestrator",
+            "origin_phase": "implement",
+            "manifested_phase": "verify",
+            "evidence_quote": "the fresh shape",
+        }]})
+    return _happy_invoke_response(prompt, model)
+
+
+def _withheld_entry(entry_id: str, title: str, sessions: tuple[str, ...]) -> dict:
+    return {
+        **_promoted_entry(),
+        "id": entry_id,
+        "title": title,
+        codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
+        "sightings": [_earlier_sighting(session) for session in sessions],
+    }
+
+
+def _fixed_twin_entry(title: str) -> dict:
+    """A fixed entry of *title*, so a re-mined cluster of it is surfaced and verified."""
+    return {**_promoted_entry(), "id": "entry-fixed-twin", "title": title, "status": "fixed"}
+
+
+def _pairing_kwargs(tmp_path, cb, *, verify_fn, batch=("fresh-twin",)):
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_pairing_response),
+        batch_source=[[_hand_digest(session, "a mined shape") for session in batch]],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=cb,
+    )
+
+
+def test_a_cluster_promoted_to_its_own_entry_leaves_a_same_title_withheld_entry_withheld(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"] += [_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)), _fixed_twin_entry(_PAIRING_TITLE)]
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    persisted = codebook.load(kwargs["codebook_path"])
+    fresh = _candidate_titled(persisted, _PAIRING_TITLE)
+    assert fresh["disposition"] == "promoted"
+    entries = {entry["id"]: entry for entry in persisted["entries"]}
+    assert [row["ticket"] for row in entries[fresh["promoted_to"]]["filed_tickets"]] == ["tkt_1"]
+    withheld = entries["entry-withheld"]
+    assert withheld[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    assert "filed_tickets" not in withheld
+    assert outcome.released_entry_ids == ()
+    assert codebook.validate(persisted) == []
+
+
+def test_a_dropped_verdict_on_a_withheld_entrys_own_candidate_releases_that_entry(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"] += [_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)), _fixed_twin_entry(_PAIRING_TITLE)]
+    cb["candidates"].append({
+        "id": "cand-20260701-1", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+        "disposition": "promoted", "promoted_to": "entry-withheld", "sightings": [_earlier_sighting("s-withheld")],
+    })
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert _one_dropped(outcome).standing_id == "cand-20260701-1"
+    assert outcome.released_entry_ids == ("entry-withheld",)
+    persisted = _persisted_record(kwargs, "entry-withheld")
+    assert persisted[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+    assert [row["ticket"] for row in persisted["filed_tickets"]] == ["tkt_1"]
+
+
+def _rejected_twin(session: str) -> dict:
+    return {
+        "id": "cand-20260701-2", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+        "disposition": "rejected", "sightings": [_earlier_sighting(session)],
+    }
+
+
+def test_a_same_title_rejected_twins_session_does_not_file_a_fresh_singleton(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append(_fixed_twin_entry(_PAIRING_TITLE))
+    cb["candidates"] += [
+        {"id": "cand-20260701-1", "title": _PAIRING_TITLE, "first_seen": "2026-07-01",
+         "disposition": "pending", "sightings": []},
+        _rejected_twin("s-extra"),
+    ]
+    kwargs = _pairing_kwargs(
+        tmp_path, cb, verify_fn=_make_fake_verify_fn(verified_titles={_PAIRING_TITLE}, remediation=None),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert kwargs["submit_fn"].calls == []
+    promoted = _persisted_record(kwargs, "cand-20260701-1")
+    assert promoted["disposition"] == "promoted"
+    entry = _persisted_record(kwargs, promoted["promoted_to"])
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+
+
+def test_a_same_title_rejected_twins_session_does_not_release_a_withheld_entry(tmp_path):
+    cb = _minimal_v2_codebook()
+    cb["entries"].append(_withheld_entry("entry-withheld", _PAIRING_TITLE, ("s-withheld",)))
+    cb["candidates"].append(_rejected_twin("s-extra"))
+    kwargs = _pairing_kwargs(tmp_path, cb, verify_fn=_make_fake_verify_fn(), batch=("dup-1",))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.released_entry_ids == ()
+    assert kwargs["submit_fn"].calls == []
+    withheld = _persisted_record(kwargs, "entry-withheld")
+    assert withheld[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD

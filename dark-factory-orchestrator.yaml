@@ -914,8 +914,8 @@ verify_admission_pytest_n: "8"
 # test legs run at once, admitted through the per-project flock; merge legs never
 # take a slot. The code default is 1
 # (config.py::OrchestratorConfig.verify_admission_task_slots).
-# 2 since 2026-11-11: stepped down from 3 under Leo's progressive-slot rule
-# (local merge verifies ran over the +20% line twice in a row at 3 slots).
+# 2 since 2026-11-12 04:27Z: stepped down from 3 under Leo's progressive-slot
+# rule (two local merge verifies over 46 min while reify rebuilt a warm lane).
 # Basis, step-down triggers and the dated value history:
 # plans/verify-admission-task-slots-gate.md.
 # Any change to this value appends a dated entry there AND rewrites the

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _loopback_host import is_loopback_host
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -240,6 +241,18 @@ class TestSocketActivation:
             f"ListenStream={config.server.host}:{config.server.port}",
             f"ListenStream={recon.escalation_host}:{recon.escalation_port}",
         ]
+
+    def test_socket_listens_on_loopback_only(self) -> None:
+        listen_streams = [
+            d for d in _parse_systemd_unit(_SOCKET_UNIT)["Socket"]
+            if d.startswith("ListenStream=")
+        ]
+        assert listen_streams, f"{_SOCKET_UNIT.name} declares no ListenStream="
+        for directive in listen_streams:
+            host = directive.split("=", 1)[1].rpartition(":")[0]
+            assert is_loopback_host(host), (
+                f"{_SOCKET_UNIT.name}: {directive!r} does not bind a loopback IP address"
+            )
 
     @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
     def test_service_wants_and_orders_after_the_socket(self, unit_path: Path) -> None:

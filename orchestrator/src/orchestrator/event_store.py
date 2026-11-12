@@ -672,6 +672,14 @@ class EventType(StrEnum):
     # agent?".
     session_resume_failed = 'session_resume_failed'
 
+    # Boot reap of a zombie agent_session.json (plans/session-resume-eligibility-seam-prd.md
+    # γ/D7), producer harness.py::Harness._reap_zombie_sidecars. One row per
+    # cleared sidecar; data: {sidecar_path, task_id, owner_pid, age_secs, status}.
+    sidecar_reaped = 'sidecar_reaped'
+    # One row per boot scan, zero-reap boots included; data:
+    # agent_session_reaper.py::ReapTally.event_data.
+    sidecar_reap_summary = 'sidecar_reap_summary'
+
     # Scheduler fairness
     task_skipped = 'task_skipped'
     # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload

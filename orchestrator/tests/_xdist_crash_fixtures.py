@@ -190,6 +190,149 @@ XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT = (
     + ' 1 failed, 73 passed in 5.52s '.center(80, '=') + '\n'
 )
 
+# task 5891: default-verbosity bailouts that nonetheless COMPLETED. xdist printed
+# the bailout literal, but every collected test had already reported, so the
+# final progress line reads [100%] and the tally is whole. Measured live
+# (pytest 9.0.3, pytest-xdist 3.8.0, ``-n 2 --max-worker-restart=0``, one
+# os._exit test beside 40 passing), rebased onto this module's worker and
+# in-flight node-id.
+def _xdist_bailout_session_summary(tally: str) -> str:
+    return (
+        ' FAILURES '.center(80, '=') + '\n'
+        + ' orchestrator/tests/test_config.py '.center(80, '_') + '\n'
+        + '[gw3] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+        + f"worker 'gw3' crashed while running '{XDIST_IN_FLIGHT_NODEID}'\n"
+        + XDIST_BAILOUT_LINE
+        + ' short test summary info '.center(80, '=') + '\n'
+        + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+        + f' {tally} '.center(80, '=') + '\n'
+    )
+
+
+_XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY = _xdist_bailout_session_summary(
+    '1 failed, 40 passed in 1.12s',
+)
+
+# Default ``--dist load``: the crashed test was the last one outstanding.
+XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT = (
+    '.' * 40 + '[gw3] node down: Not properly terminated\n'
+    + 'F\n'
+    + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    + ' ' * 73 + '[100%]\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# ``--dist loadfile``: the worker died early, and the peer worker then finished
+# the queue already assigned to it, so the literal PRECEDES [100%].
+XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT = (
+    '.' * 6 + '[gw3] node down: Not properly terminated\n'
+    + 'F\n'
+    + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    + ('.' * 34).ljust(73) + '[100%]\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# task 5891 review: the same two outcomes under ``-v``, whose xdist outcome
+# lines carry the progress percentage (``[gwN] [ P%] <OUTCOME> <nodeid> ``,
+# with pytest's trailing space). Measured live as above with ``-v``.
+def _xdist_v_crash_report(percent_field: str) -> str:
+    return (
+        '[gw3] node down: Not properly terminated\n'
+        + f'[gw3] {percent_field} FAILED {XDIST_IN_FLIGHT_NODEID} \n'
+        + '\n'
+        + XDIST_RESTART_DISABLED_MESSAGE + '\n'
+    )
+
+
+# The crashed test was the last one outstanding.
+XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT = (
+    'orchestrator/tests/test_config.py::TestFoo::test_ok_39 \n'
+    + '[gw1] [ 97%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_39 \n'
+    + _xdist_v_crash_report('[100%]')
+    + '\n'
+    + _XDIST_BAILOUT_COMPLETE_SESSION_SUMMARY
+)
+
+# The worker died at 12%, and the session stopped at 51% once the peer worker
+# finished its in-flight queue.
+XDIST_V_BAILOUT_TRUNCATED_OUTPUT = (
+    '[gw1] [ 12%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_048 \n'
+    + _xdist_v_crash_report('[ 12%]')
+    + '[gw1] [ 51%] PASSED orchestrator/tests/test_config.py::TestFoo::test_ok_125 \n'
+    + '\n'
+    + _xdist_bailout_session_summary('1 failed, 102 passed in 2.10s')
+)
+
+# task 5891: the 2026-10-30 laptop investigation's shape A. A test that runs a
+# nested pytest, as tests/scripts/nested_pytest_session.py::run_nested_pytest
+# does, failed, and its captured stdout carries the nested run's own progress
+# line and crash notice, printed AFTER the outer session's [100%].
+NESTED_RUN_FAILED_NODEID = 'orchestrator/tests/test_nested.py::test_nested_run'
+PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT = (
+    ('.' * 40 + 'F').ljust(73) + '[100%]\n'
+    + ' FAILURES '.center(80, '=') + '\n'
+    + ' test_nested_run '.center(80, '_') + '\n'
+    + 'orchestrator/tests/test_nested.py:12: in test_nested_run\n'
+    + '    assert result.returncode == 0\n'
+    + 'E   assert 1 == 0\n'
+    + ' Captured stdout call '.center(80, '-') + '\n'
+    + '......'.ljust(73) + '[ 60%]\n'
+    + '[gw0] node down: Not properly terminated\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0\n'
+    + '1 failed, 40 passed in 3.00s\n'
+)
+
+# task 5891: shape B. The bailout literal QUOTED by test-controlled text rather
+# than printed by xdist, in -v sessions under xdist with the ``count`` console
+# style, whose outcome lines carry ``[N/M]`` rather than a percentage, so the
+# [100%] veto cannot read their progress.
+QUOTED_BAILOUT_FAILED_NODEID = 'orchestrator/tests/test_quote.py::test_quote'
+_PYTEST_V_XDIST_RUN_PREFIX = (
+    '[gw0] [1/2] PASSED orchestrator/tests/test_a.py::test_ok \n'
+    + f'[gw1] [2/2] FAILED {QUOTED_BAILOUT_FAILED_NODEID} \n'
+)
+_QUOTED_BAILOUT_FAILURES_HEAD = (
+    ' FAILURES '.center(80, '=') + '\n'
+    + ' test_quote '.center(80, '_') + '\n'
+    + '[gw1] linux -- Python 3.13.9 /repo/.venv/bin/python\n'
+)
+_QUOTED_BAILOUT_TALLY = ' 1 failed, 1 passed in 0.50s '.center(80, '=') + '\n'
+
+# An assertion diff quoting the literal mid-line.
+PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT = (
+    _PYTEST_V_XDIST_RUN_PREFIX
+    + _QUOTED_BAILOUT_FAILURES_HEAD
+    + 'orchestrator/tests/test_quote.py:7: in test_quote\n'
+    + "    assert msg == ''\n"
+    + "E   AssertionError: 'maximum crashed workers reached: 4'\n"
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {QUOTED_BAILOUT_FAILED_NODEID} - AssertionError\n'
+    + _QUOTED_BAILOUT_TALLY
+)
+
+# A nested xdist run's own whole-line literal in captured stdout, as
+# tests/scripts/test_xdist_worker_restart_policy.py prints its reproduction's
+# output.
+PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT = (
+    _PYTEST_V_XDIST_RUN_PREFIX
+    + _QUOTED_BAILOUT_FAILURES_HEAD
+    + 'E   assert 1 == 0\n'
+    + ' Captured stdout call '.center(80, '-') + '\n'
+    + 'worker gw0 crashed and worker restarting disabled\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'FAILED {QUOTED_BAILOUT_FAILED_NODEID} - assert 1 == 0\n'
+    + _QUOTED_BAILOUT_TALLY
+)
+
+# An INTERNALERROR traceback quoting the literal mid-line, in the run stream
+# outside any report section.
+PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT = (
+    '[gw0] [ 50%] PASSED orchestrator/tests/test_a.py::test_ok\n'
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> AssertionError: maximum crashed workers reached: 4\n'
+)
+
 # task 5492: the multi-module join `verify.py::_aggregate_results` performs —
 # each module leg's test_output joined with '\n' — with the TRUNCATED module
 # NOT last. A completed -q module follows it, so the joined text's FINAL

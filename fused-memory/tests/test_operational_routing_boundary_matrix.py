@@ -763,7 +763,7 @@ async def test_invalid_operational_mode_rejected_and_no_task_created(
     reject invalid ``operational_mode`` values by design (see its module
     docstring: ``operational`` + any mode other than ``llm`` takes the plain
     pure-gate branch, preserving the declared ``operational_mode`` verbatim
-    via ``_inject_deterministic_pure_gate``'s shallow copy) — rejection is
+    via ``pure_gate_stamped``'s shallow copy) — rejection is
     owned by the shared ``TaskMetadata`` ``Literal['gate', 'llm']`` enforced
     at the backend WRITE boundary (``parse_metadata(direction='write',
     enforce=True)``), which only an ENFORCE-mode backend

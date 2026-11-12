@@ -824,7 +824,7 @@ def _ladder_after(
 
     Both are taken through the SHIPPED functions
     (:func:`orchestrator.workflow._compute_merge_outcome_signature`,
-    :func:`orchestrator.workflow._evaluate_merge_thrash`) rather than
+    :func:`orchestrator.workflow.evaluate_merge_thrash`) rather than
     transcribed.  A transcription would let a signature-format change or a
     counter-arithmetic change pass this gate silently, which for a row whose
     entire content is "the shipped ladder does not move" would be the one
@@ -859,7 +859,7 @@ def _ladder_after(
             signature would show up as either an increment or a reset.
         requests: the scene's request registry, scanned for a blocked outcome
             rendered for any item the rounds do not already account for.
-        threshold: what ``_evaluate_merge_thrash`` escalates at.  Affects only
+        threshold: what ``evaluate_merge_thrash`` escalates at.  Affects only
             the verdict's ``escalate`` flag, which this helper drops — the
             counter arithmetic is threshold-independent — but is threaded so
             the control test can state the number it is asserting against.
@@ -869,7 +869,7 @@ def _ladder_after(
         :func:`_assert_two_way_quiescent` as ``ladder={'before': ..., 'after':
         ...}`` to make the unmoved claim part of the round-by-round oracle.
     """
-    from orchestrator.workflow import _evaluate_merge_thrash
+    from orchestrator.workflow import evaluate_merge_thrash
 
     current = RetryLedger() if ledger is None else ledger
 
@@ -891,7 +891,7 @@ def _ladder_after(
         if outcome is None or getattr(outcome, 'status', None) != 'blocked':
             continue
         signature = _blocked_signature(outcome)
-        current = _evaluate_merge_thrash(
+        current = evaluate_merge_thrash(
             current, current.last_merge_outcome_signature, signature, threshold,
         ).ledger
     return current
@@ -1315,7 +1315,7 @@ class TestTwoWayOracleContract:
         """CAS/LEDGER half (b): row 8's claim is about workflow.py's LADDER.
 
         The `after` ledger is produced by the REAL
-        ``workflow._evaluate_merge_thrash`` over a real ``RetryLedger`` rather
+        ``workflow.evaluate_merge_thrash`` over a real ``RetryLedger`` rather
         than by hand, so a change to the ladder's counter arithmetic moves this
         control rather than leaving it stale.  ``before is after`` is the
         UNMOVED shape row 8 asserts; a single genuine blocked signature folded
@@ -1325,7 +1325,7 @@ class TestTwoWayOracleContract:
 
         from orchestrator.workflow import (
             _compute_merge_outcome_signature,
-            _evaluate_merge_thrash,
+            evaluate_merge_thrash,
         )
 
         worker = _make_worker(_make_git_ops(git_repo))
@@ -1333,7 +1333,7 @@ class TestTwoWayOracleContract:
 
         before = RetryLedger()
         signature = _compute_merge_outcome_signature('merge_conflict', 'shared.txt', '')
-        moved = _evaluate_merge_thrash(before, None, signature, 2).ledger
+        moved = evaluate_merge_thrash(before, None, signature, 2).ledger
         assert moved.consecutive_merge_thrash == 1, (
             f'the ladder control is inert: folding one genuine blocked '
             f'signature must move the counter off 0, got '
@@ -3115,7 +3115,7 @@ class TestRow3HalvingIsolatesTheBadItem:
 #   unmoved.
 #
 #   LEDGER SIDE (original here): the pair of rounds' real observable outputs
-#   are folded through the SHIPPED ladder — ``workflow._evaluate_merge_thrash``
+#   are folded through the SHIPPED ladder — ``workflow.evaluate_merge_thrash``
 #   over a real ``shared.task_metadata.RetryLedger``, keyed by the SHIPPED
 #   ``workflow._compute_merge_outcome_signature`` — and the ladder comes back
 #   byte-identical.  Deriving the signature THROUGH the production function
@@ -3286,7 +3286,7 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
         """LEDGER SIDE — the conclusion, folded through the REAL ladder.
 
         The pair's own observable outputs are handed to
-        ``workflow._evaluate_merge_thrash``.  It has nothing to eat, because the
+        ``workflow.evaluate_merge_thrash``.  It has nothing to eat, because the
         ladder is fed ONLY from a rendered blocked ``MergeOutcome`` (workflow.py
         stashes ``result.reason`` into ``_last_merge_block_reason`` and gates
         the whole thrash check on it being non-None), and a deep red tip

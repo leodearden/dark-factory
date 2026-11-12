@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 
 from shared.elision import elide_at_word
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
 from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,

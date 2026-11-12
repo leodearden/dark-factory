@@ -3,7 +3,8 @@
 
 server:
   transport: "http"
-  host: "0.0.0.0"
+  # Loopback only; also the bind host of the self-bound server.recon_report_port.
+  host: "127.0.0.1"
   port: 8002
   stateless_http: true
   json_response: true

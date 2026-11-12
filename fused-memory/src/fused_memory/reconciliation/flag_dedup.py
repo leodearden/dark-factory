@@ -2564,12 +2564,10 @@ def _is_valid_marker_task_id(tid: str) -> bool:
       ``'<project>:<digits>'`` after strip.
     - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
 
-    Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
-    convention (``_looks_like_task_id`` in task_interceptor.py and
-    sqlite_task_backend.py) while additionally tolerating the comma-joined
-    marker key and canonical fp: keys.  Defined as a LOCAL helper to avoid a
-    server/middleware←reconciliation import inversion; see the local-copy
-    convention in :func:`_normalize_content_description`.
+    The check lives here, not beside
+    ``shared/src/shared/task_submit.py::looks_like_task_id``, because every
+    shape it accepts beyond a bare id (comma-joined keys, ``fp:`` keys,
+    ``'<project>:<digits>'`` components) belongs to the marker format alone.
 
     Pure, sync, no I/O.
     """

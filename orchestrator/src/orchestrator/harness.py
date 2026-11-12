@@ -66,6 +66,14 @@ from shared.transcript_archive import (
 
 from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
+from orchestrator.agent_session_reaper import (
+    ReapTally,
+    ReapVerdict,
+    SessionSidecarClaim,
+    owner_alive,
+    read_sidecar_claim,
+    reap_verdict,
+)
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -3579,7 +3587,8 @@ class Harness:
         The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
         ``TaskArtifacts._clear_path``: clearing only the resolved path risks
         the OTHER root resurrecting it via the new-then-old read fallback on
-        a later call.  Idempotent (``missing_ok=True``); never raises.
+        a later call.  Idempotent (``missing_ok=True``); any other OSError
+        propagates.
         """
         (TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name).unlink(
             missing_ok=True
@@ -3742,6 +3751,93 @@ class Harness:
             key, session_data.get('role'), session_data.get('session_id'),
         )
         return key
+
+    def _surviving_sidecar_claims(
+        self, now: datetime,
+    ) -> tuple[list[SessionSidecarClaim], int]:
+        """Each surviving agent_session.json's claim, and how many name no readable task."""
+        claims: list[SessionSidecarClaim] = []
+        unresolvable = 0
+        for entry in sorted(self.git_ops.worktree_base.iterdir()):
+            try:
+                if not entry.is_dir():
+                    continue
+                sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
+                if not sidecar_path.exists():
+                    continue
+            except OSError as exc:
+                logger.warning(
+                    'Sidecar reap: %s unreadable (%s) — counted unresolvable',
+                    entry, exc,
+                )
+                unresolvable += 1
+                continue
+            fallback = entry.name if classify_worktree_entry(entry.name) == 'task' else None
+            claim = read_sidecar_claim(
+                entry, sidecar_path, fallback_task_id=fallback, now=now,
+            )
+            if claim is None:
+                unresolvable += 1
+            else:
+                claims.append(claim)
+        return claims, unresolvable
+
+    async def _reap_zombie_sidecars(self) -> ReapTally:
+        """Clear each sidecar whose owner is dead and whose task is known and
+        not in-progress (plans/session-resume-eligibility-seam-prd.md D7).
+        """
+        claims, unresolvable = self._surviving_sidecar_claims(datetime.now(UTC))
+        liveness = [(claim, owner_alive(claim)) for claim in claims]
+        dead_ids = sorted({claim.task_id for claim, alive in liveness if not alive})
+        statuses: dict[str, str] = {}
+        err: Exception | None = None
+        if dead_ids:
+            statuses, err = await self.scheduler.get_statuses(dead_ids)
+        if err is not None:
+            logger.warning(
+                'Sidecar reap: task status read failed (%s) — keeping every '
+                'dead-owner sidecar this boot', err,
+            )
+            statuses = {}
+        verdicts: list[ReapVerdict] = []
+        clear_failed = 0
+        for claim, alive in liveness:
+            status = statuses.get(claim.task_id)
+            verdict = reap_verdict(owner_alive=alive, status=status)
+            verdicts.append(verdict)
+            if verdict is not ReapVerdict.REAP:
+                continue
+            try:
+                self._clear_recovery_artifact(claim.entry, 'agent_session.json')
+            except OSError as exc:
+                logger.warning(
+                    'Sidecar reap: could not clear %s (task %s): %s',
+                    claim.sidecar_path, claim.task_id, exc,
+                )
+                clear_failed += 1
+                continue
+            logger.info(
+                'Sidecar reap: cleared %s (task %s, status %s, dead owner_pid '
+                '%r, age %ss)',
+                claim.sidecar_path, claim.task_id, status, claim.owner_pid,
+                claim.age_secs,
+            )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.sidecar_reaped,
+                    task_id=claim.task_id,
+                    data={**claim.event_data(), 'status': status},
+                )
+        tally = ReapTally.from_verdicts(
+            verdicts,
+            clear_failed=clear_failed,
+            unresolvable=unresolvable,
+            status_read_error=None if err is None else f'{type(err).__name__}: {err}',
+        )
+        if self.event_store:
+            self.event_store.emit(EventType.sidecar_reap_summary, data=tally.event_data())
+        logger.info('Sidecar reap summary: %s', tally.event_data())
+        return tally
 
     def _sweep_orphaned_transcripts(self, *, deadline_secs: float = 30.0) -> int:
         """Archive transcripts left behind on surviving worktrees; return the count.
@@ -4274,6 +4370,13 @@ class Harness:
         # finds nothing, and a "swept 0" tally would read as "no orphans"
         # rather than "not mounted".
         self._sweep_orphaned_transcripts()
+        # Siting (plans/session-resume-eligibility-seam-prd.capability-manifest.md
+        # §F4): before 2d's re-pend, so 'in-progress' is still ground truth; and
+        # before the per-entry loop below, so no sidecar is adopted then cleared.
+        try:
+            await self._reap_zombie_sidecars()
+        except Exception as exc:
+            failures.record('agent-session-reaper', exc)
 
         # W11 delta: keep the durable LaneLifecycle record and the pool's
         # in-memory cache from ever drifting (PRD dec.3, I1) — every

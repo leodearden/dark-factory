@@ -43,7 +43,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.merge_state import MergeState
 from shared.task_read import TaskAbsent, TaskFound
 
@@ -643,8 +643,9 @@ async def probe_landing(
 ) -> GitAuthorityVerdict:
     """Ask git whether *key*'s branch landed on main, and how confidently.
 
-    *key* is a branch name or a bare task id; it is normalised through
-    ``canonical_queued_branch_name``.  Returns a VERDICT, not an MCP
+    *key* is a branch name or a bare task id; the ref is derived through
+    ``canonical_queued_branch_name`` and the task id through
+    ``bare_queued_branch_id``.  Returns a VERDICT, not an MCP
     response — which is what lets a periodic writer (PRD leaf η, task 4651)
     reuse the fully-guarded decision ``merge_status`` computes and throws
     away.  It is also why ``request_id`` is not a parameter: it was only
@@ -692,7 +693,7 @@ async def probe_landing(
         full_branch = canonical_queued_branch_name(key, git_config.branch_prefix)
         tip = await git_ops.resolve_branch_sha(full_branch)
         main_tip = await git_ops.resolve_branch_sha(git_config.main_branch)
-        tid = full_branch.removeprefix(git_config.branch_prefix)
+        tid = bare_queued_branch_id(key, git_config.branch_prefix)
         if tip is None:
             # Branch ref gone — the canonical 4352 deleted-branch shape.
             # find_merge_marker gates on branch existence internally.

@@ -81,7 +81,11 @@ from orchestrator.remote_gate import (
     reap_script_text,
     shim_suspected,
 )
-from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_to_json
+from orchestrator.task_verify_spec import (
+    TaskVerifySpec,
+    collapsed_module_overrides,
+    task_spec_to_json,
+)
 from orchestrator.verify import (
     VerifyResult,
     _archive_merge_verify_logs,
@@ -358,6 +362,15 @@ class MergeVerifySpec:
                           TaskVerifySpec's rule: non-empty replaces the host's
                           value, '' keeps the host's own. '' is also what a
                           pre-6127 dispatcher's spec decodes to.
+    scope_cargo         : the cargo-scoping switch that gates
+                          verify.py::_apply_cargo_scope, including the
+                          zero-module __cargo_scoped__ route (task 7465). None
+                          (a pre-7465 spec) keeps the host's own value; a
+                          carried value replaces it.
+    merge_config_only_full_gate_globs : task 2838's manifest-drift backstop,
+                          read by verify.py::_merge_config_only_diff_forces_full_gate
+                          (task 7465). None (a pre-7465 spec) keeps the host's
+                          own globs; a carried value, () included, replaces them.
 
     Note
     ----
@@ -386,6 +399,10 @@ class MergeVerifySpec:
     global_verify_command: VerifyCommand | None = None
     # Task 6127 — the dispatcher's pre-provision command; '' keeps the host's.
     verify_cold_preprovision_command: str = ''
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    scope_cargo: bool | None = None
+    # Task 7465 — None: not carried (a pre-7465 spec); the host keeps its own.
+    merge_config_only_full_gate_globs: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -403,6 +420,12 @@ class MergeVerifySpec:
                 else None
             ),
             "verify_cold_preprovision_command": self.verify_cold_preprovision_command,
+            "scope_cargo": self.scope_cargo,
+            "merge_config_only_full_gate_globs": (
+                list(self.merge_config_only_full_gate_globs)
+                if self.merge_config_only_full_gate_globs is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -411,6 +434,7 @@ class MergeVerifySpec:
         # Back-compat: a legacy spec dict (pre-task-2883) lacks this key, so
         # default to None — same d.get idiom as merge_verify_workspace/breadth.
         _gvc = d.get("global_verify_command")
+        _globs = d.get("merge_config_only_full_gate_globs")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -426,6 +450,8 @@ class MergeVerifySpec:
                 VerifyCommand.from_dict(_gvc) if _gvc is not None else None
             ),
             verify_cold_preprovision_command=d.get("verify_cold_preprovision_command", ""),
+            scope_cargo=d.get("scope_cargo"),
+            merge_config_only_full_gate_globs=tuple(_globs) if _globs is not None else None,
         )
 
 
@@ -532,7 +558,20 @@ def build_merge_verify_spec(
         merge_verify_breadth=config.merge_verify_breadth,
         global_verify_command=global_verify_command_for(config, verify_commands),
         verify_cold_preprovision_command=config.verify_cold_preprovision_command,
+        scope_cargo=_carried_scope_cargo(config, module_configs),
+        merge_config_only_full_gate_globs=tuple(config.git.merge_config_only_full_gate_globs),
     )
+
+
+def _carried_scope_cargo(config: OrchestratorConfig, module_configs: list[ModuleConfig]) -> bool:
+    """The scope_cargo the spec ships: False when a per-module override cannot ride it.
+
+    module_config_from_command drops a per-module scope_cargo, and on the remote
+    a spec-level False can only widen cargo scope (verify.py::_apply_cargo_scope);
+    η (task 9135) makes per-module carriage lossless.
+    """
+    collapsed = collapsed_module_overrides(module_configs)
+    return config.scope_cargo and not any(c.field == 'scope_cargo' for c in collapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +600,9 @@ def _module_config_from_command(vc: VerifyCommand, spec: MergeVerifySpec) -> Mod
     cascade (module→top-level→warm) exactly as a real local merge run does, instead of
     returning 0.0 and triggering an immediate asyncio.wait_for(..., timeout=0.0)
     TimeoutError.  Positive cold timeouts map verbatim.
+
+    A per-module scope_cargo is not carried; build_merge_verify_spec collapses it
+    into the spec-level value (see _carried_scope_cargo).
     """
     return module_config_from_command(
         vc,
@@ -629,16 +671,15 @@ async def run_merge_verify_on_worktree(
 
     # Fix (a), task 2822 — the merge-deciding profile rides the spec, so the
     # host's own --config can no longer narrow it; task 6127 — nor skip the
-    # dispatcher's cold-venv pre-provision.
+    # dispatcher's cold-venv pre-provision; task 7465 — nor decide cargo scope
+    # or the config-only full-gate backstop.
     config = apply_spec_to_host_config(
         config,
         verify_env=spec.verify_env,
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
-        field_overrides={
-            'merge_verify_workspace': spec.merge_verify_workspace,
-            'merge_verify_breadth': spec.merge_verify_breadth,
-        },
+        field_overrides=_spec_field_overrides(spec),
+        git_field_overrides=_spec_git_field_overrides(spec),
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
 
@@ -652,6 +693,24 @@ async def run_merge_verify_on_worktree(
         task_id=task_id,
     )
     return await runner.run_merge_verify(merge_sha, spec)
+
+
+def _spec_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The top-level OrchestratorConfig fields the spec decides; a None scope_cargo is not carried."""
+    overrides: dict[str, Any] = {
+        'merge_verify_workspace': spec.merge_verify_workspace,
+        'merge_verify_breadth': spec.merge_verify_breadth,
+    }
+    if spec.scope_cargo is not None:
+        overrides['scope_cargo'] = spec.scope_cargo
+    return overrides
+
+
+def _spec_git_field_overrides(spec: MergeVerifySpec) -> dict[str, Any]:
+    """The GitConfig leaves the spec decides, as fresh lists (strict validation rejects a tuple)."""
+    if spec.merge_config_only_full_gate_globs is None:
+        return {}
+    return {'merge_config_only_full_gate_globs': list(spec.merge_config_only_full_gate_globs)}
 
 
 # ---------------------------------------------------------------------------
