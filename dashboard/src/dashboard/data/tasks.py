@@ -164,6 +164,7 @@ class _TasksRead:
     project_root: str
     statuses: frozenset[str] | None
     mode: _OnePage | _CompleteRead
+    fields: tuple[str, ...] | None
 
     def wire_arguments(self) -> dict:
         """Build the MCP ``get_tasks`` arguments for this read.
@@ -173,10 +174,14 @@ class _TasksRead:
         ``None``'s "whole tree", so a truthiness guard would silently widen it.
         It crosses the wire ``sorted()`` — a frozenset has no iteration order,
         and deterministic bytes beat nondeterministic ones for logs and mocks.
+        ``fields`` is already an ordered tuple, so it crosses in the caller's
+        order, guarded on ``is not None`` the same way.
         """
         arguments: dict = {'project_root': self.project_root}
         if self.statuses is not None:
             arguments['statuses'] = sorted(self.statuses)
+        if self.fields is not None:
+            arguments['fields'] = list(self.fields)
         if isinstance(self.mode, _OnePage):
             arguments['page_size'] = self.mode.page_size
             arguments['offset'] = self.mode.offset
@@ -491,6 +496,7 @@ async def fetch_task_page(
     page_size: int,
     offset: int,
     statuses: list[str] | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch ONE explicit page of *project_root*'s task list via MCP.
@@ -511,18 +517,13 @@ async def fetch_task_page(
     **Ascending id is the only ordering key.**  *page_size*/*offset* are a
     POST-FETCH in-memory slice in ``server/tools.py::get_tasks``, over a list
     already ordered by ascending ``id``.  They cut wire bytes but not backend
-    work.  Two substrate gaps bound what any caller can do here and are
-    recorded as fused-memory-side follow-up rather than faked client-side:
-    ``get_tasks`` offers NO field/column projection (the backend is a
-    hardcoded ``SELECT *`` feeding a fixed 14-key row, so the heavy
-    ``description``/``details``/``testStrategy``/``metadata`` fields cannot be
-    dropped), and NO ``ORDER BY updated_at`` (so "the N most recently updated"
-    is not expressible server-side).  That second gap is why reaching the
-    high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
+    work.  ``get_tasks`` offers NO ``ORDER BY updated_at``, so "the N most
+    recently updated" is not expressible server-side, which is why reaching
+    the high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
 
-    *statuses* narrowing, the offline marker, the absence of any cache and the
-    per-request *timeout* budget behave IDENTICALLY here and are documented
-    once on :func:`fetch_tasks`.  Both reads go through the single
+    *statuses* narrowing, the *fields* projection, the offline marker, the
+    absence of any cache and the per-request *timeout* budget behave
+    IDENTICALLY here and are documented once on :func:`fetch_tasks`.  Both reads go through the single
     :func:`_fanout_read` core, so there is deliberately no second copy of that
     policy — or of its description — to drift.
     """
@@ -530,6 +531,7 @@ async def fetch_task_page(
         str(project_root),
         None if statuses is None else frozenset(statuses),
         _OnePage(page_size, offset),
+        None if fields is None else tuple(fields),
     )
     return await _fanout_read(
         client, config, read, timeout=timeout, label='fetch_task_page',
@@ -542,6 +544,7 @@ async def fetch_tasks(
     project_root: str | bytes | os.PathLike[str],
     *,
     statuses: list[str] | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the COMPLETE dashboard-shaped task set for *project_root* via MCP.
@@ -585,6 +588,15 @@ async def fetch_tasks(
     two calls differing only in order are ONE read, and the wire bytes stay
     deterministic.
 
+    **Projection.**  *fields* is forwarded as ``get_tasks``' ``fields``
+    argument, in the caller's order, and only when given: ``None`` (the
+    default) asks for whole rows and sends no key.  The contract is
+    ``fused-memory/src/fused_memory/backends/task_projection.py::parse_task_projection``:
+    top-level keys in ``_row_to_task``'s spelling (``updatedAt``), and
+    ``metadata.<key>`` one level deep, with ``id`` always returned.  A
+    projected row's ``metadata`` holds only the requested keys present on the
+    task, and :func:`_shape_task` reads an omitted key as absent.
+
     **Per-request budget.** *timeout* is threaded into
     :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the
     authority: it is a PER-HTTP-REQUEST budget bounding connect/read/write and
@@ -605,6 +617,7 @@ async def fetch_tasks(
         str(project_root),
         None if statuses is None else frozenset(statuses),
         _CompleteRead(),
+        None if fields is None else tuple(fields),
     )
     return await _fanout_read(
         client, config, read, timeout=timeout, label='fetch_tasks',

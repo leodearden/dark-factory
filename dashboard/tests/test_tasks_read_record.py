@@ -35,8 +35,8 @@ class TestTasksReadRecord:
         component, so the mode's TYPE is what says which answer a read
         returns — readable as a named field, not parsed out of a string.
         """
-        page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0))
-        whole = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
+        page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0), None)
+        whole = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(), None)
 
         assert page != whole
         assert type(page.mode) is not type(whole.mode)
@@ -53,7 +53,7 @@ class TestTasksReadRecord:
 
     def test_wire_arguments_omits_statuses_entirely_when_none(self):
         """statuses=None means "whole tree": the key is absent from the wire."""
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(), None)
         assert read.wire_arguments() == {'project_root': '/r'}
 
     def test_wire_arguments_sends_an_empty_statuses_list(self):
@@ -64,7 +64,7 @@ class TestTasksReadRecord:
         "whole tree".
         """
         read = tasks_mod._TasksRead(
-            '/r', frozenset(), tasks_mod._CompleteRead()
+            '/r', frozenset(), tasks_mod._CompleteRead(), None,
         )
         assert read.wire_arguments() == {'project_root': '/r', 'statuses': []}
 
@@ -76,7 +76,7 @@ class TestTasksReadRecord:
         """
         read = tasks_mod._TasksRead(
             '/r', frozenset({'pending', 'done', 'blocked'}),
-            tasks_mod._CompleteRead(),
+            tasks_mod._CompleteRead(), None,
         )
         assert read.wire_arguments()['statuses'] == ['blocked', 'done', 'pending']
 
@@ -87,7 +87,7 @@ class TestTasksReadRecord:
         request is derived from `mode` itself and there is no second copy of
         the offset to disagree with.
         """
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50), None)
 
         assert read.wire_arguments() == {
             'project_root': '/r', 'page_size': 25, 'offset': 50,
