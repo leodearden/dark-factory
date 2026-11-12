@@ -1,8 +1,8 @@
 // quality_view.js — the pure decisions behind the Quality tab
 // (tab_quality.jsx): which served metrics each section draws, the text of a
 // headline, a counting rule, an alarm verdict and a before/after comparison,
-// the arrays a metric's chart draws, and where each served marker and alarm
-// sits on that chart.
+// the arrays a metric's chart draws, the cost model's readings, and where each
+// served marker and alarm sits on that chart.
 //
 // Every figure is read from the served QUALITY / QUALITY_MARKERS values
 // (dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire and
@@ -127,6 +127,33 @@ function beforeAfterText(entry, kind) {
   return `${QUALITY_EFFECT_TEXT[kind](entry)} · n ${entry.n_before} → ${entry.n_after}`;
 }
 
+const QUALITY_BASELINE_HINT = Object.freeze({
+  frozen: 'frozen baseline',
+  provisional: 'provisional baseline',
+});
+
+// The cost model in force (quality_series.py::CostModel.to_wire) as two
+// readings; a figure the server has not fitted yet reads as null text.
+function costModelReadings(costModel) {
+  const hint = QUALITY_BASELINE_HINT[costModel.state] ?? null;
+  const reference = costModel.reference_cost_100;
+  const residual = costModel.residual_median;
+  return [
+    {
+      key: 'reference_cost_100',
+      label: 'Reference cost at 100 lines',
+      text: reference === null ? null : qualityAmount(reference, 'usd'),
+      hint,
+    },
+    {
+      key: 'residual_median',
+      label: 'Median log residual',
+      text: residual === null ? null : qualitySigned(residual.toFixed(3), residual),
+      hint,
+    },
+  ];
+}
+
 function qualityAppliesTo(marker, metricId) {
   return marker.series === null || marker.series.includes(metricId);
 }
@@ -177,6 +204,7 @@ const QUALITY_VIEW_API = {
   indexMarkers,
   alarmVerdict,
   beforeAfterText,
+  costModelReadings,
   qualityMarks,
 };
 

@@ -6,6 +6,7 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
+const { QualityTab } = window.DF_QUALITY;
 const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
 const { TAB_ENDPOINTS: TAB_POLL_PATHS } = window.DF_POLL_SCOPE;
 const { scopePollingToTab } = window.DF_DATA_LOADER;
@@ -151,6 +152,7 @@ function App() {
     { id: 'burn',     label: 'Burndown' },
     { id: 'esc',      label: 'Escalations' },
     { id: 'esc-analytics', label: 'Analytics' },
+    { id: 'quality',  label: 'Quality' },
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
@@ -185,7 +187,7 @@ function App() {
 
   // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
   //
-  // ONE render site, not thirteen: the tab -> endpoint mapping lives in
+  // ONE render site, not one per tab: the tab -> endpoint mapping lives in
   // poll_scope.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
   // there, and poll_scope.test.mjs fails loudly if a mapped endpoint
   // stops existing or a tab id goes unmapped. The per-tab toolbar config map
@@ -220,6 +222,7 @@ function App() {
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
       case 'esc':      return <EscalationsTab projectFilter={projects} focus={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
       case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
+      case 'quality':  return <QualityTab />;
       default: return null;
     }
   }
@@ -240,6 +243,7 @@ function App() {
     burn:      { showAgents: false, search: false },
     esc:       { showAgents: false, search: false },
     'esc-analytics': { showAgents: false, search: false },
+    quality:   { showProjects: false, showAgents: false, search: false },
   }[tab] || {};
   const chip = CHIP_TAB_WINDOWS[tab];
   const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;

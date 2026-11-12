@@ -11,7 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
-import { seedDashboardData } from './dom_harness.mjs';
+import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   escalationAnalytics,
   projectRow,
@@ -643,7 +643,7 @@ test('tab_quality.jsx::QualityTab overlays every in-window served marker on the 
       beforeAfter: quality.before_after, metricId: id, kind: metric.kind,
     });
     assert.deepEqual(
-      marks.map(mark => mark.key).sort(),
+      [...marks.map(mark => mark.key)].sort(),
       [FLIP.id, ARTEFACT.id, DEPLOY.id].sort(),
       `${id}: the in-window markers, and not the one past the last landing`,
     );
@@ -664,7 +664,7 @@ test('tab_quality.jsx::QualityTab reads the cost model in force: reference cost 
 
   assert.deepEqual(
     tiles.map(tile => [tile.querySelector('.lbl').textContent, tile.querySelector('.val').textContent]),
-    readings.map(reading => [`${reading.label} · ${reading.hint}`, reading.text]),
+    [...readings.map(reading => [`${reading.label} · ${reading.hint}`, reading.text])],
   );
 });
 
@@ -767,8 +767,17 @@ test("tab_quality.jsx::QualityTab's Snapshots section renders the QUALITY_SNAPSH
   assert.ok(section(container, 'snapshots').textContent.includes(body.QUALITY_SNAPSHOTS.reason));
 });
 
+// The whole page also lands one async App update outside act() after any tab
+// switch (measured on the Costs tab too), so this window tolerates exactly
+// that warning and nothing else on console.error.
+const PAGE_ACT_WARNING = 'Warning: An update to %s inside a test was not wrapped in act(...)';
+
 test('app.jsx renders a Quality rail entry, and selecting it mounts QualityTab', t => {
-  const harness = openWindow(t);
+  const harness = buildDashboardWindow();
+  t.after(() => {
+    harness.close();
+    assert.deepEqual(harness.consoleErrors.filter(entry => !entry.startsWith(PAGE_ACT_WARNING)), []);
+  });
   const root = harness.mountPage();
   const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
     [...candidate.children].some(part => part.textContent === 'Quality'),
