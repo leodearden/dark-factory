@@ -597,33 +597,39 @@ def _run_replay_on(paths: dict[str, Path], factory: Any, *arms: str) -> int:
 
 
 def _run_replay(paths: dict[str, Path], llm: _FakeLLM, *arms: str) -> int:
-    return _run_replay_on(paths, lambda model: llm, *arms)
+    return _run_replay_on(paths, lambda llm_spec: llm, *arms)
 
 
 CONFIGURED = 'm-configured'
 
 
-class _ClientsByModel:
-    """An llm_factory building one _CountingLLM per model it is asked for; None is the configured model."""
+CONTROL_LLM = mod.ExtractionLlm()
+O6_LOW_LLM = mod.ExtractionLlm(mod.O6_MODEL, 'low')
+O6_MEDIUM_LLM = mod.ExtractionLlm(mod.O6_MODEL, 'medium')
+
+
+class _ClientsByLlm:
+    """An llm_factory building one _CountingLLM per ExtractionLlm it is asked for, on that model
+    (None is CONFIGURED) and declaring that effort."""
 
     def __init__(
-        self, *, unavailable: frozenset[str | None] = frozenset(),
-        edges: dict[str | None, tuple[tuple[str, str, str], ...]] | None = None,
+        self, *, unavailable: frozenset[Any] = frozenset(),
+        edges: dict[Any, tuple[tuple[str, str, str], ...]] | None = None,
     ) -> None:
         self.unavailable = unavailable
         self.edges = edges or {}
-        self.asked: list[str | None] = []
-        self.clients: dict[str | None, _CountingLLM] = {}
+        self.asked: list[Any] = []
+        self.clients: dict[Any, _CountingLLM] = {}
 
-    def __call__(self, model: str | None) -> _CountingLLM | None:
-        self.asked.append(model)
-        if model in self.unavailable:
+    def __call__(self, spec: Any) -> _CountingLLM | None:
+        self.asked.append(spec)
+        if spec in self.unavailable:
             return None
-        name = model or CONFIGURED
-        self.clients[model] = (
-            _CountingLLM(model=name, edges=self.edges[model]) if model in self.edges else _CountingLLM(model=name)
-        )
-        return self.clients[model]
+        fields: dict[str, Any] = {'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort}
+        if spec in self.edges:
+            fields['edges'] = self.edges[spec]
+        self.clients[spec] = _CountingLLM(**fields)
+        return self.clients[spec]
 
 
 def _records(path: Path) -> list[dict[str, Any]]:
@@ -715,42 +721,64 @@ class TestReplayCommand:
 
         paths = _cli_inputs(tmp_path)
         with pytest.raises(KeyError):
-            mod.run(_replay_argv(paths), llm_factory=lambda model: _CountingLLM(),
+            mod.run(_replay_argv(paths), llm_factory=lambda llm_spec: _CountingLLM(),
                     reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_Broken()))
         assert _records(paths['replay']) == []
 
     def test_a_missing_client_exits_1(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        code = mod.run(_replay_argv(paths), llm_factory=lambda model: None,
+        code = mod.run(_replay_argv(paths), llm_factory=lambda llm_spec: None,
                        reader_factory=lambda graph: ReadOnlyGraphReader(graph_name=graph, graph=_episode_graph()))
         assert code == 1 and not paths['replay'].exists()
 
-    def test_each_arm_model_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
+    def test_each_distinct_arm_client_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        factory = _ClientsByModel()
-        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 0
-        assert factory.asked == [None, mod.O6_MODEL]
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'control', 'o1', 'o6-low', 'o6-medium') == 0
+        assert factory.asked == [CONTROL_LLM, O6_LOW_LLM, O6_MEDIUM_LLM]
         records = _records(paths['replay'])
         assert sorted((r['arm'], r['uuid']) for r in records) == sorted(
-            (arm, row['uuid']) for arm in ('control', 'o6-low') for row in CLI_ROWS
+            (arm, row['uuid']) for arm in ('control', 'o1', 'o6-low', 'o6-medium') for row in CLI_ROWS
         )
-        assert {r['model'] for r in records if r['arm'] == 'control'} == {CONFIGURED}
-        assert {r['model'] for r in records if r['arm'] == 'o6-low'} == {mod.O6_MODEL}
+        clients = {arm: {(r['model'], r['reasoning_effort']) for r in records if r['arm'] == arm}
+                   for arm in ('control', 'o1', 'o6-low', 'o6-medium')}
+        assert clients == {
+            'control': {(CONFIGURED, None)}, 'o1': {(CONFIGURED, None)},
+            'o6-low': {(mod.O6_MODEL, 'low')}, 'o6-medium': {(mod.O6_MODEL, 'medium')},
+        }
 
-    def test_a_resume_adds_the_o6_arm_beside_a_recorded_control(self, tmp_path: Path) -> None:
+    def test_a_resume_adds_both_o6_arms_beside_a_recorded_control(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        assert _run_replay_on(paths, _ClientsByModel(), 'control') == 0
-        second = _ClientsByModel()
-        assert _run_replay_on(paths, second, 'control', 'o6-low') == 0
-        assert second.clients[None].calls == []
-        assert sorted(second.clients[mod.O6_MODEL].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
-        assert len(_records(paths['replay'])) == 6
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'o6-low', 'o6-medium') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        for spec in (O6_LOW_LLM, O6_MEDIUM_LLM):
+            assert sorted(second.clients[spec].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
+        assert len(_records(paths['replay'])) == 9
 
-    def test_an_arm_model_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
+    def test_a_recorded_effort_arm_whose_client_now_declares_another_effort_exits_2(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
-        factory = _ClientsByModel(unavailable=frozenset({mod.O6_MODEL}))
-        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 1
-        assert not paths['replay'].exists()
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control', 'o6-low') == 0
+        before = paths['replay'].read_bytes()
+
+        def medium_for_low(spec: Any) -> _CountingLLM:
+            if spec == O6_LOW_LLM:
+                return _CountingLLM(model=mod.O6_MODEL, reasoning_effort='medium')
+            return _CountingLLM(model=CONFIGURED)
+
+        assert _run_replay_on(paths, medium_for_low, 'control', 'o6-low') == 2
+        assert paths['replay'].read_bytes() == before
+
+    def test_a_recorded_record_at_another_effort_than_its_arms_client_exits_2(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'o6-low') == 0
+        rewritten = [r | {'reasoning_effort': 'medium'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in rewritten))
+        before = paths['replay'].read_bytes()
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'o6-low') == 2
+        assert paths['replay'].read_bytes() == before
         assert all(client.calls == [] for client in factory.clients.values())
 
     def test_a_second_model_for_a_recorded_arm_exits_2(self, tmp_path: Path) -> None:
@@ -759,6 +787,44 @@ class TestReplayCommand:
         before = paths['replay'].read_text()
         assert _run_replay(paths, _CountingLLM(model='m-other'), 'control') == 2
         assert paths['replay'].read_text() == before
+
+    def test_a_record_written_before_9065_resumes_as_effort_none(self, tmp_path: Path) -> None:
+        """A 9040-era record has no 'reasoning_effort' key; it reads as the configured client's None."""
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        legacy = [{k: v for k, v in r.items() if k != 'reasoning_effort'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in legacy))
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'o6-low') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        assert len(_records(paths['replay'])) == 6
+
+    def test_a_factory_refusing_an_arms_client_exits_2_and_writes_nothing(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        built: list[_CountingLLM] = []
+
+        def refusing(spec: Any) -> _CountingLLM:
+            if spec.reasoning_effort is not None:
+                raise mod.ArmClientMismatch('this client class cannot send an effort')
+            built.append(_CountingLLM(model=CONFIGURED))
+            return built[-1]
+
+        assert _run_replay_on(paths, refusing, 'control', 'o6-low') == 2
+        assert not paths['replay'].exists()
+        assert all(client.calls == [] for client in built)
+
+    def test_an_arm_client_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        factory = _ClientsByLlm(unavailable=frozenset({O6_LOW_LLM}))
+        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 1
+        assert not paths['replay'].exists()
+        assert all(client.calls == [] for client in factory.clients.values())
+
+    def test_the_retired_o6_arm_is_refused(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        with pytest.raises(SystemExit) as raised:
+            _run_replay_on(paths, _ClientsByLlm(), 'control', 'o6')
+        assert raised.value.code == 2
 
 
 def _worksheet_argv(paths: dict[str, Path]) -> list[str]:
@@ -1098,21 +1164,24 @@ O6_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'),)
 class TestOneReplayAcrossArmModels:
     def _replayed(self, tmp_path: Path) -> dict[str, Path]:
         paths = _cli_inputs(tmp_path, baseline=CLI_SCORE_BASELINE)
-        assert _run_replay_on(paths, _ClientsByModel(edges={None: CONFIGURED_EDGES, mod.O6_MODEL: O6_EDGES}), 'control', 'o6-low') == 0
+        factory = _ClientsByLlm(edges={CONTROL_LLM: CONFIGURED_EDGES, O6_LOW_LLM: O6_EDGES, O6_MEDIUM_LLM: O6_EDGES})
+        assert _run_replay_on(paths, factory, 'control', 'o6-low', 'o6-medium') == 0
         return paths
 
-    def test_the_worksheet_interleaves_both_models_edges_naming_no_arm(self, tmp_path: Path) -> None:
+    def test_the_worksheet_interleaves_every_clients_edges_naming_no_arm(self, tmp_path: Path) -> None:
         paths = self._replayed(tmp_path)
         assert mod.run(_worksheet_argv(paths)) == 0
         records = _records(paths['replay'])
         for row in _records(paths['blind']):
             replayed = {m['edge_uuid'] for r in records if r['uuid'] == row['uuid'] for m in r['minted']}
-            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == 3
+            assert {m['edge_uuid'] for m in row['minted']} == replayed and len(replayed) == 4
             hashes = [hashlib.sha256(m['edge_uuid'].encode()).hexdigest() for m in row['minted']]
             assert hashes == sorted(hashes)
-            assert not {'arm', 'model'} & (row.keys() | {key for m in row['minted'] for key in m})
+            keys = row.keys() | {key for m in row['minted'] for key in m}
+            assert not {'arm', 'model', 'reasoning_effort', 'low', 'medium'} & keys
         text = paths['blind'].read_text()
         assert mod.O6_MODEL not in text and CONFIGURED not in text
+        assert not any(arm in text for arm in ('o6-low', 'o6-medium', 'control'))
 
     def test_the_score_judges_o6_against_the_same_files_control(self, tmp_path: Path) -> None:
         paths = self._replayed(tmp_path)
