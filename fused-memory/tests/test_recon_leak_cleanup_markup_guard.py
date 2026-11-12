@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fastmcp_tool_result import tool_result_dict
 from _recon_prompt_write_scope import recon_system_prompts, split_by_write_grant
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
@@ -54,8 +55,8 @@ _PROMPTS = recon_system_prompts()
 _WRITING, _NOT_WRITING = split_by_write_grant(_PROMPTS)
 
 
-def _guarded_server(store: dict[str, str], tmp_path) -> tuple[Any, AsyncMock]:
-    """The real server and production guard tier, over a stateful fake service.
+def _guarded_server(tmp_path) -> tuple[Any, AsyncMock]:
+    """The real server and production guard tier, over a fake service.
 
     The ``mem0_update`` config is real: a bare Mock leaf makes the fail-closed
     authz resolver deny, and the accepted-call test would then pass for the
@@ -63,12 +64,9 @@ def _guarded_server(store: dict[str, str], tmp_path) -> tuple[Any, AsyncMock]:
     """
     service = AsyncMock()
     service.config.mem0_update = Mem0UpdateConfig()
-
-    def amend(**kwargs: Any) -> dict[str, str]:
-        store[kwargs['memory_id']] = kwargs['content']
-        return {'status': 'updated', 'store': 'mem0', 'id': kwargs['memory_id']}
-
-    service.update_memory = AsyncMock(side_effect=amend)
+    service.update_memory = AsyncMock(
+        return_value={'status': 'updated', 'store': 'mem0', 'id': _MEMORY_ID}
+    )
     server = create_mcp_server(service)
     install_markup_guard(
         server,
@@ -100,8 +98,7 @@ def test_the_specimen_is_a_leak_by_the_corpus_detector():
 
 @pytest.mark.asyncio
 async def test_a_reason_quoting_the_fragment_is_refused_and_writes_nothing(tmp_path):
-    store = {_MEMORY_ID: _LEAKED_RECORD}
-    server, service = _guarded_server(store, tmp_path)
+    server, service = _guarded_server(tmp_path)
 
     with pytest.raises(ToolError) as exc_info:
         await _amend_leaked_record(server, _QUOTING_REASON)
@@ -110,25 +107,21 @@ async def test_a_reason_quoting_the_fragment_is_refused_and_writes_nothing(tmp_p
     assert payload['error_type'] == 'mcp_markup_unrepairable'
     assert payload['field'] == 'reason'
     service.update_memory.assert_not_awaited()
-    assert store[_MEMORY_ID] == _LEAKED_RECORD
 
 
 @pytest.mark.asyncio
-async def test_the_taught_reason_is_accepted_and_the_stored_record_is_clean(tmp_path):
-    store = {_MEMORY_ID: _LEAKED_RECORD}
-    server, service = _guarded_server(store, tmp_path)
+async def test_the_taught_reason_is_accepted_and_forwarded_with_the_clean_content(tmp_path):
+    server, service = _guarded_server(tmp_path)
 
-    result = await _amend_leaked_record(server, prompts.LEAKED_FRAGMENT_CLEANUP_REASON)
+    result = tool_result_dict(
+        await _amend_leaked_record(server, prompts.LEAKED_FRAGMENT_CLEANUP_REASON)
+    )
 
     assert result['status'] == 'updated'
     service.update_memory.assert_awaited_once()
-    assert service.update_memory.await_args.kwargs['reason'] == (
-        prompts.LEAKED_FRAGMENT_CLEANUP_REASON
-    )
-    stored = store[_MEMORY_ID]
-    assert stored == _CLEAN
-    assert not has_toolcall_xml_leak(stored)
-    assert detect(stored) is None
+    forwarded = service.update_memory.await_args.kwargs
+    assert forwarded['reason'] == prompts.LEAKED_FRAGMENT_CLEANUP_REASON
+    assert forwarded['content'] == _CLEAN
 
 
 def test_the_write_scope_split_is_not_vacuous():
