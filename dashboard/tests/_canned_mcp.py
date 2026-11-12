@@ -201,7 +201,7 @@ _METADATA_FIELD_PREFIX = 'metadata.'
 _TASK_ROW_KEYS: tuple[str, ...] = (
     'id', 'title', 'description', 'details', 'testStrategy', 'status', 'dependencies',
     'priority', 'subtasks', 'updatedAt', 'metadata', 'claimant_run_id', 'heartbeat_at',
-    'candidate_key',
+    'candidate_key', 'created_at', 'created_at_source',
 )
 """``task_projection.py::TASK_ROW_KEYS``: the top-level keys a projection may name."""
 _METADATA_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
