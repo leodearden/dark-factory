@@ -3416,6 +3416,123 @@ class TestReviewRunReturnsATypedNoVerdict:
         assert result.severity == VerdictSeverity.ok
 
 
+class TestARepeatedReviewErrorHaltsTruthfully:
+    """A judge that crashes on every run must eventually stop runs going ungraded.
+
+    A REVIEW_ERROR on a loaded run counts toward the same per-project
+    no-verdict streak as a JudgeInfraError, and at the threshold halts with a
+    reason naming the review error, gated on halt_on_judge_serious. Only a
+    completed review resets the streak.
+    """
+
+    _PID = 'proj-review-error'
+
+    def _judge(self, mock_journal, **cfg) -> Judge:
+        cfg.setdefault('halt_on_judge_serious', True)
+        return _judge_over_one_run(
+            mock_journal, self._PID, judge_infra_max_consecutive_failures=3, **cfg,
+        )
+
+    @staticmethod
+    def _assert_review_error_halt(judge: Judge, project_id: str) -> None:
+        assert judge.is_halted(project_id)
+        reason = judge.halt_reason(project_id)
+        assert reason is not None
+        assert reason.startswith('judge-review-error halt'), reason
+        assert 'judge-unreachable' not in reason
+        assert 'Serious verdict' not in reason
+
+    @pytest.mark.asyncio
+    async def test_the_third_consecutive_review_error_halts(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(2):
+                await judge.review_run('run-x')
+            assert not judge.is_halted(self._PID)
+            mock_journal.set_halt.assert_not_called()
+
+            third = await judge.review_run('run-x')
+
+        assert isinstance(third, NoVerdict)
+        assert third.reason is NoVerdictReason.REVIEW_ERROR
+        self._assert_review_error_halt(judge, self._PID)
+
+    @pytest.mark.asyncio
+    async def test_a_completed_review_resets_the_streak(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=[
+            RuntimeError('disk full'), RuntimeError('disk full'), None,
+            RuntimeError('disk full'),
+        ])
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(4):
+                await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_review_errors_never_halt_with_the_master_switch_off(self, mock_journal):
+        judge = self._judge(mock_journal, halt_on_judge_serious=False)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            for _ in range(3):
+                await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_streak_halts_naming_its_last_failure(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(side_effect=[
+            JudgeInfraError('cap storm'), JudgeInfraError('cap storm'), _OK_VERDICT_TEXT,
+        ])):
+            for _ in range(3):
+                await judge.review_run('run-x')
+
+        self._assert_review_error_halt(judge, self._PID)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_run_never_counts(self, mock_journal):
+        judge = Judge(
+            config=_make_judge_config(
+                halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+            ),
+            journal=mock_journal,
+        )
+
+        for _ in range(3):
+            assert (await judge.review_run('run-x')).reason is NoVerdictReason.RUN_NOT_FOUND
+
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_halted_project_skip_never_counts(self, mock_journal):
+        judge = self._judge(mock_journal)
+        mock_journal.get_halt_states = AsyncMock(return_value=[{
+            'project_id': self._PID, 'unhalted_at': None, 'cooldown_until': None,
+            'halted_at': None, 'reason': 'operator halt', 'unhalt_grace_remaining': 0,
+        }])
+        await judge.initialize()
+        for _ in range(2):
+            assert (await judge.review_run('run-x')).reason is NoVerdictReason.PROJECT_HALTED
+        await judge.unhalt(self._PID)
+        mock_journal.add_verdict = AsyncMock(side_effect=RuntimeError('disk full'))
+
+        with patch.object(judge, '_call_llm', AsyncMock(return_value=_OK_VERDICT_TEXT)):
+            await judge.review_run('run-x')
+
+        assert not judge.is_halted(self._PID)
+        mock_journal.set_halt.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Truthful content-serious halt reasons (task 2947 ask b)
 # ─────────────────────────────────────────────────────────────────────
