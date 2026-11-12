@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock
 import uvicorn
 from _git_fixtures import seed_repo
 from _trigger_chain_doc_shapes import concretize, snippet_submit_calls
+from escalation.action_effects import effect_for
 from escalation.models import Escalation, ReviewDueState
 from escalation.queue import EscalationQueue
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -333,6 +334,15 @@ class TriggerChainRig:
         finally:
             self.scheduler.release(assignment.task_id, requeued=outcome == WorkflowOutcome.REQUEUED)
         return assignment, outcome
+
+    async def resolve(self, escalation: Escalation, action: str, resolution: str) -> None:
+        """Resolve *escalation* with *action*, then apply its Table B status effect as the harness does."""
+        effect = effect_for(action, escalation.level, escalation.category)
+        if effect is None:
+            raise AssertionError(f'{action!r} is not a resolve action for {escalation.category}')
+        self.queue.resolve(escalation.id, resolution, resolution_action=action, resolved_by='lambda-e2e')
+        if effect.target_status is not None:
+            await self.scheduler.set_task_status(escalation.task_id, effect.target_status)
 
     def own_escalations(self, task_id: str, status: str | None = None) -> list[Escalation]:
         return self.queue.get_by_task(task_id, status=status, agent_role=DETERMINISTIC_AGENT_ROLE)

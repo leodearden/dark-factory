@@ -38,8 +38,8 @@ from fused_memory.middleware.deterministic_task_guard import (
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from shared.task_metadata import TASK_METADATA_CAPABILITIES, parse_metadata
 
-from orchestrator.event_store import EventType
 from orchestrator.deterministic_runner import DeterministicRunner
+from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
 
 pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
