@@ -3533,7 +3533,8 @@ class ConsolidationAutoConfig(BaseModel):
 
 
 class LinkHealConfig(BaseModel):
-    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
+    """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
+    healing (tasks 6181, 6184, 7159).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3614,6 +3615,59 @@ class LinkHealConfig(BaseModel):
             'Consecutive failed adjudicator shards that stop adjudicating. A plan run '
             'records the storm as would_escape under link-heal-adjudicator and files '
             'nothing; a writing run that adjudicates files it. PRD H1, H2.'
+        ),
+    )
+    projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            'The projects one scheduled sweep covers, in one run, so a parent in '
+            'another listed project is told apart from a deleted one. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    writes: bool = Field(
+        default=False,
+        description=(
+            'Whether a scheduled sweep may apply its heals. A writing sweep also '
+            'needs a passing calibration for the exact adjudicator model and '
+            'prompt; false records and reports only. Read by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_actions: list[str] = Field(
+        default_factory=lambda: ['detach', 'relabel'],
+        description=(
+            'The heal actions a scheduled sweep may stage; every other heal is '
+            'recorded as not_enabled. Strings, parsed as heal actions by '
+            'maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    sweep_window_hours: int = Field(
+        default=24,
+        ge=1,
+        description=(
+            'How far back the first scheduled sweep looks for newly created '
+            'children; later sweeps start where the last complete one ended. '
+            'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_kappa_margin: float = Field(
+        default=0.10,
+        ge=0,
+        le=1,
+        description=(
+            "How far below the raters' own kappa the adjudicator's kappa may fall, "
+            'per binary, pooled and per gated project, and still pass. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
+        ),
+    )
+    calibration_min_project_items: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            'Rated pairs a project needs before calibration gates on its own '
+            'kappa; smaller projects are reported, not gated. Read by '
+            'maintenance/link_heal_calibration.py at each run start. Task 7159.'
         ),
     )
 
