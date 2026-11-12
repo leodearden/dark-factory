@@ -1,0 +1,18 @@
+{
+  "task_id": "5145",
+  "reason": "reexport_names +1 on orchestrator/tests/conftest.py is the noqa-F401 binding of the shared df_pytest_isolation._df_no_mock_derived_stray_dirs guard. It REPLACES the 54-line local MagicMock-only _no_mock_derived_stray_dirs fixture (SPOT, one definition for orchestrator and fused-memory); lines, prose_lines and cognitive all fell in the same change.",
+  "measures": [
+    {
+      "measure": "reexport_names",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 5,
+      "current": 6
+    },
+    {
+      "measure": "total:reexport_names",
+      "key": "<cluster>",
+      "baseline": 6,
+      "current": 7
+    }
+  ]
+}

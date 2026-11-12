@@ -27,8 +27,9 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
+from fused_memory.models.reconciliation import StageAgentOutcome
 from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstones
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_KIND,
 )
@@ -56,32 +57,8 @@ logger = logging.getLogger(__name__)
 # closing a service <-> reconciliation import cycle.
 CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 
-# record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
-# two distinct writers of kind='cycle_summary': this module's deterministic,
-# terse, auto-generated Mem0 mirror of the authoritative ledger row
-# (LEDGER_STAMP, written unconditionally below), and the LLM-authored
-# reconstruction/self-heal cycle_summary write in
-# ``reconciliation.prompts.stage2`` (NARRATIVE).
-#
-# record_type was write-only as of task 2468: no reader (dedup/near-duplicate
-# tooling, Path-2 verification, pool-cap trim) filtered on it — the fix that
-# actually stopped the double-write was the removed normal-flow LLM
-# instruction (recon_self_model.py), not this discriminator.
-#
-# Task 3041 gives LEDGER_STAMP its first two real readers: this module's own
-# record_type-aware eviction order in enforce_summary_pool_cap below, and
-# reconciliation.mem0_tombstone.is_protected_mirror_record. Because
-# mem0_tombstone is imported BY this module (for the trim-path tombstone
-# write), it cannot import back — so the literals now live in the leaf
-# recon_pool_map alongside the pool names, single-sourced for both readers,
-# and are re-exported here under their historical names. See that module for
-# why (task 3041 amendment pass: they were previously duplicated with nothing
-# pinning the copies equal, so an edit to one side would silently disable half
-# the protected-mirror guard).
-#
-# NARRATIVE still has no Python consumer; keeping the prompt-side literal
-# (prompts/stage2.py, recon_self_model.py) in sync remains a reviewed
-# invariant rather than an enforced one.
+# record_type vocabulary for cycle_summary Mem0 writes, re-exported; see
+# recon_pool_map.py::CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
 
@@ -538,6 +515,8 @@ async def write_cycle_summary(
             ``completed_at``, ``items_flagged``, ``stats``, ``llm_calls``, and
             ``tokens_used`` are serialized into ``payload_json`` verbatim (the
             authoritative copy of what this cycle did).
+            ``agent_outcome`` is serialized as its ``StageAgentOutcome`` value,
+            or ``None`` when unrecorded.
         run_id: Current reconciliation run identifier (identity key).
         stage: The ``stage`` metadata tag value identifying this stage (e.g.
             ``'memory_consolidator'``, ``'task_knowledge_sync'``) — stored as
@@ -600,6 +579,9 @@ async def write_cycle_summary(
             'llm_calls': report.llm_calls,
             'tokens_used': report.tokens_used,
             'remediation': remediation,
+            'agent_outcome': (
+                report.agent_outcome.value if report.agent_outcome is not None else None
+            ),
         }
         if ledger is not None:
             record = ReconLedgerRecord(
@@ -635,9 +617,7 @@ async def write_cycle_summary(
                 project_id=project_id,
                 agent_id=f'recon-stage-{stage}',
                 category='observations_and_summaries',
-                # record_type discriminates this deterministic code mirror
-                # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
-                # write in prompts/stage2.py (NARRATIVE) — task 2468.
+                # record_type: see recon_pool_map.py::CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE.
                 # services/memory_service.py::_apply_cycle_summary_metadata_tagging
                 # strips nothing from a kind='cycle_summary' write, so
                 # record_type survives through to storage unchanged.
@@ -708,5 +688,58 @@ def _build_cycle_summary_mirror_content(run_id: str, stage: str, payload: dict) 
     return (
         f'Stage {stage} cycle summary for run_id: {run_id} — '
         f'{payload["items_flagged_count"]} item(s) flagged, '
-        f'{payload["llm_calls"]} llm_call(s), {payload["tokens_used"]} token(s) used.'
+        f'{payload["llm_calls"]} llm_call(s), {payload["tokens_used"]} token(s) used. '
+        f'Agent outcome: {payload["agent_outcome"] or "unrecorded"}.'
     )
+
+
+async def trailing_incomplete_agent_run_ids(
+    ledger: ReconLedgerStore | None, project_id: str, stage: str,
+) -> frozenset[str]:
+    """Return the runs of *stage* whose agent did not complete and after which no
+    agent of *stage* has completed, read from the newest ``cycle_summary`` rows back.
+
+    Best-effort: no ledger or a failed read returns nothing, and an unrecorded
+    outcome ends the streak. See plans/recon-stage-startup-wedge-rca-2026-09-27.md.
+    """
+    if ledger is None:
+        return frozenset()
+    try:
+        rows = await ledger.list_by_kind(project_id, _KIND_CYCLE_SUMMARY, 'active')
+    except Exception:
+        logger.warning(
+            'reconciliation.trailing_incomplete_agent_run_ids: '
+            'ledger read failed for project_id=%s stage=%s',
+            project_id,
+            stage,
+            exc_info=True,
+            extra={'project_id': project_id, 'stage': stage},
+        )
+        return frozenset()
+    owed: set[str] = set()
+    for row in reversed(rows):
+        if row.flag_type != stage:
+            continue
+        outcome = decode_cycle_summary_agent_outcome(row)
+        if outcome is None or outcome is StageAgentOutcome.completed:
+            break
+        owed.add(row.run_id)
+    return frozenset(owed)
+
+
+def decode_cycle_summary_agent_outcome(record: ReconLedgerRecord) -> StageAgentOutcome | None:
+    """Decode the ``agent_outcome`` that :func:`write_cycle_summary` stamped on *record*.
+
+    ``None`` means unrecorded: a legacy row without the key, an explicit
+    ``None``, an unknown value, or a payload that does not decode to a JSON object.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return StageAgentOutcome(payload.get('agent_outcome'))
+    except ValueError:
+        return None

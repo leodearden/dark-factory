@@ -1,0 +1,29 @@
+{
+ "stream": "S11",
+ "prd_path": "docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.md",
+ "manifest_path": "docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.capability-manifest.yaml",
+ "leaves_estimate": 12,
+ "lead_rulings_on_open_questions": [
+  "Q1 accepted (Leo may overturn): 'generated in both builds' is realised as a committed module frontend-shared/src/wire/openapi.gen.ts rendered by docsgen from app.openapi(), with a pytest freshness check (docsgen --check) that gates merges; no Node generation step (per-task verify has no node_modules, task 382).",
+  "Q2 confirmed: money formatters stay in frontend-portal/src/money.ts (the console renders no money); only FIXED_POINT_PATTERN moves as generated; S22's cross-PRD row (c) is superseded, no S22 leaf changes.",
+  "Q3 RULED by Leo 2026-10-16 (ruled_by: human; session rule:solar_challenge_platform#382, commits 294dbb2 + 42dbc4b): the SPAs' vitest suites and tsc gate merges at the MERGE verify, fail-closed — the tests drive the install (tests/e2e/frontend_npm.py runs the root npm ci once per session when DF_VERIFY_ROLE=merge and a frontend test executes; fails, never skips, on a missing install; no orchestrator preprovision; ~1 min per merge). 382 re-scoped in place (high; 382 -> 1239; 1268 -> 382). Option B later = task 1298: a declared-input `frontend` step on dark-factory's verify-cache per-step tier (dark_factory 5653), skipping the frontend tests at merge when their inputs match an audited green; path selection (dark_factory 7024) cancelled. Rejected: install in every task verify (stale installs, disk); warm-lane reflink seeding (one warm base per host; ext4 hard-linked venvs); a cadence lane (a break lands on main first). Caveat for Leo/lead (not ruled): verify.py::_build_fallback_config runs NO pytest for a diff whose .py part has no collectable test, conftest or test-data file, which disables every pytest-side gate for such a diff (noted on 1268). Cross-project: dark_factory 5652's tree-tier key must cover verify role + provisioning (noted there).",
+  "Q4: add the edges 697 -> S11-gamma and 605 -> S11-gamma (Leo's add-the-edge rule) with dated notes."
+ ],
+ "lead_actions_at_decompose": [
+  "cancel with x_acceptance_reason: 939 -> alpha1; 554 -> alpha2; 1049 -> gamma; 785 -> delta1+delta2 (re-verify item 2); 1043, 717 -> delta2; 786, 825 -> zeta",
+  "adopt 1047 as iota",
+  "add_dependency 697 -> gamma, 605 -> gamma",
+  "high leaves alpha1, alpha2, gamma, delta1, delta2, zeta, theta -> gate 1065; theta (RunsPanel fallback tone) has no prerequisites and lands early"
+ ],
+ "cross_reference_lines": [
+  "Program row S11 upstream deps: S23, S17, S13, S22, S21, S3, S27.",
+  "Shared conventions: once S11-zeta lands, any leaf changing an API model or enum runs `python -m solar_challenge_platform.docsgen --write` in the same commit or the freshness check fails; a hand-written TS union mirroring a Python Enum fails the INV-4 gate (no allowlist).",
+  "Shared conventions: frontend code that talks to the server, reads with a load lifecycle, or formats UTC times/ages/periods imports @scp/frontend-shared (session/http/read/format/wire); no SPA-local copies.",
+  "S27: INV-4's enforcing test = tests/docs/test_ts_unions_equal_python_enums.py (zeta).",
+  "S23: after S11-eta the console reads only /api/ops/stream and /api/ops/snapshot; the four per-panel routes stay as the documented operator API (retire later).",
+  "S22: PRD row (c) superseded by S11 F7.",
+  "Seam table row 'OpenAPI document': S11 owns generation, the freshness check and INV-4; schema content stays with each route's owning stream.",
+  "Triage: fk-6e809699ddc6's crash path is fixed by S11-theta (unheld, lands early).",
+  "Briefing (interactive): portals known_gaps — console 401 gap closes with alpha2; thin-coverage items with beta/gamma/delta1/delta2; after alpha1 the reinstall hint is a root npm ci."
+ ]
+}

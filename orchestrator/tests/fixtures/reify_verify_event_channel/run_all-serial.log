@@ -1,0 +1,20 @@
+=== Running all infra tests in: /tmp/ra-events-ex00uil5/infra ===
+
+--- Running: test_fail.sh ---
+  FAIL: x
+  RESULT: FAIL (test_fail.sh)
+
+--- Running: test_pass.sh ---
+member test_pass.sh ok
+  RESULT: PASS (test_pass.sh)
+
+--- Running: test_skippable.sh ---
+member test_skippable.sh ok
+  RESULT: PASS (test_skippable.sh)
+
+=== Summary: 3 discovered, 1 failed ===
+=== FAILED: test_fail.sh ===
+FAILED test_fail.sh
+--- FAILED-DETAIL: test_fail.sh ---
+  FAIL: x
+--- END FAILED-DETAIL: test_fail.sh ---

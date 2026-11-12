@@ -49,9 +49,12 @@ class FailureCategory(StrEnum):
     FLOCK_ERROR = 'flock_error'
     NPM_ERROR = 'npm_error'
     PYTEST_INTERNALERROR = 'pytest_internalerror'
-    ENV_TRANSIENT = 'env_transient'
     TEST_FAILURE = 'test_failure'
+    TYPE_ERROR = 'type_error'
+    LINT_ERROR = 'lint_error'
     UNKNOWN_TEST_FAILURE = 'unknown_test_failure'
+    INFRA_ABORT = 'infra_abort'
+    ENV_TRANSIENT = 'env_transient'
     PASSED = 'passed'
     NONE = ''
 
@@ -328,14 +331,69 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
+    # The ordering rule for ranks 11-16, the only order ``_worst_category``
+    # consumes. 11-14 are legs that reached (or may have reached) a verdict
+    # about the branch. 15-16 are host conditions that, coming from ONE leg,
+    # must never mask ANOTHER leg's verdict: task #4103's test red plus a
+    # guard-3 false ENV_TRANSIENT type leg was held by the merge lane as
+    # transient infra. Task 2048's within-leg case (xdist-death output carrying
+    # both env markers and collateral FAILED lines) is decided by
+    # ``verify_classify._classify_pytest``'s own arm order, not by this rank.
+    # TYPE_ERROR outranks LINT_ERROR: correctness before style.
+    FailureCategory.TEST_FAILURE: CategoryPolicy(
+        severity_rank=11, archive=False, preexisting_probe=True,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
+    # A type-check leg's red that no more specific category claimed. A
+    # deterministic task fault, so is_infra_transient=False and
+    # retry_kind=NONE. verdict_indeterminate=False because predicate (1)
+    # fails: the leg reached an exit decision about the branch. archive and
+    # preexisting_probe mirror UNKNOWN_TEST_FAILURE, so every derived registry
+    # keeps today's membership for a type red; the only observable change is
+    # the name.
+    FailureCategory.TYPE_ERROR: CategoryPolicy(
+        severity_rank=12, archive=True, preexisting_probe=True,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
+    # The lint leg's counterpart of TYPE_ERROR, adjudicated identically.
+    FailureCategory.LINT_ERROR: CategoryPolicy(
+        severity_rank=13, archive=True, preexisting_probe=True,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
+    FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
+        severity_rank=14, archive=True, preexisting_probe=True,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
+    # Produced ONLY by ``verify.classify_leg``, never by ``classify_failure``:
+    # a PYTEST leg with no failure evidence whose session was torn down from
+    # outside the tests (a shell-reported SIGTERM/SIGINT/SIGHUP, or xdist's
+    # controller-only teardown signature).
+    # is_infra_transient=True, so it gets the bounded retry instead of a
+    # debugger dispatch on a clean tree. archive=True, which
+    # ``_assert_infra_transient_rows_archive`` requires and which keeps the log
+    # as the only forensic handle, as for INFRA_KILL. preexisting_probe=False:
+    # there are no failing ids to probe (mirrors INFRA_KILL).
+    # verdict_indeterminate=False: predicates (2) and (3) fail, because a
+    # branch can SIGTERM its own pytest, ``exit 143``, or print the signature
+    # text. So the leg keeps its veto over another host's PASS. Fail CLOSED.
+    FailureCategory.INFRA_ABORT: CategoryPolicy(
+        severity_rank=15, archive=True, preexisting_probe=False,
+        is_infra_transient=True, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
     # archive=True (task 3683): the only row in the infra-transient family
     # with a non-NONE retry_kind, and the retry still does not keep it away
     # from a human. ENV_SERIAL is a SINGLE bounded re-run ("retrying test
-    # command once", verify.py:5221-5233), and per task 3367 it fires only
-    # when the TEST leg failed (``attempt.test.cmd is not None and
-    # attempt.test.rc != 0``, :5220-5223) — so a LINT or TYPE leg classified
-    # ENV_TRANSIENT gets ZERO retries and is reported directly. Past that, the
-    # same family terminus: workflow.py:9020's default-5-attempt window stamps
+    # command once", verify.py::run_verification's env-recovery block), and it
+    # fires only when the TEST leg's OWN classification is ENV_TRANSIENT
+    # (task 4843; task 3367 first restricted it to the test leg) — so a LINT
+    # or TYPE leg classified ENV_TRANSIENT gets ZERO retries and is reported
+    # directly. Past that, the same family terminus: workflow.py:9020's
+    # default-5-attempt window stamps
     # escalate_to_human=True on exhaustion → blocking L1 at :14791 (also
     # merge_queue.py:3134 and verify.py:7255). Enforced by
     # ``_assert_infra_transient_rows_archive``.
@@ -355,29 +413,21 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # classifies ENV_TRANSIENT. That is a branch break wearing a host label,
     # so the leg keeps its veto. The row flips back to True only once shape-1
     # carries a POSITIVE worktree-removal anchor rather than being matched by
-    # the absence of a rustc span.
+    # the absence of a rustc span, AND the scope-spawn-failure arm
+    # (``verify_classify.py::_SCOPE_SPAWN_FAILURE_RE``, task 7258) stops being
+    # text evidence that a branch could print as a leg's sole output (task 7339).
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
-        severity_rank=11, archive=True, preexisting_probe=False,
+        severity_rank=16, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.ENV_SERIAL,
     ),
-    FailureCategory.TEST_FAILURE: CategoryPolicy(
-        severity_rank=12, archive=False, preexisting_probe=True,
-        is_infra_transient=False, verdict_indeterminate=False,
-        retry_kind=RetryKind.NONE,
-    ),
-    FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
-        severity_rank=13, archive=True, preexisting_probe=True,
-        is_infra_transient=False, verdict_indeterminate=False,
-        retry_kind=RetryKind.NONE,
-    ),
     FailureCategory.PASSED: CategoryPolicy(
-        severity_rank=14, archive=False, preexisting_probe=True,
+        severity_rank=17, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NONE: CategoryPolicy(
-        severity_rank=15, archive=False, preexisting_probe=True,
+        severity_rank=18, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),

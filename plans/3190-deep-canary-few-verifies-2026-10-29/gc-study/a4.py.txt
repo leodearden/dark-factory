@@ -1,0 +1,54 @@
+import re,json,datetime as dt,collections,statistics as st
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+R=re.compile(r'^(\S+) \S+ warm-lane-gc-sweep\.sh\[(\d+)\]: (.*)$')
+rename={};reaps=[];phase=collections.defaultdict(list);cur={};first_reset_after={};ends={}
+events=[]
+pid2last=[]
+for l in open('sweep.log',errors='replace'):
+    m=R.match(l.rstrip())
+    if not m: continue
+    t=T(m.group(1));pid=m.group(2);msg=re.sub(r'#033\[[0-9;]*m','',m.group(3))
+    a=re.search(r'Renaming non-empty \S+/(_\w+-\d+)/target → \S+/\.reseed-trash/(\S+)\.(\d+) before',msg)
+    if a: rename[a.group(3)]=(t,pid,a.group(1))
+    a=re.search(r'reaped stale reseed-trash entry: \S+/(\S+)\.(\d+) \(',msg)
+    if a: reaps.append((t,pid,a.group(1),a.group(2)))
+    a=re.search(r'resetting lane: (\S+)',msg)
+    if a:
+        events.append((t,pid,'reset',a.group(1)))
+    if 'reclaim complete' in msg: ends[pid]=t
+    # seed phases
+    for name,p in (('clone_start','Cloning '),('clone_done','Clone complete'),('stamp','Stamping sources'),('delta','delta-touch base'),('touched','Touched \\d+ git delta'),('post','Post-condition OK'),('inval','Invalidated'),('reloc','Relocated'),('relink','Relinked'),('trash','Removing reseed trash'),('rerere','rerere'),('hooks','stash-guard hooks armed'),('seeded','Warm lane seeded')):
+        if re.search(p,msg): cur.setdefault(pid,{}).setdefault(name,t)
+    if 'Warm lane seeded' in msg and pid in cur:
+        c=cur.pop(pid)
+        phase['total_seed'].append((c['seeded']-c.get('clone_start',c['seeded'])).total_seconds())
+        for x,y in (('clone_start','clone_done'),('clone_done','touched'),('touched','trash'),('trash','seeded')):
+            if x in c and y in c: phase[x+'->'+y].append((c[y]-c[x]).total_seconds())
+    a=re.search(r'Touched (\d+) git delta',msg)
+    if a: phase['delta_paths'].append(int(a.group(1)))
+for k,v in phase.items(): print(k,'n',len(v),'p50',round(pct(v,.5),1),'p90',round(pct(v,.9),1))
+# reaps: matched rename pid from previous sweep's last lane?
+match=collections.Counter();lags=[]
+pidsorted=sorted(ends.items(),key=lambda x:x[1])
+for t,pid,lane,tp in reaps:
+    r=rename.get(tp)
+    if not r: match['no rename line in timer log (orchestrator-arm or older seed)']+=1;continue
+    seedpid=r[1]
+    was_last=False
+    # last reset of that sweep pid
+    rr=[e for e in events if e[1]==seedpid]
+    if rr and rr[-1][3]==lane: was_last=True
+    match['last lane of prev timer sweep' if was_last else 'timer seed, not last lane']+=1
+    if seedpid in ends: lags.append((t-ends[seedpid]).total_seconds())
+print(match,'reap-minus-prev-end p50',round(st.median(lags)) if lags else None)
+# reap duration to next reset of same pid
+d=[]
+for t,pid,lane,tp in reaps:
+    nx=[e[0] for e in events if e[1]==pid and e[0]>t][:1]
+    if nx: d.append((nx[0]-t).total_seconds())
+print('first reset after reap p50',round(st.median(d)) if d else None)
+# non-final reaped lanes
+print([ (t.strftime('%m-%d %H:%M'),l,tp) for t,pid,l,tp in reaps if l not in ('_spec-0','_spec-1')])

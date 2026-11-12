@@ -34,12 +34,15 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import _psi_admission_yaml
 import pytest
 from _orch_helpers import idle_psi_sample
-from shared.psi import PsiSample
+from shared.psi import PsiSample, read_psi_sample
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
+
+_nondefault_psi_admission_yaml = _psi_admission_yaml.nondefault_psi_admission_yaml
 
 
 def _pending_task(
@@ -76,7 +79,9 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # Phase A: a saturated PSI sample — injected directly, never
         # sampled from the host — defers the non-deterministic candidate.
         # mem_some10=99.0 is over the default mem_some_avg10=15.0 threshold.
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
         scheduler.finish_startup()
         scheduler._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler._read_psi_sample = lambda: PsiSample(
@@ -92,10 +97,12 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # Phase B: idle_psi_sample() neutralizes the gate — the identical
         # candidate now dispatches on a fresh scheduler. ``_dispatched`` is
         # seeded identically to Phase A so min_inflight_floor is still met
-        # and the gate stays *engaged* (psi_in_flight >= floor); otherwise
+        # and the gate stays *engaged* (in-flight >= floor); otherwise
         # dispatch would succeed merely because the floor wasn't met, and
         # this phase would prove nothing about idle_psi_sample specifically.
-        scheduler2 = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler2 = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
         scheduler2.finish_startup()
         scheduler2._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler2._read_psi_sample = idle_psi_sample
@@ -120,7 +127,9 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         ``test_scheduler_state.py::test_bare_config_project_root_isolated_to_tmp``,
         the guard test for the sibling autouse ``_isolate_orch_config`` fixture.
         """
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1, psi_admission=PsiAdmissionConfig())
+        )
 
         # Behavior-level contract only: the bound reader returns a
         # non-saturating, successful sample regardless of host load. This is
@@ -140,20 +149,41 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         assert sample.io_some10 == 0.0
 
 
+class TestNonDefaultPsiAdmissionYaml:
+    """Guard test for this module's ``_nondefault_psi_admission_yaml`` fixture.
+
+    The explicit ``psi_admission=`` at every construction in the scheduler PSI
+    test files is load-bearing only while a bare config really inherits a
+    non-default block; this keeps the fixture from rotting into a no-op.
+    """
+
+    def test_bare_config_inherits_a_block_differing_on_every_leaf(self) -> None:
+        bare = OrchestratorConfig().psi_admission
+        code_default = PsiAdmissionConfig()
+
+        assert bare.enabled is False
+        assert bare.min_inflight_floor == 3
+        assert [
+            name
+            for name in PsiAdmissionConfig.model_fields
+            if getattr(bare, name) == getattr(code_default, name)
+        ] == []
+
+
 @pytest.mark.real_psi_reader
 def test_real_psi_reader_marker_restores_real_reader() -> None:
-    """With the marker, the real ``shared.psi.read_psi_sample`` binding is in place.
+    """With the marker, the module seam holds the real ``shared.psi.read_psi_sample``.
 
     Companion guard for the opt-out branch of conftest's autouse
     ``_hermetic_psi_reader`` fixture (the default, patched branch is covered
     by ``TestAutouseFixtureDefaultsToIdlePsi`` above). We don't actually call
-    the bound reader — that would read real, and therefore non-deterministic,
+    the reader — that would read real, and therefore non-deterministic,
     ``/proc/pressure/*`` values, reintroducing exactly the host dependence
-    task 2418 removes. Identity to the unpatched module attribute is the only
-    host-independent way to confirm the marker skipped the monkeypatch.
+    task 2418 removes. Identity at the module seam the fixture patches is the
+    only host-independent way to confirm the marker skipped the monkeypatch;
+    the scheduler binds that seam (with its project_id) at construction.
     Mirrors ``test_dry_run_unblock_autouse.py::test_exercise_dry_run_unblock_marker_disables_noop``.
     """
     import orchestrator.scheduler as scheduler_module
 
-    scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-    assert scheduler._read_psi_sample is scheduler_module.read_psi_sample
+    assert scheduler_module.read_psi_sample is read_psi_sample

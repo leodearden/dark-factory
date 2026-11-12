@@ -18,9 +18,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _dt_helpers import fixed_clock, installed_clock
 from starlette.testclient import TestClient
 
 from dashboard.data.metrics import METRICS_SCHEMA
+
+pytestmark = pytest.mark.usefixtures('samplers_off')
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -64,12 +67,37 @@ def _make_config(tmp_path: Path, *, fused_memory_urls=None, known_project_roots=
 
 @contextmanager
 def _override_client(config):
-    """Context manager: yield a TestClient with app.state.config overridden."""
+    """Context manager: yield a TestClient with app.state.config overridden.
+
+    Its lifespan starts no sampler because this module's ``pytestmark``
+    requests conftest's ``samplers_off`` (task 5826): the metrics sampler
+    dials ``dashboard.data.metrics.mcp_tool_call``, the seam these tests patch.
+    """
     from dashboard.app import app
 
     with TestClient(app) as c:
         app.state.config = config
         yield c
+
+
+# ---------------------------------------------------------------------------
+# harness: this module's lifespans run with samplers off (task 6292)
+# ---------------------------------------------------------------------------
+
+
+def test_this_modules_lifespans_run_with_samplers_off():
+    """The lifespan gates its samplers on the config it builds from env.
+
+    That gate is pinned in dashboard/tests/test_lifespan_samplers.py, so this
+    module needs only to prove that the env switch is off for its own tests.
+    """
+    from dashboard.config import DashboardConfig
+
+    assert DashboardConfig.from_env().samplers_enabled is False, (
+        "this module's pytestmark must request samplers_off: the metrics sampler "
+        'dials dashboard.data.metrics.mcp_tool_call (via _sample_curator -> '
+        'fan_out_list_tickets), the same seam these tests patch'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +154,13 @@ def test_curator_endpoint_returns_envelope_shape(client):
 def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     """CURATOR_STATE.pending is built from the list_tickets MCP fan-out.
 
-    Config has one root (tmp_path). The mock returns one ticket for that root.
-    Assertions: pending list has length 1; row fields are correct;
-    state.pending_total == 1.
+    Config has one root (tmp_path). The mock returns one ticket for that root,
+    created 120s before the instant the app's clock is pinned to.
+    Assertions: pending list has length 1; row fields are correct, its age
+    measured from the installed clock; state.pending_total == 1.
     """
-    now = datetime.now(UTC)
-    created_at_dt = now - timedelta(seconds=120)
-    created_at = created_at_dt.isoformat()
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    created_at = (now - timedelta(seconds=120)).isoformat()
 
     ticket_row = {
         'ticket_id': 'tkt_a',
@@ -141,11 +169,14 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     }
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
+    from dashboard.app import app
+
     config = _make_config(tmp_path)
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
         patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
+        installed_clock(app, fixed_clock(now)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
@@ -158,8 +189,7 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     assert row['title'] == 'task A'
     assert row['files'] == []
     assert row['created_at'] == created_at
-    assert isinstance(row['age_seconds'], (int, float))
-    assert abs(row['age_seconds'] - 120) < 10  # allow small tolerance
+    assert row['age_seconds'] == 120
 
     assert cs['state']['pending_total'] == 1
 
@@ -556,7 +586,7 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         'p99': {'labels': [], 'values': []},
     }
 
-    async def _mock_sparks(db, *, days):
+    async def _mock_sparks(db, *, days, now=None):
         sparks_started.set()
         return _empty_sparks
 

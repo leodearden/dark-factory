@@ -1,0 +1,127 @@
+# Machine-readable twin of merge-lane-policy-prd.capability-manifest.md
+prd: plans/merge-lane-policy-prd.md
+schema_version: 1
+signal_leaves: ["η", "ι"]
+tasks:
+  - label: "α"
+    task_id: 8523
+    title: "Instrument the lane: runner_reason, base_relation, cancelled verifies, void provenance, queue-to-land"
+    capabilities:
+      - name: "runner-reason-on-merge-verify"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "runner_reason"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "cancelled-verify-event"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_verify_cancelled"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "β"
+    task_id: 8524
+    title: "Re-anchor recovery re-merges on the live tip; re-anchor the merger; amend §5.3"
+    capabilities:
+      - name: "merger-re-anchor-hook"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def on_base_invalidated"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "remerge-base-decision"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def choose_remerge_base"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+  - label: "γ"
+    task_id: 8525
+    title: "Gate re-verify as a dispatch; successors re-anchor on the rebased head"
+    capabilities:
+      - name: "rebased-head-base-relation"
+        binding: "capability→producer — built here on α's field; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rebased_head"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+  - label: "δ"
+    task_id: 8526
+    title: "K = hosts + 1; release the host lease at verdict"
+    capabilities:
+      - name: "verified-pending-landing-status"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verified_pending_landing"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "ε"
+    task_id: 8527
+    title: "Chain the head when alone"
+    capabilities:
+      - name: "head-chains-when-alone"
+        binding: "guard 1 of _deep_chain_placement relaxed; judged by test_merge_queue_deep_dispatch.py rows"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a relaxed guard is a behaviour, not a new symbol; ι's readout observes chain_items > 1 on speculative=False rows"
+  - label: "ζ"
+    task_id: 8528
+    title: "Suspect-list bisect, depth table, chain_cap as kill switch"
+    capabilities:
+      - name: "depth-table-config"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "depth_table"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "chain-policy-state"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ChainPolicyState"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+  - label: "η"
+    task_id: 8531
+    title: "Hook parity with the merge gate's module checks, plus the screen leg for tree-read files"
+    capabilities:
+      - name: "hook-module-checks-helper"
+        binding: "capability→producer — built here; grep absent on main 72239dfd5d"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "hook_module_checks"
+          paths: ["hooks/", "scripts/"]
+          expect: present
+      - name: "hook-refuses-type-red-direct-commit"
+        binding: "rejection-check — boundary rows 10–11 in η's throwaway-repo test"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection is observed by η's own test against a throwaway repo"
+  - label: "ι"
+    task_id: 8532
+    title: "7-day canary readout of the policy predicates"
+    capabilities:
+      - name: "readout-reads-alpha-fields"
+        binding: "producer α upstream; the readout refuses to run without the fields (INV-13)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the readout is a committed measurement file; its predicates are judged by a human"

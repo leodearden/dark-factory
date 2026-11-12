@@ -3,8 +3,8 @@
 Covers:
   step-03 RED — module-level ``_DEBUG_ASSERTS`` flag and the
                 ``_assert_single_writer`` owner-task-identity guard, wired at
-                the lane-buffer mutation choke points (``_buffer_owned_request``'s
-                append, ``_pop_next_pickable``'s ``del buf[i]`` removal).
+                the lane-buffer mutation choke points (``buffer_owned_request``'s
+                append, ``pop_next_pickable``'s ``del buf[i]`` removal).
                 Exercises the full semantics matrix:
 
                   (1) flag OFF                              → always a no-op
@@ -15,7 +15,7 @@ Covers:
                                                                 drain tolerance)
                   (5) flag ON + owner task IS the caller      → no-op
 
-See ``_lane_buffers``' "Accessed only from the merger coroutine" docstring
+See the lane buffers' "Accessed only from the merger coroutine" comment in MergeIntake.__init__
 comment and ``_spawn_loop`` (stores ``self._merger_task``) for the
 single-writer discipline this enforces.
 
@@ -60,18 +60,18 @@ from typing import Literal, cast
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 from _orch_helpers import wait_responsive
 
-from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import InflightEntry, MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane import worker as merge_queue
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import InflightEntry, MergeRequest, SpeculativeMergeWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 #
-# _buffer_owned_request / _pop_next_pickable are pure in-memory lane-buffer
+# buffer_owned_request / pop_next_pickable are pure in-memory lane-buffer
 # operations that never touch the filesystem or shell out to git, so (unlike
 # the frozen-prefix / two-layer-invariant test files) no real git repo is
 # needed — a bare tmp_path stands in for project_root.
@@ -90,7 +90,7 @@ def git_config() -> GitConfig:
 
 @pytest.fixture
 def config(tmp_path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=tmp_path, git=git_config)
+    return lane_scene_config(tmp_path, git_config)
 
 
 @pytest.fixture
@@ -134,7 +134,7 @@ def e2e_git_ops(git_config: GitConfig, e2e_git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def e2e_config(e2e_git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=e2e_git_repo, git=git_config)
+    return lane_scene_config(e2e_git_repo, git_config)
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
@@ -236,8 +236,8 @@ class TestAssertSingleWriterLaneBufferWiring:
     """``_assert_single_writer`` at the merger-owned lane-buffer choke points (task 1999 I7).
 
     RED until step-04 GREEN adds the module flag, the helper, and wires it at
-    ``_buffer_owned_request``'s append and the ``del buf[i]`` removal inside
-    ``_pop_next_pickable``.
+    ``buffer_owned_request``'s append and the ``del buf[i]`` removal inside
+    ``pop_next_pickable``.
     """
 
     async def test_flag_off_is_noop_for_append_and_pop(
@@ -249,8 +249,8 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._merger_task = await _make_foreign_task()
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_foreign_owner_raises_on_append(
@@ -263,25 +263,25 @@ class TestAssertSingleWriterLaneBufferWiring:
 
         req = _make_req(config, tmp_path)
         with pytest.raises(AssertionError, match='_lane_buffers'):
-            worker._buffer_owned_request(req)
+            worker._intake.buffer_owned_request(req)
 
     async def test_flag_on_foreign_owner_raises_on_pop(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path, monkeypatch,
     ) -> None:
         """(2) Flag ON + running + foreign merger task: pop raises, naming the structure.
 
-        Seeds the buffer directly (bypassing ``_buffer_owned_request``) so the
+        Seeds the buffer directly (bypassing ``buffer_owned_request``) so the
         append and pop choke points are exercised independently.
         """
         worker = _make_worker(git_ops)
         req = _make_req(config, tmp_path)
-        worker._lane_buffers['normal'].append(req)
+        worker._intake.buffer_owned_request(req)
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker._merger_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_lane_buffers'):
-            worker._pop_next_pickable()
+            worker._intake.pop_next_pickable()
 
     async def test_flag_on_owner_task_none_is_noop(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path, monkeypatch,
@@ -292,8 +292,8 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._merger_task = None
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_not_running_is_noop(
@@ -306,8 +306,8 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._running = False
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
     async def test_flag_on_owner_is_current_task_is_noop(
@@ -319,8 +319,8 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._merger_task = asyncio.current_task()
 
         req = _make_req(config, tmp_path)
-        worker._buffer_owned_request(req)  # must not raise
-        popped = worker._pop_next_pickable()  # must not raise
+        worker._intake.buffer_owned_request(req)  # must not raise
+        popped = worker._intake.pop_next_pickable()  # must not raise
         assert popped is req
 
 
@@ -547,7 +547,7 @@ class TestDebugAssertsSuiteWideAndConformance:
         through a LIVE ``worker.run()`` (merger + verifier loops) to
         resolution — must complete cleanly with the debug asserts forced ON,
         proving the production merger/verifier coroutines only ever mutate
-        ``_lane_buffers``/``_inflight`` from their own recorded owner task
+        the lane buffers/``_inflight`` from their own recorded owner task
         (``self._merger_task`` / ``self._verifier_task``) — i.e. the steps
         04/06 wiring produces no false-positive ``AssertionError`` under a
         real run.

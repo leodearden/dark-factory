@@ -11,6 +11,9 @@ collision under --import-mode=importlib:
 5. No test file uses `from conftest import ...`.  The bare `conftest` module name
    collides in `sys.modules` across subprojects — each subproject exports its
    non-fixture helpers under a uniquely-named sibling module instead.
+6. No INV-12 governed-list declaration module imports, by bare name, a module
+   that two sys.path directories define — the same `sys.modules` collision as
+   rule 5, for the containers a declaration governs.
 
 See also:
   - tests/scripts/test_dashboard_service_template.py  — file-content pattern reference
@@ -19,6 +22,7 @@ See also:
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 import tomllib
@@ -64,6 +68,26 @@ _ALL_TEST_DIRS = [
 
 # Parts of a path that indicate vendored sub-library code — excluded from scans.
 _VENDORED_PARTS = frozenset({'graphiti', 'mem0', 'taskmaster-ai'})
+
+# The directories a root-bound run puts on sys.path for bare-name imports: each
+# subproject's tests/ (rule 1), plus the three that scripts/tests/conftest.py
+# and tests/scripts/conftest.py insert.
+_BARE_IMPORT_DIRS = [REPO_ROOT / sub / 'tests' for sub in _SUBPROJECTS_WITH_CONFTEST] + [
+    REPO_ROOT / 'scripts',
+    REPO_ROOT / 'scripts' / 'legibility',
+    REPO_ROOT / 'tests' / 'scripts',
+]
+
+
+def _ambiguous_module_names() -> dict[str, list[str]]:
+    """Each bare module name two or more _BARE_IMPORT_DIRS define, to the sorted dirs defining it."""
+    defining_dirs: dict[str, set[str]] = {}
+    for directory in _BARE_IMPORT_DIRS:
+        for py_file in directory.glob('*.py'):
+            if py_file.stem == '__init__':
+                continue
+            defining_dirs.setdefault(py_file.stem, set()).add(str(directory.relative_to(REPO_ROOT)))
+    return {name: sorted(dirs) for name, dirs in defining_dirs.items() if len(dirs) > 1}
 
 
 def test_subproject_conftests_add_tests_dir_to_sys_path() -> None:
@@ -266,6 +290,57 @@ def test_root_pyproject_omits_norecursedirs() -> None:
         'This workaround was needed when subprojects had tests/__init__.py files '
         'causing a tests.conftest namespace collision. Now that those files are '
         'removed, delete the norecursedirs line and its associated comment.'
+    )
+
+
+def test_no_governed_list_declaration_imports_a_bare_name_two_dirs_define() -> None:
+    """No INV-12 declaration module may import a bare module name two sys.path dirs define.
+
+    Scoped to declaration modules because there a wrong binding changes WHICH
+    list a declaration governs — silently, whenever the two copies' lengths
+    match. Matching the `governed_exceptions(` substring finds every declaring
+    file: the register refuses any other binding of the function
+    (scripts/exception_register.py::_renamed).
+
+    Offender format in the assertion message: path:lineno: name (defined in dirs)
+    """
+    ambiguous = _ambiguous_module_names()
+    offenders: list[str] = []
+    for test_dir in _ALL_TEST_DIRS + [REPO_ROOT / 'scripts' / 'tests']:
+        if not test_dir.exists():
+            continue
+        for py_file in sorted(test_dir.rglob('*.py')):
+            rel = py_file.relative_to(REPO_ROOT)
+            if _VENDORED_PARTS & set(rel.parts):
+                continue
+            source = py_file.read_text(encoding='utf-8')
+            if 'governed_exceptions(' not in source:
+                continue
+            for node in ast.walk(ast.parse(source, filename=str(rel))):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names = [node.module]
+                else:
+                    continue
+                for name in names:
+                    top = name.split('.', 1)[0]
+                    if top in ambiguous:
+                        offenders.append(
+                            f'{rel}:{node.lineno}: {top} (defined in {", ".join(ambiguous[top])})'
+                        )
+
+    assert not offenders, (
+        f'Found {len(offenders)} bare import(s) of an ambiguous module name in INV-12 '
+        'governed-list declaration modules.\n'
+        'In a root-bound run every one of these directories is on sys.path, and '
+        'sys.modules caches ONE module per bare name, so the declaration reads '
+        'whichever copy sys.path finds first. That copy either fails collection on a '
+        "count mismatch or silently governs another package's container.\n"
+        'Fix: move the container into a uniquely named sibling module (`fm_*.py`, '
+        '`shared_*.py`) and import it from both the owner and the declaration.\n'
+        'Offenders:\n'
+        + '\n'.join(f'  {o}' for o in offenders)
     )
 
 

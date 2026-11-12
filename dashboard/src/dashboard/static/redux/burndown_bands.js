@@ -28,11 +28,7 @@
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
-const {
-  isDatum: isBurndownDatum,
-  withReceipt: stampBurndownReceipt,
-  unknownDatum: unknownBurndownDatum,
-} = window.DF_DATUM;
+const { servedDatum: servedBurndownDatum } = window.DF_DATUM;
 const {
   MEMBERS: BAND_MEMBERS,
   VIEWS: BAND_VIEWS,
@@ -127,21 +123,19 @@ function parityBannerState(block, projects) {
 // ── A served burndown Datum, stamped with the burndown receipt ──
 // Every burndown block carries two served Datums, `latest` and `forecast`.
 // data.js registers BURNDOWN / BURNDOWN_BY_PROJECT as PLAIN, so the Datums
-// nested in them arrive carrying no receipt of their own; this stamps a COPY
-// with the /burndown receipt so datum.js can age it (task_snapshot.js's
-// snapshotDatum is the same reader for the /tasks unit). No receipt outranks
-// everything else: before the first payload, nothing absent is yet evidence of
-// anything.
+// nested in them arrive carrying no receipt of their own and need the
+// /burndown receipt stamped on before datum.js can age them. The receipt rule
+// is datum.js::servedDatum's; task_snapshot.js::snapshotDatum reads the /tasks
+// unit the same way.
 const BURNDOWN_ENDPOINT = '/api/v2/dashboard/burndown';
 
 function burndownDatum(data, block, field) {
-  const receipt = (data.__receipt || {})[BURNDOWN_ENDPOINT];
-  if (!receipt) return unknownBurndownDatum('not yet fetched');
-  const served = (block || {})[field];
-  if (!isBurndownDatum(served)) {
-    return unknownBurndownDatum('the burndown payload has no ' + field + ' Datum');
-  }
-  return stampBurndownReceipt(served, receipt);
+  return servedBurndownDatum(
+    (block || {})[field],
+    BURNDOWN_ENDPOINT,
+    'the burndown payload has no ' + field + ' Datum',
+    data.__receipt || {},
+  );
 }
 
 // ── How the Forecast tile reads a served forecast value ──

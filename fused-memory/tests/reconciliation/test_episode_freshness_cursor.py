@@ -13,24 +13,29 @@ time, so a same-day-earlier episode re-surfaced on every cycle forever.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ReconciliationRun,
+    RunType,
     StageId,
     StageReport,
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.memory_consolidator import (
-    MemoryConsolidator,
-    _is_newer_than_watermark,
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    next_episode_window_anchor,
+    recorded_unfinished_write_start,
 )
+from fused_memory.reconciliation.stage1_payload_format import is_newer_than_watermark
+from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -46,6 +51,7 @@ def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     memory_mock.mem0 = AsyncMock()
     memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
     memory_mock.get_status = AsyncMock(return_value={})
+    memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
 
     stage = MemoryConsolidator(
         StageId.memory_consolidator,
@@ -277,7 +283,7 @@ class TestIsNewerThanWatermarkTrue:
         ],
     )
     def test_returns_true(self, raw_ts):
-        assert _is_newer_than_watermark(raw_ts, _WM) is True, (
+        assert is_newer_than_watermark(raw_ts, _WM) is True, (
             f'Expected {raw_ts!r} to be newer than watermark {_WM.isoformat()!r}'
         )
 
@@ -293,7 +299,7 @@ class TestIsNewerThanWatermarkTrue:
         """
         watermark = datetime(2026, 8, 21, 2, 0, 0, tzinfo=UTC)
         raw_ts = '2026-08-20T20:00:00-07:00'  # == 2026-08-21T03:00:00+00:00
-        assert _is_newer_than_watermark(raw_ts, watermark) is True, (
+        assert is_newer_than_watermark(raw_ts, watermark) is True, (
             f'Expected {raw_ts!r} (= 2026-08-21T03:00:00+00:00) to be newer than '
             f'watermark {watermark.isoformat()!r}'
         )
@@ -311,7 +317,7 @@ class TestIsNewerThanWatermarkFalse:
         ],
     )
     def test_returns_false(self, raw_ts):
-        assert _is_newer_than_watermark(raw_ts, _WM) is False, (
+        assert is_newer_than_watermark(raw_ts, _WM) is False, (
             f'Expected {raw_ts!r} to NOT be newer than watermark {_WM.isoformat()!r}'
         )
 
@@ -328,7 +334,7 @@ class TestIsNewerThanWatermarkFalse:
         arrives as a datetime object or an int epoch rather than text. Must
         be classified as undatable (False) like any other unparseable
         value, never escape as an uncaught TypeError."""
-        assert _is_newer_than_watermark(raw_ts, _WM) is False, (
+        assert is_newer_than_watermark(raw_ts, _WM) is False, (
             f'Expected non-str value {raw_ts!r} to be treated as undatable '
             f'(False), not raise'
         )
@@ -350,13 +356,13 @@ class TestIsNewerThanWatermarkNaiveWatermarkSymmetry:
         aware_wm = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
 
         # Must not raise TypeError on naive-vs-aware datetime comparison.
-        naive_result = _is_newer_than_watermark(raw_ts, naive_wm)
+        naive_result = is_newer_than_watermark(raw_ts, naive_wm)
 
         assert naive_result is expected, (
-            f'Expected _is_newer_than_watermark({raw_ts!r}, <naive watermark>) == {expected}, '
+            f'Expected is_newer_than_watermark({raw_ts!r}, <naive watermark>) == {expected}, '
             f'got {naive_result}'
         )
-        assert naive_result == _is_newer_than_watermark(raw_ts, aware_wm), (
+        assert naive_result == is_newer_than_watermark(raw_ts, aware_wm), (
             'Naive watermark must behave identically to its UTC-aware twin'
         )
 
@@ -496,7 +502,7 @@ class TestUndatableFreshnessRecords:
         epoch from a malformed record) must be classified as undatable
         rather than raising out of assemble_payload —
         datetime.fromisoformat raises TypeError (not ValueError) for a
-        non-str, non-None argument, and _parse_instant must catch it too."""
+        non-str, non-None argument, and parse_instant must catch it too."""
         stage = _make_consolidator()
         stage.memory.get_episodes = AsyncMock(
             return_value=[{'uuid': 'ep-non-str-ts', 'created_at': 12345, 'content': 'x'}]
@@ -642,7 +648,7 @@ class TestWatermarkCutoffDisclosure:
     async def test_fresh_project_all_none_watermark_does_not_raise_or_emit_none(self):
         """A fresh project's all-None Watermark must degrade cleanly: no
         raise, and the literal 'None' must never appear as a stand-in for a
-        missing cutoff. _format_watermark's existing last_full_run_completed
+        missing cutoff. format_watermark's existing last_full_run_completed
         is-None short-circuit ('First run — no previous reconciliation.')
         already covers this by construction; pinned here so a future edit
         cannot silently regress it while adding the episode/memory lines."""
@@ -694,7 +700,7 @@ class TestAssembledPathOmitsFreshnessCutoffs:
     formats ContextAssembler's ``### Related Context`` items directly, never
     the episode/mem0 "new since last reconciliation" lists. It must
     therefore NOT emit the episode/memory freshness cutoff lines
-    _format_watermark adds for the time-windowed assemble_payload path:
+    format_watermark adds for the time-windowed assemble_payload path:
     showing them here would claim a relationship to the displayed items that
     does not exist (task 4574 review amendment)."""
 
@@ -743,3 +749,114 @@ class TestAssembledPathOmitsFreshnessCutoffs:
             f'Expected the assembled path to reset the undatable counter to 0, '
             f'got {stage._undatable_freshness_records}'
         )
+
+
+RUN_START = datetime(2026, 8, 22, 9, 0, 0, tzinfo=UTC)
+
+
+def _run_with_stage1(report: StageReport) -> ReconciliationRun:
+    return ReconciliationRun(
+        id='run-window',
+        project_id='test_project',
+        run_type=RunType.full,
+        trigger_reason='t',
+        started_at=RUN_START,
+        stage_reports={StageId.memory_consolidator.value: report},
+    )
+
+
+class TestUnfinishedGraphitiWriteSample:
+    """Stage 1 records when the earliest Graphiti write still executing began,
+    sampled just BEFORE its episode fetch, so the next cycle's episode window
+    starts no later than that (fused_memory/reconciliation/episode_window.py).
+    Driven through the REAL assemble_payload; only BaseStage.run's CLI tail is
+    replaced."""
+
+    @staticmethod
+    async def _run(stage: MemoryConsolidator) -> StageReport:
+        async def _fake_base_run(events, watermark, prior_reports, run_id, model=None, resume_session_id=None):
+            await stage.assemble_payload(events, watermark, prior_reports)
+            return StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={},
+            )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=_fake_base_run)):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project', last_episode_timestamp=WATERMARK_TS),
+                prior_reports=[],
+                run_id='run-window',
+            )
+
+    @pytest.mark.asyncio
+    async def test_unfinished_write_start_becomes_the_next_episode_anchor(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        sample = MagicMock(return_value=unfinished)
+        stage.memory.earliest_unfinished_graphiti_write_start = sample
+
+        report = await self._run(stage)
+
+        sample.assert_called_once_with('test_project')
+        assert next_episode_window_anchor(_run_with_stage1(report)).at == unfinished
+
+    @pytest.mark.asyncio
+    async def test_sample_is_taken_before_the_episode_fetch(self):
+        stage = _make_consolidator()
+        order: list[str] = []
+
+        def _sample(project_id):
+            order.append('sample')
+            return None
+
+        async def _fetch(*args, **kwargs):
+            order.append('fetch')
+            return []
+
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(side_effect=_sample)
+        stage.memory.get_episodes = AsyncMock(side_effect=_fetch)
+
+        await self._run(stage)
+
+        assert order[:2] == ['sample', 'fetch']
+
+    @pytest.mark.asyncio
+    async def test_nothing_executing_records_the_stat_and_anchors_at_run_start(self):
+        stage = _make_consolidator()
+
+        report = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in report.stats
+        assert next_episode_window_anchor(_run_with_stage1(report)).at == RUN_START
+
+    @pytest.mark.asyncio
+    async def test_reused_stage_records_none_on_a_later_assembled_run(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(return_value=unfinished)
+        first = await self._run(stage)
+        assert recorded_unfinished_write_start(_run_with_stage1(first)) == unfinished
+
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        second = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in second.stats
+        assert recorded_unfinished_write_start(_run_with_stage1(second)) is None
+
+    @pytest.mark.asyncio
+    async def test_reused_stage_records_none_on_a_later_remediation_run(self):
+        stage = _make_consolidator()
+        unfinished = RUN_START - timedelta(minutes=5)
+        stage.memory.earliest_unfinished_graphiti_write_start = MagicMock(return_value=unfinished)
+        first = await self._run(stage)
+        assert recorded_unfinished_write_start(_run_with_stage1(first)) == unfinished
+
+        stage.remediation_findings = [{'description': 'fix me'}]
+        second = await self._run(stage)
+
+        assert UNFINISHED_WRITE_START_STAT in second.stats
+        assert recorded_unfinished_write_start(_run_with_stage1(second)) is None

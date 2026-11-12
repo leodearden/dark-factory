@@ -40,6 +40,7 @@ forced on locally rather than grafted from the committed value — see
 from __future__ import annotations
 
 import pathlib
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -220,7 +221,7 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         # Deterministic fire — no need to wait the committed 300s debounce.
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -259,7 +260,9 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         # hardcoded literal), matching the watch-prefixes assertion above.
         assert f'--on-active={committed.orchestrator_restart_on_active_secs}' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
-        assert expected_script in pos_args
+        # task 5371: the fleet script runs DRAINED, so the merge-landed
+        # coordinator waits out every unit's in-flight merge verifies too.
+        assert pos_args[-3:] == ('/bin/sh', '-c', shlex.join([expected_script, '--drain']))
         assert orch_coord.is_pending is False
 
 
@@ -281,7 +284,7 @@ class TestBurstCoalescingUnderCommittedConfig:
         _graft_committed_restart_config(harness, committed)
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()

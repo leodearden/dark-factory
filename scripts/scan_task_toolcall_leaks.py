@@ -2,17 +2,17 @@
 """Detect leaked serialized tool-call XML fragments in Taskmaster task text.
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task text.
-Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-so the sweep is structurally incapable of the auto-mutation this tool is
-explicitly forbidden from doing. Remediation of any match this tool finds is
-a separate, manual, individually-reviewed follow-up (matching the
+Every database connection it opens goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of the auto-mutation this
+tool is explicitly forbidden from doing. Remediation of any match this tool
+finds is a separate, manual, individually-reviewed follow-up (matching the
 safe-vs-irreversible handling already applied to tasks 2080 and 2865) —
 never bulk-edited by this script.
 
 Background: a recurring recon Stage-2 serialization bug leaks a stray
-``</description>``/``</parameter>``/``</details>`` closing tag, followed by
-a real newline and one or more serialized ``<parameter name="...">``
+``\x3c/description>``/``\x3c/parameter>``/``\x3c/details>`` closing tag, followed by
+a real newline and one or more serialized ``\x3cparameter name="...">``
 tool-call fragments, into a task's description/details column. First seen
 as an apparent one-off on task 2080 (2026-07-04); recurred on task 2865 and,
 per a live read-only probe run while planning this task, on ~32 further
@@ -21,12 +21,12 @@ one-off manual fix.
 
 The discriminator (``LEAK_TAIL``) requires one or more REAL whitespace
 characters (``\\s+``) between the stray closing tag and the
-``<parameter name="...">`` fragment — a closing tag immediately followed by
-``<parameter`` with zero whitespace in between does not match. This
+``\x3cparameter name="...">`` fragment — a closing tag immediately followed by
+``\x3cparameter`` with zero whitespace in between does not match. This
 deliberately excludes prose that merely *mentions* the leak shape (e.g.
 tasks 2938/2939, which quote the ESCAPED literal ``\\n`` — two characters,
 backslash then ``n``, which is NOT a real whitespace character — and
-continue with trailing prose afterward): a naive ``<parameter name=``
+continue with trailing prose afterward): a naive ``\x3cparameter name=``
 substring scan over-reports on exactly this shape. Once those two
 conditions hold (the closing-tag literal, then real whitespace), the
 capture group extends greedily to end-of-string (``.*$``); that greedy
@@ -60,7 +60,6 @@ predicates over that one set rather than two independently spelled sets.
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -73,6 +72,7 @@ from _task_db_scan import (
     run_scan_cli,
     truncate,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # THE detector lives in fused_memory.utils.toolcall_xml_leak and is re-exported
 # here (task 3083). It is deliberately NOT redefined locally: a second copy of
@@ -111,6 +111,9 @@ if str(_FM_SRC) not in sys.path:
 # identical bootstrap and already pay it. Making a leaf importable without the
 # package init would be a shared-wide change and is deliberately not one this
 # task takes on.
+# The shared.tasks_db_readonly import ABOVE is sound without it: importing
+# _task_db_scan already ran `import _checkout`, which bound this checkout's
+# shared/src.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -149,14 +152,13 @@ class LeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[LeakMatch]:
     """Scan *db_path* read-only for leaked tool-call fragments.
 
-    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan
-    is structurally incapable of mutating live task text — even while the
-    fused-memory server holds the same file open in WAL mode for concurrent
-    writers. Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
-    row; ``metadata`` is deliberately never read (see module docstring).
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Applies :func:`detect_leak` to each of
+    ``SCANNED_COLUMNS`` per row; ``metadata`` is deliberately never read (see
+    module docstring).
     """
     matches: list[LeakMatch] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         cursor = conn.execute(
             "SELECT tag, id, title, description, details, test_strategy FROM tasks"
@@ -211,8 +213,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "READ-ONLY sweep for leaked serialized tool-call XML fragments in "
-            "Taskmaster task text (e.g. a stray </description> followed by a "
-            'serialized <parameter name="..."> tool-call fragment). '
+            "Taskmaster task text (e.g. a stray \x3c/description> followed by a "
+            'serialized \x3cparameter name="..."> tool-call fragment). '
             "Detection/reporting only -- never mutates task text."
         ),
         # The 0/1/2/3 codes are RETURNED BY run_scan_cli() in _task_db_scan.py,

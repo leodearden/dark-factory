@@ -17,7 +17,12 @@ Contents
   module without a cycle — validates through the identical rule.  See
   that module's docstring for the measured ``ImportError`` behind the
   split.
+* ``is_canonical`` — the one strict reading of the ``canonical`` marker,
+  defined in ``canonical_marker.py::is_canonical`` and re-exported here as
+  the same object.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
+* ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
+  this vocabulary that the writing reconciliation stage prompts interpolate.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -55,10 +60,16 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+# Re-exported as the same object, like the topic_slug names below.
+from fused_memory.canonical_marker import is_canonical
 
 # Re-exported, NOT redefined (task 3198, leaf ε).  These are bound to the
 # *same objects* the leaf module defines, so this registry remains the
@@ -82,23 +93,31 @@ from fused_memory.utils.validation import is_full_uuid
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
+    'CHILD_KINDS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
     'CanonicalUniquenessViolation',
+    'EXPERIMENTAL_KEY_PREFIX',
     'MemoryMetadataValidationError',
     'MetadataViolation',
+    'ORCHESTRATOR_COMPLETION_SOURCE',
     'PARENT_ID_DEAD_CODE',
     'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
+    'SUPERSEDED_BY_METADATA_KEY',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
+    'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
+    'is_canonical',
+    'is_orchestrator_completion_record',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
+    'render_metadata_vocabulary_guidance',
     'validate_memory_metadata',
 ]
 
@@ -108,6 +127,13 @@ __all__ = [
 #: it is experimenting should be able to say so without manufacturing census
 #: noise.
 EXPERIMENTAL_KEY_PREFIX = 'x_'
+
+#: Marks a ``server/grouped_read.py::CONTESTED_METADATA_KEY`` flag that write
+#: triage's judge stamped, not one an agent declared. Only
+#: ``server/tools.py::add_memory``'s contested attach writes it, and that tool
+#: discards any value a caller supplies. Read by
+#: ``plans/write-triage-link-healing-prd.md`` H1 row 2.
+TRIAGE_CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested_by_triage'
 
 
 def normalize_supersedes(value: Any) -> list[Any]:
@@ -129,8 +155,12 @@ def normalize_supersedes(value: Any) -> list[Any]:
     tolerance for the legacy scalar stays.  The readers are
     ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
     discriminator, which tests ``any()`` of the normalized members — see
-    ITS docstring for why member-level and not container truthiness) and
-    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    ITS docstring for why member-level and not container truthiness),
+    leaf 3112's closure predicate,
+    ``server/write_triage.py::declares_supersession`` (a declaration
+    force-stores the write instead of triaging it) and
+    ``services/supersession_mark.py::mark_superseded`` (which marks each
+    declared record superseded).  All go through this helper — INV-5:
     never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
@@ -153,6 +183,13 @@ def normalize_supersedes(value: Any) -> list[Any]:
     # Any other scalar (int, dict, ...) is wrapped rather than rejected —
     # the shape validator owns rejection, this function owns shape only.
     return [value]
+
+
+#: The ``kind`` values a child entry carries when its ``parent_id`` attaches it
+#: to a parent: the V1 child kinds, triage attach outcomes only.  Both were
+#: confirmed ABSENT from the live corpus, so :data:`KIND_REGISTRY` unions them
+#: in explicitly (its BLOCK 3) rather than inheriting them from the census.
+CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 
 
 #: The normative closed registry of Mem0 ``metadata.kind`` values
@@ -549,15 +586,9 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     'entity_standing_decision',
     'stage1_flag_marker',
     # ---------------------------------------------------------------
-    # BLOCK 3 — NEW IN THIS PRD (2 values)
-    #
-    # V1 child kinds, triage attach outcomes only.  Both confirmed
-    # ABSENT from the live corpus, so they are added explicitly rather
-    # than inherited from the census.
+    # BLOCK 3 — NEW IN THIS PRD: CHILD_KINDS, unioned in below.
     # ---------------------------------------------------------------
-    'amendment',
-    'sighting',
-})
+}) | CHILD_KINDS
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +682,15 @@ BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
     'stage2_suppress',       #  1,588
     'echo_used_provenance',  #  1,284
 })
+
+#: The ``source`` the orchestrator stamps on its task completion record
+#: (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._write_completion_to_memory``).
+ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
+
+
+def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
+    return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
 
 #: Union of every known layer, precomputed for the unknown-key scan.
 _KNOWN_METADATA_KEYS: frozenset[str] = (
@@ -1068,15 +1108,14 @@ def validate_memory_metadata(
                 f'truthiness, so 1/0 do not pass as True/False',
                 fatal=True,
             ))
-        # `is True`, not truthiness — for the reason 2b already documents
-        # above (`1 == True`), and so a non-bool value reports only the TYPE
-        # defect rather than being double-counted here.
+        # Read through is_canonical, so a non-bool value reports only the
+        # TYPE defect above rather than being double-counted here.
         #
         # Only the `topic` KEY's presence is tested: when it is present but
         # malformed, 2a's invalid_topic_slug already describes that defect,
         # and emitting both would report one defect twice while implying the
         # writer forgot a key they did supply.
-        elif canonical is True and 'topic' not in meta:
+        elif is_canonical(meta) and 'topic' not in meta:
             violations.append(_violation(
                 'canonical',
                 'canonical_without_topic',
@@ -1191,9 +1230,8 @@ def check_canonical_routing(
     * ``entity_types``, the only route to ``EntityNode.attributes``, is
       never supplied by any caller, so attributes are always ``{}``.
 
-    So the marker is never stored — hence never readable by its only live
-    reader (``pick_survivor`` in ``scripts/audit_duplicate_memories.py``,
-    which reads ``metadata.get('canonical')`` off Mem0 scroll results) and
+    So the marker is never stored — hence never readable by any reader,
+    all of which read Mem0 payloads — and
     never countable by the <=1-per-``(project, topic)`` probe, whose two
     round-trips are Qdrant payload filters.  Admitting such a write would
     silently destroy a caller's assertion, which is the fail-soft the house
@@ -1251,11 +1289,10 @@ def check_canonical_routing(
         default would let a future write path skip the check silently,
         which is the exact silence this rule removes.
     """
-    # `is True`, not truthiness — the same discipline rule 2b documents
-    # above (`1 == True`).  The int form is `invalid_canonical_type`'s
+    # Read through is_canonical: the int form is `invalid_canonical_type`'s
     # defect and is reported there; catching it here too would render one
     # mistake as two.
-    if meta.get('canonical') is not True or reaches_mem0:
+    if not is_canonical(meta) or reaches_mem0:
         return []
 
     return [_violation(
@@ -1273,3 +1310,51 @@ def check_canonical_routing(
         'Mem0 twin, or drop the canonical marker',
         fatal=True,
     )]
+
+
+# ---------------------------------------------------------------------------
+# Writer guidance
+# ---------------------------------------------------------------------------
+
+def render_metadata_vocabulary_guidance() -> str:
+    """Teach a writing reconciliation stage this vocabulary, from the registry values.
+
+    Plain, brace-free text the stage prompts interpolate. Its hand-written
+    orchestrator twin is
+    ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``;
+    ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py`` holds both
+    to this registry.
+    """
+    child_kinds = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+    public_blessed_keys = ', '.join(
+        f'`{key}`' for key in sorted(BLESSED_METADATA_KEYS) if not key.startswith('_')
+    )
+    return (
+        '## Memory Metadata Vocabulary\n'
+        '`add_memory` and `update_memory` validate their `metadata` dict on write, '
+        "and `consolidate_memories`' `topic` argument is the same slug namespace. "
+        'Five keys are RESERVED:\n'
+        f'- `topic` — a kebab-case slug matching `{TOPIC_SLUG_RE.pattern}`, at most '
+        f'{TOPIC_SLUG_MAX_LEN} characters: `memory-write-path` is valid, '
+        '`memory_write_path` and `Memory Write Path` are not. A legacy snake_case '
+        'topic seen in the corpus is not a spelling to copy; `consolidate_memories` '
+        'refuses it.\n'
+        '- `canonical` — a bool marking the one authoritative entry for a topic; '
+        'requires `topic`, at most one entry per project and topic may claim it, and '
+        'it is only meaningful on a write that reaches Mem0.\n'
+        '- `kind` — the record type, drawn from a closed registry; distinct from '
+        '`source`, which records writer provenance rather than record type.\n'
+        '- `parent_id` — a full 36-character UUID of a live entry this one attaches '
+        f'to; triage attach outcomes only, with `kind` {child_kinds}.\n'
+        '- `supersedes` — a LIST of full 36-character UUIDs this entry replaces; '
+        'never a bare string, even for a single UUID.\n'
+        f'The blessed conventional keys {public_blessed_keys} do not warn; use those '
+        'exact spellings. Any other key still writes but warns to a census line; if such '
+        f'an annotation is deliberate, prefix it `{EXPERIMENTAL_KEY_PREFIX}` and it '
+        'passes silently.\n'
+        'A malformed reserved key is censused while `memory_metadata.enforce` is off '
+        'and rejected while it is on; the rejection names the violated rule and '
+        f'`{MemoryMetadataValidationError.REGISTRY_LOCATION}`. The registry module '
+        '`fused-memory/src/fused_memory/memory_metadata.py` is the single normative '
+        'source for all of this; consult it rather than guessing.'
+    )

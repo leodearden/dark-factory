@@ -85,6 +85,9 @@ Unusable                      :class:`CorpusBuildError` naming the
 ``source_description``        offending value.
 ``n`` > population            :class:`CorpusBuildError` — never a quietly
                               shorter corpus.
+Payload kind outside          :class:`CorpusBuildError` naming the kinds
+:data:`KNOWN_PAYLOAD_KINDS`   and their ``source_description`` values —
+(build only)                  never a corpus silently re-stratified.
 Non-``GRAPH.RO_QUERY``        :class:`CorpusBuildError` from the reader's
 command attempted             client-side guard.
 ============================  ============================================
@@ -116,7 +119,8 @@ Status                Exit  Meaning and remedy
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
 complete at all — the store was unreachable, the requested corpus is
-unsatisfiable, stdout could not be written (a downstream reader closed the
+unsatisfiable, a build's population carries a payload kind outside
+:data:`KNOWN_PAYLOAD_KINDS`, stdout could not be written (a downstream reader closed the
 pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
 could not be written to ``--out`` (a full disk or an unwritable directory on
 the artifact path — distinct from the stdout case, which is a reader going away
@@ -141,7 +145,6 @@ import asyncio
 import dataclasses
 import hashlib
 import json
-import os
 import random
 import re
 import sys
@@ -150,12 +153,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from redis.exceptions import RedisError
 from shared.cli_boundary import (
     LoudArgumentParser,
     report_broken_pipe,
     reset_stdout_failure_state,
     run_cli,
 )
+
+from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
+from fused_memory.config.falkordb_endpoints import FalkorEndpoint
+from fused_memory.config.schema import FusedMemoryConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -202,9 +210,10 @@ writer's category, so stripping them keeps a tagged write in its category's
 stratum instead of landing in its own bogus payload-kind stratum.
 
 The set is deliberately closed: an unrecognised bracket tag stays part of a
-caller string and buckets as :data:`ADD_EPISODE_KIND`. The live smoke's
-payload-axis equality is what catches a new writer annotation; a respelling of
-either existing one is caught offline by
+caller string and buckets as :data:`ADD_EPISODE_KIND`. A new writer
+annotation therefore buckets outside :data:`KNOWN_PAYLOAD_KINDS` and the next
+build refuses (:func:`require_known_payload_kinds`); a respelling of either
+existing one is caught offline by
 ``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestPayloadKind::test_classifies_what_the_episode_writer_persists``,
 which classifies the description the real writer persists.
 """
@@ -228,6 +237,21 @@ ADD_EPISODE_KIND = 'add_episode'
 One explicit bucket rather than one stratum per caller string: the payload axis
 must stay a small closed set, or the cross-product fragments into hundreds of
 singleton cells and stratification stops meaning anything.
+"""
+
+KNOWN_PAYLOAD_KINDS: frozenset[str] = frozenset({
+    'decisions_and_rationale',
+    'temporal_facts',
+    'entities_and_relations',
+    'procedural_knowledge',
+})
+"""The declared payload census: every kind a build may stratify over.
+
+:data:`ADD_EPISODE_KIND` is deliberately absent, because an unrecognised writer
+annotation buckets there. Extend this set only after re-measuring the census: a
+new kind adds a row to the cross-tab and moves every stratum denominator. When
+the new kind comes from a writer annotation, extend
+:data:`_WRITER_ANNOTATIONS_RE` instead.
 """
 
 
@@ -385,7 +409,7 @@ def payload_kind(source_description: object) -> str:
 def content_hash(content: str, *, uuid: str | None = None) -> str:
     """Return the full 64-char SHA-256 hex digest of *content*'s UTF-8 bytes.
 
-    Deliberately NOT ``memory_eval_retrieval_probe.content_key()``, which is
+    Deliberately NOT ``fused_memory.eval.retrieval_probe.content_key()``, which is
     ``sha256(whitespace-normalized)[:16]``. That digest's job is stable
     *identity matching* of memory text across re-indentation and rewrapping;
     this one's job is the opposite — **drift detection** on replay inputs. For
@@ -415,6 +439,28 @@ def stratum_key(record: EpisodeRecord) -> tuple[str, str]:
     the stratification report would then misreport as real coverage.
     """
     return (month_bucket(record.created_at), payload_kind(record.source_description))
+
+
+def require_known_payload_kinds(population: list[EpisodeRecord]) -> None:
+    """Refuse a population whose payload axis reaches outside the declared census.
+
+    Subset, not equality: a declared kind that vanishes leaves the axis
+    closed. Raises :class:`CorpusBuildError` naming every undeclared kind and
+    up to five of the descriptions that produced it.
+    """
+    offenders: dict[str, set[str]] = {}
+    for record in population:
+        kind = payload_kind(record.source_description)
+        if kind not in KNOWN_PAYLOAD_KINDS:
+            offenders.setdefault(kind, set()).add(record.source_description)
+    if not offenders:
+        return
+    descriptions = sorted(set().union(*offenders.values()))
+    raise CorpusBuildError(
+        f'payload kinds outside KNOWN_PAYLOAD_KINDS: {sorted(offenders)}, '
+        f'from source_description values {descriptions[:5]}; '
+        're-measure the census before building the next corpus'
+    )
 
 
 ALLOCATION_RULE = 'min-1-floor + largest-remainder proportional, capped at cell size'
@@ -714,16 +760,6 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
 DEFAULT_GRAPH = 'dark_factory'
 """The graph this corpus is drawn from."""
 
-RO_COMMAND = 'GRAPH.RO_QUERY'
-"""The only FalkorDB command this builder is permitted to issue.
-
-Read-only here is **server-enforced**, not client-promised: a ``CREATE`` issued
-through this command path was refused in a live probe and materialized no
-graph. That is a strictly stronger guarantee than a client-side convention,
-and it is why this builder reads over Cypher rather than through the product
-read path.
-"""
-
 POPULATION_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
     f'e.{field}' for field in PROJECTED_FIELDS
 )
@@ -750,15 +786,11 @@ class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with host/port, in which case it opens a ``falkordb.asyncio``
-    client lazily.
-
-    ``falkordb.FalkorDB`` — the DB client — is categorically distinct from
-    ``graphiti_core.driver.falkordb_driver.FalkorDriver``, the graphiti driver
-    whose ``__init__`` fire-and-forgets ``build_indices_and_constraints()``.
-    This class must never construct the latter; see the module docstring's
-    warning and the in-tree precedent at
-    ``fused-memory/tests/test_list_indices_integration.py``.
+    double) or with the host/port of the FalkorDB to read (the CLI passes
+    :func:`configured_corpus_source`). Either way it reads through
+    ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
+    owns the read-only guard and opens the ``falkordb.asyncio`` client lazily,
+    on the first read, without ever constructing graphiti's ``FalkorDriver``.
     """
 
     def __init__(
@@ -769,40 +801,17 @@ class EpisodeReader:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
-        self._graph = graph
+        if graph is None and (host is None or port is None):
+            raise ValueError(
+                f'EpisodeReader needs a graph handle or a host and port, got host={host!r} '
+                f'port={port!r}'
+            )
         self.graph_name = graph_name
-        self.host = host if host is not None else _falkor_host_from_env()
-        self.port = port if port is not None else _falkor_port_from_env()
-
-    @staticmethod
-    def assert_read_only_command(command: str) -> None:
-        """Raise unless *command* is :data:`RO_COMMAND`.
-
-        A client-side guard layered on top of the server-side one. The server
-        would refuse a write anyway; this makes the violation a typed
-        :class:`CorpusBuildError` at the seam that owns the guarantee, rather
-        than a redis error surfacing from three layers down where a reader
-        would not connect it to this module's read-only claim.
-        """
-        if command != RO_COMMAND:
-            raise CorpusBuildError(
-                f'build_corpus may only issue {RO_COMMAND}, refused {command!r} — '
-                f'this script is strictly read-only'
-            )
-
-    def _resolve_graph(self) -> object:
-        """Return the graph handle, opening a client on first use.
-
-        The import is local so that merely importing this module — which the
-        tests do, with a double in hand — never drags in the falkordb client.
-        """
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            self._graph = FalkorDB(host=self.host, port=self.port).select_graph(
-                self.graph_name
-            )
-        return self._graph
+        self.host = host
+        self.port = port
+        self._reader = ReadOnlyGraphReader(
+            graph_name=graph_name, graph=graph, host=self.host, port=self.port
+        )
 
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
@@ -820,11 +829,17 @@ class EpisodeReader:
         DRAWN, and an undrawn one would still be counted in its stratum's
         denominator. Content is the replay experiment's independent variable,
         so an unusable one is exactly the condition that must be loud.
+
+        Should the shared guard ever refuse a primitive on this read, the
+        refusal surfaces as a :class:`CorpusBuildError` too, so it reaches the
+        CLI as an ``error:`` line and exit 1 rather than a traceback. It cannot
+        fire today: the read resolves only ``ro_query``, which the guard
+        forwards.
         """
-        self.assert_read_only_command(RO_COMMAND)
-        graph = self._resolve_graph()
-        response = await graph.ro_query(POPULATION_CYPHER)  # type: ignore[attr-defined]
-        rows = getattr(response, 'result_set', response)
+        try:
+            rows = await self._reader.read_unpaged(POPULATION_CYPHER)
+        except NonReadOnlyCommandError as exc:
+            raise CorpusBuildError(f'build_corpus is strictly read-only: {exc}') from exc
         population: list[EpisodeRecord] = []
         for index, row in enumerate(rows):
             if len(row) != len(PROJECTED_FIELDS):
@@ -848,37 +863,6 @@ class EpisodeReader:
                 f'build a corpus from an empty population'
             )
         return population
-
-
-def _falkor_host_from_env() -> str:
-    """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
-
-    Same env vars and defaults as ``fused-memory/tests/_fm_helpers.py``, so an
-    operator who has pointed the test suite at a FalkorDB has pointed this
-    script at the same one.
-    """
-    return os.environ.get('FALKOR_HOST', 'localhost')
-
-
-def _falkor_port_from_env() -> int:
-    """FalkorDB port from ``FALKOR_PORT``, defaulting to 6379.
-
-    The ``int()`` is load-bearing: ``os.environ`` yields str and
-    ``FalkorDB(port='6379')`` misbehaves. Unset *or empty* takes the default —
-    empty is what a CI template like ``FALKOR_PORT: ${FALKOR_PORT}`` produces
-    when the variable is not set. A non-empty non-numeric value is an operator
-    error and says so, rather than reading as "FalkorDB not reachable".
-    """
-    raw = os.environ.get('FALKOR_PORT', '').strip()
-    if not raw:
-        return 6379
-    try:
-        return int(raw)
-    except ValueError:
-        raise CorpusBuildError(
-            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
-            f'default (6379), or set it to the port your FalkorDB listens on.'
-        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -1649,6 +1633,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configured_corpus_source() -> FalkorEndpoint:
+    """The FalkorDB ``FusedMemoryConfig()`` names (``FALKORDB_URI``): where the corpus lives."""
+    return FalkorEndpoint.from_uri(FusedMemoryConfig().graphiti.falkordb.uri)
+
+
 def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     """Read the whole ``Episodic`` population from *graph_name*.
 
@@ -1665,12 +1654,15 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     restart FalkorDB when the fix is a path. Attribution has to be true by
     construction, not by the hope that nothing else in the run raises.
 
-    Both the constructor and the ``asyncio.run`` are inside the ``try``:
-    :meth:`EpisodeReader._resolve_graph` imports and connects the client, so a
-    failure from there is genuinely a store-connectivity condition too.
+    The ``asyncio.run`` is inside the ``try`` because constructing the reader
+    opens nothing: the shared reader opens and connects the client lazily, on
+    the first read, so a failure from there is genuinely a store-connectivity
+    condition too.
     """
+    source = configured_corpus_source()
+    reader = EpisodeReader(graph_name=graph_name, host=source.host, port=source.port)
     try:
-        return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+        return asyncio.run(reader.fetch_population())
     except _store_error_types() as exc:
         raise CorpusBuildError(
             f'the store could not be read ({type(exc).__name__}): {exc}'
@@ -1680,6 +1672,7 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
 def _run_build(args: argparse.Namespace) -> int:
     """Build mode: sample, report, and (unless ``--dry-run``) write."""
     population = _fetch_population(args.graph)
+    require_known_payload_kinds(population)
     result = select(population, args.n, seed=args.seed)
     manifest = build_manifest(
         result, population, n=args.n, seed=args.seed, graph=args.graph
@@ -1765,21 +1758,11 @@ def _emit_verdict(report: VerifyReport) -> int:
 def _store_error_types() -> tuple[type[BaseException], ...]:
     """The exception types that mean "the store could not be read".
 
-    Two measured facts shape this, both re-confirmed on redis 7.4.0 rather than
-    assumed:
-
-    1. ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — the MRO
-       of ``redis.exceptions.ConnectionError`` is ``ConnectionError ->
-       RedisError -> Exception``. So catching ``OSError`` alone, the obvious
-       reading, would still let an unreachable FalkorDB escape as a traceback:
-       exactly the case exit ``1`` is documented to cover.
-    2. The import is function-local, matching :meth:`EpisodeReader._resolve_graph`,
-       so merely importing this module — which the tests do, with a double in
-       hand — never drags in the client. It tolerates ``ImportError`` because
-       ``redis`` is only a transitive dependency
-       (``graphiti-core[falkordb]`` -> ``falkordb`` -> ``redis``); without the
-       client installed there is no FalkorDB to be unreachable, and ``OSError``
-       alone is then the whole story.
+    ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — measured on
+    redis 7.4.0, the MRO of ``redis.exceptions.ConnectionError`` is
+    ``ConnectionError -> RedisError -> Exception``. So catching ``OSError``
+    alone, the obvious reading, would still let an unreachable FalkorDB escape
+    as a traceback: exactly the case exit ``1`` is documented to cover.
 
     ``RedisError`` rather than ``ConnectionError`` so a server-side
     ``ResponseError`` also exits with a message instead of a traceback. The
@@ -1787,10 +1770,6 @@ def _store_error_types() -> tuple[type[BaseException], ...]:
     keeps "unreachable" and "query rejected" distinguishable in the text
     without needing two clauses.
     """
-    try:
-        from redis.exceptions import RedisError  # noqa: PLC0415
-    except ImportError:
-        return (OSError,)
     return (OSError, RedisError)
 
 

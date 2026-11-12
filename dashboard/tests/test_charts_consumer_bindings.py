@@ -28,8 +28,8 @@ The parser is the shared one in ``_dashboard_helpers`` (``DF_CHARTS_DESTRUCTURE_
 and ``destructure_bindings``), so this is not a second dialect of the same line.
 That helper returns ``(canonical, local)`` PAIRS and this module projects the
 LOCAL half, because the alias is what the file renders by and therefore what
-must be referenced; test_charts_axis_labels.py projects the CANONICAL half off
-the same pairs.
+must be referenced; test_tab_burndown.py projects the CANONICAL half off the
+same pairs.
 """
 
 from __future__ import annotations
@@ -64,8 +64,8 @@ def _local_names(destructured: str) -> list[str]:
     ``{ StackedAreaChart, HistBar: HB }`` binds ``StackedAreaChart`` and ``HB``
     — the alias is what the file actually renders by, so the alias is what must
     be referenced.  A projection over the shared `destructure_bindings`; the
-    canonical half is what test_charts_axis_labels.py projects off the same
-    pairs, so the two must never be confused (see the negative control below).
+    canonical half is what test_tab_burndown.py projects off the same pairs,
+    so the two must never be confused (see the negative control below).
     """
     return [local for _canonical, local in destructure_bindings(destructured)]
 

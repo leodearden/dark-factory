@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -356,14 +357,12 @@ def _tool_service(results: list[MemoryResult]) -> AsyncMock:
 
 
 def _provider_answering(answer: dict) -> MagicMock:
-    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is.
+    """A fake ``AsyncOpenAI`` that answers *answer* on the Responses API.
 
-    It answers on the Responses API with a real-shaped usage, reasoning tokens
-    included, so the tool-level path carries a verdict with usage end to end.
+    Its usage is real-shaped, reasoning tokens included, so the tool-level
+    path carries a verdict with usage end to end.
     """
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    client = sdk_client_double()
     client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
         output_text=json.dumps(answer),
         status='completed',

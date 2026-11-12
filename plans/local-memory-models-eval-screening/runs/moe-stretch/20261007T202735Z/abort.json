@@ -1,0 +1,17 @@
+{
+  "arm_id": "moe-stretch",
+  "error_classes": [
+    "TimeoutError",
+    "TimeoutError",
+    "TimeoutError",
+    "TimeoutError",
+    "TimeoutError"
+  ],
+  "item_ids": [
+    "8ed66f45-dde5-4c43-9812-9136d45beb6e",
+    "62f8f47b-42b5-47a3-95f6-64a8f1c8cead",
+    "026c9418-e82c-4793-a6a3-ab1421e5eff3",
+    "3137f2d8-0e96-4269-a91f-a199f50a96ad",
+    "32589460-bc9c-43e0-ac07-440933459352"
+  ]
+}

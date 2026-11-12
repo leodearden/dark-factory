@@ -3,12 +3,19 @@
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _queued_write_fixtures import enqueued, envelope, episode_write, queued
 
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    measure_llm_tokens,
+)
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueuedMem0Fact
 from fused_memory.services.write_journal import WriteJournal
 
 
@@ -32,6 +39,7 @@ def service(mock_config, write_journal):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -97,21 +105,21 @@ async def test_add_episode_logs_write_op_with_causation(service, write_journal):
 
 @pytest.mark.asyncio
 async def test_add_episode_propagates_causation_to_queue(service, write_journal):
-    """Causation_id is injected into the queue payload for later Layer 2 logging."""
+    """Causation_id is carried on the queued value's envelope for later Layer 2 logging."""
     cid = str(uuid.uuid4())
     await service.add_episode(
         content='Test content',
         project_id='test',
         causation_id=cid,
     )
-    payload = service.durable_queue.enqueue.call_args[1]['payload']
-    assert payload['_causation_id'] == cid
-    assert '_write_op_id' in payload
+    value = service.durable_queue.enqueue.call_args.args[0]
+    assert value.envelope.causation_id == cid
+    assert value.envelope.write_op_id is not None
 
 
 @pytest.mark.asyncio
 async def test_graphiti_write_logs_backend_op(service, write_journal):
-    """_execute_graphiti_write logs Layer 2 with causation from payload."""
+    """_execute_graphiti_write logs Layer 2 with causation from the value's envelope."""
     cid = str(uuid.uuid4())
     wid = str(uuid.uuid4())
     payload = {
@@ -123,7 +131,7 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
         '_causation_id': cid,
         '_write_op_id': wid,
     }
-    await service._execute_graphiti_write('add_episode', payload)
+    await service._execute_graphiti_write(queued('add_episode', payload))
     backend_ops = await write_journal.get_backend_ops_for_write_op(wid)
     assert len(backend_ops) == 1
     assert backend_ops[0]['backend'] == 'graphiti'
@@ -132,7 +140,7 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
 
 @pytest.mark.asyncio
 async def test_dual_write_callback_enqueues_with_causation(service, write_journal):
-    """Dual-write callback batch-enqueues facts with causation_id in payload."""
+    """Dual-write callback batch-enqueues facts with causation_id on the envelope."""
     from _fm_helpers import MockAddEpisodeResult, MockEdge
 
     cid = str(uuid.uuid4())
@@ -140,19 +148,18 @@ async def test_dual_write_callback_enqueues_with_causation(service, write_journa
         MockEdge(fact='Always use type hints in Python'),
     ])
 
-    payload = {
-        'project_id': 'test',
-        'agent_id': 'test-agent',
-        '_causation_id': cid,
-    }
-    await service._dual_write_callback('dual_write_episode', result, payload)
+    value = episode_write(
+        envelope=envelope(agent_id='test-agent', causation_id=cid),
+    )
+    await service._dual_write_callback(value, result)
 
     service.durable_queue.enqueue_batch.assert_called_once()
-    batch = service.durable_queue.enqueue_batch.call_args[0][0]
+    batch = enqueued(service.durable_queue.enqueue_batch)
     assert len(batch) == 1
-    assert batch[0]['operation'] == 'mem0_classify_and_add'
-    assert batch[0]['payload']['_causation_id'] == cid
-    assert batch[0]['payload']['fact_text'] == 'Always use type hints in Python'
+    fact, _callback = batch[0]
+    assert isinstance(fact, QueuedMem0Fact)
+    assert fact.envelope.causation_id == cid
+    assert fact.fact_text == 'Always use type hints in Python'
 
 
 @pytest.mark.asyncio
@@ -162,7 +169,7 @@ async def test_search_logged_when_causation_present(service, write_journal):
 
     # Without causation — no log
     await service.search(query='test', project_id='test')
-    ops = await write_journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await write_journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 0
 
     # With causation — logged
@@ -258,12 +265,12 @@ async def test_execute_mem0_write_journals_on_failure(service, write_journal):
 
     with pytest.raises(RuntimeError):
         await service._execute_mem0_write(
-            {
+            queued('mem0_add', {
                 'content': 'a fact that never lands',
                 'project_id': 'test',
                 '_write_op_id': op_id,
                 'metadata': {'category': 'preferences_and_norms'},
-            }
+            })
         )
 
     row = await write_journal.get_write_op(op_id)
@@ -287,12 +294,12 @@ async def test_execute_mem0_write_still_journals_on_success(service, write_journ
     op_id = str(uuid.uuid4())
 
     await service._execute_mem0_write(
-        {
+        queued('mem0_add', {
             'content': 'a fact that lands',
             'project_id': 'test',
             '_write_op_id': op_id,
             'metadata': {'category': 'preferences_and_norms'},
-        }
+        })
     )
 
     row = await write_journal.get_write_op(op_id)
@@ -334,12 +341,12 @@ async def test_execute_mem0_write_journals_cancellation_as_failure(
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(
             service._execute_mem0_write(
-                {
+                queued('mem0_add', {
                     'content': 'a fact cancelled mid-flight',
                     'project_id': 'test',
                     '_write_op_id': op_id,
                     'metadata': {'category': 'preferences_and_norms'},
-                }
+                })
             ),
             0.2,
         )
@@ -541,3 +548,199 @@ async def test_causation_search_row_carries_the_widened_shape(service, write_jou
         'The query bound is disclosed on this row too — one contract, three '
         f'producers. got {params!r}.'
     )
+
+
+# ── task 3716: per-call backend telemetry on the persisted Layer-2 row ──
+#
+# The 10 ms sleep is the floor; 9.0 ms leaves ~1 ms for asyncio firing a timer
+# up to one clock resolution early (perf_counter and the loop clock are both
+# CLOCK_MONOTONIC on Linux).
+
+_SLEEP_SECONDS = 0.01
+_MIN_MEASURED_MS = 9.0
+
+
+@pytest.mark.asyncio
+async def test_successful_backend_call_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+
+    async def _slow_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return {'results': [{'id': 'mem0-1'}]}
+
+    service.mem0.add = _slow_add
+
+    await service.add_memory(
+        content='a fact that takes a while to land',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert isinstance(mem0_add['duration_ms'], float)
+    assert mem0_add['duration_ms'] >= _MIN_MEASURED_MS
+
+
+@pytest.mark.asyncio
+async def test_failed_backend_call_still_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+
+    async def _slow_failing_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        raise RuntimeError('mem0 exploded after burning time')
+
+    service.mem0.add = _slow_failing_add
+
+    await service.add_memory(
+        content='a fact that never lands',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [backend_row] = [o for o in ops if o['layer'] == 'backend_op']
+    assert backend_row['success'] == 0
+    assert isinstance(backend_row['duration_ms'], float)
+    assert backend_row['duration_ms'] >= _MIN_MEASURED_MS
+
+
+_EPISODE_RESULT = 'episode-result-sentinel'
+
+
+def _graphiti_write_payload(cid: str, wid: str) -> dict:
+    return {
+        'name': 'test',
+        'content': 'test content',
+        'source': 'text',
+        'group_id': 'test',
+        'source_description': '',
+        '_causation_id': cid,
+        '_write_op_id': wid,
+    }
+
+
+@pytest.fixture
+def llm_tracked_client(service) -> SimpleNamespace:
+    """The graphiti mock's token probe measures this client's tracker."""
+    client = SimpleNamespace(token_tracker=AttributingTokenUsageTracker())
+    service.graphiti.token_probe = lambda: measure_llm_tokens(client)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_graphiti_write_persists_its_llm_tokens_and_duration(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 120, 45)
+        return _EPISODE_RESULT
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert isinstance(row['duration_ms'], float)
+    assert row['duration_ms'] > 0
+    summary = json.loads(row['result_summary'])
+    assert summary['tokens'] == {
+        'input_tokens': 120,
+        'output_tokens': 45,
+        'total_tokens': 165,
+        'llm_calls': 1,
+    }
+    assert summary['result'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_failed_graphiti_write_still_persists_the_tokens_it_recorded(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 10, 2)
+        raise RuntimeError('extraction failed after an LLM call')
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='extraction failed'):
+        await service._execute_graphiti_write(
+            queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert json.loads(row['result_summary'])['tokens']['total_tokens'] == 12
+
+
+@pytest.mark.asyncio
+async def test_mem0_backend_row_keeps_its_plain_string_result_summary(
+    service, write_journal, llm_tracked_client
+):
+    cid = str(uuid.uuid4())
+
+    await service.add_memory(
+        content='a fact with no graphiti LLM spend',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert mem0_add['result_summary'] == str({'results': [{'id': 'mem0-1'}]})
+    assert 'tokens' not in mem0_add['result_summary']
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_graphiti_write_keeps_its_plain_result_summary(
+    service, write_journal
+):
+    service.graphiti.add_episode = AsyncMock(return_value=_EPISODE_RESULT)
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 1
+    assert row['result_summary'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_a_token_probe_that_cannot_open_is_journaled_as_the_backend_failure(
+    service, write_journal
+):
+    def _unopenable_probe():
+        raise RuntimeError('token probe unavailable')
+
+    service.graphiti.token_probe = _unopenable_probe
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='token probe unavailable'):
+        await service._execute_graphiti_write(
+            queued('add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid))
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert row['error'] == 'RuntimeError: token probe unavailable'
+    assert isinstance(row['duration_ms'], float)
+    service.graphiti.add_episode.assert_not_awaited()

@@ -15,9 +15,10 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage1.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, no task is live
-     this cycle — neither through a per-task signal nor through the project-wide
-     lock — and none has landing evidence; no live-workflow suppression applies …"
+    "If `### Live-Workflow Signals` is absent from the payload, no task the
+     `### Active Task Tree` lists is live this cycle — neither through a
+     per-task signal nor through the project-wide lock — and none of them has
+     landing evidence; no live-workflow suppression applies to them …"
 
 That sentence makes absence load-bearing: a builder that omits the section is
 not merely terser, it makes the model conclude something FALSE. That — not

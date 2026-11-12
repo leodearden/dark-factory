@@ -381,91 +381,12 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     )
 
 
-# The tests/scripts suite's own measured wall-clock. EVERY recorded run, the
-# inconvenient ones included: task 3350 exists because a single unrecorded
-# estimate ("Full warm verify here is ~2 min") was left standing in the root
-# yaml until it was off by an order of magnitude.
-#
-#   VERBATIM runs of the test_command this module config declares
-#   (`uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300`):
-#     233.50s, 167.73s               task 3350's worktree at HEAD 9d6af5289f;
-#                                    369 passed / 1 skipped each
-#     146.93s wall / 142.11s pytest  task 3703 pre-1 run A, base d6a5e32535;
-#                                    rc=0, 1072 passed / 2 skipped / 6
-#                                    deselected; /proc/loadavg 51.66 at start
-#                                    on a 32-core host
-#     185.29s wall / 180.47s pytest  task 3703 pre-1 run B, same base, same
-#                                    counts, rc=0; loadavg 61.43 at start
-#     353.63s, 374.40s               esc-4240-1 / esc-4240-3, on the task 4240
-#                                    branch (a tree carrying that task's extra
-#                                    module). Both derive the same 700s floor
-#                                    as the worst below, so nothing here hinges
-#                                    on which of the three is largest
-#     136.37s wall / 132.95s pytest  task 4320 architect sweep run 1, THIS
-#                                    branch at base 5c9d4817fb; rc=0, 1256
-#                                    passed / 2 skipped / 6 deselected;
-#                                    loadavg 263.26 -> 51.45, 32-core host
-#     153.57s wall / 149.97s pytest  architect run 2, same base/counts, rc=0;
-#                                    loadavg 51.45 -> 69.83
-#     283.00s wall / 270.40s pytest  architect run 3, same base/counts, rc=0;
-#                                    loadavg 69.83 -> 119.24
-#     397.47s wall                   architect run 4, same base/counts, rc=0;
-#                                    loadavg 119.24 -> 187.04.  <-- WORST
-#     323.88s wall                   architect run 5, same base/counts, rc=0;
-#                                    loadavg 187.04 -> 130.22
-#     234.34s wall / 230.67s pytest  task 4320 pre-1 run 1, same base; rc=0,
-#                                    1256 passed / 2 skipped / 6 deselected;
-#                                    loadavg 97.08 -> 154.41
-#     215.70s wall / 212.52s pytest  pre-1 run 2, same base/counts, rc=0;
-#                                    loadavg 154.41 -> 103.93
-#     172.19s wall / 167.41s pytest  pre-1 run 3, same base/counts, rc=0;
-#                                    loadavg 103.93 -> 80.03
-#     195.36s wall / 188.50s pytest  pre-1 run 4, same base/counts, rc=0;
-#                                    loadavg 80.03 -> 85.81
-#     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
-#                                    loadavg 85.81 -> 103.79
-#
-#   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
-#   nobody sizes this budget against them again:
-#     105-127s                       four runs on the __fallback__ path (task
-#                                    3062, esc-3062-3) — the fleet chain's
-#                                    legs narrowed to this diff, not the
-#                                    command declared here
-#
-# SIZING RULE: the WORST RUN, never the mean and never fresh-only, across the
-# UNION of every VERBATIM run above. Task 4320's own five fresh runs all came in
-# BELOW the 397.47s worst — the freshest of them at 148.20s — so sizing on them
-# would have LOWERED the floor from 700 back to 400 and left the then-declared
-# 600s budget passing. That is the unsafe direction, and recording the
-# inconvenient figure rather than only the convenient one is what makes the rule
-# operative.
-#
-# CORRECTED IN PLACE (task 4320). This paragraph used to read "HONEST CAVEAT ...
-# 233.50s was measured when this suite collected 369 tests, and it now collects
-# 1072 ... It is therefore a LOWER BOUND on today's contended worst case, not a
-# current measurement." That is no longer true in either half: the suite has
-# been RE-MEASURED under load on this branch (ten fresh VERBATIM runs, listed
-# above, at 1256 passed / 2 skipped / 6 deselected), so this constant is a
-# current measurement rather than a lower bound. Corrected rather than deleted,
-# because the caveat is why the re-measurement happened; corrected rather than
-# left standing, because an authoritative-reading comment a later change has
-# falsified is precisely the defect this file exists to remove.
-#
-# THE SPREAD IS LOAD, AND LOAD DOES NOT PREDICT WALL CLOCK. 136.37s -> 397.47s
-# is a 2.91x band on a BYTE-IDENTICAL command and tree within one session, which
-# is why the worst RUN and not any single fresh one sizes the floor. But the
-# loadavg annotations must not be read as a normalisation knob: the FASTEST run
-# of the architect's sweep started at the HIGHEST load of its five (263.26) and
-# the slowest at 119.24, and in task 4320's own sweep run 3 started at a HIGHER
-# load than run 4 (103.93 vs 80.03) and finished FASTER (172.19s vs 195.36s). A
-# figure annotated "recorded at loadavg N" therefore CANNOT be scaled back to a
-# clean-host number — re-measure instead.
-#
-# PROVENANCE CAVEAT RETIRED (task 4320): the 353.63s / 374.40s figures were
-# recorded on the task 4240 branch and could be argued to be inflated by that
-# task's extra module. 397.47s was measured on a tree WITHOUT it, at ~57 FEWER
-# collected tests, and still exceeds both — so the caveat is settled by
-# construction rather than by subtraction, and no figure here needs discounting.
+# The WORST run on record of the SERIAL form of this module's test_command
+# (without `-n auto --dist loadgroup`): the form verify's ENV_TRANSIENT recovery
+# re-runs under the same per-command budget. Every run behind this figure, each
+# labelled by the command that produced it, and the sizing rule are recorded
+# ONCE, in the MEASUREMENT PROVENANCE block above verify_command_timeout_secs in
+# tests/scripts/orchestrator.yaml. Read them there rather than copying them here.
 MEASURED_SUITE_WORST_SECS = 397.47
 # DERIVED from the measurement above, never hand-set beside it, so the two
 # cannot silently diverge again — see module_budget_family.min_budget's docstring
@@ -603,7 +524,8 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
 
     - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
       but ``min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
-      run of this module's VERBATIM test_command, floored to the nearest 100s.
+      run of the SERIAL form of this module's test_command (the form verify's
+      ENV_TRANSIENT recovery runs), floored to the nearest 100s.
       An achievable floor derived from measurement, not a guess, and derived
       rather than transcribed so it cannot fall out of step with the figure it
       is derived from.
@@ -635,16 +557,16 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
     # message cites MEASURED_SUITE_WORST_SECS rather than a literal (task 3703
     # amendment pass, reviewer-flagged): it used to read "a suite that measures
     # ~105-127s", which are the __fallback__-path figures the provenance block
-    # above LABELS as a different command and forbids sizing or describing this
-    # budget with — so an operator read the discredited number in the one place
-    # they see on failure. Naming the constant instead means the message cannot
+    # in tests/scripts/orchestrator.yaml LABELS as a different command and
+    # forbids sizing or describing this budget with — so an operator read the
+    # discredited number in the one place they see on failure. Naming the constant instead means the message cannot
     # fall out of step with the figure the file derives everything from.
     assert mc.verify_command_timeout_secs is not None, (
         f'{MODULE_PREFIX}/orchestrator.yaml declares no '
         'verify_command_timeout_secs (task 3350), so this suite silently '
         'inherits the repo-root whole-fleet ceiling — the budget sized for '
-        'seven subprojects, applied to a suite whose worst RECORDED run of its '
-        f'own declared test_command is {MEASURED_SUITE_WORST_SECS}s'
+        'seven subprojects, applied to a suite whose worst RECORDED run of the '
+        f'serial form of its own test_command is {MEASURED_SUITE_WORST_SECS}s'
     )
 
     # (b) Measurement-derived floor — DERIVED by min_budget from
@@ -654,9 +576,10 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
         f'{mc.verify_command_timeout_secs} is below the '
         f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
         f'literal: it is min_budget(MEASURED_SUITE_WORST_SECS='
-        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of this '
-        "module's VERBATIM test_command floored to the nearest 100s — see the "
-        'provenance block above that constant for every run behind it. A budget '
+        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of the '
+        "SERIAL form of this module's test_command floored to the nearest 100s "
+        "— see tests/scripts/orchestrator.yaml's MEASUREMENT PROVENANCE block "
+        'for every run behind it. A budget '
         'under the floor would manufacture infra_timeout on the honest green '
         'path — the exact defect this task exists to remove, reintroduced one '
         'level down. Raise MEASURED_SUITE_WORST_SECS from a fresh measurement '

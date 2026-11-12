@@ -23,7 +23,7 @@ task_count_snapshot write structural):
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -36,6 +36,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.cli_stage_runner import StageResult
 from fused_memory.reconciliation.stages import (
     task_knowledge_sync as task_knowledge_sync_module,
 )
@@ -114,11 +115,11 @@ def mock_deps():
 def _fake_cli_result():
     """Canned run_stage_via_cli result — the CLI leg is patched out so these
     tests target run()'s own pre/post-flight wiring, not the subprocess."""
-    return MagicMock(
+    return StageResult(
         success=True,
         report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
         llm_calls=1, tokens_used=0, cost_usd=0.0,
-        model='test-model', error=None,
+        model='test-model',
     )
 
 
@@ -1806,11 +1807,11 @@ class TestRunDeterministicSnapshotWrite:
         }
 
     def _fake_cli_result(self):
-        return MagicMock(
+        return StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
+            model='test-model',
         )
 
     @pytest.mark.asyncio
@@ -1967,11 +1968,11 @@ class TestRunSurfacesPruneObservability:
         }
 
     def _fake_cli_result(self):
-        return MagicMock(
+        return StageResult(
             success=True,
             report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
             llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
+            model='test-model',
         )
 
     @staticmethod

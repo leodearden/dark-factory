@@ -45,7 +45,7 @@ import pytest
 # and cannot be confused with this file's own specimen constants.
 import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import RepairPolicy
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, RepairPolicy
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
@@ -736,11 +736,8 @@ class TestStormEscape:
         assert 'toolcall-markup-containment-prd.md' in routing, (
             f'must name the live owner: {routing!r}'
         )
-        # 3083 may be NAMED as the closed predecessor — what must not happen is
-        # the reader being DIRECTED to report a recurrence against it. That
-        # correction is stated explicitly, so assert it explicitly.
-        assert 'not against 3083' in routing, (
-            f'must send recurrences to the PRD, not the closed predecessor: {routing!r}'
+        assert MARKUP_RECURRENCE_ROUTING in routing, (
+            f'must carry the ONE shared routing sentence, not a local copy: {routing!r}'
         )
 
     @pytest.mark.asyncio
@@ -760,8 +757,8 @@ class TestStormEscape:
         assert mine, f'expected one greppable ERROR line; got {caplog.records!r}'
         text = '\n'.join(r.getMessage() for r in mine)
         assert 'toolcall-markup-containment-prd.md' in text
-        assert 'see DF 3083' not in text, (
-            f'must not direct the reader at the closed predecessor: {text!r}'
+        assert MARKUP_RECURRENCE_ROUTING in text, (
+            f'must carry the ONE shared routing sentence, not a local copy: {text!r}'
         )
         # The visible-counter half of the task's remedy, without a schema
         # change. Asserted IN CONTEXT: a bare `str(_BURST) in text` is vacuous
@@ -1004,11 +1001,12 @@ class TestInstallationOrder:
 
 
 class TestReconReportServerIsNotGuarded:
-    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+    """(c) The recon-report server gets no MARKUP guard.
 
-    The recon-report server hosts the cite_* / report tools and no write tools,
-    so it has no write boundary to guard. Asserting that keeps it from being
-    wired by accident when the two call sites are next edited together.
+    It hosts the cite_* / report tools and no write tools, so it has no write
+    boundary to guard. Asserting that keeps it from being wired by accident
+    when the two call sites are next edited together. (It does get the
+    unknown-argument guard: tests/test_unknown_argument_guard_fused_memory.py.)
     """
 
     def _make_config(self) -> Any:

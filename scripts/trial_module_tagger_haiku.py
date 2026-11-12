@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import _checkout as _checkout
 from orchestrator.harness import _extract_tagger_entries
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
@@ -701,7 +702,7 @@ async def load_done_tasks(
     async with _FusedMemoryClient(server_url) as client:
         payload = await client.call_tool(
             'get_tasks',
-            {'project_root': str(project_root), 'with_subtasks': True},
+            {'project_root': str(project_root)},
         )
     done: list[dict] = []
     for t in _flatten_tasks(payload):

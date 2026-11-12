@@ -1,0 +1,48 @@
+{
+  "task_id": "7248",
+  "reason": "review amendment: ReverifyGateDecision carries the same-tree history leg command and its __post_init__ enforces a non-blank command exactly for same_tree_history_leg, so gates.py reads the leg once instead of re-deriving it from config after the decision (net-additive invariant; gates.py itself fell)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+      "baseline": 3,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py::ReverifyGateDecision::__post_init__",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+      "baseline": 125,
+      "current": 133
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+      "baseline": 16,
+      "current": 18
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4995,
+      "current": 4996
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58735,
+      "current": 58743
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31968,
+      "current": 31970
+    }
+  ]
+}

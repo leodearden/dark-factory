@@ -24,6 +24,22 @@
       "severity": "suggestion",
       "description": "lower_single_quoted_string() is defined but there's no corresponding case in the lower_expr() match dispatch for single-quoted strings. The function will never be called from the main lowering path.",
       "mutation_type": "missing_error_propagation"
+    },
+    {
+      "id": "rs_missing_error_prop_pool_01",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1974-2001",
+      "category": "duplication",
+      "severity": "suggestion",
+      "description": "lower_single_quoted_string is a line-for-line copy of lower_string_literal differing only in the quote character, so quote-stripping and its failure policy live in two places (and in the import-path and meta-entry strippers at 644 and 1678); quote style is a single dimension that should be a parameter of one helper.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "rs_missing_error_prop_pool_02",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1974",
+      "category": "missing_required_tests",
+      "severity": "blocking",
+      "description": "The change adds none of the tests the task's test_strategy requires: reify-syntax unit tests that parse a binding in each quote style and assert identical ExprKind::StringLiteral payloads with a span covering the literal node, and a single-quoted literal nested in a larger expression; nor any test of malformed/unterminated literals through the new code. Such tests would have exposed that single-quoted input never reaches the new function and that the new .unwrap() calls can panic.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

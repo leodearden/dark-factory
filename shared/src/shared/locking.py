@@ -163,6 +163,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
         'tombstones',
         'toml',
         'ts',
+        'tsv',
         'tsx',
         'txt',
         'typed',

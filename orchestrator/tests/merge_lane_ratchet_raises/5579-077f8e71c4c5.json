@@ -1,0 +1,12 @@
+{
+  "task_id": "5579",
+  "reason": "Net-additive acceptance test (task 5579): orchestrator/tests/test_resumed_run_not_discarded.py is a NEW lane-importing file that drives the real TaskWorkflow._execute_iterations -> _invoke -> gated invoke_with_cap_retry seam, proving a downgraded resumed run is kept and a measured rejection retries fresh. Its 7 private reads are the same seam stubs test_session_resume_integration_gate.py already uses: _execute_iterations, four collaborator stubs (_check_escalations, _get_head_commit, _reconcile_done_step_commits, _iteration_commit_provenance), and _config_dir (x2) to seed the live transcript.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6367,
+      "current": 6374
+    }
+  ]
+}

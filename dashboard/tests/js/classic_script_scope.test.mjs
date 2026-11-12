@@ -3,7 +3,7 @@
 //
 // WHY THIS FILE EXISTS — the per-module suites structurally cannot catch this
 // bug class. Every other suite in this directory (`graph_layout.test.mjs`,
-// `esc_flow_layout.test.mjs`, `prd_grouping.test.mjs`, ...) `import`s exactly
+// `esc_flow_layout.test.mjs`, `prd_lanes_view.test.mjs`, ...) `import`s exactly
 // one module, which resolves as CommonJS (no package.json in this repo) and is
 // evaluated in its OWN module scope. In the browser these same files are NOT
 // modules: index.html loads each as a classic `<script src=...>` tag, and
@@ -34,17 +34,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
-import crypto from 'node:crypto';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 
-// Mirrors the relative-path idiom in esc_flow_layout.test.mjs /
-// runtime_format.test.mjs: resolve the served asset directory from this test
-// file's own location rather than from process.cwd().
-const TESTS_JS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REDUX_DIR = path.resolve(TESTS_JS_DIR, '../../src/dashboard/static/redux');
-
-const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
+import {
+  INDEX_HTML,
+  REDUX_DIR,
+  SCRIPT_TAG_BABEL_OPTIONS,
+  VENDORED_BABEL,
+  babelScriptSrcs,
+  classicScriptSrcs,
+  compileAsScriptTag,
+  loadVendoredBabel,
+  readIndexHtml,
+} from './_served_bundle.mjs';
 
 // Each classic script's browser global, keyed by filename. Asserting these are
 // defined after the shared load is strictly stronger than "did not throw": it
@@ -53,7 +54,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'datum.js': 'DF_DATUM',
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
-  'prd_grouping.js': 'DF_PRD_GROUPING',
+  'prd_lanes_view.js': 'DF_PRD_LANES_VIEW',
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
   'orch_filter.js': 'DF_ORCH_FILTER',
@@ -64,30 +65,25 @@ const EXPECTED_WINDOW_GLOBALS = {
   'burndown_bands.js': 'DF_BURNDOWN_BANDS',
   'pins_recovery.js': 'DF_PINS_RECOVERY',
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
+  'poll_scope.js': 'DF_POLL_SCOPE',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
   'task_snapshot.js': 'DF_TASK_SNAPSHOT',
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
   'window_chip.js': 'DF_WINDOW_CHIP',
   'merge_queue.js': 'DF_MERGE_QUEUE',
+  'performance_cards.js': 'DF_PERFORMANCE_CARDS',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
+  'escalation_focus.js': 'DF_ESCALATION_FOCUS',
+  'escalation_check_owner.js': 'DF_ESCALATION_CHECK_OWNER',
   'memory_readings.js': 'DF_MEMORY_READINGS',
+  'system_health.js': 'DF_SYSTEM_HEALTH',
+  'spend_readings.js': 'DF_SPEND_READINGS',
+  'persisted_state.js': 'DF_PERSISTED_STATE',
+  'invariant_chip.js': 'DF_INVARIANT_CHIP',
+  'deferral_cell.js': 'DF_DEFERRAL_CELL',
+  'render_failure.js': 'DF_RENDER_FAILURE',
 };
-
-function readIndexHtml() {
-  return fs.readFileSync(INDEX_HTML, 'utf8');
-}
-
-// Matches ONLY the local classic tags — `<script src="/static/redux/<name>.js?v=NN"></script>`.
-// Excluded by construction:
-//   - the `https://unpkg.com/...` CDN tags (path does not start with /static/redux/);
-//   - the `type="text/babel"` .jsx tags (an attribute sits between `<script`
-//     and `src`, and the path ends `.jsx`, not `.js`).
-const CLASSIC_SCRIPT_RE = /<script\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.js)(?:\?[^"]*)?"\s*><\/script>/g;
-
-function classicScriptSrcs(html) {
-  return [...html.matchAll(CLASSIC_SCRIPT_RE)].map(m => m[1]);
-}
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
 // oversight. data.js:330 gates its polling auto-start on
@@ -185,7 +181,7 @@ test('every classic /static/redux/*.js script loads into ONE shared global lexic
       'scripts share ONE global lexical scope, so the second one to declare ' +
       'the name dies before its body runs and never reaches its ' +
       '`window.DF_* = ...` assignment. Fix: give the offending module a ' +
-      'module-unique `<MODULE>_API` const, per the existing PRD_GROUPING_API / ' +
+      'module-unique `<MODULE>_API` const, per the existing PRD_LANES_VIEW_API / ' +
       'RUNTIME_FORMAT_API / ORCH_FILTER_API / DF_DATA_LOADER_API precedent.',
   );
 });
@@ -235,7 +231,7 @@ test('no classic script leaks a bare `API` binding into the shared global lexica
     'undefined',
     'a classic /static/redux/*.js script still declares a bare top-level ' +
       '`const API`. The convention is that every such module exposes its ' +
-      'surface under a module-unique `<MODULE>_API` const — PRD_GROUPING_API, ' +
+      'surface under a module-unique `<MODULE>_API` const — PRD_LANES_VIEW_API, ' +
       'RUNTIME_FORMAT_API, ORCH_FILTER_API, DF_DATA_LOADER_API, ' +
       'ESC_FLOW_LAYOUT_API, GRAPH_LAYOUT_API — never a bare `API`. A bare ' +
       '`API` is a live landmine rather than a style nit: the NEXT module to ' +
@@ -274,63 +270,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-// A vendored copy of the exact Babel build index.html loads, so this suite
-// needs no npm install. Versionless on purpose: index.html's tag is the one
-// pin, and loadVendoredBabel holds this copy to it.
-const VENDORED_BABEL = path.join(TESTS_JS_DIR, 'vendor', 'babel.min.js');
-
-const BABEL_TAG_RE =
-  /<script\s+src="(https:\/\/unpkg\.com\/@babel\/standalone@[^"]+\/babel\.min\.js)"\s+integrity="(sha384-[^"]+)"/;
-
-function pinnedBabelTag() {
-  const match = readIndexHtml().match(BABEL_TAG_RE);
-  assert.ok(match, `found no @babel/standalone <script> tag with an integrity attribute in ${INDEX_HTML}`);
-  return { url: match[1], integrity: match[2] };
-}
-
-function vendoredBabelDigest() {
-  if (!fs.existsSync(VENDORED_BABEL)) return 'missing';
-  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
-}
-
-// Loads the vendored Babel only once its sha384 matches index.html's pin, so a
-// stale, truncated or missing copy fails with the refresh command rather than
-// a parse error. require's own cache makes repeat calls cheap.
-function loadVendoredBabel() {
-  const { url, integrity } = pinnedBabelTag();
-  assert.equal(
-    vendoredBabelDigest(),
-    integrity,
-    `${VENDORED_BABEL} is not the build index.html loads (${url}), so the text/babel ` +
-      'scope test would compile the .jsx files with a different Babel than the browser. ' +
-      `Refresh it: curl -sSfL -o ${VENDORED_BABEL} ${url}`,
-  );
-  return createRequire(import.meta.url)(VENDORED_BABEL);
-}
-
-// The options Babel-standalone builds for a text/babel tag with no
-// `type="module"`, no data-presets/data-plugins and no data-targets. The
-// bundle's script-tag loader keeps these literals through minification; the
-// test below pins them to it.
-const SCRIPT_TAG_BABEL_OPTIONS = {
-  presets: ['react', 'env'],
-  plugins: ['transform-class-properties', 'transform-object-rest-spread', 'transform-flow-strip-types'],
-  targets: { browsers: undefined },
-};
-
-// Matches `<script type="text/babel" src="/static/redux/<name>.jsx?v=NN"></script>`,
-// and the `text/jsx` spelling, which Babel-standalone executes too.
-const BABEL_SCRIPT_RE =
-  /<script\s+type="text\/(?:babel|jsx)"\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.jsx)(?:\?[^"]*)?"\s*><\/script>/g;
-
-function babelScriptSrcs(html) {
-  return [...html.matchAll(BABEL_SCRIPT_RE)].map(m => m[1]);
-}
-
-function compileAsScriptTag(source, filename) {
-  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
-}
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
 

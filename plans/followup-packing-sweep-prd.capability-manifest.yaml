@@ -1,0 +1,460 @@
+# Machine-readable twin of followup-packing-sweep-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+# task_id values are stamped by commit_planning at decompose.
+prd: plans/followup-packing-sweep-prd.md
+schema_version: 1
+signal_leaves: ["P3"]
+tasks:
+  - label: "P0"
+    task_id: 8451
+    title: "Pack candidate generators, hub rule, exclusions, rider reservation, survivor rule, and the pack judge"
+    note: "Resolved at decompose: the v1 recipe regexes, the absent-pending_since rule and the whole-pool hub denominator are pinned by the committed pool dump (recipe_v1 labels, header hub_keys); an independent re-implementation of PRD §4.1 reproduced all four CSV runs set-equal on 2026-11-04."
+    capabilities:
+      - name: "candidate-packs"
+        binding: "capability→producer — new fused-memory middleware/followup_packing.py (§4.1), pure"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def candidate_packs\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "rider-reserved-predicate"
+        binding: "capability→producer — decision 13; cited by PRD 3 γ (8440)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def rider_reserved\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "rider-reserve-days-constant"
+        binding: "capability→producer — one home for the 14 (INV-9); PRD 3 γ imports it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RIDER_RESERVE_DAYS *(: *int *)?= *14"
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "union-key-bound-home"
+        binding: "capability→producer — decision 6: the 15 gets its code home here"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "PACK_MAX_UNION_KEYS *(: *int *)?= *15"
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "item-bound-imported"
+        binding: "capability→producer — MAX_FOLLOWUP_ITEMS from shared.followup_items (producer 8414 upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MAX_FOLLOWUP_ITEMS"
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "exclusion-vocabulary"
+        binding: "capability→producer + rejection-mechanism — PackExclusion StrEnum created in this leaf (G6 branch 4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PackExclusion"
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "hub-rule"
+        binding: "capability→producer — decision 5, share > 2% of the whole held pool"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def hub_keys\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "survivor-rule"
+        binding: "capability→producer — decision 3, earliest pending_since then lowest id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def survivor_of\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "recipe-table"
+        binding: "capability→producer — one RECIPES table; v1 labels pinned by the dump's recipe_v1 field"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def title_recipe\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_packing.py"]
+          expect: present
+      - name: "pack-prompt-spec"
+        binding: "capability→producer — new middleware/pack_judge.py (§4.2); prompt_id curator_pack"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CURATOR_PACK_SPEC *="
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "pack-harness-version"
+        binding: "capability→producer — curator-pack-v1, separate artifact triple from curator-v1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "curator-pack-v1"
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "heuristics-shared-by-reference"
+        binding: "capability→producer (wired) — _CURATOR_HEURISTICS imported from task_curator.py, which this leaf never edits"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_CURATOR_HEURISTICS"
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "verdict-parser"
+        binding: "capability→producer + rejection-mechanism — parse_pack_verdict degrades to reject with `degraded` set (created here)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def parse_pack_verdict\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "member-render"
+        binding: "capability→producer — the one render_pack_member, clip_for_prompt shared"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def render_pack_member\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "judge-call"
+        binding: "capability→producer — judge_pack over invoke_with_cap_retry, role curator_pack"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def judge_pack\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_judge.py"]
+          expect: present
+      - name: "pool-fixture-copied"
+        binding: "grammar-fixture — verbatim copy of plans/followup-packing-sweep-prd.pack-pool-2026-11-04.json (committed with the PRD at eb84ac9f41)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\"c2_ordering\""
+          paths: ["fused-memory/tests/fixtures/pack_pool_2026-11-04.json"]
+          expect: present
+      - name: "expected-csv-fixture-copied"
+        binding: "grammar-fixture — copy of plans/followup-packing-sweep-prd.packs-a2c2.csv (committed with the PRD at eb84ac9f41)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^dark_factory,minus_reservation,"
+          paths: ["fused-memory/tests/fixtures/packs-a2c2-2026-11-04.csv"]
+          expect: present
+      - name: "fixture-reproduction-test"
+        binding: "capability→producer — test_followup_packing.py loads the pool fixture"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pack_pool_2026-11-04"
+          paths: ["fused-memory/tests/test_followup_packing.py"]
+          expect: present
+      - name: "fixture-reproduces-the-csv"
+        binding: "G6 premise — reproduced at decompose by an independent script over the two committed plans/ files: df 118 (77/41) and 64 (34/30), reify 134 (89/45) and 112 (76/36), all four runs set-equal; recipe_v1 labels agree with the re-run regexes on 2,517 of 2,517 titles"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "set equality over (generator, member set) is asserted by P0's own test; not expressible as a grep"
+      - name: "declared-scope-reader-allowlisted"
+        binding: "capability→producer — allowlist test created by 8413 (upstream); this leaf adds followup_packing"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "followup_packing"
+          paths: ["shared/tests/test_declared_scope_readers.py"]
+          expect: present
+      - name: "no-curator-or-interceptor-import"
+        binding: "rejection-style (heuristic 13) — followup_packing.py imports nothing from the curator or interceptor"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an expect-absent grep on a file that does not exist yet is vacuous at authoring; the reviewer checks the import block"
+  - label: "P1"
+    task_id: 8452
+    title: "Pack ledger, sweep loop and config; observe mode deployed"
+    capabilities:
+      - name: "pack-ledger"
+        binding: "capability→producer — new middleware/pack_ledger.py (§4.3), AUTOINCREMENT tables"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PackLedger"
+          paths: ["fused-memory/src/fused_memory/middleware/pack_ledger.py"]
+          expect: present
+      - name: "ledger-producer-proof"
+        binding: "capability→producer — producer_has_written reads sqlite_sequence (INV-13)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def producer_has_written\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_ledger.py"]
+          expect: present
+      - name: "reimage-without-judge"
+        binding: "capability→producer — decision 10, stale → proposed with no judge call"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def reimage\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_ledger.py"]
+          expect: present
+      - name: "sweep-loop"
+        binding: "capability→producer — new middleware/pack_sweep.py, TicketJanitor shape, interval read per sleep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PackSweep[(:]"
+          paths: ["fused-memory/src/fused_memory/middleware/pack_sweep.py"]
+          expect: present
+      - name: "sweep-config"
+        binding: "capability→producer — PackSweepConfig on CuratorConfig in config/schema.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PackSweepConfig"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "sweep-config-hot-reloadable"
+        binding: "capability→producer — every curator.pack_sweep.* leaf in RELOADABLE_FIELDS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "curator\\.pack_sweep\\."
+          paths: ["fused-memory/src/fused_memory/config/reload.py"]
+          expect: present
+      - name: "sweep-started-at-startup"
+        binding: "capability→producer (wired) — server/main.py builds and starts it beside the ticket janitor"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "PackSweep"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: present
+      - name: "start-log-line"
+        binding: "capability→producer — the operator-visible start line (§1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Pack sweep: mode="
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "observe-mode-deployed"
+        binding: "capability→producer — config.yaml ships curator.pack_sweep with mode observe"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pack_sweep:"
+          paths: ["fused-memory/config/config.yaml"]
+          expect: present
+      - name: "declared-scope-reader-allowlisted"
+        binding: "capability→producer — allowlist gains pack_sweep (8413's test, upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pack_sweep"
+          paths: ["shared/tests/test_declared_scope_readers.py"]
+          expect: present
+      - name: "observe-boundary-rows"
+        binding: "capability→producer — rows 1–5, 11–13, 21 in test_pack_sweep.py incl. the tasks.db row-hash invariant"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_"
+          paths: ["fused-memory/tests/test_pack_sweep.py"]
+          expect: present
+      - name: "observe-rows-in-production"
+        binding: "manual — after deploy the start log shows mode=observe and pack_sweep.db gains a runs row per project per day"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed on the live fused-memory after the next redeploy; P3's report reads it"
+  - label: "P2"
+    task_id: 8453
+    title: "Pack executor, status-chokepoint precondition, locked survivor rewrite, combine write-half extraction, undo"
+    capabilities:
+      - name: "apply-pack"
+        binding: "capability→producer — new middleware/pack_executor.py (§4.4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def apply_pack\\("
+          paths: ["fused-memory/src/fused_memory/middleware/pack_executor.py"]
+          expect: present
+      - name: "enforce-arm-wired"
+        binding: "capability→producer (wired) — the tick's enforce arm calls apply_pack"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "apply_pack"
+          paths: ["fused-memory/src/fused_memory/middleware/pack_sweep.py"]
+          expect: present
+      - name: "status-chokepoint-precondition"
+        binding: "capability→producer + rejection-mechanism — require_before on _apply_status_transition, evaluated inside its own critical section (on top of 8143, upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "require_before"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "cancel-superseded-wrapper"
+        binding: "capability→producer — thin public wrapper; superseded_by vocabulary from 8142 (upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def cancel_superseded_if_pending\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "combine-write-half-extracted"
+        binding: "capability→producer — _write_combined_rewrite extracted from _execute_combine (γ 8415's item merge moved, upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _write_combined_rewrite\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "combine-calls-the-half"
+        binding: "capability→producer (wired) — _execute_combine awaits the extracted half, behaviour unchanged"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "await self\\._write_combined_rewrite\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "locked-survivor-rewrite"
+        binding: "capability→producer + rejection-mechanism — re-read under _write_lock, PackRefusal on change/claim"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def rewrite_pack_survivor\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "undo-pack-method"
+        binding: "capability→producer — interceptor undo with the ledger pre-image"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def undo_pack\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "undo-pack-tool"
+        binding: "capability→producer (wired) — admin MCP tool in server/tools.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "undo_pack"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "rehold"
+        binding: "capability→producer — inverse of promote in followup_hold.py (module from 8415/8417, promote from 8418, upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def rehold\\("
+          paths: ["fused-memory/src/fused_memory/middleware/followup_hold.py"]
+          expect: present
+      - name: "declared-scope-basis-pack"
+        binding: "capability→producer — DeclaredScope.basis Literal gains 'pack' (α 8413 creates the module, upstream)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]pack['\"]"
+          paths: ["shared/src/shared/declared_scope.py"]
+          expect: present
+      - name: "pack-record-registered"
+        binding: "capability→producer — register_metadata_submodel for pack_record"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pack_record"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+      - name: "pack-record-documented"
+        binding: "capability→producer — docs/task-authoring.md §8 entry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pack_record"
+          paths: ["docs/task-authoring.md"]
+          expect: present
+      - name: "cancel-with-children-entry-point-row"
+        binding: "capability→producer — companion correction: §4.14 gains a pack executor row"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "[Pp]ack executor"
+          paths: ["plans/cancel-with-children-prd.md"]
+          expect: present
+      - name: "executor-boundary-rows"
+        binding: "capability→producer — rows 14–19, 15b, 16b, 22 against a real sqlite stack, incl. the claim races"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_"
+          paths: ["fused-memory/tests/test_pack_executor.py"]
+          expect: present
+      - name: "claim-race-refused-inside-the-lock"
+        binding: "manual — the race tests drive set_task_status(in-progress, claimant_run_id) concurrently with apply_pack for a member and the survivor"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a concurrency property; asserted by the leaf's tests, judged by the reviewer"
+  - label: "P3"
+    task_id: 8454
+    title: "Observe report and the integration gate"
+    capabilities:
+      - name: "report-no-producer-state"
+        binding: "capability→producer + INV-13 — new scripts/pack_sweep_report.py prints the no-producer marker per table and series"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "producer has not written"
+          paths: ["scripts/pack_sweep_report.py"]
+          expect: present
+      - name: "report-tests"
+        binding: "capability→producer — tests/scripts/test_pack_sweep_report.py (row 20)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_"
+          paths: ["tests/scripts/test_pack_sweep_report.py"]
+          expect: present
+      - name: "boundary-suite"
+        binding: "capability→producer — new fused-memory/tests/integration/test_pack_sweep.py, every §4.5 row through public interfaces"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def test_"
+          paths: ["fused-memory/tests/integration/test_pack_sweep.py"]
+          expect: present
+      - name: "rows-green-on-integrated-tree"
+        binding: "manual — §4.5 rows 1–22 green against the integrated tree"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the gate's own verify run; not a grep"
+      - name: "report-over-live-ledger"
+        binding: "manual — after ≥ 1 observe day the report shows real proposals, both coverage series, and the no-producer marker only on the enforce series"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "needs the live pack_sweep.db written by P1 in production"
+  - label: "Φ"
+    task_id: 8455
+    title: "Flip gate: read the pack sweep observe report, set curator.pack_sweep.mode enforce"
+    capabilities:
+      - name: "leo-ruling"
+        binding: "manual — one L2 on the dark-factory queue carrying the report path; Leo rules enforce / keep observing (re-arm) / off"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a human decision; the gate is deterministic and always escalates"
+      - name: "enforce-rows-after-ruling"
+        binding: "manual — after an enforce ruling, runs.mode == 'enforce' rows appear in pack_sweep.db"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed in the live ledger after reload_config"

@@ -8,10 +8,12 @@ Covers:
   step-07 RED  — snapshot() exposes additive 'frozen_prefix' key
   step-09 RED  — HEADLINE property: in-flight immutable under suffix reorder;
                  recompute excludes frozen rids (exclusion filter)
-  step-11 RED  — _warn_if_verify_base_not_frozen_tip log-only guard
-  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard:
-                 `_remerge` recovery items are exempt; the carve-out is
-                 narrow (an ordinary mismatch still warns exactly once).
+  step-11 RED  — the dispatch-time verify-base guard (task 5302: now
+                 _verify_base_divergence_at_dispatch, the §5.3 detector)
+  3206 step-1  — the PRD §5.3 RE-MERGE CARVE-OUT at the dispatch guard: a
+                 recovery re-merge that fell to main is exempt (task 8524,
+                 plans/merge-lane-policy-prd.md D1); the carve-out is narrow
+                 (an ordinary mismatch still warns exactly once).
   3206 step-5  — the surviving WARNING keeps its CALL-TIME CONTEXT (task_id,
                  request_id, both shas, verify_depth), which task 1999 records
                  as available on no other §5.3 surface.  Data only: the
@@ -19,9 +21,9 @@ Covers:
   3206 step-7d — FIVE-SITE PARITY: every `_remerge` return path stamps the
                  recovery marker.
 
-CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is
-ADVISORY BY DECISION and is never promoted to hard control-flow enforcement
-(PRD §5.3 and §10; measured precision as an enforcement predicate was 0/4).
+CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is a
+DETECTOR and is never promoted to hard control-flow enforcement (esc-3206-3;
+PRD §5.3 and §10; measured precision as an enforcement predicate was 0/4).
 The 3206 tests above are the executable half of that fence: they are expected
 to pass immediately, and their purpose is to make a future SILENT flip to
 enforcement impossible — each fails the moment the guard changes control
@@ -39,7 +41,7 @@ Mapping:
                 + self._finalizing_head when phase in {'verifying',
                   'gate_reverify', 'finalizing'}
   {landed}    = main (its SHA reflects landed items)
-  unfrozen    = self._lane_buffers (pick order high→normal, FIFO)
+  unfrozen    = the intake's lane buffers (pick order high→normal, FIFO)
 """
 
 from __future__ import annotations
@@ -47,15 +49,32 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, make_lane
+from _merge_lane_fakes import (
+    FakeClock,
+    FakeVerifier,
+    RecordingEscalations,
+    lane_scene_config,
+    make_lane,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.remerge_base import RemergeClaim
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    NoHost,
+    QueuedBranch,
+    RemergeBase,
+    RemergeReason,
+    SpecPermit,
+    VerifyBaseDivergence,
+)
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
@@ -65,7 +84,6 @@ from orchestrator.merge_queue import (
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
 #
@@ -114,7 +132,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
@@ -236,10 +254,9 @@ def _seed_suffix(
     replace: bool = False,
 ) -> None:
     """Admit *reqs* to *lane*'s buffer; *replace* reorders the lane wholesale."""
-    buffer = worker._lane_buffers[lane]
-    if replace:
-        buffer.clear()
-    buffer.extend(reqs)
+    intake = worker._intake
+    kept = () if replace else intake.buffered(lane)
+    intake.replace_lane(lane, (*kept, *reqs))
 
 
 def _seed_finalizing_head(
@@ -261,16 +278,43 @@ def _seed_finalizing_head(
 
 def _guard_warn(
     worker: SpeculativeMergeWorker, item: SpeculativeItem, main_sha: str,
-) -> None:
-    """Call the §5.3 log-only verify-base guard directly."""
-    return worker._warn_if_verify_base_not_frozen_tip(item, main_sha)
+) -> VerifyBaseDivergence | None:
+    """Call the §5.3 dispatch-time verify-base detector directly."""
+    return worker._verify_base_divergence_at_dispatch(item, main_sha)
 
 
 async def _dispatch(
-    worker: SpeculativeMergeWorker, item: SpeculativeItem,
-) -> InflightEntry | None:
-    """Drive *item* through the lane's dispatch step."""
-    return await worker._dispatch_item(item)
+    worker: SpeculativeMergeWorker,
+    git_ops: GitOps,
+    item: SpeculativeItem,
+    get_main_sha: Callable[..., Awaitable[str]],
+) -> InflightEntry | NoHost:
+    """Drive *item* through the lane's dispatch step while git's main read is
+    *get_main_sha*.  The verify the dispatch launches is a no-op, so a row
+    observes only what dispatch itself decided."""
+    import unittest.mock as mock
+
+    async def _noop_verify(_item, _lease, **_kwargs):
+        return None
+
+    with (
+        mock.patch.object(git_ops, 'get_main_sha', side_effect=get_main_sha),
+        mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+    ):
+        return await worker._dispatch_item(item)
+
+
+def _assert_divergence(
+    result: VerifyBaseDivergence | None,
+    item: SpeculativeItem,
+    expected_tip: str,
+    verify_depth: int,
+) -> None:
+    """*result* records *item* dispatched off *expected_tip* at *verify_depth*."""
+    assert result is not None, 'expected a VerifyBaseDivergence, got None'
+    assert (
+        result.request_id, result.base_sha, result.expected_tip, result.verify_depth,
+    ) == (item.request.request_id, item.base_sha, expected_tip, verify_depth)
 
 
 _INFLIGHT_STATES = frozenset(
@@ -359,7 +403,7 @@ class TestFrozenAndUnfrozenAccessors:
     async def test_lane_buffers_appear_in_unfrozen_suffix(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """Requests in _lane_buffers appear in unfrozen_suffix(), high before normal."""
+        """Requests in the lane buffers appear in unfrozen_suffix(), high before normal."""
         worker = _make_worker(git_ops)
         req_hi = _make_req('t-hi', 'task/t-hi', config, git_repo, lane='high')
         req_n1 = _make_req('t-n1', 'task/t-n1', config, git_repo)
@@ -500,6 +544,19 @@ class TestCheckFrozenPrefixInvariant:
         # The violation message should name the offending rid
         assert item_e.request.request_id in ' '.join(violations)
 
+    async def test_lone_head_off_main_is_intact(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A lone head whose base is not main_sha, and not a recorded dead
+        commit, breaks nothing: INV-3 is chain-intact, not base == main (task 5302).
+        """
+        worker = _make_worker(git_ops)
+        _, item_d = _make_fake_item('t-d', base_sha='older-main', merge_commit='commitDc',
+                                    config=config, git_repo=git_repo)
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+
+        assert worker.check_frozen_prefix_invariant('main000') == []
+
     async def test_disjointness_violation(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
@@ -528,7 +585,7 @@ class TestFrozenPrefixPropertyTest:
 
     RED until step-10 GREEN adds the frozen-rid exclusion filter to
     recompute_suffix_conflict_graph().  The immutability assertion (a) already
-    holds (emergent from δ's _lane_buffers-only recompute); only the exclusion
+    holds (emergent from δ's lane-buffers-only recompute); only the exclusion
     assertion (b) fails RED.
     """
 
@@ -537,7 +594,7 @@ class TestFrozenPrefixPropertyTest:
     ) -> None:
         """(a) In-flight entries are unchanged after suffix reorder + recompute.
 
-        Setup: D/E in _inflight (verifying); F/G in _lane_buffers['normal'].
+        Setup: D/E in _inflight (verifying); F/G in the normal lane buffer.
         Capture state, reverse F/G, recompute, assert:
           - D/E base_sha UNCHANGED
           - D/E inflight identity/order UNCHANGED
@@ -600,7 +657,7 @@ class TestFrozenPrefixPropertyTest:
 
         # ── Assert no frozen rid appears in suffix graph nodes ────────────────
         # NOTE: this loop is trivially satisfied here because D/E are only ever
-        # in _inflight and are never pushed into _lane_buffers, so they could
+        # in _inflight and are never pushed into the lane buffers, so they could
         # not appear in the suffix graph regardless of the exclusion filter.
         # The genuine RED→GREEN coverage for the exclusion filter lives in
         # test_frozen_rid_excluded_from_suffix_graph below.
@@ -613,14 +670,14 @@ class TestFrozenPrefixPropertyTest:
     async def test_frozen_rid_excluded_from_suffix_graph(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """(b) Exclusion filter: a frozen rid pushed into _lane_buffers is excluded.
+        """(b) Exclusion filter: a frozen rid pushed into the lane buffers is excluded.
 
         This is the genuine RED→GREEN delta: before step-10 adds the exclusion
-        filter, a frozen request that is also in _lane_buffers appears in
+        filter, a frozen request that is also in the lane buffers appears in
         suffix_conflict_graph.nodes.  After step-10, it is excluded.
 
         Setup: item D in _inflight (verifying); also D's request pushed into
-        _lane_buffers.  Recompute → D's rid must NOT appear in nodes.
+        the lane buffers.  Recompute → D's rid must NOT appear in nodes.
         """
         main_sha = 'fake-main-sha'
         worker = _make_worker(git_ops)
@@ -630,7 +687,7 @@ class TestFrozenPrefixPropertyTest:
                                         config=config, git_repo=git_repo)
         _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
-        # Intentionally push the SAME request into _lane_buffers (simulates the
+        # Intentionally push the SAME request into the lane buffers (simulates the
         # bug this filter guards against: a frozen rid leaking into the suffix).
         _seed_suffix(worker, req_d)
 
@@ -730,16 +787,15 @@ class TestSnapshotFrozenPrefixKey:
         }, f'unexpected metrics shape: {snap["metrics"]}'
 
 
-# ── step-11 RED: _warn_if_verify_base_not_frozen_tip log-only guard ───────────
+# ── step-11 RED: the dispatch-time verify-base guard ──────────────────────────
 
 
 @pytest.mark.asyncio
 class TestWarnIfVerifyBaseNotFrozenTip:
-    """_warn_if_verify_base_not_frozen_tip warns when verify base != frozen tip.
+    """The dispatch guard warns when verify base != frozen tip, and returns the
+    :class:`VerifyBaseDivergence` record (task 5302); on a match it returns None.
 
-    The method is log-only: it never mutates state, never raises, returns None.
-
-    RED until step-12 GREEN adds _warn_if_verify_base_not_frozen_tip.
+    It never mutates lane state and never raises.
     """
 
     async def test_speculative_only_base_logs_warning(
@@ -767,11 +823,10 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
-        # Returns None (log-only, no side effect)
-        assert result is None
+        _assert_divergence(result, item_e, 'sha-Dc', 1)
 
         # Exactly one WARNING mentioning the rid and 'frozen'
         warnings = [
@@ -814,7 +869,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
@@ -841,7 +896,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_d, 'main0')
 
         assert result is None
@@ -856,7 +911,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
         config: OrchestratorConfig,
         git_repo: Path,
     ) -> None:
-        """_warn_if_verify_base_not_frozen_tip never mutates worker state."""
+        """The dispatch guard never mutates worker state."""
         worker = _make_worker(git_ops)
         _, item_d = _make_fake_item(
             't-d', base_sha='main0', merge_commit='sha-Dc',
@@ -887,46 +942,17 @@ class TestWarnIfVerifyBaseNotFrozenTip:
 
 
 def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
-    """Stamp the §5.3 re-merge recovery marker (task 3206) on *item*.
-
-    Deliberately uses ``dataclasses.replace`` rather than a new
-    ``_make_fake_item`` keyword so this is RED (TypeError: unexpected keyword
-    argument) ONLY inside the tests that opt in, leaving every other suite in
-    this module green until step-2 adds the field.
-
-    Mirrors what ``_remerge`` does in production: it is the single producer of
-    recovery items for all five consumer paths — ``_verifier_loop``'s
-    head-failure cascade, ``_void_and_remerge`` (INV-3 adoption-time void),
-    ``_finalize_inflight``'s RUNNER_UNAVAILABLE re-dispatch, and
-    ``_dispatch_item``'s dead-base-straggler and Mechanism-2 sites — so the
-    marker is set once at the producer rather than threaded through each
-    consumer.  (Named, not line-numbered: line numbers in this ~17k-line
-    module rot within a release; PRD §5.3 carries the numbered list and is
-    reconciled at close-out.)
-    """
-    return dataclasses.replace(item, remerge_recovery=True)
+    """Stamp *item* as a recovery re-merge that fell to main, the anchor
+    ``_remerge`` gives it (plans/merge-lane-policy-prd.md D1)."""
+    return dataclasses.replace(item, remerge_base=RemergeBase(None, RemergeReason.NO_TIP))
 
 
 @pytest.mark.asyncio
 class TestRemergeCarveOutAtDispatchGuard:
-    """§5.3 carves out `_remerge` recovery items from the dispatch-time guard.
+    """A recovery re-merge that fell to main is exempt from the dispatch-time
+    guard, and nothing else is (plans/merge-lane-policy-prd.md D1)."""
 
-    ADJUDICATION (task 3206, PRD §5.3): items produced by ``_remerge`` are
-    RECOVERY re-merges that legitimately target real main rather than
-    ``frozen_prefix_tip()``.  Warning on them is crying wolf — this reproduces
-    the measured class-(b) shape: a dead-base straggler re-merged onto real
-    main while another item was frozen.  Under hard enforcement both measured
-    instances of it would have been REFUSED, and the tip they'd have been
-    forced onto can itself be the dead commit they exist to escape.  PRD §5.3
-    holds the dated instances; they are not duplicated here to rot.
-
-    The carve-out must be NARROW: it suppresses recovery items only, never a
-    genuine class-(d) violation.
-
-    RED until step-2 GREEN adds ``remerge_recovery`` and honours it here.
-    """
-
-    async def test_remerge_recovery_item_suppresses_warning(
+    async def test_a_fell_to_main_item_suppresses_warning(
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
@@ -946,16 +972,15 @@ class TestRemergeCarveOutAtDispatchGuard:
         )
         _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
-        # Recovery re-merge: _remerge always sets base_sha=actual_main (here
-        # 'main0'), which is NOT the frozen tip 'sha-Dc'.  That is correct by
-        # construction, not a violation.
+        # A recovery re-merge that fell to main (here 'main0'), not onto the
+        # frozen tip 'sha-Dc'.
         _, item_r = _make_fake_item(
             't-recovery', base_sha='main0', merge_commit='sha-Rc',
             config=config, git_repo=git_repo,
         )
         item_r = _mark_recovery(item_r)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_r, 'main0')
 
         assert result is None
@@ -992,10 +1017,10 @@ class TestRemergeCarveOutAtDispatchGuard:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
-        assert result is None
+        _assert_divergence(result, item_e, 'sha-Dc', 1)
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1, (
             f'expected exactly 1 WARNING for a non-recovery mismatch, got '
@@ -1029,7 +1054,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             if marked:
                 item_e = _mark_recovery(item_e)
 
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 assert _guard_warn(worker, item_e, 'main0') is None
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1061,7 +1086,7 @@ class TestGuardWarningCarriesCallTimeContext:
     not reintroduce them as looser substring matching.
 
     That narrative is NOT gone, it simply lives where it belongs: the
-    `logger.warning(...)` message itself, the `_warn_if_verify_base_not_frozen_tip`
+    `logger.warning(...)` message itself, the `_verify_base_divergence_at_dispatch`
     docstring, and PRD §5.3 — all of which still carry it.  The enforcement
     fence they were reaching for is held by CONTROL-FLOW assertions that go red
     the moment the guard refuses a dispatch: `TestDispatchItemGuardWiring` and
@@ -1080,15 +1105,16 @@ class TestGuardWarningCarriesCallTimeContext:
     ) -> None:
         """(1) task_id, request_id, actual base, expected tip and verify_depth.
 
-        Task 1999 notes this call-time context is NOT available on the
-        invariant/snapshot surface — the dispatch guard is the only place it
-        can be captured, so it must not be dropped by a reword.
+        The WARNING and the ``VerifyBaseDivergence`` record carry the same
+        call-time context (task 5302).  The record, in
+        ``snapshot()['verify_base_divergences']``, is the durable copy; the
+        WARNING is the journal's, so a reword must not drop it either.
 
         Every needle is DERIVED from the fixture's own request/item/worker
         state rather than re-typed as a short literal, and verify_depth is
         pinned as the RENDERED PAIR ``verify_depth=1``.  A bare ``'1'`` would
         be satisfied vacuously — the message body itself contains 'ε=1890',
-        'task-3082' and 'task 3206' — so it would pin the label while letting
+        '§5.3' and 'esc-3206-3' — so it would pin the label while letting
         the %d argument be dropped or reordered against the other three.
         """
         import logging
@@ -1112,7 +1138,7 @@ class TestGuardWarningCarriesCallTimeContext:
         assert len(worker.frozen_prefix()) == 1
         expected_tip = worker.frozen_prefix_tip('main0')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             _guard_warn(worker, item_e, 'main0')
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1127,8 +1153,8 @@ class TestGuardWarningCarriesCallTimeContext:
             ('verify_depth=1', 'verify_depth label AND value'),
         ):
             assert needle in text, (
-                f'WARNING lost its {what} ({needle!r}) — task 1999: this '
-                f'call-time context exists on NO other §5.3 surface. Got: {text!r}'
+                f'WARNING lost its {what} ({needle!r}): the journal copy of the '
+                f'context the VerifyBaseDivergence record carries. Got: {text!r}'
             )
 
 
@@ -1138,7 +1164,8 @@ class TestGuardWarningCarriesCallTimeContext:
 @pytest.mark.asyncio
 class TestFinalizingHeadInFrozenPrefix:
     """_finalizing_head is included in the frozen prefix when its phase is
-    verifying/gate_reverify/finalizing, and excluded for other phases.
+    verifying/gate_reverify/finalizing and it is not vacated (task 5302), and
+    excluded otherwise.
 
     These tests exercise the _frozen_inflight_entries() branch for
     self._finalizing_head that was untested by the original step-01/02 tests.
@@ -1253,6 +1280,97 @@ class TestFinalizingHeadInFrozenPrefix:
             f"gate_reverify-phase _finalizing_head missing from frozen_prefix(): {fp!r}"
         )
 
+    @pytest.mark.parametrize('status', [InflightStatus.REQUEUED, InflightStatus.DROPPED])
+    @pytest.mark.parametrize(
+        'then', [None, ItemLifecycleState.FINALIZING], ids=['verifying', 'finalizing'],
+    )
+    async def test_vacated_finalizing_head_is_not_frozen(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        status: InflightStatus,
+        then: ItemLifecycleState | None,
+    ) -> None:
+        """A vacated finalize head is not frozen, whatever its phase (task 5302).
+
+        Its verify requeued or dropped the request and released the lease
+        (task 4582); only the head-of-line finalize remains.  Counting it is
+        the PRD §5.3 class-(a) phantom frozen tip.
+        """
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(_make_inflight_entry(item_h), status=status)
+        _seed_finalizing_head(worker, entry_h, then=then)
+
+        assert worker.frozen_prefix() == ()
+        assert worker.snapshot()['frozen_prefix']['request_ids'] == []
+        assert worker.frozen_prefix_tip('main0') == 'main0'
+
+    async def test_vacated_finalizing_head_yields_to_live_deque_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Behind a vacated finalize head, the live deque entry is the whole prefix."""
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='main0', merge_commit='sha-Ec',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(
+            _make_inflight_entry(item_h), status=InflightStatus.REQUEUED,
+        )
+        _seed_finalizing_head(worker, entry_h)
+        _seed_frozen(worker, _make_inflight_entry(item_e))
+
+        assert worker.frozen_prefix() == (item_e.request.request_id,)
+        assert worker.frozen_prefix_tip('main0') == 'sha-Ec'
+
+    async def test_phantom_finalize_head_does_not_poison_the_dispatch_guard(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Replay of PRD §5.3 class (a): 2026-08-08, tasks 5687/5830.
+
+        A requeued head's dead merge commit stayed the frozen tip, so a later
+        dispatch on correct main warned.  With the head vacated the tip is
+        main, and the same dispatch is silent.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-5687', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(
+            _make_inflight_entry(item_h), status=InflightStatus.REQUEUED,
+        )
+        _seed_finalizing_head(worker, entry_h, then=ItemLifecycleState.FINALIZING)
+        _, item_c = _make_fake_item('t-5830', base_sha='main0', merge_commit='sha-Cc',
+                                    config=config, git_repo=git_repo)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            _guard_warn(worker, item_c, 'main0')
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == []
+
+    async def test_live_finalizing_head_is_still_frozen(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """CONTROL: a finalize head that was not vacated stays frozen."""
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='sha-Hc',
+                                    config=config, git_repo=git_repo)
+        _seed_finalizing_head(
+            worker, _make_inflight_entry(item_h), then=ItemLifecycleState.FINALIZING,
+        )
+
+        assert worker.frozen_prefix() == (item_h.request.request_id,)
+        assert worker.frozen_prefix_tip('main0') == 'sha-Hc'
+
 
 # ── Amendment: _dispatch_item guard wiring tests (review suggestion) ──────────
 
@@ -1280,8 +1398,6 @@ class TestDispatchItemGuardWiring:
         Confirms the integration wiring: _dispatch_item returns a verifying
         InflightEntry even when the guard's git call fails.
         """
-        import unittest.mock as mock
-
         worker = _make_worker(git_ops)
 
         # Build an item that passes all _dispatch_item early-bailout checks:
@@ -1299,21 +1415,13 @@ class TestDispatchItemGuardWiring:
         async def _raise_on_get_main(*_args, **_kwargs):
             raise RuntimeError('simulated transient git error')
 
-        async def _noop_verify(_item, _lease, **_kwargs):
-            return None
+        result = await _dispatch(worker, git_ops, item, _raise_on_get_main)
 
-        with (
-            mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main),
-            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-        ):
-            result = await _dispatch(worker, item)
-
-        # Fail-open: dispatch must return a verifying InflightEntry, not None.
-        assert result is not None, (
-            '_dispatch_item returned None; expected a verifying InflightEntry '
+        # Fail-open: dispatch must return a verifying InflightEntry.
+        assert isinstance(result, InflightEntry), (
+            f'_dispatch_item returned {result!r}; expected a verifying InflightEntry '
             'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
         )
-        assert isinstance(result, InflightEntry)
         assert result.verify_task is not None, (
             'dispatch returned an entry with no verify task: the guard refused '
             'the dispatch instead of failing open'
@@ -1340,7 +1448,6 @@ class TestDispatchItemGuardWiring:
         the rid, confirming the integration seam is active.
         """
         import logging
-        import unittest.mock as mock
 
         worker = _make_worker(git_ops)
 
@@ -1364,15 +1471,8 @@ class TestDispatchItemGuardWiring:
         async def _return_main(*_args, **_kwargs) -> str:
             return 'fake-main'
 
-        async def _noop_verify(_item, _lease, **_kwargs):
-            return None
-
-        with (
-            mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
-            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-        ):
-            result = await _dispatch(worker, item_e)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            result = await _dispatch(worker, git_ops, item_e, _return_main)
 
         # Guard must have fired at least one WARNING naming the dispatched rid.
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1393,7 +1493,7 @@ class TestDispatchItemGuardWiring:
         )
 
         # Dispatch must still succeed — the guard is purely observational.
-        assert result is not None, 'dispatch must succeed even when guard warns'
+        assert isinstance(result, InflightEntry), 'dispatch must succeed even when guard warns'
         assert result.verify_task is not None, (
             'guard is observational: it must not withhold the verify task'
         )
@@ -1405,116 +1505,262 @@ class TestDispatchItemGuardWiring:
                 await result.verify_task
 
 
+# ── task 5302: the dispatch-time verify-base detector key ────────────────────
+
+
+_DIVERGENCE_CATEGORY = 'merge_verify_base_divergence'
+
+
+async def _dispatch_on_main(
+    worker: SpeculativeMergeWorker,
+    git_ops: GitOps,
+    item: SpeculativeItem,
+    main_sha: str,
+) -> InflightEntry:
+    """Dispatch *item* for real-verify while main reads *main_sha*, then admit
+    the entry to the in-flight region as the verifier loop does.
+
+    The verify itself is a no-op (:func:`_dispatch`).
+    """
+    async def _return_main(*_args, **_kwargs) -> str:
+        return main_sha
+
+    entry = await _dispatch(worker, git_ops, item, _return_main)
+    assert isinstance(entry, InflightEntry) and entry.verify_task is not None, 'dispatch was refused'
+    _seed_frozen(worker, entry)
+    return entry
+
+
+class _FailingEscalations(RecordingEscalations):
+    """An escalation queue whose every filing raises."""
+
+    def submit(self, escalation: Any) -> None:
+        raise RuntimeError('simulated escalation-queue outage')
+
+
+async def _settle(*entries: InflightEntry) -> None:
+    """Await each entry's no-op verify task so the loop closes clean."""
+    for entry in entries:
+        if entry.verify_task is not None:
+            entry.verify_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await entry.verify_task
+
+
+@pytest.mark.asyncio
+class TestVerifyBaseDetectorKey:
+    """A divergent dispatch is published and escalated, never refused (task 5302).
+
+    The record computed at dispatch is the one ``snapshot()`` reports under
+    ``verify_base_divergences``, and its first hit files one L1.  Items are
+    speculative, as in :class:`TestDispatchItemGuardWiring`, so Mechanism 2
+    reads no main of its own.
+    """
+
+    def _lane(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        escalations: RecordingEscalations | None = None,
+    ) -> tuple[SpeculativeMergeWorker, RecordingEscalations]:
+        """A lane whose frozen prefix is one verifying head with merge commit 'sha-Dc'."""
+        escalations = RecordingEscalations() if escalations is None else escalations
+        worker = make_lane(
+            git_ops, verifier=FakeVerifier(), clock=FakeClock(), escalation_queue=escalations,
+        )
+        _, item_d = _make_fake_item('t-d-frozen', base_sha='fake-main', merge_commit='sha-Dc',
+                                    config=config, git_repo=git_repo)
+        _seed_frozen(worker, _make_inflight_entry(item_d))
+        return worker, escalations
+
+    def _candidate(
+        self, task_id: str, base_sha: str, config: OrchestratorConfig, git_repo: Path,
+    ) -> SpeculativeItem:
+        _, item = _make_fake_item(task_id, base_sha=base_sha, merge_commit=f'sha-{task_id}',
+                                  config=config, git_repo=git_repo)
+        return dataclasses.replace(item, speculative=True, merge_wt=git_repo)
+
+    async def test_divergent_dispatch_is_published_and_escalated(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker, escalations = self._lane(git_ops, config, git_repo)
+        item_e = self._candidate('t-e', 'wrong-base', config, git_repo)
+
+        entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
+
+        published = worker.snapshot()['verify_base_divergences']
+        assert [d['request_id'] for d in published] == [item_e.request.request_id]
+        assert published[0]['expected_tip'] == 'sha-Dc'
+        filed = [e for e in escalations.filed if e.category == _DIVERGENCE_CATEGORY]
+        assert len(filed) == 1 and filed[0].level == 1
+        await _settle(entry)
+
+    async def test_a_failed_filing_neither_blocks_dispatch_nor_goes_silent(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        worker, _ = self._lane(git_ops, config, git_repo, _FailingEscalations())
+        item_e = self._candidate('t-e', 'wrong-base', config, git_repo)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
+
+        published = worker.snapshot()['verify_base_divergences']
+        assert [d['request_id'] for d in published] == [item_e.request.request_id]
+        failed = [r for r in caplog.records if 'failed to file' in r.getMessage()]
+        assert len(failed) == 1 and failed[0].levelno == logging.WARNING, failed
+        assert failed[0].exc_info is not None, 'the filing failure lost its traceback'
+        await _settle(entry)
+
+    async def test_divergent_successor_reads_as_a_chain_link_break_not_a_verify_base_string(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker, _ = self._lane(git_ops, config, git_repo)
+        item_e = self._candidate('t-e', 'wrong-base', config, git_repo)
+
+        entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
+
+        assert worker.snapshot()['two_layer_invariants'] == [
+            f'frozen-prefix base-chain broken at {item_e.request.request_id}: '
+            f"expected base 'sha-Dc' but item has 'wrong-base'"
+        ]
+        await _settle(entry)
+
+    async def test_open_l1_dedups_a_second_divergence(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The second detection goes through the guard directly: the lane's one
+        local host is still leased to the first verify, so a second full
+        dispatch would be parked before reaching the guard."""
+        worker, escalations = self._lane(git_ops, config, git_repo)
+        first = await _dispatch_on_main(
+            worker, git_ops, self._candidate('t-e', 'wrong-base', config, git_repo), 'fake-main',
+        )
+        escalations.open_it()
+
+        item_f = self._candidate('t-f', 'wrong-base-2', config, git_repo)
+        _assert_divergence(_guard_warn(worker, item_f, 'fake-main'), item_f, 'sha-t-e', 2)
+
+        assert len([e for e in escalations.filed if e.category == _DIVERGENCE_CATEGORY]) == 1
+        await _settle(first)
+
+    async def test_dispatch_on_the_tip_records_nothing(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker, escalations = self._lane(git_ops, config, git_repo)
+        item_e = self._candidate('t-e', 'sha-Dc', config, git_repo)
+
+        entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
+
+        assert worker.snapshot()['verify_base_divergences'] == []
+        assert escalations.filed == []
+        await _settle(entry)
+
+
 # ── task 3206 step-7(d): FIVE-SITE PARITY for the _remerge recovery marker ───
 
 
 class TestRemergeReturnPathParity:
-    """Every item `_remerge` can produce carries `remerge_recovery=True`.
-
-    CHARACTERIZATION / chokepoint pin (task regression item 3), modelled on
-    task 3082's on_requeued/_note_requeue pairing test and task 3204's
-    `_requeue_request` chokepoint parity test.
+    """Every item `_remerge` produces carries the claim it was given.
 
     `_remerge` is the SINGLE PRODUCER of recovery items for all five consumer
     paths (`_verifier_loop` head-failure cascade, `_void_and_remerge` INV-3
     void, `_finalize_inflight` RUNNER_UNAVAILABLE, and `_dispatch_item`'s
-    dead-base-straggler and Mechanism-2 sites).  That is only true while EVERY
-    exit stamps the marker — an exit that escaped it would silently escape the
-    PRD §5.3 carve-out and start crying wolf again at both §5.3 surfaces.
-
-    MADE TRUE BY CONSTRUCTION, not pinned by shape (review remediation).  The
-    body's many early returns live in `_remerge_inner`; `_remerge` itself is a
-    wrapper with ONE exit that stamps the marker on whatever came back.  So
-    the test below is BEHAVIOURAL — it feeds `_remerge` an arbitrary unmarked
-    item (both union arms) and asserts the stamp — and holds for return paths
-    that do not exist yet.  It replaces an AST walk that asserted `_remerge`
-    contained exactly five `return <Ctor>(...)` nodes each with a literal
-    `remerge_recovery=True` keyword: that pinned implementation shape (a
-    harmless extract-a-local refactor turned it red) while still being unable
-    to catch a path returning a pre-built item.  Do not reinstate it.
+    dead-base-straggler and Mechanism-2 sites).  Its single exit stamps the
+    claim's anchor as `remerge_base` and the claim's permit on whatever
+    `_remerge_inner` returned, so the speculative <=> permit invariant
+    (plans/merge-lane-policy-prd.md §6) holds for every present and future
+    return path of the body, and the §5.3 detector reads the anchor rather
+    than a separately maintained flag (task 8524).
     """
 
     @pytest.mark.asyncio
-    async def test_remerge_stamps_the_marker_on_every_exit(
+    async def test_remerge_stamps_the_claim_on_every_exit(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """Whatever `_remerge_inner` returns, `_remerge` returns it MARKED.
-
-        Covers both arms of the item union — `_remerge` can return either —
-        and, because the stamp is unconditional at the single exit, covers
-        every present and future return path inside the body.
-        """
+        """Whatever `_remerge_inner` returns, `_remerge` returns it stamped
+        with the claim, for both union arms and both kinds of anchor."""
         import unittest.mock as mock
 
         worker = _make_worker(git_ops)
+        claims = (
+            RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None),
+            RemergeClaim(RemergeBase('sha-tip', RemergeReason.LIVE_TIP), SpecPermit()),
+        )
+        for claim in claims:
+            for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
+                _, unmarked = _make_fake_item(
+                    f't-recovery-{label}', base_sha='real-main',
+                    merge_commit=merge_commit, config=config, git_repo=git_repo,
+                )
+                assert unmarked.remerge_base is None, 'fixture must start unmarked'
+                anchors: list[RemergeBase] = []
 
-        for label, merge_commit in (('real', 'sha-Rc'), ('decided', None)):
-            _, unmarked = _make_fake_item(
-                f't-recovery-{label}', base_sha='real-main',
-                merge_commit=merge_commit, config=config, git_repo=git_repo,
-            )
-            assert unmarked.remerge_recovery is False, 'fixture must start unmarked'
+                # Patch on the INSTANCE, not the class: an instance attribute
+                # is not re-bound, so the defaults survive the call.
+                async def _body(
+                    _req: object, _mono: object, anchor: RemergeBase,
+                    _item: SpeculativeItem = unmarked, _seen: list[RemergeBase] = anchors,
+                ) -> SpeculativeItem:
+                    _seen.append(anchor)
+                    return _item
 
-            # Patch on the INSTANCE, not the class: an instance attribute is
-            # not re-bound, so `_item`'s default survives the call.
-            async def _body(_req: object, _mono: object, _item=unmarked) -> SpeculativeItem:
-                return _item
+                with mock.patch.object(worker, '_remerge_inner', _body):
+                    out = await worker._remerge(unmarked.request, None, claim=claim)
 
-            with mock.patch.object(worker, '_remerge_inner', _body):
-                out = await worker._remerge(unmarked.request, None)
-
-            assert out.remerge_recovery is True, (
-                f'§5.3 CARVE-OUT ESCAPE (task 3206): _remerge returned an '
-                f'UNMARKED {label} item. The single-exit chokepoint must stamp '
-                f'remerge_recovery on whatever the body returns — an unmarked '
-                f'recovery item re-introduces the class-(b) false positives at '
-                f'BOTH §5.3 surfaces. See PRD §5.3.'
-            )
-            # The stamp must be the ONLY difference: dataclasses.replace copies
-            # every other field, so a recovery item is otherwise byte-identical.
-            assert dataclasses.replace(out, remerge_recovery=False) == unmarked, (
-                f'_remerge altered the {label} item beyond the §5.3 marker'
-            )
+                assert anchors == [claim.anchor], f'{label}: the body merges onto the claim'
+                assert out.remerge_base == claim.anchor, f'{label}: anchor not stamped'
+                assert out.permit is claim.permit, f'{label}: permit not handed over'
+                assert dataclasses.replace(out, remerge_base=None, permit=None) == unmarked, (
+                    f'_remerge altered the {label} item beyond the claim'
+                )
 
     def test_remerge_has_a_single_exit(self) -> None:
-        """The chokepoint above is only load-bearing while `_remerge` has ONE exit.
+        """The stamp above is only load-bearing while `_remerge` has ONE exit.
 
-        Deliberately the whole of the structural check (see the class
-        docstring): not what the exits construct, only that there is exactly
-        one, so no path can bypass the stamp.  If you need another return in
-        `_remerge`, put it in `_remerge_inner` instead.
+        Deliberately the whole of the structural check: not what the exits
+        construct, only that there is exactly one, so no path can bypass the
+        stamp.  If you need another return in `_remerge`, put it in
+        `_remerge_inner` instead.
         """
         import ast
         import inspect
         import textwrap
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
         returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
 
         assert len(returns) == 1, (
-            f'_remerge must have exactly ONE exit — it is the single chokepoint '
-            f'that stamps the §5.3 remerge_recovery marker (task 3206); found '
-            f'{len(returns)}. Move the new return into _remerge_inner, or the '
-            f'marker stops holding by construction.'
+            f'_remerge must have exactly ONE exit -- it is the single chokepoint '
+            f'that stamps the claim (remerge_base + permit, task 8524); found '
+            f'{len(returns)}. Move the new return into _remerge_inner.'
         )
 
-    def test_marker_defaults_false_on_both_item_variants(self) -> None:
-        """Only `_remerge` may produce recovery items.
+    @pytest.mark.asyncio
+    async def test_anchor_defaults_to_none_on_both_item_variants(
+        self, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """An item built without an anchor carries none: only `_remerge`
+        stamps one (task 8524)."""
+        _, real = _make_fake_item('t-unanchored-real', config=config, git_repo=git_repo)
+        _, decided = _make_fake_item(
+            't-unanchored-decided', merge_commit=None, config=config, git_repo=git_repo,
+        )
 
-        The default must stay False so every OTHER construction site — and
-        every `dataclasses.replace` relabel/put-back, which copies all fields
-        — is unaffected by the carve-out. A default of True would exempt the
-        entire pipeline from §5.3 in one character.
-        """
-        from orchestrator.merge_types import DecidedItem as _DI
-        from orchestrator.merge_types import RealMergeItem as _RMI
+        assert isinstance(real, RealMergeItem)
+        assert isinstance(decided, DecidedItem)
+        assert real.remerge_base is None
+        assert decided.remerge_base is None
 
-        for cls in (_RMI, _DI):
-            field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']
-            assert field.default is False, (
-                f'{cls.__name__}.remerge_recovery must default to False, got '
-                f'{field.default!r} — a True default would exempt every item '
-                f'from the §5.3 guard (task 3206).'
-            )
+    @pytest.mark.asyncio
+    async def test_the_recovery_marker_is_a_fall_to_main(
+        self, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        _, item = _make_fake_item('t-mark', config=config, git_repo=git_repo)
+        marked = _mark_recovery(item)
+        assert marked.remerge_base == RemergeBase(None, RemergeReason.NO_TIP)

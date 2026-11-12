@@ -113,7 +113,9 @@ def _quoting_cluster(**overrides: Any) -> dict[str, Any]:
 
 
 def _payload_for(cluster: dict[str, Any]) -> dict[str, Any]:
-    return mod.build_task_payloads([cluster], project_root='/r', project_id='reify')[0]
+    return mod.build_task_payloads(
+        [cluster], project_root='/r', project_id='reify', run_id='census-reify-20260714',
+    )[0]
 
 
 def test_evidence_quoting_envelope_closers_submits_and_round_trips_escaped():

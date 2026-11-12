@@ -1,0 +1,12 @@
+{
+  "task_id": "5227",
+  "reason": "new info-L0 router boundary suite (PRD rows #1-#20): imports MergeOutcome for row #5; its 10 private reads are harness/workflow router call sites, none a merge-lane private",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6452,
+      "current": 6462
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "task_id": "5827",
+  "reason": "Review amendment to the stuck-alarm ladder: request_ledger.py::_raise_stuck_alarm now catches and logs a raising L1 filing per entry, so one failed filing neither re-WARNs every heartbeat nor starves the other due entries; request_ledger.py::_ladder_alarm_number refuses an alarm number outside STUCK_ALARM_THRESHOLD_MULTIPLES with a named ValueError instead of a bare IndexError. Both are new behaviour, not a failed refactor.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/request_ledger.py",
+      "baseline": 21,
+      "current": 23
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4995,
+      "current": 4997
+    }
+  ]
+}

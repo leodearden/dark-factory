@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "session_slug": "fixture-s1-author",
+  "title": "prd:fixture S1",
+  "role": "prd",
+  "project": "fixture",
+  "task_id": null,
+  "escalation_id": null,
+  "prompt": "Read /review-all-fixture/home/briefs/S1.author.md and follow it as your brief.",
+  "cwd": "/review-all-fixture/project",
+  "launche

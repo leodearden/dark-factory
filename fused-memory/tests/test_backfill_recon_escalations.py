@@ -18,7 +18,7 @@ from escalation.dedupe import compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'backfill_recon_escalations.py'
 
@@ -772,6 +772,7 @@ class TestSafetyAndCli:
         """main() with no --apply prints JSON report to stdout."""
         import sys as _sys  # noqa: PLC0415
 
+        _submit_esc(EscalationQueue(tmp_path), _esc())
         old_argv = _sys.argv
         try:
             _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(tmp_path)]
@@ -821,19 +822,20 @@ class TestRunTargetStorePreflight:
     ``--queue-dir`` default is the RELATIVE ``./data/reconciliation/
     escalations``, so that is what a run from a task worktree does.
 
-    Every OTHER class in this file constructs ``EscalationQueue(tmp_path)`` on
-    an EXISTING directory, so the guard is a verified no-op for them. If one of
+    Every OTHER class in this file runs against a queue it has SEEDED (task
+    5468: an existing but empty dir is refused too), so the guard is a
+    verified no-op for them. If one of
     them breaks, that is a signal the guard was placed wrongly (e.g. asserting
     absoluteness) — not a licence to weaken it.
     """
 
     def test_dry_run_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
         """The DRY RUN refuses too: its report is exactly as false as an apply."""
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=False)
 
     def test_apply_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=True)
 
     @pytest.mark.parametrize('apply', [False, True])
@@ -841,38 +843,43 @@ class TestRunTargetStorePreflight:
         """The queue was never constructed, so the ``mkdir`` never happened."""
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(target, apply=apply)
 
         assert not target.exists()
         assert not (tmp_path / 'data').exists()
 
-    def test_main_does_not_return_zero_for_a_missing_queue_dir(
-        self, tmp_path: Path
+    @pytest.mark.parametrize('create_empty_dir', [False, True], ids=['missing', 'empty'])
+    def test_main_does_not_return_zero_for_a_missing_or_empty_queue_dir(
+        self, tmp_path: Path, create_empty_dir: bool,
     ) -> None:
         """The refusal must RAISE, not report.
 
-        Routed through the normal report path, a missing dir reads as an empty
-        queue with no ``canonical_not_found`` or ``children_vanished`` count,
-        which ``resolve_exit_code`` grades as a clean 0 — reproducing the very
-        defect the guard exists to fix.
+        Routed through the normal report path, a missing or empty dir reads as
+        an empty queue with no ``canonical_not_found`` or ``children_vanished``
+        count, which ``resolve_exit_code`` grades as a clean 0 — reproducing
+        the very defect the guard exists to fix.
         """
         import sys as _sys  # noqa: PLC0415
 
-        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        target = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        if create_empty_dir:
+            target.mkdir(parents=True)
         old_argv = _sys.argv
         try:
-            _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(missing)]
-            with pytest.raises(TargetStoreMissing):
+            _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(target)]
+            with pytest.raises(TargetStoreUnpopulated):
                 _mod.main()
         finally:
             _sys.argv = old_argv
 
-    def test_existing_queue_dir_passes_the_guard(self, tmp_path: Path) -> None:
-        """The guard does not require absoluteness, or a non-empty queue."""
-        report = run(tmp_path, apply=False)
+    def test_an_empty_existing_queue_dir_is_refused(self, tmp_path: Path) -> None:
+        """An empty queue dir is refused before the scan (task 5468).
 
-        assert report['pending_before'] == 0
+        The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
+        """
+        with pytest.raises(TargetStoreUnpopulated):
+            run(tmp_path, apply=False)
 
 
 # ---------------------------------------------------------------------------

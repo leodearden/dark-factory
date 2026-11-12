@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _task_db_scan import decode_metadata
 from audit_delivered_checks import (
     _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
@@ -48,9 +49,15 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
+    load_manifest_checks,
+    load_open_dependents,
     load_task_index,
+    stale_path_findings,
+    stale_path_is_actionable,
+    structural_findings,
 )
 from shared.delivered_check_polarity import CheckOutcome
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
 # classify_descriptor — the pure core, and the whole point of the script.
@@ -263,6 +270,45 @@ class TestLoadTaskIndex:
         assert index.metadata_rows == ()
         assert index.stamped_names == {(11, 'c')}
 
+    def test_path_descriptors_are_loaded_for_the_stale_path_sweep(self, make_tasks_db):
+        db = make_tasks_db([
+            {
+                'id': 16,
+                'status': 'pending',
+                'metadata': {
+                    'delivered_checks': [
+                        {'name': 'p', 'kind': 'path', 'expect': 'present',
+                         'paths': ['src/b.py']},
+                    ]
+                },
+            },
+        ])
+
+        rows = load_task_index(str(db)).metadata_rows
+
+        assert [(r.task_id, r.name, r.kind, r.pattern, r.paths) for r in rows] == [
+            (16, 'p', 'path', None, ('src/b.py',)),
+        ]
+
+    @pytest.mark.parametrize('paths', [None, [], [42, None]])
+    def test_a_path_descriptor_without_usable_paths_is_skipped(self, make_tasks_db, paths):
+        db = make_tasks_db([
+            {
+                'id': 17,
+                'status': 'pending',
+                'metadata': {
+                    'delivered_checks': [
+                        {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': paths},
+                    ]
+                },
+            },
+        ])
+
+        index = load_task_index(str(db))
+
+        assert index.metadata_rows == ()
+        assert index.stamped_names == {(17, 'p')}
+
     def test_malformed_metadata_is_skipped_not_raised(self, make_tasks_db):
         # A single undecodable row must not abort a whole-project sweep.
         db = make_tasks_db([
@@ -285,6 +331,28 @@ class TestLoadTaskIndex:
         assert index.stamped_names == {(14, 'ok')}
         assert set(index.statuses) == {12, 13, 14}
 
+    def test_metadata_is_decoded_as_the_sibling_audits_decode_it(self, make_tasks_db):
+        # A BLOB-typed metadata column is still metadata: the decoder every
+        # audit script shares accepts bytes, so this one must too.
+        db = make_tasks_db([{'id': 18, 'status': 'done'}])
+        blob = json.dumps({
+            'delivered_checks': [
+                {'name': 'blob', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'}
+            ]
+        }).encode()
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute('UPDATE tasks SET metadata = ? WHERE id = 18', (blob,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        index = load_task_index(str(db))
+
+        assert [(r.task_id, r.name) for r in index.metadata_rows] == [(18, 'blob')]
+        assert index.stamped_names == {(18, 'blob')}
+        assert 'delivered_checks' in decode_metadata(blob)
+
     def test_connection_is_read_only(self, make_tasks_db):
         # READ-ONLY/REPORT-ONLY is a structural guarantee, not a convention:
         # the URI mode makes writing impossible rather than merely unwritten.
@@ -295,6 +363,18 @@ class TestLoadTaskIndex:
                 conn.execute("UPDATE tasks SET status = 'cancelled'")
         finally:
             conn.close()
+
+
+def test_load_open_dependents_refuses_a_stub_instead_of_reading_nobody_blocked(tmp_path):
+    """Its `no such table` swallow is for a store lacking only the
+    dependencies table; a 0-byte stub has no tables at all."""
+    stub = tmp_path / 'tasks.db'
+    stub.write_bytes(b'')
+
+    with pytest.raises(TaskDbUnreadable) as refused:
+        load_open_dependents(str(stub))
+
+    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +413,26 @@ class TestEvaluateRow:
         plain = tmp_path / 'not-a-repo'
         plain.mkdir()
         assert evaluate_row(_row(), repo_root=str(plain)) is CheckOutcome.ERRORED
+
+    def test_a_path_row_is_evaluated_as_existence(self, tmp_path):
+        # An EMPTY file exists but holds no line for a grep to match: only an
+        # existence check reads it as present.
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n', 'src/empty.py': ''})
+
+        def outcome(path, expect='present'):
+            row = _row(kind='path', pattern=None, paths=(path,), expect=expect)
+            return evaluate_row(row, repo_root=str(root))
+
+        assert outcome('src/a.py') is CheckOutcome.PASS
+        assert outcome('src/empty.py') is CheckOutcome.PASS
+        assert outcome('src/b.py') is CheckOutcome.FAIL
+        assert outcome('src/b.py', expect='absent') is CheckOutcome.PASS
+
+    def test_a_kind_with_no_probe_is_refused_by_name(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n'})
+
+        with pytest.raises(ValueError, match="kind 'script'"):
+            evaluate_row(_row(kind='script', pattern=None), repo_root=str(root))
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +573,62 @@ class TestAuditProject:
         assert audit.coverage.sidecars_unloadable == 0
         assert from_sidecar == {'cap-y': DISPOSITION_UNWIRED_LIVE_GATE}
 
+    def test_path_descriptors_get_a_polarity_disposition(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A path check carries an ``expect`` like a grep check, so the same
+        status-by-outcome table classifies it."""
+        def path_check(path):
+            return {'delivered_checks': [
+                {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': [path]}]}
+
+        root = _init_repo(tmp_path / 'proj', {'src/a.py': 'pass\n'})
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [
+                {'id': 30, 'status': 'done', 'metadata': path_check('src/a.py')},
+                {'id': 31, 'status': 'done', 'metadata': path_check('src/never.py')},
+                {'id': 32, 'status': 'pending', 'metadata': path_check('src/a.py')},
+                {'id': 33, 'status': 'pending', 'metadata': path_check('src/never.py')},
+                {'id': 34, 'status': 'cancelled', 'metadata': path_check('src/never.py')},
+            ],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+        by_task = {f.row.task_id: f.disposition for f in audit.findings}
+
+        assert by_task == {
+            30: DISPOSITION_DELIVERED,
+            31: DISPOSITION_BROKEN,
+            32: DISPOSITION_VACUOUS_LIVE_GATE,
+            33: DISPOSITION_HEALTHY,
+            34: DISPOSITION_INERT,
+        }
+        assert audit.coverage.descriptors_total == len(audit.findings) == 5
+
+    def test_a_grep_row_beside_path_rows_is_still_classified(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _init_repo(tmp_path / 'proj', {'src/a.py': 'pass\n'})
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [{'id': 31, 'status': 'done', 'metadata': {'delivered_checks': [
+                {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': ['src/b.py']},
+                {'name': 'g', 'kind': 'grep', 'pattern': 'NeverBuilt',
+                 'expect': 'present', 'paths': ['src/']},
+            ]}}],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+
+        assert sorted((f.row.name, f.disposition) for f in audit.findings) == [
+            ('g', DISPOSITION_BROKEN),
+            ('p', DISPOSITION_BROKEN),
+        ]
+        assert audit.coverage.descriptors_total == 2
+
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
         # correctly-authored descriptor that later work legitimately undid, and
@@ -503,6 +659,37 @@ class TestAuditProject:
         assert '3578' in report
         assert superseded_at != broken_at
         assert 'COVERAGE' in report
+
+
+def test_load_manifest_checks_carries_sidecar_path_capabilities(tmp_path):
+    root = _init_repo(
+        tmp_path / 'proj',
+        {
+            'src/a.py': 'pass\n',
+            'plans/x-prd.capability-manifest.yaml': (
+                'prd: plans/x-prd.md\n'
+                'schema_version: 1\n'
+                'tasks:\n'
+                '  - label: α\n'
+                '    task_id: 40\n'
+                '    capabilities:\n'
+                '      - name: file-lands\n'
+                '        binding: b\n'
+                '        verdict: FAIL\n'
+                '        delivered_check:\n'
+                '          kind: path\n'
+                '          paths: [src/b.py]\n'
+                '          expect: present\n'
+            ),
+        },
+    )
+
+    rows, unloadable = load_manifest_checks(str(root), {40: ('master', 'pending')})
+
+    assert unloadable == 0
+    assert [(r.task_id, r.name, r.kind, r.pattern, r.paths, r.source) for r in rows] == [
+        (40, 'file-lands', 'path', None, ('src/b.py',), 'manifest'),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +1039,306 @@ class TestMainExitCodes:
         assert '3578' in result.stdout
 
 
+_SHIM_BODY = 'import sys\n\nfrom src import new_mod as target\n\nsys.modules[__name__] = target\n'
+
+#: main carries a sys.modules shim, a live module, and (after _stale_project's
+#: delete commit) no longer src/gone.py.
+_STALE_TREE = {
+    'src/new_mod.py': 'def real():\n    return 1\n',
+    'src/old_mod.py': _SHIM_BODY,
+    'src/gone.py': 'def legacy():\n    return 0\n',
+}
+
+
+def _delete(root, message, rel):
+    """Commit the deletion of *rel* (a file or a directory) alone; the
+    untracked tasks.db stays out."""
+    subprocess.run(
+        ['git', '-C', str(root), 'rm', '-q', '-r', rel], check=True, capture_output=True
+    )
+    subprocess.run(
+        ['git', '-C', str(root), '-c', 'user.email=t@e', '-c', 'user.name=t',
+         'commit', '-q', '-m', message],
+        check=True, capture_output=True,
+    )
+
+
+def _stale_project(tmp_path, make_tasks_db, project_root_with_tasks_db, *, tasks,
+                   files=None):
+    root = _make_project(
+        tmp_path, make_tasks_db, project_root_with_tasks_db,
+        tasks=tasks, files={**_STALE_TREE, **(files or {})},
+    )
+    _delete(root, 'retire the gone module', 'src/gone.py')
+    return root
+
+
+def _shim_grep(name, pattern='BrandNewSymbol'):
+    return _grep(name, pattern, paths=('src/old_mod.py',))
+
+
+def _section(stdout, header, next_header):
+    return stdout.split(header, 1)[1].split(next_header, 1)[0]
+
+
+class TestStalePaths:
+    """The STALE PATHS sweep: an expect=present check whose `paths` name a
+    sys.modules shim or a mainline-removed path can never go green."""
+
+    @pytest.mark.parametrize(
+        ('removed', 'gone'),
+        [('src/gone.py', 'src/gone.py'), ('src/olddir', 'src/olddir/')],
+        ids=['file', 'directory-with-trailing-slash'],
+    )
+    def test_sweep_flags_shim_and_removed_paths_only(self, tmp_path, removed, gone):
+        root = _init_repo(
+            tmp_path / 'repo', {**_STALE_TREE, 'src/olddir/legacy.py': 'pass\n'}
+        )
+        _delete(root, 'retire the gone module', removed)
+        rows = [
+            _row(task_id=1, name='grep-shim', paths=('src/old_mod.py',)),
+            _row(task_id=2, name='grep-gone', paths=(gone,)),
+            _row(task_id=3, name='path-gone', kind='path', pattern=None, paths=(gone,)),
+            _row(task_id=4, name='grep-new', paths=('src/never_created.py',)),
+            _row(task_id=5, name='absent-shim', expect='absent', paths=('src/old_mod.py',)),
+            _row(task_id=6, name='absent-gone', expect='absent', paths=(gone,)),
+            _row(task_id=7, name='path-shim', kind='path', pattern=None,
+                 paths=('src/old_mod.py',)),
+            _row(task_id=8, name='grep-live', paths=('src/new_mod.py',)),
+        ]
+
+        sweep = stale_path_findings(rows, repo_root=str(root), ref='main')
+
+        assert {(f.row.task_id, f.row.name, f.scope.path, f.code) for f in sweep.findings} == {
+            (1, 'grep-shim', 'src/old_mod.py', 'shim_path'),
+            (2, 'grep-gone', gone, 'removed_path'),
+            (3, 'path-gone', gone, 'removed_path'),
+        }
+        removed = [f for f in sweep.findings if f.code == 'removed_path']
+        assert all(
+            f.scope.removed_in and 'retire the gone module' in f.scope.removed_in
+            for f in removed
+        )
+        assert sweep.paths_unclassified == 0
+
+    def test_a_row_yields_one_finding_per_stale_path_in_its_paths_order(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
+        _delete(root, 'retire the gone module', 'src/gone.py')
+        row = _row(paths=('src/old_mod.py', 'src/new_mod.py', 'src/gone.py'))
+
+        sweep = stale_path_findings([row], repo_root=str(root), ref='main')
+
+        assert [(f.scope.path, f.code) for f in sweep.findings] == [
+            ('src/old_mod.py', 'shim_path'),
+            ('src/gone.py', 'removed_path'),
+        ]
+
+    def test_glob_entries_are_neither_classified_nor_counted_unclassified(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
+        row = _row(paths=('src/*.py', ':(glob)src/**', 'src/old_mod.py'))
+
+        sweep = stale_path_findings([row], repo_root=str(root), ref='main')
+
+        assert [(f.scope.path, f.code) for f in sweep.findings] == [
+            ('src/old_mod.py', 'shim_path'),
+        ]
+        assert sweep.paths_unclassified == 0
+
+    @pytest.mark.parametrize(
+        ('status', 'open_dependents', 'actionable'),
+        [
+            ('pending', (), True),
+            ('in-progress', (), True),
+            ('blocked', (), True),
+            ('deferred', (), True),
+            ('done', (), False),
+            ('done', (77,), True),
+            ('cancelled', (77,), False),
+            (None, (77,), False),
+        ],
+    )
+    def test_actionability_follows_who_is_held(self, status, open_dependents, actionable):
+        assert stale_path_is_actionable(status, open_dependents) is actionable
+
+    def test_live_producer_with_a_shim_scoped_check_exits_1(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 50, 'status': 'pending', 'metadata': _checks(_shim_grep('cap'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'STALE PATHS (1)' in result.stdout
+        section = _section(result.stdout, 'STALE PATHS (1)', '  BROKEN (')
+        lines = section.splitlines()
+        [row_at] = [i for i, line in enumerate(lines) if 'task_id=' in line]
+        row_line = lines[row_at]
+        assert 'task_id=50' in row_line
+        assert 'path=src/old_mod.py' in row_line
+        assert 'code=shim_path' in row_line
+        assert 'open_dependents=' in row_line
+        assert lines[row_at + 1].strip().startswith('reason:')
+
+    def test_done_producer_without_open_dependents_is_report_only(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 51, 'status': 'done',
+                    'metadata': _checks(_shim_grep('cap', pattern='sys.modules'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'STALE PATHS (0)' in result.stdout
+        assert 'STALE PATHS, report-only (1)' in result.stdout
+        report_only = result.stdout.split('STALE PATHS, report-only (1)', 1)[1]
+        assert 'task_id=51' in report_only
+
+    def test_cancelled_producer_is_report_only_even_with_an_open_dependent(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 56, 'status': 'cancelled', 'metadata': _checks(_shim_grep('cap'))},
+                {'id': 79, 'status': 'blocked'},
+            ],
+        )
+        _seed_dependencies(root, [(79, 56)])
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'STALE PATHS (0)' in result.stdout
+        report_only = result.stdout.split('STALE PATHS, report-only (1)', 1)[1]
+        assert 'task_id=56' in report_only
+        assert 'status=cancelled' in report_only
+
+    def test_done_producer_with_an_open_dependent_exits_1(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 51, 'status': 'done',
+                 'metadata': _checks(_shim_grep('cap', pattern='sys.modules'))},
+                {'id': 77, 'status': 'blocked'},
+            ],
+        )
+        _seed_dependencies(root, [(77, 51)])
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        section = _section(result.stdout, 'STALE PATHS (1)', '  BROKEN (')
+        assert 'open_dependents=77' in section
+
+    def test_both_halves_are_swept_without_dedupe(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A stale sidecar is re-stamped over a repaired record on
+        re-decompose, so each half is its own artifact to repair."""
+        sidecar = (
+            'prd: plans/x-prd.md\n'
+            'schema_version: 1\n'
+            'tasks:\n'
+            '  - label: α\n'
+            '    task_id: 52\n'
+            '    capabilities:\n'
+            '      - name: cap\n'
+            '        binding: b\n'
+            '        verdict: FAIL\n'
+            '        delivered_check:\n'
+            '          kind: grep\n'
+            '          pattern: BrandNewSymbol\n'
+            '          expect: present\n'
+            '          paths: [src/old_mod.py]\n'
+        )
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'plans/x-prd.capability-manifest.yaml': sidecar},
+            tasks=[{'id': 52, 'status': 'pending', 'metadata': _checks(_shim_grep('cap'))}],
+        )
+
+        audit = audit_project(str(root))
+
+        assert sorted((f.row.source, f.row.name, f.code) for f in audit.stale_paths) == [
+            ('manifest', 'cap', 'shim_path'),
+            ('metadata', 'cap', 'shim_path'),
+        ]
+
+    @pytest.mark.parametrize(
+        ('gone', 'removed_by'),
+        [('src/gone.py', 'retire the gone module'),
+         ('src/olddir/', 'retire the old package')],
+        ids=['file', 'directory-with-trailing-slash'],
+    )
+    def test_json_carries_stale_paths_and_their_coverage(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db, gone, removed_by
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/olddir/legacy.py': 'pass\n'},
+            tasks=[
+                {'id': 53, 'status': 'pending', 'metadata': _checks(
+                    _grep('gone', 'BrandNewSymbol', paths=(gone,)))},
+                {'id': 78, 'status': 'pending'},
+            ],
+        )
+        _delete(root, 'retire the old package', 'src/olddir')
+        _seed_dependencies(root, [(78, 53)])
+
+        result = _run_cli('--project-root', str(root), '--json')
+        project = json.loads(result.stdout)['projects'][0]
+
+        [entry] = project['stale_paths']
+        assert entry['task_id'] == 53
+        assert entry['path'] == gone
+        assert entry['code'] == 'removed_path'
+        assert removed_by in entry['removed_in']
+        assert entry['actionable'] is True
+        assert entry['open_dependents'] == [78]
+        assert project['coverage']['scope_paths_unclassified'] == 0
+
+    def test_an_unanswerable_classifier_is_counted_never_read_as_clean(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 54, 'status': 'pending', 'metadata': _checks(
+                _shim_grep('shim'),
+                _grep('gone', 'BrandNewSymbol', paths=('src/gone.py', 'src/old_mod.py')),
+            )}],
+        )
+
+        audit = audit_project(str(root), ref='nope')
+
+        assert audit.stale_paths == ()
+        assert audit.coverage.scope_paths_unclassified == 2
+
+
 class TestReportShape:
+    def test_a_path_row_is_rendered_by_its_paths(self):
+        row = _row(kind='path', pattern=None, paths=('src/gone.py',), status='done')
+        audit = ProjectAudit(
+            project_root='/synthetic',
+            findings=[Finding(row=row, disposition=DISPOSITION_BROKEN)],
+            coverage=AuditCoverage(
+                descriptors_total=1, descriptors_without_task=0, unevaluable=0,
+                sidecars_unloadable=0,
+            ),
+        )
+
+        report = format_report([audit])
+
+        assert 'paths=src/gone.py' in report
+        assert 'pattern=None' not in report
+
     def test_json_is_an_object_carrying_coverage(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
     ):
@@ -970,6 +1456,13 @@ class TestStructuralSection:
         assert [(s['name'], s['code']) for s in payload['projects'][0]['structural']] == [
             ('hook-wired', 'vacuous_present_comment_only')
         ]
+
+    def test_a_path_row_yields_no_structural_code(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n'})
+        row = _row(kind='path', pattern=None, paths=('src/a.py',), source='manifest',
+                   manifest='plans/x.capability-manifest.yaml')
+
+        assert structural_findings([row], repo_root=str(root)) == ()
 
 
 class TestReadOnly:
@@ -1098,6 +1591,156 @@ class TestSupersessionAttribution:
 
         assert finding.superseded_by is None
         assert finding.disposition == DISPOSITION_BROKEN
+
+    def _path_project(self, tmp_path, make_tasks_db, project_root_with_tasks_db, *,
+                      task_id, expect, paths, files=None):
+        return _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files=files,
+            tasks=[{'id': task_id, 'status': 'done',
+                    'updated_at': '2020-01-01T00:00:00+00:00',
+                    'metadata': _checks({'name': f'{task_id}-lands', 'kind': 'path',
+                                         'expect': expect, 'paths': list(paths)})}],
+        )
+
+    def test_a_deleted_path_is_attributed_to_the_task_that_deleted_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3700, expect='present', paths=('src/gone.py',),
+            files={'src/a.py': 'pass\n', 'src/gone.py': 'def f():\n    pass\n'},
+        )
+        _delete(root, 'Merge task/3701 into main', 'src/gone.py')
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_SUPERSEDED
+        assert finding.superseded_by == '3701'
+
+    def test_a_recreated_path_is_attributed_to_the_task_that_recreated_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3702, expect='absent', paths=('src/back.py',),
+        )
+        _commit(root, 'feat: restore the module (task 3703)', {'src/back.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_SUPERSEDED
+        assert finding.superseded_by == '3703'
+
+    def test_a_path_never_created_is_broken_not_superseded(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3704, expect='present', paths=('src/never.py',),
+        )
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_the_producers_own_commit_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3705, expect='absent', paths=('src/own.py',),
+        )
+        _commit(root, 'Merge task/3705 into main', {'src/own.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_that_only_modified_the_path_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # The path was never deleted, so editing it undid nothing.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3706, expect='absent', paths=('src/kept.py',),
+            files={'src/a.py': 'pass\n', 'src/kept.py': 'pass\n'},
+        )
+        _commit(root, 'fix: tweak (task 3707)', {'src/kept.py': 'changed\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_file_added_beneath_a_directory_entry_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # The directory was never removed, so an unrelated file landing in it
+        # undid nothing.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3708, expect='absent', paths=('src/pkg',),
+            files={'src/a.py': 'pass\n', 'src/pkg/a.py': 'pass\n'},
+        )
+        _commit(root, 'feat: a neighbour (task 3709)', {'src/pkg/b.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_glob_character_in_a_path_is_read_literally(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # ls-tree reads 'src/x*.py' as that one file; a commit adding
+        # src/xy.py touches a different path.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3710, expect='absent', paths=('src/x*.py',),
+            files={'src/a.py': 'pass\n', 'src/x*.py': 'pass\n'},
+        )
+        _commit(root, 'feat: another module (task 3711)', {'src/xy.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_creating_one_listed_path_never_supersedes_a_present_check(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # Creating x moved the conjunctive check toward passing; y is still
+        # missing, so nothing was undone.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3712, expect='present', paths=('src/x.py', 'src/y.py'),
+        )
+        _commit(root, 'feat: add x (task 3713)', {'src/x.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_deleting_one_listed_path_never_supersedes_an_absent_check(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # Deleting p moved the conjunctive check toward passing; q still
+        # exists, so nothing was undone.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3714, expect='absent', paths=('src/p.py', 'src/q.py'),
+            files={'src/a.py': 'pass\n', 'src/p.py': 'pass\n', 'src/q.py': 'pass\n'},
+        )
+        _delete(root, 'refactor: drop p (task 3715)', 'src/p.py')
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
 
     @pytest.mark.parametrize('subject, expected', [
         ('Merge task/3578 into main', '3578'),

@@ -3,8 +3,8 @@
 Task 5267. A member with a ``[tool.pyright]`` table type-checks through two
 entry points that select files independently:
 
-  * a BARE ``pyright`` run from the member directory (``hooks/project-checks``,
-    the fleet chain in ``dark-factory-orchestrator.yaml``, an editor), which
+  * a BARE ``pyright`` run from the member directory (the fleet chain in
+    ``dark-factory-orchestrator.yaml``, an editor), which
     selects by ``[tool.pyright] include``;
   * the member's module verify type leg, ``<member>/orchestrator.yaml``
     ``type_check_command``. Under the root config's

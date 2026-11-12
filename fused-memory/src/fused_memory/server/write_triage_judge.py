@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
 from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
@@ -54,8 +55,9 @@ from fused_memory.server.grouped_read import PARENT_ID_KEY
 # A second copy does not raise when task 3658's
 # ``relevance_score → metadata['store_score']`` move happens again: it scores
 # every candidate as uncomparable, which empties the judge's slate and reads
-# exactly like a genuinely novel corpus.
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# exactly like a genuinely novel corpus. Public name (task 4734): renamed
+# from the underscore-prefixed ``_cosine_of``.
+from fused_memory.server.near_duplicate_guard import cosine_of
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -64,9 +66,10 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.utils.clip_disclosure import TruncationFact, elide_text
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -304,11 +307,6 @@ _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 #: multiply the cost of every call.
 _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
 
-#: Appended to any field this module cut. The marker is not decoration: a
-#: silent truncation hands the model a severed sentence to read as the whole
-#: record, and "this text continues" is information the verdict depends on.
-_ELIDED_MARKER = '…[elided]'
-
 #: The ceiling on the whole judge call at the shipped defaults, in the unit
 #: this module can actually count: characters. It is not a token cap — what a
 #: call costs in tokens per slate width is PRD C1's measured ESTIMATE
@@ -332,33 +330,59 @@ _ELIDED_MARKER = '…[elided]'
 #:
 #: WHY THE SLACK STAYS SMALL. What has to stay small is the SLACK, budget minus
 #: the measured worst case, which is what a future addition could spend
-#: without anyone having to come here. That slack is 58 chars. The four worked
-#: examples presently rendered cost 157 to 192 chars apiece including the
-#: blank line between them, so even the cheapest fifth one does not fit and
-#: its author has to either make room or make the case here. A ceiling that
-#: admitted another example would have stopped bounding anything.
+#: without anyone having to come here. It stays under the cost of one more
+#: worked example, so that example's author has to either make room or make
+#: the case here: a ceiling that admitted another example would have stopped
+#: bounding anything.
+#: fused-memory/tests/server/test_write_triage_judge.py::TestJudgeExemplars::test_the_budget_admits_no_further_worked_example
+#: holds it there, measuring both sides afresh on every run.
 #:
-#: Measured at task 6076, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 27_142 chars — system 2_468, plus a 24_674-char
-#: render of six fields at 4_009 chars each and 620 chars of scaffold. The ids
-#: are not slop: every stored record's id is a 36-char uuid — all 104 in
-#: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
-#: :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so a
-#: full slate costs 155 chars more than 5-char stand-in ids suggest.
-#:
-#: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
-#: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
-#: widest render is 9 chars per field — 54 across the six — wider than a slate
-#: built at the cap.
-_PROMPT_CHAR_BUDGET = 27_200
+#: WHY A CUT FIELD IS WIDER THAN THE CAP. :func:`_elide` renders a field at the
+#: cap untouched, and a longer one as the cap plus a marker that counts the
+#: cut, so the widest render grows by one char per field for each digit of
+#: that count. The measured worst case cuts every field by a six-digit count;
+#: each further digit adds 6 chars across the call, and the slack absorbs
+#: those up to a count no process could hold. That worst case is measured
+#: afresh on every run by
+#: fused-memory/tests/server/test_write_triage_judge.py::_worst_case_call_chars.
+JUDGE_PROMPT_CHAR_BUDGET = 27_100
 
 
 def _elide(text: object, field_chars: int) -> str:
-    """*text* as a string, bounded by *field_chars* and marked if cut."""
-    body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= field_chars:
-        return body
-    return body[:field_chars] + _ELIDED_MARKER
+    """*text* cut to *field_chars* by elide_text, which marks how many characters it dropped.
+
+    The marker is not decoration: a silent truncation hands the model a
+    severed sentence to read as the whole record. It carries the count
+    because the size of the loss decides whether it mattered. Input that is
+    not a string is coerced to its text first.
+    """
+    return elide_text(text, field_chars, field='judge_field').text
+
+
+class JudgePromptElisions(NamedTuple):
+    """Which fields build_judge_prompt cuts at one width: the entry, and each candidate by id."""
+
+    entry: bool
+    candidates: Mapping[str, bool]
+
+
+def judge_prompt_elisions(
+    content: str,
+    candidates: Sequence[MemoryResult],
+    *,
+    field_chars: int = _DEFAULT_JUDGE_FIELD_CHARS,
+) -> JudgePromptElisions:
+    """Which fields :func:`build_judge_prompt` would cut, for every candidate given.
+
+    Answered by the same :func:`_elide` the render calls, so it cannot disagree
+    with the prompt. It selects nothing: the whole slate it is handed is reported.
+    """
+    return JudgePromptElisions(
+        entry=_elide(content, field_chars) != content,
+        candidates=MappingProxyType(
+            {c.id: _elide(c.content, field_chars) != c.content for c in candidates},
+        ),
+    )
 
 
 def select_judge_candidates(
@@ -376,7 +400,7 @@ def select_judge_candidates(
     that reads them.
 
     Ordered by DESCENDING per-store cosine, read through
-    ``near_duplicate_guard._cosine_of`` — the SAME reader ``decide_band``
+    ``near_duplicate_guard.cosine_of`` — the SAME reader ``decide_band``
     uses, imported rather than re-implemented (INV-5). A second copy is
     precisely how task 3658's ``relevance_score → metadata['store_score']``
     move would go wrong again, and it would not raise: it would score every
@@ -404,7 +428,7 @@ def select_judge_candidates(
     """
     scored: list[tuple[float, MemoryResult]] = []
     for result in results or ():
-        cosine = _cosine_of(result)
+        cosine = cosine_of(result)
         if cosine is not None:
             scored.append((cosine, result))
     if not scored:
@@ -439,7 +463,7 @@ def select_judge_candidates(
 
 # --- prompt -----------------------------------------------------------------
 
-def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
+def render_judge_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
     """The EXAMPLES section of the system prompt: one block per exemplar.
 
     A FUNCTION OF THE TUPLE ALONE — pure, total, and walking the sequence in
@@ -475,6 +499,8 @@ JUDGE_REPLY_SHAPE = json.dumps({
 #: code-reading and cross-checking the synchronous ``add_memory`` write path
 #: cannot do. So the instruction says what ``contests`` MEANS — a detection
 #: that routes the entry onward — and says the judge is not deciding truth.
+#: The `contests` clause is Leo's 2026-09-30 ruling,
+#: plans/write-triage-flip-readiness-prd.md §11.3 C1''.
 JUDGE_SYSTEM_PROMPT = f"""\
 You classify the RELATIONSHIP between a new memory entry and a small set of \
 existing entries retrieved as its closest matches. You do not decide which \
@@ -488,25 +514,22 @@ Shared wording alone neither makes a match nor rules one out.
 nothing new. A paraphrase restates.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
 something the candidate does not have: a detail, a scope, a later \
-observation, a correction of degree.
-- "contests" — the new entry asserts something that CANNOT be true at the \
-same time as a candidate. Use this only for a genuine incompatibility, not \
-for a difference in emphasis, scope, or point in time — two entries \
-describing different situations, or the same situation at different times, \
-are not in conflict. You are DETECTING a contradiction so a human or a \
+observation — without saying the candidate is wrong.
+- "contests" — the new entry addresses the same claim or subject as a \
+candidate and says it is wrong, outdated or different, explicitly or \
+implicitly — not when it merely restates it, and not when it agrees and \
+only adds to it. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
 Find the candidate whose core claim the new entry shares (or, for \
 "contests", contradicts), answer about THAT candidate, and name it by its \
 id: the verdict is filed against the candidate you name and no other. \
-Answer "distinct", naming none, only when no candidate qualifies. Between \
-"amends" and "contests", prefer "amends" — a genuine incompatibility is a \
-last resort, not a default reading.
+Answer "distinct", naming none, only when no candidate qualifies.
 
 Worked examples:
 
-{_render_exemplars(JUDGE_EXEMPLARS)}
+{render_judge_exemplars(JUDGE_EXEMPLARS)}
 
 Reply with a bare JSON object and nothing else:
 
@@ -533,9 +556,9 @@ def build_judge_prompt(
     No candidate is marked or singled out. The verdict carries its own id, so
     neither slate position nor the band's winner steers the answer.
 
-    Every field is bounded by *field_chars* and marked with
-    :data:`_ELIDED_MARKER` when cut, so a pathological canonical cannot blow
-    up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
+    Every field is bounded by *field_chars* and cut by :func:`_elide`, which
+    marks how many characters it dropped, so a pathological canonical cannot
+    blow up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
     resolved per call; what that costs in tokens per slate width is PRD C1's
     measured estimate.
 
@@ -775,6 +798,20 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def resolve_judge_api_url(memory_service: Any) -> str | None:
+    """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
+
+    A blank or non-string value inherits, for the same reason
+    :func:`_provider_credentials` refuses to forward a blank credential: an
+    empty ``base_url`` fails every call and reads as a judge outage rather
+    than as the cleared leaf it is.
+    """
+    value = _judge_attr(memory_service, 'judge_api_url')
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 # --- the LLM call ------------------------------------------------------------
 
 #: Output cap for the two answer-only arms (anthropic, and a chat-only compat
@@ -792,6 +829,12 @@ _JUDGE_MAX_TOKENS = 128
 #: must fit are the frontier judge arms of
 #: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
+
+#: Every arm's SDK client makes ONE attempt, so nothing retries inside
+#: ``write_triage.judge_timeout_seconds``; the SDK's per-attempt timeouts still
+#: apply within it. Why: that field's description in
+#: ``config/schema.py::WriteTriageConfig``.
+_JUDGE_SDK_MAX_RETRIES = 0
 
 
 class _ProviderCredentials(NamedTuple):
@@ -812,6 +855,12 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
 
+    ``base_url`` is ``write_triage.judge_api_url`` when set, else
+    ``llm.providers.<provider>.api_url``. The override is judge-only, so the
+    main LLM arm is unaffected; the ``api_key`` still comes from the provider
+    section (a judge-scoped key is task ν's, not this leaf's), and so does
+    ``serves_responses_api`` below.
+
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
     declaration ``backends/graphiti_client.py`` builds its client from, where
@@ -829,7 +878,7 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     api_key = getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = getattr(section, 'api_url', None)
+    api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
@@ -899,9 +948,10 @@ async def _call_llm(
     Each arm builds and closes its client PER CALL. A cached client would pin
     a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
     knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
-    closes the connection pool even when a timeout cancels the request, which
-    matters because neither SDK client defines ``__del__``. The lost
-    connection reuse is a deliberate trade.
+    closes the connection pool even when a timeout cancels the request. The
+    SDK's own ``httpx`` wrapper finaliser (``AsyncHttpxClientWrapper.__del__``)
+    is no substitute: it closes the pool only if an event loop is running when
+    the client is collected. The lost connection reuse is a deliberate trade.
 
     NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
     failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,
@@ -958,7 +1008,9 @@ async def _call_openai_responses(
         if reasoning_effort is None
         else {'reasoning': {'effort': reasoning_effort}}
     )
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.responses.create(
                 model=model,
@@ -998,7 +1050,9 @@ async def _call_openai_chat(
     """
     import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=model,
@@ -1033,7 +1087,9 @@ async def _call_anthropic(
     """
     import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
-    async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
+    async with anthropic.AsyncAnthropic(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.messages.create(
                 model=model,
@@ -1139,9 +1195,10 @@ async def judge_write(
         )
         return TriageJudgeVerdict(OUTCOME_STORED)
 
+    candidate_count = resolve_judge_candidate_count(memory_service)
     selected = select_judge_candidates(
         candidates,
-        resolve_judge_candidate_count(memory_service),
+        candidate_count,
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
@@ -1158,4 +1215,18 @@ async def judge_write(
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
-    return verdict._replace(usage=reply.usage)
+    return verdict._replace(
+        usage=reply.usage,
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
+    )
+
+
+def _slate_trim_facts(
+    candidates: Any, selected: Sequence[MemoryResult], candidate_count: int,
+) -> tuple[TruncationFact, ...]:
+    """How many COMPARABLE candidates the judge was not shown, counted with ``cosine_of``."""
+    comparable = sum(1 for result in candidates or () if cosine_of(result) is not None)
+    elided = comparable - len(selected)
+    if elided <= 0:
+        return ()
+    return (TruncationFact(field='judge_candidates', cap=candidate_count, elided=elided),)

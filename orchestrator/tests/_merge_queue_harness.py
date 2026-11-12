@@ -20,9 +20,9 @@ flat-test-helper convention (see ``_orch_helpers.py``, ``_merge_lane_fakes.py``
 
 CRITICAL — dynamic module lookup, not from-import: every merge_queue
 module-level symbol is referenced as ``_mq.<name>`` (attribute lookup on the
-module object, resolved at call time), NEVER ``from orchestrator.merge_queue
+module object, resolved at call time), NEVER ``from orchestrator.merge_lane.worker
 import <name>``.  ~15 of the migrated tests do
-``patch('orchestrator.merge_queue.run_scoped_verification', …)`` (and similar
+``patch('orchestrator.merge_lane.worker.run_scoped_verification', …)`` (and similar
 on the other symbols); a from-import would bind the name in THIS module's
 namespace at import time, so the patch on the merge_queue attribute would
 silently fail to reach the helper's reference and the pass-mock would be
@@ -35,13 +35,17 @@ in-class shim's module-global reads did.  Worker methods
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from typing import TYPE_CHECKING
 
-import orchestrator.merge_queue as _mq
+import orchestrator.merge_lane.worker as _mq
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import (
+    from collections.abc import Callable
+
+    from orchestrator.merge_lane.worker import (
+        InflightEntry,
         LocalRunner,
         RealMergeItem,
         SpeculativeMergeWorker,
@@ -58,6 +62,17 @@ async def drive_verify_and_advance(
     flat drive path never manages the speculation semaphore — direct-call
     tests that care about speculation exercise the full loop instead.
     """
+    entry = await _launch_local_verify(worker, item)
+    if entry is None:
+        return False
+    return await finalize_through_gate(worker, entry)
+
+
+async def _launch_local_verify(
+    worker: SpeculativeMergeWorker, item: RealMergeItem,
+) -> InflightEntry | None:
+    """Launch *item*'s verify on a LOCAL lease; None when no slot can be had,
+    with the request resolved blocked."""
     req = item.request
     allocator = worker._ensure_host_allocator(req.config)
 
@@ -88,13 +103,13 @@ async def drive_verify_and_advance(
             req.result.set_result(_mq.MergeOutcome(
                 'blocked', reason='No verify host available (harness path)',
             ))
-        return False
+        return None
 
     verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
         worker._run_inflight_verify(item, lease)
     )
 
-    entry = _mq.InflightEntry(
+    return _mq.InflightEntry(
         item=item,
         lease=lease,
         verify_task=verify_task,
@@ -103,4 +118,31 @@ async def drive_verify_and_advance(
         started_at=time.time(),
     )
 
-    return await worker._finalize_inflight(entry)
+
+async def finalize_through_gate(
+    worker: SpeculativeMergeWorker,
+    entry: InflightEntry,
+    *,
+    on_park: Callable[[], object] = lambda: None,
+) -> bool:
+    """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
+    re-verify (task 6155), and following its rebased head when the gate's
+    re-verify became a dispatch (task 8525).  Returns True iff main was advanced.
+
+    *on_park* runs each time the entry parks, before its gate has started,
+    and each time a dispatched rebased head starts verifying.
+    """
+    while True:
+        advanced = await worker._finalize_inflight(entry)
+        if entry.gate is None:
+            break
+        on_park()
+    if advanced:
+        return True
+    head_entry = await worker.dispatch_parked_rebased_head(
+        entry.item.request.request_id, functools.partial(_launch_local_verify, worker),
+    )
+    if head_entry is None:
+        return False
+    on_park()
+    return await finalize_through_gate(worker, head_entry, on_park=on_park)

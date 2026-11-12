@@ -81,29 +81,27 @@ from typing import IO, Any, Literal, NamedTuple
 
 # Allow execution as a bare script (``python tests/startup_completion_probe.py``)
 # as well as import from a pytest run, mirroring shared/tests/conftest.py.
-_TESTS_DIR = Path(__file__).resolve().parent
-_SRC_DIR = _TESTS_DIR.parent / 'src'
-for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-import startup_completion_fixtures as _scf  # noqa: E402  (isort: after src bootstrap)
-from _oauth_accounts import (  # noqa: E402  (isort: after tests-dir bootstrap)
+import startup_completion_fixtures as _scf
+from _oauth_accounts import (
     ALL_TOKEN_LETTERS,
     first_available_token,
 )
 
-from shared.cli_invoke import (  # noqa: E402
+from shared.cli_invoke import (
     _resolve_transcript_path,
     count_transcript_turns,
     read_transcript_records,
 )
-from shared.config_dir import (  # noqa: E402
+from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
     sweep_stale_pid_dirs,
     sweep_stale_pid_dirs_once,
 )
+from shared.proc_group import read_stat_fields
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
 
@@ -730,7 +728,8 @@ def sample_proc(pid: int | None) -> dict:
     """Sample ``/proc/<pid>`` — liveness, scheduler state char, argv, direct children.
 
     Total: every field degrades to ``None``/``[]`` rather than raising, because a
-    probe that crashes on a racing exit loses the whole (paid-for) capture.
+    probe that crashes on a racing exit loses the whole (paid-for) capture.  Each
+    comm comes from the same stat read as its state.
     """
     out: dict[str, Any] = {
         'pid': pid,
@@ -746,14 +745,9 @@ def sample_proc(pid: int | None) -> dict:
     if not proc.exists():
         return out
     out['alive'] = True
-    try:
-        stat = (proc / 'stat').read_text()
-        # comm may contain spaces/parens — split on the LAST ') ' per proc(5).
-        out['state'] = stat.rsplit(') ', 1)[1].split()[0]
-    except (OSError, IndexError):
-        pass
-    with contextlib.suppress(OSError):
-        out['comm'] = (proc / 'comm').read_text().strip()
+    fields = read_stat_fields(proc, skip_malformed=True)
+    out['state'] = None if fields is None else fields.state
+    out['comm'] = None if fields is None else fields.comm
     try:
         raw = (proc / 'cmdline').read_bytes().decode('utf-8', 'replace')
         argv = [part for part in raw.split('\0') if part]
@@ -763,11 +757,12 @@ def sample_proc(pid: int | None) -> dict:
     try:
         child_pids = (proc / 'task' / str(pid) / 'children').read_text().split()
         for child in child_pids:
-            try:
-                comm = Path(f'/proc/{child}/comm').read_text().strip()
-            except OSError:
-                comm = None
-            out['children'].append({'pid': int(child), 'comm': comm})
+            child_pid = int(child)
+            child_fields = read_stat_fields(
+                proc.parent / str(child_pid), skip_malformed=True
+            )
+            comm = None if child_fields is None else child_fields.comm
+            out['children'].append({'pid': child_pid, 'comm': comm})
     except (OSError, ValueError):
         pass
     return out

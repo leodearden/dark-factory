@@ -27,7 +27,7 @@ import logging
 import sys
 from pathlib import Path
 
-from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
+from escalation.models import BORN_AT_L2_SEVERITIES, HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
@@ -36,13 +36,6 @@ logger = logging.getLogger(__name__)
 # and the server's sentinel namespace (orchestrator-*), keeping on-disk records
 # consistent with server-filed L2s for dashboard/audit.
 DEFAULT_AGENT_ROLE = 'orchestrator-deterministic'
-
-# Harness sentinel role prefixes — mirrors server.py:_HARNESS_SENTINEL_ROLE_PREFIXES.
-# Defined here (rather than imported from server.py) because importing server.py
-# pulls in fastmcp, sweep, dedupe, and other heavy dependencies inappropriate for
-# a lightweight CLI entry point.  Update this tuple whenever server.py's
-# _HARNESS_SENTINEL_ROLE_PREFIXES changes.
-_HARNESS_SENTINEL_ROLE_PREFIXES: tuple[str, ...] = ('harness-', 'orchestrator-')
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         dest='agent_role',
         help=(
             f'Sentinel agent role (default: {DEFAULT_AGENT_ROLE!r}). '
-            f'Must start with one of {_HARNESS_SENTINEL_ROLE_PREFIXES} '
+            f'Must start with one of {HARNESS_SENTINEL_ROLE_PREFIXES} '
             'to satisfy the sentinel namespace contract (enforced).'
         ),
     )
@@ -129,10 +122,10 @@ def main(argv: list[str] | None = None) -> int:
     # downgrade gate.  A non-sentinel role would produce a born-at-L2 record with
     # a non-sentinel role — exactly the combination the server prevents.  Reject
     # before any disk write, consistent with the --severity restriction.
-    if not any(args.agent_role.startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES):
+    if not args.agent_role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES):
         parser.error(
             f'--agent-role {args.agent_role!r} does not start with a sentinel prefix '
-            f'{_HARNESS_SENTINEL_ROLE_PREFIXES}; '
+            f'{HARNESS_SENTINEL_ROLE_PREFIXES}; '
             'only sentinel roles (harness-*, orchestrator-*) may file L2 escalations'
         )
 

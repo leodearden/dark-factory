@@ -498,3 +498,5 @@ tasks:
       kind: manual
       reason: disclosure field naming is implementation-chosen; pinned by theta's
         committed mini-fixture round-trip plus an all-unparseable-input case
+signal_leaves:
+- epsilon

@@ -4,8 +4,9 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import aiosqlite
@@ -15,13 +16,20 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.coalescing import (
+    coalesce_key,
+    coalesced_count,
+    merge_coalesced_payload,
+)
 from fused_memory.reconciliation.throughput import utc_hour_bucket
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +44,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     timestamp TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
-    drained_by_run_id TEXT
+    drained_by_run_id TEXT,
+    coalesce_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -67,7 +76,6 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     claimed_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
 
 -- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
 -- cleanup_drained once they are drained and older than max_age_seconds
@@ -84,6 +92,19 @@ CREATE TABLE IF NOT EXISTS event_arrival_hourly (
     event_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, hour_bucket, event_type)
 );
+
+-- Task 4278 (recon lever 3): events push() folded into an older buffered row.
+-- Counted in the same write unit as the fold, so every pushed event is a live
+-- event_buffer row, OR in event_arrival_hourly, OR in event_coalesced_hourly.
+-- One bound: a redelivered event that folded in as an older or middle
+-- constituent is not recognised as a redelivery, so it is counted here again.
+CREATE TABLE IF NOT EXISTS event_coalesced_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    coalesced_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
 """
 
 # Maximum number of replay attempts before a deferred write is treated as a poison-pill
@@ -94,6 +115,53 @@ _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 # DELETE ... RETURNING cursor.  Bounds peak memory at O(chunk) instead of
 # O(rows deleted) — see cleanup_drained's docstring for the measurement.
 _CLEANUP_FETCH_CHUNK: int = 10_000
+
+# A folded row announces itself at WARNING each time its fold count reaches a
+# multiple of this.  A looping task no longer builds backlog once its events
+# fold, so the reconciliation_backlog alarm cannot see it; this line can.
+_COALESCE_HOT_TASK_WARNING_INTERVAL: int = 100
+
+
+class _PushOutcome(StrEnum):
+    """What one push did to the buffer."""
+
+    buffered = 'buffered'  # a new row
+    coalesced = 'coalesced'  # folded into an older buffered row
+    redelivered = 'redelivered'  # already stored, so nothing changed
+
+
+class _PushResult(NamedTuple):
+    outcome: _PushOutcome
+    fold_count: int = 1
+
+
+_UNFOLDED_PUSH_LOG_LINE = {
+    _PushOutcome.buffered: 'reconciliation.event_buffered',
+    _PushOutcome.redelivered: 'reconciliation.event_redelivered',
+}
+
+
+def _log_push(event: ReconciliationEvent, key: str | None, result: _PushResult) -> None:
+    """One structured line per push; a WARNING when a folded row turns hot."""
+    if result.outcome is not _PushOutcome.coalesced:
+        logger.info(
+            _UNFOLDED_PUSH_LOG_LINE[result.outcome],
+            extra={
+                'project_id': event.project_id,
+                'event_type': event.type.value,
+                'agent_id': event.agent_id,
+            },
+        )
+        return
+    fold_extra = {
+        'project_id': event.project_id,
+        'event_type': event.type.value,
+        'coalesce_key': key,
+        'coalesced_count': result.fold_count,
+    }
+    logger.info('reconciliation.event_coalesced', extra=fold_extra)
+    if result.fold_count % _COALESCE_HOT_TASK_WARNING_INTERVAL == 0:
+        logger.warning('reconciliation.coalesce_hot_task', extra=fold_extra)
 
 
 class EventBuffer:
@@ -117,7 +185,15 @@ class EventBuffer:
         stale_lock_seconds: float = 7200.0,
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
+        *,
+        connect: Connector = connect_daemon,
+        coalesce_task_events: bool = True,
     ):
+        """*connect* is how ``initialize`` opens the buffer's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        *coalesce_task_events* switches push-time folding (see ``push``).
+        """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
         # passing db_path=Path(':memory:') is treated as a file path and
@@ -133,12 +209,14 @@ class EventBuffer:
         self.stale_lock_seconds = stale_lock_seconds
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
+        self._connect = connect
+        self.coalesce_task_events = coalesce_task_events
         self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
-        conn = await connect_daemon(self._db_path)
+        conn = await self._connect(self._db_path)
         conn.row_factory = aiosqlite.Row
         # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
         # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
@@ -158,40 +236,25 @@ class EventBuffer:
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
 
     async def _migrate(self) -> None:
-        """Add new columns to pre-existing DBs (idempotent).
-
-        Each ALTER TABLE is:
-        * Guarded by a PRAGMA table_info check so we only run it when the column
-          is missing.
-        * Wrapped in try/except to survive the narrow race where two processes both
-          call initialize() on the same file concurrently — SQLite's ALTER TABLE
-          has no IF NOT EXISTS syntax, so the second writer would otherwise fail
-          with 'duplicate column name'.
-        """
-        access = self._require_access()
-        columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(deferred_writes)')
-        }
-        eb_columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(event_buffer)')
-        }
-
-        # One write unit for every DDL statement below: the PRAGMA probes above
-        # already ran as their own accesses, so nothing here nests.
-        async with access.write() as db:
+        """Add new columns to pre-existing DBs."""
+        async with self._require_access().write() as db:
             # Add drained_by_run_id if missing — attributes a drained row to the run
             # that drained it (task 2711 / E7) so restore_drained() can be scoped to
             # a single run instead of unconditionally restoring the whole project.
-            if 'drained_by_run_id' not in eb_columns:
-                try:
-                    await db.execute('ALTER TABLE event_buffer ADD COLUMN drained_by_run_id TEXT')
-                    logger.info(
-                        'EventBuffer: migrated event_buffer — added drained_by_run_id column'
-                    )
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: drained_by_run_id already exists (concurrent init)')
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
+
+            # Add coalesce_key if missing (task 4278).  Rows written before it
+            # keep NULL and are never fold targets.  The index lives here, not
+            # in _BUFFER_SCHEMA_SQL, because that script runs first and would
+            # name a column a pre-existing table does not have yet.
+            if await add_column_if_missing(db, 'event_buffer', 'coalesce_key', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added coalesce_key column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_eb_coalesce'
+                ' ON event_buffer(project_id, coalesce_key, status)'
+                ' WHERE coalesce_key IS NOT NULL'
+            )
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -199,33 +262,19 @@ class EventBuffer:
             # had idx_dw_project.
             await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
-            # Add claimed_at if missing.
-            if 'claimed_at' not in columns:
-                try:
-                    await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
-                    await db.execute(
-                        'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                        ' ON deferred_writes(project_id, claimed_at)'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: claimed_at already exists (concurrent init)')
+            # Same placement as idx_eb_coalesce above, for the same reason.
+            if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
+                logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                ' ON deferred_writes(project_id, claimed_at)'
+            )
 
             # Add attempt_count if missing — tracks poison-pill detection across restarts.
-            if 'attempt_count' not in columns:
-                try:
-                    await db.execute(
-                        'ALTER TABLE deferred_writes'
-                        ' ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: attempt_count already exists (concurrent init)')
-
+            if await add_column_if_missing(
+                db, 'deferred_writes', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0'
+            ):
+                logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
@@ -235,29 +284,37 @@ class EventBuffer:
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer.
+        """Insert event into the shared buffer, folding a repeat task event.
 
-        Idempotent on the event id (UUID primary key): the conflict clause is
-        scoped to the primary key with ``ON CONFLICT(id) DO NOTHING`` so
-        re-pushing an already-committed event is a harmless no-op rather than an
-        IntegrityError. A duplicate only ever occurs on EventJournal-driven
-        startup recovery, which redelivers in-flight events at-least-once — the
-        drainer can be killed after this push commits but before it marks the
-        journal row processed, so recover() re-enqueues and re-pushes it (task
-        2709). Without the conflict clause the drainer would treat the duplicate
-        as a non-retriable error and dead-letter a perfectly good event.
+        Idempotent on the event id: ``ON CONFLICT(id) DO NOTHING`` makes the
+        at-least-once redelivery of EventJournal startup recovery a no-op
+        (task 2709), while any other constraint violation still raises.
 
-        Scoping to ``(id)`` rather than a bare ``INSERT OR IGNORE`` is
-        deliberate (loud-over-silent): only the intended duplicate-id case is
-        swallowed; any *other* constraint violation on this row — e.g. a
-        NOT NULL breach on project_id/event_type/event_source/timestamp — still
-        raises loudly instead of silently dropping the event.
+        An event with a ``coalescing.coalesce_key`` folds into the OLDEST
+        buffered row with the same key (task 4278).  That row keeps its id, so
+        an id ``peek_buffered`` handed out still drains via ``drain_by_ids``,
+        and its timestamp, which only ever moves earlier, so ``ORDER BY
+        timestamp`` positions and the ``MIN(timestamp)`` staleness trigger
+        hold.  A folded event leaves no row of its own for ``ON CONFLICT`` to
+        hit, so its redelivery is recognised only when it is the row's newest
+        constituent (``coalescing.merge_coalesced_payload``); an older or
+        middle constituent folds again and over-counts by one.
+        The INSERT runs first: a unit whose first statement writes is
+        serialised against other connections, which a unit that SELECTs first
+        is not (``AtomicConnection.write``).  A transition into done never
+        folds (``coalescing.coalesce_key``), so ``select_done_transitions`` sees
+        each with its own ``done_provenance``; every other drained task-event
+        reader uses task_id or the live task.  That also makes a fold landing
+        between ``peek_buffered`` and ``drain_by_ids`` benign: the stage gets
+        the pre-fold payload, and no done event can have folded into it.
         """
+        key = coalesce_key(event)
         async with self._require_access().write() as db:
-            await db.execute(
+            cursor = await db.execute(
                 """INSERT INTO event_buffer
-                   (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')
+                   (id, project_id, event_type, event_source, agent_id, timestamp, payload,
+                    status, coalesce_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered', ?)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     event.id,
@@ -267,20 +324,71 @@ class EventBuffer:
                     event.agent_id,
                     event.timestamp.isoformat(),
                     json.dumps(event.payload),
+                    key,
                 ),
             )
+            if cursor.rowcount == 0:
+                result = _PushResult(_PushOutcome.redelivered)
+            elif self.coalesce_task_events and key is not None:
+                result = await self._fold_into_oldest(db, event, key)
+            else:
+                result = _PushResult(_PushOutcome.buffered)
 
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
 
-        logger.info(
-            'reconciliation.event_buffered',
-            extra={
-                'project_id': event.project_id,
-                'event_type': event.type.value,
-                'agent_id': event.agent_id,
-            },
+        _log_push(event, key, result)
+
+    async def _fold_into_oldest(
+        self, db: aiosqlite.Connection, event: ReconciliationEvent, key: str,
+    ) -> _PushResult:
+        """Fold the row ``push`` just inserted into the oldest buffered row sharing ``key``.
+
+        Runs on the open write unit's connection.  The just-inserted row is
+        uncommitted, so deleting it leaves no trace any reader could see.
+        """
+        # Oldest buffered row: stable id, MIN(timestamp) and ORDER BY position (see push).
+        async with db.execute(
+            """SELECT id, payload, timestamp FROM event_buffer
+               WHERE project_id = ? AND coalesce_key = ? AND status = 'buffered'
+                 AND id != ?
+               ORDER BY timestamp ASC
+               LIMIT 1""",
+            (event.project_id, key, event.id),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if target is None:
+            return _PushResult(_PushOutcome.buffered)
+
+        await db.execute('DELETE FROM event_buffer WHERE id = ?', (event.id,))
+        fold = merge_coalesced_payload(
+            json.loads(target['payload']),
+            event.payload,
+            event_type=event.type,
+            incoming_id=event.id,
+            incoming_ts=event.timestamp,
+            row_ts=datetime.fromisoformat(target['timestamp']),
         )
+        if fold is None:
+            return _PushResult(_PushOutcome.redelivered)
+
+        await db.execute(
+            'UPDATE event_buffer SET payload = ?, timestamp = ? WHERE id = ?',
+            (json.dumps(fold.payload), fold.row_timestamp.isoformat(), target['id']),
+        )
+        await db.execute(
+            """INSERT INTO event_coalesced_hourly
+                   (project_id, hour_bucket, event_type, coalesced_count)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(project_id, hour_bucket, event_type)
+               DO UPDATE SET coalesced_count = coalesced_count + excluded.coalesced_count""",
+            (
+                event.project_id,
+                utc_hour_bucket(fold.folded_timestamp.isoformat()),
+                event.type.value,
+            ),
+        )
+        return _PushResult(_PushOutcome.coalesced, coalesced_count(fold.payload))
 
     # ── Burst detection ────────────────────────────────────────────────
 
@@ -639,22 +747,25 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str],
+        self, project_id: str, ids: list[str], run_id: str,
     ) -> int:
-        """Mark specific event IDs as drained.
+        """Mark specific event IDs as drained by run *run_id*.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.
+        token budget.  Returns the number of rows updated.  *run_id* is
+        stamped as ``drained_by_run_id`` so a later run-scoped
+        ``restore_drained`` can target exactly this chunk; it is required so
+        this path can never leave an unattributed row (task 6453).
         """
         if not ids:
             return 0
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained'
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [project_id, *ids],
+                [run_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -662,42 +773,35 @@ class EventBuffer:
     async def restore_drained(
         self,
         project_id: str,
-        run_id: str | None = None,
+        run_id: str,
         *,
         include_unattributed: bool = False,
     ) -> int:
-        """Restore drained events to 'buffered' after a failed run.
+        """Restore one run's drained events to 'buffered' after it failed.
 
-        When ``run_id`` is provided, only rows stamped with
-        ``drained_by_run_id = run_id`` are restored — this protects a
-        concurrent live run's drained events from being clobbered when the
-        reaper recovers a *different* orphaned run on the same project (task
-        2711 / E7). When omitted (the default), behaviour is unchanged: every
-        drained row for the project is restored, project-wide.
+        Only rows stamped with ``drained_by_run_id = run_id`` are restored —
+        this protects a concurrent live run's drained events from being
+        clobbered when the reaper recovers a *different* orphaned run on the
+        same project (task 2711 / E7), and an earlier completed run's consumed
+        events from being re-processed (task 6453). There is deliberately no
+        project-wide mode.
 
         ``include_unattributed`` additionally restores rows with
-        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
-        otherwise — the project-wide path already covers them). This closes
-        the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every current code path now
-        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
-        left over from a process that no longer exists by the time a recovery
-        pass runs, so it is provably safe to fold into a *specific* run's
-        recovery without reintroducing the concurrent-run clobber the run
-        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
+        where events drained by a pre-task-2711 process carry no run
+        attribution: since every production drain path stamps
+        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
+        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
+        caller, always passes one; task 6453), a NULL row can only be left
+        over from a process that no longer exists by the time a recovery pass
+        runs, so it is provably safe to fold into a *specific* run's recovery
+        without reintroducing the concurrent-run clobber the run scoping was
+        added to prevent (task 2711 amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
         """
-        if run_id is None:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained'",
-                    (project_id,),
-                )
-                count = cursor.rowcount
-        elif include_unattributed:
+        if include_unattributed:
             async with self._require_access().write() as db:
                 cursor = await db.execute(
                     "UPDATE event_buffer SET status = 'buffered' "
@@ -723,12 +827,11 @@ class EventBuffer:
     ) -> int:
         """Attribute already-drained rows to the run about to process them.
 
-        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
-        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
-        rows would otherwise carry no ``drained_by_run_id`` attribution. This
-        lets the harness stamp them retroactively so a later run-scoped
-        ``restore_drained`` can restore exactly that chunk's events (task 2711
-        / E7).
+        ``run_full_cycle``'s attribution for caller-supplied ``events``, so a
+        later run-scoped ``restore_drained`` can restore exactly that run's
+        events (task 2711 / E7). BacklogIterator already stamps each chunk's
+        run_id at ``drain_by_ids`` (task 6453), which makes this an idempotent
+        re-stamp on that path.
 
         Only rows currently ``status = 'drained'`` are touched; ids that don't
         exist, aren't currently drained, or are empty are silently ignored (no
@@ -1081,10 +1184,13 @@ class EventBuffer:
 
         Task 3049: before deleting, roll the very same rows up into
         ``event_arrival_hourly`` so the project's arrival history survives the
-        DELETE.  This is the only ``DELETE FROM event_buffer`` in the codebase
-        — the single chokepoint where inflow history is destroyed — so rolling
-        up here captures 100% of events regardless of which drain path
-        (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
+        DELETE.  This is the only DELETE of a COMMITTED ``event_buffer`` row in
+        the codebase — the single chokepoint where inflow history is destroyed
+        — so rolling up here captures 100% of events regardless of which drain
+        path (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked
+        them.  ``push``'s fold deletes only the row it inserted earlier in the
+        same uncommitted unit, and counts that event in
+        ``event_coalesced_hourly``.
 
         The rollup runs inside the SAME write unit as the DELETE, and takes its
         rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
@@ -1265,16 +1371,4 @@ class EventBuffer:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        Still ``(-1, -1, -1)`` — never a raise — for a buffer that was never
-        initialized OR one already closed: server/main.py's checkpoint cycle
-        unpacks the result and logs exceptions separately.
-
-        This is the contract THIS store's callers already had; the journal and
-        ReconLedgerStore raise 'not initialized' in both those cases instead.
-        See ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
-        """
-        if self._access is None:
-            return CheckpointResult(-1, -1, -1)
-        return await self._access.checkpoint()
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

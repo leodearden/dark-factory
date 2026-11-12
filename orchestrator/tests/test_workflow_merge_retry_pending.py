@@ -33,7 +33,7 @@ from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import ConflictProbe
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import StewardResolved
 
 
@@ -451,7 +451,7 @@ class TestMergeAndFinalise:
     @pytest.mark.asyncio
     async def test_none_merge_result_runs_finalise_tail_and_returns_done(self):
         # (b) _run_merge_phase returns None (merge SUCCEEDED) → run the finalise
-        # tail and return _finalise_merged_done()'s value, entering DONE.
+        # tail and return _finalise_merged_done()'s value.
         f = _make()
         spies = _wire_finalise_spies(f, merge_result=None)
 
@@ -461,7 +461,6 @@ class TestMergeAndFinalise:
         spies.run_merge_phase.assert_awaited_once()
         spies.write_completion_to_memory.assert_awaited_once()
         spies.await_steward_completion.assert_awaited_once()
-        spies.enter_phase.assert_any_call(WorkflowState.DONE)
         spies.finalise_merged_done.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -477,7 +476,6 @@ class TestMergeAndFinalise:
         assert outcome == WorkflowOutcome.DONE
         spies.run_merge_phase.assert_not_awaited()
         spies.write_completion_to_memory.assert_awaited_once()
-        spies.enter_phase.assert_any_call(WorkflowState.DONE)
         spies.finalise_merged_done.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -638,11 +636,14 @@ class TestResumeGuard:
     ):
         """HEAD still matches the stamp, but main advanced and introduced a conflict.
 
-        The stamped branch is unchanged (HEAD match), so the pre-3024 guard
-        fast-pathed straight to _merge_and_finalise with an empty ``plan.files``
-        — tripping the merge-entry scope invariant and looping forever.  The
-        clean-merge probe must void the now-unsatisfiable stamp and fall back to
-        the full plan/execute/verify/review pipeline instead.
+        The stamped branch is unchanged (HEAD match), but a stale obligation
+        must not merge a branch that no longer applies onto current main.  So
+        the clean-merge probe voids the now-unsatisfiable stamp and the full
+        plan/execute/verify/review pipeline runs instead.  (The empty
+        ``plan.files`` merge-entry loop was esc-3388-9's separate cause, closed
+        by the plan read and pinned by
+        test_head_match_populates_self_plan_before_delegating and
+        test_workflow_merge_retry_resume_merge_entry.py.)
         """
         f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
         spies = _wire_resume_guard_spies(f)
@@ -659,7 +660,7 @@ class TestResumeGuard:
         assert outcome is None
         # A confirmed conflict voids the resume obligation — clear it.
         spies.clear_merge_retry_pending.assert_awaited_once()
-        # ...and never hand an empty-plan workflow to the merge phase.
+        # ...and never merge a branch that no longer applies.
         spies.merge_and_finalise.assert_not_awaited()
         f.git_ops.merge_tree_conflicts.assert_awaited_once_with('BASE-SHA', 'HEAD-SHA')
 

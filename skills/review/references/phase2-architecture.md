@@ -84,6 +84,7 @@ Inputs prioritise; they are not findings to copy. Record every input in `inputs_
    ```
 
    Anchors with three or more sightings inside the Phase 2 file set are confusion-dense: add them to Step 4. A /review finding that rests on a codebook entry lists `agent-transcripts` in `evidence_source`. Record the codebook as `codebook@<as_of_sha>`.
+4. **Metrics snapshot.** The latest committed `plans/quality-metrics/*.json`, newest by commit (`git log -1 --diff-filter=A --name-only --format= -- plans/quality-metrics/`), rendered with `scripts/quality_metrics_snapshot.py --summary <path>`; its file records and `import_graph` section are read with a small script, never by eye. Record its `run_id` in `inputs_consumed`. It is context for choosing Step 4's modules, never a ranking (contract §10): nothing is ordered by a measure.
 
 A /review finding whose key equals one in a consumed report is the same finding (§9): keep that report's `first_seen`, append this `run_id` to `last_seen`, and say in `change_note` if our evidence changes its verdict or severity.
 
@@ -143,6 +144,7 @@ From the Phase 2 file set, in this order:
 - `/review-all`'s open findings (Step 1.5);
 - hotspot-ranked areas, minus exonerated churn (Step 1.5);
 - confusion-dense codebook anchors (Step 1.5);
+- modules the metrics snapshot shows in `cycles`, `hidden_cycles` or `typing_cycles`, with reach-back imports or deferred imports marked `closes_cycle`, or reached by tests' `private_patch_targets` (Step 1.5);
 - server startup, config loading, pipeline stages and orchestration, infrastructure files (Dockerfiles, units, CI), shared utilities;
 - the briefing's `stability_concerns`.
 

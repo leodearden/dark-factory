@@ -384,24 +384,6 @@ class TestOrchTabReadsTheCensus:
             'OrchTab keeps the Orchestrators tile plus ONE tile mapped over TASK_CENSUS_TILES'
         )
 
-    def test_the_rows_come_from_the_snapshot_by_view(self, orch_tab_code):
-        assert re.search(
-            r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
-            r'unrequestedTerminalRows\(\s*DF\[\s*LOADER_ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
-            orch_tab_code,
-        ), (
-            'OrchTab rows do not come from viewRows(projectRows(DF, o.project), '
-            'unrequestedTerminalRows(DF[LOADER_ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
-            'OrchTab never requests the terminal window, so an absent one must say so '
-            'rather than datumFor\'s "not yet fetched".'
-        )
-        assert 'requestOnDemand' not in orch_tab_code, (
-            'OrchTab reads the terminal window when one has landed; it does not request it.'
-        )
-        assert 'datumFor(' not in orch_tab_code, (
-            'datumFor answers an absent window with "not yet fetched", a fetch OrchTab never makes.'
-        )
-
     def test_the_placeholder_row_renders_the_reasoned_hole(self, orch_tab_code):
         assert re.search(r'title=\{\s*placeholder\.title\s*\}', orch_tab_code)
         assert re.search(r'\{\s*placeholder\.text\s*\}', orch_tab_code)
@@ -420,3 +402,93 @@ class TestOrchTabReadsTheCensus:
         assert re.search(r'\bnotes\.map\(\s*(\w+)\s*=>[^;]*<td\b[^>]*>\s*\{\s*\1\s*\}', orch_tab_code), (
             'OrchTab does not render each viewRows note in a table cell'
         )
+
+
+class TestOrchTabRequestsTheTerminalWindow:
+    """OrchTab requests a project's ``?terminal=`` window while a listing's
+    filter selects the terminal view (task 5936; PRD decision 5).
+
+    This pins only the WIRING, on comment-stripped source: OrchTab hands its
+    wanted set to the hook task_snapshot.js::createTerminalWindowHooks builds,
+    and lists the reader that hook returns. The rules execute under node in
+    task_snapshot.test.mjs: which projects are wanted
+    (terminalSelectingProjects), and when each is requested and what it then
+    reads (createTerminalWindowHooks).
+    """
+
+    @pytest.fixture(scope='class')
+    def tabs_code(self, tabs_jsx_body):
+        return strip_js_comments(tabs_jsx_body)
+
+    @pytest.fixture(scope='class')
+    def wanted(self, orch_tab_code):
+        """The name OrchTab binds its wanted projects to; the probes follow it."""
+        calls = re.findall(r'\bconst\s+(\w+)\s*=\s*terminalSelectingProjects\(', orch_tab_code)
+        assert len(calls) == 1, f'OrchTab binds terminalSelectingProjects(...) {len(calls)} times; expected one'
+        return calls[0]
+
+    @pytest.fixture(scope='class')
+    def window_of(self, orch_tab_code, wanted):
+        """The name OrchTab binds the hook's reader to; the probes follow it."""
+        readers = re.findall(rf'\bconst\s+(\w+)\s*=\s*useTerminalWindows\(\s*DF\s*,\s*{wanted}\s*\)', orch_tab_code)
+        assert len(readers) == 1, (
+            f'OrchTab binds useTerminalWindows(DF, {wanted}) {len(readers)} times; expected one'
+        )
+        return readers[0]
+
+    def test_the_wanted_set_is_each_listed_project_whose_filter_selects_terminal(self, orch_tab_code, wanted):
+        assert re.search(
+            r'terminalSelectingProjects\(\s*matches\.map\(\s*(\w+)\s*=>\s*\(\s*\{\s*project\s*:\s*\1\.project\s*,'
+            r'\s*filter\s*:\s*getFilter\(\s*\1\.pid\s*\)\s*\}\s*\)\s*\)\s*\)',
+            orch_tab_code,
+        ), (
+            f'`{wanted}` is not terminalSelectingProjects(matches.map(o => ({{ project: o.project, '
+            'filter: getFilter(o.pid) }})): every listed orchestrator, by the filter its rows are listed by'
+        )
+        calls = [walk_balanced(orch_tab_code, m.end() - 1, '(', ')') for m in re.finditer(r'\bviewRows\(', orch_tab_code)]
+        assert len(calls) == 1, f'OrchTab calls viewRows {len(calls)} times; expected one'
+        last = re.search(r',\s*(\w+)\s*\)\Z', calls[0])
+        assert last, f'the viewRows call does not end on a filter binding: {calls[0]}'
+        assert re.search(rf'\bconst\s+{last.group(1)}\s*=\s*getFilter\(\s*o\.pid\s*\)', orch_tab_code), (
+            f'the rows are listed by `{last.group(1)}`, which is not getFilter(o.pid), the filter the '
+            'wanted set is derived from'
+        )
+
+    def test_the_listed_terminal_rows_are_the_hooks_reading(self, orch_tab_code, window_of):
+        assert re.search(
+            rf'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*{window_of}\(\s*o\.project\s*\)'
+            r'\s*,\s*filter\s*\)',
+            orch_tab_code,
+        ), (
+            f'OrchTab rows do not come from viewRows(projectRows(DF, o.project), {window_of}(o.project), '
+            'filter): the listed window must say what OrchTab\'s own request is doing'
+        )
+
+    def test_the_hook_is_built_over_react_and_the_loader(self, tabs_code):
+        assert re.search(
+            r'\bconst\s*\{\s*useTerminalWindows\s*\}\s*=\s*'
+            r'createTerminalWindowHooks\(\s*React\s*,\s*window\.DF_DATA_LOADER\s*\)\s*;',
+            tabs_code,
+        ), 'tabs.jsx does not build useTerminalWindows from React and window.DF_DATA_LOADER at module scope'
+        destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_TASK_SNAPSHOT\s*;', tabs_code)
+        assert destructure and re.search(r'\bcreateTerminalWindowHooks\b', destructure.group(1)), (
+            'tabs.jsx does not take createTerminalWindowHooks from window.DF_TASK_SNAPSHOT'
+        )
+
+    @pytest.mark.parametrize(
+        ('scope', 'retired', 'why'),
+        [
+            ('tabs_code', 'requestOnDemand', 'the request is the shared hook\'s, whose rules execute under node'),
+            ('tabs_code', 'onDemandDatum', 'the shared hook reads what OrchTab\'s request is doing'),
+            ('tabs_code', 'unrequestedTerminalRows', 'the shared hook reads a window OrchTab does not request'),
+            (
+                'orch_tab_code',
+                'datumFor(',
+                'datumFor cannot tell a request in flight from one that failed or was skipped',
+            ),
+            ('orch_tab_code', 'TASKS_TERMINAL:', 'the key is built in data.js only'),
+            ('orch_tab_code', 'ON_DEMAND_KEYS', 'the key is built in data.js only'),
+        ],
+    )
+    def test_no_reader_that_misstates_the_window_remains(self, request, scope, retired, why):
+        assert retired not in request.getfixturevalue(scope), f'`{retired}` remains in {scope}: {why}'

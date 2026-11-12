@@ -52,17 +52,20 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _plan_model_helpers import read_model
+from _plan_mutex_race import PROBE_SECS
 from shared.mcp_markup_middleware import FACT_MARKUP_DETECTED
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_markup_stamp
+from orchestrator.artifacts import PlanState, TaskArtifacts
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -900,8 +903,6 @@ def artifacts(tmp_path) -> TaskArtifacts:
 
 def seed_plan(artifacts: TaskArtifacts) -> dict[str, Any]:
     """A plan built through the REAL writer, as ``_create_plan`` builds one."""
-    from orchestrator.mcp import plan_tools
-
     plan_tools._create_plan(
         artifacts,
         'test-1',
@@ -916,12 +917,27 @@ def seed_plan(artifacts: TaskArtifacts) -> dict[str, Any]:
 def plan_on_disk(artifacts: TaskArtifacts) -> dict[str, Any]:
     """``plan.json`` parsed straight off disk, bypassing any normalisation."""
     return json.loads(
-        (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+        artifacts.artifact_path('plan.json').read_text(encoding='utf-8')
     )
 
 
 class TestThePlanStampRecordsTheRefusal:
     """The sink's happy path: one fact in, one accumulated block on disk."""
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_plan_stays_stamped(self, artifacts: TaskArtifacts):
+        seed_plan(artifacts)
+        assert plan_tools._confirm_plan(artifacts)['status'] == 'ok'
+        stamped = artifacts.stamp_plan_provenance('stamper')
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp(make_fact()) is not None
+
+        plan = read_model(artifacts)
+        assert plan.state is PlanState.STAMPED
+        assert plan.lifecycle.confirmed_at == stamped.lifecycle.confirmed_at
+        assert plan.lifecycle.session_id == stamped.lifecycle.session_id
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY in plan.body
 
     @pytest.mark.asyncio
     async def test_one_fact_lands_as_a_one_event_block(self, artifacts: TaskArtifacts):
@@ -936,7 +952,7 @@ class TestThePlanStampRecordsTheRefusal:
         assert len(block['events']) == 1
         assert block['events'][0]['param'] == 'decision'
         assert block['note'] == plan_markup_stamp.STAMP_NOTE
-        assert locator == str(artifacts.root / 'plan.json'), (
+        assert locator == str(artifacts.artifact_path('plan.json')), (
             'the locator names the artifact, as the journal sink names its file'
         )
 
@@ -1000,7 +1016,7 @@ class TestThePlanStampRecordsTheRefusal:
 
         await stamp(make_fact())
 
-        text = (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+        text = artifacts.artifact_path('plan.json').read_text(encoding='utf-8')
         for sequence in _FORBIDDEN_SEQUENCES:
             assert sequence not in text, (
                 f'the stamped plan carries the raw sentinel {sequence!r}'
@@ -1023,16 +1039,16 @@ class TestThePlanStampNeverRaises:
         self, artifacts: TaskArtifacts, monkeypatch
     ):
         seed_plan(artifacts)
-        before = (artifacts.root / 'plan.json').read_bytes()
+        before = artifacts.artifact_path('plan.json').read_bytes()
 
-        def boom(plan):
+        def boom(plan, **_kwargs):
             raise OSError('the plan is unwritable')
 
-        monkeypatch.setattr(artifacts, 'write_plan', boom)
+        monkeypatch.setattr(artifacts, 'write_plan_model', boom)
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         assert await stamp(make_fact()) is None
-        assert (artifacts.root / 'plan.json').read_bytes() == before
+        assert artifacts.artifact_path('plan.json').read_bytes() == before
 
     @pytest.mark.asyncio
     async def test_a_failing_read_is_swallowed(
@@ -1103,7 +1119,7 @@ class TestARefusalBeforeAnyPlanExistsIsBuffered:
 
         await stamp(make_fact(tool='create_plan', param='title'))
 
-        assert not (artifacts.root / 'plan.json').exists(), (
+        assert not artifacts.artifact_path('plan.json').exists(), (
             'a refusal must not conjure a plan that no architect authored'
         )
 
@@ -1173,6 +1189,9 @@ class TestConcurrentStampsDoNotLoseACount:
     ``plan.json`` before either writes and the second write lands a block that
     never saw the first refusal — an UNDERCOUNT, in the one artifact whose
     entire purpose is to say how much was lost.
+
+    ``TaskArtifacts.plan_mutex`` serialises the read-merge-write, and
+    ``_PENDING_LOCK`` serialises the pre-plan buffer.
     """
 
     @pytest.mark.asyncio
@@ -1181,8 +1200,9 @@ class TestConcurrentStampsDoNotLoseACount:
     ):
         """A slow read WIDENS the window, so the failure is deterministic.
 
-        Without ``_STAMP_LOCK`` all four threads read the same block-free plan
-        and the last write wins, leaving ``count == 1``.
+        Without the plan mutex around the read-merge-write, all four threads
+        read the same block-free plan and the last write wins, leaving
+        ``count == 1``.
         """
         seed_plan(artifacts)
         real_read = artifacts.read_plan
@@ -1218,62 +1238,78 @@ class TestConcurrentStampsDoNotLoseACount:
         assert pending['count'] == 4
 
 
-class TestTheCrossWriterWindowIsKnown:
-    """THE RESIDUE, pinned so it is a decision rather than an oversight.
+class TestTheStampSerialisesWithEveryPlanWriter:
+    """The cross-writer window task 4597 pinned here is closed by
+    ``TaskArtifacts.plan_mutex`` (task 5745).
 
-    ``plan.json`` has NO cross-writer lock anywhere: the ten plan-tools
-    mutators already race each other and ``artifacts.update_step_status`` the
-    same way, and this sink is a THIRD writer joining that existing race.
-    ``_STAMP_LOCK`` closes the stamp-against-stamp pair, which this module owns
-    both sides of; it cannot close stamp-against-an-accepted-tool-write,
-    because that needs the lock to live with ``artifacts.write_plan`` — the
-    single owner of the file — and to be taken by every mutator.
-
-    That is a change to ``orchestrator/artifacts.py``, outside task 4597's
-    scope, and filed as follow-up work rather than half-done here. THIS TEST IS
-    THE CANARY: when the cross-writer lock lands, it is the test that has to
-    change, and its failure will say so out loud instead of leaving the fix
-    unnoticed.
+    The stamp's read-merge-write and every accepted plan-tools write hold the
+    same mutex, so a write arriving inside the stamp's window waits for it
+    rather than being clobbered by the stamp's stale snapshot.
     """
 
     @pytest.mark.asyncio
-    async def test_an_accepted_write_inside_the_window_is_lost(
+    async def test_an_accepted_write_inside_the_stamps_window_survives(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
-        from orchestrator.mcp import plan_tools
-
         seed_plan(artifacts)
         real_read = artifacts.read_plan
-        interleaved = {'done': False}
+        accepted: list[threading.Thread] = []
+        blocked: list[bool] = []
 
-        def read_then_let_an_accepted_write_in() -> dict[str, Any]:
-            """Land an accepted ``add_plan_step`` between the read and write."""
+        def read_then_start_an_accepted_write() -> dict[str, Any]:
             plan = real_read()
-            if not interleaved['done']:
-                # Set FIRST: _add_plan_step reads the plan itself, and this
-                # wrapper is still installed.
-                interleaved['done'] = True
-                plan_tools._add_plan_step(
-                    artifacts, 'step-2', 'impl', 'An accepted call.'
+            if not accepted:
+                # A SECOND THREAD, as FastMCP's thread pool would run it. The
+                # plan mutex is reentrant per thread, so a same-thread nested
+                # write passes straight through by design and could never
+                # exercise the race.
+                writer = threading.Thread(
+                    target=plan_tools._add_plan_step,
+                    args=(artifacts, 'step-2', 'impl', 'An accepted call.'),
+                    daemon=True,
                 )
+                accepted.append(writer)
+                writer.start()
+                writer.join(PROBE_SECS)
+                blocked.append(writer.is_alive())
             return plan
 
-        monkeypatch.setattr(artifacts, 'read_plan', read_then_let_an_accepted_write_in)
+        monkeypatch.setattr(artifacts, 'read_plan', read_then_start_an_accepted_write)
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         await stamp(make_fact())
+        accepted[0].join(10)
 
         plan = plan_on_disk(artifacts)
-        assert interleaved['done'], 'the interleaving never happened'
+        assert blocked == [True], 'the accepted write did not wait for the stamp'
+        assert not accepted[0].is_alive()
+        assert [step['id'] for step in plan['steps']] == ['step-1', 'step-2']
         assert plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1
-        assert [step['id'] for step in plan['steps']] == ['step-1'], (
-            'KNOWN AND ACCEPTED: the stamp writes back the snapshot it read, '
-            'so an accepted write landing inside the window is lost. This is '
-            'the pre-existing unsynchronised-plan.json race, not a new one — '
-            'see _STAMP_LOCK. When a cross-writer lock lands in '
-            'orchestrator/artifacts.py, step-2 will survive and THIS '
-            'assertion is the one to update.'
-        )
+
+    def test_a_refusal_arriving_mid_create_plan_stamps_the_new_plan(
+        self, artifacts: TaskArtifacts
+    ):
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        async def refuse() -> None:
+            await stamp(make_fact())
+
+        refusal = threading.Thread(target=lambda: asyncio.run(refuse()), daemon=True)
+
+        with artifacts.plan_mutex():
+            refusal.start()
+            refusal.join(PROBE_SECS)
+            blocked = refusal.is_alive()
+            plan_tools._create_plan(
+                artifacts, 'test-1', 'A plan', 'Analysis.', ['a.py'],
+            )
+        refusal.join(10)
+
+        assert blocked, 'the refusal did not wait for the in-flight create_plan'
+        assert not refusal.is_alive()
+        block = plan_on_disk(artifacts)[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1
+        assert plan_markup_stamp.pending_block() is None, 'the refusal was stranded'
 
 
 class TestDrainPendingFoldsTheBufferIntoAPlan:

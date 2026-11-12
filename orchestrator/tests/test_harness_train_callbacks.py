@@ -27,8 +27,8 @@ from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.types import QueuedBranch
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +69,7 @@ class TestWorkerSideSurface:
 
     def test_worker_accepts_train_callback_factory_kwarg(self) -> None:
         """SpeculativeMergeWorker stores the injected factory as _train_callback_factory."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         sentinel = object()
         worker = SpeculativeMergeWorker(
@@ -81,7 +81,7 @@ class TestWorkerSideSurface:
 
     def test_worker_defaults_train_callback_factory_to_none(self) -> None:
         """SpeculativeMergeWorker._train_callback_factory defaults to None."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             MagicMock(),  # git_ops
@@ -103,7 +103,7 @@ class TestRealTaskFlip:
         """Factory callbacks mark a seeded task done with kind='merged' provenance."""
         from orchestrator.harness import build_train_callback_factory
         from orchestrator.merge_lane.types import TrainCallbacks
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
+        from orchestrator.merge_lane.worker import GroupMergeRequest, MergeOutcome
 
         sched = FakeScheduler()
         await sched.set_task_status('4442', 'merge-deferred')
@@ -507,11 +507,11 @@ class TestHarnessWiring:
             async def stop(self) -> None:
                 pass
 
-        # _start_merge_worker imports everything locally from orchestrator.merge_queue,
+        # _start_merge_worker imports everything locally from orchestrator.merge_lane.worker,
         # so we must patch on the merge_queue module (not harness).
         with (
             patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker',
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                 CapturingWorker,
             ),
             patch(

@@ -2,14 +2,14 @@
 """Retroactive, STATUS-AWARE sweep over checked-in ``delivered_checks`` (task 3500).
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record or
-a manifest file. Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of writing to the live WAL database the running
-orchestrator holds open. Manifest YAML on disk and git history are only ever
-read. There is no ``--apply`` flag and no MCP client is ever constructed.
-REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — repairing a descriptor from
-this report is never done by this script (the audit/repair split of tasks
-3146 / 3329).
+a manifest file. Every database connection it opens goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of writing to the live
+WAL database the running orchestrator holds open. Manifest YAML on disk and git
+history are only ever read. There is no ``--apply`` flag and no MCP client is
+ever constructed. REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — repairing a
+descriptor from this report is never done by this script (the audit/repair
+split of tasks 3146 / 3329).
 
 WHAT IT ANSWERS. ``shared.delivered_check_polarity`` gates NEW descriptors at
 authoring time, where the reference tree is free: ``commit_planning`` runs
@@ -45,13 +45,23 @@ would carry all 39 as false positives. Main today is also the tree an operator
 can actually act on: a descriptor that is broken TODAY is broken for every
 dependent dispatched from now on, whatever it did at merge time.
 
-EVALUATION GOES THROUGH THE RUNTIME PRIMITIVE.
+EVALUATION GOES THROUGH THE RUNTIME PRIMITIVES.
 ``shared.delivered_check_polarity.evaluate_grep_at_tree`` — which
-``orchestrator.delivered_checks._run_grep_check`` also delegates to — so the
-sweep cannot disagree with the scheduler about ERE-vs-Python regex, the ``-e``
-separator, pathspec placement, or the ``rc >= 2 -> ERRORED`` boundary. A sweep
-that used its own grep would invent findings the gate does not see, and miss
-the ones it does.
+``orchestrator.delivered_checks._run_grep_check`` also delegates to — and its
+path twin ``shared.delivered_check_polarity.evaluate_path_at_tree`` (twin of
+``orchestrator.delivered_checks._run_path_check``), so the sweep cannot
+disagree with the scheduler about ERE-vs-Python regex, the ``-e`` separator,
+pathspec placement, path existence, or the ``rc >= 2 -> ERRORED`` boundary. A
+sweep that used its own grep would invent findings the gate does not see, and
+miss the ones it does.
+
+STALE PATHS. A second question, orthogonal to polarity: does an
+``expect: present`` grep or path check name a ``sys.modules`` alias shim, or a
+path the mainline deleted or moved away? Such a check can never go green, so
+its dependents wedge behind what reads as an undelivered capability. Both
+halves (stamped metadata and sidecar) are swept, through the authoring lint's
+own classifier and policy (``shared.delivered_check_scope``), in ONE batched
+classification per project because the mainline deletion walk costs seconds.
 
 EPISTEMIC HONESTY. ``ERRORED`` is its own disposition, never folded into
 "never delivered"; a descriptor whose task is absent from tasks.db is reported
@@ -71,7 +81,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
 
 # Tier 1 (tasks.db discovery). The flat-sibling import contract the exemplar
@@ -84,11 +96,13 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -97,6 +111,9 @@ from _task_db_scan import (
 # the MAIN checkout's primitive. Same reasoning and same form as
 # scripts/audit_combine_gate_marker_loss.py::_SHARED_SRC. The shared.* imports below MUST
 # stay after this insert.
+# The shared.tasks_db_readonly import ABOVE is sound without it: importing
+# _task_db_scan already ran `import _checkout`, which bound this checkout's
+# shared/src.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -106,8 +123,17 @@ from shared.delivered_check_polarity import (  # noqa: E402
     GATE_REF,
     CheckOutcome,
     evaluate_grep_at_tree,
+    evaluate_path_at_tree,
     extract_delivered_checks,
     lint_delivered_checks,
+)
+from shared.delivered_check_scope import (  # noqa: E402
+    STALE_PATH_CODES,
+    STALE_PATH_REASONS,
+    ScopePath,
+    classify_scope_paths,
+    is_literal_scope_path,
+    stale_scope_paths,
 )
 
 MANIFEST_SUFFIX = ".capability-manifest.yaml"
@@ -147,9 +173,13 @@ DEFECT_DISPOSITIONS = (
     DISPOSITION_UNWIRED_LIVE_GATE,
 )
 
+#: The kinds the STRUCTURAL section lints: its codes exist only for grep.
+STRUCTURAL_SWEPT_KINDS = ("grep",)
+
 
 class DescriptorRow(NamedTuple):
-    """One ``kind: grep`` delivered_check, joined to its producer's status.
+    """One ``kind: grep`` or ``kind: path`` delivered_check, joined to its
+    producer's status. ``pattern`` is ``None`` on a path row.
 
     ``status`` is ``None`` when the descriptor came from a sidecar naming a
     task this project's tasks.db does not carry — the COVERAGE case, kept as a
@@ -180,7 +210,8 @@ class Finding(NamedTuple):
     """One classified descriptor.
 
     ``superseded_by`` is set only when the supersession probe attributed a
-    later task to the pattern's return.
+    later task to the change that undid the check (see
+    :func:`find_superseding_task`).
 
     ``open_dependents`` names the still-open tasks that depend on this
     descriptor's producer — the tasks a defective check actually holds up. It
@@ -207,6 +238,7 @@ class AuditCoverage(NamedTuple):
     descriptors_without_task: int
     unevaluable: int
     sidecars_unloadable: int
+    scope_paths_unclassified: int = 0
 
 
 #: The lint codes that describe where a descriptor's matches LIE rather than
@@ -223,11 +255,36 @@ class StructuralFinding(NamedTuple):
     code: str
 
 
+class StalePathFinding(NamedTuple):
+    """One descriptor ``paths`` entry that leaves its check unable to go green.
+
+    ``open_dependents`` is always carried, since "nobody" is itself an answer.
+    """
+
+    row: DescriptorRow
+    scope: ScopePath
+    open_dependents: tuple[int, ...]
+
+    @property
+    def code(self) -> str:
+        return STALE_PATH_CODES[self.scope.state]
+
+    @property
+    def actionable(self) -> bool:
+        return stale_path_is_actionable(self.row.status, self.open_dependents)
+
+
+class StalePathSweep(NamedTuple):
+    findings: tuple[StalePathFinding, ...]
+    paths_unclassified: int
+
+
 class ProjectAudit(NamedTuple):
     project_root: str
     findings: list[Finding]
     coverage: AuditCoverage
     structural: tuple[StructuralFinding, ...] = ()
+    stale_paths: tuple[StalePathFinding, ...] = ()
 
 
 def structural_findings(
@@ -237,10 +294,11 @@ def structural_findings(
 
     Through ``lint_delivered_checks`` itself, with the row's sidecar as
     ``manifest_path`` so the self-reference rule can see the descriptor's own
-    family — the same classification the authoring gate reaches.
+    family — the same classification the authoring gate reaches. Only rows of
+    :data:`STRUCTURAL_SWEPT_KINDS` are linted, whatever the caller passes.
     """
     found = []
-    for row in rows:
+    for row in (r for r in rows if r.kind in STRUCTURAL_SWEPT_KINDS):
         check = {
             "name": row.name, "kind": row.kind, "pattern": row.pattern,
             "expect": row.expect, "paths": list(row.paths), "manifest_path": row.manifest,
@@ -249,6 +307,53 @@ def structural_findings(
             if lint.code in STRUCTURAL_CODES:
                 found.append(StructuralFinding(row=row, code=lint.code))
     return tuple(found)
+
+
+def stale_path_is_actionable(status: str | None, open_dependents: tuple[int, ...]) -> bool:
+    """Whether a stale path holds anyone: a live producer's own gate, or a done
+    producer's still-open dependents. A cancelled or unknown producer is inert."""
+    if status is None or status in INERT_STATUSES:
+        return False
+    if status in DONE_STATUSES:
+        return bool(open_dependents)
+    return True
+
+
+def stale_path_findings(
+    rows: Iterable[DescriptorRow],
+    *,
+    repo_root: str,
+    ref: str = GATE_REF,
+    open_dependents: Mapping[int, tuple[int, ...]] = MappingProxyType({}),
+) -> StalePathSweep:
+    """Every stale ``paths`` entry across *rows*, from ONE classification of
+    their distinct literal paths at *ref*; the policy is the authoring lint's
+    own. A row's findings keep its ``paths`` order.
+
+    A literal path the classifier could not answer for is counted in
+    ``paths_unclassified`` (all of them when git could not answer at all), so
+    a git failure never reads as "nothing stale". A glob or pathspec-magic
+    entry names no single path, so it is neither classified nor counted.
+    """
+    swept = list(rows)
+    literals = sorted(
+        {path for row in swept for path in row.paths if is_literal_scope_path(path)}
+    )
+    census = classify_scope_paths(literals, repo_root=repo_root, ref=ref) or {}
+    findings = []
+    for row in swept:
+        scope = [census[path] for path in dict.fromkeys(row.paths) if path in census]
+        findings.extend(
+            StalePathFinding(
+                row=row, scope=entry, open_dependents=open_dependents.get(row.task_id, ())
+            )
+            for entry in stale_scope_paths(row.kind, row.expect, scope)
+        )
+    findings.sort(key=lambda f: (not f.actionable, f.row.task_id, f.row.name))
+    return StalePathSweep(
+        findings=tuple(findings),
+        paths_unclassified=sum(1 for path in literals if path not in census),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +386,8 @@ def classify_descriptor(
        nothing (so a failing check is not a defect) and it gates nothing (so a
        passing one is not a vacuous live gate).
     4. Done: ``PASS`` is the success state; ``FAIL`` is the defect, unless a
-       later task is known to have reintroduced the pattern.
+       later task is known to have undone it, by changing the pattern's
+       occurrences or creating or deleting the path.
     5. Live: ``PASS`` is the vacuous gate this sweep exists to surface, and
        ``FAIL`` is the ordinary forward-looking majority — unless the
        descriptor was never *stamped* onto its producer, in which case the
@@ -310,14 +416,7 @@ def classify_descriptor(
     return DISPOSITION_HEALTHY if stamped else DISPOSITION_UNWIRED_LIVE_GATE
 
 
-def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
-    """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
-
-    Deliberately a one-line delegation rather than its own grep:
-    :func:`shared.delivered_check_polarity.evaluate_grep_at_tree` is the same
-    function ``orchestrator.delivered_checks._run_grep_check`` delegates to, so
-    this sweep and the scheduler cannot disagree about what a check means.
-    """
+def _evaluate_grep_row(row: DescriptorRow, repo_root: str, ref: str) -> CheckOutcome:
     return evaluate_grep_at_tree(
         row.pattern or "",
         list(row.paths),
@@ -327,12 +426,32 @@ def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> 
     )
 
 
+def _evaluate_path_row(row: DescriptorRow, repo_root: str, ref: str) -> CheckOutcome:
+    return evaluate_path_at_tree(
+        list(row.paths), expect=row.expect, repo_root=repo_root, ref=ref
+    )
+
+
+def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
+    """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
+
+    Deliberately a delegation rather than its own grep or listing: a grep row
+    goes to :func:`shared.delivered_check_polarity.evaluate_grep_at_tree` and
+    a path row to :func:`shared.delivered_check_polarity.evaluate_path_at_tree`,
+    the functions ``orchestrator.delivered_checks._run_grep_check`` and
+    ``_run_path_check`` delegate to or twin, so this sweep and the scheduler
+    cannot disagree about what a check means. A kind outside
+    :data:`POLARITY_SWEPT_KINDS` raises ``ValueError`` naming it.
+    """
+    return _kind_probe(row).evaluate(row, repo_root, ref)
+
+
 # ---------------------------------------------------------------------------
 # Source 1 — tasks.db
 # ---------------------------------------------------------------------------
 
 
-def _grep_rows_from_checks(
+def _mechanical_rows_from_checks(
     checks: list[dict],
     *,
     task_id: int,
@@ -342,38 +461,47 @@ def _grep_rows_from_checks(
     manifest: str | None = None,
     task_label: str | None = None,
 ) -> list[DescriptorRow]:
-    """Filter *checks* down to evaluable grep descriptors and shape them.
+    """Filter *checks* down to the grep and path descriptors and shape them.
 
-    Only ``kind == 'grep'`` survives: the sweep is a statement about grep
-    POLARITY against a tree, and a script check has no pattern to evaluate
-    (its own guard is TestCheckedInScriptCheckTargets). ``kind == 'path'`` is
-    not swept either: :func:`find_superseding_task` is a pickaxe over a
-    PATTERN and this tool has no path-history counterpart to it, so a done
-    path check that fails could not be told apart from a superseded one. A grep entry with
-    no pattern is a SCHEMA defect the corpus validator owns, not a delivery
-    one.
+    Both kinds feed the polarity dispositions (see
+    :data:`POLARITY_SWEPT_KINDS`) and the stale-path sweep. A script check has
+    no tree predicate (its own guard is TestCheckedInScriptCheckTargets). A grep entry with no
+    pattern, or a path entry with no usable paths, is a SCHEMA defect the
+    corpus validator owns, not a delivery one.
     """
     rows = []
     for check in checks:
-        if not isinstance(check, dict) or check.get("kind") != "grep":
+        if not isinstance(check, dict):
             continue
-        pattern = check.get("pattern")
+        kind = check.get("kind")
         name = check.get("name")
-        if not isinstance(pattern, str) or not pattern:
-            continue
+        pattern = check.get("pattern")
+        raw_paths = check.get("paths")
+        paths = tuple(
+            p for p in (raw_paths if isinstance(raw_paths, (list, tuple)) else [])
+            if isinstance(p, str)
+        )
         if not isinstance(name, str) or not name:
             continue
-        paths = check.get("paths")
+        if kind == "grep":
+            if not isinstance(pattern, str) or not pattern:
+                continue
+        elif kind == "path":
+            if not paths:
+                continue
+            pattern = None
+        else:
+            continue
         rows.append(
             DescriptorRow(
                 task_id=task_id,
                 tag=tag,
                 status=status,
                 name=name,
-                kind="grep",
+                kind=kind,
                 pattern=pattern,
                 expect=check.get("expect"),
-                paths=tuple(p for p in (paths or []) if isinstance(p, str)),
+                paths=paths,
                 source=source,
                 manifest=manifest,
                 task_label=task_label,
@@ -387,7 +515,7 @@ class TaskIndex(NamedTuple):
 
     ``metadata_rows`` and ``stamped_names`` are two views of ONE fact — what
     is stamped — derived from the same per-task extraction, so they cannot
-    drift apart. ``metadata_rows`` holds only the evaluable grep descriptors;
+    drift apart. ``metadata_rows`` holds the grep AND path descriptors;
     ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
     delivered_check, whatever its kind — the set a sidecar capability is
     deduplicated against.
@@ -402,13 +530,14 @@ class TaskIndex(NamedTuple):
 def load_task_index(db_path: str) -> TaskIndex:
     """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
-    Read-only URI — the guarantee is structural, not a convention. Malformed
-    metadata is SKIPPED rather than raised: a single undecodable row must not
-    abort a whole-project sweep, and ``extract_delivered_checks`` already
-    implements exactly that benign-absent contract (the same one
-    ``lock_charter_guard.extract_files`` uses at the wire boundary).
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Metadata is decoded by
+    ``scripts/_task_db_scan.py::decode_metadata``, the decoder every audit
+    script shares, which degrades a corrupt blob to ``{}``: a single
+    undecodable row is SKIPPED rather than raised, because it must not abort
+    a whole-project sweep.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         conn.row_factory = sqlite3.Row
         statuses: dict[int, tuple[str, str]] = {}
@@ -421,9 +550,9 @@ def load_task_index(db_path: str) -> TaskIndex:
             task_id = int(record["id"])
             statuses[task_id] = (record["tag"], record["status"])
             stamps[task_id] = record["updated_at"]
-            checks = extract_delivered_checks(record["metadata"])
+            checks = extract_delivered_checks(decode_metadata(record["metadata"]))
             metadata_rows.extend(
-                _grep_rows_from_checks(
+                _mechanical_rows_from_checks(
                     checks,
                     task_id=task_id,
                     tag=record["tag"],
@@ -473,7 +602,8 @@ def manifest_paths(project_root: str) -> list[Path]:
 def load_manifest_checks(
     project_root: str, statuses: dict[int, tuple[str, str]]
 ) -> tuple[list[DescriptorRow], int]:
-    """Sidecar grep descriptors, joined to *statuses*; plus the unloadable count.
+    """Sidecar grep and path descriptors, joined to *statuses*; plus the
+    unloadable count.
 
     *statuses* maps ``task_id -> (tag, status)``. A capability whose task is
     absent gets ``status=None``, which :func:`classify_descriptor` renders as
@@ -504,15 +634,15 @@ def load_manifest_checks(
             tag, status = statuses.get(int(task_id), ("master", None))
             for cap in task.capabilities:
                 check = cap.delivered_check
-                if check is None or check.kind != "grep":
+                if check is None or check.kind not in ("grep", "path"):
                     continue
                 rows.extend(
-                    _grep_rows_from_checks(
+                    _mechanical_rows_from_checks(
                         [
                             {
                                 "name": cap.name,
-                                "kind": "grep",
-                                "pattern": check.pattern,
+                                "kind": check.kind,
+                                "pattern": check.pattern if check.kind == "grep" else None,
                                 "expect": check.expect,
                                 "paths": list(check.paths),
                             }
@@ -557,21 +687,8 @@ _TASK_IN_SUBJECT_RE = re.compile(r"task[\s/-]#?(\d+)")
 _SUPERSESSION_EXCLUDE_PATHSPEC = f":(exclude)*{MANIFEST_SUFFIX}"
 
 
-def find_superseding_task(
-    row: DescriptorRow, *, repo_root: str, since: str | None
-) -> str | None:
-    r"""A LATER task that reintroduced *row*'s pattern, or ``None``.
-
-    Only ever consulted for a would-be ``broken`` row, and only ever able to
-    DOWNGRADE it — so a false negative costs a footnote and a false positive
-    costs a missed defect. That asymmetry is why the attribution is strict:
-    the task id must come from the merge-commit subject convention, never
-    inferred from the diff or the author.
-
-    *since* is the producer's ``updated_at``; commits at or before it are the
-    producer's own work, not a later undoing. Absent, no claim is made at all
-    rather than scanning all of history and attributing the producer's own
-    merge to it.
+def _grep_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
+    r"""The commits since *since* that changed the pattern's occurrence count.
 
     ``--pickaxe-regex`` IS LOAD-BEARING, not a refinement. A bare ``-S`` is a
     LITERAL-string pickaxe, but every pattern here is the POSIX ERE that
@@ -585,7 +702,7 @@ def find_superseding_task(
     repo: literal ``-S`` returns nothing for both patterns, ``--pickaxe-regex``
     returns 3578's commits for both.
     """
-    if not since or not row.pattern:
+    if not row.pattern:
         return None
     argv = [
         "git", "-C", repo_root, "log", "--format=%s",
@@ -594,7 +711,106 @@ def find_superseding_task(
     # A pathspec of nothing-but-exclusions applies the exclusion to the
     # implicit "everything" — verified against this repo's git rather than
     # assumed, since older git treats it as matching nothing.
-    argv += ["--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
+    return [*argv, "--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
+
+
+def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
+    """The commits since *since* that moved the check toward FAILING.
+
+    Those are deletions of a listed path for ``expect: present`` and
+    creations for any other *expect*, the reading
+    ``shared.delivered_check_polarity.interpret_path_listing`` applies. The
+    check is conjunctive, so a commit moving it toward passing (creating one
+    of several required paths, deleting one of several forbidden ones) can
+    sit beside a real defect and must not be attributed.
+
+    A commit that only modified the path changed nothing the check reads.
+    Each path is ``:(literal)``, the way ``ls-tree`` reads it, and everything
+    beneath it is excluded. Git records no commit creating a directory
+    itself, so a directory entry yields no commits and the probe makes no
+    claim for it.
+    """
+    undoing_filter = "D" if row.expect == "present" else "A"
+    pathspecs = [
+        spec
+        for path in row.paths
+        for spec in (f":(literal){path}", f":(exclude,literal){path.rstrip('/')}/")
+    ]
+    return [
+        "git", "-C", repo_root, "log", "--format=%s",
+        f"--since={since}", f"--diff-filter={undoing_filter}", "--", *pathspecs,
+    ]
+
+
+def _grep_subject(row: DescriptorRow) -> tuple[str, str]:
+    return ("pattern", repr(row.pattern))
+
+
+def _path_subject(row: DescriptorRow) -> tuple[str, str]:
+    return ("paths", ",".join(row.paths))
+
+
+class _KindProbe(NamedTuple):
+    """Everything the polarity sweep does differently for one kind.
+
+    ``evaluate`` reads the check's outcome at a ref; ``history_argv`` lists
+    the commits that could have undone it, or ``None`` for no claim;
+    ``subject`` is the report's key=value pair for what the check asserts
+    about.
+    """
+
+    evaluate: Callable[[DescriptorRow, str, str], CheckOutcome]
+    history_argv: Callable[[DescriptorRow, str, str], list[str] | None]
+    subject: Callable[[DescriptorRow], tuple[str, str]]
+
+
+_KIND_PROBES: Mapping[str, _KindProbe] = MappingProxyType({
+    "grep": _KindProbe(_evaluate_grep_row, _grep_history_argv, _grep_subject),
+    "path": _KindProbe(_evaluate_path_row, _path_history_argv, _path_subject),
+})
+
+#: The kinds given a polarity disposition: exactly those with a probe.
+POLARITY_SWEPT_KINDS = tuple(_KIND_PROBES)
+
+
+def _kind_probe(row: DescriptorRow) -> _KindProbe:
+    probe = _KIND_PROBES.get(row.kind)
+    if probe is None:
+        raise ValueError(
+            f"no polarity probe for kind {row.kind!r} (task {row.task_id}, "
+            f"check {row.name!r}): only {POLARITY_SWEPT_KINDS} rows are swept"
+        )
+    return probe
+
+
+def find_superseding_task(
+    row: DescriptorRow, *, repo_root: str, since: str | None
+) -> str | None:
+    """A LATER task that undid *row*'s capability, or ``None``.
+
+    Only ever consulted for a would-be ``broken`` row, and only ever able to
+    DOWNGRADE it — so a false negative costs a footnote and a false positive
+    costs a missed defect. That asymmetry is why the attribution is strict,
+    for every kind's ``history_argv`` in :data:`_KIND_PROBES`: the task id
+    must come from the merge-commit subject convention, never inferred from
+    the diff or the author.
+
+    *since* is the producer's ``updated_at``; commits at or before it are the
+    producer's own work, not a later undoing. Absent, no claim is made at all
+    rather than scanning all of history and attributing the producer's own
+    merge to it.
+
+    A grep row's probe is the regex pickaxe (:func:`_grep_history_argv`). A
+    path row's is the commits that deleted (expect=present) or created (any
+    other expect) exactly a listed path
+    (:func:`_path_history_argv`); it needs no manifest exclusion, because it
+    names explicit paths rather than searching contents.
+    """
+    if not since:
+        return None
+    argv = _kind_probe(row).history_argv(row, repo_root, since)
+    if argv is None:
+        return None
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
@@ -629,15 +845,19 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
     capability that can never be delivered.
 
     A MISSING ``dependencies`` TABLE IS NOT AN ERROR HERE, and the swallow is
-    narrow and deliberate. ``sweep_project_roots`` catches ``sqlite3.Error``
-    and turns it into "unreadable project"; an ``OperationalError`` escaping
-    this function would therefore demote a perfectly readable project to a
-    skip, and — if it were the only root — turn a healthy sweep into a false
-    exit 3, the exact silent-fail-soft that exit code exists to prevent. Only
-    the "no such table" shape is swallowed; every other ``sqlite3.Error``
-    propagates so a genuinely corrupt database still surfaces.
+    narrow and deliberate. ``sweep_project_roots`` catches
+    ``UNREADABLE_STORE_ERRORS``, every ``sqlite3.Error`` among them, and turns
+    it into "unreadable project"; an ``OperationalError`` escaping this
+    function would therefore demote a perfectly readable project to a skip,
+    and — if it were the only root — turn a healthy sweep into a false exit 3,
+    the exact silent-fail-soft that exit code exists to prevent. Only the "no
+    such table" shape is swallowed; every other ``sqlite3.Error`` propagates
+    so a genuinely corrupt database still surfaces. The open goes through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro``, which refuses a
+    store with NO tables at all before the query runs — it guarantees some
+    table, not this one, so the swallow still has work to do.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         conn.row_factory = sqlite3.Row
         try:
@@ -663,7 +883,8 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
 def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     """Join tasks.db, the sidecars and the tree; classify every descriptor.
 
-    Raises ``sqlite3.Error`` on an unreadable database, which is the contract
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` on an
+    unreadable database, which is the contract
     ``_task_db_scan.sweep_project_roots`` depends on: exactly one audit object
     per root, or a raise. Returning a sentinel to "skip" would silently break
     the exit-3 gate that stops a total-failure sweep reading as clean.
@@ -671,18 +892,32 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     Deduplication is by ``(task_id, name)`` with the METADATA copy winning,
     regardless of kind: that is the artifact the runtime gate actually
     evaluates, so when the sidecar and the stamped metadata disagree — even
-    when the stamped copy is a path check the sweep does not evaluate — the
-    stamped one is the live behaviour and the sidecar row would be a phantom.
+    when the stamped copy is a path check and the sidecar spells it as a
+    grep — the stamped one is the live behaviour and the sidecar row would be
+    a phantom.
     """
     db = str(tasks_db_path(project_root))
     index = load_task_index(db)
     open_dependents = load_open_dependents(db)
     manifest_rows, unloadable = load_manifest_checks(project_root, index.statuses)
 
+    polarity_manifest_rows = [r for r in manifest_rows if r.kind in POLARITY_SWEPT_KINDS]
     rows = [
-        *index.metadata_rows,
-        *(r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names),
+        *(r for r in index.metadata_rows if r.kind in POLARITY_SWEPT_KINDS),
+        *(
+            r for r in polarity_manifest_rows
+            if (r.task_id, r.name) not in index.stamped_names
+        ),
     ]
+
+    # Not deduped: a stale sidecar is re-stamped over a repaired record on
+    # re-decompose, so each half is its own artifact to repair.
+    stale = stale_path_findings(
+        [*index.metadata_rows, *manifest_rows],
+        repo_root=project_root,
+        ref=ref,
+        open_dependents=open_dependents,
+    )
 
     findings: list[Finding] = []
     for row in rows:
@@ -718,7 +953,10 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     return ProjectAudit(
         project_root=project_root,
         findings=findings,
-        structural=structural_findings(manifest_rows, repo_root=project_root, ref=ref),
+        structural=structural_findings(
+            polarity_manifest_rows, repo_root=project_root, ref=ref
+        ),
+        stale_paths=stale.findings,
         coverage=AuditCoverage(
             descriptors_total=len(findings),
             descriptors_without_task=sum(
@@ -728,6 +966,7 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
                 1 for f in findings if f.disposition == DISPOSITION_UNEVALUABLE
             ),
             sidecars_unloadable=unloadable,
+            scope_paths_unclassified=stale.paths_unclassified,
         ),
     )
 
@@ -756,9 +995,12 @@ _TERMINAL_SECTIONS = (
     ("UNEVALUABLE", DISPOSITION_UNEVALUABLE),
 )
 
-_SECTIONS = _LIVE_SECTIONS + _TERMINAL_SECTIONS
-
 _STRUCTURAL_LABEL = "STRUCTURAL, report-only"
+
+#: Actionable stale paths sit with the live sections (someone is held right
+#: now); the rest are listed after STRUCTURAL.
+_STALE_LABEL = "STALE PATHS"
+_STALE_REPORT_ONLY_LABEL = "STALE PATHS, report-only"
 
 #: One line per disposition saying WHY, in the reader's terms. A disposition
 #: name alone is a verdict without an argument: it tells an operator what the
@@ -810,7 +1052,9 @@ _COVERAGE_CAVEAT = (
     "  4731's external_task_id), and a sidecar that would not load. A foreign\n"
     "  id that COLLIDES with a local task is not counted here; it is\n"
     "  classified against that unrelated task. The reconciliation record is\n"
-    "  docs/sidecar-orphan-reconciliation-2026-09-29/investigation.md."
+    "  docs/sidecar-orphan-reconciliation-2026-09-29/investigation.md.\n"
+    "  Separately, a scope path the STALE PATHS classifier could not answer\n"
+    "  for is counted, so a git failure never reads as nothing stale."
 )
 
 
@@ -828,7 +1072,7 @@ def _format_finding(finding: Finding) -> list[str]:
         ("status", row.status),
         ("name", row.name),
         ("expect", row.expect),
-        ("pattern", repr(row.pattern)),
+        _kind_probe(row).subject(row),
         ("source", row.source),
     ]
     if row.manifest:
@@ -849,6 +1093,42 @@ def _format_finding(finding: Finding) -> list[str]:
     reason = _REASONS.get(finding.disposition)
     if reason:
         lines.append(f"      reason: {reason}")
+    return lines
+
+
+def _format_stale(finding: StalePathFinding) -> list[str]:
+    row = finding.row
+    pairs: list[tuple[str, object]] = [
+        ("task_id", row.task_id),
+        ("status", row.status),
+        ("name", row.name),
+        ("code", finding.code),
+        ("path", finding.scope.path),
+        ("source", row.source),
+    ]
+    if row.manifest:
+        pairs.append(("manifest", row.manifest))
+    if finding.scope.removed_in:
+        pairs.append(("removed_in", finding.scope.removed_in))
+    pairs.append(
+        ("open_dependents", ",".join(str(d) for d in finding.open_dependents) or "none")
+    )
+    return [format_kv_line(pairs), f"      reason: {STALE_PATH_REASONS[finding.code]}"]
+
+
+def _disposition_section(audit: ProjectAudit, label: str, disposition: str) -> list[str]:
+    rows = [f for f in audit.findings if f.disposition == disposition]
+    lines = [f"  {label} ({len(rows)})"]
+    for finding in rows:
+        lines.extend(_format_finding(finding))
+    return lines
+
+
+def _stale_section(audit: ProjectAudit, label: str, *, actionable: bool) -> list[str]:
+    rows = [f for f in audit.stale_paths if f.actionable is actionable]
+    lines = [f"  {label} ({len(rows)})"]
+    for finding in rows:
+        lines.extend(_format_stale(finding))
     return lines
 
 
@@ -873,11 +1153,11 @@ def format_report(audits: list[ProjectAudit]) -> str:
     lines: list[str] = []
     for audit in audits:
         lines.append(f"=== {audit.project_root}")
-        for label, disposition in _SECTIONS:
-            rows = [f for f in audit.findings if f.disposition == disposition]
-            lines.append(f"  {label} ({len(rows)})")
-            for finding in rows:
-                lines.extend(_format_finding(finding))
+        for label, disposition in _LIVE_SECTIONS:
+            lines.extend(_disposition_section(audit, label, disposition))
+        lines.extend(_stale_section(audit, _STALE_LABEL, actionable=True))
+        for label, disposition in _TERMINAL_SECTIONS:
+            lines.extend(_disposition_section(audit, label, disposition))
         lines.append(f"  {_STRUCTURAL_LABEL} ({len(audit.structural)})")
         for item in audit.structural:
             lines.append(format_kv_line([
@@ -885,6 +1165,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
                 ("code", item.code), ("pattern", repr(item.row.pattern)),
                 ("manifest", item.row.manifest),
             ]))
+        lines.extend(_stale_section(audit, _STALE_REPORT_ONLY_LABEL, actionable=False))
         lines.append("")
         lines.extend(format_coverage_block(
             _COVERAGE_CAVEAT,
@@ -893,6 +1174,8 @@ def format_report(audits: list[ProjectAudit]) -> str:
                 ("descriptors with no task row", audit.coverage.descriptors_without_task),
                 ("descriptors git could not evaluate", audit.coverage.unevaluable),
                 ("sidecars that would not load", audit.coverage.sidecars_unloadable),
+                ("scope paths git could not classify",
+                 audit.coverage.scope_paths_unclassified),
             ),
             _coverage_details(audit),
         ))
@@ -904,9 +1187,13 @@ def format_report(audits: list[ProjectAudit]) -> str:
         # and empty on a total-failure sweep too, so only the exit code
         # distinguishes them.
         lines.append("no projects audited")
-        for label, _ in _SECTIONS:
+        for label, _ in _LIVE_SECTIONS:
+            lines.append(f"  {label} (0)")
+        lines.append(f"  {_STALE_LABEL} (0)")
+        for label, _ in _TERMINAL_SECTIONS:
             lines.append(f"  {label} (0)")
         lines.append(f"  {_STRUCTURAL_LABEL} (0)")
+        lines.append(f"  {_STALE_REPORT_ONLY_LABEL} (0)")
         lines.append("  " + _COVERAGE_CAVEAT)
     return "\n".join(lines)
 
@@ -940,6 +1227,19 @@ def format_json(audits: list[ProjectAudit]) -> str:
                         {**item.row._asdict(), "paths": list(item.row.paths), "code": item.code}
                         for item in audit.structural
                     ],
+                    "stale_paths": [
+                        {
+                            **item.row._asdict(),
+                            "paths": list(item.row.paths),
+                            "path": item.scope.path,
+                            "code": item.code,
+                            "removed_in": item.scope.removed_in,
+                            "actionable": item.actionable,
+                            "open_dependents": list(item.open_dependents),
+                            "reason": STALE_PATH_REASONS[item.code],
+                        }
+                        for item in audit.stale_paths
+                    ],
                 }
                 for audit in audits
             ]
@@ -960,7 +1260,8 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # in audit_combine_gate_marker_loss.py.
 EXIT_OK = AUDIT_EXIT_OK                        # audited; no ACTIONABLE defect
 EXIT_DEFECTS = AUDIT_EXIT_FINDINGS             # a broken, vacuous-live-gate or
-                                               # unwired-live-gate descriptor
+                                               # unwired-live-gate descriptor,
+                                               # or an actionable stale path,
                                                # was found
 EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT              # no project root resolved to a
                                                # readable tasks.db
@@ -972,23 +1273,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "READ-ONLY, STATUS-AWARE audit of checked-in delivered_checks: "
-            "reports every kind=grep descriptor whose polarity against main "
-            "today disagrees with its producer's status — a closed producer "
+            "reports every kind=grep and kind=path descriptor whose polarity "
+            "against main today disagrees with its producer's status — a closed producer "
             "whose capability is nowhere on main (broken), an open one "
             "whose check already passes and therefore gates nothing (vacuous "
             "live gate), or an open one whose sound sidecar check was never "
             "stamped onto it, so the runtime gate cannot see it (unwired live "
-            "gate). Reporting only — never mutates a task or a manifest. "
+            "gate); and every grep/path descriptor whose paths name a "
+            "sys.modules shim or a mainline-removed path, so it can never go "
+            "green (stale paths). Reporting only — never mutates a task or a manifest. "
             "Remediation is a separate, individually-reviewed follow-up."
         ),
         epilog=(
             "exit codes: 0 = audited, no ACTIONABLE defect; 1 = at least one "
-            "actionable defect (broken, a vacuous live gate, or an unwired "
-            "live gate); 2 = no project root resolved to a readable tasks.db; "
+            "actionable defect (broken, a vacuous live gate, an unwired live "
+            "gate, or a stale path on a live producer or on a done one with "
+            "open dependents); 2 = no project root resolved to a readable tasks.db; "
             "3 = roots resolved but every one failed to audit, so NOTHING was "
             "swept (never treat 3 as a clean run). Superseded, unevaluable, "
-            "delivered, inert and stamped forward-looking rows are reported "
-            "in full but never affect the exit code."
+            "delivered, inert and stamped forward-looking rows, and report-only "
+            "stale paths, are reported in full but never affect the exit code."
         ),
     )
     parser.add_argument(
@@ -1007,7 +1311,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
-    """Audit ONE project root. Exactly one audit, or ``sqlite3.Error``.
+    """Audit ONE project root. Exactly one audit, or one of UNREADABLE_STORE_ERRORS.
 
     That is :func:`_task_db_scan.sweep_project_roots`' one-audit-per-root
     contract, and the exit-3 gate depends on it — a sentinel return to "skip"
@@ -1039,18 +1343,21 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
     * ``unevaluable`` / ``no_task``: coverage facts, not verdicts. Letting
       "git could not answer" exit 1 would make an infrastructure failure
       indistinguishable from a real defect.
+
+    An ACTIONABLE stale path (:func:`stale_path_is_actionable`) also exits 1;
+    a report-only one, which holds nobody, does not.
     """
     return any(
         f.disposition in DEFECT_DISPOSITIONS for a in audits for f in a.findings
-    )
+    ) or any(f.actionable for a in audits for f in a.stale_paths)
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
     Exit codes: 0 = audited, no actionable defect; 1 = at least one
-    ``broken``, ``vacuous_live_gate`` or ``unwired_live_gate`` descriptor;
-    2 = no project root resolved to a readable tasks.db; 3 = roots resolved
+    ``broken``, ``vacuous_live_gate`` or ``unwired_live_gate`` descriptor, or
+    an actionable stale path; 2 = no project root resolved to a readable tasks.db; 3 = roots resolved
     but every one failed to audit, so NOTHING was swept (never treat 3 as a
     clean run).
 

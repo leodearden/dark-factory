@@ -25,7 +25,7 @@ right in both.
 WHY EACH OTHER TABLE STAYS OFF. The dated per-table counts are in task 5086's
 record, not here, because they go stale with the next edit to any member.
 
-* root — ``scripts/merge_lane_metrics.py::_import_complexipy`` and the radon
+* root — ``scripts/source_measures.py::_import_complexipy`` and the radon
   import beside it are lazy by design, so env-dependent; and the root table
   also governs every ad-hoc root-scoped pyright run over member files, which
   would then surface their sites.

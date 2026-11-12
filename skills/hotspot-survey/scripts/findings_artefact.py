@@ -34,6 +34,9 @@ PRIMARY_TAG_RE = re.compile(r"^(h([1-9]|1[0-4])|comments|tests)$")
 TAG_RE = re.compile(r"^(h([1-9]|1[0-4])|comments|tests|inv-\d+|kind:[a-z-]+)$")
 ANCHOR_RE = re.compile(r"^(slug:[a-z0-9]+(-[a-z0-9]+)*|[\w.-][\w./-]*(::[A-Za-z_][\w.]*)?)$")
 LINE_PIN_RE = re.compile(r":\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
+# A symbol path after the file (Rust `Type::method`, `module::Type::method`) is a class-level
+# definition; it is written with dots after the first `::`, the form ANCHOR_RE accepts.
+SYMBOL_PATH_RE = re.compile(r"::([A-Za-z_][\w.]*(?:::[A-Za-z_][\w.]*)+)$")
 DISPOSITION_RE = re.compile(r"^(open|refuted|filed:\d+|accepted:\d+|fixed:[0-9a-f]{7,40})$")
 SUPERSEDES_RE = re.compile(r"^(fk-[0-9a-f]{12}|positional:clusters\[\d+\]\.findings\[\d+\])$")
 CITED_KEY_RE = re.compile(r"\bfk-[0-9a-f]{12}\b")
@@ -57,7 +60,8 @@ def load_kind_tags() -> dict:
 
 
 def normalise_anchor(anchor: str) -> str:
-    return LINE_PIN_RE.sub("", anchor.strip().replace("\\", "/"))
+    unpinned = LINE_PIN_RE.sub("", anchor.strip().replace("\\", "/"))
+    return SYMBOL_PATH_RE.sub(lambda m: "::" + m.group(1).replace("::", "."), unpinned)
 
 
 def finding_key(area: str, anchor: str, primary_tag: str) -> str:

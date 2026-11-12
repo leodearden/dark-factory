@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import wait_responsive
 
 from orchestrator.branch_stack import (
@@ -86,7 +87,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_request(
@@ -451,9 +452,9 @@ class TestDerailRedriveUnstacks:
 
 @pytest.fixture
 def no_op_verify_config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    return lane_scene_config(
+        git_repo,
+        git_config,
         test_command='true',
         lint_command='true',
         type_check_command='true',

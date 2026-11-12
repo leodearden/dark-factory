@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.harness import Harness
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Shared harness builder — mirrors test_harness_merge_store_wiring

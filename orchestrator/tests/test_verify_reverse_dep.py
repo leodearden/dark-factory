@@ -39,14 +39,14 @@ from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 # escalation/tests/test_server.py's real shape: a guarded, indented import of
-# orchestrator.merge_queue (escalation/tests/test_server.py:31-34).
+# orchestrator.merge_lane.worker (escalation/tests/test_server.py:31-34).
 _TEST_SERVER_CONTENT = (
     'from __future__ import annotations\n'
     '\n'
     'import pytest\n'
     '\n'
     'try:\n'
-    '    from orchestrator.merge_queue import SpeculativeMergeWorker\n'
+    '    from orchestrator.merge_lane.worker import SpeculativeMergeWorker\n'
     'except ImportError:\n'
     '    SpeculativeMergeWorker = None\n'
 )
@@ -341,7 +341,7 @@ class TestRunScopedVerificationReverseDependencyWidening:
 
         `existing_files` (the `(worktree / f).exists()`-filtered list) drops
         the deleted source path entirely, hiding exactly the class of change
-        most likely to break escalation's `from orchestrator.merge_queue
+        most likely to break escalation's `from orchestrator.merge_lane.worker
         import ...` contract. The trigger gate must key off the RAW
         `task_files` list instead, so a deletion/rename still counts.
         """

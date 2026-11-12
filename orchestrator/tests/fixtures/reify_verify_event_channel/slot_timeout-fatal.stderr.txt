@@ -1,0 +1,1 @@
+@@REIFY_SLOT_TIMEOUT@@ reason=test_slot slots=8 waited=1800 disposition=fatal lock=/tmp/reify-test-semaphore.lock

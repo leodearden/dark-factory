@@ -83,7 +83,7 @@ Half of that is now done, and the split is deliberate:
     MEASURED behaviours, so a divergent copy is the expensive kind of
     drift. Its negative-case owner stays HERE (the four-case parametrized
     test at the bottom of this file), mirroring how
-    test_dashboard_service_template.py owns assert_restart_backoff_
+    test_dashboard_unit_restart_policy.py owns assert_restart_backoff_
     effective's guard.
   - ALSO MOVED — `UNIT_DIR` (now `INSTALLED_UNIT_DIR`),
     `_require_installed_unit` (now `require_installed_unit`, parameterized

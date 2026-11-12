@@ -1,0 +1,30 @@
+{
+  "task_id": "5651",
+  "reason": "A1 pre-merge site: I5 drops pre-merge reds via verify_evidence.counts_as_branch_verdict; new lane-importing tests drive the workflow verify emit sites and the four workflow_verify readers",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/disposition.py",
+      "baseline": 53,
+      "current": 56
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/disposition.py::_branch_pre_merge_verify_green",
+      "baseline": 5,
+      "current": 8
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5020,
+      "current": 5023
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6582,
+      "current": 6587
+    }
+  ]
+}

@@ -142,7 +142,7 @@ class TestResolveTerminalKind:
         pytest.param(_create_plan_stub(), id='create_plan-header-only-stub'),
     ])
     def test_no_scorable_plan_and_no_decline_is_none(self, plan):
-        """The plan side consults judge.is_scorable_plan, NOT raw truthiness.
+        """The plan side consults plan_predicates.is_scorable_plan, NOT raw truthiness.
 
         The header-only ``create_plan`` stub is a TRUTHY dict, so a truthiness
         test would score it ``'planned'`` — the exact trap that made ``tainted``
@@ -445,15 +445,14 @@ class TestReadDeclineArtifacts:
             self, eval_artifacts, caplog):
         """A decline read must NEVER raise into ``run_architect_eval``'s
         ``finally``, where it would turn a scored cell into a lost one — so an
-        unreadable artifact costs exactly ONE kind's visibility (the
-        ``runner._verdict_cost_usd`` precedent), not the cell.
+        unreadable artifact costs exactly ONE kind's visibility, not the cell.
         """
         import logging
 
         from orchestrator.evals.metrics import read_decline_artifacts
 
         eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
-        (eval_artifacts.root / 'already_done.json').write_text('{not json')
+        eval_artifacts.artifact_path('already_done.json').write_text('{not json')
 
         with caplog.at_level(logging.WARNING):
             out = read_decline_artifacts(eval_artifacts)
@@ -485,7 +484,7 @@ class TestReadDeclineArtifacts:
         from orchestrator.evals.metrics import read_decline_artifacts
 
         eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
-        (eval_artifacts.root / 'already_done.json').write_text(written)
+        eval_artifacts.artifact_path('already_done.json').write_text(written)
 
         with caplog.at_level(logging.WARNING):
             out = read_decline_artifacts(eval_artifacts)

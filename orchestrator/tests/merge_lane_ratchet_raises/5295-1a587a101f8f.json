@@ -1,0 +1,12 @@
+{
+  "task_id": "5295",
+  "reason": "Net-additive guard, not a refactor that failed: the new test_merge_verify_config_fidelity.py census of OrchestratorConfig reads on the merge-verify path must start its static AST walk from every callable LocalRunner.run_merge_verify is fed, and one of them is merge_lane/gates.py::_run_unscoped_typechecks, the private gate run_merge_verify_on_worktree wires in. Naming it is that file's one private read. The avoidable read added by the env-probe tests (vr._SSH_PROBE_OPTS, already pinned literally by the argv assertion) was cut.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6586,
+      "current": 6587
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+```json
+{"edges_added": ["596->1123", "1133->1126"], "stamped": ["446", "596 (details note)", "446 (details note)"], "cancelled": ["673", "684"], "skipped": [], "released": [{"task": "1133", "commit_planning_result": "1133 deferred -> pending; manifest_stamping path docs/prds/review-all-governed-ledgers-on-one-mixin-and-reader.capability-manifest.yaml, stamped [γ], missing_labels [], errors []"}], "errors": []}
+```

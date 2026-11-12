@@ -14,7 +14,7 @@ reaches into the other's internals.
 Harness patterns are taken wholesale from the existing suite rather than
 hand-rolled — ``call_merge_request`` from ``_merge_tool_calls``, the
 ``captured_req`` background worker from ``test_server_chokepoint.py``, and the
-``scheduler.get_task`` AsyncMock (including its ``scheduler_raises`` fault arm)
+``scheduler.read_task`` AsyncMock (including its ``scheduler_raises`` fault arm)
 from ``test_merge_status_git_authority.py``.  The AsyncMock is also what makes
 the COST contract executable: ``await_count`` / ``assert_not_awaited`` pin that
 the lane fallback never adds a second Taskmaster round-trip to the submit path.
@@ -22,6 +22,8 @@ the lane fallback never adds a second Taskmaster round-trip to the submit path.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import types
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_tool_calls import call_merge_request
+from shared.task_read import TaskFound
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -38,10 +41,11 @@ from escalation.server import create_server
 # ---------------------------------------------------------------------------
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import MergeOutcome
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
-    from orchestrator.merge_types import MergeOutcome  # type: ignore[reportMissingImports]
+    from orchestrator.scheduler import Scheduler
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -88,14 +92,14 @@ def _make_harness(
     scheduler_raises: bool = False,
     no_scheduler: bool = False,
 ) -> types.SimpleNamespace:
-    """Harness with a ``scheduler.get_task`` AsyncMock the tests can interrogate."""
+    """Harness with a ``scheduler.read_task`` AsyncMock the tests can interrogate."""
     harness = types.SimpleNamespace(git_ops=git_ops or _stub_git_ops())
     if not no_scheduler:
         harness.scheduler = types.SimpleNamespace(
-            get_task=(
+            read_task=(
                 AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
                 if scheduler_raises
-                else AsyncMock(return_value={'metadata': metadata or {}})
+                else AsyncMock(return_value=TaskFound({'metadata': metadata or {}}))
             ),
         )
     return harness
@@ -256,7 +260,7 @@ class TestInvalidLaneIsRejectedLoudly:
             lane='higgh',
         )
 
-        harness.scheduler.get_task.assert_not_awaited()
+        harness.scheduler.read_task.assert_not_awaited()
         git_ops.resolve_branch_sha.assert_not_awaited()
 
 
@@ -333,7 +337,7 @@ class TestMetadataReadIsPaidAtMostOnce:
     """The COST contract, made executable (design decision 5).
 
     ``git_authority.task_metadata`` is uncached: every call is a fresh
-    ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+    ``scheduler.read_task`` → Taskmaster MCP dispatch with an internal
     ``timeout=15``.  Without these two tests the memoization is unpinned and a
     later edit can silently reintroduce a second round-trip on the submit path.
     """
@@ -362,7 +366,7 @@ class TestMetadataReadIsPaidAtMostOnce:
             project_root=repo,
         )
 
-    async def test_at_most_one_get_task_when_both_consumers_are_live(
+    async def test_at_most_one_read_task_when_both_consumers_are_live(
         self, tmp_path: Path
     ):
         tip = 'b' * 40
@@ -374,9 +378,9 @@ class TestMetadataReadIsPaidAtMostOnce:
 
         assert captured, 'the degenerate branch should fall through to the queue'
         assert captured[0].lane == 'high'
-        assert harness.scheduler.get_task.await_count <= 1, (
+        assert harness.scheduler.read_task.await_count <= 1, (
             'the degeneracy probe and the lane fallback must share ONE metadata '
-            f'read; got {harness.scheduler.get_task.await_count} awaits'
+            f'read; got {harness.scheduler.read_task.await_count} awaits'
         )
 
     async def test_explicit_lane_pays_no_metadata_read_at_all(self, tmp_path: Path):
@@ -385,7 +389,7 @@ class TestMetadataReadIsPaidAtMostOnce:
         _, captured = await _submit(tmp_path, harness, lane='high')
 
         assert captured and captured[0].lane == 'high'
-        harness.scheduler.get_task.assert_not_awaited()
+        harness.scheduler.read_task.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +435,30 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'default', result
 
+    @pytest.mark.parametrize(
+        ('scheduler_raises', 'no_scheduler'),
+        [(True, False), (False, True)],
+        ids=['scheduler_raises', 'no_scheduler'],
+    )
+    async def test_failed_metadata_read_reports_unavailable_not_default(
+        self, tmp_path: Path, scheduler_raises: bool, no_scheduler: bool
+    ):
+        """A degraded task store must not read as "nothing asked at all".
+
+        The lane still fails open to ``'normal'``; only the provenance differs
+        from ``test_neither_source_reports_the_default``.  A harness with no
+        scheduler at all is the same "could not find out" case as one whose
+        scheduler raises, so a scheduler-less deployment reports
+        ``'unavailable'`` on every submission that passes no ``lane``.
+        """
+        harness = _make_harness(
+            scheduler_raises=scheduler_raises, no_scheduler=no_scheduler
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'unavailable', result
+
     async def test_queued_response_reports_the_lane_as_applied(self, tmp_path: Path):
         """On the dispatched arm the echo IS the effective lane."""
         result = await _submit_nonblocking(
@@ -472,3 +500,93 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane') == 'high', result
         assert result.get('lane_source') == 'argument', result
         assert result.get('lane_applied') is False, result
+
+
+# ---------------------------------------------------------------------------
+# The real orchestrator Scheduler — a fused-memory fault is not "no such task"
+# ---------------------------------------------------------------------------
+
+
+class _GetTaskReplySession:
+    """An ``mcp_session`` double that answers ``get_task`` with one payload.
+
+    Any other tool raises, so a read this composition does not expect fails
+    loudly instead of being answered.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], timeout: float = 30,
+    ) -> dict[str, Any]:
+        if name != 'get_task':
+            raise NotImplementedError(f'unexpected tool call: {name}')
+        return {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'result': {'content': [{'type': 'text', 'text': json.dumps(self._payload)}]},
+        }
+
+
+def _real_scheduler_harness(tmp_path: Path, payload: dict[str, Any]) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        git_ops=_stub_git_ops(),
+        scheduler=Scheduler(
+            OrchestratorConfig(project_root=tmp_path / 'repo'),
+            mcp_session=_GetTaskReplySession(payload),
+        ),
+    )
+
+
+class TestRealSchedulerReadFeedsLaneSource:
+    """Task 8336: drive the production ``Scheduler`` itself, not a stub of it.
+
+    The real ``Scheduler.get_task`` never raises: it answers ``None`` for a
+    fused-memory fault and for absence alike.  So an AsyncMock that raises
+    kept the "could not read" arm looking tested while, in production, every
+    fault read as "no such task" and reported ``lane_source='default'``.
+    """
+
+    async def test_a_fused_memory_error_reply_reports_unavailable(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'fused-memory backend unreachable', 'error_type': 'TaskmasterError'},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'unavailable', result
+
+    async def test_a_fused_memory_error_reply_logs_its_reason_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level(logging.WARNING)
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'fused-memory backend unreachable', 'error_type': 'TaskmasterError'},
+        )
+        await _submit_nonblocking(tmp_path, harness)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len([m for m in warnings if 'TaskmasterError' in m]) == 1, warnings
+        assert any('merge_request' in m and '4888' in m for m in warnings), warnings
+
+    async def test_no_such_task_reports_the_default(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'No tasks found for ID(s): 4888', 'error_type': 'TaskNotFoundError'},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'default', result
+
+    async def test_a_task_row_lane_is_honoured(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path, {'id': '4888', 'status': 'pending', 'metadata': {'merge_lane': 'high'}},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'high', result
+        assert result.get('lane_source') == 'task_metadata', result

@@ -117,27 +117,47 @@ def _aggregate(
 # step-1: load_regime_markers
 # ---------------------------------------------------------------------------
 
+COMMITTED_REGIME_MARKERS = [
+    {'date': '2026-07-15', 'label': 'Starvation threshold raised to 72h', 'tasks': [2631]},
+    {'date': '2026-07-15', 'label': 'Auto-watcher benign closes', 'tasks': [2630]},
+    {'date': '2026-07-15', 'label': 'Verify-scope flip', 'tasks': [2593]},
+]
+
 
 class TestLoadRegimeMarkers:
     """load_regime_markers(path) -> (markers, parse_failures_delta). Never raises."""
 
     def test_default_path_parses_committed_seed_file(self):
-        """The committed dashboard/regime-markers.yaml parses to exactly 3 markers."""
+        """The committed file's regime entries, unchanged; its quality artefact is not one of them."""
         markers, parse_failures_delta = load_regime_markers()
 
         assert parse_failures_delta == 0
-        assert len(markers) == 3
-        for m in markers:
-            assert set(m) == {'date', 'label', 'tasks'}
-            # Must be JSON-serializable: yaml.safe_load parses unquoted
-            # YYYY-MM-DD as a datetime.date, which is NOT JSON-serializable —
-            # the loader must normalize it to a str.
-            assert isinstance(m['date'], str)
-            assert isinstance(m['label'], str)
-            assert isinstance(m['tasks'], list)
+        assert markers == COMMITTED_REGIME_MARKERS
 
-        all_tasks = sorted(t for m in markers for t in m['tasks'])
-        assert all_tasks == [2593, 2630, 2631]
+    def test_only_regime_entries_are_escalation_regime_markers(self, tmp_path):
+        mixed = tmp_path / 'mixed.yaml'
+        mixed.write_text(
+            '- {date: 2026-07-15, label: a regime, tasks: [1]}\n'
+            '- {date: 2026-10-16, until: 2026-10-16, kind: artefact, label: an artefact}\n'
+            '- {date: 2026-11-01, kind: effort, label: an effort change}\n'
+        )
+
+        assert load_regime_markers(mixed) == ([{'date': '2026-07-15', 'label': 'a regime', 'tasks': [1]}], 0)
+
+    def test_a_rejected_entry_is_counted_in_the_delta(self, tmp_path):
+        partly_bad = tmp_path / 'partly-bad.yaml'
+        partly_bad.write_text('- {date: 2026-07-15, label: kept}\n- not a mapping\n')
+
+        assert load_regime_markers(partly_bad) == ([{'date': '2026-07-15', 'label': 'kept', 'tasks': []}], 1)
+
+    def test_the_payload_serves_the_committed_regime_markers(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+
+        result = _analytics([('dark_factory', esc_dir, _make_runs_db(tmp_path, []))], now=now)
+
+        assert result['regime_markers'] == COMMITTED_REGIME_MARKERS
 
     def test_malformed_yaml_returns_empty_and_one_failure(self, tmp_path):
         """Unparseable YAML syntax -> ([], 1), never raises."""
@@ -207,12 +227,26 @@ class TestDoneByDay:
 
         assert result == {'2026-07-10': 2, '2026-07-11': 1}
 
-    def test_missing_db_returns_empty_dict(self, tmp_path):
+    def test_missing_db_is_unreadable(self, tmp_path):
+        """No runs.db is no reading — never {}, which would claim no task completed."""
         from dashboard.data.escalation_analytics import _done_by_day
 
         missing = tmp_path / 'does-not-exist' / 'runs.db'
 
-        assert _done_by_day(missing) == {}
+        assert _done_by_day(missing) is None
+
+    def test_a_failing_query_is_unreadable(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        tableless = tmp_path / 'runs.db'
+        sqlite3.connect(str(tableless)).close()
+
+        assert _done_by_day(tableless) is None
+
+    def test_a_readable_empty_db_is_a_measured_empty_dict(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        assert _done_by_day(_make_runs_db(tmp_path, [])) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +644,9 @@ class TestAggregateProjectLifespan:
         lifespan = entry['lifespan']
 
         promo = lifespan['l1_to_l2_promotion']
-        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+        assert promo == {
+            'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+        }
 
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
@@ -699,6 +735,7 @@ class TestAggregateProjectWorkflow:
         assert by_date[done_only_day]['filings'] == 0
         assert by_date[done_only_day]['done'] == 1
         assert by_date[done_only_day]['ratio'] == 0.0
+        assert workflow['done_counts_read'] is True
 
         # flow_daily: sparse cube over the 5 terminal-with-valid-times
         # records, keyed by (date(resolved_at), source, level, tier, class).
@@ -726,6 +763,24 @@ class TestAggregateProjectWorkflow:
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+    def test_unreadable_runs_db_serves_unmeasured_done_counts(self, tmp_path):
+        """An unread runs.db is not 'no tasks completed': done and ratio are unmeasured."""
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'absent' / 'runs.db', now=now)
+        workflow = entry['workflow']
+
+        assert workflow['done_counts_read'] is False
+        rows = workflow['esc_per_done_daily']
+        assert {row['date']: row['filings'] for row in rows} == expected_filings_by_date
+        assert all(row['done'] is None and row['ratio'] is None for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1635,11 +1690,17 @@ def _terminal(esc_id: str, *, now: datetime, status: str, resolution_class: str 
     }
 
 
+_INFERRED_CLASSES = frozenset({'benign', 'actionable'})
+
+
 def _one_terminal_per_class(esc_dir: Path, now: datetime) -> None:
-    """Stamped moot-terminal-subject and stale-strand, unstamped dismissed and resolved."""
+    """Unstamped dismissed and resolved, plus one stamp per other RESOLUTION_CLASSES member."""
+    stamped = [
+        _terminal(f'esc-{100 + n}-1', now=now, status='dismissed', resolution_class=cls)
+        for n, cls in enumerate(sorted(RESOLUTION_CLASSES - _INFERRED_CLASSES))
+    ]
     for record in (
-        _terminal('esc-1-1', now=now, status='dismissed', resolution_class='moot-terminal-subject'),
-        _terminal('esc-2-1', now=now, status='dismissed', resolution_class='stale-strand'),
+        *stamped,
         _terminal('esc-3-1', now=now, status='dismissed'),
         _terminal('esc-4-1', now=now, status='resolved', action='restart'),
     ):
@@ -1660,7 +1721,7 @@ class TestCompleteResolutionClasses:
         assert set(source['classes']) == set(RESOLUTION_CLASSES)
         for cls in RESOLUTION_CLASSES:
             assert source['classes'][cls] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 4
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES)
         assert source['benign_rate'] == source['classes']['benign'] / source['classified']
         assert 'benign' not in source and 'actionable' not in source
 
@@ -1690,7 +1751,38 @@ class TestCompleteResolutionClasses:
         (source,) = entry['origin']['sources']
 
         assert source['classes']['not-a-class'] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 5
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
+
+
+_ROUTER_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
+
+class TestDispositionedBucket:
+    """origin.sources[].dispositioned counts what the info-L0 router closed
+    (plans/info-l0-disposition-router-prd.md D14), beside the per-class keys."""
+
+    def test_it_counts_the_four_router_classes_and_no_other(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        strand = _terminal('esc-7-1', now=now, status='dismissed', resolution_class='stale-strand')
+        _write_escalation(esc_dir, {**strand, 'agent_role': 'steward'}, archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        sources = {s['source']: s for s in entry['origin']['sources']}
+
+        implementer = sources['implementer']
+        assert implementer['dispositioned'] == 4
+        assert implementer['dispositioned'] == sum(implementer['classes'][c] for c in _ROUTER_CLASSES)
+        assert sources['steward']['dispositioned'] == 0
+        assert set(implementer['classes']) == set(RESOLUTION_CLASSES)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} <= RESOLUTION_CLASSES
+
+    def test_the_bucket_is_drawn_from_the_resolution_vocabulary(self):
+        from dashboard.data.escalation_analytics import DISPOSITIONED_CLASSES
+
+        assert DISPOSITIONED_CLASSES == _ROUTER_CLASSES
+        assert DISPOSITIONED_CLASSES <= RESOLUTION_CLASSES
 
 
 class TestOneTerminalPopulation:
@@ -1710,8 +1802,8 @@ class TestOneTerminalPopulation:
         classified = sum(sum(s['classes'].values()) for s in entry['origin']['sources'])
         action_mix = entry['workflow']['action_mix']
 
-        assert entry['terminal'] == classified == sum(action_mix.values()) == 5
-        assert action_mix == {'restart': 1, 'unspecified': 4}
+        assert entry['terminal'] == classified == sum(action_mix.values()) == len(RESOLUTION_CLASSES) + 1
+        assert action_mix == {'restart': 1, 'unspecified': len(RESOLUTION_CLASSES)}
 
 
 def _write_pending(esc_dir: Path, esc_id: str, *, now: datetime, archived: bool) -> None:
@@ -1769,11 +1861,14 @@ class TestCorpusViewsAndProvenance:
 
         payload = _analytics(projects, now=now)
 
+        read = {entry['project']: entry['workflow']['done_counts_read'] for entry in payload['per_project']}
+        assert read == {'alpha': True, 'beta': True, 'gamma': False}
         done = {
             entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
             for entry in payload['per_project']
+            if entry['workflow']['done_counts_read']
         }
-        assert done == {'alpha': 1, 'beta': 2, 'gamma': 0}
+        assert done == {'alpha': 1, 'beta': 2}
 
     def test_generated_at_is_the_corpus_instant(self, tmp_path):
         now = golden_now()

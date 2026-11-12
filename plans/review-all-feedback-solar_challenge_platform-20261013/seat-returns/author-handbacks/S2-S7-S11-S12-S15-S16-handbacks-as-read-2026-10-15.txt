@@ -1,0 +1,494 @@
+=================== prd:solar_challenge_platform S2 billing-push-lifecycle
+---
+outcome: done
+changed: docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.md and docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.capability-manifest.yaml (both written, NOT committed — author mode only); no tasks filed, no memory written
+action_needed: lead commits the two files, rules the open questions, applies the cross-reference lines below, holds tasks 295 and 1046 as deferred now, and runs S2's decompose (8 leaves, 3 held on S1)
+---
+S2 author pass for review-all-scp-2026-10-14. R2 was not relitigated. Two design questions came up that the brief did not answer, and Leo ruled both in-session (AskUserQuestion):
+
+1. **S2 owns the ledger mechanism and the row's birth; P-Gate builds the gate states on it.** The filed P-Gate PRD tasks 459 (δ0a) and 460 (δ0b) already designed half of R2.
+2. **All three dead states are deleted now.** P-Collect γ (644) re-adds INVOICED and DD_SCHEDULED with its producer.
+
+The PRD is B+H, with a contract (§9) and a two-sided boundary sketch (§10, B1–B14). The sidecar validates against `shared.capability_manifest`. The polarity lint has no rejections, only `absent_overbroad` warnings, because `metadata.files` is not declared until decompose. Not committed, per the brief. Leo then invoked /reflect explicitly, which wrote 13 fused-memory records (decisions, gotchas and the session summary).
+
+## Return block
+- **prd_path:** docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.md
+- **manifest_path:** docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.capability-manifest.yaml
+- **Leaves (8):**
+  - α: push op → billing/push.py.
+  - β1: billing/lifecycle.py (codec, LEGAL, typed reads); dead states gone; recon_status derived. **High.**
+  - β2: run born CALCULATED with its statement; attempt committed before any provider call. **High.** Held on S1.
+  - γ: SkipReason; adopts 295. Held on S1.
+  - δ: unit of work.
+  - ε: PushInput; adopts 301.
+  - ζ: exhaustive scp-bill outcomes; adopts 1046.
+  - η: integration gate. **High.**
+  - Gate 1065 dependencies: β1, β2, η.
+- **open_questions** (only those the brief and rulings cannot answer):
+  1. Hold tasks 295 and 1046 as `deferred` now? Both are dispatchable today against shapes α, β2 and γ rewrite. Suggested: yes.
+  2. Should the monthly close fail on a BREACHED run, to match `scp-bill --account`'s new exit 1 (PRD D13)? Suggested route: P-Gate δ (461), which redefines close success. S2 leaves `FleetBillingSummary`'s verdict alone.
+  3. α depends on S6-θ (1180), per S6's "S2 carries it". If S6 lags, the lead may relax this edge to contention.
+  4. β2 depends on S1-θ, which puts P-Gate 459 behind S1. If P-Gate's own chain (442→445) clears first, the lead may relax it to contention: `record_calculated` is a single call.
+  5. Should fk-43579bc83b3d be stamped on P-Gate μ (476)? S2 files no leaf for it. Does 476 join gate 1065?
+  6. P-Gate θ (466) and S15 overlap on provider mode and lookup-before-create. The lead reconciles them; S2 only names θ as the owner of the duplicate-invoice residual.
+- **seam_dependencies_on_other_streams:**
+  - S3: α depends on 1147 (S3·β3, the `billing_service` constructor with a required `as_of`) and 1151 (S3·ε, `build_bill_graph`/`BillGraph`). The push module never constructs `BillingService`.
+  - S6: α depends on 1180 (S6·θ: one `SettlementSnapshot` per run; sources built over it).
+  - S9: β1 depends on 1100 (S9·γ1: typed `state`/`arrears` on `enum_column`, enums homed in `models/billing_run.py`). The 1098 convention: CHECK-replacing migrations through `chain_head()`.
+  - S1 (not filed): β2, γ and δ are held (`x_seam_wait`) on S1·θ (`run_billing` persist step), ζ3 (billed once at the DB) and κ (required consent seam). γ additionally waits on S1·ζ1 (the `not_supplied`/`no_property` reasons).
+  - S13: γ and δ depend on 493 (S13·γ2: `decide`, `consent_check_failed`, no rollback in `_check_consent`).
+  - Task 221: ε depends on it (the frozen register-evidence hold verdict and its named predicate).
+  - Produces for:
+    - S23·β2 (1117): `lifecycle.recent_runs` and `runs_in_states`.
+    - S15·γ: the codec, `LEGAL` with guarded rows, and `may_push(run, mode)`.
+    - P-Gate 459, 460, 461, 462, 464, 465, 466, 476.
+    - P-Collect 637, 638, 639, 644.
+    - Task 663.
+- **cross_reference_lines** (for the lead to apply to the program doc and task records):
+  - Program row S2: upstream deps become S1, S3, S6, S9, S13 (+ task 221). 8 leaves.
+  - Seam row "billing_run_status row and its state machine": S2 owns `billing/lifecycle.py` (codec, `LEGAL`, `transition`, typed reads) and the row's birth with its statement. P-Gate adds gate states, actor columns and the close record through it. S15 adds `mode` and its guarded re-push row. P-Collect deletes `arrears`, renames `recon_collected` and re-adds INVOICED/DD_SCHEDULED, each through the one codec.
+  - P-Gate 459 (δ0a): `add_dependency 459 → S2·β2`. Re-scope it to APPROVED/ISSUE_REQUESTED, the actor columns and stamps, `close_run_id` + `close_record.py`, the transitional `system:scp-bill` path and `run_billing(close_run)`. Its migration no longer deletes billing rows. Repath its 4 lifecycle delivered_checks, which S2·β1/β2 satisfy, to 459's own delta.
+  - P-Gate 460 (δ0b): `add_dependency 460 → S2·α, S2·β2, S2·ε`. 460 splits `billing/push.py::bill_account` into `calculate_account` + `issue_row`, and `issue_row` uses `push_input`. Repath `bill-account-split-retired` to `src/solar_challenge_platform/billing/push.py`. Its stores-retired check is already satisfied by β1.
+  - P-Gate 461 (δ): the gate closes by deleting `(CALCULATED, RECORD_ATTEMPT|RECORD_PUSH_OUTCOME)` from `LEGAL`. Persisting `SkipReason` moves it to `models/` (S9 D3). `bill_fleet`'s outcome commit joins `UNIT_OF_WORK_MODULES`.
+  - P-Gate 462 (ε): the UNDER_METERED refusal is a `LEGAL` guard.
+  - P-Gate 464 (ζ): `hold_released` rides `PushInput`.
+  - P-Gate 465 (η): `issue_attempts` already exists; η moves RECORD_ATTEMPT to ISSUE_REQUESTED and adds the lease.
+  - P-Gate 466 (θ): owns the duplicate-invoice residual (lookup-before-create).
+  - P-Gate 476 (μ): stamp `fk-43579bc83b3d`.
+  - `docs/prds/billing-approve-issue-gate.md`: dated AMENDED notes at §0.4, §4 D1 and §9.1 pointing to the S2 PRD. This is the reciprocal-ownership fix: P-Gate's header claims "the statement lifecycle on billing_run_status".
+  - P-Collect: 637 → β2 (drop the nullable `arrears` and its CHECK clause); 639 → β1 (rename via the codec); 644 → β2 (re-add INVOICED/DD_SCHEDULED with a CHECK-replacing migration, LEGAL rows and RECON_STATUS_OF entries); 638 serves S23·β2's arrears axis.
+  - Task 663 depends on S2·β1.
+  - S23: 1117 depends on S2·β1. Commit 1117 out of deferred with S2's batch and re-stamp S23's sidecar.
+  - S15: γ depends on S2·β2. `BillingPorts`' stripe/gocardless pair becomes `providers: ProviderPorts`.
+  - S18: S2·α removes 2 `validation → runtime` sites. The entry stays until S12 removes the 4 `runtime.composition` sites.
+  - S16 / task 221: whichever deletes the `no_tariff`/`tariff_not_found` or `import_shape_unavailable` skip also deletes its `SkipReason` member and its §10.2 row.
+  - Briefing (interactive on main, after β2): restate the billing scenarios "statement committed before the push; only the run goes unrecorded" and the run-state list.
+  - S27: S2 owns no INV-1..10. Once 1066 lands, S2's decompose re-walks G7 by slug.
+
+=================== prd:solar_challenge_platform S7 tenant-reach
+---
+outcome: done
+changed: none committed (author mode). Wrote docs/prds/review-all-tenant-reach-has-one-predicate.md and docs/prds/review-all-tenant-reach-has-one-predicate.capability-manifest.yaml (10 tasks, validated by dark-factory shared.capability_manifest). No tasks filed, no program-doc/other-PRD edits, no memory writes (and no /reflect, per the brief).
+action_needed: lead — (1) reconcile the supply-rule home with S1's draft PRD (S7 moves SupplySpan/supply_span/supplied()/OverlappingSupply to models/occupancy.py; S1's draft keeps them in billing/supply_dates.py); (2) rule open questions 1–3 below; (3) apply the cross-reference lines; (4) commit the two files with `git commit --only`.
+---
+
+S7 author pass is complete. R7 is implemented, not relitigated: there is one occupancy rule over the supply window
+at a UTC day, in `models/occupancy.py`. ScopedRepository (one reach table), GateConsentChecker and the optimiser
+resolver/roster use it, and so does the RLS SQL, which is generated from the same table, frozen in a migration and
+bound by a drift test. The GUC is bound in `api/deps.py::tenant_session` on every transaction begin. Unset denies,
+`fleet` is the explicit staff marker, and INV-6 is enforced in leaf ζ.
+
+The Postgres premises were probed on the pinned Timescale image (PG 16.9):
+- deny on unset and on `''`;
+- day-evaluated home reach;
+- garbage raises;
+- the per-session `after_begin` listener re-applies;
+- the connection-level default persists;
+- a standalone-compiled correlated EXISTS triggers "infinite recursion detected in policy", so the generator renders
+  the row as bare columns.
+
+**Paths**
+- PRD: `docs/prds/review-all-tenant-reach-has-one-predicate.md`
+- Manifest: `docs/prds/review-all-tenant-reach-has-one-predicate.capability-manifest.yaml`
+
+**Leaves** (labels α–κ; all medium by key severity; none joins gate 1065 unless the lead rules Q3):
+- α — the module
+- β — Principal and scope sum type
+- γ — reach table and repository
+- δ — tenant_session
+- ε — per-role RoleReach
+- ζ — generated policies, deny by default, INV-6
+- η — consent and optimiser use occupant
+- θ — consent routes
+- ι — CLOSED states its window
+- κ — integration gate
+
+Held leaves are α, ε, η, θ and ι.
+
+**Open questions (the brief and R7 could not answer)**
+1. Non-HTTP fleet reach: the drafter chose a required, connection-level `RoleReach.FLEET` per role instead of a
+   BYPASSRLS login. All roles connect as `scp_app`, and a BYPASSRLS login adds a secret and an apply step for no
+   isolation gain against a compromised scp-api. The synthesis named BYPASSRLS in passing. Lead or Leo may overturn
+   this before ε is filed.
+2. Adding consent_current, consent_events and billing_statements to RLS (fk-2d3a9a905420's proposal). The drafter
+   included them; narrowing to the six moves them to REACH_EXEMPT and changes nothing else.
+3. ζ (and κ) priority. Severity gives medium, but ζ flips the DB to deny for every process. Suggest raising both to
+   high and adding them to gate 1065.
+4. (Carried, a human question) Whether OPERATOR may read consent (task 752). θ keeps today's 403, now with an
+   informative cause.
+5. (From S1, routed "alongside S7") An EXCLUDE gist overlap backstop. S7 does not add one; occupancy raises
+   OverlappingSupply at use.
+
+**Seam dependencies on other streams**
+- **S1** ζ1 + ζ4: `supplied()`, `OverlappingSupply`, `SUPPLY_MOVES`, and admit/roster reading `supply_span`. α and ι
+  are held.
+- **S17** ε: `AccountChange` and `Account.apply_change`. α and ι are held (per the amendment).
+- **S13**:
+  - γ3, GateConsentChecker on `decide` with `check_device(…, at)`: η is held.
+  - β and δ1, the consent router bodies: θ is held.
+- **S3**:
+  - α, `open_role_database`: ε is held.
+  - β2, the broadcaster built in `create_app(graph)`: ε is held.
+  - β1: contention on `api/deps.py`, no edge.
+- **S26**:
+  - α = 1078: needed by α, β and δ.
+  - κ = 517, identity read at `issued_at`: needed by η.
+- **S27** α = 1066: needed by ζ (INV-6 entry).
+- **P-Gate**:
+  - 442, the role set: needed by β and θ.
+  - 445, `audited_session`: needed by δ.
+- **Task 707** (in progress): ζ depends on it and supersedes it.
+- **S16** (reverse): when it drops `accounts.tariff_id`, the tariffs rule changes and S16 lands the regenerated
+  policy migration.
+- **S10**: folds `NO_OCCUPANT`; its per-home try catches `OverlappingSupply`.
+- **S5**: `OverlappingSupply` from the checker is a per-device integrity fault.
+- **S12**: validation engines that connect as the app role use `RoleReach.FLEET`.
+- **S18**: none (the predicate lands in models, stratum 2, and tenancy stays at 4, so the amendment's condition does
+  not trigger).
+
+**Cross-reference lines for the lead**
+- Program row S7, Upstream deps: `S1` → `S1, S3, S13, S17, S26, S27` (plus tasks 442, 445, 707). Wave stays 4.
+- S1: the supply rule's module is `models/occupancy.py` (S7-owned seam row). Strata force it there: consent and
+  tenancy sit at stratum 4 and cannot import billing at 6, and billing imports consent. S7-α moves `SupplySpan`,
+  `supply_window`/`supply_span`, `supplied()` and `OverlappingSupply` there. `window_after`, `next_period_start`,
+  `_SUPPLY_DATES` and `MisstatedSupplyDate` stay in billing. S1's PRD should name the destination, or else state that
+  it homes them interim in `supply_dates.py`.
+- S1: B8's row "CLOSED undated" becomes "CLOSED never supplied (empty window)" once S7-ι lands. S7-ι changes
+  `SUPPLY_MOVES`'s `(PENDING, CLOSED)` row to date an empty window on the closing day.
+- S27 / INV-6: the statement should name "the tenant-scope GUC", not `app.current_customer_id`, which S7-ζ renames to
+  `app.tenant_scope` plus `app.tenant_scope_on`. ζ sets `Status: enforced` with
+  `tests/integration/test_tenant_reach_postgres.py::test_a_connection_with_no_scope_sees_no_tenant_rows`.
+- S3: `open_role_database(script, settings, *, reach: RoleReach)` takes a required reach (S7-ε). `create_app(graph)`
+  builds the ops broadcaster over `fleet_sessions(graph.database.session_factory)`. S3's "34 `Depends(get_session)`
+  sites stay" becomes `Depends(tenant_session)` after S7-δ; only `tenant_session` and `get_auth_provider` depend on
+  `get_session`.
+- P-Gate (445): `audited_session` takes `Depends(tenant_session)`. P-Gate α's adaptation of
+  `TenantScope.from_principal` is superseded by S7-β's `scope_of`.
+- S13: S13 §7's "S7 rebases on β/δ1" is confirmed (θ is held on both). η is held on γ3.
+- S16: when the current-tariff pointer is dropped, the `tariffs` rule in `tenancy/reach.py::TENANT_TABLES` reads the
+  assignment ledger, `account_tariff_assignments` joins `TENANT_TABLES`, and S16's leaf lands the regenerated policy
+  migration (S7's drift test fails otherwise).
+- S10: the one skip-reason enum absorbs `ResolveSkipReason.NO_OCCUPANT` (renamed from `NO_ACTIVE_ACCOUNT` by S7-η).
+- S5: an `OverlappingSupply` raised by `GateConsentChecker` is a per-device integrity fault, not a store blip. D2's
+  "CHECK_FAILED retries the batch" should not wedge the fleet on it.
+- S12: validation engines that connect as the deployed app role open with `RoleReach.FLEET`
+  (`tenancy.rls.install_role_reach`).
+- Shared conventions (new bullet): a new table carrying a customer, account, property, device, statement or segment
+  reference lands with a `TENANT_TABLES` rule (and a regenerated policy migration) or a reasoned `REACH_EXEMPT` entry
+  (`tests/tenancy/test_tenant_table_coverage.py`).
+- Existing tasks at decompose:
+  - 752: cancel with `x_acceptance_reason` naming S7-θ.
+  - 972: stays and depends on S7-η.
+  - 707: stays (in progress); S7-ζ depends on it.
+  - 323: stays with S1.
+
+=================== prd:solar_challenge_platform S11 frontend-shared
+---
+outcome: done
+changed: two new UNCOMMITTED files (author mode, no commit, no tasks filed) — docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.md, docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.capability-manifest.yaml
+action_needed: lead rules on the 4 open questions below, applies the cross-reference lines to the program doc, commits both files with the batch (git commit --only), and later sends the upstream filed ids for the decompose pass
+---
+S11 author pass complete. 12 leaves (α1 α2 β γ δ1 δ2 ε ζ η θ ι κ), B+H with three integration gates: α2 (session seam), γ (read seam), ζ (wire seam, INV-4).
+G3 probes ran in this session: `create_app().openapi()` builds with no database (OpenAPI 3.1, 34 paths, 74 schemas, 17 enum components). tsc 6 and Vite 8 resolve and bundle a workspace package that exports raw .ts through a hoisted symlink.
+Sidecar: it validates with dark-factory's shared.capability_manifest (12 tasks, 68 capabilities). Every grep/path check's polarity was verified against main 363f63c. OPEN bindings are upstream leaves not yet filed.
+High leaves for the trigger-chain gate: α1, α2, γ, δ1, δ2, ζ, θ. θ (RunsPanel fallback tone, the crash in the triage briefing) has no prerequisites and can land early.
+
+## Paths
+- prd_path: docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.md
+- manifest_path: docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.capability-manifest.yaml
+
+## Open questions for the lead (the brief and rulings do not answer these)
+1. **R11's "generated … in both SPA builds".** The PRD (F3) realises it as a committed module, `frontend-shared/src/wire/openapi.gen.ts`, rendered by docsgen from app.openapi(). Pytest checks it is current (`docsgen --check`), and both builds compile against it. There is no Node generation step.
+   - Why: per-task verify has no node_modules (task 382), so a Node-side check would never gate merges. The Docker frontend stage has no Python/app to render from.
+   - Overturn if Leo meant a Node build step.
+2. **Money formatters stay in frontend-portal/src/money.ts** (F7: the console renders no money). Only FIXED_POINT_PATTERN moves, as generated, and PLAIN_DECIMAL is deleted.
+   - S22's PRD cross-PRD row (c) assumed frontend-shared lifts formatPence/roundMoney/formatMoney. No S22 leaf changes.
+   - Confirm.
+3. **Task 382** (install node_modules in per-task verify) stays an owner decision (F22). It is the one lever that makes S11's vitest signals gate merges; after α1 it is one root `npm ci`. Leo may want to rule it with this stream.
+4. **Recommended dependency edges 697 → γ and 605 → γ** (both clone governed-config read lifecycles). These follow Leo's add-the-edge rule, but they delay P-Fleet 605. Lead's call.
+
+## Seam dependencies on other streams (S<n> + contract)
+- S23-α: OpenAPI components for every /api/ops model and OpsSnapshot (panels Panel|None, nested shard, last_window.registry, RunView.period {start,end}). Consumers: ζ, η.
+- S23-β1: compute_snapshot / OpsReadPolicy and the broadcaster's producer. Consumer: η, which adds GET /api/ops/snapshot (response_model=OpsSnapshot) under S23-O1's every-route-declares-a-model test.
+- S17-α (BillBreakdownOut library-derived) and S17-β2 (BatteryConfigOut.spec). Consumer: ζ.
+- S22-ε (public FIXED_POINT_PATTERN) and S22-γ (StatementOut amount_due_minor/collected_minor, formatPence). Consumers: ζ; δ1 also depends on S22-γ.
+- S21-δ (Current-from-GET in ConfigFinanceView/ConfigCoverageView). Consumer: γ.
+- S13-β (purpose-only GrantRequest), S13-δ1 (EffectiveConsentStatus, ConsentStateOut.as_of) and S13-ζ (me → ConsentScreen). Consumers: ζ (β, δ1) and δ2 (β, ζ).
+- S3-β1 (create_app(graph) over a hermetic ApiGraph, as docsgen/served_app builds it). Consumer: ζ.
+- S27-α (INV-4 entry). ζ flips it to enforced. κ removes Appendix A's api/routers/portal.py pointer and its allowlist entry if S27-β has landed.
+- Contended, no edge: S1 (BillingPeriod docstring sentence, ε), S14 (Dockerfile: S11 owns only the frontend-build stage), S6/S7 (portal/reads.py, κ/δ1).
+
+## Cross-reference lines for the lead (program doc)
+- Stream row S11, upstream deps: S23, S17, S13, S22, S21, S3, S27 (adds S22, S21, S3, S27).
+- Shared conventions, new bullet: once S11-ζ lands, any leaf changing an API model or enum runs `python -m solar_challenge_platform.docsgen --write` in the same commit, or the freshness check fails. A hand-written TS union mirroring a Python Enum fails the INV-4 gate, which has no allowlist.
+- Shared conventions, new bullet: frontend code that talks to the server, reads with a load lifecycle, or formats UTC times/ages/periods imports @scp/frontend-shared (session/http/read/format/wire). No SPA-local copies.
+- S27 / invariants table: INV-4's enforcing test = tests/docs/test_ts_unions_equal_python_enums.py (ζ; node id named at implementation).
+- S23: after S11-η the console reads only /api/ops/stream and /api/ops/snapshot. The four per-panel /api/ops routes then have no console consumer: keep them as the documented operator API, or retire them in a later pass.
+- S22: PRD row (c) is superseded by S11 F7 (money.ts stays in the portal). No leaf change.
+- Seam table, row "OpenAPI document": S11 owns generation, the freshness check and INV-4. Schema content stays with each route's owning stream.
+- Triage briefing: fk-6e809699ddc6's crash path is fixed by S11-θ (unheld, lands early).
+- review/briefing.yaml (apply interactively, not as tasks):
+  - portals known_gaps: the console 401 gap closes with α2;
+  - thin-coverage items close with β/γ/δ1/δ2;
+  - after α1 the reinstall hint is a root `npm ci`.
+
+## Decompose-time actions
+- Cancel with x_acceptance_reason:
+  - 939 → α1; 554 → α2; 1049 → γ;
+  - 785 → δ1+δ2 (re-verify item 2: /me/energy reads only supplied days, 2476fda/5ecc31e);
+  - 1043 → δ2; 717 → δ2; 786 and 825 → ζ.
+- Adopt 1047 as ι.
+- Append coordination notes to 428 (AccountScreen) and to pending console-view tasks of P-Gate, P-Fleet (605) and P-Collect (638), saying to build on @scp/frontend-shared.
+- Nothing to file for fk-e5f819d4d63a: task 1017 (c4f37a6) fixed it on main.
+- Held leaves (x_seam_wait if the upstream is unfiled):
+  - ζ on S23-α, S17-α, S17-β2, S22-ε, S22-γ, S13-β, S13-δ1, S3-β1, S27-α;
+  - η on S23-α, S23-β1.
+- Plain dependency edges: γ on S21-δ; δ1 on S22-γ; δ2 on S13-β and S13-ζ.
+
+=================== prd:solar_challenge_platform S12 validation-topology
+---
+outcome: done
+changed: docs/prds/review-all-validation-topology-as-a-value.md, docs/prds/review-all-validation-topology-as-a-value.capability-manifest.yaml (both written, uncommitted, per author-only brief; sidecar validated by shared.capability_manifest: 15 tasks / 35 capabilities)
+action_needed: lead applies the cross-reference lines below to the program doc, rules on open questions Q1–Q5, re-drives tasks 308 and 437 (complete branches, status pending) before S12 decomposes, commits the two files
+---
+S12 author pass done. B+H PRD, 15 leaves (α β γ δ ε1 ε2 ζ η θ ι κ λ μ ν + deterministic ξ), R12 applied, not relitigated. Key structural findings the brief did not carry: (1) task 308's branch already delivers 3 of the 6 run.py partitions + the cycle hoist + a harness strata guard, task 1016 the RED-robust half, task 437 the mosquitto half — S12 builds on all three (D1); (2) task 177 is hollow-done (esc-411-2), so G1 stays held; (3) an empty artifact dir cannot mean "ran" because ArtifactTaskSink.__init__ creates it, so NO_SIGNAL needs a runner-written verdict record (D6), not a branch flip.
+
+**Paths**
+- PRD: `docs/prds/review-all-validation-topology-as-a-value.md`
+- Manifest: `docs/prds/review-all-validation-topology-as-a-value.capability-manifest.yaml`
+
+**Open questions the brief and rulings could not answer (lead / Leo)**
+1. **Golden-account lookup vs S25 α (D5).** validation cannot import S25 α's `runtime/seed.py::golden_fleet_account_id` (runtime sits above validation in S18's strata), so S12 finds the account by `Account.property_id == fleet_shape.home_id(slot)`. S25's accessor is then left with only its test consumer — does S25 keep it or retire it?
+2. **sandbox-weekly HELD (D13).** Recommended HELD ("no sandbox credentials on this workstation") over NO_SIGNAL-every-week. Leo may prefer the weekly NO_SIGNAL L2 as a standing reminder.
+3. **Hold per capstone (D13, fk-1ea710a1b8ad; R12 silent on it).** Chosen: smoke-nightly gains `--dispatch --grid-charging`; new unheld `dispatch-capstone-weekly` (D); G1 alone held; G2 gets no lane (smoke-nightly's golden-compare is the same check). Confirm, plus the new timer's host install (ξ, operator act).
+4. **Core drill set (D9).** Deletes every harness-self-test drill (sleeper, throwaway broker, throttle echo, compressed burst, yo-yo, live burst) and the LATENCY/COMBINATION groups until a platform drill of that kind exists; core = ingest-sigkill-mid-drain + broker-restart-mid-drain, both GATING on exact drain count. Cancels 514 and 708 as subsumed. Confirm that dropping the latency group is acceptable.
+5. **S5 session constructor (D14).** S12·θ needs a public `IngestSession` constructor from Settings that `IngestionService.from_settings` also calls. Ask S5's decompose to include it in S5·δ; otherwise θ adds it in `ingestion/session.py` (S5-owned file).
+
+**Seam dependencies on other streams (S<n> + contract → S12 leaf)**
+- S25 γ (1090): sim `--result-path` → `readings_published`, fail fast on errors → γ. S25 α (1072): `fleet_shape.home_id` → γ.
+- S26 ι (1093): `PG_SESSION_TIMEZONE_OPTION` via `db/session._engine_kwargs` → δ (validation engines open through `open_database`).
+- S27 α (1066): INV-2 entry → β (β flips INV-2 enforced).
+- S22 ε (1079): golden writer on `fixed_point` → μ.
+- S3 α, ε (unfiled): `Database`/`open_database`, `build_bill_graph(settings, database)` → δ.
+- S6 θ, μ (unfiled): pinned-snapshot billing readers, census readout, day-2 drop order → γ; S6 λ, μ: `timeseries.fault_injection` → η.
+- S5 ε (unfiled): ack-after-persist, the no-loss premise of the core drills → ζ; S5 δ: `IngestSession` → θ.
+- S14 α, γ (unfiled): Dockerfile stops citing validation.yml; cadence calendar moved → κ.
+- Existing tasks: 308 → γ; 1016 → β, γ; 437 → ι.
+
+**Cross-reference lines for the lead (program doc amendments / decompose actions)**
+- S18 Q1 realised: S12·δ removes all 7 `validation → runtime` sites (not just the 4 composition ones) — the role passes a `Compose` callable (bill graph + bill operation, fakes bound by the role); δ deletes `_KNOWN_UPWARD_EDGES[("validation","runtime")]`. S2's later `bill_account` move then changes one import in `runtime/roles/validate.py`; S2's leaves should not list validation files for it.
+- S18 D7: the root leaf `solar_challenge_platform/container_images.py` goes in stratum 0 (S12·ι). The `instance → validation` edge disappears.
+- S27: INV-2's enforcing node is `RecordedVerdict.assess` on an empty run dir (α), not `FailureArtifacts.assess` — α deletes FailureArtifacts. Amend S27's Appendix row. S12·ζ/η delete the INV-10 allowlist entries for `drills/live_burst.py` (file deleted) and `drills/dropped_readings.py`.
+- S23 β1: moot if S12·η lands first (η deletes `observe_dispatch_wedge` and its call); no edge.
+- S3 §12: S12 keeps the validation `BillingService(` constructions (live_readers / grid_charging); if S3 β3's required `as_of` lands first, β3 passes it at those sites mechanically.
+- S6 D13: S12 declines `RunGrade` (no consumer once `survival_ok` is removed; D16).
+- S14 §10: `.github/dependabot.yml` is not S12's — R12 names only the two workflows; its finding fk-5d943ec6029d is task 1031.
+- Decompose actions: amend 809 in place into S12·ι (keep fk-2b47ea2764a9; add fk-2614d330cf39, fk-3fbdfe49527a); cancel 514 (→ ζ items 1-2, β item 4, 1016 item 3) and 708 (→ ζ) with x_acceptance_reason; stamp fk-e507cf236576 on 1016 and fk-8e67094cbf75 on 308 (step 2); add edges 471 → ζ and 472 → ζ with dated coordination notes (P-Alert drills build on `OwnTopology` + `run_through`); notes on 411/416 (lane narrowed to G1's node id; 416's validation.yml item moot after κ), 984 (read `lane.targets`; no dormant job needed), 213 (drain lives in simulated_run/pipeline).
+- High leaves → trigger-chain gate: α, β, ε1, ζ, η, ν.
+- Held leaves: any of δ, γ, ζ, η, θ, κ whose upstream (S3, S5, S6, S14) has not filed at S12 decompose, with x_seam_wait.
+- Briefing (apply interactively on main): drills now fault the live platform; NO_SIGNAL semantics; cadence = LANES only (workflows deleted).
+
+=================== prd:solar_challenge_platform S15 provider-mode
+---
+outcome: done
+changed: docs/prds/review-all-provider-mode-as-a-typed-axis.md and docs/prds/review-all-provider-mode-as-a-typed-axis.capability-manifest.yaml written, uncommitted (author pass only; no commit, no tasks, no memory, no edits to the program doc or other PRDs)
+action_needed: lead rules on Q1–Q4 below, applies the cross-reference lines to the program doc, then commits both files (git commit --only) before the S15 decompose pass
+---
+S15 author pass is complete. The manifest validates under `shared.capability_manifest.load_capability_manifest`: 8 leaves, 66 capabilities. Four bindings are OPEN, all held-seam prerequisites on other streams: S3·ε, S24·γ, S9·β/γ1 with S2, and S18·α.
+
+The main freshness finding is that **task 466 (P-Gate·θ, pending) already planned the same axis**: `billing_provider_mode`, `billing/providers/mode.py::providers_for_issue`, `ProviderModeRefused`, credential fields and `gocardless_environment`. The PRD makes S15·α1 the one home and re-scopes 466 onto it (Q2).
+
+Task 637 (P-Collect·α2a) deletes `EventKind`, `handle_event`, `DirectDebit`, `PaymentMatcher` and `ArrearsStateMachine`. So `fk-97dcf1114cc0` and `fk-29ac1fb9951f` route there; ζ keeps one arrears map only until 637 lands. `fk-fc2f2705caa3` routes to 641 and 466.
+
+## Paths
+- PRD: `docs/prds/review-all-provider-mode-as-a-typed-axis.md`
+- Manifest sidecar: `docs/prds/review-all-provider-mode-as-a-typed-axis.capability-manifest.yaml`
+
+## Leaves (8)
+
+| Leaf | Priority | What it does | Held on / prereqs |
+|---|---|---|---|
+| α1 | medium | Axis, Settings fields, inventory rows and `billing/providers/binding.py` | prereqs 444, 1014 |
+| α2 | medium | scp-bill binds the pair in `build_bill_graph` | **held on S3·ε** |
+| β | medium | `provider-mode-not-live` row in `HERMETIC_SWITCHES` | **held on S24·γ** |
+| γ | medium | `BillingRunStatusRow.mode` plus the `ProviderMode.supersedes` finality rule | **held on S2** push read-through and codec; deps S9·β, S9·γ1 |
+| δ | low | Drift lane moves to `ci/billing_drift_lane.py` | prereqs α1, 1014, S18·α; **amend task 1025 in place** |
+| ε | **high** | Typed `ReferenceKey` in `contract.py` plus `billing/provider_keys.py` | none in-batch |
+| ζ | **high** | Fakes use their own prefixes, item-derived totals, one status table, one arrears map | prereqs ε, 1041 |
+| η | low | Companion doc notes | last |
+
+ε and ζ join the trigger-chain gate.
+
+## Open questions for the lead (the brief and rulings cannot answer these)
+
+1. **Q1 — ProviderMode home.** The S9 amendment homes it in `models/billing_run.py`, but S18 places `settings` alone in stratum 0, importing nothing. R15's Settings field typed by the enum would then be an upward `settings → models` edge. The PRD (D2) homes `ProviderMode` in `settings.py`, and `models/billing_run.py` imports it downward; the column still uses `enum_column`. This needs the lead to amend that S9 clause; S9's D3 home rule could gain "or the lowest stratum that types it".
+2. **Q2 — Task 466 re-scope.** Proposed decompose actions:
+   - `add_dependency 466 → S15·α1` and `466 → S15·ε`;
+   - a dated note on 466: no `billing/providers/mode.py`, no `gocardless_environment` (derived from mode), production refuses **sandbox** too per R15 (466's D4 refused only fake), B19's "production + fake" half becomes β's row, the replay case edits `ci/billing_drift_lane.py`, and `find_by_reference_key` takes `ReferenceKey`;
+   - repath or drop 466's delivered_check `providers-for-issue-built`.
+
+   466 keeps replay-safe Stripe, the lookups, the provider-customer record and the issue wiring.
+3. **Q3 — Consequence of R15 with task 815, for Leo's eyes.**
+   - Every rendered instance is `ENVIRONMENT=production`, so its bill role must run `live`. Live needs both secrets now and 467's `CollectionAuthorisation` later.
+   - A deployed sandbox instance is impossible, so 653's sandbox witness runs as a non-production lane.
+   - Today's close both calculates and pushes, so a production close exits 2, calculating nothing, until live is configured or P-Gate δ makes the close calculate-only.
+
+   This is the fail-safe R15 chose; it needs confirming, not redesigning.
+4. **Q4 — Extra dependency edges.** Recommended: 641, 644 and 655 → S15·ε, so P-Collect's attempt and paid-out-of-band keys and P-Correct's revision extend `provider_keys` / `ReferenceKey` instead of adding f-strings. Leo's standing rule favours the edges, but they delay those leaves behind ε.
+
+## Seam dependencies on other streams
+- **S3** — α2 binds `BillGraph.providers` in `build_bill_graph`. S3 §9 already says "S15 adds the provider ports".
+- **S24** — β adds one `HermeticSwitch` row: `provider-mode-not-live`, field `billing_provider_mode`, roles `PROVIDER_ROLES`. S24·ε2's render evaluates it.
+- **S2** — γ needs S2's push idempotency read-through and run-row codec. The read-through returns the existing row unless `providers.mode.supersedes(row.mode)`. If S2's lifecycle never re-selects a POST_PUSH row, S2 adds that transition and the predicate stays S15's.
+- **S9** — γ uses `enum_column` (β) and S9·γ1's typed `models/billing_run.py`. The migration follows the S9 convention and back-fills `'fake'`, which is a verified fact, not a fallback.
+- **S18** — δ moves `ci` from stratum 1 to 7 in `docs/package-strata.toml`, because `ci` now imports `billing` and must stay below `validation`. No allowlist entry.
+- **S12** — contention only on `validation/run.py::query_smoke_summary` and `dropped_readings.py::_bill_or_raise`.
+- **S23** — optional: `RunView` may carry `mode`.
+
+## Cross-reference lines for the lead
+- Program seam row "billing/providers/ binding constructors": the constructors are `billing/providers/binding.py::providers_for / stripe_for / gocardless_for` with `ProviderPorts`, `ProviderCredentials` and `ProviderModeRefused`. This is the `providers_from_env` of C10, renamed because it reads Settings, not env.
+- S9 amendment line "S15's mode-column leaf depends on S9-beta and gamma1 (ProviderMode homed in models/billing_run.py)": amend to "ProviderMode homed in settings.py (S18 stratum 0); models/billing_run.py imports it" (Q1).
+- S3: `BillGraph` gains `providers: ProviderPorts`; S15·α2 is held on S3·ε.
+- S24: `PROVIDER_ROLES` (`instance/topology.py`) is the roles value of the `provider-mode-not-live` row and of the two provider secret rows. S15·β is held on S24·γ.
+- S2: the push takes one `providers: ProviderPorts`, not separate stripe and gocardless arguments, and the codec maps `mode`. S15·γ is held on S2's push module.
+- S18: δ moves `ci` to stratum 7 in the change that moves the lane.
+- Mechanical filings:
+  - **1025:** amend in place into S15·δ and add `fk-060d7b2890a1`.
+  - **1014:** unchanged; δ and α1 depend on it. The replay-idempotency half of `fk-0959d091d763` goes to 466.
+  - **1041:** unchanged; ζ depends on it.
+- Routing stamps:
+  - `fk-97dcf1114cc0` → 637 (plus ζ);
+  - `fk-29ac1fb9951f` → 637 and 641;
+  - `fk-fc2f2705caa3` → 641 and 466.
+- Coordination notes at decompose:
+  - **465:** the issue role joins `PROVIDER_ROLES` and binds via `providers_for`.
+  - **467:** the live check reads `ProviderPorts.mode`; no `mode.py`.
+  - **644 / 641:** keys go through `provider_keys`.
+  - **655:** `ReferenceKey.revision`.
+  - **653:** the witness runs outside production.
+- Triage: after ζ, fake refs start with `fake_`, so a `fake_…` ref seen in a production database is evidence of the pre-β hazard, not a new defect.
+
+=================== prd:solar_challenge_platform S16 tariff-value
+---
+outcome: done
+changed: none committed. Two new untracked files: docs/prds/review-all-tariff-as-a-typed-domain-value.md and docs/prds/review-all-tariff-as-a-typed-domain-value.capability-manifest.yaml (sidecar validated by dark-factory shared.capability_manifest). No tasks filed, no memory written.
+action_needed: lead applies the cross-reference lines below; holds tasks 803 and 811 as deferred now; rules Q1–Q2 (with Q3–Q5 as lead overrides) and the S10 is_tou conflict; commits the two files with the batch.
+---
+S16 AUTHOR pass done in AUTHOR MODE ONLY. Six leaves, B+H (contract §9 plus boundary-test sketch §10). Every key is
+medium, so no leaf is high/critical and none joins the trigger-chain gate. Anchors were verified at main 363f63c.
+The S1, S10 and S12 drafts that appeared mid-session were read, and the seams bind to their labels.
+
+prd_path: docs/prds/review-all-tariff-as-a-typed-domain-value.md
+manifest_path: docs/prds/review-all-tariff-as-a-typed-domain-value.capability-manifest.yaml
+
+Leaves:
+- α: typed terms and the one validity rule (models/tariff_value.py).
+- β: every consumer dispatches on the terms; billing accepts wrap; the optimiser gets the kind.
+- γ: tests build tariff facts through tests/_tariffs.py.
+- δ: assignments become a governed ledger; the account pointer is dropped.
+- ε: rate versions; the /tariffs write surface returns 422s.
+- ζ: DamagedRecord narrows the billing routes' "needs repair".
+
+Design calls beyond R16's text (resolved in the PRD; the lead may overturn):
+- D2: the typed value lives in models/, not billing. S18 strict strata put billing and optimiser in one stratum,
+  with integrations below both.
+- D5: a TOU tariff needs ≥2 distinct rates.
+- D7: both tariff facts take effect at UTC midnight on S21's mixin, and the store API is date-typed.
+- D10: no assignment or version may restate a billed day (409).
+- D11: an opened_on correction to before the first assignment is refused (409).
+
+## Open questions (the brief and rulings cannot answer)
+- Q1 (product, Leo): **correcting an earlier move-in on an unbilled account.** S21's append-only rule cannot add an
+  assignment before the first one. D11 therefore refuses (409) an opened_on correction to before the first
+  assignment, and such an account cannot be fixed from the API. Alternative: a "restate unbilled tariff history"
+  operation, i.e. an insert-only prepend allowed only while the account holds no statement. Default as authored:
+  refuse now, and treat restatement as a follow-up capability.
+- Q2 (G4 conflict, lead): **S10 D12 vs R16/C9.** S10 D12 makes `planner.is_tou(tariff: TariffConfig)`, the
+  rate-count rule, "the one public TOU predicate". R16/C9 make the TouTariff type the one home, and the key
+  fk-c7780f124df0 is S16's. Proposed: S10's is_tou takes TariffTerms with body `isinstance(…, TouTariff)`, or S10
+  drops it for the type match. The second of S10·η and S16·β to land makes it so. No mis-plan in between, because
+  D5 makes the two rules agree on every valid tariff.
+- Q3 (lead may overturn): D10. A back-dated rate version is refused when any account ever assigned that tariff has
+  billed past its effective day.
+- Q4 (lead may overturn): D5. A TOU tariff with a single distinct rate is refused; such a tariff must be entered as
+  FLAT.
+- Q5: per-segment finance needs no ruling. S1·δ adopts task 555, and S16·β depends on S1·δ.
+
+## Seam dependencies on other streams
+- S1·δ (`billing/pricing.py::price_plan` / `PricedSegment` with per-segment FinanceConfig; transitively ε, θ, ζ1)
+  → S16·β.
+- S1·α (`billing/meter_evidence.py` refusal classes) and S1·η (`Statement.from_record` read surface) → S16·ζ.
+- S21·α (EffectiveDatedLedgerMixin), S21·β (EffectiveDatedLedger, in_force_at) and S21·ε (GOVERNED_WRITE_ROLES,
+  append(actor=Principal)) → S16·δ, and through δ → ε.
+- S9·α (widened schema-equivalence test) and S9·ε (chain_head()) → S16·δ.
+- S9·β (enum_column) → S16·ε.
+- S17·δ1 (ColumnBackedBody `__not_columns__`), S17·δ2 (api/writes.py commit_or_refuse/apply_fields) and S17·ε
+  (AccountChange) → S16·δ, and through δ → ε.
+- S22·β (MoneyFinerThanFiled) → S16·ζ.
+- Contention, no edge, second to land adapts:
+  - S10 on optimiser/identity.py, planner.py, runner.py, backtest.py;
+  - S7 on tenancy/repository.py and the RLS policy SQL;
+  - S12 on validation query_smoke_summary;
+  - S2 on api/routers/billing.py;
+  - S26 (soft) for utc helpers.
+- Held leaves at decompose: only those whose upstream stream has not filed. S1 is the likely one, giving
+  x_seam_wait on β and ζ.
+
+## Cross-reference lines for the lead
+- **Actions now:** hold tasks 803 and 811 as deferred. Both are pending and low. 803 would make billing read bands
+  through the library's matches_time in the adapter, which R16 rejects in favour of the typed minute Band. 811 is
+  the partition check built on 803.
+- **Actions for the decompose pass:**
+  - cancel 803 with x_acceptance_reason naming S16·α (typed Band, library-identical convention) and S16·β;
+  - cancel 811 with x_acceptance_reason naming S16·α (BANDS_OVERLAP/BANDS_LEAVE_GAP) and S16·ε (enforced at write).
+- **S1:** its seam row "S16 depends on S1·δ" stands.
+  - fk-9215f3d84973's "the pointer gates billing" clause closes with S16·δ.
+  - S16·β retypes PricedSegment.tariff and to_finance_config's tariff parameter to TariffTerms.
+  - S16·δ removes price_plan's tariff_pointer parameter, its fallback and TariffNotFound/`tariff_not_found`.
+    NoTariff stays, meaning "a supplied day has no tariff in force".
+  - S16·δ replaces segment_period's assignments argument with TariffSpans.
+- **S1/S22:** S16·ζ re-bases MeterEvidenceMismatch, MeterEvidenceIncomplete, AmountDueExceedsTotal,
+  CoverageVerdictIncomplete, RegisterRegressionError and MoneyFinerThanFiled onto models/damaged_record.py::
+  DamagedRecord(ValueError). It names the bare ValueErrors on the documented rebuild paths. `_REFUSALS_NEEDING_REPAIR`
+  becomes `(DamagedRecord,)`. S1's NothingOwed and OverlappingSupply are not damaged records.
+- **S10 (Q2):**
+  - the deletable list's `_is_tou_tariff` is S16's (β);
+  - is_tou retypes to TariffTerms;
+  - ResolvedIdentity.tariff becomes TariffTerms after S16·β;
+  - resolve reads TariffStore.in_force after S16·δ;
+  - INVALID_TARIFF catches StoredTariffInvalid only, and to_finance_config no longer raises for a stored tariff
+    once terms guarantee standing > 0.
+- **S17:**
+  - S16·δ removes tariff_id from AccountChange and AccountUpdate (AccountUpdate gets extra="forbid"), so ζ's B12
+    parity follows.
+  - AccountCreate.tariff_id becomes a declared `__not_columns__` field.
+  - S16·ε registers TariffTerms ↔ FlatTermsIn/TouTermsIn/BandIn in tests/test_wire_shapes_derived.py, declaring
+    the time ↔ minutes divergence.
+  - The /tariffs bodies are rebuilt in ε: TariffUpdate is name-only.
+- **S21:**
+  - GOVERNED_WRITE_ROLES gains TariffVersion → {ADMIN} (ε) and AccountTariffAssignment → {ADMIN} (δ).
+  - S21's out-of-scope line "AccountTariffAssignment adopting the mixin … S16 decides" is decided: yes, with DateTime
+    UTC-midnight instants (D7). S16 does not use D10's Date path.
+  - S21 A3/E4 then cover both models.
+- **S7:**
+  - S16·δ retargets ScopedRepository._reachable_tariff_subq and the tariffs RLS hub to account_tariff_assignments,
+    and deletes Account.tariff_id's add-time FK check.
+  - Invariant 6's tenant-table list gains account_tariff_assignments (δ) and tariff_versions/tariff_version_bands
+    (ε).
+- **S9:**
+  - δ's migration drops accounts.tariff_id, after replacing the tariffs policy on PG, and reshapes
+    account_tariff_assignments.
+  - ε's migration creates tariff_versions with kind on enum_column, plus tariff_version_bands; it drops
+    tariff_periods and the tariffs price columns, then runs DROP TYPE tariff_kind.
+  - TariffKind moves from models/enums.py into models/tariff.py.
+- **S11:** the generated types pick up TariffRead{id,name,current}, TariffDetail, TariffVersionOut and
+  TariffAssignmentOut. ε hand-edits adminTypes.ts and CrmView TariffsTable only to keep the console building.
+- **S12:** query_smoke_summary's standing-charge SQL (`JOIN tariffs t ON a.tariff_id`) is replaced by
+  TariffStore.in_force_for in S16·δ, in whatever module S12's split leaves it.
+- **S18:** models/tariff_value.py and models/damaged_record.py sit in stratum 2 with no allowlist entry.
+- **Task 521:** no edge. After ε, TariffSpan.version_id makes the priced tariff version recordable beside 521's
+  own-use/VAT rates.
+- **Briefing (lead, interactive on main after δ):** review/briefing.yaml's tariff and known-gap lines.
+- **Program row S16 (scope text):** "One tariff constructor in billing" → "in models/tariff_value.py (S18 strata)".
+- **No /reflect run:** this spawn prompt predates the 2026-10-14 "spawned sessions end with /reflect" rule and forbids
+  memory writes. The lead may want to capture the D

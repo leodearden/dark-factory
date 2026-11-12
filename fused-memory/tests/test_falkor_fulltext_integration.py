@@ -29,7 +29,7 @@ would pass vacuously about a third of the time even if the fix were broken, and
 the upstream-baseline test would flake red and get quarantined.  With the barrier
 the same cases were stable 5/5.
 
-The barrier itself lives in ``_fm_helpers.await_index_operational`` (task 3377
+The barrier itself lives in ``_fm_falkor_live.await_index_operational`` (task 3377
 extracted it out of this file so every live-index module shares one
 implementation); ``tests/test_falkor_index_barrier_guard.py`` enforces that this
 module keeps routing through it and never re-forks a local copy.
@@ -44,7 +44,7 @@ import re
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import (
+from _fm_falkor_live import (
     FALKOR_HOST,
     FALKOR_PORT,
     await_index_operational,

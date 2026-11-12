@@ -1,0 +1,29 @@
+# Scheduled memory-eval runner (fused-memory/scripts/memory_eval_runner.py).
+# Every value is an operator declaration and every key is required: the runner
+# has no code defaults (docs/prds/memory-eval-program.md G6).
+
+# The memory project E4 and E6 measure. E1 is not told it: it probes the
+# project set its topic registry was derived from (DEFAULT_PROJECT_IDS in
+# fused-memory/scripts/memory_eval_retrieval_probe.py).
+project_id: dark_factory
+
+# Runs per quarter: the timer fires daily (OnCalendar in
+# scripts/fused-memory-memory-eval.timer, D10). Alpha is derived from this, so
+# it must match that cadence; a scripts/tests parity test enforces it.
+runs_per_quarter: 90
+
+# Upper bound on false alarms per quarter per eval (PRD M2 default).
+false_alarm_budget: 1.0
+
+# Fewest samples before a statistical verdict is meaningful (canary precedent).
+min_samples: 10
+
+# Trailing runs pooled into the baseline: one week at the daily cadence.
+baseline_window: 7
+
+# K: more alarms than this in one run collapse into ONE aggregate escalation.
+# Resolves PRD section 9's open aggregate-K default; tune it from experience.
+storm_alarm_limit: 10
+
+# Wall-clock bound on each producer subprocess, in seconds.
+producer_timeout_secs: 3600

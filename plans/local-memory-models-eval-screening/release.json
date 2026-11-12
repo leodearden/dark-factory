@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "/home/leo/.local/bin/uv",
+    "run",
+    "--no-sync",
+    "--project",
+    "/home/leo/src/dark-factory/shared",
+    "python",
+    "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+    "stop-all"
+  ],
+  "exit_code": 0,
+  "finished_at": "2026-10-07T19:59:08.766767Z",
+  "output_tail": "",
+  "stage": "release",
+  "started_at": "2026-10-07T19:59:08.192775Z"
+}

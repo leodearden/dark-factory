@@ -119,6 +119,18 @@ AFTER:
 ]
 ```
 
+**2026-10-14, task 5845.** EVAL_OUTCOMES and the confusion/per-class order
+now live in `fused-memory/scripts/eval_write_triage_scoring.py`, so
+`eval_outcome_order_is_deterministic` as recorded above greps a file that no
+longer holds that code, and passes vacuously. The live check is item 2 of
+`scripts/check_write_triage_flip_preconditions.sh`, which greps both files. A
+copy of this descriptor must list both paths: for `expect: absent`, every
+listed path must be clean
+(`orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check`). The
+copy stored on task 4762 gates nothing, because its dependents 3169, 4811 and
+5540 are all done (measured 2026-10-14). `report_path_does_not_overwrite_its_own_json`
+is unaffected, because `markdown_sibling` stayed in the CLI.
+
 **Why `kind='script'`, naming that script.** It is byte-for-byte the same
 `script`/`args`/`timeout_secs` as task 3169's own `metadata.before_done`
 predicate. The invariant then has ONE encoding referenced from TWO enforcement

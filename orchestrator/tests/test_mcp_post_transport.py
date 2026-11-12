@@ -314,7 +314,7 @@ def _make_merge_worker(tmp_path, mcp_url: str | None = 'http://memory.test:8002'
     import asyncio
 
     from orchestrator.git_ops import GitOps
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     # project_root must be wired: SpeculativeMergeWorker.__init__ reads it and
     # it is an instance attribute, so a spec-only mock does not carry it (see

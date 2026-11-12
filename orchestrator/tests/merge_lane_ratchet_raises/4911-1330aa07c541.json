@@ -1,0 +1,12 @@
+{
+  "task_id": "4911",
+  "reason": "task_citation_pattern now guards its render: a git.commit_citation_pattern template that str.format cannot fill (an ERE {2} quantifier) or that Python re cannot compile raises CitationPatternInvalid instead of an uncaught IndexError/KeyError. The re.compile guard moved here from find_task_citation_commit_checked (which fell by the same amount), so git_ops.py and the cluster total hold; only this function's key rises.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::task_citation_pattern",
+      "baseline": 2,
+      "current": 3
+    }
+  ]
+}

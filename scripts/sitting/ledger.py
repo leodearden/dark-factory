@@ -27,7 +27,7 @@ from types import MappingProxyType
 from typing import Any
 
 from shared.safe_io import atomic_write_text
-from sitting.inventory import key_str, parse_key, parse_stamp
+from sitting.inventory import QUESTION_KINDS, key_str, parse_key, parse_stamp
 from sitting.preparation import Standing, standing_from_json, standing_to_json
 
 ENTRY_STATES = frozenset({'open', 'standing', 'done'})
@@ -172,11 +172,27 @@ def new_sitting(started_at: str, seed: Ledger | None = None) -> Ledger:
     return Ledger(sitting_id, started_at, carried, seed.next_number)
 
 
-def assign(ledger: Ledger, live_keys: Iterable[str], sort_key: Callable[[str], Any], now: str) -> Ledger:
-    """Number the new live keys in *sort_key* order (key as the final tiebreak); keys no longer live go done."""
+def assign(
+    ledger: Ledger,
+    live_keys: Iterable[str],
+    sort_key: Callable[[str], Any],
+    now: str,
+    *,
+    kinds: frozenset[str] = QUESTION_KINDS,
+) -> Ledger:
+    """Number the new live keys in *sort_key* order (key as the final tiebreak); keys no longer live go done.
+
+    *kinds* scopes the call to one population: only entries of those key kinds
+    can go done, entries of any other kind are carried as they are, and a live
+    key of another kind is refused. Every population draws from the one
+    high-water mark, so no number is issued twice across them.
+    """
     _instant('now', now)
-    live = {_require_key(key) for key in live_keys}
-    entries = {key: _carried(entry, key in live, now) for key, entry in ledger.entries.items()}
+    live = {_require_kind(_require_key(key), kinds) for key in live_keys}
+    entries = {
+        key: _carried(entry, key in live, now) if _kind(key) in kinds else entry
+        for key, entry in ledger.entries.items()
+    }
     next_number = ledger.next_number
     for key in sorted(live - entries.keys(), key=lambda key: (sort_key(key), key)):
         entries[key] = LedgerEntry(number=next_number, state='open', first_presented_at=now)
@@ -209,13 +225,22 @@ def resolve_answers(
     return replace(ledger, entries=entries), ResolvedAnswers(rows, unresolved)
 
 
+def key_for_ref(ledger: Ledger, item_ref: str) -> str | None:
+    """The key an item number, as Leo typed it, names in *ledger*; None when it names none."""
+    ref = item_ref.strip()
+    if not _ITEM_NUMBER_RE.fullmatch(ref):
+        return None
+    number = int(ref)
+    return next((key for key, entry in ledger.entries.items() if entry.number == number), None)
+
+
 def resolution_turns(ledger: Ledger, key: str) -> int:
     return _entry(ledger, key).answer_rounds
 
 
 def sitting_summary(ledger: Ledger) -> SittingSummary:
-    """The trial's sitting-time instrument inputs; standing items are not counted as presented."""
-    entries = list(ledger.entries.values())
+    """The trial's sitting-time instrument inputs; standing items and audits are not counted as presented."""
+    entries = [entry for key, entry in ledger.entries.items() if _kind(key) in QUESTION_KINDS]
     first = [entry.first_answered_at for entry in entries if entry.first_answered_at is not None]
     last = [entry.last_answered_at for entry in entries if entry.last_answered_at is not None]
     return SittingSummary(
@@ -288,8 +313,18 @@ def _require_key(key: object) -> str:
     return key
 
 
+def _require_kind(key: str, kinds: frozenset[str]) -> str:
+    if _kind(key) not in kinds:
+        raise ValueError(f'{key} is not of a kind this assign numbers ({sorted(kinds)})')
+    return key
+
+
+def _kind(key: str) -> str:
+    return parse_key(key)[0]
+
+
 def _record_id(key: str) -> str:
-    """Both key kinds end in the id Leo sees: the escalation id, or the decision id."""
+    """Every key kind ends in the id Leo sees: the escalation id, or the decision id."""
     return parse_key(key)[-1]
 
 

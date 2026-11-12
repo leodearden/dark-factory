@@ -1,0 +1,17 @@
+{
+  "arm_id": "incumbent-openai-20",
+  "arm_role": "control",
+  "axis": "llm",
+  "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "incomplete": false,
+  "measured_at": "2026-10-07T02:12:13.889203Z",
+  "metric": {
+    "kind": "scalar",
+    "metric_id": "tokens-per-episode",
+    "n": 20,
+    "value": 12065.5
+  },
+  "preregistration_sha": null,
+  "schema_version": 1
+}

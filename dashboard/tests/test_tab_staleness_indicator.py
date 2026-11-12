@@ -14,9 +14,10 @@ WHAT IS BEING PINNED. The 2026-08-27 incident ran 19.8h with every tab
 rendering a fully-populated table whose numbers had stopped advancing. The
 decision content lives in `endpoint_staleness.js` (covered by
 `dashboard/tests/js/endpoint_staleness.test.mjs`) and the recorded facts in
-`data.js` (covered by `data_poll.test.mjs`); what neither can see is whether
-`App` actually reads them, renders them, and — the acceptance that matters
-most — renders them ALONGSIDE the tab body rather than in place of it.
+`data.js` (covered by `dashboard/tests/js/data_freshness.test.mjs`); what
+neither can see is whether `App` actually reads them, renders them, and — the
+acceptance that matters most — renders them ALONGSIDE the tab body rather
+than in place of it.
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ def test_app_passes_the_current_tab_and_the_published_stale_map(app_jsx_body: st
     args = call.group(1)
 
     assert re.search(r'\btab\b', args), (
-        f'the call must pass the CURRENT tab id; got: {args!r}'
+        f"the call must pass the CURRENT tab's paths; got: {args!r}"
     )
     assert '__stale' in args, (
         'the call must read the published map DF_DATA.__stale — that is where '
@@ -226,7 +227,7 @@ def test_app_passes_the_tab_the_receipts_and_the_stale_map(app_jsx_body: str) ->
     call = re.search(r'loadingNoticeForTab\(\s*\{(.*?)\}\s*\)', body, re.S)
     assert call, 'App() must call loadingNoticeForTab({...})'
     args = call.group(1)
-    assert re.search(r'\btab\b', args), f'the call must pass the CURRENT tab id; got: {args!r}'
+    assert re.search(r'\btab\b', args), f"the call must pass the CURRENT tab's paths; got: {args!r}"
     assert re.search(r'DD\.__receipt', args), (
         f'the call must read DF_DATA.__receipt, the success-only map; got: {args!r}'
     )

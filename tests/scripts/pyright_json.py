@@ -13,10 +13,8 @@ the run:
 * undecodable stdout surfaced as an ``AssertionError`` carrying stdout and
   stderr, never as a bare ``JSONDecodeError``.
 
-IMPORT ME, DO NOT COPY ME. This was extracted from
-``tests/scripts/test_root_py_type_gate.py::_pyright_report`` (task 5086), which
-still carries that copy until it imports this instead; a fix to one must reach
-the other until then.
+IMPORT ME, DO NOT COPY ME. Extracted by task 5086; every pyright-JSON guard
+under ``tests/scripts/`` imports this.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path``.

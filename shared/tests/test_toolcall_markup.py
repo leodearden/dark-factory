@@ -6,10 +6,8 @@ TDD pair 1 (step 1/2): the SINGLE literal enumeration (INV-5) and ``detect``.
 TDD pair 2 (step 3/4): ``repair`` over the four PRD section 2.1 specimens.
 TDD pair 3 (step 5/6): the refusal boundary and the four C1 invariants.
 
-Task **3689** (contract C2) appends the ``allow_mcp_markup`` override
-lifecycle, promoted here from ``fused_memory.server.markup_tripwire`` so the
-middleware's boundary row B6 preserves today's semantics by REUSING the code
-that defines them rather than re-implementing it (INV-5).
+The ``allow_mcp_markup`` override lifecycle (task 3689, contract C2) is tested
+in ``shared/tests/test_toolcall_markup_override.py``.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
@@ -22,7 +20,7 @@ appears verbatim in the file text. Leave it escaped.
 """
 from __future__ import annotations
 
-import json
+from collections.abc import Callable
 
 import pytest
 
@@ -31,7 +29,6 @@ from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     ENVELOPE_LITERALS,
     INVOKE_CLOSER,
-    MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
     PARAMETER_CLOSER_NAMES,
     PREFILTER_NEEDLES,
@@ -39,9 +36,7 @@ from shared.toolcall_markup import (
     closer_for,
     detect,
     detect_for,
-    markup_override_requested,
     repair,
-    strip_markup_override,
 )
 
 # The two calibrations as they are spelled TODAY at their current owners. These
@@ -1054,7 +1049,9 @@ class TestQuotedReportIsRepairable:
         )
 
     @staticmethod
-    def _sibling_opener_tail(opener, separator: str = _SIBLING_PROSE) -> str:
+    def _sibling_opener_tail(
+        opener: Callable[[str], str], separator: str = _SIBLING_PROSE
+    ) -> str:
         """An ``evidence`` value that QUOTES a whole record, opener included.
 
         The three specimens that turn on a sibling opener differ in exactly two
@@ -1066,8 +1063,8 @@ class TestQuotedReportIsRepairable:
 
         The trailing ``xyz`` closer and the prose after it are LOAD-BEARING and
         must not be tidied away: without them the sibling's text ends the body,
-        the remainder after that closer is empty, an empty remainder parses as
-        an empty recovery, and condition (ii) refuses the whole specimen. Each
+        the remainder after that closer is empty, a blank remainder is an item
+        boundary, so condition (ii) refuses the whole specimen. Each
         of these would then pass for a reason that has nothing to do with the
         opener rule it exists to pin.
         """
@@ -1076,6 +1073,40 @@ class TestQuotedReportIsRepairable:
             + opener('suggested_action')
             + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
         )
+
+    @classmethod
+    def _spanning_opener_value(
+        cls, opener: Callable[[str], str], own_closer: str, sibling_closer: str
+    ) -> str:
+        """An ``evidence`` item hiding an opener that SPANS its own closer.
+
+        The quoted name after ``abc`` never closes inside the value, so the
+        canonical opener pattern's name group runs across *own_closer* and is
+        closed by the BLEND sibling opener's stray quote. An item therefore
+        opens right after the quoted ``foo`` closer although no complete opener
+        lies inside the value, which the opener mirror cannot see. That stray
+        quote is load-bearing. *sibling_closer* is the cell the two
+        alternative_boundary tests vary; *opener* and *own_closer* carry the
+        enclosing dialect, varied separately by ``_ENCLOSING_DIALECTS``.
+        """
+        return (
+            cls._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + opener('evidence')
+            + 'the report quotes ' + _closer('foo') + ' '
+            + CANONICAL_OPENER_PREFIX + '"abc'
+            + own_closer
+            + _blend_opener('suggested_action')
+            + 'refile once the guard is narrowed'
+            + sibling_closer
+            + '\n' + INVOKE_CLOSER
+        )
+
+    _ENCLOSING_DIALECTS = pytest.mark.parametrize(
+        ('opener', 'own_closer'),
+        [(_canonical_opener, _CANONICAL_CLOSER), (_opener, _closer('evidence'))],
+        ids=['canonical', 'echo'],
+    )
 
     def test_the_quoted_report_recovers_both_dropped_siblings(self):
         """THE RED ASSERTION. Returns None today; must return a Repair.
@@ -1129,8 +1160,8 @@ class TestQuotedReportIsRepairable:
         ``rationale`` opens in the CANONICAL dialect but closes with the
         name-echoing ``rationale`` closer, and is followed by an invoke closer
         and then the head of a whole NEXT invoke block ending in an
-        unterminated opener. An ambiguity probe alone does not catch this (the
-        residue does not itself parse as pseudo-parameters), so a narrowing
+        unterminated opener. Condition (ii) alone does not catch this (the
+        residue is not an item boundary), so a narrowing
         that qualified inner closers only on ambiguity — or only on schema
         membership — would ACCEPT it and silently swallow the next tool call's
         fragment into the recovered ``rationale``. That is the
@@ -1139,7 +1170,8 @@ class TestQuotedReportIsRepairable:
 
         An item's OWN closing tag appearing inside its value is a cross-dialect
         mis-close by definition, never prose about itself — which is why the
-        rule may state that condition categorically.
+        rule may state that condition categorically. Since task 5620 the
+        opener mirror refuses this specimen before condition (i) is consulted.
         """
         clean = 'Recording the rationale for the routing change.'
         value = (
@@ -1191,8 +1223,8 @@ class TestQuotedReportIsRepairable:
         Referenced by SHAPE rather than duplicated: this is exactly
         ``TestRepairRefuses::test_doubly_corrupted_tail_is_refused`` — a
         name-echoing ``agent_id`` item closed by the ``details`` closer, where
-        reading that closer as the terminator ALSO yields a valid parse of the
-        remainder. That is the genuine ambiguity B5 was written for ("its
+        nothing follows that closer, so reading it as the terminator is
+        equally valid. That is the genuine ambiguity B5 was written for ("its
         boundary is a guess"), it is NOT quoted prose, and it stays refused.
         Asserted here too so the two halves of the narrowed rule — own-name and
         alternative-boundary — are both pinned inside this class.
@@ -1227,9 +1259,9 @@ class TestQuotedReportIsRepairable:
         ``agent_id`` as ``'claude-interactive'`` + the canonical closer + the
         whole trailing paragraph, reported as ``outcome=repaired`` — so under
         FORWARD_REPAIR a corrupt ``agent_id`` carrying the head of the NEXT
-        tool call went straight into the tool's arguments. Probe (ii) cannot
-        save this: the trailing prose does not itself parse as pseudo-
-        parameters, which is the same argument control (a) makes.
+        tool call went straight into the tool's arguments. (ii) cannot save
+        this: the trailing prose is not an item boundary, which is the same
+        argument control (a) makes.
 
         The fix lists ``parameter`` categorically, independent of the item's
         opener dialect, because ``_parse_body`` treats the canonical closer as
@@ -1272,14 +1304,9 @@ class TestQuotedReportIsRepairable:
         through an OPENER instead of a closer, which is why the opener half is
         stated as categorically as condition (i) states the closer half.
 
-        THE AMBIGUITY PROBE CANNOT REACH THIS, as it stands OR moved. As it
-        stands, (ii) runs from each inner CLOSER, and both remainders here
-        begin mid-prose, so neither parses. Moved to run from each inner OPENER
-        — the other remedy weighed for this task — it still answers "does not
-        parse", because the sibling's own text carries the trailing ``xyz``
-        closer and the probe's depth-1 bound restores the blanket substring
-        refusal for exactly that. Only a rule stated on the opener refuses this
-        shape.
+        CONDITION (ii) CANNOT REACH THIS: it reads only the position after
+        each inner closer, and both remainders here begin mid-prose. Only a
+        rule stated on the opener refuses this shape.
         """
         value = (
             self._CLEAN
@@ -1313,8 +1340,8 @@ class TestQuotedReportIsRepairable:
         (a)/(d) on the closer side, (g)/(h) on the opener side.
 
         The trailing ``xyz`` closer inside the sibling's text is kept for (g)'s
-        reason — so that ONLY the opener rule can refuse this, and the
-        ambiguity probe demonstrably cannot, from either position.
+        reason — so that ONLY the opener rule can refuse this, and condition
+        (ii) cannot.
         """
         value = (
             self._CLEAN
@@ -1327,13 +1354,15 @@ class TestQuotedReportIsRepairable:
 
     # -- the narrowed rule's own BOUNDS -------------------------------------
     #
-    # Three branches decide how far the narrowing does NOT reach: the
-    # malformed-closer fallback, the inner-closer budget, and the probe's depth
-    # bound. Measured with ``pytest --cov=shared.toolcall_markup`` before these
-    # pins existed, all three were UNEXECUTED by the entire suite — so for a
-    # change whose whole subject is loosening a safety guard, the parts that
-    # bound the loosening carried no regression pin at all. Each specimen below
-    # is mutation-verified: deleting the branch it names flips that specimen and
+    # These decide how far the narrowing does NOT reach: the malformed-closer
+    # fallback, the inner-closer budget, and the alternative-boundary controls
+    # (task 5638) for an opener standing just after an inner closer. When task
+    # 4502 measured with ``pytest --cov=shared.toolcall_markup``, the three
+    # branches then bounding it — the first two and a since-removed probe depth
+    # bound — were all UNEXECUTED by the entire suite, so for a change whose
+    # whole subject is loosening a safety guard, the parts that bound the
+    # loosening carried no regression pin at all. Controls (e) and (f) are
+    # mutation-verified: deleting the branch each names flips that specimen and
     # leaves every other test in this file green.
 
     def test_a_malformed_closing_sequence_alone_is_still_refused(self):
@@ -1390,39 +1419,43 @@ class TestQuotedReportIsRepairable:
 
         assert self._repair(value) is None
 
+    @_ENCLOSING_DIALECTS
+    def test_an_opener_at_the_alternative_boundary_is_refused_when_the_remainder_would_not_parse(
+        self, opener, own_closer
+    ):
+        """An item opening just after an inner closer makes that closer a guess.
+
+        Whether the rest of the remainder would parse does not change that, so
+        B5 refuses either way. Here the spanned sibling's value carries its own
+        closer: the shape a depth-limited re-parse read as "does not parse".
+        """
+        value = self._spanning_opener_value(opener, own_closer, _closer('suggested_action'))
+
+        assert self._repair(value) is None
+
+    @_ENCLOSING_DIALECTS
+    def test_an_opener_at_the_alternative_boundary_is_refused_when_the_remainder_parses(
+        self, opener, own_closer
+    ):
+        """The both-ways control for the test above: the spanned parse completes.
+
+        Refused before task 5638 as well, so it pins that the collapse of
+        condition (ii) lost nothing: the tempting "only a blank remainder is a
+        boundary" variant would newly recover this specimen.
+        """
+        value = self._spanning_opener_value(opener, own_closer, '')
+
+        assert self._repair(value) is None
+
     def test_a_sibling_opener_abutting_a_quoted_closer_is_refused_TOO(self):
-        """The narrowing's REACH, re-pinned INVERTED by task **5620**.
+        """The narrowing's REACH: one cell away from control (g), refused like it.
 
-        WAS ``test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE``,
-        and it asserted a RECOVERY of this exact specimen, which is unchanged
-        below. THE OLD READING, correct about the machinery when 4502 wrote it:
-        the probe asks "does the remainder after this inner closer ALSO
-        parse?", at depth 1 it restores the blanket substring refusal, so a
-        remainder that WOULD parse into an item whose own value quotes markup
-        reads as "does not parse", condition (ii) stays silent, and the tail is
-        recovered whole. The mutation it cited was real, and the bound it
-        describes still exists.
-
-        IT WAS ALSO A PIN ON THE DEFECT TASK 5620 REMOVES. This specimen
-        differs from negative control (g) in ONE cell — a single space where
-        that one has a sentence of prose, which is why both are built by
-        ``_sibling_opener_tail`` rather than spelled out. Both regressed
-        identically at 4502 (measured: it refused both before, recovered both
-        after), so no rule can block one and spare the other. What the recovery
-        asserted here actually WAS: ``suggested_action``, a real parameter of
-        this tool, silently not recovered, its text written into ``evidence``
-        instead — the same swallowed-sibling partial repair control (g) refuses.
-
-        SO THE PIN IS INVERTED RATHER THAN DELETED. Its subject — how far the
-        narrowing reaches — is still the thing under test, and this is the
-        decision its own closing sentence demanded: "moving it must be a
-        decision rather than a tidy-up." What changed is only WHICH rule
-        decides the specimen. The depth-1 bound no longer does; the opener rule
-        refuses the value before condition (ii) is consulted, so the old
-        MUTATION-VERIFIED claim — that deleting the ``probe`` short-circuit
-        flips this answer — no longer holds and is deliberately not restated.
-        :func:`shared.toolcall_markup._parse_body` carries the measured
-        consequence for that branch.
+        This specimen differs from negative control (g) in ONE cell — a single
+        space where that one has a sentence of prose, which is why both are
+        built by ``_sibling_opener_tail``. The opener mirror refuses it before
+        condition (ii) is consulted. A recovery would be the swallowed-sibling
+        partial repair (g) refuses: ``suggested_action``, a real parameter of
+        this tool, not recovered, its text written into ``evidence`` instead.
         """
         value = (
             self._CLEAN
@@ -1838,146 +1871,3 @@ class TestNoSilentPartialRepairOfSelfNameMisclose:
         assert result.recovered == {'decision': 'Chose X.'}
         assert detect_for(result.clean_value, 'rationale', self._SCHEMA) is None
         assert_repair_invariants(value, result)
-
-
-class TestMarkupOverrideLifecycle:
-    """The ``allow_mcp_markup`` opt-in, at its new single home (task 3689).
-
-    Promoted from ``fused_memory.server.markup_tripwire``. ``MarkupGuardMiddleware``
-    (contract C2, boundary row B6) must PRESERVE today's markup_tripwire
-    semantics, and a second implementation of the override is precisely the
-    no-lockstep-duplication violation (INV-5) this PRD exists to end — so the
-    middleware calls the code that DEFINES those semantics rather than
-    re-describing them.
-
-    These assertions therefore pin the EXISTING behaviour exactly; nothing here
-    is new contract.
-    """
-
-    def test_the_key_is_unchanged(self):
-        assert MARKUP_OVERRIDE_KEY == 'allow_mcp_markup'
-
-    # -- (b) fail-closed: ONLY a literal boolean True ---------------------
-
-    def test_literal_true_enables_the_override(self):
-        assert markup_override_requested({MARKUP_OVERRIDE_KEY: True}) is True
-
-    @pytest.mark.parametrize(
-        'value',
-        ['yes', 'True', 'true', 1, 1.0, [1], {'a': 1}, 'allow', False, 0, None, ''],
-        ids=repr,
-    )
-    def test_truthy_but_not_true_does_not_enable_it(self, value):
-        """Fail-closed, mirroring add_memory's ``allow_near_duplicate is True``.
-
-        A truthy-but-not-``True`` value is far more likely to be unrelated data
-        than a considered decision to write raw envelope markup — and the
-        failure mode being contained, an accidental serialization leak, never
-        sets an explicit flag at all.
-        """
-        assert markup_override_requested({MARKUP_OVERRIDE_KEY: value}) is False
-
-    def test_an_absent_key_does_not_enable_it(self):
-        assert markup_override_requested({}) is False
-        assert markup_override_requested({'other': True}) is False
-
-    # -- (c) dict OR JSON string, never raising ---------------------------
-
-    def test_accepts_a_json_string(self):
-        assert markup_override_requested('{"allow_mcp_markup": true}') is True
-        assert markup_override_requested('{"allow_mcp_markup": "yes"}') is False
-
-    @pytest.mark.parametrize(
-        'metadata',
-        [
-            None,
-            '',
-            'not json at all',
-            '{"unterminated": ',
-            '[1, 2, 3]',           # valid JSON, not a dict
-            '"a bare string"',     # valid JSON, not a dict
-            '42',
-            42,
-            3.5,
-            True,
-            ['allow_mcp_markup'],
-            # Bare sentinel: an explicit id, because repr(object()) embeds a heap
-            # address that differs per process and makes pytest-xdist abort the
-            # whole suite on a collection-consistency mismatch.
-            pytest.param(object(), id='<bare object()>'),
-        ],
-        ids=repr,
-    )
-    def test_never_raises_and_fails_closed_on_any_other_input(self, metadata):
-        assert markup_override_requested(metadata) is False
-
-    # -- (d) strip is shape-preserving and NON-mutating --------------------
-
-    def test_strips_from_a_dict_returning_a_dict(self):
-        out = strip_markup_override({MARKUP_OVERRIDE_KEY: True, 'keep': 1})
-
-        assert out == {'keep': 1}
-        assert isinstance(out, dict)
-
-    def test_strips_from_a_json_string_returning_a_json_string(self):
-        out = strip_markup_override('{"allow_mcp_markup": true, "keep": 1}')
-
-        assert isinstance(out, str)
-        assert json.loads(out) == {'keep': 1}
-
-    def test_does_not_mutate_the_callers_own_dict(self):
-        """The handler may still need the original; quietly mutating
-        caller-owned metadata is action-at-a-distance this guard must not
-        introduce."""
-        original = {MARKUP_OVERRIDE_KEY: True, 'keep': 1}
-
-        strip_markup_override(original)
-
-        assert original == {MARKUP_OVERRIDE_KEY: True, 'keep': 1}
-
-    def test_stripping_is_the_only_change(self):
-        original = {MARKUP_OVERRIDE_KEY: True, 'a': 1, 'b': [2], 'c': {'d': 3}}
-
-        assert strip_markup_override(original) == {'a': 1, 'b': [2], 'c': {'d': 3}}
-
-    # -- (e) unparseable input passes straight through ---------------------
-
-    @pytest.mark.parametrize(
-        'metadata',
-        [None, '', 'not json at all', '[1, 2, 3]', 42, 3.5],
-        ids=repr,
-    )
-    def test_unparseable_input_passes_through_unchanged(self, metadata):
-        assert strip_markup_override(metadata) == metadata
-
-    def test_a_dict_without_the_key_is_returned_as_is(self):
-        original = {'keep': 1}
-
-        assert strip_markup_override(original) is original
-
-    def test_a_json_string_without_the_key_is_returned_byte_identical(self):
-        """Not merely equivalent: an untouched string must not be re-serialized,
-        or a caller round-tripping metadata would see spurious key reordering."""
-        original = '{"keep": 1,   "other":  2}'
-
-        assert strip_markup_override(original) is original
-
-
-class TestMarkupOverrideReExport:
-    """fused_memory.server.markup_tripwire keeps exposing all three names.
-
-    The re-export contract, in the same shape task 3688 established for
-    ``MCP_MARKUP_PATTERNS``: promote to ``shared``, re-export from the old
-    home, public names unchanged, so ``server/tools.py``'s imports and
-    fused-memory's own suite need no edit.
-
-    Guarded by importorskip so shared's suite stays independent of fused-memory
-    being installed — shared is the base layer and may not require it.
-    """
-
-    def test_the_old_home_still_exposes_all_three_names(self):
-        tripwire = pytest.importorskip('fused_memory.server.markup_tripwire')
-
-        assert tripwire.MARKUP_OVERRIDE_KEY is MARKUP_OVERRIDE_KEY
-        assert tripwire.markup_override_requested is markup_override_requested
-        assert tripwire.strip_markup_override is strip_markup_override

@@ -486,24 +486,28 @@ def test_scheduler_heatmap_iterates_the_bounded_axes(scheduler_heatmap_jsx_body)
 
 
 def test_scheduler_heatmap_discloses_what_it_is_not_showing(scheduler_heatmap_jsx_body):
-    """A truncated grid must say so, naming the totals.
+    """A truncated grid must say so, in the caption the selection composes.
 
     A silently-truncated heatmap is worse than a slow one: an operator reading
-    60 rows has no way to tell whether that is the whole picture or the top
-    2% of it. The affordance reads rowsTotal/modulesTotal — the INPUT sizes —
-    so it stays honest whether the shrinkage came from the contention filter
-    or from the hard cap.
+    60 rows has no way to tell whether that is the whole picture or the top 2%
+    of it. The copy's truth is pinned executably in
+    dashboard/tests/js/scheduler_heatmap_bounds.test.mjs; this probe pins only
+    that the component renders that caption.
     """
+    src = strip_js_comments(scheduler_heatmap_jsx_body)
+    assert re.search(
+        r'const\s*\{[^}]*describeHeatmapCap[^}]*\}\s*=\s*window\.DF_SCHED_HEATMAP_BOUNDS',
+        src,
+    ), (
+        'scheduler_heatmap.jsx must destructure describeHeatmapCap from '
+        'window.DF_SCHED_HEATMAP_BOUNDS at module scope'
+    )
     body = _heatmap_body(scheduler_heatmap_jsx_body)
 
-    assert 'rowsTotal' in body and 'modulesTotal' in body, (
-        'SchedulerHeatmap must render the input totals so a truncated grid '
-        'discloses what it is hiding'
+    assert re.search(r'describeHeatmapCap\s*\(', body), (
+        'SchedulerHeatmap must render the caption describeHeatmapCap composes'
     )
-    assert 'rowsTruncated' in body or 'modulesTruncated' in body, (
-        'the disclosure must be conditioned on the truncation flags rather '
-        'than shown unconditionally'
-    )
+    assert 'sched-heatmap-cap' in body, 'the caption keeps its styled container'
 
 
 def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatmap_jsx_body):
@@ -649,4 +653,50 @@ def test_memoising_the_module_filter_preserved_its_predicate(tab_scheduler_jsx_b
     ), (
         'the strict per-project predicate must survive the memo wrap verbatim, '
         'inside the visibleModules stUseMemo callback'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-4889 #4425: the Scheduler tab reads the new degraded_projects key
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_tab_renders_degraded_projects_distinctly(tab_scheduler_jsx_body):
+    """SchedulerTab must both destructure AND use ``degraded_projects``.
+
+    This layer has no render test by construction — the dashboard has no
+    JS/DOM runner (React/Babel are CDN-only, no build step), which
+    test_chip_label_disambiguation.py's module docstring already records for
+    the six other JSX render sites. A source-structure assertion is therefore
+    the only executable guard against a payload key that reaches the browser
+    and is never read, which is precisely the silent drop this workstream
+    closes one seam earlier.
+
+    Comment-stripped, per this file's convention: that is what keeps this a
+    WIRING assertion rather than a prose pin — a mention in the banner's own
+    explanatory comment cannot satisfy it.
+    """
+    from _dashboard_helpers import destructure_bindings
+
+    body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
+
+    match = re.search(r'const\s*\{(.*?)\}\s*=\s*sched\s*;', body, re.S)
+    assert match, 'SchedulerTab must destructure its fields from `sched`'
+    # Every binding here carries a destructuring DEFAULT (`offline = false`),
+    # which the shared helper keeps attached because it splits aliases on ':',
+    # not defaults on '='.  Dropping the default is this test's own projection
+    # over the shared parse, not a second dialect of it.
+    bound = {
+        canonical.split('=')[0].strip()
+        for canonical, _local in destructure_bindings(match.group(1))
+    }
+    assert 'degraded_projects' in bound, (
+        'SchedulerTab must destructure degraded_projects from sched; bound '
+        f'names were {sorted(bound)}'
+    )
+
+    outside_destructure = body.replace(match.group(0), '')
+    assert outside_destructure.count('degraded_projects') >= 2, (
+        'degraded_projects must be both gated on and rendered, not '
+        'destructured and dropped'
     )

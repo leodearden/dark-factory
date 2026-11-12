@@ -63,9 +63,13 @@ class TestIsBwrapAvailable:
 
 class TestInvokeAgentSandboxFallback:
     @pytest.mark.asyncio
-    async def test_runs_unsandboxed_when_no_backend_available(self, tmp_path):
+    async def test_runs_unsandboxed_when_no_backend_available(self, tmp_path, monkeypatch):
         """When every sandbox backend is unavailable, invoke_agent falls
         through to the shared (unsandboxed) invocation path."""
+        claude = tmp_path / 'claude'
+        claude.write_text('#!/bin/sh\nexit 0\n')
+        claude.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(claude))
         # Root conftest's _restore_sandbox_backend autouse fixture restores
         # the prior backend after this test, so no try/finally needed here.
         from orchestrator.agents import sandbox_dispatch
@@ -86,4 +90,4 @@ class TestInvokeAgentSandboxFallback:
                 sandbox_modules=['mod_a'],
             )
             call_args = mock_exec.call_args[0]
-            assert call_args[0] == 'claude'
+            assert call_args[0] == str(claude)

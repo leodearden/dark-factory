@@ -1,0 +1,266 @@
+prd: plans/review-all-s7-merge-lane-gates-placement-mechanisms-and-target-adapters-prd.md
+schema_version: 1
+signal_leaves: ["ζ", "δ"]
+tasks:
+  - label: "δ"
+    task_id: 9127
+    title: "Delete reify retry narrowing end to end"
+    note: "Closes fk-dd411ada7c29 by deletion (S7-3 = B, an amendment to R11). Deps: S6 α only (same-file order: S6 α lands first on worker.py, shadow.py, types.py, test_merge_shadow.py, test_merge_queue.py and the ratchet baseline, lead 2026-11-10 late; S6 α waits on no S7 leaf). First in S7's chain by the lead sequencing ruling of 2026-11-10 (β depends on δ), so δ does not wait on 7720 (rebase-only on worker.py and the ratchet baseline). S3 ε2 (merge_request move) depends on δ. The fixture run_all-failed-marker.txt moves to fixtures/verify_classify_run_all/ (test_verify_event_channel.py reads it). No edge to 5040 either way (S6-2 = B); the absent checks scan all of orchestrator/src, so they hold wherever 5040 moved the section. Subsumes task 6575; replaces task 6576."
+    capabilities:
+      - name: "retry-flag-and-tool-parameter-removed"
+        binding: "anti-inversion (δ) — retry_failed_only present at bb1c659562 in merge_lane/types.py (2), merge_lane/worker.py (6) and escalation/src/escalation/server.py (3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "retry_failed_only"
+          paths: ["orchestrator/src/", "escalation/src/"]
+          expect: absent
+      - name: "reify-sidecar-producer-removed"
+        binding: "anti-inversion (δ) — worker.py::_REIFY_ATTEMPT_SIDECAR_RELPATH present at bb1c659562 (4 matches); scanned over all of orchestrator/src so a moved spelling (5040's merge_lane/retry_verify_env.py) cannot pass it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_REIFY_ATTEMPT_SIDECAR_RELPATH"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "cross-repo-line-pins-removed"
+        binding: "anti-inversion (δ) — 12 verify.sh:NNNN pins in merge_lane at bb1c659562: 9 in the worker.py producer section, 3 in shadow.py::parse_failed_run_all_members"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify\\.sh:[0-9]"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: absent
+      - name: "retry-scope-event-marker-removed"
+        binding: "anti-inversion (δ) — verify_runner.py::retry_scope_event_fields present at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "retry_scope_event_fields"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "retry-only-shadow-helpers-removed"
+        binding: "anti-inversion (δ) — shadow.py::merge_retry_shadow_baseline, parse_failed_run_all_members and did_not_pass_subset present at bb1c659562, with no caller outside the producer"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def (merge_retry_shadow_baseline|parse_failed_run_all_members|did_not_pass_subset)\\("
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "narrowed-retry-budget-removed"
+        binding: "anti-inversion (δ) — worker.py::MAX_POST_MERGE_VERIFY_NARROWED_RETRIES and _post_merge_verify_narrowed_retries present at bb1c659562 (task 2835's separate budget)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "NARROWED_RETRIES|_post_merge_verify_narrowed_retries"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "narrowing-test-module-removed"
+        binding: "anti-inversion (δ) — orchestrator/tests/test_merge_queue_verify_retry.py (1,828 lines) present at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_merge_queue_verify_retry.py"]
+          expect: absent
+      - name: "warm-shadow-parser-kept"
+        binding: "substrate — passes today and must keep passing: merge_lane/shadow.py::parse_per_test_results, used by the warm and cold shadow on every verify"
+        verdict: PASS
+  - label: "β"
+    task_id: 9133
+    title: "Delete the variable-depth probe and γ2 auto-chain; adjacent placement plus deep chain"
+    note: "Closes fk-7d1580bb3f03 (probe and auto-chain deleted; the deep-chain third dropped under G6 because deep chain is live and kept by S7-1 = A, an amendment to R11). Subsumes task 7384. Deps: δ (chain; lead sequencing ruling 2026-11-10), task 7720 (OQ-CQ7), S6 α (same-file order, S6 α first, lead 2026-11-10 late); reify yaml block via external_deps (OQ-CQ2). S6's remaining worker.py leaves depend on β (OQ-CQ5). No edge to 5040 either way (S6-2 = B). Same-file neighbours without an edge: 8527, 8528, 7721, 7824, 7922."
+    capabilities:
+      - name: "auto-chain-kill-switch-removed"
+        binding: "anti-inversion (β) — AUTO_CHAIN_GENERATIONS_ENABLED present in gates.py (4 matches) and worker.py (1) at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "AUTO_CHAIN_GENERATIONS_ENABLED"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "probe-placement-removed"
+        binding: "anti-inversion (β) — worker.py::ProbePlacement present at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ProbePlacement"
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
+          expect: absent
+      - name: "probe-config-model-removed"
+        binding: "anti-inversion (β) — config.py::SpeculationProbeConfig present at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class SpeculationProbeConfig"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: absent
+      - name: "probe-outcome-window-removed"
+        binding: "anti-inversion (β) — worker.py::_recent_verify_outcomes is probe-only (single feed in _finalize_inflight, single reader _recent_verify_fail_rate; measured at bb1c659562); 7 matches today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_recent_verify_outcomes"
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
+          expect: absent
+      - name: "deep-chain-retained"
+        binding: "substrate — passes today and must keep passing: worker.py::build_chain and _deep_chain_placement present (merge_deep.chain_cap 6 live in dark-factory and reify; kept by S7-1 = A); no mechanical check because a present-today check is vacuous by the polarity rule"
+        verdict: PASS
+      - name: "reify-yaml-key-retired"
+        binding: "external producer — a reify-side change removes speculation_probe: from /home/leo/src/reify/dark-factory-orchestrator.yaml (still present 2026-11-10) before β deploys (OQ-CQ2, ruled by the lead); verified by orchestrator check-config, not a dark-factory tree grep"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "cross-repo yaml state, checked with orchestrator check-config --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
+  - label: "α1"
+    task_id: 9136
+    title: "GateMeasurement, ProbeId, UNMEASURED_POLICY, StormEscalationSink and GateUnmeasuredReporter"
+    note: "Carries fk-88e3c228b649. Deps: β (chain δ → β → α1). Produces C1 and C2 (S6 consumes)."
+    capabilities:
+      - name: "gate-measurement-type"
+        binding: "capability→producer (α1) — merge_lane/gate_measurement.py does not exist at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class Unmeasurable"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gate_measurement.py"]
+          expect: present
+      - name: "probe-vocabulary"
+        binding: "capability→producer (α1) — closed ProbeId enum keying the policy (S7-4, ruled as recommended)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ProbeId"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gate_measurement.py"]
+          expect: present
+      - name: "policy-table-one-home"
+        binding: "capability→producer (α1) — UNMEASURED_POLICY absent from orchestrator/src at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^UNMEASURED_POLICY"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gate_measurement.py"]
+          expect: present
+      - name: "event-type-registered"
+        binding: "capability→producer (α1) — merge_gate_unmeasured absent from event_store.py at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_gate_unmeasured"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "storm-substrate"
+        binding: "substrate — passes today: shared/src/shared/storm_counter.py::StormCounter; escalation/queue.py::EscalationQueue.make_id(key), has_open_l1(task_id, *, category) and submit(escalation) (the three-method StormEscalationSink, OQ-CQ4 ruled by the lead); house pattern merge_lane/landing_evidence.py::file_landing_git_error_storm_escalation"
+        verdict: PASS
+  - label: "α2"
+    task_id: 9139
+    title: "Convert the 12 fail-open returns and the sub-probes they own; gates_unmeasured on merge_attempt"
+    note: "Carries fk-88e3c228b649. Deps: α1."
+    capabilities:
+      - name: "drop-guard-pass-value-returns-removed"
+        binding: "anti-inversion (α2) — 5 'return DropGuardResult()' fail-open returns in gates.py at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "return DropGuardResult\\(\\)"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
+          expect: absent
+      - name: "merge-attempt-carries-unmeasured-gates"
+        binding: "capability→producer (α2) — gates_unmeasured absent from orchestrator/src at bb1c659562 (S7-5, ruled as recommended)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "gates_unmeasured"
+          paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
+          expect: present
+      - name: "event-produced-by-real-git"
+        binding: "INV-13 producer proof — boundary row 1 drives a real --depth 2 clone (^2 resolves, merge-base exits 1; measured by the critic)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a runtime event under a real git fault; judged by the boundary test, not a tree grep"
+  - label: "γ"
+    task_id: 9145
+    title: "Remaining encodings onto GateMeasurement: overlap, rename pair, already-landed, plan-files"
+    note: "Closes fk-689227abfab1; carries fk-88e3c228b649. Deps: α2, S5/C4 (S5 leaf ε, the typed query failure), task 3918. Held on S5/C4 if S5 has not filed at S7 decompose."
+    capabilities:
+      - name: "overlap-sentinel-removed"
+        binding: "anti-inversion (γ) — gates.py::_OVERLAP_GIT_ERROR_SENTINEL present at bb1c659562 (12 matches in gates.py: definition, 5 returns, 1 compare, 5 prose)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_OVERLAP_GIT_ERROR_SENTINEL"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "rename-probe-singleton-removed"
+        binding: "anti-inversion (γ) — gates.py::_RENAME_PROBE_UNMEASURABLE present at bb1c659562 (4 matches)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_RENAME_PROBE_UNMEASURABLE"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "git-query-error-contract"
+        binding: "producer:S5/C4 (S5 draft leaf ε: GitOps read queries raise a typed failure carrying returncode and stderr; git_ops.py::GitQueryFailed from task 7485 is message-only at bb1c659562) — upstream of γ, dependency edge wired at decompose; no check on this block because the capability is S5's, not γ's"
+        verdict: PASS
+      - name: "overlap-unknown-decision-substrate"
+        binding: "substrate — passes today: merge_lane/reverify_gate_decision.py::ReverifyGateReason.overlap_unknown is the recheck path γ settles onto"
+        verdict: PASS
+      - name: "workflow-reaches-lane-reporter"
+        binding: "substrate — passes today: workflow.py::TaskWorkflow holds merge_worker; γ reads merge_worker.gate_reporter (α1)"
+        verdict: PASS
+  - label: "ε"
+    task_id: 9149
+    title: "Resource-audit violations as records fingerprinted on identity, not regex"
+    note: "Closes fk-5d4406afeade (weakened, re-verified under R23). Deps: γ (chain), task 7720 (OQ-CQ7), S6 α (the resource-audit file test_merge_queue_resource_audit.py; S6 α first, lead 2026-11-10 late). Fingerprint fields per OQ-CQ6 (lead; a clarification of R11)."
+    capabilities:
+      - name: "violation-record-type"
+        binding: "capability→producer (ε) — merge_lane/resource_audit.py does not exist at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ResourceAuditViolation"
+          paths: ["orchestrator/src/orchestrator/merge_lane/resource_audit.py"]
+          expect: present
+      - name: "age-figure-regex-removed"
+        binding: "anti-inversion (ε) — worker.py::_RESOURCE_AUDIT_AGE_FIGURE_RE present at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_RESOURCE_AUDIT_AGE_FIGURE_RE"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "snapshot-strings-frozen"
+        binding: "substrate — passes today: snapshot()['resource_audit'] pinned by exact dict equality in orchestrator/tests/test_merge_queue_invariant_integration_gate.py; ε must keep it green"
+        verdict: PASS
+  - label: "ζ"
+    task_id: 9154
+    title: "The merge-gate-unmeasured-typed invariant (INV-17), its guard, and the PRD's integration gate"
+    note: "Enforces fk-88e3c228b649's rule (R11, R22 item 6). Deps: γ, ε, and S10 θ (cross-stream). INV-17 under the lead's revised order (S6 α INV-15, S10 θ INV-16; S10 θ depends on S6 α, ζ on S10 θ); checks anchor on the slug, never the number."
+    capabilities:
+      - name: "invariant-registered"
+        binding: "capability→producer (ζ) — four-site lockstep edit guarded by scripts/tests/test_design_invariants_consistency.py::PINNED_SITES; the slug is absent from design-invariants.md at bb1c659562 (highest invariant INV-14)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge-gate-unmeasured-typed"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "guard-test-module-exists"
+        binding: "capability→producer (ζ) — orchestrator/tests/test_gate_measurement_invariant.py absent at bb1c659562"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_gate_measurement_invariant.py"]
+          expect: present
+      - name: "guard-rejects-seeded-fixtures"
+        binding: "rejection-mechanism (ζ) — the guard's own fixture tests observe each flag firing and the answer-code probe passing (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by the guard's fixture tests, not a grep"
+      - name: "integration-gate-rows"
+        binding: "B+H integration gate — boundary rows 1–15 pass together at ζ's tree"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a test-suite outcome at the landing tree, not a tree property"

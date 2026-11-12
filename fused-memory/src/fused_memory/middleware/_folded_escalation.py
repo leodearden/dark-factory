@@ -31,22 +31,21 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 # The `escalation` workspace package is optional (minimal CI envs, deployments
-# that have not installed it); without it every filer is a logged no-op.
+# that have not installed it); without it every filer is a WARNING-logged no-op.
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
 except ImportError:  # pragma: no cover — exercised only in minimal envs
     HAS_ESCALATION = False
-
-_QUEUE_DIRNAME: str = 'data/escalations'
 
 
 def _suffix(context: str) -> str:
@@ -70,7 +69,6 @@ def file_folded_escalation(
     dedupe: bool = True,
     context: str = '',
     on_fold: Callable[[Any], None] | None = None,
-    no_escalation_level: int = logging.DEBUG,
 ) -> str | None:
     """File one escalation under *anchor_task_id* into *project_root*'s queue.
 
@@ -102,12 +100,14 @@ def file_folded_escalation(
         on_fold: Called with the existing escalation in place of the default
             INFO fold line, so a caller can log the fold on its own logger at
             its own level.  An exception from it is logged, never raised.
-        no_escalation_level: Log level for the package-unavailable arm;
-            defaults to DEBUG.
 
     Returns the escalation id — freshly filed, or the id of the already-open
     escalation under this anchor when one exists — or ``None`` when filing was
     not possible. NEVER raises.
+
+    Without the ``escalation`` package the alarm is LOST, so that arm logs at
+    WARNING for every caller; the rationale lives in
+    ``tests/test_folded_escalation.py::TestTheEmittedLevels``.
     """
     if project_root is None:
         logger.debug(
@@ -117,15 +117,14 @@ def file_folded_escalation(
         return None
 
     if not HAS_ESCALATION:
-        logger.log(
-            no_escalation_level,
+        logger.warning(
             '%s: escalation package unavailable; nothing will be escalated%s',
             log_label, _suffix(context),
         )
         return None
 
     try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+        queue = EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         # Constructing the queue creates its directory; a read-only or missing
         # project_root must not turn an alarm into a crash on a write path.

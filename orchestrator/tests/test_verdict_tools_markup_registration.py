@@ -27,19 +27,29 @@ TWO CONSTRAINTS THIS FILE ENCODES, both measured:
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import main_checkout_with_lane
 from _markup_helpers import LT, closer, type_alternatives
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
+from shared.project_layout import escalation_queue_dir
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, verdict_tools
+from orchestrator.mcp import markup_journal, markup_sink, verdict_tools
 from orchestrator.mcp.verdict_tools import _SINGLETON_ROLE_TOOLS, create_server
 
 # ---------------------------------------------------------------------------
@@ -143,6 +153,28 @@ def journal_lines(root: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+def queue_under(root: Path) -> EscalationQueue:
+    """The real queue a sink steered at *root* files into."""
+    return EscalationQueue(escalation_queue_dir(root))
+
+
+def queued_residue(root: Path) -> list[Any]:
+    """Every pending residue record a sink steered at *root* queued."""
+    return queue_under(root).get_by_task(
+        verdict_tools.MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
+    )
+
+
+def rooted_at(root: Path | None) -> Callable[[Path], Path | None]:
+    """A project-root resolver that answers *root* for every worktree.
+
+    Passed to ``create_server``, it points BOTH injected channels — escalation
+    sink and fact journal — at *root*; ``None`` makes the root unresolvable, so
+    the queue is unreachable.
+    """
+    return lambda worktree: root
+
+
 # ---------------------------------------------------------------------------
 # The B14 signal: a REQUIRED list-typed parameter, absorbed and restored.
 # ---------------------------------------------------------------------------
@@ -167,7 +199,13 @@ def seed_plan(artifacts: TaskArtifacts) -> None:
     })
 
 
-async def repaired_call(artifacts: TaskArtifacts):
+async def repaired_call(
+    artifacts: TaskArtifacts,
+    *,
+    resolve_project_root: Callable[[Path], Path | None] = (
+        markup_sink.resolve_project_root
+    ),
+):
     """Drive the ``ISSUES_SPECIMEN`` leak through the REAL server, repaired.
 
     Module level rather than a method because two suites need it: the B14
@@ -181,7 +219,9 @@ async def repaired_call(artifacts: TaskArtifacts):
     # three, which is exactly what the specimen's own `supplied` records.
     assert sorted(record['supplied']) == ['reviewer', 'summary', 'verdict']
 
-    server = create_server(artifacts, REVIEWER_ROLE)
+    server = create_server(
+        artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+    )
     async with Client(server) as client:
         return await client.call_tool('submit_review_verdict', {
             'reviewer': REVIEWER_ROLE,
@@ -440,6 +480,42 @@ class TestCorpusReplayAgainstRealServer:
 UNREPAIRABLE_SPECIMEN = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
 
 
+def unrepairable_value() -> str:
+    """The ``UNREPAIRABLE_SPECIMEN`` payload, its outcome asserted rather than assumed."""
+    record = specimen(UNREPAIRABLE_SPECIMEN)
+    assert record['expected_outcome'] == 'unrepairable'
+    assert record['expected_recovered'] == []
+    return record['value']
+
+
+async def refused_call(
+    artifacts: TaskArtifacts,
+    *,
+    resolve_project_root: Callable[[Path], Path | None] = (
+        markup_sink.resolve_project_root
+    ),
+) -> dict[str, Any]:
+    """Drive the specimen as ``submit_review_verdict.summary`` through the REAL
+    server, and return the refusal's payload.
+
+    Module level for the same reason as ``repaired_call``: two suites need it,
+    the refusal rows below and the resolver rows, which want the one outcome
+    where both injected channels fire.
+    """
+    server = create_server(
+        artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+    )
+    async with Client(server) as client:
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'ISSUES_FOUND',
+                'issues': [],
+                'summary': unrepairable_value(),
+            })
+    return json.loads(str(excinfo.value))
+
+
 class TestUnrepairableResidueIsPreserved:
     """A refusal on THIS server must not destroy the payload it refuses.
 
@@ -453,30 +529,6 @@ class TestUnrepairableResidueIsPreserved:
     the caller is nonetheless told its payload is safely stored.
     """
 
-    @staticmethod
-    def _value() -> str:
-        record = specimen(UNREPAIRABLE_SPECIMEN)
-        assert record['expected_outcome'] == 'unrepairable'
-        assert record['expected_recovered'] == []
-        return record['value']
-
-    async def _refuse(self, artifacts: TaskArtifacts) -> dict[str, Any]:
-        """Drive the specimen as ``submit_review_verdict.summary``."""
-        server = create_server(artifacts, REVIEWER_ROLE)
-        async with Client(server) as client:
-            with pytest.raises(ToolError) as excinfo:
-                await client.call_tool('submit_review_verdict', {
-                    'reviewer': REVIEWER_ROLE,
-                    'verdict': 'ISSUES_FOUND',
-                    'issues': [],
-                    'summary': self._value(),
-                })
-        return json.loads(str(excinfo.value))
-
-    @staticmethod
-    def _residue_files(artifacts: TaskArtifacts) -> list[Path]:
-        return sorted(artifacts.root.glob('markup_residue-*.json'))
-
     @pytest.mark.asyncio
     async def test_the_call_is_refused(self, artifacts: TaskArtifacts):
         """(a) The boundary is a GUESS, so nothing is forwarded.
@@ -484,7 +536,7 @@ class TestUnrepairableResidueIsPreserved:
         Also the self-verifying half of the cross-tool specimen reuse: the
         observed outcome is asserted, not assumed.
         """
-        payload = await self._refuse(artifacts)
+        payload = await refused_call(artifacts)
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['outcome'] == 'unrepairable'
@@ -497,61 +549,99 @@ class TestUnrepairableResidueIsPreserved:
         """(b) The tool body never ran, so no half-written verdict envelope
         carrying the corrupted ``summary`` exists. Mirrors the escalation
         suite's ``test_nothing_partial_was_written_for_the_caller``."""
-        await self._refuse(artifacts)
+        await refused_call(artifacts)
 
         assert artifacts.read_verdict(REVIEWER_ROLE) is None
 
     @pytest.mark.asyncio
-    async def test_the_residue_survives_in_full(self, artifacts: TaskArtifacts):
+    async def test_the_residue_survives_in_full(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
         """(c) "The entire issues payload destroyed with no surviving copy
         anywhere on disk" — made FALSE.
 
         Verbatim and entire, deliberately unlike ``build_markup_block``'s
         200-char excerpt: this is the only surviving copy.
         """
-        value = self._value()
-        await self._refuse(artifacts)
+        value = unrepairable_value()
+        assert len(value) == 3525
 
-        files = self._residue_files(artifacts)
-        assert len(files) == 1, f'expected exactly one residue file, got {files!r}'
-        stored = json.loads(files[0].read_text())
-        assert stored['raw_value'] == value
-        assert len(stored['raw_value']) == len(value) == 3525
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        queued = queued_residue(tmp_path)
+        assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
+        assert value in queued[0].detail
 
     @pytest.mark.asyncio
-    async def test_the_refusal_names_the_residue(self, artifacts: TaskArtifacts):
+    async def test_the_refusal_names_the_residue(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
         """(d) A bounced reviewer must be able to point an operator at its own
         preserved data — an id it cannot look up is no better than none."""
-        payload = await self._refuse(artifacts)
 
-        assert isinstance(payload['escalation_id'], str)
-        assert (artifacts.root / payload['escalation_id']).is_file()
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        filed = queue_under(tmp_path).get(payload['escalation_id'])
+        assert filed is not None
+        assert filed.task_id == 'verdict-tools-markup-residue'
 
     @pytest.mark.asyncio
     async def test_the_residue_carries_its_routing_fields(
-        self, artifacts: TaskArtifacts
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
         the flat fields locating the leak."""
-        await self._refuse(artifacts)
 
-        stored = json.loads(self._residue_files(artifacts)[0].read_text())
-        assert stored['category'] == 'mcp_markup_residue'
-        assert stored['owner'] == 'l2-escalation-watcher'
-        assert stored['level'] == 2
-        assert stored['tool'] == 'submit_review_verdict'
-        assert stored['field'] == 'summary'
-        assert stored['matched_pattern']
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        (filed,) = queued_residue(tmp_path)
+        assert filed.category == 'mcp_markup_residue'
+        assert filed.level == 2
+        assert "owner='l2-escalation-watcher'" in filed.detail
+        assert "tool='submit_review_verdict'" in filed.detail
+        assert "field='summary'" in filed.detail
+
+    @pytest.mark.asyncio
+    async def test_the_refused_record_states_its_refusal(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The guard row for the kind dispatch: a REFUSED call's record keeps
+        saying what the refusal cost, and never that the call was forwarded."""
+
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        (filed,) = queued_residue(tmp_path)
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence in filed.detail
+        assert 'FORWARDED' not in filed.detail
 
     @pytest.mark.asyncio
     async def test_the_hint_makes_the_preservation_claim(
-        self, artifacts: TaskArtifacts
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
-        """(f) On this server preservation now ACTUALLY happened, so the
+        """(f) On this server preservation ACTUALLY happened, so the
         preserved variant of the hint is the true one."""
-        payload = await self._refuse(artifacts)
+
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert 'preserved verbatim' in payload['hint']
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_queue_leaves_nothing_in_the_worktree_and_says_so(
+        self, artifacts: TaskArtifacts
+    ):
+        """(f, floor) Queue or nothing — no worktree-local copy to strand.
+
+        A file under the lane dies at ``git worktree remove --force`` and
+        nothing reads it, yet its bare filename is a ``str`` id to the
+        middleware and so bought the caller a preservation claim that was
+        false. The caller still holds the payload, and must be told to keep it.
+        """
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(None))
+
+        assert payload['escalation_id'] is None
+        assert 'nothing was preserved' in payload['hint'].lower()
+        assert 'preserved verbatim' not in payload['hint']
+        assert sorted(artifacts.lane_root.glob('markup_residue-*')) == []
 
     @pytest.mark.asyncio
     async def test_the_hint_tells_the_truth_when_nothing_could_be_written(
@@ -560,9 +650,9 @@ class TestUnrepairableResidueIsPreserved:
         """(f, negative) The guarantee is "the prose matches the id", NOT "the
         prose is always optimistic".
 
-        With the artifacts root removed the residue write cannot land, and the
-        caller must be told so rather than sent after a file that never
-        existed.
+        With the worktree removed its project root cannot be resolved, so
+        nothing is queued, and the caller must be told so rather than sent
+        after a record that never existed.
         """
         import shutil
 
@@ -572,7 +662,7 @@ class TestUnrepairableResidueIsPreserved:
         gone.init('test-1', 'Test task', 'A test')
         shutil.rmtree(worktree)
 
-        payload = await self._refuse(gone)
+        payload = await refused_call(gone)
 
         assert payload['escalation_id'] is None
         assert 'preserved verbatim' not in payload['hint']
@@ -580,7 +670,7 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_fact_still_fires(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(g) INV-2: EVERY outcome emits ``markup_detected``, including this
         one. A refusal that emitted no fact would be invisible to the storm
@@ -594,7 +684,7 @@ class TestUnrepairableResidueIsPreserved:
         not: the fact must still fire on the outcome nothing else records
         per-event.
 
-        Patching ``_markup_project_root`` steers the escalation sink to
+        The resolver passed to ``create_server`` steers the escalation sink to
         ``tmp_path`` as well, so this row's residue filing opens a real
         ``EscalationQueue`` under the temp tree. That is hermetic, and it is
         what makes this the ONE outcome where BOTH channels fire — so it is
@@ -603,16 +693,12 @@ class TestUnrepairableResidueIsPreserved:
         rather than a copy per channel, on the stated grounds that a guard
         whose escalation and whose journal disagree about who leaked is worse
         than either alone; the two assertions at the bottom are what would
-        catch that disagreement. The residue FLOOR (what happens when the queue
-        cannot be opened at all) stays the business of the UNPATCHED rows
-        above.
+        catch that disagreement. What happens when the queue cannot be reached
+        at all is the business of the (f, floor) row above.
         """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
         seed_plan(artifacts)
 
-        await self._refuse(artifacts)
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         facts = journal_lines(tmp_path)
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
@@ -790,7 +876,7 @@ class TestTheDeliberateQuotingOverrideOnThisServer:
 
     @staticmethod
     def _envelope_path(artifacts: TaskArtifacts) -> Path:
-        return artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json'
+        return artifacts.artifact_path('verdicts') / f'{REVIEWER_ROLE}.json'
 
     @pytest.mark.asyncio
     async def test_the_quoted_summary_lands_verbatim(self, artifacts: TaskArtifacts):
@@ -886,11 +972,20 @@ class TestTheWidenedRepairVocabularyStaysContained:
     """
 
     @staticmethod
-    async def _submit(artifacts: TaskArtifacts):
-        server = create_server(artifacts, REVIEWER_ROLE)
+    async def _submit(
+        artifacts: TaskArtifacts,
+        reviewer: str = REVIEWER_ROLE,
+        *,
+        resolve_project_root: Callable[[Path], Path | None] = (
+            markup_sink.resolve_project_root
+        ),
+    ):
+        server = create_server(
+            artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+        )
         async with Client(server) as client:
             return await client.call_tool('submit_review_verdict', {
-                'reviewer': REVIEWER_ROLE,
+                'reviewer': reviewer,
                 'verdict': 'PASS',
                 'issues': [],
                 'summary': METADATA_TAIL_SUMMARY,
@@ -911,7 +1006,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
         """Over the whole document: the envelope nests the payload."""
         await self._submit(artifacts)
 
-        text = (artifacts.root / 'verdicts' / f'{REVIEWER_ROLE}.json').read_text('utf-8')
+        text = (artifacts.artifact_path('verdicts') / f'{REVIEWER_ROLE}.json').read_text('utf-8')
         assert 'metadata' not in text
         assert 'swallowed tail' not in text
 
@@ -930,16 +1025,93 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_the_dropped_value_survives_in_the_residue_channel(
-        self, artifacts: TaskArtifacts
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """Nothing is guessed AND nothing is destroyed — the C2 pair."""
-        await self._submit(artifacts)
 
-        files = sorted(artifacts.root.glob('markup_residue-*.json'))
-        assert len(files) == 1, f'expected one residue file, got {files!r}'
-        stored = json.loads(files[0].read_text())
-        assert stored['field'] == 'metadata'
-        assert stored['raw_value'] == 'swallowed tail'
+        await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        queued = queued_residue(tmp_path)
+        assert len(queued) == 1, f'expected one residue record, got {queued!r}'
+        assert "field='metadata'" in queued[0].detail
+        assert 'swallowed tail' in queued[0].detail
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_slice_files_with_no_sink_warning(
+        self, artifacts: TaskArtifacts, tmp_path: Path, caplog
+    ):
+        """The dropped-slice kind is one the sink KNOWS, so it must not be
+        filed under the "unrecognised record kind" warning.
+
+        Keyed on the logger and the level rather than on the warning's
+        wording, so rewording that warning cannot make this row pass
+        vacuously. The queued record is the precondition that proves the
+        sink really ran on this path.
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
+            await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        queued = queued_residue(tmp_path)
+        assert len(queued) == 1, f'expected one residue record, got {queued!r}'
+        assert "field='metadata'" in queued[0].detail
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno >= logging.WARNING
+        ]
+        assert warnings == [], (
+            f'the sink warned while filing a kind it knows: {warnings!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_slice_record_does_not_claim_a_refusal(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """This call was FORWARDED and its verdict landed
+        (``test_the_call_still_lands``), so the record must not say the call
+        was refused or that no verdict was written."""
+
+        await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
+
+        (residue,) = queued_residue(tmp_path)
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
+        assert 'FORWARDED' in residue.detail
+        assert 'swallowed tail' in residue.detail
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_slice_record_claims_no_landing_it_cannot_see(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The slice is filed BEFORE the call is forwarded, so the sink cannot
+        know whether the call then succeeds. Here it does not: the tool rejects
+        the mismatched reviewer and writes nothing, after the record was filed,
+        so the record must not say the call landed."""
+
+        result = await self._submit(
+            artifacts,
+            reviewer=f'not_{REVIEWER_ROLE}',
+            resolve_project_root=rooted_at(tmp_path),
+        )
+
+        assert result.data['status'] == 'error'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is None
+        (residue,) = queued_residue(tmp_path)
+        assert 'landed' not in residue.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
+        self, artifacts: TaskArtifacts
+    ):
+        """Queue or nothing on the FORWARD tier too: the call still lands, and
+        the dropped slice is reported as preserved nowhere rather than under a
+        worktree-local filename that dies with the lane."""
+
+        result = await self._submit(artifacts, resolve_project_root=rooted_at(None))
+
+        assert result.data['status'] == 'ok'
+        assert result.meta is not None
+        assert result.meta['markup_repair']['unrecovered_residue_id'] is None
+        assert sorted(artifacts.lane_root.glob('markup_residue-*')) == []
 
 
 # ---------------------------------------------------------------------------
@@ -947,30 +1119,84 @@ class TestTheWidenedRepairVocabularyStaysContained:
 # ---------------------------------------------------------------------------
 
 
+class _RefusingQueue:
+    """A queue that opens, but whose ``submit`` fails as a full disk would."""
+
+    def make_id(self, anchor: str) -> str:
+        return f'esc-{anchor}-1'
+
+    def submit(self, esc: Any) -> str:
+        raise OSError('No space left on device')
+
+
+class _RecordingQueue:
+    """A queue that takes every record and keeps it for the row to read."""
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+
+    def make_id(self, anchor: str) -> str:
+        return f'esc-{anchor}-1'
+
+    def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
+        return []
+
+    def submit(self, esc: Any) -> str:
+        self.submitted.append(esc)
+        return esc.id
+
+
+#: A record kind today's middleware does not emit. There is, by construction,
+#: no way to make today's middleware emit tomorrow's record, so rows using it
+#: drive the sink directly.
+UNKNOWN_KIND = 'mcp_markup_some_future_kind'
+
+
+async def file_an_unknown_kind(root: Path) -> _RecordingQueue:
+    """Send one ``UNKNOWN_KIND`` record straight at a verdict-tools sink and
+    return the queue it filed into."""
+    queue = _RecordingQueue()
+    sink = markup_sink.make_escalation_sink(
+        worktree=root,
+        spec=verdict_tools.MARKUP_SINK_SPEC,
+        subject_task_id=lambda: '6083',
+        resolve_root=lambda worktree: root,
+        open_channel=lambda project_root: (Escalation, queue),
+    )
+    await sink({
+        'error_type': UNKNOWN_KIND,
+        'tool': 'submit_review_verdict',
+        'field': 'issues',
+        'raw_value': 'THE ONLY SURVIVING COPY',
+    })
+    return queue
+
+
 class TestVerdictToolsResidueChannelIsShared:
     """The sink files into the real escalation queue, not a doomed worktree file.
 
-    The first cut of this leaf wired ``escalation_sink`` straight to
-    ``TaskArtifacts.write_markup_residue``, which lands under the task
-    worktree — a root the orchestrator destroys with
+    The first cut of this leaf wired ``escalation_sink`` straight to a
+    ``markup_residue-<n>.json`` writer under the task worktree — a root the
+    orchestrator destroys with
     ``git worktree remove --force`` at teardown, and which no watcher ever
-    reads. These pin the corrected wiring: the queued escalation is the primary
-    channel, and the worktree file is only the floor beneath a queue that
-    cannot be opened.
+    reads. These pin the corrected wiring: the queued escalation is the ONLY
+    channel, and a payload the queue cannot take is reported lost rather than
+    parked where it would die unread.
     """
 
     def test_spec_declares_verdict_tools_own_anchors(self):
         """Not plan-tools' anchors, and not the middleware's defaults."""
         from orchestrator.mcp import plan_tools, verdict_tools
 
-        spec = verdict_tools._MARKUP_SINK_SPEC
+        spec = verdict_tools.MARKUP_SINK_SPEC
+        plan_tools_spec = plan_tools.MARKUP_SINK_SPEC
         assert spec.server_label == 'verdict-tools'
         assert spec.residue_anchor_task_id == 'verdict-tools-markup-residue'
         assert spec.storm_anchor_task_id == 'verdict-tools-markup-storm'
         # Distinct from plan-tools', so a reader can tell whose boundary spoke,
         # and so one server's open storm record cannot dedup the other's away.
-        assert spec.residue_anchor_task_id != plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID
-        assert spec.storm_anchor_task_id != plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
+        assert spec.residue_anchor_task_id != plan_tools_spec.residue_anchor_task_id
+        assert spec.storm_anchor_task_id != plan_tools_spec.storm_anchor_task_id
         # A NON-TASK anchor: at the level 2 the middleware declares, a pending
         # record under a live task id would halt the task whose verdict leaked.
         assert not spec.residue_anchor_task_id.isdigit()
@@ -990,7 +1216,7 @@ class TestVerdictToolsResidueChannelIsShared:
         """
         from orchestrator.mcp import plan_tools
 
-        spec = verdict_tools._MARKUP_SINK_SPEC
+        spec = verdict_tools.MARKUP_SINK_SPEC
         assert (
             f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl'
             in spec.attribution_source
@@ -1004,7 +1230,7 @@ class TestVerdictToolsResidueChannelIsShared:
             'the unfollowable grep-the-logs sentence task 4744 retired must '
             'not come back'
         )
-        assert spec.attribution_source != plan_tools._MARKUP_SINK_SPEC.attribution_source
+        assert spec.attribution_source != plan_tools.MARKUP_SINK_SPEC.attribution_source
 
     def test_the_field_is_required_so_a_new_server_must_decide(self):
         """A DEFAULT is what would let the next server inherit silently.
@@ -1026,35 +1252,21 @@ class TestVerdictToolsResidueChannelIsShared:
             )
 
     @pytest.mark.asyncio
-    async def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
-        self, tmp_path,
-    ):
-        """The primary channel is the queue, and the fallback is NOT taken."""
+    async def test_residue_is_queued_as_an_escalation(self, tmp_path):
+        """The channel is the queue."""
         from orchestrator.mcp import markup_sink, verdict_tools
 
-        submitted: list[Any] = []
-        fell_back: list[dict[str, Any]] = []
-
-        class _Queue:
-            def make_id(self, anchor: str) -> str:
-                return f'esc-{anchor}-1'
-
-            def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
-                return []
-
-            def submit(self, esc: Any) -> str:
-                submitted.append(esc)
-                return esc.id
+        queue = _RecordingQueue()
+        submitted = queue.submitted
 
         from escalation.models import Escalation
 
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
-            open_channel=lambda root: (Escalation, _Queue()),
-            last_resort=lambda record: fell_back.append(record) or 'residue.json',
+            open_channel=lambda root: (Escalation, queue),
         )
         record = {
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
@@ -1069,10 +1281,6 @@ class TestVerdictToolsResidueChannelIsShared:
         esc_id = await sink(record)
 
         assert esc_id == 'esc-verdict-tools-markup-residue-1'
-        assert not fell_back, (
-            'the worktree-local writer is the LAST RESORT — taking it while '
-            'the queue is healthy is the doomed-storage bug this test pins'
-        )
         assert len(submitted) == 1
         filed = submitted[0]
         assert filed.task_id == 'verdict-tools-markup-residue'
@@ -1088,32 +1296,125 @@ class TestVerdictToolsResidueChannelIsShared:
         assert 'verdict-tools' in filed.detail
 
     @pytest.mark.asyncio
-    async def test_worktree_file_is_the_floor_when_the_queue_cannot_be_opened(
-        self, tmp_path,
+    async def test_a_genuinely_unknown_kind_still_files_and_warns_naming_the_known_kinds(
+        self, tmp_path, caplog,
     ):
-        """Strictly better than losing the payload; strictly worse than a queue."""
-        from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.mcp import markup_sink, verdict_tools
+        """The anti-vacuity partner of the dropped-slice no-warning row: the
+        warning still exists for the case it is meant for, and names both the
+        offending kind and the kinds the sink does accept."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
+            queue = await file_an_unknown_kind(tmp_path)
 
-        artifacts = TaskArtifacts(tmp_path)
-        artifacts.root.mkdir(parents=True, exist_ok=True)
+        assert len(queue.submitted) == 1
+        assert 'THE ONLY SURVIVING COPY' in queue.submitted[0].detail
+        (warning,) = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno >= logging.WARNING
+        ]
+        assert UNKNOWN_KIND in warning
+        assert MARKUP_UNRECOVERED_PARAM_ERROR_TYPE in warning, (
+            f'the warning does not name the kinds this sink knows: {warning!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unknown_kind_claims_no_outcome(self, tmp_path):
+        """The sink cannot know what happened to a call whose kind it does not
+        know, so the body names the kind and claims no refusal."""
+        queue = await file_an_unknown_kind(tmp_path)
+
+        (filed,) = queue.submitted
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence not in filed.detail
+        assert UNKNOWN_KIND in filed.detail
+        assert 'THE ONLY SURVIVING COPY' in filed.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('resolve_root', 'open_channel'),
+        [
+            pytest.param(
+                lambda worktree: None, lambda root: None, id='root-unresolved',
+            ),
+            pytest.param(
+                lambda worktree: worktree, lambda root: None, id='queue-unopened',
+            ),
+            pytest.param(
+                lambda worktree: worktree,
+                lambda root: (Escalation, _RefusingQueue()),
+                id='submit-raised',
+            ),
+        ],
+    )
+    async def test_a_payload_the_queue_cannot_take_is_reported_lost_once(
+        self, tmp_path, caplog, resolve_root, open_channel,
+    ):
+        """Queue or nothing, and the nothing is LOUD.
+
+        Exactly one ERROR line per lost payload whichever step failed, so a
+        loss is countable, and it names the leak and the size of what was lost.
+        """
+        raw = 'THE ONLY SURVIVING COPY'
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
-            resolve_root=lambda worktree: tmp_path,
-            open_channel=lambda root: None,
-            last_resort=artifacts.write_markup_residue,
+            resolve_root=resolve_root,
+            open_channel=open_channel,
         )
-        locator = await sink({
-            'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
-            'tool': 'submit_review_verdict',
-            'field': 'issues',
-            'raw_value': 'THE ONLY SURVIVING COPY',
-        })
-        assert locator, 'a queue outage must not silently destroy the payload'
-        # A bare filename, resolved against the artifacts root it was written to.
-        assert 'THE ONLY SURVIVING COPY' in (artifacts.root / locator).read_text()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            locator = await sink({
+                'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+                'tool': 'submit_review_verdict',
+                'field': 'issues',
+                'raw_value': raw,
+            })
+
+        assert locator is None
+        errors = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1, errors
+        assert 'submit_review_verdict.issues' in errors[0]
+        assert str(len(raw)) in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_a_lost_burst_alarm_is_reported_in_its_own_terms(
+        self, tmp_path, caplog,
+    ):
+        """A storm record carries no payload and no caller waits to resend one,
+        so its loss line must name the burst rather than a raw value."""
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '3690',
+            resolve_root=lambda worktree: None,
+            open_channel=lambda root: None,
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            locator = await sink({
+                'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+                'count': 7,
+                'threshold': 5,
+                'window_seconds': 3600,
+                'outcome': 'repaired',
+                'project': None,
+                'callers': [],
+            })
+
+        assert locator is None
+        (error,) = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno == logging.ERROR
+        ]
+        assert 'burst alarm' in error
+        assert '7 repaired' in error
+        assert 'raw value' not in error
+        assert 'resend' not in error
 
     @pytest.mark.asyncio
     async def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
@@ -1124,11 +1425,10 @@ class TestVerdictToolsResidueChannelIsShared:
 
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
-            last_resort=None,
         )
         assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None
 
@@ -1153,45 +1453,20 @@ class TestTheVerdictFactReachesADurableJournal:
     It is also the cleanest rig: because the repaired path never touches the
     escalation channel, these rows need no fake queue and no clock.
 
-    Every row steers the project root through the ``_markup_project_root``
-    seam. That indirection is load-bearing, not convenience:
-    ``make_fact_journal``'s default resolver is bound at module-DEFINITION
-    time, so patching ``markup_sink.resolve_project_root`` afterwards would not
-    reach a server ``create_server`` has already built — the journal would run
-    a real ``git rev-parse`` against a bare ``tmp_path``, resolve nothing, and
-    write no line whether or not the wiring landed.
+    Every row passes a project-root resolver to ``create_server``. Without it
+    the journal would run a real ``git rev-parse`` against a bare
+    ``tmp_path``, resolve nothing, and write no line whether or not the wiring
+    landed.
     """
-
-    @staticmethod
-    def _steer(monkeypatch, tmp_path: Path) -> None:
-        """Point BOTH injected channels at *tmp_path*, failing if the seam went.
-
-        ``raising`` is left at its default TRUE deliberately. The step-1 rows
-        that first drove this passed it as False because the seam did not exist
-        yet; once the seam landed, that flag became the thing DISABLING the
-        only check that it still does. With it, a renamed or inlined
-        ``_markup_project_root`` would leave monkeypatch quietly creating an
-        unused attribute — and while most rows here would then fail loudly (an
-        empty journal), ``test_a_journal_outage_never_changes_the_outcome``
-        would pass VACUOUSLY: its assertions are all that the call succeeded,
-        which is equally true when the journal was never steered at the
-        directory collision it means to force.
-        ``test_plan_tools_markup_guard.py`` patches the identical seam the same
-        way.
-        """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
 
     @pytest.mark.asyncio
     async def test_a_repaired_call_is_journalled_with_its_task_id(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(a) THE user-observable signal, on the measured leak shape."""
-        self._steer(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
-        await repaired_call(artifacts)
+        await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (line,) = journal_lines(tmp_path)
         assert line['tool'] == 'submit_review_verdict'
@@ -1207,7 +1482,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @pytest.mark.asyncio
     async def test_the_journal_is_the_only_durable_trace_of_a_repair(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(b) The boundary-specific row: FORWARD_REPAIR leaves nothing else.
 
@@ -1215,20 +1490,19 @@ class TestTheVerdictFactReachesADurableJournal:
         escalation channel is not consulted, so no residue record does either.
         Only the journal knows this happened at all.
         """
-        self._steer(monkeypatch, tmp_path)
-
-        result = await repaired_call(artifacts)
+        result = await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
-        assert sorted(artifacts.root.glob('markup_residue-*.json')) == [], (
+        queue_dir = escalation_queue_dir(tmp_path)
+        assert sorted(queue_dir.rglob('esc-*.json')) == [], (
             'a repaired call never reaches the residue channel'
         )
         assert len(journal_lines(tmp_path)) == 1
 
     @pytest.mark.asyncio
     async def test_a_burst_is_one_line_per_event(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(c) The journal is per-EVENT; the storm escalation is per-WINDOW.
 
@@ -1237,11 +1511,10 @@ class TestTheVerdictFactReachesADurableJournal:
         / window_seconds / outcome / project, and ``project`` is structurally
         None on this boundary. WHICH caller leaked is a per-event fact.
         """
-        self._steer(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         for _ in range(3):
-            await repaired_call(artifacts)
+            await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         lines = journal_lines(tmp_path)
         assert len(lines) == 3, 'one line per repair, not one per window'
@@ -1249,7 +1522,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @pytest.mark.asyncio
     async def test_a_journal_outage_never_changes_the_outcome(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(d) The journal is ADDITIVE: the outcome is decided before it runs.
 
@@ -1258,14 +1531,96 @@ class TestTheVerdictFactReachesADurableJournal:
         record-keeping file could not be written.
         """
         markup_journal.journal_path(tmp_path, 'verdict-tools').mkdir(parents=True)
-        self._steer(monkeypatch, tmp_path)
 
-        result = await repaired_call(artifacts)
+        result = await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
         assert result.meta is not None
         assert result.meta['markup_repair']['outcome'] == 'repaired'
+
+
+# ---------------------------------------------------------------------------
+# create_server takes the project-root resolver (task 6098).
+# ---------------------------------------------------------------------------
+
+
+class TestCreateServerTakesAProjectRootResolver:
+    """One resolver, passed to ``create_server``, decides where BOTH injected
+    channels file: the residue escalation and the fact journal.
+
+    Each steered row resolves to a checkout DISTINCT from the server's own
+    worktree, so a record that lands there can only have got there through the
+    resolver's answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_resolver_steers_both_channels(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The unrepairable outcome is the one where both channels fire, so it
+        is where a residue record and its journal line must meet."""
+        main_checkout = tmp_path / 'main'
+        seed_plan(artifacts)
+
+        payload = await refused_call(
+            artifacts, resolve_project_root=rooted_at(main_checkout),
+        )
+
+        queued = queued_residue(main_checkout)
+        assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
+        assert queued[0].id == payload['escalation_id']
+        (line,) = journal_lines(main_checkout)
+        assert line['outcome'] == 'unrepairable'
+
+    @pytest.mark.asyncio
+    async def test_the_resolver_is_asked_lazily_with_the_servers_worktree(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """Construction resolves nothing: one ``git rev-parse`` per server start
+        would land on every agent invocation, not only on the calls that leak."""
+        main_checkout = tmp_path / 'main'
+        asked: list[Path] = []
+
+        def recording_resolver(worktree: Path) -> Path:
+            asked.append(worktree)
+            return main_checkout
+
+        server = create_server(
+            artifacts, REVIEWER_ROLE, resolve_project_root=recording_resolver,
+        )
+        assert asked == []
+        seed_plan(artifacts)
+        record = specimen(ISSUES_SPECIMEN)
+
+        async with Client(server) as client:
+            await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'ISSUES_FOUND',
+                record['param']: record['value'],
+            })
+
+        assert asked
+        assert all(worktree == artifacts.worktree for worktree in asked)
+        (line,) = journal_lines(main_checkout)
+        assert line['outcome'] == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_the_default_resolver_files_into_the_main_checkout(
+        self, tmp_path: Path
+    ):
+        """With no resolver passed, a lane's journal line reaches its MAIN
+        checkout — never the lane, which dies at ``git worktree remove``."""
+        checkout, lane = main_checkout_with_lane(tmp_path)
+        lane_artifacts = TaskArtifacts(lane)
+        lane_artifacts.init('test-1', 'Test task', 'A test')
+        seed_plan(lane_artifacts)
+
+        await repaired_call(lane_artifacts)
+
+        (line,) = journal_lines(checkout)
+        assert line['subject_task_id'] == 'test-1'
+        assert not markup_journal.journal_path(lane, 'verdict-tools').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1298,7 +1653,7 @@ class TestTheStormRecordNamesTheJournal:
                 'project': None,
             },
             'test-1',
-            verdict_tools._MARKUP_SINK_SPEC,
+            verdict_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_storm_detail_names_the_journal(self):
@@ -1316,7 +1671,7 @@ class TestTheStormRecordNamesTheJournal:
 
     @pytest.mark.asyncio
     async def test_following_the_records_own_instruction_now_succeeds(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(c) The end-to-end row, and the only one that catches the two halves
         drifting apart.
@@ -1325,12 +1680,9 @@ class TestTheStormRecordNamesTheJournal:
         merely better-worded. So this one FOLLOWS it: pull the path the record
         names out of its own body, open that exact file, and read the line.
         """
-        monkeypatch.setattr(
-            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-        )
         seed_plan(artifacts)
 
-        await repaired_call(artifacts)
+        await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         named = [tok for tok in self._storm_detail().split() if tok.endswith('.jsonl')]
         assert len(named) == 1, (

@@ -1,0 +1,30 @@
+{
+  "task_id": "6670",
+  "reason": "net-additive host-health wiring (task 6670): SpeculativeMergeWorker.__init__ takes the harness-owned runner_quarantine (None -> a worker-own set) and _host_states_block reads the optional host_holder_reader for the new task_held_by row key; one conditional each",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1930,
+      "current": 1932
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_host_states_block",
+      "baseline": 11,
+      "current": 12
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5033,
+      "current": 5035
+    }
+  ]
+}

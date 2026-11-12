@@ -41,7 +41,9 @@ and are NOT already covered by other tests:
    collaborator defaults the folded-in factories depended on are pinned here
    too.  See ``TestMakeStewardFixture``.
 
-7. **The shared mock-derived stray-dir guard is bound** — see
+7. **No real cold pre-provision** — ``_isolate_orch_config`` empties the host-reaching ``verify_cold_preprovision_command``, so no test runs a real ``uv sync``; an explicit kwarg still opts in.
+
+8. **The shared mock-derived stray-dir guard is bound** — see
    ``TestTheMockDerivedStrayDirGuardIsWired``.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
@@ -328,6 +330,30 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
     assert db_path.suffix == '.db', (
         f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
     )
+
+
+def test_no_test_inherits_a_cold_preprovision_command(tmp_path, monkeypatch):
+    """A bare config carries no cold pre-provision command, whatever the yaml says.
+
+    The yaml here sets one deliberately, so the assertion does not hang on the
+    operational yaml's current value.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    yaml_path = tmp_path / 'orch.yaml'
+    yaml_path.write_text('verify_cold_preprovision_command: "uv sync --all-packages"\n')
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(yaml_path))
+
+    assert OrchestratorConfig().verify_cold_preprovision_command == ''
+
+
+def test_an_explicit_preprovision_command_still_wins():
+    """Feature tests opt into provisioning with an explicit kwarg."""
+    from orchestrator.config import OrchestratorConfig
+
+    config = OrchestratorConfig(verify_cold_preprovision_command='touch x')
+
+    assert config.verify_cold_preprovision_command == 'touch x'
 
 
 class TestMakeStewardFixture:

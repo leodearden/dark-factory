@@ -102,6 +102,17 @@ info "Restoring FalkorDB data"
 FALKOR_EXPORT="$EXPORT_DIR/fused-memory-data/falkordb"
 FALKOR_DEST="$REPO_ROOT/fused-memory/data/falkordb"
 if [ -d "$FALKOR_EXPORT" ]; then
+  # A new falkordb container boots with appendonly yes and loads ONLY the AOF,
+  # ignoring dump.rdb (task 6330), so with no AOF manifest, or one older than
+  # dump.rdb, the server would come up stale or empty. export-data.sh rewrites
+  # the AOF after its BGSAVE, so a current export's manifest is never older
+  # than its dump.rdb. Judged on the EXPORT before copying: the overlay copy
+  # below keeps any newer manifest the destination already has.
+  FALKOR_EXPORT_MANIFEST="$FALKOR_EXPORT/appendonlydir/appendonly.aof.manifest"
+  if [ -f "$FALKOR_EXPORT/dump.rdb" ] \
+    && { [ ! -f "$FALKOR_EXPORT_MANIFEST" ] || [ "$FALKOR_EXPORT_MANIFEST" -ot "$FALKOR_EXPORT/dump.rdb" ]; }; then
+    fail "FalkorDB: the export's dump.rdb has no AOF manifest at least as new, so a started server would load a stale or empty AOF. NOT importing FalkorDB data (the import stops here). Follow OPERATIONS.md \"Deciding which FalkorDB copy is newest\" with the export's files."
+  fi
   mkdir -p "$FALKOR_DEST"
   cp -a "$FALKOR_EXPORT/." "$FALKOR_DEST/"
   ok "FalkorDB: $(du -sh "$FALKOR_DEST" | cut -f1)"

@@ -4,33 +4,34 @@
 #
 # TWO TIERS, and the split is deliberate:
 #
-#   UNIVERSAL (every branch) -- the merge-lane ratchet audit below. It is
-#     scoped to what this commit STAGES, so an ordinary commit costs one
-#     `git diff --cached` and spawns nothing.
-#   MAIN ONLY -- ruff, the three staged-file style checks, and pyright.
-#     These sweep whole packages and cost seconds, which is the wrong price
-#     to pay on every commit of every task branch.
+#   UNIVERSAL (every branch) -- the merge-lane ratchet audit and the
+#     code-quality render check below. Each is scoped to what this commit
+#     STAGES, so an ordinary commit costs one `git diff --cached` per check
+#     and spawns nothing.
+#   MAIN ONLY -- ruff, the three staged-file style checks, and the merge
+#     gate's module checks and screen for what this commit stages
+#     (plans/merge-lane-policy-prd.md D8). These cost seconds to minutes,
+#     which is the wrong price to pay on every commit of every task branch.
 #
 # WHY THE RATCHET AUDIT IS UNIVERSAL. A ratchet raise is INTRODUCED by a
 # commit on a task branch and reaches main by MERGE -- exactly like the
 # .task/ contamination the neighbouring universal guard in hooks/pre-commit
 # exists to stop. A CLEAN merge runs pre-merge-commit rather than pre-commit
 # (a conflicted one finished with `git commit` does run pre-commit), and the
-# merge worker advances main with `git update-ref`, which runs no hooks at
-# all, so a main-only audit would never see the two raises that actually
+# merge worker advances main with `git update-ref`, which runs no commit
+# hooks, so a main-only audit would never see the two raises that actually
 # landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a raise
-# where it is introduced is the only placement that bites.
+# where it is introduced is the placement that bites first;
+# hooks/reference-transaction audits the landing itself, for what a rebase
+# replay or a clean merge carried past this one.
 #
-# $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
-# measured rather than stylistic. Before the branch was passed down this
-# script had no branch concept at all: invoked directly, it ran every check.
-# orchestrator/tests/test_project_checks_pyright_scope.py invokes it exactly
-# that way against a throwaway repo -- whose branch is whatever
-# init.defaultBranch happens to be -- so a rev-parse default silently skips
-# the pyright scoping those four tests exist to pin. Defaulting to main keeps
-# a direct invocation byte-identical to its prior behaviour AND points the
-# unspecified case at the STRICTEST set: an omitted argument must never be
-# the reason a check quietly does not run (INV-11).
+# $2 DEFAULTS TO main, not to a `rev-parse` of the working tree. Before the
+# branch was passed down this script had no branch concept at all: invoked
+# directly, it ran every check. Defaulting to main keeps a direct invocation
+# running every check AND points the unspecified case at the STRICTEST set:
+# an omitted argument must never be the reason a check quietly does not run
+# (INV-11). tests/scripts/test_project_checks_merge_gate_parity.py pins the
+# main-only tier through a real commit in a throwaway repo.
 #
 # FOR A REPO THAT COPIED hooks/, the honest claim is narrower than "stays
 # valid": a branch-unaware project-checks stays CORRECT, and stops being
@@ -57,8 +58,12 @@ BRANCH="${2:-main}"
 # listing must mean "nothing staged", never "git could not answer". A corrupt
 # or locked index would otherwise disarm the audit in silence -- the very shape
 # this gate exists to close, reproduced one layer out (INV-11).
+# The ledger is a DIRECTORY, one file per authorization; the retired
+# single-array file stays listed because the commit that splits it, and any
+# commit that stages it back, is the auditor's to judge.
 ratchet_artifacts=(
     orchestrator/tests/merge_lane_ratchet_baseline.json
+    orchestrator/tests/merge_lane_ratchet_raises
     orchestrator/tests/merge_lane_ratchet_authorized_raises.json
 )
 staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
@@ -88,18 +93,43 @@ if [ -n "$staged_ratchet" ]; then
     # the instrument; it never skips itself.
     (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py)
     ratchet_rc=$?
-    # NO DIAGNOSIS IS RESTATED HERE. The auditor has five refusal paths (an
+    # NO DIAGNOSIS IS RESTATED HERE. The auditor has six refusal paths (an
     # unrecorded raise, a staged baseline deletion, a rewritten ledger history,
-    # an unreadable artifact, an unimportable instrument) and prints its own
-    # named cause plus the ONE copy of RAISE_REMEDY for the paths that remedy
-    # fits. A fixed "--authorize-raise it" line here was wrong for four of the
-    # five and sent the committer hunting the wrong thing. Only the exit ladder
-    # is read: 1 policy, 2 instrument.
+    # a retired ledger split wrongly or staged back, an unreadable artifact, an
+    # unimportable instrument) and prints its own named cause plus the ONE copy
+    # of RAISE_REMEDY for the paths that remedy fits. A fixed "--authorize-raise
+    # it" line here was wrong for most of them and sent the committer hunting
+    # the wrong thing. Only the exit ladder is read: 1 policy, 2 instrument.
     if [ "$ratchet_rc" -eq 2 ]; then
         echo "pre-commit: merge-lane ratchet audit could NOT RUN (rc=2); its named cause is above."
         exit 1
     elif [ "$ratchet_rc" -ne 0 ]; then
         echo "pre-commit: merge-lane ratchet audit REFUSED this commit (rc=$ratchet_rc); see above."
+        exit 1
+    fi
+fi
+
+# ── code-quality render check (ALL BRANCHES, staged-scoped) ──────────
+#
+# roles.py renders the packaged code-quality doc at import through
+# code_quality.py::render, and a docs-only commit straight to main never meets
+# the merge gate's test of it. So whenever this commit stages either file, the
+# STAGED doc is rendered with the STAGED renderer. NO `|| true` on the filter,
+# for the same reason as the ratchet filter above.
+code_quality_inputs=(
+    orchestrator/src/orchestrator/agents/code_quality.md
+    orchestrator/src/orchestrator/agents/code_quality.py
+)
+staged_code_quality="$(cd "$ROOT" && git diff --cached --no-renames --name-only -- \
+    "${code_quality_inputs[@]}")" || {
+    echo "pre-commit: could not list staged code-quality inputs (git rc=$?);"
+    echo "  refusing the commit rather than skipping the render check."
+    exit 1
+}
+if [ -n "$staged_code_quality" ]; then
+    echo "pre-commit: code-quality render check (staged)..."
+    if ! (cd "$ROOT" && python3 scripts/check_staged_code_quality_render.py); then
+        echo "pre-commit: code-quality render check REFUSED this commit; its named cause is above."
         exit 1
     fi
 fi
@@ -114,28 +144,15 @@ fi
 echo "pre-commit: linting (main branch)..."
 
 # Every path the merge gate lints, in the order of the `ruff check` leg of
-# dark-factory-orchestrator.yaml::lint_command -- a wider set than
-# PYRIGHT_PACKAGES, since it also names non-member paths. That leg is the
-# source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
-# this list and the leg disagree, so widen both together.
-RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills)
-# Every package the merge gate type-checks, in the order of
-# dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
-# pyright runs per-package from its directory). That chain is the source of
-# truth: tests/scripts/test_hook_pyright_packages_drift.py fails when this list
-# and the chain disagree, so widen both together.
-PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit)
-# Dependency packages that the other PYRIGHT_PACKAGES import. They are
-# pyright-checked like any other member, but a staged change here can break a
-# consumer without touching the consumer's files, so it forces a sweep across
-# all PYRIGHT_PACKAGES instead of just its own. See task 2551.
-DEP_PACKAGES=(shared escalation)
-
+# dark-factory-orchestrator.yaml::lint_command, non-member paths included.
+# That leg is the source of truth: tests/scripts/test_hook_ruff_targets_drift.py
+# fails when this list and the leg disagree, so widen both together.
+RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills)
 # Every tests/ directory the merge gate's check_bare_magicmock_config.py tail leg
 # scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
 # the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
 # when this list and the leg disagree, so widen both together.
-MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
+MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests client-feed/tests)
 
 RUFF_PATHS=()
 for target in "${RUFF_TARGETS[@]}"; do
@@ -208,52 +225,88 @@ if [ -n "$staged_tc" ]; then
     fi
 fi
 
-# pyright (must run from each package directory to pick up [tool.pyright] config)
-# Path-filtered: only run for packages with staged .py changes, so docs/plans-only
-# commits (and commits scoped to a single package) don't pay for an
-# unconditional all-package pyright run. A staged change under a DEP_PACKAGES
-# dependency (shared, escalation) forces a full sweep across all
-# PYRIGHT_PACKAGES instead, because consumers import from them and can go red
-# without any of their own files being staged. See task 2551.
-# -c core.quotepath=false stops git from quoting/escaping non-ASCII path
-# bytes (its default quoting only covers bytes >= 0x80; control characters and
-# literal quote/backslash bytes are always escaped regardless of this
-# setting). A path with an embedded newline or a leading double-quote could
-# still fail the ^${dep}/ / ^${pkg}/ prefix matches below and silently skip
-# pyright for a package that was actually staged — a pre-existing limitation
-# shared by the ruff/asyncmock/magicmock staged-file filters elsewhere in this
-# script (not a regression), accepted as low-likelihood given this repo's
-# file-naming conventions. See task 2551.
-staged_py_all="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
-if [ -z "$staged_py_all" ]; then
-    echo "pre-commit: pyright skipped (no Python changes)"
+# ── merge-gate module checks and screen (main only) ──────────────────
+#
+# scripts/hook_module_checks.py lists the units the merge gate would run for
+# what this commit stages -- module:<m>:lint / module:<m>:type with each
+# module's registered command, and screen:<id> for scripts/merge_screen.yaml --
+# and every listed unit runs here, in parallel, verbatim
+# (plans/merge-lane-policy-prd.md D8). NO `|| true` on the staged listing, and
+# a helper failure refuses rather than skips: an empty listing must mean
+# "nothing to check", never "could not answer" (INV-11).
+#
+# At most GATE_SLOTS units run at once: a staged shared/ or escalation/ file
+# lists every module's type check, on a host whose merge verifies already
+# load it. Units are reported in listing order. An interrupt (INT, or TERM
+# sent to this hook alone) stops every running unit's whole process tree;
+# the unit logs go on any exit.
+GATE_SLOTS=4
+gate_start=$SECONDS
+staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
+    echo "pre-commit: could not list staged files (git rc=$?);"
+    echo "  refusing the commit rather than skipping the merge-gate checks."
+    exit 1
+}
+listing="$(printf '%s\n' "$staged" | (cd "$ROOT" && uv run --project shared python scripts/hook_module_checks.py))"
+listing_rc=$?
+if [ "$listing_rc" -ne 0 ]; then
+    echo "pre-commit: scripts/hook_module_checks.py could NOT RUN (rc=$listing_rc); its named cause is above."
+    exit 1
+fi
+if [ -z "$listing" ]; then
+    echo "pre-commit: merge-gate checks skipped (no staged file maps to a module or the screen) in $((SECONDS - gate_start))s"
 else
-    run_all=false
-    for dep in "${DEP_PACKAGES[@]}"; do
-        if printf '%s\n' "$staged_py_all" | grep -q "^${dep}/"; then
-            run_all=true
-            break
+    gate_units=()
+    gate_commands=()
+    gate_logs=()
+    gate_pids=()
+    gate_collected=0
+    gate_failed=false
+    gate_process_tree() {
+        local child
+        echo "$1"
+        for child in $(pgrep -P "$1"); do gate_process_tree "$child"; done
+    }
+    gate_stop_units() {
+        local job tree=()
+        for job in $(jobs -rp); do tree+=($(gate_process_tree "$job")); done
+        [ "${#tree[@]}" -eq 0 ] || kill -TERM "${tree[@]}" 2>/dev/null
+    }
+    gate_collect_next() {
+        local i=$gate_collected unit_rc=0
+        gate_collected=$((gate_collected + 1))
+        wait "${gate_pids[$i]}" || unit_rc=$?
+        if [ "$unit_rc" -eq 0 ]; then
+            echo "  ok ${gate_units[$i]}"
+        else
+            echo "pre-commit: ${gate_units[$i]} FAILED (rc=$unit_rc): ${gate_commands[$i]}"
+            tail -n 60 "${gate_logs[$i]}"
+            gate_failed=true
         fi
+    }
+    trap 'rm -f "${gate_logs[@]}"' EXIT
+    trap 'gate_stop_units; exit 130' INT
+    trap 'gate_stop_units; exit 143' TERM
+    while IFS=$'\t' read -r unit command; do
+        if [ "$((${#gate_pids[@]} - gate_collected))" -ge "$GATE_SLOTS" ]; then
+            gate_collect_next
+        fi
+        log="$(mktemp)"
+        echo "  running $unit: $command"
+        (cd "$ROOT" && bash -c "$command") < /dev/null > "$log" 2>&1 &
+        gate_pids+=("$!")
+        gate_units+=("$unit")
+        gate_commands+=("$command")
+        gate_logs+=("$log")
+    done <<< "$listing"
+    while [ "$gate_collected" -lt "${#gate_pids[@]}" ]; do
+        gate_collect_next
     done
-    # Note: a staged .py file that lives outside every DEP_PACKAGES and
-    # PYRIGHT_PACKAGES prefix (e.g. a repo-root script) leaves run_all=false
-    # and matches no ^${pkg}/ prefix below, so pyright is skipped everywhere
-    # for that commit. Accepted as an over-narrowing given this repo's layout
-    # (root-level Python is rare and itself unconfigured for pyright); if that
-    # changes, treat "staged .py matching no known package prefix" as its own
-    # run_all trigger. See task 2551.
-    for pkg in "${PYRIGHT_PACKAGES[@]}"; do
-        dir="$ROOT/$pkg"
-        [ -d "$dir" ] || continue
-        if [ "$run_all" = false ] && ! printf '%s\n' "$staged_py_all" | grep -q "^${pkg}/"; then
-            continue
-        fi
-        echo "  pyright: $pkg"
-        if ! (cd "$dir" && uv run pyright); then
-            echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
-            exit 1
-        fi
-    done
+    echo "pre-commit: merge-gate checks: ${#gate_units[@]} unit(s) in $((SECONDS - gate_start))s"
+    if [ "$gate_failed" = true ]; then
+        echo "pre-commit: commit REFUSED -- fix the unit(s) above (the merge gate runs the same commands)"
+        exit 1
+    fi
 fi
 
 echo "pre-commit: all checks passed."

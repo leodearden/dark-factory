@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "esc-8524-8 regression test asserts the orphaned dispatch re-merge replacement is recorded in worker._dead_base_commits (no public seam for the dead-base ledger yet; kappa/lambda own the extraction)",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 84,
+      "current": 85
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6451,
+      "current": 6452
+    }
+  ]
+}

@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import git, main_checkout_with_lane
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -70,7 +71,11 @@ from _markup_helpers import (
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
@@ -183,7 +188,7 @@ class Harness:
 
     @property
     def plan_path(self) -> Path:
-        return self.artifacts.root / 'plan.json'
+        return self.artifacts.artifact_path('plan.json')
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
@@ -1223,6 +1228,23 @@ class TestUnrepairableResidueIsPreserved:
         )
 
     @pytest.mark.asyncio
+    async def test_the_residue_record_routes_a_recurrence_through_the_shared_sentence(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The queued record is where an operator reads the route (task 5698)."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        assert len(rig.queue.submitted) == 1
+        detail = rig.queue.submitted[0].detail
+        assert 'plans/toolcall-markup-containment-prd.md' in detail
+        assert MARKUP_RECURRENCE_ROUTING in detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: {detail!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_residue_never_gates_the_leaking_task(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
@@ -1400,7 +1422,7 @@ class TestUnrepairableResidueIsPreserved:
 # ---------------------------------------------------------------------------
 #
 # The middleware routes storm records through the SAME injected sink as residue
-# records (``_file_storm_escalation`` hands it ``{'error_type':
+# records (its ``BoundaryStormEscape`` hands it ``{'error_type':
 # 'mcp_markup_storm', ...}``), so without a branch the sink would file a
 # residue-shaped record — one claiming to hold a caller payload it does not
 # have — for a burst.
@@ -1428,18 +1450,17 @@ class _Clock:
 def tune_storm(rig: ResidueRig, *, threshold: int, clock: _Clock) -> MarkupGuardMiddleware:
     """Point the REGISTERED guard's burst detector at a fake clock.
 
-    Not a reach-around: ``StormCounter``'s reload-safety contract has the
-    middleware pass ``threshold`` and ``window_seconds`` PER record() call
-    precisely so a consumer can read them live, and the counters themselves are
-    created lazily on the first event — so tuning them on the constructed guard
-    before any call is exactly as supported as reading them from a config leaf.
-    The alternative is sleeping through the real 3600s window.
+    Through the guard's public ``storm_escape``, whose ``threshold`` and
+    ``time_provider`` are documented live-read tuning: both are read at every
+    record, so setting them before the first call is exactly as supported as
+    reading them from a config leaf. The alternative is sleeping through the
+    real 3600s window.
     """
     guard = next(
         m for m in rig.harness.server.middleware if isinstance(m, MarkupGuardMiddleware)
     )
-    guard._storm_threshold = threshold
-    guard._storm_time_provider = clock
+    guard.storm_escape.threshold = threshold
+    guard.storm_escape.time_provider = clock
     return guard
 
 
@@ -1474,6 +1495,10 @@ class TestTheStormEscape:
             "payload — pinning the anchor is what makes the dedup lookup stable"
         )
         assert 'plans/toolcall-markup-containment-prd.md' in filed.detail
+        assert MARKUP_RECURRENCE_ROUTING in filed.detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: '
+            f'{filed.detail!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_second_burst_folds_into_the_still_open_record(
@@ -1524,7 +1549,7 @@ class TestTheStormEscape:
                 'crossing_subject_agent_role': None,
                 'callers': [],
             },
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_open_records_subject_reads_back_through_one_spelling(self):
@@ -1778,7 +1803,7 @@ class TestTheStormEscape:
                 'callers': [spoof],
             },
             'test-1',
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
         assert spoof not in detail, 'the raw newline reached the body verbatim'
@@ -1818,7 +1843,9 @@ class TestTheStormEscape:
             assert "the guard's own log lines" not in body
         # The routing survives — the grep is demoted, not the destination.
         assert 'plans/toolcall-markup-containment-prd.md' in filed.suggested_action
-        assert '3083' in filed.suggested_action
+        assert MARKUP_RECURRENCE_ROUTING in filed.suggested_action, (
+            filed.suggested_action
+        )
 
     @pytest.mark.asyncio
     async def test_the_dedup_anchor_and_routing_are_untouched(
@@ -1888,13 +1915,6 @@ class TestTheStormEscape:
 # data exactly where this leaf promises none is lost.
 
 
-def _git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestWhereTheRecordLands:
     """``_markup_project_root`` decides which queue every record reaches."""
 
@@ -1906,7 +1926,7 @@ class TestWhereTheRecordLands:
         """
         checkout = tmp_path / 'repo'
         checkout.mkdir()
-        _git('init', cwd=checkout)
+        git('init', cwd=checkout)
 
         assert plan_tools._markup_project_root(checkout) == checkout.resolve()
 
@@ -1918,13 +1938,7 @@ class TestWhereTheRecordLands:
         would answer with the lane itself, filing each record into a directory
         that is deleted when the lane is reset.
         """
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        _git('init', cwd=checkout)
-        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-             '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
 
         assert plan_tools._markup_project_root(lane) == checkout.resolve()
         assert plan_tools._markup_project_root(lane) != lane.resolve()

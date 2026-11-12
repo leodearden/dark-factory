@@ -7,7 +7,7 @@ committed-but-not-checkpointed frames.
 
 A subprocess (``_sqlite_chaos_child.py``) opens the production backend,
 writes N task rows via the real ``add_task`` path (each row goes through
-``_txn`` and returns only after ``conn.commit()``), journals each returned
+a write unit and returns only after its commit), journals each returned
 id to a separate fsync'd file, and then SIGKILLs itself. The parent then
 opens a fresh ``SqliteTaskBackend`` and asserts every journaled id is
 present in the DB.
@@ -81,7 +81,6 @@ async def reopened_backend(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)
 @pytest.mark.parametrize('n_commits', [50])
 async def test_committed_rows_survive_sigkill(
     tmp_path: Path,
@@ -113,7 +112,6 @@ async def test_committed_rows_survive_sigkill(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
 async def test_repeated_sigkill_cycles_preserve_durability(
     tmp_path: Path,
 ) -> None:

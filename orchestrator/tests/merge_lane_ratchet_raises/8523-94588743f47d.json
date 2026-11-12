@@ -1,0 +1,30 @@
+{
+  "task_id": "8523",
+  "reason": "Net-additive instrumentation (task 8523, merge-lane-policy PRD alpha/D10): runner_reason/base_relation threaded through dispatch, the merge_verify_cancelled row at the teardown chokepoint, dead-base killer provenance, and gate/abort cancel causes; the dead-base FIFO moved out of worker.py into merge_lane/dead_base_ledger.py.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1930,
+      "current": 1943
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_teardown_verify_task",
+      "baseline": 5,
+      "current": 7
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_concurrent_verify.py",
+      "baseline": 172,
+      "current": 177
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5034,
+      "current": 5066
+    }
+  ]
+}

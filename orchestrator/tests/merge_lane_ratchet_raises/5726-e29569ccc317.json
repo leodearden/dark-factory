@@ -1,0 +1,18 @@
+{
+  "task_id": "5726",
+  "reason": "Regression tests for the task 5726 iteration-log provenance fix: two new rederive tests drive workflow._rederive_step_status_from_branch_state, the private method under test, called exactly as every existing test in test_harness_plan_step_rederive.py already does (8 direct calls plus 5 via _inter_iteration_rebase). No public entry point reaches it short of a full workflow run. Mirrors the task 3651 raise on the same file.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_plan_step_rederive.py",
+      "baseline": 15,
+      "current": 17
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6604,
+      "current": 6606
+    }
+  ]
+}

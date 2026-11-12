@@ -13,20 +13,20 @@ This guarantees:
 - The restart script runs detached / fire-and-forget so it never blocks the
   orchestrator event loop.
 
-Two instances are used in production:
+The harness polls ``maybe_restart`` on its own cadence, independent of the
+dispatch loop (``Harness._run_stale_service_restart_pass``), passing
+``agents_idle`` from live state.  Three instances are used in production:
 
-* **fused-memory** (``service_name='fused-memory'``, ``require_idle=True``):
-  prefers the run-loop's idle quiet-window (no dispatched agents), but
-  additionally force-fires on the busy-wait branch once a pending restart is
-  owed past ``force_fire_after_secs`` (wired from
-  ``config.fused_memory_restart_force_fire_after_secs``, task 2817) — the
-  anti-starvation backstop for chronic fleet saturation, where the idle branch
-  never runs and an armed restart would otherwise starve forever.
+* **fused-memory** (``require_idle=True``): prefers a quiet window with no
+  live agents, and force-fires once a pending restart is owed past
+  ``force_fire_after_secs`` (``config.fused_memory_restart_force_fire_after_secs``,
+  task 2817), so chronic fleet saturation cannot starve it.
   Script: ``scripts/restart-fused-memory.sh --drain``.
 
-* **dashboard** (``service_name='dashboard'``, ``require_idle=False``):
-  leaf service — fires even while agents are dispatching (promptly on the
-  busy-wait branch).  Script: ``scripts/restart-dashboard.sh`` (no drain).
+* **dashboard** (``require_idle=False``): leaf service — fires even while
+  agents are dispatching.  Script: ``scripts/restart-dashboard.sh`` (no drain).
+
+* **orchestrator** itself — see ``Harness._build_orchestrator_restart_coordinator``.
 """
 
 from __future__ import annotations
@@ -63,6 +63,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.proc_liveness import pid_alive
+
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
@@ -70,13 +72,6 @@ if TYPE_CHECKING:
 
 from orchestrator.event_store import EventType
 from orchestrator.proc_supervision import RestartDisposition, RestartPlan
-
-# IMPORTED, not copied (heuristic 11): session_registry._pid_alive already
-# encodes the pid contract lease_is_live needs, down to rejecting pid <= 0
-# before os.kill. Safe by inspection — session_registry imports nothing from
-# the orchestrator package, so there is no cycle — and it also spares this
-# module an `os` import it does not otherwise need.
-from orchestrator.session_registry import _pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -111,16 +106,13 @@ FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 # test_fleet_lease_path_matches_across_tiers.
 FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
 
-# How old a lease may be before its readers stop believing it. DERIVED, not
-# picked: the worst LEGITIMATE sweep is one permanently-busy unit burning the
-# whole ORCH_RESTART_FORCE_FIRE_AFTER_SECS busy grace (4500s), plus ~6
-# stale/absent units at ORCH_DRAIN_UNKNOWN_GRACE_SECS 120s each, plus 7 x
-# (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS 120) — 6270s ≈ 1.74h.
-# 7200 clears that with headroom while staying far below the 8h
-# min_interval_secs, so a lease leaked by a SIGKILLed sweep (whose EXIT trap
-# cannot run, by construction) delays at most ONE redeploy window and can
-# never wedge the fleet.
-DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 7200.0
+# How old a lease may be before its readers stop believing it. The default of
+# orchestrator.config's orchestrator_restart_lease_max_age_secs; a --drain sweep
+# is fitted under it at scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS.
+# A lease leaked by a SIGKILLed
+# sweep (whose EXIT trap cannot run, by construction) therefore delays at most
+# ONE redeploy window and can never wedge the fleet.
+DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 14400.0
 
 
 # ---------------------------------------------------------------------------
@@ -181,14 +173,8 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
     costs at most one collision — exactly pre-4755 behaviour. A backwards clock
     step is the cheap failure; a wedged fleet is not.
 
-    The pid predicate is ``session_registry._pid_alive``, IMPORTED rather than
-    re-implemented (heuristic 11): it already encodes the required contract,
-    including rejecting ``pid <= 0`` BEFORE ``os.kill`` — ``os.kill(0, 0)``
-    signals the caller's whole process group. The type checks here are this
-    function's own share of that contract, because JSON can hand us a string
-    or a bool where that predicate expects an int. The watchdog's fourth copy
-    of the same predicate is FORCED by its stdlib-only constraint, not a
-    second opinion.
+    The type checks here gate this function's WARNING for a malformed lease,
+    which ``pid_alive``'s silent False would not give.
     """
     if path is None:
         return False
@@ -238,7 +224,7 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
         return False
     if age >= max_age_secs:
         return False
-    return _pid_alive(pid)
+    return pid_alive(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -737,9 +723,8 @@ class StaleServiceRestartCoordinator:
         ``force_fire_after_secs`` (disabled when ``0.0``), the agents_idle
         gate, the debounce, and the restart_precondition preference are all
         bypassed — but the min_interval cap below is NEVER bypassed. This
-        exists so the polite path (which requires ``agents_idle=True``, only
-        reachable from the run-loop's idle branch) cannot starve a pending
-        restart indefinitely under chronic fleet saturation.
+        exists so the polite path (which requires ``agents_idle=True``) cannot
+        starve a pending restart indefinitely under chronic fleet saturation.
 
         This class does NOT itself provide an interrupt-safety net for
         whatever ``restart_precondition`` was standing in for (e.g. a

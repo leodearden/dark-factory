@@ -1,0 +1,48 @@
+{
+  "task_id": "4953",
+  "reason": "Net-additive defect fix: stack_train_branches now captures each member's tip immediately before the rebase that overwrites it (PreStackTip; a member with no readable tip is ejected, so none is stacked without a restore point), and GitOps.restore_pre_stack_tip adds the guarded compare-and-swap that hands a member back on that tip when its coalesce train does not land.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1424,
+      "current": 1435
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_stack_member",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 15870,
+      "current": 15957
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9292,
+      "current": 9313
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4842,
+      "current": 4853
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57607,
+      "current": 57694
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32043,
+      "current": 32064
+    }
+  ]
+}

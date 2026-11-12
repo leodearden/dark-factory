@@ -14,25 +14,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
+from shared.task_tags import DEFAULT_TAG
 
 import dashboard.data.escalation_corpus as escalation_corpus
 from dashboard.config import DashboardConfig
-from dashboard.data.datum import Datum, DatumState, validate_datum
+from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
 from dashboard.data.escalation_corpus import (
     CORPUS_FRESHNESS_BOUND_SECONDS,
     CORPUS_TTL_SECONDS,
+    HUMAN_LEVEL,
     EscalationCorpus,
     EscalationView,
     Location,
+    PendingEscalations,
     QueueKind,
     QueueRef,
     acquire_corpus,
     corpus_queues,
+    measure_corpus,
+    pending_escalation_ids,
+    pending_level2_by_task,
+    serve_corpus,
     views_over,
     walk_corpus,
 )
@@ -79,6 +90,11 @@ def _fresh(corpus: EscalationCorpus) -> Datum[EscalationCorpus]:
 def _reason(datum: Datum) -> str:
     assert datum.reason is not None
     return datum.reason
+
+
+def _by_task(datum: Datum[Mapping[int, tuple[str, ...]]]) -> dict[int, tuple[str, ...]]:
+    assert datum.value is not None, datum.reason
+    return dict(datum.value)
 
 
 def _corpus(datum: Datum[EscalationCorpus]) -> EscalationCorpus:
@@ -295,6 +311,95 @@ class TestViewsOver:
         assert views[EscalationView.OPEN_IN_HISTORY].value == 7
 
 
+class TestPendingEscalationIds:
+    """Each task's pending live-queue escalations in one queue; None when that is unknown."""
+
+    def test_pending_root_records_are_grouped_by_task_with_sorted_ids(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-2', task_id='7'))
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        _write(queue_dir, _record('esc-9-1', task_id='9'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1', 'esc-7-2'), '9': ('esc-9-1',)})
+
+    def test_the_queue_names_only_tasks_of_the_default_tag(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids is not None
+        assert ids.pinning(DEFAULT_TAG, 7) == ('esc-7-1',)
+        assert ids.pinning(DEFAULT_TAG, 8) == ()
+        assert ids.pinning('feature', 7) is None
+
+    def test_resolved_and_archived_records_are_not_in_the_live_queue_view(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        _write(queue_dir, _record('esc-7-2', status='resolved', task_id='7'))
+        _write(queue_dir, _record('esc-8-1', task_id='8'), archived=True)
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_an_unreached_queue_is_unknown(self, tmp_path):
+        queue = _queue(tmp_path / 'never-escalated')
+
+        assert pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id) is None
+
+    def test_an_unreadable_file_makes_the_queue_unknown_not_none(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        (queue_dir / 'esc-7-2.json').write_text('{not json')
+        queue = _queue(queue_dir)
+
+        assert pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id) is None
+
+    def test_an_unreadable_archived_file_leaves_the_live_queue_known(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        corrupt = _write(queue_dir, _record('esc-8-1', task_id='8'), archived=True)
+        corrupt.write_text('{not json')
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), queue.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_an_unread_corpus_is_unknown(self, tmp_path):
+        unread = unknown_datum('the escalation corpus was not read', CORPUS_FRESHNESS_BOUND_SECONDS)
+
+        assert pending_escalation_ids(unread, str(tmp_path)) is None
+
+    def test_only_the_named_queue_is_read(self, tmp_path):
+        first_dir = tmp_path / 'a' / 'escalations'
+        second_dir = tmp_path / 'b' / 'escalations'
+        _write(first_dir, _record('esc-7-1', task_id='7'))
+        _write(second_dir, _record('esc-7-9', task_id='7'))
+        _write(second_dir, _record('esc-3-1', task_id='3'))
+        first = _queue(first_dir, 'a')
+        second = _queue(second_dir, 'b')
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((first, second))), first.id)
+
+        assert ids == PendingEscalations({'7': ('esc-7-1',)})
+
+    def test_a_queue_the_corpus_does_not_carry_is_unknown(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _write(queue_dir, _record('esc-7-1', task_id='7'))
+        queue = _queue(queue_dir)
+
+        ids = pending_escalation_ids(_fresh(walk_corpus((queue,))), str(tmp_path / 'other'))
+
+        assert ids is None
+
+
 
 @pytest.fixture(autouse=True)
 def _corpus_cache():
@@ -420,3 +525,233 @@ class TestAcquireCorpus:
         )
 
         assert first is second
+
+
+class _CountedWalk:
+    """``walk_corpus`` as patched in: counts its calls, optionally sleeping or raising first."""
+
+    def __init__(self, *, sleep_seconds: float = 0.0, error: Exception | None = None) -> None:
+        self.calls = 0
+        self.sleep_seconds = sleep_seconds
+        self.error = error
+
+    def __call__(self, queues) -> EscalationCorpus:
+        self.calls += 1
+        time.sleep(self.sleep_seconds)
+        if self.error is not None:
+            raise self.error
+        return walk_corpus(queues)
+
+
+def _unreadable_walk() -> _CountedWalk:
+    return _CountedWalk(error=OSError('queue directory unreadable'))
+
+
+class TestServeCorpus:
+    """The corpus served with a bounded wait, an exception guard and its last good walk."""
+
+    @pytest.fixture
+    def queue(self, tmp_path) -> QueueRef:
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        return _queue(queue_dir)
+
+    async def test_a_walk_that_raises_before_any_success_is_unknown_naming_it(
+        self, queue, monkeypatch,
+    ):
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+
+        assert served.state is DatumState.UNKNOWN
+        assert served.value is None
+        assert 'OSError' in _reason(served)
+        assert 'queue directory unreadable' in _reason(served)
+        assert served.freshness_bound_seconds == CORPUS_FRESHNESS_BOUND_SECONDS
+
+    async def test_a_walk_that_raises_after_a_good_one_serves_the_last_good_walk(
+        self, queue, monkeypatch,
+    ):
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+        good = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert good.state is DatumState.FRESH
+        assert served.state is DatumState.STALE
+        assert _corpus(served).scans == _corpus(good).scans
+        assert served.as_of == NOW
+        assert 'OSError' in _reason(served)
+
+    async def test_a_slow_walk_is_not_waited_on_and_lands_for_a_later_call(
+        self, queue, monkeypatch,
+    ):
+        walk = _CountedWalk(sleep_seconds=0.5)
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', walk)
+
+        started = time.monotonic()
+        waited = await serve_corpus((queue,), now=NOW, wait_seconds=0.05)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < walk.sleep_seconds
+        assert waited.state is DatumState.UNKNOWN
+        assert 'in flight' in _reason(waited)
+
+        deadline = time.monotonic() + 5.0
+        landed = waited
+        while landed.state is not DatumState.FRESH and time.monotonic() < deadline:
+            landed = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+
+        assert landed.state is DatumState.FRESH
+        assert _counts(landed, queue) == (2, 5)
+        assert walk.calls == 1
+
+    async def test_the_cache_clear_hook_forgets_the_last_good_walk_too(
+        self, queue, monkeypatch,
+    ):
+        await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        escalation_corpus._corpus_cache_clear()
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert served.state is DatumState.UNKNOWN
+
+    async def test_two_calls_inside_the_ttl_walk_once(self, queue, monkeypatch):
+        walk = _CountedWalk()
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', walk)
+
+        first = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        second = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert walk.calls == 1
+        assert first.state is second.state is DatumState.FRESH
+        assert second.as_of == NOW
+
+
+def _file(queue: EscalationQueue, esc_id: str, task_id: str, *, level: int = 2) -> None:
+    """One pending escalation, filed through the real queue."""
+    queue.submit(Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='implementer',
+        severity='blocking',
+        category='design_concern',
+        summary=f'summary of {esc_id}',
+        timestamp='2026-09-01T00:00:00+00:00',
+        status='pending',
+        level=level,
+    ))
+
+
+def _archive_pending(queue: EscalationQueue, esc_id: str) -> None:
+    """Move a still-pending record into the archive, where no live escalation lies."""
+    archived = archive_dir_for_date(queue.queue_dir, NOW.isoformat())
+    archived.mkdir(parents=True, exist_ok=True)
+    (queue.queue_dir / f'{esc_id}.json').replace(archived / f'{esc_id}.json')
+
+
+class TestPendingLevel2ByTask:
+    """The ruling input: each task's pending human-level escalations in its project's live queue."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> DashboardConfig:
+        root = tmp_path / 'proj'
+        root.mkdir()
+        config = DashboardConfig(project_root=root)
+        config.escalations_dir.mkdir(parents=True)
+        config.reconciliation_escalations_dir.mkdir(parents=True)
+        return config
+
+    @staticmethod
+    def _ruling(config: DashboardConfig) -> Datum:
+        return pending_level2_by_task(
+            measure_corpus(corpus_queues(config), now=NOW), str(config.project_root),
+        )
+
+    def test_a_pending_human_record_at_the_queue_root_names_its_task(self, config):
+        _file(EscalationQueue(config.escalations_dir), 'esc-3546-2', '3546')
+
+        datum = self._ruling(config)
+
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert datum.as_of == NOW
+        assert datum.freshness_bound_seconds == CORPUS_FRESHNESS_BOUND_SECONDS
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
+
+    def test_only_pending_human_records_at_the_root_on_a_numbered_task_are_listed(self, config):
+        queue = EscalationQueue(config.escalations_dir)
+        _file(queue, 'esc-3546-2', '3546')
+        _file(queue, 'esc-10-1', '10', level=1)
+        _file(queue, 'esc-11-1', '11')
+        queue.resolve('esc-11-1', 'ruled')
+        _file(queue, 'esc-12-1', '12')
+        _archive_pending(queue, 'esc-12-1')
+        _file(queue, 'esc-b13-1', 'b13')
+
+        datum = self._ruling(config)
+
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
+
+    @pytest.mark.parametrize('task_id', [None, 7])
+    def test_a_human_record_whose_task_id_is_not_a_digit_string_is_left_out(
+        self, config, task_id,
+    ):
+        _file(EscalationQueue(config.escalations_dir), 'esc-3546-2', '3546')
+        record = _record('esc-none-1') | {'task_id': task_id, 'level': HUMAN_LEVEL}
+        _write(config.escalations_dir, record)
+
+        datum = self._ruling(config)
+
+        assert datum.state is DatumState.FRESH
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
+
+    def test_two_human_records_on_one_task_are_both_listed_in_order(self, config):
+        queue = EscalationQueue(config.escalations_dir)
+        _file(queue, 'esc-20-3', '20')
+        _file(queue, 'esc-20-1', '20')
+
+        assert _by_task(self._ruling(config)) == {20: ('esc-20-1', 'esc-20-3')}
+
+    def test_another_roots_missing_queue_does_not_make_this_projects_ruling_partial(
+        self, config, tmp_path,
+    ):
+        other = tmp_path / 'other'
+        other.mkdir()
+        config = DashboardConfig(project_root=config.project_root, known_project_roots=[other])
+        _file(EscalationQueue(config.escalations_dir), 'esc-3546-2', '3546')
+        corpus_datum = measure_corpus(corpus_queues(config), now=NOW)
+
+        datum = pending_level2_by_task(corpus_datum, str(config.project_root))
+
+        assert corpus_datum.state is DatumState.LOWER_BOUND
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
+
+    def test_this_projects_missing_queue_makes_its_ruling_a_lower_bound_naming_it(self, config):
+        config.escalations_dir.rmdir()
+
+        datum = self._ruling(config)
+
+        assert datum.state is DatumState.LOWER_BOUND
+        assert str(config.escalations_dir) in _reason(datum)
+        assert _by_task(datum) == {}
+
+    def test_an_unknown_corpus_is_an_unknown_ruling_with_its_reason(self, config):
+        unread = unknown_datum('corpus walk timed out', CORPUS_FRESHNESS_BOUND_SECONDS)
+
+        datum = pending_level2_by_task(unread, str(config.project_root))
+
+        assert datum == unknown_datum('corpus walk timed out', CORPUS_FRESHNESS_BOUND_SECONDS)
+
+    def test_a_queue_the_corpus_does_not_carry_is_an_unknown_ruling(self, config, tmp_path):
+        datum = pending_level2_by_task(
+            measure_corpus(corpus_queues(config), now=NOW), str(tmp_path / 'elsewhere'),
+        )
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert str(tmp_path / 'elsewhere') in _reason(datum)

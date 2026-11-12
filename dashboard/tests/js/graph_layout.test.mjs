@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView } = layout;
+const { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView, layoutSignature, taskGraphLayout } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -25,6 +25,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'computeNeighborhood',
   'focusSubset',
   'focusGroupView',
+  'layoutSignature',
+  'taskGraphLayout',
 ];
 
 // Builds a minimal task fixture matching the dep edge shape the dashboard
@@ -805,4 +807,168 @@ test('focusGroupView: INVARIANT — shownCount === shown.length across every cas
       `shownCount drifted from shown.length for options ${JSON.stringify(options)}`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// layoutSignature — the content key TaskGraph memoizes its layout and
+// neighborhood on (task 5116). Callers hand TaskGraph a fresh array of fresh
+// task objects on every render and every data poll, so a reference-keyed memo
+// never hits; this key must be equal whenever the layout's inputs (input
+// order, id, status, deps[].id) are equal, and differ whenever any of them
+// differs.
+// ---------------------------------------------------------------------------
+
+// A task carrying the display fields the dashboard ships alongside the
+// layout inputs, so tests can vary the former without touching the latter.
+function displayTask(id, depIds = [], status = 'pending') {
+  return {
+    id,
+    status,
+    title: `title ${id}`,
+    started: '2026-10-04T10:00:00Z',
+    completed: null,
+    stranded: false,
+    train: null,
+    prd: 'prd-a',
+    deps: depIds.map(depId => ({ id: depId, done: false, title: `title ${depId}` })),
+  };
+}
+
+// A tangled two-tier component, a separate chain, and two singletons.
+function signatureFixture() {
+  return [
+    displayTask('P1'),
+    displayTask('P2', [], 'in-progress'),
+    displayTask('C1', ['P2']),
+    displayTask('C2', ['P1']),
+    displayTask('S1', [], 'blocked'),
+    displayTask('A'),
+    displayTask('B', ['A'], 'done'),
+    displayTask('S2'),
+  ];
+}
+
+// Every field the layout does NOT read is changed; every field it does read
+// is left alone.
+function withDisplayFieldsChanged(tasks) {
+  return structuredClone(tasks).map(t => ({
+    ...t,
+    title: `${t.title} (renamed)`,
+    started: '2026-10-05T00:00:00Z',
+    completed: '2026-10-05T01:00:00Z',
+    stranded: true,
+    train: 'train-7',
+    prd: 'prd-b',
+    deps: t.deps.map(d => ({ ...d, done: true, title: `${d.title} (renamed)` })),
+  }));
+}
+
+test('layoutSignature: equal across a fresh deep copy (the per-render / per-poll case)', () => {
+  const tasks = signatureFixture();
+  assert.equal(layoutSignature(tasks), layoutSignature(structuredClone(tasks)));
+});
+
+test('layoutSignature: blind to fields the layout does not read', () => {
+  const tasks = signatureFixture();
+  assert.equal(layoutSignature(tasks), layoutSignature(withDisplayFieldsChanged(tasks)));
+});
+
+test('layoutSignature: differs when any layout input changes', () => {
+  const base = signatureFixture();
+  const variants = {
+    'status changed': tasks => { tasks[0].status = 'blocked'; },
+    'dep id added': tasks => { tasks[4].deps.push({ id: 'S2' }); },
+    'dep id removed': tasks => { tasks[2].deps = []; },
+    'task added': tasks => { tasks.push(displayTask('S3')); },
+    'task removed': tasks => { tasks.splice(4, 1); },
+    'input order swapped': tasks => { [tasks[0], tasks[1]] = [tasks[1], tasks[0]]; },
+  };
+  for (const [label, mutate] of Object.entries(variants)) {
+    const changed = structuredClone(base);
+    mutate(changed);
+    assert.notEqual(
+      layoutSignature(changed),
+      layoutSignature(base),
+      `layoutSignature must change when ${label}`,
+    );
+  }
+});
+
+test('layoutSignature: a missing deps field and an empty deps array are the same key', () => {
+  assert.equal(layoutSignature([{ id: 'a' }]), layoutSignature([{ id: 'a', deps: [] }]));
+});
+
+test('layoutSignature: encoding is unambiguous — a comma inside a dep id is not two deps', () => {
+  assert.notEqual(
+    layoutSignature([{ id: 'a', deps: [{ id: 'b,c' }] }]),
+    layoutSignature([{ id: 'a', deps: [{ id: 'b' }, { id: 'c' }] }]),
+  );
+});
+
+test('layoutSignature: empty input returns a string without throwing', () => {
+  assert.equal(typeof layoutSignature([]), 'string');
+});
+
+// ---------------------------------------------------------------------------
+// taskGraphLayout — TaskGraph's whole layout as ids only: tiers computed once
+// over the full list, weakly-connected components each ordered by orderRows,
+// and the singletons. Holding ids (never task objects) is what lets TaskGraph
+// cache the result on layoutSignature without freezing displayed task fields.
+// ---------------------------------------------------------------------------
+
+// Three components — a P1 diamond, an A→B chain, a P2 chain — interleaved
+// with two singletons, so neither is contiguous in the input.
+function layoutFixture() {
+  return [
+    displayTask('P1'),
+    displayTask('A'),
+    displayTask('P2'),
+    displayTask('S1', [], 'blocked'),
+    displayTask('M1', ['P2']),
+    displayTask('M2', ['P1'], 'in-progress'),
+    displayTask('B', ['A'], 'done'),
+    displayTask('M3', ['P1']),
+    displayTask('C1', ['M2', 'M3']),
+    displayTask('S2'),
+    displayTask('C2', ['M1']),
+  ];
+}
+
+test('taskGraphLayout: one block per component in first-member order, one row per tier, singletons apart', () => {
+  assert.deepEqual(taskGraphLayout(layoutFixture()), {
+    blocks: [
+      [['P1'], ['M2', 'M3'], ['C1']],
+      [['A'], ['B']],
+      [['P2'], ['M1'], ['C2']],
+    ],
+    singletons: ['S1', 'S2'],
+  });
+});
+
+test('taskGraphLayout: holds ids only — every leaf is a string, so no task object is reachable', () => {
+  const { blocks, singletons } = taskGraphLayout(layoutFixture());
+  assert.ok(blocks.length > 0, 'fixture should produce at least one component block');
+  for (const block of blocks) {
+    assert.ok(Array.isArray(block), `block should be an array of rows, got ${JSON.stringify(block)}`);
+    for (const row of block) {
+      assert.ok(Array.isArray(row), `row should be an array of ids, got ${JSON.stringify(row)}`);
+      for (const id of row) assert.equal(typeof id, 'string', `row entry should be an id string, got ${JSON.stringify(id)}`);
+    }
+  }
+  assert.ok(singletons.length > 0, 'fixture should produce at least one singleton');
+  for (const id of singletons) assert.equal(typeof id, 'string', `singleton should be an id string, got ${JSON.stringify(id)}`);
+});
+
+test('taskGraphLayout: blind to fields the layout does not read', () => {
+  const tasks = layoutFixture();
+  assert.deepEqual(taskGraphLayout(withDisplayFieldsChanged(tasks)), taskGraphLayout(tasks));
+});
+
+test('taskGraphLayout: empty input yields no blocks and no singletons', () => {
+  assert.deepEqual(taskGraphLayout([]), { blocks: [], singletons: [] });
+});
+
+test('taskGraphLayout: deterministic across fresh deep copies of identical input', () => {
+  const tasks = layoutFixture();
+  assert.deepEqual(taskGraphLayout(structuredClone(tasks)), taskGraphLayout(structuredClone(tasks)));
 });

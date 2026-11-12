@@ -1,6 +1,9 @@
 # PRD — Offline deep-test lane, Part B (dark-factory async lane worker)
 
 **Status:** author-complete, gates passed (2026-07-01). Decompose-ready.
+
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: C3 (failing-set fingerprint dedup), C4 (escalation staging) and boundary rows B4 to B7 are replaced by per-test episodes, filing on persistence and one bounded escalation; read that PRD for the red path.
+
 **Slug:** `offline-deep-test-lane-worker` · **Milestone:** orchestrator verify/merge infra (`docs/prds/`).
 **Authoritative design:** `/home/leo/src/reify/docs/design/offline-deep-test-lane.md` (ratified D1–D5,
 2026-06-09; §5 trigger/single-flight, §7 failure handling, §8 warm worktree, §10 ownership, §11 invariants).

@@ -146,6 +146,17 @@ class TestCoerceFiles:
             'residual bracket/quote characters' in r.getMessage() for r in caplog.records
         )
 
+    @pytest.mark.parametrize('value', [{'a.py': 1}, 42])
+    def test_unrecognized_type_maps_to_empty_and_logs_warning(self, caplog, value):
+        """A ``files`` value read back from a stored plan has passed no
+        pydantic boundary, so a type that is neither list, str nor None must
+        degrade to no files, loudly, rather than raise."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files(value)
+
+        assert result == []
+        assert any('unrecognized type' in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Architect tool tests
@@ -915,6 +926,57 @@ class TestDropPlanFile:
         assert result['message']
         self._assert_record_untouched(artifacts, ['mod_a/only.py'])
 
+    def test_stringified_files_are_normalized_not_iterated_by_character(
+        self, artifacts
+    ):
+        """A stored non-list ``files`` must be coerced, not treated as a
+        string whose substrings and characters are the "entries"."""
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = '["mod_a/foo.py","mod_a/bar.py"]'
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_plan()['files'] == ['mod_a/bar.py']
+
+    def test_stringified_files_single_entry_still_refuses_last_drop(
+        self, artifacts
+    ):
+        stored = '["mod_a/only.py"]'
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert 'last file' in result['message']
+        self._assert_record_untouched(artifacts, stored)
+
+    @pytest.mark.parametrize('stored', [{'mod_a/foo.py': True}, 42])
+    def test_unrecognized_stored_files_type_is_refused_not_raised(
+        self, artifacts, stored
+    ):
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'error'
+        assert 'not in the plan files list' in result['message']
+        self._assert_record_untouched(artifacts, stored)
+
 
 class TestRemovePlanStep:
     def test_removes_pending_step(self, artifacts):
@@ -1017,6 +1079,11 @@ class TestConfirmPlan:
         # _finalized_at is the durable completeness marker the workflow gates on.
         assert '_finalized_at' in plan
         assert plan['_finalized_at']
+
+    def test_records_the_architect_as_confirmer(self, artifacts):
+        _setup_full_plan(artifacts)
+        assert _confirm_plan(artifacts)['status'] == 'ok'
+        assert artifacts.read_plan()['_confirmed_by'] == 'architect'
 
     def test_no_plan_returns_error(self, artifacts):
         result = _confirm_plan(artifacts)
@@ -1482,7 +1549,7 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root == mr
+        assert artifacts.lane_root == artifacts.task_root == mr
         assert artifacts.worktree == wt
 
     def test_omitted_meta_root_falls_back_to_legacy_task_dir(self, tmp_path):
@@ -1492,12 +1559,12 @@ class TestArtifactsFromArgs:
 
         artifacts = _artifacts_from_args(['--worktree', str(wt)])
 
-        assert artifacts.root == wt / '.task'
+        assert artifacts.lane_root == artifacts.task_root == wt / '.task'
         assert artifacts.worktree == wt
 
     def test_worktree_attr_survives_sibling_root_relocation(self, tmp_path):
         """Documents the plan_tools.py:600 bug this task fixes: once ``root``
-        is a sibling ``.task-meta`` dir, ``artifacts.root.parent`` is the
+        is a sibling ``.task-meta`` dir, ``artifacts.lane_root.parent`` is the
         `.task-meta` BASE, not the worktree — callers needing the worktree
         (e.g. resolving main's SHA via git) must use ``artifacts.worktree``.
         """
@@ -1510,8 +1577,79 @@ class TestArtifactsFromArgs:
             ['--worktree', str(wt), '--meta-root', str(mr)]
         )
 
-        assert artifacts.root.parent != wt
+        assert artifacts.lane_root.parent != wt
         assert artifacts.worktree == wt
+
+
+def _dual_root_argv(tmp_path: Path, task_root: Path) -> tuple[list[str], Path]:
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+    lane = tmp_path / '.task-meta' / 'wt'
+    lane.mkdir(parents=True)
+    argv = ['--worktree', str(wt), '--meta-root', str(lane), '--task-root', str(task_root)]
+    return argv, lane
+
+
+class TestArtifactsFromArgsTaskRoot:
+    """``--task-root`` (task 3155) gives the agent-side server the same two
+    roots the workflow uses: task-lifetime artifacts land in the task root,
+    the architect's structured exits stay in the lane root."""
+
+    def test_task_root_flag_produces_dual_roots(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+
+        artifacts = _artifacts_from_args(argv)
+
+        assert artifacts.lane_root == lane.resolve()
+        assert artifacts.task_root == task.resolve()
+
+    def test_missing_task_root_exits_naming_it(self, tmp_path, capsys):
+        task = tmp_path / '.task-meta' / 'task-absent'
+        argv, _ = _dual_root_argv(tmp_path, task)
+
+        with pytest.raises(SystemExit) as exc:
+            _artifacts_from_args(argv)
+
+        assert exc.value.code == 1
+        assert str(task.resolve()) in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_plan_lifecycle_writes_the_task_root_plan(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        for name, arguments in (
+            ('create_plan', {'task_id': '3155', 'title': 'T', 'analysis': 'A', 'files': ['m.py']}),
+            ('add_plan_step', {'step_id': 'step-1', 'step_type': 'test', 'description': 'Write a test'}),
+            ('confirm_plan', {}),
+            ('mark_step_done', {'step_id': 'step-1', 'commit_sha': 'abc123'}),
+        ):
+            tool = await server.get_tool(name)
+            assert tool is not None
+            await tool.run(arguments)
+
+        plan = TaskArtifacts(tmp_path / 'wt', task).read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert not (lane / 'plan.json').exists()
+
+    @pytest.mark.asyncio
+    async def test_blocking_dependency_report_stays_in_the_lane_root(self, tmp_path, monkeypatch):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        argv, lane = _dual_root_argv(tmp_path, task)
+        task.mkdir()
+        monkeypatch.setattr(plan_tools, '_resolve_main_sha', lambda worktree: 'deadbeef')
+        server = plan_tools.create_server(_artifacts_from_args(argv))
+
+        tool = await server.get_tool('report_blocking_dependency')
+        assert tool is not None
+        await tool.run({'depends_on_task_id': '42', 'reason': 'missing foo()'})
+
+        assert (lane / 'blocking_dependency.json').is_file()
+        assert not (task / 'blocking_dependency.json').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1529,7 +1667,7 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
     unit tests) call the private helper with an explicit ``main_sha=``,
     bypassing the tool wrapper's own ``worktree = artifacts.worktree`` /
     ``_resolve_main_sha(worktree)`` code path entirely — a regression that
-    reverted plan_tools.py:603 back to ``artifacts.root.parent`` would still
+    reverted plan_tools.py:603 back to ``artifacts.lane_root.parent`` would still
     pass every one of those tests. This test drives the actual registered
     MCP tool through ``create_server`` with a relocated (sibling)
     ``meta_root`` and monkeypatches ``_resolve_main_sha`` to capture the
@@ -1551,7 +1689,7 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         # Sanity check this fixture actually reproduces the bug scenario:
         # once root is a relocated sibling, root.parent is the .task-meta
         # BASE, not the worktree.
-        assert artifacts.root.parent != artifacts.worktree
+        assert artifacts.lane_root.parent != artifacts.worktree
 
         captured: list[object] = []
 
@@ -1790,7 +1928,7 @@ class TestMarkStepCommitted:
         artifacts, _head = _init_git_repo_artifacts(tmp_path / 'repo')
         artifacts.write_plan(_committable_plan())
         artifacts.read_plan()  # stabilize any one-time normalization rewrite
-        before = (artifacts.root / 'plan.json').read_text()
+        before = artifacts.artifact_path('plan.json').read_text()
 
         bogus = 'f' * 40
         result = plan_tools._mark_step_committed(artifacts, 'step-1', bogus)
@@ -1800,7 +1938,7 @@ class TestMarkStepCommitted:
         assert bogus in result['message']
         # corroborate-before-acting: plan is byte-for-byte unchanged and the
         # step is still pending (the git cat-file -e guard refused the sha).
-        assert (artifacts.root / 'plan.json').read_text() == before
+        assert artifacts.artifact_path('plan.json').read_text() == before
         assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
 
     async def test_unknown_step_id_errors(self, tmp_path):

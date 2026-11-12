@@ -1,0 +1,48 @@
+{
+  "task_id": "4953",
+  "reason": "Net-additive defect fix: a coalesce train that does not land (derail, incomplete train, admission-halt dissolution) now hands every member back on its pre-stack tip before the 1867 re-drive, through one _unwind_coalesce_train policy (GroupMergeRequest.member_pre_stack_tips; status- and landed-guarded restore that never resets a branch a live agent may own); the two inline guarded re-drive blocks it replaces are gone.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2195,
+      "current": 2199
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1901,
+      "current": 1907
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22142,
+      "current": 22235
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12547,
+      "current": 12574
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4853,
+      "current": 4857
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57694,
+      "current": 57793
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32064,
+      "current": 32091
+    }
+  ]
+}

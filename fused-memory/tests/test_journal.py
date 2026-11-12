@@ -2,14 +2,15 @@
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -25,6 +26,33 @@ from fused_memory.reconciliation.journal import (
     ReconciliationJournal,
 )
 from fused_memory.services.memory_service import MemoryService
+
+_LEGACY_JOURNAL_ENTRIES_DDL = """
+CREATE TABLE journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    stage TEXT,
+    timestamp TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    before_state TEXT,
+    after_state TEXT,
+    reasoning TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]'
+);
+CREATE INDEX idx_journal_run ON journal_entries(run_id);
+"""
+
+
+def _schema_names(db_path: Path, kind: str) -> set[str]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT name FROM sqlite_master WHERE type = ?', (kind,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {name for (name,) in rows}
 
 
 @pytest_asyncio.fixture
@@ -90,27 +118,54 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_journal_entries(journal):
-    run_id = str(uuid.uuid4())
-    entry = JournalEntry(
-        id=str(uuid.uuid4()),
-        run_id=run_id,
-        stage=StageId.memory_consolidator,
-        timestamp=datetime.now(UTC),
-        operation='delete_memory',
-        target_system='mem0',
-        before_state={'id': '123', 'content': 'old'},
-        after_state=None,
-        reasoning='Duplicate found',
-        evidence=[{'query': 'test', 'match': True}],
-    )
-    await journal.add_entry(entry)
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
+    """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    entries = await journal.get_entries(run_id)
-    assert len(entries) == 1
-    assert entries[0].operation == 'delete_memory'
-    assert entries[0].before_state == {'id': '123', 'content': 'old'}
-    assert entries[0].evidence == [{'query': 'test', 'match': True}]
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.
+    """
+    db_path = journal.data_dir / 'reconciliation.db'
+
+    assert _schema_names(db_path, 'table') == {
+        'watermarks',
+        'runs',
+        'judge_verdicts',
+        'event_buffer',
+        'reconciliation_locks',
+        'burst_state',
+        'chunk_boundaries',
+        'run_actions',
+        'halt_state',
+        'judge_pending',
+    }
+
+
+@pytest.mark.asyncio
+async def test_initialize_drops_the_retired_journal_entries_table(journal, tmp_path):
+    """A reconciliation.db created before task 5890 loses the retired journal_entries table, and its index, on initialize."""
+    legacy_dir = tmp_path / 'legacy_recon'
+    legacy_dir.mkdir()
+    legacy_db = legacy_dir / 'reconciliation.db'
+    conn = sqlite3.connect(legacy_db)
+    try:
+        conn.executescript(_LEGACY_JOURNAL_ENTRIES_DDL)
+    finally:
+        conn.close()
+
+    legacy = ReconciliationJournal(legacy_dir)
+    try:
+        await legacy.initialize()
+    finally:
+        await legacy.close()
+
+    assert 'journal_entries' not in _schema_names(legacy_db, 'table')
+    assert 'idx_journal_run' not in _schema_names(legacy_db, 'index')
+    assert _schema_names(legacy_db, 'table') == _schema_names(
+        journal.data_dir / 'reconciliation.db', 'table',
+    )
 
 
 @pytest.mark.asyncio
@@ -367,7 +422,7 @@ async def test_record_run_session_persists_and_increments_attempt(journal):
     assert loaded.stage_cursor == 'memory_consolidator'
     assert loaded.attempt == 1
 
-    # Same snapshot is visible via the _row_to_run recovery read path (σ).
+    # Same snapshot is visible via the _row_to_run recovery read path.
     running = {r.id: r for r in await journal.get_running_runs()}
     assert running[run_id].session_id == 'S1'
     assert running[run_id].stage_cursor == 'memory_consolidator'
@@ -1274,6 +1329,29 @@ class TestCompleteRunIfStatus:
         assert after.completed_at == before.completed_at
 
 
+class TestIsRunCompleted:
+    """The journal's one answer to whether a run durably completed."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_journaled_completed_answers_true(self, journal):
+        run_id = await TestCompleteRunIfStatus._seed(journal, RunStatus.completed)
+
+        assert await journal.is_run_completed(run_id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', [RunStatus.running, RunStatus.failed, RunStatus.interrupted]
+    )
+    async def test_a_run_in_any_other_status_answers_false(self, journal, status):
+        run_id = await TestCompleteRunIfStatus._seed(journal, status)
+
+        assert await journal.is_run_completed(run_id) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_id_answers_false_without_raising(self, journal):
+        assert await journal.is_run_completed('nonexistent-id') is False
+
+
 class TestUpdateRunStageReportsPreservesCitationRepairs:
     """The run owner's wholesale rewrite never erases a citation repair a
     compare-and-set writer persisted: the owner's copy predates the repair, so
@@ -1588,14 +1666,15 @@ class TestGetRunStageExecution:
     async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
         self, journal
     ):
-        """``status`` alone cannot tell a settled run from one that is running
-        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
-        run and ``run_full_cycle`` marks it running only on the in-memory
-        object, leaving the column ``'interrupted'``. The adopt pass does
-        persist its ``_resume`` bookkeeping first, so that key is the one
-        durable signal that the blob may be a stale mid-flight snapshot, and
-        the projection surfaces it rather than making every caller re-parse
-        ``stage_reports`` to find out."""
+        """``status`` alone cannot tell a settled legacy row from one that was
+        running again: before task 5514 retired resume, the startup
+        adopt-and-resume pass took over an interrupted run and
+        ``run_full_cycle`` marked it running only on the in-memory object,
+        leaving the column ``'interrupted'``. The adopt pass did persist its
+        ``_resume`` bookkeeping first, so that key is the one durable signal
+        that the blob may be a stale mid-flight snapshot, and the projection
+        surfaces it rather than making every caller re-parse ``stage_reports``
+        to find out."""
         settled = str(uuid.uuid4())
         await self._start(journal, settled)
         await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
@@ -1662,12 +1741,13 @@ class TestGetRunStageExecution:
     async def test_interrupted_settles_only_when_it_was_never_adopted(
         self, journal, adopted, settled
     ):
-        """``interrupted`` is the one terminal status a run can leave: the
-        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
-        re-runs the run behind a status column only ``complete_run`` ever
-        writes. So the SAME terminal status means "finished account" or
-        "executing again" depending on that key, and the projection — not its
-        caller — is what knows the difference."""
+        """``interrupted`` was the one terminal status a run could leave: the
+        adopt-and-resume pass (retired by task 5514) persisted its ``_resume``
+        bookkeeping and then re-ran the run behind a status column only
+        ``complete_run`` ever writes. So on a legacy row the SAME terminal
+        status means "finished account" or "was executing again" depending on
+        that key, and the projection — not its caller — is what knows the
+        difference."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
         if adopted:

@@ -32,8 +32,8 @@ from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import GroupMergeRequest, MergeOutcome
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowCancelled,

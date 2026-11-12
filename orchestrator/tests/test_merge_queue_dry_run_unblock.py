@@ -27,7 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, make_lane
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, make_lane
 from _orch_helpers import wait_responsive
 from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
 from test_merge_queue_main_health import (
@@ -41,10 +41,11 @@ from test_merge_queue_main_health import (
 
 from orchestrator.b3_gate import ABORT, check_proposal
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.git_ops import _run as _run_git
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     PRODUCTION_CLOCK,
     PRODUCTION_VERIFIER,
@@ -458,14 +459,14 @@ class TestUnscopedTypecheckFailedSpawns:
             # The ONE patch this file still needs (PRD γ9 residual). Every
             # sibling arm produces its condition for real -- the RED verify
             # through the injected port, "not pre-existing" through
-            # `escalate_preexisting_main_break=False`, the disk skip through
-            # the port's disk guard -- but a genuinely RED main has no such
-            # seam: `verify_failure_is_preexisting_on_main` lives in
+            # `_make_config(tmp_path, escalate_preexisting=False)`, the disk
+            # skip through the port's disk guard -- but a genuinely RED main
+            # has no such seam: `verify_failure_is_preexisting_on_main` lives in
             # `orchestrator.verify`, takes no port, and probes by running a
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
                 patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(True, MAIN_SHA)),
                 ),
             ):
@@ -517,7 +518,7 @@ class TestUnblockAutoDisabledSkipsSpawn:
 
 class TestInflightDedupSkipsDuplicate:
     """Step-9 (RED): a not-done investigation task already registered under
-    the same 'unblock-auto-<task_id>' name must suppress a second spawn."""
+    the task's investigation_task_name must suppress a second spawn."""
 
     def test_inflight_dedup_skips_duplicate(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path, escalate_preexisting=False)
@@ -535,7 +536,7 @@ class TestInflightDedupSkipsDuplicate:
                 await asyncio.Event().wait()
 
             dummy_task = asyncio.create_task(
-                _hang_forever(), name=f'unblock-auto-{req.task_id}',
+                _hang_forever(), name=investigation_task_name(req.task_id),
             )
             handles.background_tasks.add(dummy_task)
             try:
@@ -548,6 +549,46 @@ class TestInflightDedupSkipsDuplicate:
                 dummy_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await dummy_task
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert verifier.investigations == [], verifier.investigations
+
+    def test_investigation_running_outside_the_lane_skips_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        """A workflow-spawned investigation lives in no merge-worker set, so
+        the dedupe must see the whole loop, not handles.background_tasks."""
+        config = _make_config(tmp_path, escalate_preexisting=False)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        verifier = FakeVerifier(default=VerifyScript(result=COMPILE_ERROR_RESULT))
+
+        async def _run() -> MergeOutcome | None:
+            elsewhere = asyncio.create_task(
+                asyncio.Event().wait(), name=investigation_task_name(req.task_id),
+            )
+            try:
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, verifier=verifier, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+            finally:
+                elsewhere.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await elsewhere
 
         outcome = asyncio.run(_run())
 
@@ -578,14 +619,7 @@ async def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
         worktree_dir='.worktrees', push_after_advance=False,
     )
     git_ops = GitOps(git_config, repo)
-    config = OrchestratorConfig(
-        project_root=repo,
-        git=git_config,
-        # The main-health probe is out of scope here and would run a REAL
-        # scoped verification against a probe worktree; the production guard
-        # that skips it is this flag (_classify_main_health_red).
-        escalate_preexisting_main_break=False,
-    )
+    config = lane_scene_config(repo, git_config)
     return git_ops, config
 
 
@@ -736,7 +770,7 @@ class TestHarnessWiresDryRunHandlesIntoWorker:
             # whose verify port the harness gives us no way to inject.
             with (
                 patch(
-                    'orchestrator.merge_queue.SpeculativeMergeWorker',
+                    'orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                     CapturingWorker,
                 ),
                 patch.object(

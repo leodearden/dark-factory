@@ -174,3 +174,104 @@ class TestSummarizeGraphitiQueueHealth:
         assert not warns, (
             f"dead-letter unhealthy case must not emit WARNINGs; got {warns!r}"
         )
+
+    # --- Task 5478: per-operation attribution of dead writes ---
+
+    def test_dead_by_operation_propagated(self, caplog):
+        """A well-formed breakdown is copied through as a fresh dict, with no WARNING."""
+        stats = {
+            'counts': {'dead': 3, 'completed': 5},
+            'oldest_pending_age_seconds': None,
+            'dead_by_operation': {'add_episode': 2, 'add_memory_graphiti': 1},
+        }
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['dead_by_operation'] == {'add_episode': 2, 'add_memory_graphiti': 1}
+        assert result['dead_count'] == 3
+        assert result['healthy'] is False
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"a well-formed dead_by_operation must not emit WARNINGs; got {warns!r}"
+        )
+
+        result['dead_by_operation']['injected'] = 99
+        assert stats['dead_by_operation'] == {'add_episode': 2, 'add_memory_graphiti': 1}, (
+            "the summary's breakdown must not alias the producer's mapping"
+        )
+
+    @pytest.mark.parametrize("stats", [{}, {'counts': {'completed': 1}}])
+    def test_dead_by_operation_absent_defaults_to_empty_mapping(self, stats, caplog):
+        """Absent 'dead_by_operation' is benign: {} with healthy=True and ZERO warnings."""
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['dead_by_operation'] == {}
+        assert result['healthy'] is True
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f"absent 'dead_by_operation' key must not emit any WARNING; got {warns!r}"
+        )
+
+    def test_dead_by_operation_present_but_non_dict_yields_unhealthy_and_warning(self, caplog):
+        """'dead_by_operation' present but not a dict => healthy=False, {} and a WARNING."""
+        stats = {'counts': {'completed': 1}, 'dead_by_operation': 'corrupt'}
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['healthy'] is False, (
+            "dead_by_operation='corrupt' (present-but-not-dict) must yield healthy=False"
+        )
+        assert result['dead_by_operation'] == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, (
+            f"expected a WARNING on {_LOGGER!r} for present-but-non-dict dead_by_operation"
+        )
+
+    @pytest.mark.parametrize("bad_stats", [None, "oops", [1, 2, 3]])
+    def test_non_dict_stats_yields_empty_breakdown(self, bad_stats):
+        """The 'dead_by_operation' key is always present, whatever the input."""
+        assert summarize_graphiti_queue_health(bad_stats)['dead_by_operation'] == {}
+
+    @pytest.mark.parametrize(
+        "stats",
+        [
+            {'counts': {'completed': 5, 'pending': 'corrupt'}},
+            {'counts': {'completed': 5}, 'dead_by_operation': {'add_episode': None}},
+        ],
+    )
+    def test_non_integer_count_yields_unhealthy_and_warning(self, stats, caplog):
+        """A count that is not int-convertible, in either mapping => healthy=False + WARNING."""
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = summarize_graphiti_queue_health(stats)
+
+        assert result['healthy'] is False, (
+            f"a non-integer count in {stats!r} must yield healthy=False"
+        )
+        warns = [
+            r for r in caplog.records
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, f"expected a WARNING on {_LOGGER!r} for a non-integer count"
+
+    def test_non_integer_breakdown_entry_is_dropped_and_dead_count_survives(self):
+        """Only the malformed entry is dropped: the rest of the record still reports."""
+        stats = {
+            'counts': {'dead': 3, 'pending': 'corrupt'},
+            'dead_by_operation': {'add_episode': 2, 'add_memory_graphiti': 'corrupt'},
+        }
+        result = summarize_graphiti_queue_health(stats)
+
+        assert result['dead_count'] == 3
+        assert result['pending_count'] == 0
+        assert result['dead_by_operation'] == {'add_episode': 2}
+        assert result['healthy'] is False

@@ -877,21 +877,26 @@ class TestShutdownBudgetArithmetic:
             "force-exit-before-SIGKILL invariant stays honest."
         )
 
-    def test_memory_close_step_budget_dominates_bounded_close(self):
+    def test_memory_close_step_budget_dominates_bounded_close(self, mock_config):
         """Task 2701 documented basis: the memory_service.close step budget must
         exceed the flat per-step default AND dominate the worst-case bounded
-        close (6 sub-closes each ≤ _SUBCLOSE_TIMEOUT), while the force-exit and
-        systemd constants stay UNCHANGED so the schema.py _MIRROR_* guard and the
+        close (every sub-close's budget, summed by
+        MemoryService.close_budget_secs), while the force-exit and systemd
+        constants stay UNCHANGED so the schema.py _MIRROR_* guard and the
         systemd-template parity test both remain valid.
         """
         import fused_memory.server.main as main_mod
-        from fused_memory.services import memory_service as ms_mod
+        from fused_memory.services.memory_service import MemoryService
 
         # Enlarged relative to the flat per-step default.
         assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT > main_mod._CLEANUP_STEP_TIMEOUT
-        # Dominates the worst-case bounded close: 6 sub-closes each capped at
-        # _SUBCLOSE_TIMEOUT run sequentially inside the one step.
-        assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT >= 6 * ms_mod._SUBCLOSE_TIMEOUT
+        # Dominates the worst-case bounded close: every sub-close's budget,
+        # summed by MemoryService.close_budget_secs, runs sequentially inside
+        # the one step.
+        assert (
+            MemoryService(mock_config).close_budget_secs()
+            <= main_mod._MEMORY_CLOSE_STEP_TIMEOUT
+        )
 
         # Illustrative worst-case step sum with the resized memory-close budget
         # still fits within the force-exit budget: five flat 5s steps

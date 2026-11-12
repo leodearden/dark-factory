@@ -1,0 +1,12 @@
+{
+  "task_id": "5305",
+  "reason": "Move, not growth: the ruling-A integration (esc-5305-12) ports main's task-5246 relane intake work out of merge_lane/worker.py into MergeIntake, the lane buffers' sole writer: _rebucket_relaned_requests (12), the relane target search + journal re-record as relane_waiting (8), _queued_arrivals as queued_arrivals (2) and _answers_to as answers_to (3), +25 here. The same code leaves worker.py (relane 12 -> 5, the other three deleted: -24), and total:cognitive falls against main (5061 -> 5009).",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py",
+      "baseline": 64,
+      "current": 89
+    }
+  ]
+}

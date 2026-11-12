@@ -339,7 +339,7 @@ async def run_one_cycle(ledger, items_flagged: list[dict]) -> tuple[StageReport,
         dedup_seen.append(list(kwargs.get('flags', [])))
         return kwargs.get('flags', [])
 
-    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    module = 'fused_memory.reconciliation.stage1_flag_chain'
     with (
         patch.object(
             BaseStage, 'run', new=AsyncMock(return_value=make_base_report(items_flagged))

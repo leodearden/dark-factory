@@ -182,8 +182,11 @@ class _Scaffold:
     home: Path
     main_sha: str
     task_meta: Path
+    task_id: str
+    task_root: Path
     sibling_worktree: Path
     other_task_meta: Path
+    other_task_root: Path
     plan_symlink: Path
     plan_target: Path
     uv_cache: Path
@@ -202,7 +205,7 @@ def _run_sandboxed(
     path list — INV-5), and run with ``HOME`` redirected to the scaffold's
     hermetic fake home.
     """
-    write_set = compute_write_set(scaffold.worktree, home=scaffold.home)
+    write_set = compute_write_set(scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home)
     cmd = build_landlock_command(
         inner_cmd, scaffold.worktree, [],
         writable_extras=[str(p) for p in write_set.writable_paths()],
@@ -260,7 +263,7 @@ def landlock_matrix_scaffold():
     change in the worktree, ready for a row's own ``git commit``; a
     ``<worktree>/.task/plan.json`` symlink into ``<base>/.task-meta/<name>/
     plan.json`` (the target itself is left ABSENT — row 7's child write is
-    what creates it, mirroring ``TaskArtifacts.ensure_lane_plan_symlink``'s
+    what creates it, mirroring ``TaskArtifacts.ensure_lane_symlinks``'s
     real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
     ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;
@@ -319,6 +322,13 @@ def landlock_matrix_scaffold():
         task_meta.mkdir(parents=True)
         other_task_meta = base / '.task-meta' / other_name
         other_task_meta.mkdir(parents=True)
+        # Rows 13/14: this task's task-lifetime root (plan-tools' mark_step_done
+        # target) and another task's, pre-created so a denial is EACCES.
+        task_id = '4242'
+        task_root = base / '.task-meta' / f'task-{task_id}'
+        task_root.mkdir(parents=True)
+        other_task_root = base / '.task-meta' / 'task-4343'
+        other_task_root.mkdir(parents=True)
 
         home = base / 'home'
         home.mkdir()
@@ -359,7 +369,9 @@ def landlock_matrix_scaffold():
         yield _Scaffold(
             base=base, main=main, worktree=worktree, name=name, home=home,
             main_sha=main_sha, task_meta=task_meta,
+            task_id=task_id, task_root=task_root,
             sibling_worktree=sibling_worktree, other_task_meta=other_task_meta,
+            other_task_root=other_task_root,
             plan_symlink=plan_symlink, plan_target=plan_target,
             uv_cache=uv_cache, uv_data=uv_data,
             claude_fleet=claude_fleet, settings_json=settings_json,
@@ -431,8 +443,26 @@ class TestSandboxEnforcementMatrix:
         # carve-out to the whole `.task-meta/` parent (rather than just
         # `.task-meta/<name>/`) would stay green here purely because of the
         # kernel-level side-effect check below.
-        write_set = compute_write_set(scaffold.worktree, home=scaffold.home)
+        write_set = compute_write_set(scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home)
         assert str(scaffold.other_task_meta) not in [
+            str(p) for p in write_set.writable_paths()
+        ]
+        result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
+        assert not target.exists()
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row13_own_task_root_write_allowed(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.task_root / 'plan.json'
+        result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf PLAN > {target}'])
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'PLAN'
+
+    def test_row14_other_task_root_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.other_task_root / 'plan.json'
+        write_set = compute_write_set(scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home)
+        assert str(scaffold.other_task_root) not in [
             str(p) for p in write_set.writable_paths()
         ]
         result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])

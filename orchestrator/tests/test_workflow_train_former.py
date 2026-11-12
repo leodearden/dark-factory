@@ -1,8 +1,8 @@
 """Tests for the β train former — selection, stackability, and formation.
 
 Covers:
-  step-7:  _line_ranges_stackable (pure predicate)
-  step-9:  _select_train_members (pure selection)
+  step-7:  line_ranges_stackable (pure predicate)
+  step-9:  select_train_members (pure selection)
   step-11: _train_candidates (async candidate discovery)
   step-13: _maybe_form_train guards (disabled, lone-task, already-member)
   step-15: _maybe_form_train formation, overlap-rejection, and cap
@@ -120,16 +120,16 @@ def _make(
 
 
 # ---------------------------------------------------------------------------
-# step-7: _line_ranges_stackable — pure predicate tests
+# step-7: line_ranges_stackable — pure predicate tests
 # ---------------------------------------------------------------------------
 
 
 class TestLineRangesStackable:
-    """Unit tests for the _line_ranges_stackable pure predicate in workflow.py."""
+    """Unit tests for the line_ranges_stackable pure predicate in merge_lane/train_selection.py."""
 
     def _fn(self):
-        from orchestrator.workflow import _line_ranges_stackable
-        return _line_ranges_stackable
+        from orchestrator.merge_lane.train_selection import line_ranges_stackable
+        return line_ranges_stackable
 
     def test_disjoint_files_are_stackable(self):
         """Two tasks touching completely different files are always stackable."""
@@ -189,16 +189,16 @@ class TestLineRangesStackable:
 
 
 # ---------------------------------------------------------------------------
-# step-9: _select_train_members — pure selection tests
+# step-9: select_train_members — pure selection tests
 # ---------------------------------------------------------------------------
 
 
 class TestSelectTrainMembers:
-    """Unit tests for _select_train_members pure selection function."""
+    """Unit tests for select_train_members pure selection function."""
 
     def _fn(self):
-        from orchestrator.workflow import _select_train_members
-        return _select_train_members
+        from orchestrator.merge_lane.train_selection import select_train_members
+        return select_train_members
 
     def _ranges(self, file: str, start: int, end: int) -> dict[str, list[tuple[int, int]]]:
         return {file: [(start, end)]}
@@ -791,7 +791,7 @@ class TestMaybeFormTrainStackBranches:
 
     @pytest.mark.asyncio
     async def test_stack_train_branches_is_called_with_selected_members(self):
-        """stack_train_branches is called with the selected member list from _select_train_members."""
+        """stack_train_branches is called with the selected member list from select_train_members."""
         fix = _make(
             task_id='200',
             former_enabled=True,

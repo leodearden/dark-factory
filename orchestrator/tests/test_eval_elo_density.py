@@ -1,7 +1,7 @@
 """Tests for elo.is_pairwise_data_dense — the Open-Q3 density gate (task 2477 λ).
 
 Elo is DEMOTED (decision 10): the primary leaderboard is now
-report.build_composite_report; the pairwise Elo path is retained only when the
+composite_report.py::build_composite_report; the pairwise Elo path is retained only when the
 pairwise judge data is dense, gated by this predicate ("drop Elo unless pairwise
 judge data is dense").
 """

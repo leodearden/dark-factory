@@ -67,7 +67,7 @@ Since task 3658 ``relevance_score`` is an ordinal RRF fusion value
 (rank-1 ~ 0.0164), NOT a cosine; the honest per-store cosine lives in
 ``metadata['store_score']``.  The write-time near-duplicate guard reads the
 cosine from ``metadata['store_score']`` and qualifies on ``>= threshold``
-(``near_duplicate_guard.py`` ``_cosine_of`` / ``find_near_duplicate_memory``).
+(``near_duplicate_guard.py`` ``cosine_of`` / ``find_near_duplicate_memory``).
 An injected anchor therefore MUST carry no ``store_score`` at all: a missing
 cosine means "not comparable" and can never qualify at any threshold, whereas
 a synthetic high score would hard-block EVERY ``procedural_knowledge`` write
@@ -92,6 +92,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.models.enums import SourceStore
 
 if TYPE_CHECKING:
@@ -154,7 +155,7 @@ def extract_anchor_topics(
     key presence and value types are not schema-enforced at READ time, so a
     missing, empty, or non-``str`` topic is skipped rather than raised on.
     ``bool`` is excluded despite being an ``int`` subclass, consistent with
-    the coercion discipline in ``near_duplicate_guard._cosine_of``.
+    the coercion discipline in ``near_duplicate_guard.cosine_of``.
 
     Returning ``[]`` is the ZERO-COST path and the caller must treat it as
     "make no backend call at all" — on the live corpus today that is the
@@ -232,11 +233,9 @@ def select_canonical_payload(
 
     1. drop payloads outside *allowed_categories* (when it is not ``None``),
        planned payloads (unless *include_planned*), and child-shaped payloads;
-    2. keep only STRICTLY canonical survivors — ``meta.get('canonical') is True``,
-       an IDENTITY check, never truthiness.  ``1 == True`` in Python, so
-       truthiness would admit an int as canonical; the identity check mirrors
-       the write-side uniqueness predicate at ``memory_service.py:940`` so the
-       read path and the write path agree on what "canonical" means;
+    2. keep only STRICTLY canonical survivors, read through
+       ``fused_memory/canonical_marker.py::is_canonical`` — an identity check,
+       never truthiness, which is why an int ``1`` is not canonical;
     3. apply the deterministic tie-break.
 
     Filtering BEFORE selecting is what makes *allowed_categories* a narrowing:
@@ -291,7 +290,7 @@ def select_canonical_payload(
             continue
         if _is_child_shaped(meta):
             continue
-        if meta.get('canonical') is not True:
+        if not is_canonical(meta):
             continue
         survivors.append(payload)
 

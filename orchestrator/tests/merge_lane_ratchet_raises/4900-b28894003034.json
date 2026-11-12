@@ -1,0 +1,54 @@
+{
+  "task_id": "4900",
+  "reason": "Net-additive per-tick branch snapshot (task 4900, item 1): GitOps.list_local_branches is the one 'git for-each-ref refs/heads/' per tick that lets the already-landed dispatch gate abstain for a branch-absent, unmarked candidate without its per-candidate rev-parse. The private_reads rise is the new TestAlreadyLandedGateTickView class driving Harness._already_landed_dispatch_gate, _mark_in_progress_done and the escalation/provenance seams the same way the file's existing tests do.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1467,
+      "current": 1472
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16151,
+      "current": 16177
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 262,
+      "current": 282
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9342,
+      "current": 9347
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4912,
+      "current": 4917
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58037,
+      "current": 58063
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6581,
+      "current": 6601
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31782,
+      "current": 31787
+    }
+  ]
+}

@@ -7,13 +7,13 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from fused_memory.middleware.curator_types import embedding_text
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DuplicateFinding,
     build_duplicate_metadata,
     select_near_duplicate,
     sweep_zot_duplicate,
 )
-from fused_memory.middleware.task_curator import embedding_text
 
 
 def _hit(task_id, score, title='dup title'):

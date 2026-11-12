@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.curator_types import DEFAULT_PRIORITY
 from fused_memory.middleware.task_curator import (
     _PRIORITY_RANK,
-    DEFAULT_PRIORITY,
     BackfillResult,
     TaskCurator,
 )
@@ -232,7 +232,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_backfill_uses_same_point_id_as_record_task(self):
         """backfill_corpus() and record_task() produce identical UUID5 point IDs."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'myproject'
         task_id = '42'
@@ -296,7 +296,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_record_task_normalizes_none_fields(self):
         """record_task() with files_to_modify=None and priority=None stores [] and 'medium' in payload."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '99'
@@ -353,7 +353,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_record_task_and_backfill_payload_shapes_match(self):
         """record_task() and backfill_corpus() produce payloads with identical types."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '77'
@@ -453,7 +453,7 @@ class TestBackfillPointIdConsistency:
     @pytest.mark.asyncio
     async def test_default_priority_alignment(self):
         """record_task() with default CandidateTask and backfill_corpus() with no priority key both produce 'medium'."""
-        from fused_memory.middleware.task_curator import CandidateTask
+        from fused_memory.middleware.curator_types import CandidateTask
 
         project_id = 'proj'
         task_id = '50'

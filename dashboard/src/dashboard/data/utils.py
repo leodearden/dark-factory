@@ -6,6 +6,8 @@ import logging
 from datetime import UTC, datetime
 from typing import TypeVar, cast
 
+from dashboard.data.mcp_fanout import describe_exc
+
 _logger = logging.getLogger(__name__)
 _T = TypeVar('_T')
 
@@ -21,7 +23,10 @@ def safe_gather_result(result: object, default: _T, label: str) -> _T:
     correctly during shutdown and disconnect.
 
     Warnings are emitted under the ``dashboard.data.utils`` logger so that all
-    gather-result warnings from any caller are routable via a single logger name.
+    gather-result warnings from any caller are routable via a single logger name,
+    and name the exception type via ``mcp_fanout.py::describe_exc`` so an
+    exception whose ``str()`` is empty (a bare asyncio ``TimeoutError``,
+    ``httpx.PoolTimeout``) is never logged content-free.
 
     Args:
         result: The value returned by ``asyncio.gather(return_exceptions=True)``
@@ -41,7 +46,7 @@ def safe_gather_result(result: object, default: _T, label: str) -> _T:
     if isinstance(result, BaseException) and not isinstance(result, Exception):
         raise result
     if isinstance(result, Exception):
-        _logger.warning('Error gathering %s: %s', label, result)
+        _logger.warning('Error gathering %s: %s', label, describe_exc(result))
         return default
     return cast(_T, result)
 

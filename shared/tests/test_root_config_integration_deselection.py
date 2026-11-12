@@ -149,10 +149,6 @@ def default_collect() -> str:
     return _collect()
 
 
-# shared/pyproject.toml caps tests at 60s (signal method). A warm collect is
-# ~2s, but this pays a cold root-conftest import that reaches across all seven
-# subprojects, so take generous headroom rather than flake on a cold cache.
-@pytest.mark.timeout(180)
 class TestRootConfigIntegrationDeselection:
     """The root config must gate `integration` -- without over-gating.
 

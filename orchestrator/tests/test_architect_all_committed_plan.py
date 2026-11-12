@@ -343,18 +343,21 @@ class TestDetectCommittedBranchWork:
 
         assert await workflow._detect_committed_branch_work() == []
 
-    async def test_unset_base_commit_returns_empty(
+    async def test_unset_stored_base_still_lists_only_the_branch_s_commit(
         self, config, git_ops, task_assignment,
     ):
+        """The fork point bounds the range, so main's 'Initial' is excluded."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
         workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
         artifacts.update_base_commit('')
 
         (wt / 'impl.py').write_text('x = 1\n')
-        await git_ops.commit(wt, 'feat: GREEN — x')
+        sha = await git_ops.commit(wt, 'feat: GREEN — x')
 
-        assert await workflow._detect_committed_branch_work() == []
+        assert await workflow._detect_committed_branch_work() == [
+            {'sha': sha, 'subject': 'feat: GREEN — x'},
+        ]
 
     @pytest.mark.parametrize('missing', ['worktree', 'git_ops', 'artifacts'])
     async def test_missing_collaborator_returns_empty(
@@ -617,6 +620,7 @@ def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
     from unittest.mock import AsyncMock as _AsyncMock  # noqa: PLC0415
 
     from _orch_helpers import pydantic_spec  # noqa: PLC0415
+    from _workflow_helpers import invoke_stub_awaiting_builder  # noqa: PLC0415
     from shared.cli_invoke import AgentResult  # noqa: PLC0415
 
     assignment = MagicMock()
@@ -664,8 +668,8 @@ def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
 
     # Architect succeeds but writes no plan.json → _plan falls to the stubbed
     # no-plan handler, which is enough to observe the briefing call.
-    wf._invoke = _AsyncMock(  # type: ignore[method-assign]
-        return_value=AgentResult(success=True, output='ok'),
+    wf._invoke = invoke_stub_awaiting_builder(  # type: ignore[method-assign]
+        AgentResult(success=True, output='ok'),
     )
     wf._mark_blocked = _AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
     wf._handle_no_plan_failure = _AsyncMock(  # type: ignore[method-assign]
@@ -686,10 +690,12 @@ class TestPlanThreadsCommittedWorkIntoBriefing:
 
         await wf._plan()
 
-        assert detector.await_count == 1, (
-            f'Expected exactly one detector await, got {detector.await_count}'
-        )
         build.assert_awaited()
+        assert detector.await_count == build.await_count, (
+            'Expected one detector await per architect briefing (the builder '
+            f're-gathers before every dispatch), got {detector.await_count} '
+            f'detector awaits for {build.await_count} briefings'
+        )
         kwargs = build.call_args.kwargs
         assert kwargs.get('committed_work') == detected, (
             f'Expected the detector list forwarded as committed_work, got {kwargs}'
@@ -883,9 +889,10 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
 
         invoke, build_implementer_prompt = _stub_execute_collaborators(workflow)
 
-        def _mark_pending_done(*_args, **_kwargs):
+        async def _mark_pending_done(_role, build_prompt, *_args, **_kwargs):
             from shared.cli_invoke import AgentResult  # noqa: PLC0415
 
+            await build_prompt()
             artifacts.update_step_status('step-2', 'done', 'impl-commit-sha')
             return AgentResult(success=True, output='')
 

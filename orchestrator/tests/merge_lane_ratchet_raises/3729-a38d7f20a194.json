@@ -1,0 +1,18 @@
+{
+  "task_id": "3729",
+  "reason": "net-additive tests for task 3729 (zombie agent_session sidecar reaper at boot): test_agent_session_reaper.py drives the boot scan Harness._recover_crashed_tasks and reads its recovery sets (_recovered_sessions/_preserved_worktrees/_recovered_plans) like its sibling test_transcript_archive_startup_sweeper.py; test_harness_startup_steps.py adds one siting test through real Harness.run that stubs _recover_crashed_tasks like the existing step tests",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_startup_steps.py",
+      "baseline": 15,
+      "current": 16
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6473,
+      "current": 6495
+    }
+  ]
+}
