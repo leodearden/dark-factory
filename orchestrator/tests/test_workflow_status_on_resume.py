@@ -759,7 +759,7 @@ class TestStatusPreservationOnResume:
         assert workflow.artifacts.read_scope_requests() == ()
 
     async def test_a_brief_a_prior_dispatch_left_waiting_reaches_the_resumed_implementer(
-        self, config, git_ops, task_assignment, tmp_path,
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
     ):
         """A contested scope-drift report no writer received outlives its dispatch (task 3090).
 
@@ -789,7 +789,7 @@ class TestStatusPreservationOnResume:
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
         )
-        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl_mock)
         briefed: list[object] = []
 
         async def build_resume_prompt(
@@ -804,7 +804,7 @@ class TestStatusPreservationOnResume:
             await build_prompt()
             return AgentResult(success=True, output='', turns=2)
 
-        workflow._invoke = invoke_taking_a_turn  # type: ignore[method-assign]
+        monkeypatch.setattr(workflow, '_invoke', invoke_taking_a_turn)
 
         outcome = (await workflow.run()).outcome
 
