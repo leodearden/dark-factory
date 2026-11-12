@@ -90,6 +90,10 @@ Payload kind outside          :class:`CorpusBuildError` naming the kinds
 (build only)                  never a corpus silently re-stratified.
 Non-``GRAPH.RO_QUERY``        :class:`CorpusBuildError` from the reader's
 command attempted             client-side guard.
+Population read not provably  :class:`CorpusBuildError` naming the cause
+whole (a short read, no       and both counts — never a corpus drawn over
+census, the page cap, or a    a partial census.
+write mid-read)
 ============================  ============================================
 
 Verification (``--verify``) instead reports a status and exits on its code.
@@ -118,7 +122,9 @@ Status                Exit  Meaning and remedy
 ====================  ====  ==================================================
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
-complete at all — the store was unreachable, the requested corpus is
+complete at all — the store was unreachable, the population read could not be
+proven whole (a short read, no census, the page cap, or a write mid-read; under
+``--verify`` no verdict was reached), the requested corpus is
 unsatisfiable, a build's population carries a payload kind outside
 :data:`KNOWN_PAYLOAD_KINDS`, stdout could not be written (a downstream reader closed the
 pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
@@ -166,6 +172,7 @@ from fused_memory.backends.falkor_read_only import (
     PagedQuery,
     ReadOnlyGraphReader,
 )
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.config.falkordb_endpoints import FalkorEndpoint
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -792,6 +799,35 @@ the payload-kind stratification dimension here — and the MCP tool clamps
 """
 
 
+def _whole_population_rows(read: PagedRead, graph_name: str) -> list[list]:
+    """The rows of *read*, refused unless they are the whole, exactly censused population.
+
+    Branches only on the typed fields; ``read.reason`` is diagnostic prose,
+    carried into the message and never parsed.
+
+    Exact equality is stricter than ``read.complete``, which accepts more rows
+    than the census as growth. A row written below the cursor while the pages
+    are read shifts a page boundary, so the next page re-returns a row the
+    store holds once. Refused here, that is reported as the write it was
+    rather than as a duplicate episode in the store.
+    """
+    if not read.complete:
+        raise CorpusBuildError(
+            f'graph {graph_name!r}: the Episodic population read is not whole '
+            f'(incomplete_kind={read.incomplete_kind}, rows_seen={read.rows_seen}, '
+            f'expected_rows={read.expected_rows}); refusing to stratify a partial '
+            f'census. Diagnostics: {read.reason}'
+        )
+    if read.rows_seen != read.expected_rows:
+        raise CorpusBuildError(
+            f'graph {graph_name!r} was written to while its Episodic population was '
+            f'being paged: the census counted {read.expected_rows} but the pages '
+            f'returned {read.rows_seen}. A row written mid-read can shift a page '
+            f'boundary and be returned twice, so re-run.'
+        )
+    return read.rows
+
+
 class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
@@ -826,7 +862,12 @@ class EpisodeReader:
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
 
-        Paged, census-checked, no filter. A row whose ``created_at`` or
+        Paged, census-checked, no filter. A read that cannot be proven to be
+        the whole population, exactly as censused, is refused as a
+        :class:`CorpusBuildError` before any row is examined — so a read
+        defect is reported as one, never as a row or duplicate-uuid defect.
+
+        A row whose ``created_at`` or
         ``source_description`` cannot be parsed aborts the build via
         :class:`CorpusBuildError` rather than being dropped — a silently
         dropped row would shrink a stratum's denominator and skew every
@@ -850,8 +891,9 @@ class EpisodeReader:
             read = await self._reader.read_paged(POPULATION_READ)
         except NonReadOnlyCommandError as exc:
             raise CorpusBuildError(f'build_corpus is strictly read-only: {exc}') from exc
+        rows = _whole_population_rows(read, self.graph_name)
         population: list[EpisodeRecord] = []
-        for index, row in enumerate(read.rows):
+        for index, row in enumerate(rows):
             if len(row) != len(PROJECTED_FIELDS):
                 raise CorpusBuildError(
                     f'row {index} has {len(row)} columns, expected '
