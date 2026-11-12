@@ -178,6 +178,13 @@ def _success() -> AgentResult:
     return AgentResult(success=True, output='done', cost_usd=0.5, turns=3, duration_ms=5_000)
 
 
+def _timed_out(*, transcript_turns: int) -> AgentResult:
+    return AgentResult(
+        success=False, output='', cost_usd=0.5, turns=transcript_turns, duration_ms=5_000,
+        timed_out=True, transcript_turns=transcript_turns,
+    )
+
+
 def _implementer_reporting_on_first_iteration(wf: TaskWorkflow):
     """Iteration N marks step-N done; iteration 1 also files the scope request."""
     assert wf.artifacts is not None
@@ -333,6 +340,75 @@ class TestImplementerScopeRequest:
         assert drift.contested == ((_REQUESTED, _HOLDER),)
         assert agent.await_count == 2
         _assert_never_repended(scheduler)
+
+    async def test_a_contested_request_before_a_progress_timeout_resume_gets_a_follow_up(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+        assert wf.artifacts is not None
+        artifacts = wf.artifacts
+        calls = 0
+
+        async def agent(**_kwargs) -> AgentResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+                return _timed_out(transcript_turns=5)
+            if calls == 2:
+                artifacts.update_step_status('step-1', 'done', None)
+            return _success()
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert wf.metrics.progress_resume_total == 1
+        [followup_call] = rig.followup_prompt.await_args_list
+        assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)
+
+    async def test_a_zero_output_session_does_not_consume_the_brief(self, tmp_path, monkeypatch):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        rig.cfg.max_consecutive_zero_output_timeouts = 3
+        _write_dispatched_plan(wf, steps=2)
+        _stub_loop_collaborators(wf, monkeypatch)
+        assert wf.artifacts is not None
+        artifacts = wf.artifacts
+        calls = 0
+
+        async def agent(**_kwargs) -> AgentResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+                artifacts.update_step_status('step-1', 'done', None)
+            elif calls == 2:
+                return _timed_out(transcript_turns=0)
+            else:
+                artifacts.update_step_status('step-2', 'done', None)
+            return _success()
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        briefs = _scope_drift_kwargs(rig.implementer_prompt)
+        assert len(briefs) == 3
+        after_the_wedge = briefs[2]
+        assert after_the_wedge is not None
+        assert after_the_wedge.contested == ((_REQUESTED, _HOLDER),)
 
     async def test_a_granted_request_in_the_last_session_needs_no_follow_up(
         self, tmp_path, monkeypatch

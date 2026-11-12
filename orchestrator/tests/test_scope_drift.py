@@ -217,7 +217,4 @@ class TestScopeDriftReason:
 
     def test_an_unknown_reason_string_is_refused(self):
         with pytest.raises(ValueError):
-            ScopeDriftReport(
-                reason='made_up', role='implementer', iteration=1,  # type: ignore[arg-type]
-                requested=(), acquired=(), contested=(),
-            )
+            ScopeDriftReason('made_up')
