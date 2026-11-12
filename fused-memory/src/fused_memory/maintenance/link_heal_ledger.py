@@ -9,7 +9,9 @@ distinct state. Every plan run records one examination per link it decided,
 committed with its planned rows; :meth:`LinkHealLedger.run_records` joins them
 into the run's :class:`CandidateRecord` view. A calibration of the adjudicator
 is kept per model and prompt version, so the gate on writes asks for exactly the
-adjudicator it would write with. Nothing here is ever pruned.
+adjudicator it would write with. Each sweep run records the creation window it
+examined, and the newest complete one is where the next sweep starts. Nothing
+here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -46,6 +48,7 @@ from fused_memory.maintenance.link_heal import (
 from fused_memory.maintenance.link_heal_store import (
     CREATED_AT_KEY,
     UPDATED_AT_KEY,
+    CreatedWindow,
     LiveRecord,
     text_sha256,
 )
@@ -210,6 +213,14 @@ CREATE TABLE IF NOT EXISTS calibrations (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS calibrations_by_prompt ON calibrations (model, prompt_sha256);
+CREATE TABLE IF NOT EXISTS sweep_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    since TEXT NOT NULL,
+    until TEXT NOT NULL,
+    complete INTEGER NOT NULL,
+    at TEXT NOT NULL
+);
 """
 
 #: Columns added after their table first shipped: an older ledger gains them in place.
@@ -233,6 +244,11 @@ _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
 
 def new_run_id() -> str:
     return uuid.uuid4().hex
+
+
+def plan_document_path(ledger_dir: Path, run_id: str) -> Path:
+    """Where plan run *run_id*'s plan document goes when no other path is asked for."""
+    return ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
 
 
 def _now() -> str:
@@ -913,6 +929,26 @@ class LinkHealLedger:
             (model, prompt_sha256),
         ).fetchone()
         return None if row is None else _calibration_row(row)
+
+    def record_sweep_window(self, run_id: str, window: CreatedWindow, *, complete: bool) -> None:
+        """Record the window sweep run *run_id* examined; only a *complete* one moves
+        the watermark."""
+        with self._conn:
+            self._conn.execute(
+                'INSERT INTO sweep_windows (run_id, since, until, complete, at) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (
+                    run_id, window.since.astimezone(UTC).isoformat(),
+                    window.until.astimezone(UTC).isoformat(), int(complete), _now(),
+                ),
+            )
+
+    def sweep_watermark(self) -> datetime | None:
+        """The end of the newest complete sweep window: where the next sweep starts."""
+        row = self._conn.execute(
+            'SELECT until FROM sweep_windows WHERE complete = 1 ORDER BY id DESC LIMIT 1',
+        ).fetchone()
+        return None if row is None else datetime.fromisoformat(row['until'])
 
     def snapshot(self, project_id: str, record: LiveRecord) -> int:
         """The id of *record*'s snapshot, stored now unless this exact state already is."""

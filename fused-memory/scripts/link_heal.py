@@ -80,6 +80,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunRow,
     RunSource,
     UnknownRun,
+    plan_document_path,
 )
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
@@ -339,7 +340,7 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
 
 def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
     if out is None:
-        return lambda run_id: ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
+        return lambda run_id: plan_document_path(ledger_dir, run_id)
     plan_path = out.absolute()
     if not plan_path.parent.is_dir():
         raise Refused(

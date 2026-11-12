@@ -130,20 +130,27 @@ def _cells(record: CandidateRecord) -> tuple[str, str, str, str]:
     return record.project_id, record.decision.value, verdict, record.action_taken
 
 
-def _document(view: SweepRunView) -> dict[str, Any]:
+def run_headline(view: SweepRunView) -> dict[str, Any]:
+    """The facts a run's report leads with: its runs, its window and its writes."""
     return {
-        'format': SWEEP_REPORT_FORMAT,
         'plan_run_id': view.plan.run_id,
         'apply_run_id': None if view.apply is None else view.apply.run_id,
         'undo_run_id': view.undo_run_id,
         'window': {
             'since': view.window.since.isoformat(), 'until': view.window.until.isoformat(),
         },
-        'calibration': view.calibration.as_json(),
         'writes': {
             'mode': _writes_mode(view),
             'withheld': None if view.withheld is None else view.withheld.value,
         },
+    }
+
+
+def _document(view: SweepRunView) -> dict[str, Any]:
+    return {
+        'format': SWEEP_REPORT_FORMAT,
+        **run_headline(view),
+        'calibration': view.calibration.as_json(),
         'runs': {
             'plan': view.plan.as_json(),
             'apply': None if view.apply is None else view.apply.as_json(),
