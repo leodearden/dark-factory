@@ -374,8 +374,8 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     #   outside the tests (a shell-reported SIGTERM/SIGINT/SIGHUP, or xdist's
     #   controller-only teardown signature);
     # - a RUFF or PYRIGHT leg with a shell-reported SIGTERM/SIGINT/SIGHUP whose
-    #   output holds no finding
-    #   (``verify_classify.py::shows_no_lint_type_finding``).
+    #   output proves no finding was reached
+    #   (``verify_classify.py::output_proves_no_finding``).
     # is_infra_transient=True, so it gets the bounded retry instead of a
     # debugger dispatch on a clean tree. archive=True, which
     # ``_assert_infra_transient_rows_archive`` requires and which keeps the log

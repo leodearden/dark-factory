@@ -721,7 +721,6 @@ class TestVerdictlessLintTypeExitIsInfraAbort:
 
     @pytest.mark.asyncio
     async def test_killed_type_leg_makes_the_run_infra_abort(self, tmp_path: Path):
-        """Also proves the task-6127 TYPE refinement does not intercept it."""
         result = await _verify_legs(
             tmp_path, type_=(143, _PYRIGHT_GREEN_THEN_LATER_LINK_SIGTERM),
         )

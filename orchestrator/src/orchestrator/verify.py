@@ -92,7 +92,7 @@ from orchestrator.verify_classify import (
     is_interpreter_missing_workspace_packages,
     is_partially_provisioned_venv_type_failure,
     is_shell_reported_external_kill,
-    shows_no_lint_type_finding,
+    output_proves_no_finding,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -1113,12 +1113,12 @@ def _leg_aborted_without_verdict(tool: ToolKind, rc: int, output: str) -> bool:
     """Return True when a leg was torn down before reaching any verdict.
 
     A pytest leg answers through ``_pytest_session_aborted_without_verdict``.
-    Any other leg needs a shell-reported kill and output holding no finding
-    (``verify_classify.py::shows_no_lint_type_finding``).
+    Any other leg needs a shell-reported kill and output proving no finding
+    was reached (``verify_classify.py::output_proves_no_finding``).
     """
     if tool is ToolKind.PYTEST:
         return _pytest_session_aborted_without_verdict(rc, output)
-    return is_shell_reported_external_kill(rc) and shows_no_lint_type_finding(tool, output)
+    return is_shell_reported_external_kill(rc) and output_proves_no_finding(tool, output)
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
