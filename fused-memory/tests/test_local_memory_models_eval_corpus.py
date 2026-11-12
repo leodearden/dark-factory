@@ -33,8 +33,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_falkor_live import falkor_skipif
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from _fm_helpers import load_script_module
+from falkordb.asyncio import FalkorDB
 from redis.exceptions import ConnectionError as RedisConnectionError
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
@@ -1035,55 +1036,24 @@ class TestReaderRejectsUnusableContent:
         assert 'NoneType' in str(exc.value)
 
 
-class TestFalkorEnvWiring:
-    """Host/port come from the same env vars the fused-memory test suite uses.
+class TestReaderDefaultsToTheConfiguredStore:
+    """With no host/port the reader reads the store the config names: the production corpus.
 
-    An operator who pointed the suite at a FalkorDB has pointed this script at
-    the same one — so these three behaviours are contract, not incidental.
+    FALKOR_HOST/FALKOR_PORT aim the test suite at the scratch FalkorDB, so they
+    must never move this read: the corpus exists only on production.
     """
 
-    def test_port_defaults_when_unset(self, monkeypatch):
-        monkeypatch.delenv('FALKOR_PORT', raising=False)
-        assert _mod._falkor_port_from_env() == 6379
+    def test_the_reader_follows_falkordb_uri_not_the_test_knobs(self, monkeypatch):
+        monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
+        monkeypatch.setenv('FALKOR_HOST', '127.0.0.1')
+        monkeypatch.setenv('FALKOR_PORT', '16380')
 
-    def test_port_defaults_when_empty(self, monkeypatch):
-        """`FALKOR_PORT: ${FALKOR_PORT}` in a CI template expands to ''."""
-        monkeypatch.setenv('FALKOR_PORT', '   ')
-        assert _mod._falkor_port_from_env() == 6379
+        reader = _mod.EpisodeReader(graph_name='g')
 
-    def test_port_is_converted_to_int_not_left_a_string(self, monkeypatch):
-        """Load-bearing: FalkorDB(port='6379') misbehaves."""
-        monkeypatch.setenv('FALKOR_PORT', '6380')
-        port = _mod._falkor_port_from_env()
-        assert port == 6380
-        assert isinstance(port, int) and not isinstance(port, bool)
+        assert (reader.host, reader.port) == ('corpus.invalid', 7001)
 
-    def test_a_non_numeric_port_is_an_operator_error_naming_the_var(self, monkeypatch):
-        """Never a connection failure — those send the reader after the store."""
-        monkeypatch.setenv('FALKOR_PORT', 'not-a-port')
-        with pytest.raises(_mod.CorpusBuildError) as exc:
-            _mod._falkor_port_from_env()
-        assert 'FALKOR_PORT' in str(exc.value)
-        assert 'not-a-port' in str(exc.value)
-
-    def test_host_defaults_to_localhost(self, monkeypatch):
-        monkeypatch.delenv('FALKOR_HOST', raising=False)
-        assert _mod._falkor_host_from_env() == 'localhost'
-
-    def test_host_is_read_from_the_env(self, monkeypatch):
-        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
-        assert _mod._falkor_host_from_env() == 'falkor.internal'
-
-    def test_the_reader_actually_reads_them(self, monkeypatch):
-        """The env plumbing is only worth testing if the seam consumes it."""
-        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
-        monkeypatch.setenv('FALKOR_PORT', '6380')
-        reader = _mod.EpisodeReader(graph=_FalkorDouble([]))
-        assert (reader.host, reader.port) == ('falkor.internal', 6380)
-
-    def test_explicit_arguments_win_over_the_env(self, monkeypatch):
-        monkeypatch.setenv('FALKOR_HOST', 'falkor.internal')
-        monkeypatch.setenv('FALKOR_PORT', '6380')
+    def test_explicit_arguments_win_over_the_config(self, monkeypatch):
+        monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
         reader = _mod.EpisodeReader(graph=_FalkorDouble([]), host='other', port=1234)
         assert (reader.host, reader.port) == ('other', 1234)
 
@@ -3499,7 +3469,7 @@ class TestBuilderScriptSatisfiesTheDeliveredCheck:
 
 
 # ===========================================================================
-# Live smoke — ONE read-only query against the real dark_factory graph
+# Live smoke — ONE read-only query against a seeded scratch graph
 # ===========================================================================
 #
 # Marked @pytest.mark.integration PER-TEST, never as a module-level pytestmark:
@@ -3507,23 +3477,19 @@ class TestBuilderScriptSatisfiesTheDeliveredCheck:
 # module-wide marker would deselect every offline test above and this file
 # would silently stop running in the default lane.
 
-# Drift-tolerant floors, never equalities. The store grows continuously — the
-# PRD measured ~2,635 episodes at authoring and this task measured 2,770 two
-# months later — so `assert len(population) == 2770` would be a guaranteed
-# future red that says nothing about correctness.
-LIVE_MIN_POPULATION = 2000
-LIVE_MIN_MONTH_BUCKETS = 5
-LIVE_WINDOW_STARTS_BY = '2026-04-06'
-
-# The payload axis IS asserted by equality, unlike the counts. A new kind
-# appearing is not drift to tolerate: it adds a row to the cross-tab, changes
-# every stratum denominator, and means delta's census needs re-measuring
-# before the next corpus build. A red here is information, not noise.
-LIVE_PAYLOAD_KINDS = {
-    'decisions_and_rationale',
-    'temporal_facts',
-    'entities_and_relations',
-    'procedural_knowledge',
+# A seeded scratch graph with one episode per (month, payload kind) cell, in the
+# store's four timestamp spellings.
+SEEDED_EPISODES = (
+    ('7792-a', 'a', 'g', 'add_memory:decisions_and_rationale', '2026-04-06T10:00:00+00:00', 'alpha'),
+    ('7792-b', 'b', 'g', 'add_memory:temporal_facts', '2026-05-02T10:00:00Z', 'beta'),
+    ('7792-c', 'c', 'g', 'replay_from_mem0:procedural_knowledge', '2026-06-15T12:00:00', 'gamma'),
+    ('7792-d', 'd', 'g', 'a caller-supplied add_episode description', '2026-07-02 08:00:00', 'delta'),
+)
+SEEDED_STRATA = {
+    ('2026-04', 'decisions_and_rationale'),
+    ('2026-05', 'temporal_facts'),
+    ('2026-06', 'procedural_knowledge'),
+    ('2026-07', 'add_episode'),
 }
 
 
@@ -3552,35 +3518,49 @@ class _RecordingLiveGraph:
 
 @pytest.mark.integration
 @falkor_skipif()
-def test_live_dark_factory_population_smoke(monkeypatch):
-    """One GRAPH.RO_QUERY against the live graph; nothing is written.
+def test_live_population_read_smoke(monkeypatch):
+    """One GRAPH.RO_QUERY against a live graph seeded on the scratch FalkorDB.
 
-    Asserts the premises the whole builder rests on are still true of the real
-    store — the two stratification dimensions actually discriminate, and the
-    population is big enough for a 150-300 corpus to mean anything — plus the
-    two hazards, measured rather than promised: only the read-only command path
-    was used, and no graphiti FalkorDriver was constructed (its ``__init__``
-    fire-and-forgets ``build_indices_and_constraints()``, which would create
-    indices on dark_factory and destroy the no-index evidence owned by
-    docs/prds/falkordb-index-provisioning.md).
+    Measures, on the real client path, that the read projects the six fields
+    and places every row in its stratum, plus the two hazards: only the
+    read-only command path was used, and no graphiti FalkorDriver was
+    constructed (its ``__init__`` fire-and-forgets
+    ``build_indices_and_constraints()``, which would create indices on the
+    graph it reads; docs/prds/falkordb-index-provisioning.md).
+
+    The real population's facts (its size, month span, window start and
+    payload axis) are the operator's ``build_corpus.py --verify`` against
+    production, where the corpus lives; tests never read production.
     """
     from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
 
     def _boom(*args, **kwargs):
         raise AssertionError(
             'the live smoke constructed a graphiti FalkorDriver — this fires '
-            'build_indices_and_constraints() against dark_factory'
+            'build_indices_and_constraints() against the graph it reads'
         )
 
     monkeypatch.setattr(falkordb_driver.FalkorDriver, '__init__', _boom)
 
+    graph_name = unique_graph_name('7792_corpus_reader')
     recorders: list[_RecordingLiveGraph] = []
 
-    async def _run() -> list:
-        # The probe reader resolves FALKOR_HOST/FALKOR_PORT, so the env wiring
-        # is exercised live; the handle it addresses is wrapped to record the
-        # command path.
-        probe = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
+    async def _seed() -> None:
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            graph = client.select_graph(graph_name)
+            for row in SEEDED_EPISODES:
+                await graph.query(
+                    'CREATE (:Episodic {uuid: $uuid, name: $name, group_id: $group_id, '
+                    'source_description: $source_description, created_at: $created_at, '
+                    'content: $content})',
+                    dict(zip(_mod.PROJECTED_FIELDS, row, strict=True)),
+                )
+        finally:
+            await client.aclose()
+
+    async def _read() -> list:
+        probe = _mod.EpisodeReader(graph_name=graph_name, host=FALKOR_HOST, port=FALKOR_PORT)
         live: Any = open_graph(probe.graph_name, host=probe.host, port=probe.port)
         recorder = _RecordingLiveGraph(live)
         recorders.append(recorder)
@@ -3590,31 +3570,22 @@ def test_live_dark_factory_population_smoke(monkeypatch):
         finally:
             await live.client.aclose()
 
-    population = asyncio.run(_run())
+    async def _delete() -> None:
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            await client.select_graph(graph_name).delete()
+        finally:
+            await client.aclose()
 
-    assert len(population) > LIVE_MIN_POPULATION, (
-        f'only {len(population)} episodes — too few for a 150-300 corpus to be a '
-        f'sample rather than a census'
-    )
+    try:
+        asyncio.run(_seed())
+        population = asyncio.run(_read())
+    finally:
+        asyncio.run(_delete())
 
-    classified = [
-        (r.source_description, _mod.payload_kind(r.source_description)) for r in population
-    ]
-    kinds = {kind for _, kind in classified}
-    unexpected_descriptions = sorted(
-        {description for description, kind in classified if kind not in LIVE_PAYLOAD_KINDS}
-    )
-    assert kinds == LIVE_PAYLOAD_KINDS, (
-        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} '
-        f'(source_descriptions outside it: {unexpected_descriptions[:5]}) — '
-        f're-measure the census before building the next corpus'
-    )
-
-    months = {_mod.month_bucket(r.created_at) for r in population}
-    assert len(months) >= LIVE_MIN_MONTH_BUCKETS, months
-
-    window_start = min(r.created_at for r in population)
-    assert window_start[:10] <= LIVE_WINDOW_STARTS_BY, window_start
+    projected = {tuple(getattr(r, field) for field in _mod.PROJECTED_FIELDS) for r in population}
+    assert projected == set(SEEDED_EPISODES)
+    assert {_mod.stratum_key(r) for r in population} == SEEDED_STRATA
 
     # The hazards, measured: exactly one query, on the read-only path only.
     assert [r.commands for r in recorders] == [['ro_query']]

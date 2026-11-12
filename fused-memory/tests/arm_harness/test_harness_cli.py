@@ -75,6 +75,7 @@ from fused_memory.arm_harness.screening_evidence import ArmEvidencePaths, load_a
 from fused_memory.arm_harness.slate import load_llm_slate
 from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER, read_topology, topology_hash
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
 from fused_memory.config.schema import FusedMemoryConfig
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
@@ -1360,3 +1361,47 @@ def test_topology_refuses_a_protected_graph_before_any_dependency(harness, live,
     assert code == harness.EXIT_SCRATCH_GUARD
     assert live.log.factory_calls == 0
     assert live.falkor.calls == []
+
+
+# --- live dependencies -----------------------------------------------------------------
+
+
+class RecordingFalkorDB:
+    """Stands in for ``falkordb.asyncio.FalkorDB``, whose constructor dials its address."""
+
+    def __init__(self, opened: list[dict[str, Any]], **address: Any) -> None:
+        opened.append(address)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_live_deps_write_to_the_scratch_falkordb_and_read_the_corpus_where_it_lives(
+    harness, monkeypatch
+):
+    monkeypatch.setenv('FALKORDB_URI', 'redis://corpus.invalid:7001')
+    monkeypatch.setenv('FALKOR_HOST', '127.0.0.1')
+    monkeypatch.setenv('FALKOR_PORT', '16380')
+    opened: list[dict[str, Any]] = []
+    monkeypatch.setattr(harness, 'FalkorDB', lambda **address: RecordingFalkorDB(opened, **address))
+
+    live = harness.build_live_deps()
+
+    assert live.base_config.graphiti.falkordb.uri == 'redis://127.0.0.1:16380'
+    assert live.base_config.graphiti.falkordb.password is None
+    corpus_reader = live.episode_reader(CORPUS_GRAPH)
+    assert (corpus_reader.host, corpus_reader.port) == ('corpus.invalid', 7001)
+
+    async def _open_scratch() -> None:
+        async with live.open_falkordb():
+            pass
+
+    asyncio.run(_open_scratch())
+    assert opened == [{'host': '127.0.0.1', 'port': 16380, 'password': None}]
+
+
+def test_live_deps_refuse_a_scratch_target_that_is_production(harness, monkeypatch):
+    monkeypatch.setenv('FALKOR_PORT', '6379')
+
+    with pytest.raises(ProductionFalkorDBTarget):
+        harness.build_live_deps()
