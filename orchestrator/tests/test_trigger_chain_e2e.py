@@ -28,7 +28,8 @@ from _trigger_chain_doc_shapes import (
     snippet_submit_calls,
     submit_calls,
 )
-from _trigger_chain_rig import Chain, TriggerChainRig, open_rig
+from _trigger_chain_rig import Chain, TriggerChainRig, open_rig, review_due
+from escalation.models import Escalation
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
@@ -291,3 +292,95 @@ class TestCompletionGate:
         assert 'before_done.recheck_secs is not declared' in escalation.detail
         assert (await rig.task(gate_id))['status'] == 'blocked'
         assert _rearm_events(rig, gate_id) == []
+
+
+@dataclass(frozen=True)
+class _Fired:
+    first: _FirstCheck
+    escalation: Escalation
+
+
+async def _human_gate_fired(rig: TriggerChainRig) -> _Fired:
+    """Row 1's re-armed chain; its high finding lands, the gate passes, the human gate files review_due."""
+    first = await _first_check_not_yet(rig)
+    await rig.set_finding_status(first.findings[0], 'done')
+    rig.clock.set(_at(await rig.task(first.chain.completion_id)))
+
+    gate_assignment, gate_outcome = await rig.dispatch()
+    human_assignment, human_outcome = await rig.dispatch()
+
+    assert gate_assignment is not None and gate_assignment.task_id == first.chain.completion_id
+    assert gate_outcome == WorkflowOutcome.DONE
+    assert human_assignment is not None and human_assignment.task_id == first.chain.human_id
+    assert human_outcome == WorkflowOutcome.BLOCKED
+    (escalation,) = rig.own_escalations(first.chain.human_id, status='pending')
+    return _Fired(first, escalation)
+
+
+@pytest.mark.asyncio
+class TestHumanGateFires:
+    async def test_a_passed_gate_fires_review_due(self, rig: TriggerChainRig) -> None:
+        fired = await _human_gate_fired(rig)
+        chain = fired.first.chain
+
+        gate = await rig.task(chain.completion_id)
+        assert gate['status'] == 'done'
+        assert _metadata(gate)['done_provenance']['kind'] == 'deterministic-milestone'
+        assert '"verdict":"pass"' in _metadata(gate)['done_provenance']['note']
+        escalation = fired.escalation
+        assert (escalation.category, escalation.level) == ('review_due', 2)
+        due = review_due(escalation)
+        assert due['run_id'] == RUN
+        assert due['skill'] == 'review'
+        verdict = due['verdict']
+        assert verdict is not None
+        share = verdict['share']
+        assert isinstance(share, float) and share >= 0.7
+        assert due['completion_gate_task_id'] == chain.completion_id
+        assert due['human_gate_task_id'] == chain.human_id
+        assert due['launched_from'] == escalation.id
+        assert due['project_root'] == str(rig.root)
+        assert (await rig.task(chain.human_id))['status'] == 'blocked'
+
+    async def test_a_bare_skill_is_stored_bare_and_rendered_with_a_slash(
+        self, rig: TriggerChainRig
+    ) -> None:
+        human_id = await rig.submit(rig.snippet_call('human_gate', RUN))
+        await rig.call_ok('commit_planning', project_root=str(rig.root), task_ids=human_id)
+
+        _, outcome = await rig.dispatch()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        (escalation,) = rig.own_escalations(human_id, status='pending')
+        assert review_due(escalation)['skill'] == 'review'
+        assert escalation.summary == f'Run /review on {rig.project_id} ({RUN} landed)'
+
+    async def test_the_interim_gate_fires_259200_seconds_after_its_last_dependency(
+        self, rig: TriggerChainRig
+    ) -> None:
+        first_dep, last_dep, _ = await rig.seed_run(RUN, ('high', OPEN), ('high', OPEN), ('low', OPEN))
+        human_id = await rig.file_interim_gate(RUN, deps=(first_dep, last_dep))
+
+        await rig.set_finding_status(first_dep, 'cancelled')
+        assert await rig.dispatch() == (None, None)
+        assert 'milestone_deps_satisfied_at' not in _metadata(await rig.task(human_id))
+
+        rig.clock.advance(3600)
+        last_terminal = rig.clock()
+        await rig.set_finding_status(last_dep, 'done')
+        assert await rig.dispatch() == (None, None)
+        anchor = _metadata(await rig.task(human_id))['milestone_deps_satisfied_at']
+        assert datetime.fromisoformat(anchor) == last_terminal
+
+        rig.clock.set(last_terminal + timedelta(seconds=259199))
+        assert await rig.dispatch() == (None, None)
+        rig.clock.set(last_terminal + timedelta(seconds=259200))
+        assignment, outcome = await rig.dispatch()
+
+        assert assignment is not None and assignment.task_id == human_id
+        assert outcome == WorkflowOutcome.BLOCKED
+        (escalation,) = rig.own_escalations(human_id, status='pending')
+        assert escalation.category == 'review_due'
+        assert 'trigger_chain' in _metadata(await rig.task(human_id))
+        assert review_due(escalation)['completion_gate_task_id'] is None
+        assert review_due(escalation)['verdict'] is None
