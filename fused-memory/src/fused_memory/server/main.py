@@ -120,8 +120,9 @@ _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
 _FORCE_EXIT_BUDGET = 75.0
 
 # A repeat stop signal this soon after the first is the same stop delivered
-# twice (measured repeats land <= 0.29 s after it); must stay far below the drain.
-_OPERATOR_STOP_REPEAT_WINDOW_SECS = 1.0
+# twice: over 40 restarts (2026-11-09..12) the latest repeat landed 1.542 s
+# after the first. Must stay far below the drain.
+_OPERATOR_STOP_REPEAT_WINDOW_SECS = 3.0
 
 # Mirrors TimeoutStopSec=90 in the committed systemd unit template
 # (scripts/fused-memory.service.template). Invariant (survey finding D1):
