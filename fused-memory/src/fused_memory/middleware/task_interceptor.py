@@ -31,8 +31,8 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 from shared.mcp_envelope import write_failure_reason
-from shared.pure_gate_provenance import PURE_GATE_FROM_KEY, PureGateTrigger, is_pure_gate_shape
-from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.pure_gate_provenance import PureGateTrigger, pure_gate_stamped
+from shared.task_metadata import DoneProvenance
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
@@ -109,10 +109,11 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
-
-# NOTE: safe top-level import — operational_routing_guard has NO top-level
-# task_interceptor import (it lazily imports TaskInterceptor inside its
-# function to break the cycle), so this does not create a circular import.
+from fused_memory.middleware.metadata_dict import (
+    extract_metadata_dict,
+    fresh_metadata_copy,
+    raw_metadata_dict,
+)
 from fused_memory.middleware.operational_routing_guard import (
     inject_operational_routing,
     pure_gate_routing_notice,
@@ -197,22 +198,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not resolve any dict at all.
-# Only these are loud from the read-path parsers below; 'unknown_key' /
-# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
-# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
-# and belong to the write boundary (W3-β's _emit_schema_warning census),
-# not these read-path helpers — emitting them here would flood the
-# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
-# for zero lines against schema-clean metadata.
-_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
-
 # The escalation-gate stamp, named once so the writers stay greppably
 # coupled. WRITERS: ``operational_routing_guard.inject_operational_routing``
 # (the declared execution_class='operational'|'decision' boundary coercion)
-# and ``TaskInterceptor._inject_deterministic_pure_gate`` (the curator's
-# route_deterministic fallback), which between them set every key below.
+# and ``shared/src/shared/pure_gate_provenance.py::pure_gate_stamped`` (via the
+# curator's route_deterministic fallback), which between them set every key below.
 #
 # NOT a reader-coupling: ``TaskInterceptor._is_gate_metadata`` (task 3446)
 # does NOT consult this constant — its gate predicate is deliberately
@@ -237,28 +227,6 @@ class _CombineRewrite(TypedDict):
     details: str
 
 
-def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
-
-    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
-    readable metadata, and ``(None, warnings)`` for present-but-unreadable
-    metadata. *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
-    its ``unparseable_json`` / ``not_an_object`` codes cover every value
-    ``coerce_task_metadata`` rejects, so the list is never empty.
-
-    ``parse_metadata`` runs only on that failure path, for its diagnosis.
-    The returned dict is never ``parse_metadata(...).model_dump()``, so
-    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
-    gaining ``TaskMetadata``'s typed-field defaults.
-    """
-    meta = coerce_task_metadata(metadata)
-    if meta is not None:
-        return meta, []
-    _, warnings = parse_metadata(metadata, direction='read')
-    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-
-
 def _has_branch_base_sha(metadata: Any) -> bool:
     """True when *metadata* records a non-blank ``branch_base_sha``.
 
@@ -266,20 +234,9 @@ def _has_branch_base_sha(metadata: Any) -> bool:
     (``orchestrator/src/orchestrator/workflow.py``), so the task already owns a branch.
     Absent, non-dict or unparseable metadata answers False without emitting a schema warning.
     """
-    meta, _warnings = _parse_metadata_value(metadata)
+    meta = coerce_task_metadata(metadata)
     sha = (meta or {}).get('branch_base_sha')
     return isinstance(sha, str) and sha.strip() != ''
-
-
-def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
-    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
-    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
-    logger.warning(
-        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
-        source,
-        reason,
-        type(metadata).__name__,
-    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -311,9 +268,9 @@ def _resolve_backend_label(taskmaster: Any) -> str:
     return 'unknown'
 
 
-# Terminal statuses the server refuses to exit without a reopen_reason.
-# Re-exported from shared.task_statuses (PRD task-status-authority C1/C2) —
-# the single source of truth, imported above as TERMINAL_STATUSES.
+# Terminal statuses the server refuses to exit without a reopen_reason:
+# shared.task_statuses.TERMINAL (PRD task-status-authority C1/C2), the single
+# source of truth, imported above as TERMINAL_STATUSES.
 #
 # 'merge-deferred' is deliberately NOT in this set — a property of
 # shared.TERMINAL, not this module. It is a non-terminal holding state for
@@ -380,37 +337,8 @@ def _claimant_exception_entry(
     }
 
 
-def _is_ticket_id(value: object) -> bool:
-    """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
-    return isinstance(value, str) and value.startswith('tkt_')
-
-
 class TicketStoreNotConfiguredError(RuntimeError):
     """Raised by a read that needs the ticket store when the interceptor has none."""
-
-
-def _looks_like_task_id(value: object) -> bool:
-    """Return True when *value* parses as a non-negative integer task id.
-
-    Accepts ``int`` directly, plus numeric strings (with surrounding whitespace
-    trimmed). Rejects empty strings, negatives, and non-numeric strings.
-
-    Used by ``resolve_ticket`` to short-circuit when a caller passes a numeric
-    task id that came back from ``submit_task(planning_mode=True)`` — the
-    planning-mode path returns the id synchronously, so the two-step
-    submit/resolve dance does not apply, but agents may still call it blindly.
-    """
-    if isinstance(value, bool):
-        # bool is a subclass of int in Python; reject explicitly.
-        return False
-    if isinstance(value, int):
-        return value >= 0
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return False
-        return stripped.isdigit()
-    return False
 
 
 @dataclasses.dataclass
@@ -988,7 +916,10 @@ class TaskInterceptor:
         scroll = self._consolidation_scroll
         if scroll is None:
             return None
-        meta = self._extract_metadata_dict(before.get('metadata') if isinstance(before, dict) else None)
+        meta = extract_metadata_dict(
+            before.get('metadata') if isinstance(before, dict) else None,
+            source='TaskInterceptor._consolidation_closure_error',
+        )
         if not meta or meta.get('operational_mode') != 'gate':
             return None
         block = meta.get(GATE_METADATA_KEY)
@@ -2550,17 +2481,11 @@ class TaskInterceptor:
         callers such as :meth:`_extract_meta_files` and
         :meth:`_build_candidate` can read keys without additional guarding.
 
-        The absent/readable/unreadable rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`. Unreadable metadata emits a
-        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
-        — I4: this replaces a silent ``{}`` coercion.
+        Resolved by ``fused_memory/middleware/metadata_dict.py::raw_metadata_dict``,
+        so unreadable metadata emits a ``task_metadata.schema_warning`` WARNING
+        before collapsing to ``{}`` — I4: this replaces a silent ``{}`` coercion.
         """
-        metadata = kwargs.get('metadata')
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
-        return parsed if parsed is not None else {}
+        return raw_metadata_dict(kwargs.get('metadata'), source='TaskInterceptor._parse_metadata')
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -3615,8 +3540,10 @@ class TaskInterceptor:
             return None
 
         target_metadata = target.get('metadata')
-        target_meta, _target_warnings = _parse_metadata_value(target_metadata)
-        candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
+        target_meta = coerce_task_metadata(target_metadata)
+        candidate_meta = (
+            extract_metadata_dict(candidate_metadata, source='TaskInterceptor._execute_combine') or {}
+        )
         audit_context, items_after = _combine_fold(
             decision,
             ticket_id=ticket_id,
@@ -3919,47 +3846,10 @@ class TaskInterceptor:
         return lock
 
     @staticmethod
-    def _extract_metadata_dict(metadata) -> dict | None:
-        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
-
-        None means present-but-unreadable, and in that case the
-        ``task_metadata.schema_warning`` census WARNING has already been
-        emitted — I4: this replaces a silent ``None`` coercion. The rule is
-        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
-        :func:`_parse_metadata_value`.
-        """
-        parsed, warnings = _parse_metadata_value(metadata)
-        if warnings:
-            _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
-        return parsed
-
-    @staticmethod
-    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
-        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
-
-        Absent metadata gives a fresh ``{}``, and a readable dict is
-        shallow-copied, so the caller's dict is never mutated. Unreadable
-        metadata is DISCARDED for a fresh ``{}``. On top of the census line
-        :meth:`_extract_metadata_dict` already emitted, a second WARNING
-        prefixed with *site* is logged: two log lines for one failure, so the
-        discard can be grepped by caller.
-        """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            logger.warning(
-                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
-                site,
-                type(metadata).__name__,
-                metadata,
-            )
-            return {}
-        return dict(meta)
-
-    @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
         """True when *metadata* declares an escalation gate (task 3446).
 
-        Normalises through :meth:`_extract_metadata_dict` so a JSON-string
+        Normalises through ``metadata_dict.py::extract_metadata_dict`` so a JSON-string
         blob, a dict, and ``None`` are all handled by the one shared shape
         policy — never a hand-rolled ``json.loads``. Unparseable or non-dict
         metadata answers False (ungated): the shape WARNING is already emitted
@@ -3974,7 +3864,7 @@ class TaskInterceptor:
         intent. Reading the same keys loosely here would let a task the guard
         considers ungated be treated as gated (and vice versa).
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._is_gate_metadata')
         if not meta:
             return False
         return (
@@ -3987,7 +3877,7 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        Builds on ``metadata_dict.py::fresh_metadata_copy`` to normalise the incoming
         shape (absent or unreadable → fresh dict) before writing the key, so
         the result is always a plain dict ready for JSON serialisation.
 
@@ -3999,38 +3889,8 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
+        meta = fresh_metadata_copy(metadata, site='routing-override')
         meta['routing_override_reason'] = reason
-        return meta
-
-    @staticmethod
-    def _inject_deterministic_pure_gate(metadata: Any, *, trigger: PureGateTrigger) -> dict:
-        """Return a metadata dict stamped as a deterministic PURE-GATE.
-
-        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
-        shape (absent or unreadable → fresh dict) before writing the keys, so
-        the result is always a plain dict ready for JSON serialisation —
-        mirrors :meth:`_inject_routing_override`.
-
-        Unconditionally sets ``task_kind='deterministic'`` and
-        ``always_escalates=True``, and DELETES any ``before_done`` key so the
-        result always satisfies the pure-gate invariant enforced by
-        :func:`deterministic_task_guard.deterministic_task_error` — a
-        deterministic task with no action must always escalate, never be an
-        ill-formed no-op. This holds regardless of what task_kind/before_done
-        the recon LLM originally supplied in metadata.
-
-        Stamps ``pure_gate_from`` with ``trigger`` only when the conversion
-        rewrote the routing: metadata already in the pure-gate shape stays
-        unstamped, and an existing stamp is kept.
-        """
-        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
-        declared = is_pure_gate_shape(meta)
-        meta['task_kind'] = 'deterministic'
-        meta['always_escalates'] = True
-        meta.pop('before_done', None)
-        if not declared:
-            meta[PURE_GATE_FROM_KEY] = trigger.value
         return meta
 
     @staticmethod
@@ -4044,7 +3904,7 @@ class TaskInterceptor:
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
         — normalises the existing ``kwargs['metadata']`` (via
-        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
+        ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable → fresh dict,
         unreadable input discarded with a WARNING, same as the override path)
         into a plain dict, sets ``possible_scope_mismatch``, and writes the
         result back into ``kwargs['metadata']`` in place.
@@ -4070,9 +3930,7 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(
-            kwargs.get('metadata'), 'scope-mismatch-advisory'
-        )
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='scope-mismatch-advisory')
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -4089,7 +3947,7 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
+        normalisation (via ``metadata_dict.py::fresh_metadata_copy``: absent or unreadable
         → fresh dict, unreadable input discarded with a WARNING) and, like
         it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
@@ -4100,7 +3958,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
+        meta = fresh_metadata_copy(kwargs.get('metadata'), site='cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
@@ -4117,7 +3975,7 @@ class TaskInterceptor:
         *lookup* is the batch's, None without a backend. A lookup that raised falls through to
         CREATE with every item, logged here.
         """
-        meta = self._extract_metadata_dict(metadata)
+        meta = extract_metadata_dict(metadata, source='TaskInterceptor._check_escalation_idempotency')
         if not meta or lookup is None:
             return R4Verdict()
         try:
@@ -4243,7 +4101,7 @@ class TaskInterceptor:
         # tools.py). Idempotent, so for MCP-tool callers — where tools.py has
         # already coerced before delegating — re-running here is a no-op; the
         # twin's real job is the direct caller. Distinct from
-        # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
+        # _dispatch_ticket_decision's pure_gate_stamped call
         # (the curator's untagged-substring route_deterministic fallback),
         # which is a different mechanism, not this declared-tag coercion.
         # The routing notice is derived here so it is right whichever layer
@@ -4964,8 +4822,8 @@ class TaskInterceptor:
             # Combine: rewrite target task under write_lock, spawn reembed background task.
             async with self._write_lock(project_id):
                 # candidate_metadata is this ticket's post-inject_operational_routing
-                # submission metadata — the same object stamped by
-                # _inject_deterministic_pure_gate and serialised into tm.add_task
+                # submission metadata — the same value stamped by
+                # pure_gate_stamped and serialised into tm.add_task
                 # below. _execute_combine reads it to refuse absorbing a gated
                 # candidate into an ungated target (task 3446).
                 combine_result = await self._execute_combine(
@@ -5008,8 +4866,9 @@ class TaskInterceptor:
             # Operational-ask registry match (filing-policy gate): stamp
             # metadata as a deterministic PURE-GATE and fall through to the
             # ordinary create path below.
-            metadata = self._inject_deterministic_pure_gate(
-                metadata, trigger=PureGateTrigger.OPERATIONAL_ASK_REGISTRY
+            metadata = pure_gate_stamped(
+                fresh_metadata_copy(metadata, site='deterministic-pure-gate'),
+                PureGateTrigger.OPERATIONAL_ASK_REGISTRY,
             )
 
         # ── Create task ───────────────────────────────────────────────
@@ -5022,7 +4881,7 @@ class TaskInterceptor:
         skipped_reason = _dedupe_skipped_reason(decision, curator_unavailable=curator_unavailable)
         if skipped_reason is not None:
             metadata = {
-                **self._fresh_metadata_copy(metadata, 'dedupe-skipped-marker'),
+                **fresh_metadata_copy(metadata, site='dedupe-skipped-marker'),
                 **dedupe_skipped_marker(skipped_reason, at=datetime.now(UTC)),
             }
 
@@ -7113,13 +6972,13 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
 def _extract_reopen_at(before: Any) -> str | None:
     """Return ``metadata.reopen_at`` from a Taskmaster ``before`` snapshot.
 
-    Uses :func:`_parse_metadata_value` so a JSON-string metadata blob is
-    handled identically to an already-parsed dict. Returns None when
-    absent, empty, or unresolvable — callers treat that as "never
+    Uses ``shared.task_metadata_wire.coerce_task_metadata`` so a JSON-string
+    metadata blob is handled identically to an already-parsed dict. Returns
+    None when absent, empty, or unresolvable — callers treat that as "never
     reopened" (the reopen-freshness gate stays inert).
     """
     raw = before.get('metadata') if isinstance(before, dict) else None
-    parsed, _warnings = _parse_metadata_value(raw)
+    parsed = coerce_task_metadata(raw)
     if not isinstance(parsed, dict):
         return None
     reopen_at = parsed.get('reopen_at')

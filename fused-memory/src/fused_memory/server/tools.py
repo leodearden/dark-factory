@@ -28,6 +28,8 @@ from shared.delivered_check_polarity import (
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_submit import is_ticket_id, looks_like_task_id
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
@@ -100,10 +102,7 @@ from fused_memory.middleware.routing_intent_guard import (
 )
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_interceptor import (
-    TERMINAL_STATUSES,
     TicketStoreNotConfiguredError,
-    _is_ticket_id,
-    _looks_like_task_id,
     interceptor_write_succeeded,
 )
 from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
@@ -1703,13 +1702,12 @@ def create_mcp_server(
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     # Derived from the authoritative sets so this validator stays in lockstep
     # automatically when a new status is added to either partition. Both names
-    # are re-exported from shared.task_statuses (PRD task-status-authority
-    # C1/C2, finding 6.4) — the single source of truth:
+    # come from shared.task_statuses (PRD task-status-authority C1/C2,
+    # finding 6.4) — the single source of truth:
     #   ACTIVE_TASK_STATUSES  — shared.ACTIVE: non-terminal in-flight statuses
     #                           (re-exported by fused_memory.reconciliation.task_filter)
     #   TERMINAL_STATUSES     — shared.TERMINAL: terminal statuses requiring
-    #                           reopen_reason to exit (re-exported by
-    #                           fused_memory.middleware.task_interceptor)
+    #                           reopen_reason to exit (imported directly)
     # Do NOT hardcode this as a literal; use the union so a future status added
     # to shared.task_statuses.TaskStatus is automatically accepted here without
     # a separate edit to this file.
@@ -8654,10 +8652,10 @@ def create_mcp_server(
         task tools. Returning a clear error here prevents confusing downstream
         failures inside the taskmaster backend.
 
-        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
-        so there is a single source of truth for the ticket-id prefix.
+        Delegates to ``shared/src/shared/task_submit.py::is_ticket_id`` so
+        there is a single source of truth for the ticket-id prefix.
         """
-        if _is_ticket_id(value):
+        if is_ticket_id(value):
             return {
                 'error': (
                     f'Ticket-shaped id {value!r} not allowed here; '
@@ -9828,14 +9826,14 @@ def create_mcp_server(
                 under the MCP 120 s hard limit) so external callers that omit this
                 parameter cannot hang indefinitely on an orphaned ticket.
         """
-        if not _is_ticket_id(ticket):
+        if not is_ticket_id(ticket):
             # Idempotent passthrough: if the caller passed a numeric task id,
             # short-circuit instead of erroring.  This catches agents that
             # blindly use the two-step submit/resolve dance after a
             # ``planning_mode=True`` submit_task that already returned a
             # synchronous ``task_id``.  No store lookup is performed — the
             # contract is that any numeric id is treated as already-resolved.
-            if _looks_like_task_id(ticket):
+            if looks_like_task_id(ticket):
                 return {
                     'status': 'created',
                     'task_id': str(ticket).strip(),
@@ -10334,7 +10332,7 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         for tid in ids:
-            if _is_ticket_id(tid):
+            if is_ticket_id(tid):
                 return {
                     'error': (
                         f'commit_planning: task_ids must contain numeric task ids, '
