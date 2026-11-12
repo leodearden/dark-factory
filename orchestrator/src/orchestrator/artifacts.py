@@ -981,15 +981,25 @@ class TaskArtifacts:
         workflow in the orchestrator stalls. Keep critical sections short, and
         never hold one across a subprocess the plan does not depend on.
         """
-        lock_path = self._plan_mutex_path()
+        with self._artifact_mutex('plan.json'):
+            yield
+
+    @contextmanager
+    def _artifact_mutex(self, name: str) -> Iterator[None]:
+        """The cross-process lock for a read-modify-write of artifact *name*.
+
+        The policy :meth:`plan_mutex` documents, for any artifact: keyed on
+        the RESOLVED path, and no lock once the root is gone.
+        """
+        lock_path = self._artifact_mutex_path(name)
         if lock_path is None:
             yield
             return
         with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
             yield
 
-    def _plan_mutex_path(self) -> Path | None:
-        lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
+    def _artifact_mutex_path(self, name: str) -> Path | None:
+        lock_path = Path(os.path.realpath(self.artifact_path(name))).with_name(f'{name}.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
     def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> Plan:
@@ -1004,7 +1014,7 @@ class TaskArtifacts:
         """
         written = _at_current_schema(plan)
         with nullcontext() if mutex_held else self.plan_mutex():
-            lock_path = self._plan_mutex_path()
+            lock_path = self._artifact_mutex_path('plan.json')
             if lock_path is not None and not file_mutex.held(lock_path):
                 raise PlanMutexNotHeld(
                     f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
@@ -1085,26 +1095,15 @@ class TaskArtifacts:
         One entry per path: a repeat replaces the earlier entry and moves to
         the end. Returns how many requests are now pending. The plan-tools
         server runs concurrent tool calls on threads, so the read-modify-write
-        holds :meth:`_scope_requests_mutex`. The workflow applies and removes
+        holds its :meth:`_artifact_mutex`. The workflow applies and removes
         them at each writer boundary
         (``workflow.py::TaskWorkflow._apply_scope_requests``).
         """
-        with self._scope_requests_mutex():
+        with self._artifact_mutex('scope_requests.json'):
             kept = [r for r in self.read_scope_requests() if r.path != request.path]
             entries = [r.to_mapping() for r in (*kept, request)]
             self._write_json('scope_requests.json', {'requests': entries})
             return len(entries)
-
-    @contextmanager
-    def _scope_requests_mutex(self) -> Iterator[None]:
-        lock_path = Path(
-            os.path.realpath(self.artifact_path('scope_requests.json'))
-        ).with_name('scope_requests.json.mutex')
-        if not lock_path.parent.is_dir():
-            yield
-            return
-        with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
-            yield
 
     def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
         """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
@@ -1127,7 +1126,7 @@ class TaskArtifacts:
         The artifact goes once nothing is left in it.
         """
         done = set(applied)
-        with self._scope_requests_mutex():
+        with self._artifact_mutex('scope_requests.json'):
             remaining = [r for r in self.read_scope_requests() if r not in done]
             if remaining:
                 self._write_json(
