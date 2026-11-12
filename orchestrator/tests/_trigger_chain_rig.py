@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 import threading
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock
 
 import uvicorn
 from _git_fixtures import seed_repo
-from _trigger_chain_doc_shapes import concretize, snippet_submit_calls
+from _trigger_chain_doc_shapes import concretize, snippet_placeholders, snippet_submit_calls
 from escalation.action_effects import effect_for
 from escalation.models import Escalation, ReviewDueState
 from escalation.queue import EscalationQueue
@@ -52,13 +52,13 @@ from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 PROJECT_ID = 'lambda_fixture'
-FIRST_CHECK_SECS = 86400
 INTERIM_DELAY_SECS = 259200
 
 _READY_TIMEOUT_S = 60.0
 _READY_POLL_S = 0.05
 _TOOL_TIMEOUT_S = 30.0
 _SCRIPT_TIMEOUT_S = 120.0
+_SCHEDULER_CLOSE_TIMEOUT_S = 5.0
 CHECK_SCRIPT_RELPATH = Path('scripts/check_run_completion.py')
 
 _T = TypeVar('_T')
@@ -168,8 +168,8 @@ class LiveFusedMemory:
         """Await *coro* on the server loop."""
         return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._loop))
 
-    async def start(self, probe: Any) -> None:
-        """Serve, and return once *probe* (an async no-arg callable) completes a real tool call."""
+    async def start(self, probe: Callable[[], Awaitable[object]]) -> None:
+        """Serve, and return once *probe* completes a real tool call."""
         self._thread.start()
         deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_S
         last_error: BaseException | None = None
@@ -192,12 +192,14 @@ class LiveFusedMemory:
             self._server.should_exit = True
 
     def stop(self) -> None:
-        """Ask the server loop to exit, and wait (bounded) for its thread."""
+        """Ask the server loop to exit, wait (bounded) for its thread, and raise whatever ended it."""
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._request_exit)
         self._thread.join(timeout=self._config.server.graceful_shutdown_timeout + 10)
         self._listener.close()
         assert not self._thread.is_alive(), f'fused-memory serving thread for {self.url} did not stop'
+        if self._serve_error is not None:
+            raise self._serve_error
 
 
 class FakeClock:
@@ -274,13 +276,9 @@ class TriggerChainRig:
 
     def snippet_call(self, role: str, run_id: str, skill: str = 'review') -> dict[str, Any]:
         """The snippet's ``submit_task`` call for *role*, concretized for this project."""
-        placeholders = {
-            'skill': skill,
-            'run_id': run_id,
-            'project_root': str(self.root),
-            'project_id': self.project_id,
-            'now + 86400 s, ISO-8601 UTC': (self.clock() + timedelta(seconds=FIRST_CHECK_SECS)).isoformat(),
-        }
+        placeholders = snippet_placeholders(
+            skill=skill, run_id=run_id, project_root=self.root, project_id=self.project_id, now=self.clock()
+        )
         calls = [concretize(call, placeholders) for call in snippet_submit_calls(self.factory_root)]
         (call,) = [call for call in calls if call['metadata']['trigger_chain']['role'] == role]
         return call
@@ -342,11 +340,14 @@ class TriggerChainRig:
         await self.server.run(self.server.backend.set_task_status(task_id, status, str(self.root)))
 
     def runner(
-        self, *, stall_cap: int = PREDICATE_RECHECK_STALL_CAP, scheduler: Any = None
+        self,
+        *,
+        stall_cap: int = PREDICATE_RECHECK_STALL_CAP,
+        scheduler: Scheduler | StatusWriteFailing | None = None,
     ) -> DeterministicRunner:
         """A runner as the harness builds one per slot, on the fake clock, running the real script."""
         return DeterministicRunner(
-            scheduler=scheduler or self.scheduler,
+            scheduler=self.scheduler if scheduler is None else scheduler,
             escalation_queue=self.queue,
             predicate_recheck_stall_cap=stall_cap,
             clock=self.clock,
@@ -360,6 +361,11 @@ class TriggerChainRig:
         if assignment is None:
             return None, None
         try:
+            if not Scheduler.is_deterministic(assignment.task):
+                raise AssertionError(
+                    f'task {assignment.task_id} is not deterministic, so this rig cannot run it; '
+                    'seed an open finding as one another lane holds (in-progress), not pending'
+                )
             outcome = await (runner or self.runner()).run(assignment)
         finally:
             self.scheduler.release(assignment.task_id)
@@ -494,4 +500,7 @@ async def open_rig(tmp_path: Path, factory_root: Path) -> AsyncIterator[TriggerC
         await server.start(lambda: rig.call('get_tasks', project_root=str(root)))
         yield rig
     finally:
-        server.stop()
+        try:
+            await asyncio.wait_for(rig.scheduler.aclose(), timeout=_SCHEDULER_CLOSE_TIMEOUT_S)
+        finally:
+            server.stop()

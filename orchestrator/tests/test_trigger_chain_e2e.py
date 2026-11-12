@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,10 +26,12 @@ from _trigger_chain_doc_shapes import (
     DocShapeError,
     authoring_metadata_exemplars,
     concretize,
+    fenced_blocks,
+    snippet_placeholders,
     snippet_submit_calls,
     submit_calls,
 )
-from _trigger_chain_rig import Chain, TriggerChainRig, open_rig, review_due
+from _trigger_chain_rig import PROJECT_ID, Chain, TriggerChainRig, open_rig, review_due
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES
 from escalation.models import Escalation
 from fused_memory.middleware.deterministic_task_guard import (
@@ -43,7 +45,7 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
 
-pytestmark = [pytest.mark.usefixtures('code_default_config'), pytest.mark.real_mcp_session]
+pytestmark = pytest.mark.usefixtures('code_default_config')
 
 RUN = 'review-lambda-20261112-1'
 # An open finding is held by another lane, so this rig's scheduler never dispatches it.
@@ -70,15 +72,10 @@ async def rig(
         yield opened
 
 
-def _doc_placeholders(project_root: Path) -> dict[str, str]:
-    first_check = datetime.now(UTC) + timedelta(seconds=86400)
-    return {
-        'skill': 'review',
-        'run_id': RUN,
-        'project_root': str(project_root),
-        'project_id': 'lambda_fixture',
-        'now + 86400 s, ISO-8601 UTC': first_check.isoformat(),
-    }
+def _doc_placeholders(project_root: Path) -> Mapping[str, str]:
+    return snippet_placeholders(
+        skill='review', run_id=RUN, project_root=project_root, project_id=PROJECT_ID, now=datetime.now(UTC)
+    )
 
 
 def _assert_accepted(task_kind: str, metadata: dict, project_root: Path) -> None:
@@ -127,6 +124,15 @@ class TestDocShapes:
         with pytest.raises(DocShapeError, match='<mystery>'):
             concretize({'title': 'about <mystery>'}, {'skill': 'review'})
 
+    @pytest.mark.parametrize(('tag', 'lang'), [('py', 'python'), ('python3', 'python'), ('jsonc', 'json')])
+    def test_a_fence_retagged_with_another_spelling_fails_loudly(self, tag: str, lang: str) -> None:
+        with pytest.raises(DocShapeError, match=f'```{tag} fence; tag it ```{lang}'):
+            fenced_blocks(f'```{tag}\n{{}}\n```\n', lang)
+
+    def test_a_fence_is_read_by_the_first_word_of_its_info_string(self) -> None:
+        text = '```JSON title=exemplar\n{"a": 1}\n```\n```js\nlet a\n```\n```\nprose\n```\n'
+
+        assert fenced_blocks(text, 'json') == ['{"a": 1}']
 
 
 async def _titled(rig: TriggerChainRig, title: str) -> list[dict]:
@@ -135,6 +141,7 @@ async def _titled(rig: TriggerChainRig, title: str) -> list[dict]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestSubmitBoundary:
     async def test_an_unknown_before_done_key_is_refused_and_nothing_persists(
         self, rig: TriggerChainRig
@@ -223,6 +230,7 @@ async def _first_check_not_yet(
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestCompletionGate:
     async def test_not_yet_re_arms_without_escalating(self, rig: TriggerChainRig) -> None:
         first = await _first_check_not_yet(rig)
@@ -325,6 +333,7 @@ async def _human_gate_fired(rig: TriggerChainRig) -> _Fired:
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestHumanGateFires:
     async def test_a_passed_gate_fires_review_due(self, rig: TriggerChainRig) -> None:
         fired = await _human_gate_fired(rig)
@@ -412,7 +421,7 @@ async def _stalled_at_cap_two(rig: TriggerChainRig) -> _Stalled:
     _, outcome = await rig.dispatch(runner=runner)
 
     assert outcome == WorkflowOutcome.BLOCKED
-    (escalation,) = rig.own_escalations(first.chain.completion_id, status='pending')
+    (escalation,) = rig.queue.get_by_task(first.chain.completion_id, status='pending')
     return _Stalled(first, escalation)
 
 
@@ -428,6 +437,7 @@ async def _resumed_after_stall(rig: TriggerChainRig) -> _Stalled:
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestStall:
     async def test_the_cap_files_one_stalled_l2(self, rig: TriggerChainRig) -> None:
         stalled = await _stalled_at_cap_two(rig)
@@ -475,6 +485,7 @@ class TestStall:
         gate = await rig.task(gate_id)
         assert _metadata(gate).get('gate_escalated_at')
         assert _recheck(gate)['consecutive'] == 2
+        assert datetime.fromisoformat(_recheck(gate)['first_rearmed_at']) == stalled.first.first_at
         assert datetime.fromisoformat(_recheck(gate)['last_checked_at']) == rig.clock()
         assert rig.own_escalations(gate_id, status='pending') == []
 
@@ -483,6 +494,7 @@ RUN_2 = 'review-lambda-20261112-2'
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestSupersede:
     async def test_an_open_chain_refuses_a_rival_until_superseded(
         self, rig: TriggerChainRig
@@ -553,8 +565,37 @@ class TestSupersede:
         }
         await rig.file_final_chain(RUN_2)
 
+    async def test_a_stalled_gate_is_abandoned_and_a_parked_human_gate_cancelled(
+        self, rig: TriggerChainRig
+    ) -> None:
+        stalled = await _stalled_at_cap_two(rig)
+        chain = stalled.first.chain
+        await rig.call_ok(
+            'set_task_status',
+            id=chain.human_id,
+            status='deferred',
+            deferral={'kind': 'until_condition', 'condition': 'the operator un-parks this chain'},
+            project_root=str(rig.root),
+        )
+
+        await rig.supersede(chain, RUN_2, launched_from=None)
+
+        for task_id in (chain.completion_id, chain.human_id):
+            assert (await rig.task(task_id))['status'] == 'cancelled'
+        (abandoned,) = rig.own_escalations(chain.completion_id)
+        assert abandoned.id == stalled.escalation.id
+        assert (abandoned.status, abandoned.resolution, abandoned.resolution_action) == (
+            'resolved',
+            f'superseded by {RUN_2}',
+            'abandon',
+        )
+        assert rig.queue.get_by_task(chain.human_id) == []
+        assert await rig.dispatch() == (None, None)
+        await rig.file_final_chain(RUN_2)
+
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestLostStatusWrite:
     async def test_a_lost_pending_write_still_withholds_until_at(
         self, rig: TriggerChainRig
@@ -584,6 +625,7 @@ class TestLostStatusWrite:
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_mcp_session
 class TestPendingReport:
     async def test_a_project_with_no_chain_says_none_was_ever_filed_distinct_from_none_open(
         self, rig: TriggerChainRig

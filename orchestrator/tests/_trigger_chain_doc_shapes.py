@@ -13,6 +13,7 @@ import ast
 import json
 import re
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -20,25 +21,43 @@ from typing import Any
 SNIPPET_RELPATH = Path('skills/_shared/filing-the-trigger-chain.md')
 AUTHORING_RELPATH = Path('docs/task-authoring.md')
 
+FIRST_CHECK_SECS = 86400
+
 _FENCE = '```'
 _SECTION_6_HEADING = '## 6.'
 _PLACEHOLDER = re.compile(r'<[^<>]+>')
+_OTHER_SPELLINGS: Mapping[str, frozenset[str]] = MappingProxyType({'python': frozenset({'py', 'py3'})})
 
 
 class DocShapeError(Exception):
     """A doc's fenced code does not yield the shape this suite reads."""
 
 
+def _fence_language(info: str) -> str:
+    words = info.split(maxsplit=1)
+    return words[0].lower() if words else ''
+
+
+def _misspells(language: str, lang: str) -> bool:
+    return language != lang and (language.startswith(lang) or language in _OTHER_SPELLINGS.get(lang, ()))
+
+
 def fenced_blocks(text: str, lang: str) -> list[str]:
-    """The bodies of every fence in *text* whose info string is exactly *lang*."""
+    """The bodies of every fence in *text* whose language (its info string's first word) is *lang*.
+
+    A fence tagged with another spelling of *lang* (``py``, ``python3``, ``jsonc``) raises.
+    """
     blocks: list[str] = []
     body: list[str] | None = None
     keep = False
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if body is None:
             if stripped.startswith(_FENCE):
-                body, keep = [], stripped[len(_FENCE):].strip() == lang
+                language = _fence_language(stripped[len(_FENCE):])
+                if _misspells(language, lang):
+                    raise DocShapeError(f'line {number}: a {_FENCE}{language} fence; tag it {_FENCE}{lang}')
+                body, keep = [], language == lang
         elif stripped == _FENCE:
             if keep:
                 blocks.append('\n'.join(body))
@@ -132,6 +151,21 @@ def _substitute(text: str, placeholders: Mapping[str, str]) -> str:
             raise DocShapeError(f'no concrete value for placeholder {token}') from None
 
     return _PLACEHOLDER.sub(replace, text)
+
+
+def snippet_placeholders(
+    *, skill: str, run_id: str, project_root: Path, project_id: str, now: datetime
+) -> Mapping[str, str]:
+    """The concrete value of every ``<token>`` the snippet's submit calls carry, as of *now*."""
+    return MappingProxyType(
+        {
+            'skill': skill,
+            'run_id': run_id,
+            'project_root': str(project_root),
+            'project_id': project_id,
+            f'now + {FIRST_CHECK_SECS} s, ISO-8601 UTC': (now + timedelta(seconds=FIRST_CHECK_SECS)).isoformat(),
+        }
+    )
 
 
 def concretize(value: object, placeholders: Mapping[str, str]) -> Any:
