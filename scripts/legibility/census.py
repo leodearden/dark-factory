@@ -98,7 +98,6 @@ from legibility import (  # noqa: E402
     unlanded,
 )
 from orchestrator.agents import code_quality  # noqa: E402
-from shared.mcp_session import SyncMcpSession  # noqa: E402  # debt: task 6760
 
 logger = logging.getLogger("legibility.census")
 
@@ -175,17 +174,6 @@ var/default -- submit_task lives on the same fused-memory MCP server this
 project's get_statuses call already targets."""
 
 
-def _post_mcp_tool_call(base_url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
-    """Call MCP tool *tool_name* on the server at *base_url*, returning its reply.
-
-    Refused under pytest unless the caller declared the endpoint its own
-    (:func:`alarm.refuse_real_post_under_test`).
-    """
-    alarm.refuse_real_post_under_test(base_url, tool_name)
-    with SyncMcpSession(base_url, client_name="legibility-census", timeout=timeout) as session:
-        return session.call_tool(tool_name, arguments)
-
-
 def _fused_memory_base_url() -> str:
     return os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
@@ -194,7 +182,9 @@ def default_submit_fn(**kwargs) -> dict:
     """Real curator-path ``submit_task`` poster (fused-memory MCP server) --
     build_task_payloads' payloads are forwarded verbatim as this call's
     arguments."""
-    return _post_mcp_tool_call(_fused_memory_base_url(), "submit_task", kwargs)
+    return alarm.post_tool_call(
+        _fused_memory_base_url(), "submit_task", kwargs, timeout=30.0, client_name="legibility-census",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +578,10 @@ def _run_configured_census(
                 embed_fn=embeddings.openai_embed, cache_path=embeddings.cache_path(cfg.project_id),
             ),
             submit_fn=default_submit_fn,
-            task_store=task_store.McpTaskStore(url=_fused_memory_base_url(), post=_post_mcp_tool_call),
+            task_store=task_store.McpTaskStore(
+                url=_fused_memory_base_url(),
+                post=functools.partial(alarm.post_tool_call, client_name="legibility-census"),
+            ),
             status_fetcher=status_fetcher,
             escalate_fn=escalate_fn,
             gate=functools.partial(landing_gate.run_gate, project_root, cfg.census.landing_gate),
