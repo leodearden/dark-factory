@@ -52,6 +52,7 @@ from fastapi.testclient import TestClient
 from shared.capability_manifest import sidecar_path
 from shared.locking import files_to_modules
 from shared.project_id import project_id_for_root
+from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import GitCrossCheck, LinesBase
 from shared.quality_series.rows import Cost, LandingRow, Outcomes
 from shared.task_statuses import TaskStatus
@@ -61,9 +62,19 @@ from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.quality_markers import (
+    DerivedState,
+    Marker,
+    MarkerKind,
+    MarkerSource,
+    PromptCoverage,
+    RoutingFold,
+    SourceType,
+)
 from dashboard.data.quality_sampler import QUALITY_SAMPLE_INTERVAL_SECONDS
-from dashboard.data.quality_store import QualitySample
+from dashboard.data.quality_store import QualitySample, write_marker_state
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.loops import _QualityStore
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -896,6 +907,12 @@ QUALITY_TICK = timedelta(seconds=QUALITY_SAMPLE_INTERVAL_SECONDS)
 QUALITY_MODULE = 'dashboard'
 QUALITY_MODULE_ORDINALS = tuple(range(0, QUALITY_STORED, 3))
 """The module the drill-down scenario is read for, and the stored landings touching it."""
+QUALITY_SHIFT = 300
+"""The landing at which the alarm scenarios' rejection rate jumps from 3 in 10 to every landing:
+past the 200 a frozen baseline needs before the marker nearest it."""
+QUALITY_SHIFTED = 15
+"""Landings the alarm scenarios store from the shift on: enough for the up-CUSUM to cross h, too
+few to give the explaining marker's own segment a baseline of its own."""
 _NO_DISAGREEMENT = GitCrossCheck(0, 0, 0)
 
 
@@ -914,10 +931,26 @@ def _quality_cost(ordinal: int) -> Cost:
 
 def _quality_history(
     n: int, *, cost: Callable[[int], Cost] = lambda ordinal: NO_COST,
+    outcome: Callable[[int], Outcomes] = _quality_outcome,
+    modules: Callable[[int], tuple[ModuleLines, ...]] = lambda ordinal: (),
 ) -> list[LandingRow]:
     """*n* landings two hours apart, the newest a day before :data:`QUALITY_AT`."""
     return history(n, start=QUALITY_AT - timedelta(days=1, hours=2 * (n - 1)),
-                   outcome=_quality_outcome, cost=cost)
+                   outcome=outcome, cost=cost, modules=modules)
+
+
+def _shifted_outcome(ordinal: int) -> Outcomes:
+    """The first three of every ten landings rejected until :data:`QUALITY_SHIFT`, every one from it."""
+    rejected = ordinal >= QUALITY_SHIFT or ordinal % 10 < 3
+    return replace(NO_OUTCOMES, rejected=rejected, rejection_events=int(rejected))
+
+
+_MODULE_TOUCHED = frozenset(QUALITY_MODULE_ORDINALS)
+
+
+def _module_lines(ordinal: int) -> tuple[ModuleLines, ...]:
+    module = QUALITY_MODULE if ordinal in _MODULE_TOUCHED else 'orchestrator'
+    return (ModuleLines(module, 40),)
 
 
 def _off_the_line(rows: list[LandingRow]) -> list[LandingRow]:
@@ -957,14 +990,54 @@ def _store_quality(
     client.portal.call(write_quality_db, app.state.config.quality_db, rows, [sample])
 
 
-def _render_quality(client: TestClient, at: datetime) -> dict[str, Any]:
-    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*."""
+def _render_quality(client: TestClient, at: datetime, **module: str) -> dict[str, Any]:
+    """GET /quality?project=dark_factory&window=100 on the real route, its clock at *at*; a
+    ``module=`` keyword drills down to that module."""
     with installed_clock(app, fixed_clock(at)):
-        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW))
+        return _get(client, QUALITY, project='dark_factory', window=str(QUALITY_WINDOW), **module)
+
+
+async def _write_markers(path: Path, state: DerivedState) -> None:
+    async with _QualityStore(path) as store:
+        await write_marker_state(store.connection, state)
+        await store.connection.commit()
+
+
+def _store_routing_marker(client: TestClient, at: datetime, *, refreshed_at: datetime) -> None:
+    """Store one derived reviewer effort change at *at* as dark_factory's marker derivation."""
+    marker = Marker(
+        marker_id=f'routing:reviewer_comprehensive:{at.isoformat()}', at=at, kind=MarkerKind.EFFORT,
+        scope='dark_factory', series=None, until=None,
+        label='reviewer_comprehensive effort high → xhigh',
+        source=MarkerSource(SourceType.ROUTING, role='reviewer_comprehensive'),
+    )
+    state = DerivedState(
+        fold=replace(RoutingFold.empty('dark_factory'), complete=True), markers=(marker,), skipped=0,
+        prompt_coverage=PromptCoverage(digest_since=None, roles_py_landings=None, counted_since=None,
+                                       reason='no routing decision is folded yet'),
+        refreshed_at=refreshed_at,
+    )
+    assert client.portal is not None, 'quality.db is written inside a live TestClient'
+    client.portal.call(_write_markers, app.state.config.quality_db, state)
+
+
+def _alarm_scenario(
+    client: TestClient, workdir: Path, *, marker_before: int, sampled_at: datetime,
+) -> dict[str, Any]:
+    """Sketch row 9: the rejection rate shifts at :data:`QUALITY_SHIFT`, and the one derived
+    marker is dated at the landing *marker_before* landings before it."""
+    root = _quality_root(workdir)
+    rows = _quality_history(QUALITY_SHIFT + QUALITY_SHIFTED, outcome=_shifted_outcome)
+    write_landing_events(root, rows)
+    _store_quality(client, root, rows, sampled_at=sampled_at)
+    _store_routing_marker(client, rows[QUALITY_SHIFT - marker_before].landing.landed_at,
+                          refreshed_at=sampled_at)
+    return _render_quality(client, QUALITY_AT)
 
 
 def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
-    """Quality sketch rows 3, 4, 5, 10 and 12: one project's per-landing series as /quality serves it.
+    """Quality sketch rows 3, 4, 5, 9, 10 and 12 and the module drill-down: one project's
+    per-landing series as /quality serves it.
 
     Each scenario stores rows in quality.db and records the same landings in runs.db, so the
     read side's freshness is runs.db's verdict on the store, never a fixture's say-so.
@@ -1003,6 +1076,17 @@ def _quality_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     next_tick = sampled + QUALITY_TICK
     _store_quality(client, root, [*stored, *pending], sampled_at=next_tick)
     bodies['quality_main_ahead_cleared'] = _render_quality(client, next_tick + timedelta(minutes=1))
+
+    bodies['quality_alarm_explained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_explained', marker_before=10, sampled_at=sampled)
+    bodies['quality_alarm_unexplained'] = _alarm_scenario(
+        client, workdir / 'quality_alarm_unexplained', marker_before=100, sampled_at=sampled)
+
+    root = _quality_root(workdir / 'quality_module')
+    touched = _quality_history(QUALITY_STORED, cost=_quality_cost, modules=_module_lines)
+    write_landing_events(root, touched)
+    _store_quality(client, root, touched, sampled_at=sampled)
+    bodies['quality_module'] = _render_quality(client, QUALITY_AT, module=QUALITY_MODULE)
 
     return bodies
 

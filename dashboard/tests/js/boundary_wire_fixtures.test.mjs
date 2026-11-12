@@ -15,6 +15,8 @@ import {
   escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  qualityMarker,
+  qualityMarkers,
   qualityMetric,
   qualityPayload,
   schedulerLockRow,
@@ -168,4 +170,16 @@ test('a QUALITY series, a measured and a no-producer metric included, is built o
   assertSameKeys(measured.headline.value, servedMetrics.rejected.headline.value, 'a measured headline value');
   assert.equal(servedMetrics.reverts.rule.measured_since, null, 'this check expects reverts to have no producer');
   assert.equal(unproduced.headline.state, servedMetrics.reverts.headline.state);
+});
+
+test('a QUALITY_MARKERS stream and its derived marker are built with exactly the keys /quality serves', () => {
+  const served = payload('quality_alarm_explained').QUALITY_MARKERS;
+  const [servedMarker] = served.value.markers.filter(marker => marker.source.type === 'routing');
+  const built = qualityMarkers([qualityMarker({ id: 'routing:reviewer_comprehensive:1', ordinal: 3 })]);
+
+  assertSameKeys(wireDatum(null), served, 'the QUALITY_MARKERS Datum');
+  assertSameKeys(built, served.value, 'QUALITY_MARKERS.value');
+  assertSameKeys(built.prompt_coverage, served.value.prompt_coverage, 'QUALITY_MARKERS.value.prompt_coverage');
+  assertSameKeys(built.markers[0], servedMarker, 'QUALITY_MARKERS.value.markers[0]');
+  assertSameKeys(built.markers[0].source, servedMarker.source, 'QUALITY_MARKERS.value.markers[0].source');
 });
