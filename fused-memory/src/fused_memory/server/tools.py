@@ -210,6 +210,8 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    TRIAGE_FAIL_OPEN_KEY,
+    FailOpenStage,
     TriageFailOpenCounter,
     attach_write_durable,
     declares_attach_keys,
@@ -4149,6 +4151,7 @@ def create_mcp_server(
             if triage_decision is not None and attach_kind is not None
             else None
         )
+        fail_open_stage = triage_decision.fail_open_stage if triage_decision is not None else None
         if (
             triage_decision is not None
             and attach_kind is None
@@ -4183,6 +4186,7 @@ def create_mcp_server(
                 triage_decision.outcome, OUTCOME_STORED,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.UNWIRED_VERDICT
         write_meta = cleaned_meta
         if attached_to is not None:
             # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
@@ -4266,6 +4270,7 @@ def create_mcp_server(
                 attached_to,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_WRITE
             attached_to = None
             result = await memory_service.add_memory(
                 content=content,
@@ -4318,6 +4323,7 @@ def create_mcp_server(
                 attached_to, OUTCOME_STORED, getattr(result, 'message', None),
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_NOT_DURABLE
             attached_to = None
         # Marks each record this write supersedes, now that the new id exists.
         # Not a triage event; see services/supersession_mark.py.
@@ -4351,6 +4357,9 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
+            # See write_triage.TRIAGE_FAIL_OPEN_KEY.
+            if fail_open_stage is not None:
+                ack[TRIAGE_FAIL_OPEN_KEY] = fail_open_stage.value
             ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
