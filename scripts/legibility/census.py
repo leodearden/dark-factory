@@ -39,7 +39,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
-import enum
 import functools
 import json
 import logging
@@ -89,6 +88,7 @@ if str(_ORCH_SRC) not in sys.path:
 from legibility import (  # noqa: E402
     alarm,
     census_findings,
+    census_headroom,
     census_identity,
     census_state,
     census_trigger,
@@ -529,10 +529,6 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
 # usage API assumed -- one tiny call, scan its reply for a banner)
 # ---------------------------------------------------------------------------
 
-_HEADROOM_PROBE_PROMPT = "ping"
-"""The tiny probe prompt -- a cheap single round trip, not a real mining
-call. Its content doesn't matter; only whether the reply carries a banner
-marker or raises."""
 
 _VERIFY_PROBE_EVERY = 5
 """How many clusters the default verifier adjudicates between backstop
@@ -547,126 +543,8 @@ cluster, so a probe per cluster would be cheap but not free, and pointless
 a cap announces itself."""
 
 
-class CensusHeadroomExhausted(Exception):
-    """Raised when a headroom limit is detected DURING a census stage.
-
-    Not an error in the census -- an external condition that makes the
-    stage's output untrustworthy. It exists so an infra failure can never
-    be laundered into a verdict: ``adjudicate`` catches it and defers
-    before any persistence, instead of the cap-poisoned clusters landing
-    in the codebook as ordinary rejections.
-
-    Carries the counts an operator needs to size what was interrupted:
-    *verified* clusters that came back TRUE before the hit, *rejected*
-    ones adjudicated FALSE before it, and *unverified* ones left (the
-    hitting cluster plus every one never attempted). A rejection is real
-    work already spent, not an absence -- omitting it made the counts fail
-    to account for the run on exactly the interrupted runs an operator
-    most needs to size.
-
-    INVARIANT, true at every raise site: ``verified + rejected +
-    unverified`` equals the number of clusters offered. At the two
-    pre-append sites (invocation error, unparseable banner) the hitting
-    cluster is not yet adjudicated, so ``verified + rejected == index``
-    and ``unverified == remaining``; at the backstop site it already IS
-    adjudicated, so ``verified + rejected == index + 1`` and ``unverified
-    == remaining - 1``. The total is therefore derivable by any reader and
-    is NOT threaded separately -- see ``_defer``, which sums it, so the
-    raise sites cannot disagree about what "total" means.
-    """
-
-    def __init__(
-        self, *, stage: CensusStage, reason: str, verified: int = 0, rejected: int = 0,
-        unverified: int = 0,
-    ):
-        super().__init__(f"census headroom exhausted during {stage}: {reason}")
-        self.stage = stage
-        self.reason = reason
-        self.verified = verified
-        self.rejected = rejected
-        self.unverified = unverified
-
-    @property
-    def counts(self) -> DeferralCounts:
-        return DeferralCounts(verified=self.verified, rejected=self.rejected, unverified=self.unverified)
-
-
 class CensusPreconditionFailed(RuntimeError):
     """A check before any spend refused this run."""
-
-
-@dataclass
-class HeadroomResult:
-    """Verdict from ``preflight_headroom``: ``ok=True`` means the probe
-    round-tripped cleanly and mining may proceed; ``ok=False`` means it
-    should be deferred to the next trigger evaluation, with ``reason``
-    explaining why (a banner marker, or an invocation error)."""
-
-    ok: bool
-    reason: str | None = None
-
-
-def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
-    """Issue one tiny probe via ``invoke(prompt, model)`` and decide
-    whether the census has headroom to proceed.
-
-    No usage API is assumed to exist (PRD decision 5) -- this is a cheap
-    preflight probe, not a quota lookup. The reply is scanned
-    case-insensitively for a known usage-limit/auth banner marker via
-    ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
-    either means no useful model output is coming); a match defers, and
-    the reason quotes the marker that fired. An invocation error
-    raised by *invoke* (e.g. a ``session_runner.InvocationFailed``-shaped failure)
-    is also treated as a deferral -- fail-safe, never a crash, since a
-    probe failure is exactly the kind of "the model isn't reachable right
-    now" signal this preflight exists to catch. Makes no mining decisions
-    itself -- just the ok/deferred verdict + reason.
-
-    In production *invoke* is the pooled runner's mining stage, so a capped
-    account fails over to the next INSIDE the probe; only a pool with no
-    headroom left raises (``session_runner.NoHeadroom``) and defers the
-    census (task 5515).
-    """
-    try:
-        reply = invoke(_HEADROOM_PROBE_PROMPT, model)
-    except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
-        return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
-
-    marker = looks_like_blocking_banner(reply or "")
-    if marker is not None:
-        return HeadroomResult(
-            ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
-        )
-
-    return HeadroomResult(ok=True, reason=None)
-
-
-def _stage_headroom_gate(invoke, *, model: str, stage: CensusStage) -> HeadroomResult:
-    """Re-probe headroom at a stage boundary, logging which stage asked.
-
-    Deliberately NOT a second probe implementation -- it is a thin wrapper
-    over ``preflight_headroom`` that adds the stage name to the log and
-    nothing else, so the "one tiny call, no usage API assumed" decision
-    (PRD decision 5) and its fail-safe exception handling hold identically
-    at every gate.
-
-    Gates exist only where an unnoticed cap CORRUPTS output, not at every
-    stage transition. Today that means the preflight and this one, before
-    verification. There is deliberately NO gate before synthesis: a cap
-    there makes ``synthesize_fn`` RAISE, which propagates into ``main()``'s
-    hard-failure path and is already loud and already distinguishable from
-    a verification result -- so a gate there would only abort a run whose
-    ``verified`` list is complete and honest, discarding work that was
-    genuinely paid for. Mining is the same: a storm batch is already
-    detected and reported. Do not "complete the pattern" by adding them.
-    """
-    result = preflight_headroom(invoke, model=model)
-    if not result.ok:
-        logger.warning(
-            "census headroom gate FAILED at the %s stage boundary: %s",
-            stage, result.reason,
-        )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1658,7 +1536,7 @@ def _reverify(
     ]
     try:
         result = verify_fn(clusters, model=model) or {}
-    except CensusHeadroomExhausted as exc:
+    except census_headroom.CensusHeadroomExhausted as exc:
         logger.warning("census: headroom exhausted during re-verification, so it is inconclusive: %s", exc.reason)
         return _Reverified(disposition.reverifications(
             {}, offered=offered, deferred=deferred, error=f"headroom exhausted: {exc.reason}",
@@ -1882,7 +1760,7 @@ def _adjudicate_queue(
     clusters = [_pending_cluster(cb, queued) for queued in offered]
     try:
         result = verify_fn(clusters, model=model) or {}
-    except CensusHeadroomExhausted as exc:
+    except census_headroom.CensusHeadroomExhausted as exc:
         logger.warning("census: headroom exhausted during queue adjudication, so it is inconclusive: %s", exc.reason)
         return QueueOutcome(inconclusive=f"headroom exhausted: {exc.reason}")
     verified = _offered_replies(result.get("verified") or [], clusters, verdict="verified")
@@ -2144,34 +2022,14 @@ def _ensure_output_parents(*paths) -> None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-class CensusStage(enum.StrEnum):
-    """The headroom gates at which a census defers."""
-
-    PREFLIGHT = "preflight"
-    VERIFY = "verify"
-
-
-@dataclass(frozen=True)
-class DeferralCounts:
-    """What a verify-stage deferral had adjudicated when the cap hit."""
-
-    verified: int = 0
-    rejected: int = 0
-    unverified: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.verified + self.rejected + self.unverified
-
-
 @dataclass(frozen=True)
 class Deferred:
     """A headroom gate failed at *stage*; no census output or state was
     persisted, so a re-run loses nothing."""
 
-    stage: CensusStage
+    stage: census_headroom.CensusStage
     reason: str
-    counts: DeferralCounts = DeferralCounts()
+    counts: census_headroom.DeferralCounts = census_headroom.DeferralCounts()
 
 
 @dataclass(frozen=True)
@@ -2231,11 +2089,11 @@ CensusOutcome = Deferred | Done | Unlanded
 
 
 def _defer(
-    stage: CensusStage,
+    stage: census_headroom.CensusStage,
     reason: str | None,
     *,
     escalate_fn,
-    counts: DeferralCounts,
+    counts: census_headroom.DeferralCounts,
 ) -> Deferred:
     """Abort the census at *stage*: raise one WARNING alarm, return the outcome.
 
@@ -2253,7 +2111,7 @@ def _defer(
     total = counts.total
 
     detail = reason
-    if stage is not CensusStage.PREFLIGHT:
+    if stage is not census_headroom.CensusStage.PREFLIGHT:
         # All THREE counts plus the derived total, so the numbers account for
         # every offered cluster. A REJECTION is adjudication already paid for,
         # not an absence: with only verified/unverified, "1 verified, 3
@@ -2279,7 +2137,7 @@ def _defer(
             f"legibility census deferred at the {stage} stage "
             f"({verified} cluster(s) verified, {rejected} rejected, "
             f"{unverified} unverified of {total} offered): {reason}"
-            if stage is not CensusStage.PREFLIGHT
+            if stage is not census_headroom.CensusStage.PREFLIGHT
             else f"legibility census deferred: {reason}"
         ),
         detail=detail,
@@ -2578,22 +2436,22 @@ def adjudicate(run: CensusRun, effects: CensusEffects, mined: Mined, merged: Mer
     probes = 0
     if merged.to_verify or merged.offered:
         probes += 1
-        stage_headroom = _stage_headroom_gate(
-            effects.invoke, model=run.config.models.trickle, stage=CensusStage.VERIFY,
+        stage_headroom = census_headroom.stage_headroom_gate(
+            effects.invoke, model=run.config.models.trickle, stage=census_headroom.CensusStage.VERIFY,
         )
         if not stage_headroom.ok:
             return _defer(
-                CensusStage.VERIFY,
+                census_headroom.CensusStage.VERIFY,
                 "headroom gate failed at the verify stage boundary: "
                 f"{stage_headroom.reason or 'no headroom'}",
                 escalate_fn=effects.escalate_fn,
-                counts=DeferralCounts(unverified=len(merged.to_verify)),
+                counts=census_headroom.DeferralCounts(unverified=len(merged.to_verify)),
             )
     try:
         verify_result = effects.verify_fn(list(merged.to_verify), model=run.config.models.census_verify) or {}
-    except CensusHeadroomExhausted as exc:
+    except census_headroom.CensusHeadroomExhausted as exc:
         return _defer(
-            CensusStage.VERIFY,
+            census_headroom.CensusStage.VERIFY,
             f"headroom exhausted during verification: {exc.reason}",
             escalate_fn=effects.escalate_fn,
             counts=exc.counts,
@@ -3247,13 +3105,13 @@ def run_census(
         dry_run_payloads_path=dry_run_payloads_path,
         harness_project=harness_project,
     )
-    headroom = preflight_headroom(effects.invoke, model=config.models.trickle)
+    headroom = census_headroom.preflight_headroom(effects.invoke, model=config.models.trickle)
     if not headroom.ok:
         return _defer(
-            CensusStage.PREFLIGHT,
+            census_headroom.CensusStage.PREFLIGHT,
             headroom.reason or "headroom preflight failed",
             escalate_fn=effects.escalate_fn,
-            counts=DeferralCounts(),
+            counts=census_headroom.DeferralCounts(),
         )
 
     # Before mining, so an uncreatable output path fails fast; after
@@ -3599,12 +3457,12 @@ def _build_default_verify_fn(
                 # no-probe behaviour (the detectors are no-ops; nothing says
                 # the account is capped) and spends no probe, instead of a
                 # TypeError escaping mid-verification.
-                return HeadroomResult(ok=True, reason=None)
+                return census_headroom.HeadroomResult(ok=True, reason=None)
             probes[0] += 1
             try:
                 return headroom_probe()
             except Exception as exc:  # noqa: BLE001 - a raising probe defers, never crashes the census
-                return HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
+                return census_headroom.HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
 
         for index, cluster in enumerate(clusters):
             # The hitting cluster plus everything never attempted. Computed
@@ -3624,8 +3482,8 @@ def _build_default_verify_fn(
                 if headroom_probe is not None:
                     probe = _probe()
                     if not probe.ok:
-                        raise CensusHeadroomExhausted(
-                            stage=CensusStage.VERIFY,
+                        raise census_headroom.CensusHeadroomExhausted(
+                            stage=census_headroom.CensusStage.VERIFY,
                             reason=(
                                 "verify invocation failed and the headroom re-probe "
                                 f"reports no capacity: {probe.reason or 'no headroom'}"
@@ -3651,8 +3509,8 @@ def _build_default_verify_fn(
                 if marker is not None and headroom_probe is not None:
                     probe = _probe()
                     if not probe.ok:
-                        raise CensusHeadroomExhausted(
-                            stage=CensusStage.VERIFY,
+                        raise census_headroom.CensusHeadroomExhausted(
+                            stage=census_headroom.CensusStage.VERIFY,
                             reason=(
                                 "verify reply failed to parse and carries a banner "
                                 f"marker {marker!r}; headroom probe confirms no "
@@ -3702,8 +3560,8 @@ def _build_default_verify_fn(
             ):
                 probe = _probe()
                 if not probe.ok:
-                    raise CensusHeadroomExhausted(
-                        stage=CensusStage.VERIFY,
+                    raise census_headroom.CensusHeadroomExhausted(
+                        stage=census_headroom.CensusStage.VERIFY,
                         reason=(
                             "headroom backstop probe after "
                             f"{index + 1} cluster(s) reports no capacity: "
@@ -4147,7 +4005,7 @@ def _run_configured_census(
                 str(project_root),
                 verify_invoke,
                 headroom_probe=functools.partial(
-                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                    census_headroom.preflight_headroom, verify_invoke, model=cfg.models.trickle,
                 ),
             ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
