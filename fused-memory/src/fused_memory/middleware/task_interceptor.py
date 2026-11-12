@@ -6935,7 +6935,11 @@ async def _resolve_commit_sha(
     if isinstance(result, _ProbeUnavailable):
         return _CommitResolutionFailure(False, result.detail)
     if result.returncode == 1:
-        return _CommitResolutionFailure(True, result.stderr or 'no such commit')
+        return _CommitResolutionFailure(
+            True,
+            result.stderr or 'does not name exactly one commit (an unknown name, or an '
+            'ambiguous short prefix: pass the full 40-char SHA)',
+        )
     if result.returncode != 0:
         return _CommitResolutionFailure(False, result.stderr or 'rev-parse failed')
     if len(result.stdout) < 7:

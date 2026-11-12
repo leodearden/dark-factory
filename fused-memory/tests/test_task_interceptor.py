@@ -5650,7 +5650,9 @@ async def test_rev_parse_rejection_reports_not_found(taskmaster, reconciler, eve
 @pytest.mark.asyncio
 async def test_rev_parse_rc1_reports_not_found(taskmaster, reconciler, event_buffer, tmp_path):
     """Under `--verify --quiet`, rc=1 is git's verdict on the ref, so it
-    keeps the assertive wording; quiet stderr falls back to 'no such commit'."""
+    keeps the assertive wording. git is equally silent for an unknown name
+    and for an ambiguous short prefix, so the fallback detail must be true
+    of both rather than claim the commit does not exist."""
     sha = _init_git_repo(tmp_path)
 
     reason = await _refused_merged_done_reason(
@@ -5659,7 +5661,8 @@ async def test_rev_parse_rc1_reports_not_found(taskmaster, reconciler, event_buf
     )
 
     assert 'not found in' in reason
-    assert 'no such commit' in reason
+    assert 'does not name exactly one commit' in reason
+    assert 'ambiguous short prefix' in reason
     assert 'could not be resolved in' not in reason
 
 
