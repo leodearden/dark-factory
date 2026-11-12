@@ -28,6 +28,7 @@ from orchestrator.agents.review_briefing import (
 from orchestrator.config import OrchestratorConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +478,37 @@ def _format_verify_attempt(ctx: VerifyAttemptContext) -> str:
             'not work — find a different root cause instead of repeating it.'
         )
     return '# Verify Attempt\n\n' + '\n'.join(lines) + '\n\n'
+
+
+def _format_scope_drift(report: ScopeDriftReport | None) -> str:
+    """The briefing block reporting what the last writer boundary did with scope requests.
+
+    Empty for None or a report with nothing acquired or contested. The single
+    home of this briefing line; task 4371 reuses it.
+    """
+    if report is None or not (report.acquired or report.contested):
+        return ''
+    lines = [
+        '## Scope Requests',
+        '',
+        'The orchestrator applied the files reported with `report_missing_plan_file`:',
+        '',
+    ]
+    lines.extend(
+        f'- `{path}`: granted. It is now in plan.json `files`, and this task holds its lock.'
+        for path in report.acquired
+    )
+    lines.extend(
+        f'- `{path}`: contested, held by task {holder}.' for path, holder in report.contested
+    )
+    if report.contested:
+        lines.extend([
+            '',
+            'Do not edit a contested file. Revert any edit already made to it, or call '
+            "`escalate_blocker(category='scope_violation')` naming the file, the "
+            'holder and the design reason it must change.',
+        ])
+    return '\n'.join(lines) + '\n'
 
 
 @dataclass
@@ -1075,6 +1107,8 @@ suggestions-only on this exact tree — call
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
+        *,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the implementer agent.
 
@@ -1112,6 +1146,9 @@ Your worktree was rebased onto the latest main branch.
 
 Review any overlap with your plan steps before continuing — file contents may have changed.
 """
+
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'\n{scope_drift_block}' if scope_drift_block else ''
 
         wip_section = ''
         if wip_notice:
@@ -1162,7 +1199,7 @@ Before writing any new code, walk the pending steps in plan order:
 **Analysis:** {plan.get('analysis', 'N/A')}
 
 {rebase_section}
-{wip_section}
+{wip_section}{scope_drift_section}
 # Session Startup Protocol
 
 1. Read `.task/plan.json` to see the full plan with current status.
@@ -1299,6 +1336,7 @@ This task holds locks for the following modules:
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
         *, attempt_context: VerifyAttemptContext | None = None,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for the debugger agent.
 
@@ -1312,6 +1350,8 @@ This task holds locks for the following modules:
 
         identity = self._agent_identity(scope.task_id, 'debugger')
         verify_attempt = _format_verify_attempt(attempt_context) if attempt_context else ''
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1323,7 +1363,7 @@ This task holds locks for the following modules:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-{verify_attempt}# Failures
+{verify_attempt}{scope_drift_section}# Failures
 
 ```
 {failures}
