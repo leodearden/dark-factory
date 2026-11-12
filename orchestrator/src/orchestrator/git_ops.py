@@ -1704,10 +1704,12 @@ class GitQueryFailed(RuntimeError):
 
 
 class CitationPatternInvalid(ValueError):
-    """A citation lookup's pattern is not a valid Python ``re``: a caller's error, not git's."""
+    """A citation lookup's pattern does not render for its task id, or is not a valid Python ``re``: a caller's error, not git's."""
 
     def __init__(self, pattern: str) -> None:
-        super().__init__(f'citation pattern is not a valid Python re; raising: {pattern!r}')
+        super().__init__(
+            f'citation pattern does not render for the task id or is not a valid Python re; raising: {pattern!r}'
+        )
         self.pattern = pattern
 
 
@@ -9985,7 +9987,8 @@ class GitOps:
         """Search main's history for a commit whose SUBJECT cites *tid*.
 
         The fail-safe face of :meth:`find_task_citation_commit_checked`: a git
-        failure or an uncompilable override reads as no citation.
+        failure, an uncompilable override or a *tid* no branch can name reads
+        as no citation.
 
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
@@ -10045,9 +10048,9 @@ class GitOps:
             )
         except CitationPatternInvalid as exc:
             logger.warning(
-                'find_task_citation_commit: pattern_template is not a '
-                'valid Python re pattern (tid=%s); treating as '
-                'no-citation (fail-safe): %r',
+                'find_task_citation_commit: pattern_template does not '
+                'render for tid=%r or is not a valid Python re pattern; '
+                'treating as no-citation (fail-safe): %r',
                 tid, exc.pattern,
             )
             return None
@@ -10059,7 +10062,8 @@ class GitOps:
 
         Raises :class:`GitQueryFailed` on a git failure and
         :class:`CitationPatternInvalid` on an override that is not a valid
-        Python ``re``; a disabled pattern (``''``) still answers None. For a caller
+        Python ``re`` or a *tid* no branch can name (empty, or holding
+        whitespace); a disabled pattern (``''``) still answers None. For a caller
         that writes on a miss and so must not read "could not look" as "no
         citation".
         """
@@ -10070,13 +10074,14 @@ class GitOps:
         )
         if template == '':
             return None
-        pattern_str = render_citation_pattern(
-            template, tid,
-            branch_prefix=self.config.branch_prefix, main_branch=self.config.main_branch,
-        )
+        pattern_str = template
         try:
+            pattern_str = render_citation_pattern(
+                template, tid,
+                branch_prefix=self.config.branch_prefix, main_branch=self.config.main_branch,
+            )
             compiled = re.compile(pattern_str)
-        except re.error as exc:
+        except (ValueError, re.error) as exc:
             raise CitationPatternInvalid(pattern_str) from exc
         rc, out, err = await _run(
             [
