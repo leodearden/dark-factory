@@ -104,6 +104,13 @@ caller string. The annotations `GraphitiBackend.add_episode` prepends,
 classification, so a tagged write stays in its category's stratum; any other
 leading text is a caller string and buckets as `add_episode`.
 
+**The axis is closed.** `build_corpus.KNOWN_PAYLOAD_KINDS` declares the four
+measured kinds, and `add_episode` is deliberately not among them. A build (or
+`--dry-run`) over a population carrying any other kind exits 1, naming the
+kinds and the `source_description` values that produced them. The remedy is to
+re-measure the census before building the next corpus, or, when the cause is a
+new writer annotation, to extend the annotation regex.
+
 Allocation is **min-1 floor + largest-remainder proportional, capped at cell
 size**. The floor is load-bearing, not tidiness: the
 `('2026-04', 'procedural_knowledge')` cell holds exactly **one** episode of
@@ -195,11 +202,14 @@ handle so only `ro_query` can be reached.
 
 Test lane: the offline suite runs by default; the single live test is
 `@pytest.mark.integration` (per-test, never module-level — `addopts` is
-`-m 'not integration'`) and skips cleanly with no FalkorDB.
+`-m 'not integration'`) and skips cleanly with no FalkorDB. It seeds and
+deletes a throwaway graph on the scratch FalkorDB and reads it read-only. No
+automated check asserts the real population's size, month span or window
+start; the build report prints them for the operator.
 
 ```bash
 uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py            # offline
-uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, read-only
+uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, scratch FalkorDB
 ```
 
 ## Self-check
@@ -234,7 +244,14 @@ commit, or this self-check quietly stops meaning anything.
 `harness.py` is thin CLI wiring over `fused_memory.arm_harness`; read the
 module named in each row for behaviour. Run it from `fused-memory/` with
 `uv run python scripts/local_memory_models_eval/harness.py <subcommand> …`.
-Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
+Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`), with
+one split. The corpus read follows the config (`FALKORDB_URI`), because the
+corpus graph lives only on production; it is `GRAPH.RO_QUERY`, read-only.
+Every write, copy, index build and teardown goes to the scratch FalkorDB
+(`FALKOR_HOST`/`FALKOR_PORT`, default `localhost:6380`), which must hold
+`evalmem_lme_ref_incumbent_a`, seeded by
+`scripts/seed_scratch_reference_graph.py` (OPERATIONS.md "The scratch
+FalkorDB").
 
 | Subcommand | Invoked by | What it does |
 |---|---|---|
@@ -329,9 +346,10 @@ the rule's one home. Protected graphs are unreachable by construction.
 uv run pytest -m integration tests/arm_harness
 ```
 
-It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
-`FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
-protected graph or index changed. `test_live_embedding_integration.py` does
+It replays two episodes onto `evalmem_test_` graphs on the scratch FalkorDB
+at `FALKOR_HOST`/`FALKOR_PORT` (default `localhost:6380`; a test session aimed
+at production `:6379` exits 4) against a local mock endpoint, and asserts that
+no protected graph or index changed. `test_live_embedding_integration.py` does
 the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations

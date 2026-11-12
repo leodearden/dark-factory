@@ -324,6 +324,13 @@ def render_entity_standing_decision_write_section() -> str:
 # ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
+# The `reason` the norm's case (e) teaches. Shape-neutral, so a verbatim copy is true of any
+# leaked fragment; tests/test_recon_leak_cleanup_markup_guard.py drives it through the guard.
+LEAKED_FRAGMENT_CLEANUP_REASON = (
+    'removed a leaked serialized tool-call fragment from the stored text; '
+    'the substantive claim is unchanged'
+)
+
 # States the precedence order for annotating superseded, wrong, or corrupted
 # knowledge across both stores — lightest-touch first, last-resort last — plus
 # the ruling's option (b) cross-check rule against trusting episode prose at
@@ -349,11 +356,13 @@ def render_entity_standing_decision_write_section() -> str:
 # reason MUST NOT reference "## Proposing a Cluster Consolidation" by heading
 # name: that section is stage1.py-only. These four MUST-NOTs are pinned in
 # tests/test_stage1_consolidation_guidance.py::TestTheSharedNorm.
-# Not an
-# f-string: it is interpolated INTO f-strings, and braces inside an
-# interpolated value are not re-parsed by the enclosing f-string, so its own
-# text needs no {{/}} escaping (there are none below regardless).
-STALE_KNOWLEDGE_ANNOTATION_NORM = """\
+# Built from adjacent string literals with an f-string only on the segment that
+# interpolates LEAKED_FRAGMENT_CLEANUP_REASON (the house form
+# CITATION_REPAIR_TOOL_BLOCK's comment records), so no other segment needs
+# {{/}} escaping; braces inside the value are not re-parsed by the stage
+# f-strings it is interpolated into.
+STALE_KNOWLEDGE_ANNOTATION_NORM = (
+    """\
 ## Annotating Stale or Wrong Knowledge
 When you find stale, superseded, or wrong knowledge, use the LIGHTEST-touch tool that \
 correctly resolves it — in this order:
@@ -391,6 +400,23 @@ SINGLE record: amend the SURVIVOR in place FIRST with `mcp__fused-memory__update
 which preserves its id — see the tool listing above for why that matters — and only \
 THEN delete the redundant entry, naming the survivor via `replacement_memory_id`. Never \
 delete and re-add the survivor.
+(e) **Leaked fragment in a Mem0 record** (e.g. a serialized tool-call tail appended to the \
+stored text): amend the record in place with `mcp__fused-memory__update_memory`, which \
+keeps its id. `content` is the record's current text, copied verbatim, with the fragment \
+cut out entirely; the substantive claim is unchanged, so no marker is needed. """
+    f"""`reason` \
+describes the removal in words, e.g. `{LEAKED_FRAGMENT_CLEANUP_REASON}`. To be more \
+specific, add the tag kinds and parameter names actually present in THAT record's \
+fragment, as words (say, closing content tag + category parameter), per the rule below.
+
+"""
+    """\
+**Describe envelope markup; never quote it.** The MCP boundary markup guard scans EVERY \
+string argument of every call — `reason`, `content`, `new_content`, an edge fact — not \
+only the field you are cleaning. A literal closing tag or parameter opener in any of them \
+refuses the whole call and writes nothing; an unrepairable one also files an L2 escalation \
+for a human, and every retry worded the same way files another. So name the tag kinds and \
+parameter names in words. This applies to the case-(b) redaction too.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
@@ -398,6 +424,7 @@ acting on an episode's claim, cross-check current entity/edge state (`search` / 
 `get_entity`) or live task status (`get_task`) rather than trusting the prose at face \
 value.\
 """
+)
 
 # ---------------------------------------------------------------------------
 # Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)

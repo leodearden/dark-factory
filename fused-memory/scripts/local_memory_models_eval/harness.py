@@ -44,7 +44,6 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
-from urllib.parse import urlparse
 
 import build_corpus
 from falkordb.asyncio import FalkorDB
@@ -211,6 +210,11 @@ from fused_memory.arm_harness.topology import (
     topology_hash,
 )
 from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
+from fused_memory.config.falkordb_endpoints import (
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+    with_falkordb,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.eval.retrieval_probe import canonical_hit, content_key
 from fused_memory.eval.topic_registry import Canonical, RegistryError, load_topic_registry
@@ -287,18 +291,26 @@ class HarnessDeps:
 
 
 def build_live_deps() -> HarnessDeps:
-    """The real dependencies, configured by ``FusedMemoryConfig()`` (its ``CONFIG_PATH``)."""
-    base = FusedMemoryConfig()
-    falkor = base.graphiti.falkordb
-    address = urlparse(falkor.uri)
-    host, port = address.hostname or 'localhost', address.port or 6379
+    """The real dependencies, configured by ``FusedMemoryConfig()`` (its ``CONFIG_PATH``).
+
+    The corpus is read, over ``GRAPH.RO_QUERY``, from the FalkorDB the config
+    names, the only store that holds it. Every write, copy, index build,
+    reference read and teardown goes to the scratch FalkorDB, which
+    ``scratch_falkordb_from_env`` resolves and never lets be production.
+    """
+    configured = FusedMemoryConfig()
+    corpus_source = FalkorEndpoint.from_uri(configured.graphiti.falkordb.uri)
+    scratch = scratch_falkordb_from_env()
+    base = with_falkordb(configured, scratch)
 
     def episode_reader(graph_name: str) -> EpisodeSource:
-        return build_corpus.EpisodeReader(graph_name=graph_name, host=host, port=port)
+        return build_corpus.EpisodeReader(
+            graph_name=graph_name, host=corpus_source.host, port=corpus_source.port
+        )
 
     @contextlib.asynccontextmanager
     async def open_falkordb() -> AsyncIterator[ScratchGraphClient]:
-        client = FalkorDB(host=host, port=port, password=falkor.password)
+        client = FalkorDB(host=scratch.host, port=scratch.port, password=None)
         try:
             yield client
         finally:
