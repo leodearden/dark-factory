@@ -164,7 +164,7 @@ class TestInstallOperatorStopHandlerIntegration:
             _install_operator_stop_handler(_counting_stop)
             os.kill(os.getpid(), signal.SIGTERM)
             os.kill(os.getpid(), signal.SIGTERM)
-            # noqa: wall-clock-deadline — hang guard on self-delivered signals; wait_responsive is orchestrator/tests-only
+            # noqa: wall-clock-deadline — hang guard on self-delivered signals  # debt: task 6274
             await asyncio.wait_for(second_received.wait(), timeout=2.0)
 
         with asyncio.Runner() as runner:
