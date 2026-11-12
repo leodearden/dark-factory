@@ -7,10 +7,12 @@ so the two must agree word for word (INV-10).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +21,7 @@ from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
+from fused_memory.maintenance import link_adjudicator
 from fused_memory.maintenance.link_adjudicator import (
     RATER_BRIEF_PATH,
     TRUNCATION_MARKER,
@@ -34,6 +37,8 @@ from fused_memory.maintenance.link_adjudicator import (
     adjudicate_links,
     cap_text,
     configured_adjudicator,
+    prompt_sha256,
+    render_system_prompt,
 )
 from fused_memory.maintenance.link_heal import (
     AGREEING_VERDICTS,
@@ -530,6 +535,19 @@ class TestClaudeShardAsker:
         assert reply.cost_usd == 0.1
 
     @pytest.mark.asyncio
+    async def test_a_given_brief_text_is_used_and_the_path_never_read(self, tmp_path):
+        invoke = FakeInvoke(_ok())
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+
+        reply = await ask(_SHARD)
+
+        assert reply.success is True
+        (call,) = invoke.calls
+        assert call['system_prompt'] == render_system_prompt(FIXED_BRIEF)
+
+    @pytest.mark.asyncio
     async def test_an_invoke_that_raises_is_a_failed_reply(self, brief):
         invoke = FakeInvoke(RuntimeError('all accounts capped'))
 
@@ -539,7 +557,67 @@ class TestClaudeShardAsker:
         assert reply.detail == 'RuntimeError: all accounts capped'
 
 
+FIXED_BRIEF = '# A fixed brief\n\nJudge each pair, once.\n'
+
+
+class TestPromptVersion:
+    def test_the_prompt_version_is_the_sha_of_the_rendered_system_prompt(self):
+        rendered = render_system_prompt(FIXED_BRIEF).encode('utf-8')
+
+        assert prompt_sha256(FIXED_BRIEF) == hashlib.sha256(rendered).hexdigest()
+
+    def test_it_is_stable_for_a_brief_and_moves_with_it(self):
+        assert prompt_sha256(FIXED_BRIEF) == prompt_sha256(FIXED_BRIEF)
+        assert prompt_sha256(FIXED_BRIEF) != prompt_sha256(FIXED_BRIEF + 'One more rule.\n')
+
+
 class TestConfiguredAdjudicator:
+    @pytest.mark.asyncio
+    async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+        adjudicate = configured_adjudicator(
+            LinkHealConfig(adjudicator_model='haiku', shard_size=1),
+            ask=ask, brief_text=FIXED_BRIEF,
+        )
+
+        verdicts = await adjudicate(_pairs(2))
+
+        assert adjudicate.model == 'haiku'
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF)
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_without_a_brief_text_the_brief_is_read_once_at_construction(
+        self, monkeypatch, tmp_path,
+    ):
+        brief = tmp_path / 'brief.md'
+        brief.write_text(FIXED_BRIEF, encoding='utf-8')
+        monkeypatch.setattr(link_adjudicator, 'RATER_BRIEF_PATH', brief)
+        reads: list[Path] = []
+        read_text = Path.read_text
+
+        def counting_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == brief:
+                reads.append(path)
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', counting_read_text)
+
+        adjudicate = configured_adjudicator(LinkHealConfig())
+        fake_backed = configured_adjudicator(LinkHealConfig(), ask=FakeAsker())
+        await fake_backed(_pairs(3))
+
+        assert reads == [brief, brief]
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF)
+        assert adjudicate.model == LinkHealConfig().adjudicator_model
+
     @pytest.mark.asyncio
     async def test_the_config_leaves_bind_model_sharding_cap_and_streak(self):
         ask = FakeAsker()
