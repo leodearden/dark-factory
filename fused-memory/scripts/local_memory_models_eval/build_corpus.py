@@ -141,7 +141,6 @@ import asyncio
 import dataclasses
 import hashlib
 import json
-import os
 import random
 import re
 import sys
@@ -159,6 +158,8 @@ from shared.cli_boundary import (
 )
 
 from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
+from fused_memory.config.falkordb_endpoints import FalkorEndpoint
+from fused_memory.config.schema import FusedMemoryConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -743,7 +744,9 @@ class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with host/port. Either way it reads through
+    double) or with host/port, which default to the FalkorDB
+    ``FusedMemoryConfig()`` names (``FALKORDB_URI``), where the corpus lives.
+    Either way it reads through
     ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
     owns the read-only guard and opens the ``falkordb.asyncio`` client lazily,
     on the first read, without ever constructing graphiti's ``FalkorDriver``.
@@ -757,9 +760,13 @@ class EpisodeReader:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
+        if host is None or port is None:
+            configured = FalkorEndpoint.from_uri(FusedMemoryConfig().graphiti.falkordb.uri)
+            host = configured.host if host is None else host
+            port = configured.port if port is None else port
         self.graph_name = graph_name
-        self.host = host if host is not None else _falkor_host_from_env()
-        self.port = port if port is not None else _falkor_port_from_env()
+        self.host = host
+        self.port = port
         self._reader = ReadOnlyGraphReader(
             graph_name=graph_name, graph=graph, host=self.host, port=self.port
         )
@@ -814,37 +821,6 @@ class EpisodeReader:
                 f'build a corpus from an empty population'
             )
         return population
-
-
-def _falkor_host_from_env() -> str:
-    """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
-
-    Same env vars and defaults as ``fused-memory/tests/_fm_falkor_live.py``, so an
-    operator who has pointed the test suite at a FalkorDB has pointed this
-    script at the same one.
-    """
-    return os.environ.get('FALKOR_HOST', 'localhost')
-
-
-def _falkor_port_from_env() -> int:
-    """FalkorDB port from ``FALKOR_PORT``, defaulting to 6379.
-
-    The ``int()`` is load-bearing: ``os.environ`` yields str and
-    ``FalkorDB(port='6379')`` misbehaves. Unset *or empty* takes the default —
-    empty is what a CI template like ``FALKOR_PORT: ${FALKOR_PORT}`` produces
-    when the variable is not set. A non-empty non-numeric value is an operator
-    error and says so, rather than reading as "FalkorDB not reachable".
-    """
-    raw = os.environ.get('FALKOR_PORT', '').strip()
-    if not raw:
-        return 6379
-    try:
-        return int(raw)
-    except ValueError:
-        raise CorpusBuildError(
-            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
-            f'default (6379), or set it to the port your FalkorDB listens on.'
-        ) from None
 
 
 # ---------------------------------------------------------------------------

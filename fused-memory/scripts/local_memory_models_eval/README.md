@@ -234,7 +234,14 @@ commit, or this self-check quietly stops meaning anything.
 `harness.py` is thin CLI wiring over `fused_memory.arm_harness`; read the
 module named in each row for behaviour. Run it from `fused-memory/` with
 `uv run python scripts/local_memory_models_eval/harness.py <subcommand> …`.
-Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
+Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`), with
+one split. The corpus read follows the config (`FALKORDB_URI`), because the
+corpus graph lives only on production; it is `GRAPH.RO_QUERY`, read-only.
+Every write, copy, index build and teardown goes to the scratch FalkorDB
+(`FALKOR_HOST`/`FALKOR_PORT`, default `localhost:6380`), which must hold
+`evalmem_lme_ref_incumbent_a`, seeded by
+`scripts/seed_scratch_reference_graph.py` (OPERATIONS.md "The scratch
+FalkorDB").
 
 | Subcommand | Invoked by | What it does |
 |---|---|---|
@@ -329,9 +336,10 @@ the rule's one home. Protected graphs are unreachable by construction.
 uv run pytest -m integration tests/arm_harness
 ```
 
-It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
-`FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
-protected graph or index changed. `test_live_embedding_integration.py` does
+It replays two episodes onto `evalmem_test_` graphs on the scratch FalkorDB
+at `FALKOR_HOST`/`FALKOR_PORT` (default `localhost:6380`; a test session aimed
+at production `:6379` exits 4) against a local mock endpoint, and asserts that
+no protected graph or index changed. `test_live_embedding_integration.py` does
 the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
