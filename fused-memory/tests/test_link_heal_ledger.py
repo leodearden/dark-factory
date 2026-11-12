@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -30,6 +32,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     UndoTarget,
     UnknownRun,
 )
+from fused_memory.maintenance.link_heal_store import LiveRecord, text_sha256
 from fused_memory.server.grouped_read import CONTESTED_METADATA_KEY
 
 PROJECT = 'dark_factory'
@@ -81,7 +84,7 @@ class TestSchema:
             tables = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
         finally:
             conn.close()
-        for name in ('runs', 'adjudications', 'run_adjudications', 'actions'):
+        for name in ('runs', 'adjudications', 'run_adjudications', 'actions', 'snapshots'):
             assert re.search(
                 r'\bid INTEGER PRIMARY KEY AUTOINCREMENT\b', tables[name],
             ), tables[name]
@@ -140,6 +143,197 @@ class TestSchema:
         finally:
             ledger.close()
         LinkHealLedger(db).close()
+
+    def test_a_ledger_written_before_the_records_opens_and_gains_them(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        run_id = 'b' * 32
+        conn = sqlite3.connect(db)
+        try:
+            conn.executescript(_SCHEMA_BEFORE_RECORDS)
+            conn.execute(
+                'INSERT INTO runs (run_id, source, writes, started_at) VALUES (?, ?, ?, ?)',
+                (run_id, RunSource.CORPUS.value, 0, '2026-11-01T00:00:00+00:00'),
+            )
+            conn.execute(
+                'INSERT INTO actions (run_id, project_id, child_id, action, pre_image_json, '
+                'post_image_json, basis_source, basis_key, child_sha256, parent_sha256, state, '
+                'at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    run_id, PROJECT, _child(1), HealAction.DETACH.value,
+                    json.dumps({'parent_id': PARENT, 'kind': 'amendment'}), json.dumps({}),
+                    BasisSource.CORPUS.value, 'H001', CHILD_SHA, PARENT_SHA,
+                    ActionState.PLANNED.value, '2026-11-01T00:00:00+00:00',
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ledger = LinkHealLedger(db)
+        try:
+            (old,) = ledger.run_actions(run_id)
+            assert old.planned.child_id == _child(1)
+            record = LiveRecord(memory_id=_child(1), text='child', metadata={'parent_id': PARENT})
+            assert ledger.read_snapshot(ledger.snapshot(PROJECT, record)).content == 'child'
+        finally:
+            ledger.close()
+        assert _columns(db, 'adjudications') >= {'prompt_sha256'}
+        assert _columns(db, 'actions') >= {
+            'before_child_snapshot_id', 'before_parent_snapshot_id', 'after_child_snapshot_id',
+        }
+        LinkHealLedger(db).close()
+
+
+def _columns(db: Path, table: str) -> set[str]:
+    conn = sqlite3.connect(db)
+    try:
+        return {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+    finally:
+        conn.close()
+
+
+#: ``link_heal.db``'s schema as task 7159 found it, before snapshots and the
+#: record columns: a ledger this old must open and migrate in place.
+_SCHEMA_BEFORE_RECORDS = """
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    writes INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    counts_json TEXT,
+    plan_sha256 TEXT,
+    plan_path TEXT
+);
+CREATE TABLE adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL,
+    child_sha256 TEXT NOT NULL,
+    parent_sha256 TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT,
+    model TEXT,
+    run_id TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX adjudications_by_texts
+    ON adjudications (project_id, child_id, parent_id, child_sha256, parent_sha256);
+CREATE TABLE run_adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    adjudication_id INTEGER NOT NULL REFERENCES adjudications (id)
+);
+CREATE UNIQUE INDEX run_adjudications_by_run
+    ON run_adjudications (run_id, adjudication_id);
+CREATE TABLE actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    pre_image_json TEXT NOT NULL,
+    post_image_json TEXT NOT NULL,
+    basis_source TEXT NOT NULL,
+    basis_key TEXT,
+    child_sha256 TEXT NOT NULL,
+    parent_sha256 TEXT,
+    state TEXT NOT NULL,
+    detail TEXT,
+    at TEXT NOT NULL,
+    executed_run_id TEXT,
+    undone_run_id TEXT
+);
+CREATE INDEX actions_by_link ON actions (project_id, child_id);
+"""
+
+
+SNAPSHOT_META = {
+    'data': 'the child note',
+    'parent_id': PARENT,
+    'kind': 'amendment',
+    'created_at': '2026-11-11T20:00:00-07:00',
+    'updated_at': '2026-11-12T03:00:00+00:00',
+    'nested': {'b': 2, 'a': [1, 2]},
+}
+
+
+def _record(text: str = 'the child note', **meta_changes) -> LiveRecord:
+    return LiveRecord(memory_id=_child(1), text=text, metadata={**SNAPSHOT_META, **meta_changes})
+
+
+class TestSnapshots:
+    def test_a_snapshot_holds_the_full_record_and_its_hashes(self, ledger):
+        snapshot_id = ledger.snapshot(PROJECT, _record())
+
+        assert isinstance(snapshot_id, int)
+        snapshot = ledger.read_snapshot(snapshot_id)
+        assert snapshot.snapshot_id == snapshot_id
+        assert snapshot.project_id == PROJECT
+        assert snapshot.memory_id == _child(1)
+        assert snapshot.content == 'the child note'
+        assert snapshot.content_sha256 == text_sha256('the child note')
+        assert snapshot.metadata == SNAPSHOT_META
+        assert snapshot.metadata_sha256 == hashlib.sha256(
+            json.dumps(SNAPSHOT_META, sort_keys=True).encode('utf-8'),
+        ).hexdigest()
+        assert snapshot.created_at == '2026-11-11T20:00:00-07:00'
+        assert snapshot.updated_at == '2026-11-12T03:00:00+00:00'
+
+    def test_a_snapshot_without_timestamps_stores_none(self, ledger):
+        record = LiveRecord(memory_id=_child(2), text='bare', metadata={'parent_id': PARENT})
+
+        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, record))
+
+        assert snapshot.created_at is None
+        assert snapshot.updated_at is None
+
+    def test_an_identical_record_reuses_its_snapshot(self, ledger):
+        first = ledger.snapshot(PROJECT, _record())
+
+        assert ledger.snapshot(PROJECT, _record()) == first
+
+    @pytest.mark.parametrize(
+        'changed',
+        [
+            {'text': 'the child note, edited'},
+            {'kind': 'sighting'},
+            {'nested': {'b': 3, 'a': [1, 2]}},
+        ],
+        ids=['content', 'one-key', 'nested-value'],
+    )
+    def test_a_changed_record_is_a_new_snapshot(self, ledger, changed):
+        first = ledger.snapshot(PROJECT, _record())
+
+        assert ledger.snapshot(PROJECT, _record(**changed)) != first
+
+    def test_the_same_record_in_another_project_is_a_new_snapshot(self, ledger):
+        first = ledger.snapshot(PROJECT, _record())
+
+        assert ledger.snapshot('reify', _record()) != first
+
+    def test_a_snapshot_is_frozen_and_reads_its_link(self, ledger):
+        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, _record()))
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snapshot.content = 'changed'  # type: ignore[misc]
+        assert snapshot.link_image() == LinkImage.from_metadata(SNAPSHOT_META)
+
+    def test_an_unknown_snapshot_id_is_refused(self, ledger):
+        with pytest.raises(LookupError):
+            ledger.read_snapshot(4242)
+
+    def test_sqlite_sequence_carries_snapshots_once_one_is_written(self, ledger):
+        ledger.snapshot(PROJECT, _record())
+
+        conn = sqlite3.connect(ledger.db_path)
+        try:
+            names = {name for (name,) in conn.execute('SELECT name FROM sqlite_sequence')}
+        finally:
+            conn.close()
+        assert 'snapshots' in names
 
 
 class TestRuns:
