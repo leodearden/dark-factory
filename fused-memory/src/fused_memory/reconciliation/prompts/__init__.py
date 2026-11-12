@@ -324,10 +324,11 @@ def render_entity_standing_decision_write_section() -> str:
 # ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
-# The `reason` the norm's case (e) teaches: it describes the fragment by structure, never by
-# its tags. tests/test_recon_leak_cleanup_markup_guard.py drives it through the markup guard.
+# The `reason` the norm's case (e) teaches. Shape-neutral, so a verbatim copy is true of any
+# leaked fragment; tests/test_recon_leak_cleanup_markup_guard.py drives it through the guard.
 LEAKED_FRAGMENT_CLEANUP_REASON = (
-    'removed a leaked serialized tool-call fragment (closing content tag + category parameter)'
+    'removed a leaked serialized tool-call fragment from the stored text; '
+    'the substantive claim is unchanged'
 )
 
 # States the precedence order for annotating superseded, wrong, or corrupted
@@ -404,7 +405,9 @@ stored text): amend the record in place with `mcp__fused-memory__update_memory`,
 keeps its id. `content` is the record's current text, copied verbatim, with the fragment \
 cut out entirely; the substantive claim is unchanged, so no marker is needed. """
     f"""`reason` \
-names what was removed BY STRUCTURE, in words, e.g. `{LEAKED_FRAGMENT_CLEANUP_REASON}`.
+describes the removal in words, e.g. `{LEAKED_FRAGMENT_CLEANUP_REASON}`. To be more \
+specific, add the tag kinds and parameter names actually present in THAT record's \
+fragment, as words (say, closing content tag + category parameter), per the rule below.
 
 """
     """\
