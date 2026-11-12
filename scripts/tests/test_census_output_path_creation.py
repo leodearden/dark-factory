@@ -27,6 +27,7 @@ which is precisely and only the surface under test here.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 from typing import Any
@@ -85,23 +86,31 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     zoo: ``batch_source=[]`` mines nothing, so the only LLM call any test
     here makes is the headroom probe.
     """
-    kwargs: dict[str, Any] = dict(
+    effects = mod.CensusEffects(
         batch_source=[],
         selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
         synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
-        submit_fn=lambda payload: {"task_id": "t1"},
-        task_store=FakeTaskStore(),
-        escalate_fn=lambda **kw: None,
-        status_fetcher=lambda: {"statuses": {}},
-        gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
-        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
-        roll_back=_never_roll_back,
-        codebook_dict=_minimal_v2_codebook(),
         embedder=embeddings.Embedder(
             embed_fn=_distinct_one_hot_embed, cache_path=root / "embeddings.sqlite",
         ),
+        submit_fn=lambda payload: {"task_id": "t1"},
+        task_store=FakeTaskStore(),
+        status_fetcher=lambda: {"statuses": {}},
+        escalate_fn=lambda **kw: None,
+        gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
+        roll_back=_never_roll_back,
+    )
+    seams = {
+        name: overrides.pop(name)
+        for name in list(overrides)
+        if name in {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
+    }
+    kwargs: dict[str, Any] = dict(
+        effects=dataclasses.replace(effects, **seams),
+        codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
             project_id="target_project",
             project_root=str(root),

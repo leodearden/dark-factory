@@ -7,6 +7,7 @@ fakes, passed through ``run_census``'s own parameters.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import logging
@@ -170,23 +171,31 @@ class _Census:
         """``run_census`` keywords mining *source* (a fresh window source by
         default), whose selection ``selection_of`` reports."""
         source = source if source is not None else self.source()
-        kwargs: dict[str, Any] = dict(
+        effects = mod.CensusEffects(
             batch_source=source,
             selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
             synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
-            submit_fn=_Recorder({"ticket": "tkt_1"}),
-            task_store=FakeTaskStore(),
-            escalate_fn=_Recorder(),
-            status_fetcher=lambda: {"statuses": {}},
-            gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
-            commit=_Recorder(_LANDED),
-            roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
-            codebook_dict={"version": 2, "entries": [], "candidates": []},
             embedder=embeddings.Embedder(
                 embed_fn=_distinct_one_hot_embed, cache_path=embeddings.cache_path("p"),
             ),
+            submit_fn=_Recorder({"ticket": "tkt_1"}),
+            task_store=FakeTaskStore(),
+            status_fetcher=lambda: {"statuses": {}},
+            escalate_fn=_Recorder(),
+            gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            commit=_Recorder(_LANDED),
+            roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
+        )
+        seams = {
+            name: overrides.pop(name)
+            for name in list(overrides)
+            if name in {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
+        }
+        kwargs: dict[str, Any] = dict(
+            effects=dataclasses.replace(effects, **seams),
+            codebook_dict={"version": 2, "entries": [], "candidates": []},
             config=self.cfg,
             project_root=self.cwd,
             project_id="p",
@@ -231,7 +240,7 @@ def test_the_run_writes_its_record_first_and_renders_the_report_from_it(census):
     text, record = _record_of(report_path)
     assert report_path.read_text(encoding="utf-8") == mod.render_report(json.loads(text))
     assert record["run_id"] == _RUN_ID
-    [commit] = kwargs["commit"].calls
+    [commit] = kwargs["effects"].commit.calls
     assert set(commit["paths"]) >= {
         str(report_path), str(record_path), str(census.codebook_path), str(census.state_path),
     }

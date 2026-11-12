@@ -85,9 +85,9 @@ def _make_seam_driving_run_census():
 
     def fake_run_census(**kwargs):
         calls.append(kwargs)
-        kwargs["invoke"]("ping", "haiku")
-        kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
-        kwargs["synthesize_fn"](_EMPTY_BRIEF, model="fable")
+        kwargs["effects"].invoke("ping", "haiku")
+        kwargs["effects"].verify_fn([{"title": "x"}], model="sonnet")
+        kwargs["effects"].synthesize_fn(_EMPTY_BRIEF, model="fable")
         return mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-08-03.md",
             filed_ticket_ids=[], stop_reason="exhausted",

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import functools
 import itertools
 import json
@@ -2491,24 +2492,26 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
     # per parameter) and at each `kwargs[...]` attribute access. Measured: this
     # single annotation cleared 337 of the 350 errors this file carried.
     kwargs: dict[str, Any] = dict(
-        batch_source=None,
-        selection_of=_no_selection,
-        invoke=_make_fake_invoke(default="pong"),
-        verify_fn=_poison("verify_fn"),
-        synthesize_fn=_poison("synthesize_fn"),
-        submit_fn=_make_fake_submit_fn(),
-        task_store=FakeTaskStore(),
-        escalate_fn=_make_fake_escalate_fn(),
-        status_fetcher=_make_fake_status_fetcher(0),
-        gate=_passing_gate,
-        commit=_poison("commit"),
-        roll_back=_poison("roll_back"),
-        codebook_dict=_minimal_v2_codebook(),
-        # Nothing is ever similar and the queue cap is 0, so a suite not about
-        # the similarity stage (census PRD L7) sees no attach and no queue verify.
-        embedder=embeddings.Embedder(
-            embed_fn=_nothing_similar_embed, cache_path=embeddings.cache_path("dark_factory"),
+        effects=mod.CensusEffects(
+            batch_source=None,
+            selection_of=_no_selection,
+            invoke=_make_fake_invoke(default="pong"),
+            verify_fn=_poison("verify_fn"),
+            synthesize_fn=_poison("synthesize_fn"),
+            # Nothing is ever similar and the queue cap is 0, so a suite not about
+            # the similarity stage (census PRD L7) sees no attach and no queue verify.
+            embedder=embeddings.Embedder(
+                embed_fn=_nothing_similar_embed, cache_path=embeddings.cache_path("dark_factory"),
+            ),
+            submit_fn=_make_fake_submit_fn(),
+            task_store=FakeTaskStore(),
+            status_fetcher=_make_fake_status_fetcher(0),
+            escalate_fn=_make_fake_escalate_fn(),
+            gate=_passing_gate,
+            commit=_poison("commit"),
+            roll_back=_poison("roll_back"),
         ),
+        codebook_dict=_minimal_v2_codebook(),
         config=_census_config(tmp_path),
         project_root=str(tmp_path),
         project_id="dark_factory",
@@ -2521,8 +2524,17 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         since=None,
         force=False,
     )
-    kwargs.update(overrides)
+    _override(kwargs, **overrides)
     return kwargs
+
+
+def _override(kwargs: dict[str, Any], **overrides) -> None:
+    """Apply *overrides* to run_census *kwargs*, each seam into its ``effects``."""
+    effect_names = {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
+    seams = {name: overrides.pop(name) for name in list(overrides) if name in effect_names}
+    if seams:
+        kwargs["effects"] = dataclasses.replace(kwargs["effects"], **seams)
+    kwargs.update(overrides)
 
 
 def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
@@ -2531,8 +2543,8 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
         invoke=_make_fake_invoke(default="You have reached your usage limit for this period."),
         batch_source=_poison("batch_source"),
     )
-    fake_submit_fn = kwargs["submit_fn"]
-    fake_escalate_fn = kwargs["escalate_fn"]
+    fake_submit_fn = kwargs["effects"].submit_fn
+    fake_escalate_fn = kwargs["effects"].escalate_fn
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -2603,8 +2615,8 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
         synthesize_fn=_poison("synthesize_fn"),
         commit=_poison("commit"),
     )
-    fake_submit_fn = kwargs["submit_fn"]
-    fake_escalate_fn = kwargs["escalate_fn"]
+    fake_submit_fn = kwargs["effects"].submit_fn
+    fake_escalate_fn = kwargs["effects"].escalate_fn
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -3039,12 +3051,12 @@ def test_run_census_unlanded_commit_rolls_back_every_written_path_and_escalates(
 
     assert outcome.status == "unlanded"
     assert outcome.rollback is rollback
-    assert fake_roll_back.calls == [{"paths": kwargs["commit"].calls[0]["paths"]}]
+    assert fake_roll_back.calls == [{"paths": kwargs["effects"].commit.calls[0]["paths"]}]
     assert outcome.report_path is None
     assert outcome.filed_ticket_ids == ["tkt_1"]
 
-    assert len(kwargs["escalate_fn"].calls) == 1
-    call = kwargs["escalate_fn"].calls[0]
+    assert len(kwargs["effects"].escalate_fn.calls) == 1
+    call = kwargs["effects"].escalate_fn.calls[0]
     detail = call["detail"]
     assert "cited-test-path gate" in detail
     assert "after 1 attempt(s)" in detail
@@ -3191,7 +3203,7 @@ def test_run_census_commit_refusal_keeps_its_summary_and_detail_and_records_the_
 
     assert outcome.status == "unlanded"
     assert outcome.gate == _passing_gate()
-    (call,) = kwargs["escalate_fn"].calls
+    (call,) = kwargs["effects"].escalate_fn.calls
     assert call["summary"] == (
         "legibility census commit did not land (dark_factory): outputs rolled back, "
         "census-state NOT advanced"
@@ -3265,7 +3277,7 @@ def test_run_census_refused_by_its_landing_gate_rolls_back_unlanded_and_never_co
         written.append(str(payloads_path))
     assert fake_roll_back.calls == [{"paths": written}]
 
-    (call,) = kwargs["escalate_fn"].calls
+    (call,) = kwargs["effects"].escalate_fn.calls
     assert call["level"] == logging.ERROR
     assert "landing gate" in call["summary"]
     assert "dark_factory" in call["summary"]
@@ -3353,7 +3365,7 @@ def test_run_census_skips_a_deletion_shaped_mining_record_and_lands_the_rest(
     assert state["last_census_at"] == "2026-07-14"
     [entry] = codebook.load(kwargs["codebook_path"])["entries"]
     assert [s["session"] for s in entry["sightings"]] == ["sess-match"]
-    assert len(kwargs["commit"].calls) == 1
+    assert len(kwargs["effects"].commit.calls) == 1
     naming = [
         r for r in caplog.records
         if r.levelno == logging.WARNING and "sess-delete" in r.getMessage()
@@ -4149,7 +4161,7 @@ def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_ve
     (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
     synthesize_fn = _make_fake_synthesize_fn()
     kwargs = _promotion_kwargs(tmp_path, verify_fn=_verdictless_verify_fn(_IN_TREE_REMEDIATION))
-    kwargs["synthesize_fn"] = synthesize_fn
+    _override(kwargs, synthesize_fn=synthesize_fn)
 
     outcome = mod.run_census(**kwargs)
 
@@ -4158,7 +4170,7 @@ def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_ve
     assert finding.verdict is not None
     assert finding.verdict.proposal == _IN_TREE_REMEDIATION["change"]
     assert finding.verdict.route == verdict.Route.MECHANICAL.value
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert _IN_TREE_REMEDIATION["path"] in filed["description"]
     assert _recorded_normalisations(kwargs) == _normalisation_counts(
         anchor_from_remediation=1, severity_missing=1, route_defaulted=1, reason_missing=1,
@@ -4171,7 +4183,7 @@ def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_pat
         tmp_path,
         verify_fn=_verdictless_verify_fn({"path": "docs/missing.md", "change": "Document X"}),
     )
-    kwargs["synthesize_fn"] = synthesize_fn
+    _override(kwargs, synthesize_fn=synthesize_fn)
 
     outcome = mod.run_census(**kwargs)
 
@@ -4179,7 +4191,7 @@ def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_pat
     [finding] = synthesize_fn.calls[0]["brief"].new
     assert finding.verdict is not None
     assert finding.verdict.proposal is None
-    assert all("docs/missing.md" not in call["description"] for call in kwargs["submit_fn"].calls)
+    assert all("docs/missing.md" not in call["description"] for call in kwargs["effects"].submit_fn.calls)
     assert _recorded_normalisations(kwargs) == _normalisation_counts(
         anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
         remediation_rejected=1,
@@ -5165,6 +5177,22 @@ def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
     assert fake_run_census.calls[0]["force"] is True
 
 
+def test_main_hands_run_census_every_seam_in_one_effects_bundle(tmp_path, monkeypatch):
+    _census_project(tmp_path)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    [call] = fake_run_census.calls
+    effects = call["effects"]
+    assert isinstance(effects, mod.CensusEffects)
+    assert callable(effects.escalate_fn)
+    assert callable(effects.commit)
+    assert callable(effects.roll_back)
+    assert set(call) & {seam.name for seam in dataclasses.fields(mod.CensusEffects)} == set()
+
+
 def test_main_without_force_no_fire_noops_with_exit_zero(
     tmp_path, monkeypatch, capsys, opened_runners,
 ):
@@ -5218,7 +5246,7 @@ def test_main_hands_run_census_the_projects_landing_gate_run_in_its_root(tmp_pat
 
     assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
 
-    verdict = fake_run_census.calls[0]["gate"]()
+    verdict = fake_run_census.calls[0]["effects"].gate()
     assert verdict.status is landing_gate.GateStatus.PASSED
     assert verdict.output_tail.strip() == str(tmp_path.resolve())
 
@@ -5288,7 +5316,7 @@ def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypa
 
     call = fake_run_census.calls[0]
     census_state_path.write_text('{"last_census_at": "2026-07-14"}\n', encoding="utf-8")
-    rb = call["roll_back"](paths=[call["census_state_path"]])
+    rb = call["effects"].roll_back(paths=[call["census_state_path"]])
     assert rb.restored
     assert census_state_path.read_bytes() == _git(
         repo, "show", "HEAD:docs/legibility/census-state.json",
@@ -5820,7 +5848,7 @@ def test_main_passes_the_openai_embedder_and_the_hosts_vector_cache(tmp_path, mo
 
     call = _main_with_fake_census(tmp_path, monkeypatch)
 
-    embedder = call["embedder"]
+    embedder = call["effects"].embedder
     assert isinstance(embedder, embeddings.Embedder)
     assert embedder.embed_fn is embeddings.openai_embed
     assert embedder.cache_path == embeddings.cache_path("dark_factory")
@@ -5865,9 +5893,9 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
     sources = []
 
     def fake_run_census(**kwargs):
-        source = kwargs["batch_source"]
+        source = kwargs["effects"].batch_source
         list(source)
-        sources.append((source, kwargs["selection_of"]()))
+        sources.append((source, kwargs["effects"].selection_of()))
         return mod.CensusOutcome(
             status="done", report_path="plans/r.md", filed_ticket_ids=[],
             stop_reason="exhausted",
@@ -6116,11 +6144,11 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
     assert [spec.timeout_secs for spec in specs] == [120, 900, 1800]
 
     kwargs = fake_run_census.calls[0]
-    kwargs["invoke"]("ping", "haiku")
+    kwargs["effects"].invoke("ping", "haiku")
     assert runner.calls[-1] == (specs[0].name, "haiku")
-    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
+    kwargs["effects"].verify_fn([{"title": "x"}], model="sonnet")
     assert runner.calls[-1] == (specs[1].name, "sonnet")
-    kwargs["synthesize_fn"](_synthesis_brief(), model="fable")
+    kwargs["effects"].synthesize_fn(_synthesis_brief(), model="fable")
     assert runner.calls[-1] == (specs[2].name, "fable")
 
 
@@ -6647,7 +6675,7 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
         status_fetcher=_make_fake_status_fetcher(0),
         commit=_poison("commit"),
     )
-    fake_submit_fn = kwargs["submit_fn"]
+    fake_submit_fn = kwargs["effects"].submit_fn
 
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**kwargs)
@@ -7719,7 +7747,7 @@ def test_run_census_screens_a_title_with_a_standing_rejection_instead_of_droppin
     assert outcome.status == "done"
     assert kwargs["census_state_path"].exists(), "state is still persisted"
     assert outcome.unresolved_verdicts == 0
-    assert [cluster["title"] for cluster in kwargs["verify_fn"].calls[0]["clusters"]] == list(_THREE_NOVEL_TITLES[1:])
+    assert [cluster["title"] for cluster in kwargs["effects"].verify_fn.calls[0]["clusters"]] == list(_THREE_NOVEL_TITLES[1:])
     assert _run_record(kwargs)["method"]["extra"]["screened"]["title"] == 1
 
     # The other two titles were promoted normally — the screen is scoped to the
@@ -8155,7 +8183,7 @@ def test_run_census_withholds_an_unremediated_singleton_but_records_it(tmp_path)
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     persisted = codebook.load(kwargs["codebook_path"])
     assert any(entry["title"] == _GATED_TITLE for entry in persisted["entries"]), (
         "a withheld cluster is recorded, never lost"
@@ -8171,7 +8199,7 @@ def test_run_census_files_an_unremediated_cluster_seen_in_two_sessions(tmp_path)
 
     outcome = mod.run_census(**kwargs)
 
-    assert len(kwargs["submit_fn"].calls) == 1
+    assert len(kwargs["effects"].submit_fn.calls) == 1
     assert outcome.withheld == ()
 
 
@@ -8180,7 +8208,7 @@ def test_run_census_files_a_remediated_singleton(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert len(kwargs["submit_fn"].calls) == 1
+    assert len(kwargs["effects"].submit_fn.calls) == 1
     assert outcome.withheld == ()
 
 
@@ -8261,7 +8289,7 @@ def test_run_census_files_a_harness_fix_surface_into_the_harness_project(tmp_pat
 
     outcome = mod.run_census(**kwargs)
 
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert filed["project_root"] == _HARNESS.project_root
     assert filed["metadata"]["origin_project_id"] == "hosted_project"
     assert outcome.cross_project_tickets == (
@@ -8284,7 +8312,7 @@ def test_run_census_without_harness_project_files_into_the_observed_project(tmp_
 
     outcome = mod.run_census(**kwargs)
 
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert filed["project_root"] == str(tmp_path)
     assert outcome.cross_project_tickets == ()
 
@@ -8296,7 +8324,7 @@ def test_run_census_keeps_a_remediated_harness_marked_cluster_observed(tmp_path)
 
     outcome = mod.run_census(**kwargs)
 
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert filed["project_root"] == str(tmp_path)
     assert outcome.cross_project_tickets == ()
 
@@ -8409,7 +8437,7 @@ def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **override
 def _withheld_first_run(tmp_path, **overrides):
     first = _gate_kwargs(tmp_path, **overrides)
     outcome = mod.run_census(**first)
-    assert first["submit_fn"].calls == [], "run 1 must withhold the singleton"
+    assert first["effects"].submit_fn.calls == [], "run 1 must withhold the singleton"
     assert outcome.withheld
     return first
 
@@ -8421,7 +8449,7 @@ def test_run_census_files_a_withheld_entry_once_a_matches_op_makes_it_recur(tmp_
 
     outcome = mod.run_census(**second)
 
-    [filed] = second["submit_fn"].calls
+    [filed] = second["effects"].submit_fn.calls
     assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
     assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.released_entry_ids == (entry_id,)
@@ -8436,7 +8464,7 @@ def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_pat
         "batch_source": [[_hand_digest("s1-df-marked", "a task-store read timed out")]],
     }
     mod.run_census(**first)
-    assert first["submit_fn"].calls == [], "run 1 must withhold the singleton"
+    assert first["effects"].submit_fn.calls == [], "run 1 must withhold the singleton"
     second = _recurrence_kwargs(
         tmp_path, first,
         reply=_matches_reply,
@@ -8448,7 +8476,7 @@ def test_run_census_routes_a_released_harness_owned_entry_to_the_harness(tmp_pat
 
     outcome = mod.run_census(**second)
 
-    [filed] = second["submit_fn"].calls
+    [filed] = second["effects"].submit_fn.calls
     assert filed["project_root"] == _HARNESS.project_root
     assert filed["metadata"]["origin_project_id"] == "hosted_project"
     assert "x_fix_surface" in filed["metadata"]
@@ -8469,7 +8497,7 @@ def test_run_census_never_refiles_a_released_entry(tmp_path):
 
     outcome = mod.run_census(**third)
 
-    assert third["submit_fn"].calls == []
+    assert third["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
 
 
@@ -8487,7 +8515,7 @@ def test_run_census_files_a_miscoded_recurrence_once_and_releases_the_entry(tmp_
 
     mod.run_census(**second)
 
-    assert len(second["submit_fn"].calls) == 1, "one ticket per title, never two"
+    assert len(second["effects"].submit_fn.calls) == 1, "one ticket per title, never two"
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
         codebook.ENTRY_FILING_KEY
     ] == codebook.ENTRY_FILING_FILED
@@ -8513,7 +8541,7 @@ def test_run_census_keeps_the_marker_when_the_release_filing_fails(tmp_path, cap
     with caplog.at_level(logging.WARNING):
         outcome = mod.run_census(**second)
 
-    assert len(second["submit_fn"].calls) == 1
+    assert len(second["effects"].submit_fn.calls) == 1
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
         codebook.ENTRY_FILING_KEY
@@ -8525,7 +8553,7 @@ def test_run_census_keeps_the_marker_when_the_release_filing_fails(tmp_path, cap
     third = _recurrence_kwargs(tmp_path, second, reply=_matches_reply)
     retried = mod.run_census(**third)
 
-    [filed] = third["submit_fn"].calls
+    [filed] = third["effects"].submit_fn.calls
     assert filed["title"] == f"[legibility census] {_GATED_TITLE}"
     assert retried.released_entry_ids == (_withheld_entry_id(first),)
 
@@ -8557,7 +8585,7 @@ def test_run_census_does_not_release_an_entry_that_did_not_recur(tmp_path):
 
     outcome = mod.run_census(**second)
 
-    assert second["submit_fn"].calls == []
+    assert second["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
     assert _persisted_entry(second["codebook_path"], _GATED_TITLE)[
         codebook.ENTRY_FILING_KEY
@@ -8576,7 +8604,7 @@ def test_run_census_does_not_release_an_entry_retired_this_run(tmp_path):
 
     outcome = mod.run_census(**second)
 
-    assert second["submit_fn"].calls == []
+    assert second["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
 
 
@@ -8604,7 +8632,7 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
 
     outcome = mod.run_census(**kwargs)
 
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
 
 
@@ -8644,7 +8672,7 @@ def test_run_census_does_not_report_an_unpromoted_cluster_as_withheld(tmp_path):
 
     assert outcome.dropped_verdicts == (), "re-premised by task 6405: the title is screened, not verified"
     assert _run_record(second)["method"]["extra"]["screened"]["title"] == 1
-    assert second["submit_fn"].calls == []
+    assert second["effects"].submit_fn.calls == []
     assert outcome.withheld == (), "no entry was promoted, so none carries the withheld marker"
     assert not any(e["title"] == _GATED_TITLE for e in codebook.load(second["codebook_path"])["entries"])
 
@@ -8659,8 +8687,8 @@ def test_run_census_attaches_a_rejected_titles_recurrence_without_verifying_or_f
 
     outcome = mod.run_census(**second)
 
-    assert [call["clusters"] for call in second["verify_fn"].calls] == [[]]
-    assert second["submit_fn"].calls == []
+    assert [call["clusters"] for call in second["effects"].verify_fn.calls] == [[]]
+    assert second["effects"].submit_fn.calls == []
     assert outcome.withheld == ()
     [candidate] = [
         c for c in codebook.load(second["codebook_path"])["candidates"] if c["title"] == _GATED_TITLE
@@ -8757,7 +8785,7 @@ def test_run_census_row5_verdict_key_ticket(tmp_path):
     candidate = _promoted_candidate_of(kwargs, entry["id"])
     assert {field: candidate[field] for field in _ROW5_FIELDS} == _ROW5_FIELDS
 
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
     assert payload["metadata"]["x_finding_run"] == run_id
     assert payload["priority"] == "high"
@@ -8912,7 +8940,7 @@ def test_run_census_files_a_released_keyed_entry_with_its_severity_and_key(tmp_p
 
     mod.run_census(**second)
 
-    [filed] = second["submit_fn"].calls
+    [filed] = second["effects"].submit_fn.calls
     assert filed["priority"] == "high"
     assert filed["metadata"]["x_finding_key"] == entry["finding_key"]
     assert filed["metadata"]["x_finding_run"] == second["run_id"]
@@ -8950,7 +8978,7 @@ def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
 
     mod.run_census(**kwargs)
 
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert filed["priority"] == "low"
     assert "x_finding_key" not in filed["metadata"]
     assert filed["metadata"]["x_finding_run"] == kwargs["run_id"]
@@ -8978,7 +9006,7 @@ def _keyed_kwargs(tmp_path, store, **overrides):
     """A run that promotes and would file _PROMOTED_TITLE under _ROW5_KEY."""
     _write_briefing(tmp_path)
     kwargs = _promotion_kwargs(tmp_path, verify_fn=_keyed_verify_fn())
-    kwargs.update(task_store=store, **overrides)
+    _override(kwargs, task_store=store, **overrides)
     return kwargs
 
 
@@ -8999,7 +9027,7 @@ def test_run_census_row7_a_live_task_carrying_the_key_is_not_refiled(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     assert outcome.filed_ticket_ids == []
     assert _persisted_promoted_entry(kwargs)["filed_tickets"] == [{
         "ticket": None,
@@ -9034,7 +9062,7 @@ def test_run_census_row8_an_unreachable_key_lookup_files_nothing(tmp_path, mode)
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     assert outcome.filed_ticket_ids == []
     assert outcome.filing is not None
     unreachable = outcome.filing.disposal.unreachable
@@ -9149,7 +9177,7 @@ def test_run_census_writes_no_artifact_when_filing_leaves_the_codebook_invalid(t
     with pytest.raises(RuntimeError, match="codebook filing produced an invalid codebook"):
         mod.run_census(**kwargs)
 
-    assert kwargs["submit_fn"].calls, "the run reached the curator before the check"
+    assert kwargs["effects"].submit_fn.calls, "the run reached the curator before the check"
     assert not kwargs["report_path"].exists()
     assert not kwargs["report_path"].with_suffix(".json").exists()
     assert not kwargs["codebook_path"].exists()
@@ -9209,7 +9237,7 @@ def test_run_census_records_a_structural_finding_and_files_only_the_mechanical_o
 
     mod.run_census(**kwargs)
 
-    [filed] = kwargs["submit_fn"].calls
+    [filed] = kwargs["effects"].submit_fn.calls
     assert filed["title"] == disposition.task_title(_PROMOTED_TITLE)
     structural = _persisted_entry(kwargs["codebook_path"], _STRUCTURAL_TITLE)
     assert codebook.ENTRY_FILING_KEY not in structural, "a structural finding is not withheld"
@@ -9298,12 +9326,12 @@ def test_run_census_records_a_verdictless_unremediated_cluster_as_structural(tmp
     """The verdict parser defaults an unremediated verdict's route to
     STRUCTURAL, so a recurring verdictless cluster is recorded, not filed."""
     kwargs = _gate_kwargs(tmp_path, sessions=("s1", "s2"))
-    kwargs["verify_fn"] = _bare_verify_fn({_GATED_TITLE})
+    _override(kwargs, verify_fn=_bare_verify_fn({_GATED_TITLE}))
 
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     assert outcome.withheld == ()
     entry = _persisted_entry(kwargs["codebook_path"], _GATED_TITLE)
     assert codebook.ENTRY_FILING_KEY not in entry
@@ -9335,7 +9363,7 @@ def _duplicate_only_kwargs(tmp_path, store, **overrides):
         commit=_make_fake_commit(),
         task_store=store,
     )
-    kwargs.update(overrides)
+    _override(kwargs, **overrides)
     return kwargs
 
 
@@ -9414,7 +9442,7 @@ def test_run_census_resolves_a_ticket_carried_over_from_an_earlier_run(tmp_path)
 
     mod.run_census(**kwargs)
 
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     [entry] = [e for e in codebook.load(kwargs["codebook_path"])["entries"] if e["id"] == "entry-a"]
     [row] = entry["filed_tickets"]
     assert (row["ticket"], row["task_id"], row["resolution"]) == ("tkt_old", 88, "created")
@@ -9500,7 +9528,7 @@ def _main_task_store(tmp_path, monkeypatch, *, outcome=None):
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
     assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
     [kwargs] = fake_run_census.calls
-    return kwargs["task_store"]
+    return kwargs["effects"].task_store
 
 
 def _tool_calls(server):
@@ -9675,7 +9703,7 @@ def _outcome_kwargs(tmp_path, answer: str, *, statuses=None, batch=None, **entry
         verify_fn=verify_fn,
     )
     if batch is not None:
-        kwargs["batch_source"] = [batch]
+        _override(kwargs, batch_source=[batch])
     return kwargs
 
 
@@ -9688,13 +9716,13 @@ def test_run_census_fixes_an_entry_whose_done_task_reverifies_gone(tmp_path):
     entry = _persisted_entry_a(kwargs)
     assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", kwargs["as_of_sha"])
     assert "accepted_by" not in entry
-    [call] = _reverify_calls(kwargs["verify_fn"])
+    [call] = _reverify_calls(kwargs["effects"].verify_fn)
     [cluster] = call["clusters"]
     assert cluster["title"] == "Some confusion cluster"
     assert cluster[disposition.REVERIFY_ENTRY] == "entry-a"
     assert call["model"] == kwargs["config"].models.census_verify
     json.dumps(cluster)
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     record = _run_record(kwargs)
     assert record["method"]["cost"]["verify_calls"] == 1
     [row] = record["dispositions"]["rows"]
@@ -9711,7 +9739,7 @@ def test_run_census_refiles_an_entry_whose_done_task_reverifies_present(tmp_path
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
     assert payload["metadata"]["x_finding_run"] == kwargs["run_id"]
     assert payload["title"].startswith(disposition.task_title("Some confusion cluster"))
@@ -9739,7 +9767,7 @@ def test_run_census_never_fixes_an_entry_whose_reverify_did_not_establish_gone(t
     entry = _persisted_entry_a(kwargs)
     assert entry["status"] == "open"
     assert "fixed_at_sha" not in entry
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     [row] = _run_record(kwargs)["dispositions"]["rows"]
     assert row["outcome"] == "inconclusive"
     assert _run_record(kwargs)["dispositions"]["reverify"]["inconclusive"] == 1
@@ -9753,7 +9781,7 @@ def test_run_census_reverifies_only_inside_what_the_verify_cap_leaves(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [call] = kwargs["verify_fn"].calls
+    [call] = kwargs["effects"].verify_fn.calls
     assert [cluster["title"] for cluster in call["clusters"]] == ["Silent no-op subagent contract"]
     entry = _persisted_entry_a(kwargs)
     assert (entry["status"], "fixed_at_sha" in entry) == ("open", False)
@@ -9768,7 +9796,7 @@ def test_run_census_never_reverifies_an_entry_already_fixed(tmp_path):
 
     mod.run_census(**kwargs)
 
-    assert _reverify_calls(kwargs["verify_fn"]) == []
+    assert _reverify_calls(kwargs["effects"].verify_fn) == []
     entry = _persisted_entry_a(kwargs)
     assert (entry["status"], entry["fixed_at_sha"]) == ("fixed", "abcdef1")
 
@@ -9778,7 +9806,7 @@ def test_run_census_reads_get_statuses_once_and_feeds_the_outcomes(tmp_path):
 
     mod.run_census(**kwargs)
 
-    assert len(kwargs["status_fetcher"].calls) == 1
+    assert len(kwargs["effects"].status_fetcher.calls) == 1
     state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
     assert "last_census_done_count" not in state
     assert _persisted_entry_a(kwargs)["status"] == "fixed"
@@ -9786,17 +9814,17 @@ def test_run_census_reads_get_statuses_once_and_feeds_the_outcomes(tmp_path):
 
 def test_run_census_changes_no_status_when_get_statuses_fails(tmp_path):
     kwargs = _outcome_kwargs(tmp_path, "gone", status="accepted", accepted_by=_LINKED_TASK)
-    kwargs["status_fetcher"] = _counting_status_fetcher(
+    _override(kwargs, status_fetcher=_counting_status_fetcher(
         raises=census_trigger.StatusFetchUnavailable("get_statuses unreachable: fused-memory down"),
-    )
+    ))
 
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert len(kwargs["status_fetcher"].calls) == 1
+    assert len(kwargs["effects"].status_fetcher.calls) == 1
     entry = _persisted_entry_a(kwargs)
     assert (entry["status"], entry["accepted_by"]) == ("accepted", _LINKED_TASK)
-    assert _reverify_calls(kwargs["verify_fn"]) == []
+    assert _reverify_calls(kwargs["effects"].verify_fn) == []
     section = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Dispositions")
     assert any("fused-memory down" in line and not line.startswith("|") for line in section.splitlines())
     assert "last_census_done_count" not in json.loads(
@@ -9848,9 +9876,9 @@ def _cancelled_kwargs(
     if keyed:
         entry_fields.update(_LINKED_IDENTITY.to_fields())
     kwargs = _outcome_kwargs(tmp_path, "gone", statuses={str(_LINKED_TASK): "cancelled"}, **entry_fields)
-    kwargs["task_store"] = _cancelled_store(
+    _override(kwargs, task_store=_cancelled_store(
         acceptance_reason=acceptance_reason, keyed=keyed, resolve_outcomes=resolve_outcomes,
-    )
+    ))
     return kwargs
 
 
@@ -9868,8 +9896,8 @@ def test_run_census_accepts_an_entry_whose_task_was_cancelled_with_a_reason(tmp_
     assert codebook.validate(persisted) == []
     entry = _persisted_entry_a(kwargs)
     assert (entry["status"], entry["accepted_by"]) == ("accepted", _LINKED_TASK)
-    assert _reverify_calls(kwargs["verify_fn"]) == []
-    assert kwargs["submit_fn"].calls == []
+    assert _reverify_calls(kwargs["effects"].verify_fn) == []
+    assert kwargs["effects"].submit_fn.calls == []
     [row] = _run_record(kwargs)["dispositions"]["rows"]
     assert (row["task_id"], row["task_status"], row["outcome"]) == (_LINKED_TASK, "cancelled", "accepted")
     [table_row] = _dispositions_table(kwargs)
@@ -9878,7 +9906,7 @@ def test_run_census_accepts_an_entry_whose_task_was_cancelled_with_a_reason(tmp_
 
 def test_run_census_reopens_an_accepted_entry_whose_task_was_cancelled_without_a_reason(tmp_path):
     kwargs = _cancelled_kwargs(tmp_path, acceptance_reason=None, status="accepted", accepted_by=_LINKED_TASK)
-    kwargs["batch_source"] = []
+    _override(kwargs, batch_source=[])
 
     outcome = mod.run_census(**kwargs)
 
@@ -9886,7 +9914,7 @@ def test_run_census_reopens_an_accepted_entry_whose_task_was_cancelled_without_a
     entry = _persisted_entry_a(kwargs)
     assert entry["status"] == "open"
     assert "accepted_by" not in entry
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     record = _run_record(kwargs)["dispositions"]
     assert record["refiled"] == []
     assert record["changes"] == [{
@@ -9903,11 +9931,11 @@ def test_run_census_refiles_an_abandoned_entry_when_it_recurs(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert disposition.SUPERSEDES_TASK_METADATA not in payload["metadata"]
     assert payload["metadata"][disposition.FINDING_KEY_METADATA] == _LINKED_IDENTITY.key
     assert payload["title"] == disposition.task_title("Some confusion cluster")
-    store = kwargs["task_store"]
+    store = kwargs["effects"].task_store
     assert {"key": disposition.FINDING_KEY_METADATA, "value": _LINKED_IDENTITY.key} in [
         {"key": call["key"], "value": call["value"]} for call in store.arguments_of("find_tasks_by_metadata")
     ]
@@ -9991,7 +10019,7 @@ def _rows_by_task(kwargs) -> dict[int | None, dict]:
 
 def test_run_census_neither_reverifies_nor_refiles_while_its_refiled_ticket_awaits_the_curator(tmp_path):
     first = _outcome_kwargs(tmp_path, "present")
-    first["task_store"] = FakeTaskStore(resolve_outcomes=_undecided("tkt_1"))
+    _override(first, task_store=FakeTaskStore(resolve_outcomes=_undecided("tkt_1")))
     mod.run_census(**first)
     first_rows = _persisted_entry_a(first)["filed_tickets"]
     assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", None)]
@@ -10007,8 +10035,8 @@ def test_run_census_neither_reverifies_nor_refiles_while_its_refiled_ticket_awai
     outcome = mod.run_census(**second)
 
     assert outcome.status == "done"
-    assert _reverify_calls(second["verify_fn"]) == []
-    assert second["submit_fn"].calls == []
+    assert _reverify_calls(second["effects"].verify_fn) == []
+    assert second["effects"].submit_fn.calls == []
     entry = _persisted_entry_a(second)
     assert entry["filed_tickets"] == first_rows
     assert (entry["status"], "fixed_at_sha" in entry) == ("open", False)
@@ -10027,7 +10055,7 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_while_its_ticket
             tmp_path, acceptance_reason=None, keyed=True, status="accepted", accepted_by=_LINKED_TASK,
             resolve_outcomes=_undecided("tkt_1"),
         )
-        kwargs.update(overrides)
+        _override(kwargs, **overrides)
         return kwargs
 
     first = abandoned_run()
@@ -10040,7 +10068,7 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_while_its_ticket
     outcome = mod.run_census(**second)
 
     assert outcome.status == "done"
-    assert second["submit_fn"].calls == []
+    assert second["effects"].submit_fn.calls == []
     assert _run_record(second)["dispositions"]["refiled"] == []
     assert _persisted_entry_a(second)["filed_tickets"] == first_rows
 
@@ -10059,7 +10087,7 @@ def test_run_census_files_no_second_ticket_for_a_recurrence_whose_entry_awaits_t
     outcome = mod.run_census(**kwargs)
 
     assert outcome.filed_ticket_ids == []
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     entries = {entry["id"]: entry for entry in codebook.load(kwargs["codebook_path"])["entries"]}
     assert entries["entry-spurious"]["filed_tickets"] == [pending_row]
     [row] = _filed_rows(kwargs)
@@ -10088,8 +10116,8 @@ def _later_outcome_run(tmp_path, first, answer: str, store: FakeTaskStore) -> di
 def test_run_census_reverifies_a_present_structural_finding_once_per_done_task(tmp_path):
     first = _outcome_kwargs(tmp_path, "structural")
     mod.run_census(**first)
-    assert len(_reverify_calls(first["verify_fn"])) == 1
-    assert first["submit_fn"].calls == []
+    assert len(_reverify_calls(first["effects"].verify_fn)) == 1
+    assert first["effects"].submit_fn.calls == []
     [first_row] = _run_record(first)["dispositions"]["rows"]
     assert first_row["outcome"] == "present-structural"
     follow_up = _persisted_entry_a(first)[disposition.FOLLOW_UP]
@@ -10101,8 +10129,8 @@ def test_run_census_reverifies_a_present_structural_finding_once_per_done_task(t
     outcome = mod.run_census(**second)
 
     assert outcome.status == "done"
-    assert _reverify_calls(second["verify_fn"]) == []
-    assert second["submit_fn"].calls == []
+    assert _reverify_calls(second["effects"].verify_fn) == []
+    assert second["effects"].submit_fn.calls == []
     dispositions = _run_record(second)["dispositions"]
     assert (dispositions["reverify"]["due"], dispositions["reverify"]["offered"]) == (0, 0)
     [row] = dispositions["rows"]
@@ -10114,9 +10142,9 @@ def test_run_census_reverifies_a_present_structural_finding_once_per_done_task(t
 
 def test_run_census_files_nothing_after_the_curator_refused_its_superseding_refiling(tmp_path):
     first = _outcome_kwargs(tmp_path, "present")
-    first["task_store"] = FakeTaskStore(resolve_outcomes=_REFUSED)
+    _override(first, task_store=FakeTaskStore(resolve_outcomes=_REFUSED))
     mod.run_census(**first)
-    [payload] = first["submit_fn"].calls
+    [payload] = first["effects"].submit_fn.calls
     assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
     first_rows = _persisted_entry_a(first)["filed_tickets"]
     assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", "refused")]
@@ -10125,8 +10153,8 @@ def test_run_census_files_nothing_after_the_curator_refused_its_superseding_refi
     outcome = mod.run_census(**second)
 
     assert outcome.status == "done"
-    assert _reverify_calls(second["verify_fn"]) == []
-    assert second["submit_fn"].calls == []
+    assert _reverify_calls(second["effects"].verify_fn) == []
+    assert second["effects"].submit_fn.calls == []
     assert _persisted_entry_a(second)["filed_tickets"] == first_rows
     rows = _rows_by_task(second)
     assert rows[_LINKED_TASK]["outcome"] == "answered"
@@ -10136,15 +10164,15 @@ def test_run_census_files_nothing_after_the_curator_refused_its_superseding_refi
 
 def test_run_census_refiles_again_after_its_superseding_ticket_reached_no_curator(tmp_path):
     first = _outcome_kwargs(tmp_path, "present")
-    first["submit_fn"] = _make_rejecting_submit_fn()
+    _override(first, submit_fn=_make_rejecting_submit_fn())
     mod.run_census(**first)
     assert disposition.FOLLOW_UP not in _persisted_entry_a(first)
     second = _later_outcome_run(tmp_path, first, "present", FakeTaskStore())
 
     mod.run_census(**second)
 
-    assert len(_reverify_calls(second["verify_fn"])) == 1
-    [payload] = second["submit_fn"].calls
+    assert len(_reverify_calls(second["effects"].verify_fn)) == 1
+    [payload] = second["effects"].submit_fn.calls
     assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
 
 
@@ -10154,12 +10182,12 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_the_curator_refu
             tmp_path, acceptance_reason=None, keyed=True, status="accepted", accepted_by=_LINKED_TASK,
             resolve_outcomes=_REFUSED,
         )
-        kwargs.update(overrides)
+        _override(kwargs, **overrides)
         return kwargs
 
     first = abandoned_run()
     mod.run_census(**first)
-    assert len(first["submit_fn"].calls) == 1
+    assert len(first["effects"].submit_fn.calls) == 1
     first_rows = _persisted_entry_a(first)["filed_tickets"]
     assert [(row["ticket"], row["resolution"]) for row in first_rows] == [(None, "created"), ("tkt_1", "refused")]
     second = abandoned_run(**_next_run(first))
@@ -10167,7 +10195,7 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_the_curator_refu
     outcome = mod.run_census(**second)
 
     assert outcome.status == "done"
-    assert second["submit_fn"].calls == []
+    assert second["effects"].submit_fn.calls == []
     assert _run_record(second)["dispositions"]["refiled"] == []
     assert _rows_by_task(second)[_LINKED_TASK]["outcome"] == "answered"
     assert _persisted_entry_a(second)["filed_tickets"] == first_rows
@@ -10186,7 +10214,7 @@ def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tm
     outcome = mod.run_census(**kwargs)
 
     assert outcome.released_entry_ids == ("entry-a",)
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"][disposition.SUPERSEDES_TASK_METADATA] == _LINKED_TASK
     assert str(_LINKED_TASK) in payload["title"].removeprefix(disposition.task_title("Some confusion cluster"))
     assert _IN_TREE_REMEDIATION["path"] in payload["description"]
@@ -10434,7 +10462,7 @@ def test_a_verdict_at_a_keyed_entrys_anchor_attaches_to_it_under_the_standing_ke
     confirmed = [row for row in record["findings"] if row["verdict"] == "confirmed"]
     assert [(row["id"], row["key"]) for row in confirmed] == [(_STANDING_ENTRY_ID, _ROW5_KEY)]
 
-    filed_keys = [call["metadata"]["x_finding_key"] for call in kwargs["submit_fn"].calls]
+    filed_keys = [call["metadata"]["x_finding_key"] for call in kwargs["effects"].submit_fn.calls]
     linked_keys = [row["finding_key"] for row in standing.get("filed_tickets") or []]
     assert filed_keys + linked_keys, "the attached cluster was filed or linked"
     assert set(filed_keys + linked_keys) == {_ROW5_KEY}
@@ -10470,7 +10498,7 @@ def test_within_run_twins_at_one_anchor_promote_one_entry(tmp_path):
     record = _run_record(kwargs)
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [entry["id"]]
-    assert len(kwargs["submit_fn"].calls) == 1
+    assert len(kwargs["effects"].submit_fn.calls) == 1
 
 
 def test_a_verdict_at_only_a_fixed_entrys_anchor_is_promoted_afresh_and_surfaced(tmp_path):
@@ -10500,7 +10528,7 @@ def test_a_verdict_at_only_a_fixed_entrys_anchor_is_promoted_afresh_and_surfaced
         if "surfaced by key" in line and _STANDING_ENTRY_ID in line and _PROMOTED_TITLE in line
     ]
     assert [row["id"] for row in record["findings"] if row["verdict"] == "confirmed"] == [fresh["id"]]
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
 
 
@@ -10568,7 +10596,7 @@ def test_a_held_back_verdict_that_attaches_by_key_is_reported_withheld(tmp_path)
     ]
     recorded = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Recorded, Not Filed")
     assert _TWIN_TITLE in recorded
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
 
 
 def test_a_key_attach_that_raises_a_withheld_entry_to_two_sightings_files_and_releases_it(tmp_path):
@@ -10591,7 +10619,7 @@ def test_a_key_attach_that_raises_a_withheld_entry_to_two_sightings_files_and_re
     assert record["method"]["extra"]["screened"]["key"] == 1
     assert record["withheld"] == []
     assert len(record["filing"]["decisions"]) == 1, "one filing for the entry, not one per cluster on it"
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
 
 
@@ -10643,7 +10671,7 @@ def test_a_promotion_at_an_externally_keyed_location_is_re_observed_under_that_k
     assert record["method"]["inputs_consumed"] == [_REVIEW_ALL_RUN]
     screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
     assert [line for line in screened.splitlines() if _PROMOTED_TITLE in line and _REVIEW_ALL_RUN in line]
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _EXTERNAL_KEY
 
 
@@ -10738,7 +10766,7 @@ def test_a_backlog_candidate_near_an_open_entry_is_attached_by_similarity(tmp_pa
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert _offered_titles(kwargs["verify_fn"]) in ([], [[]])
+    assert _offered_titles(kwargs["effects"].verify_fn) in ([], [[]])
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     candidate = _persisted_record(kwargs, "cand-20260701-1")
@@ -10770,7 +10798,7 @@ def test_a_novel_cluster_near_an_entry_is_screened_and_its_candidate_attached(tm
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert _offered_titles(kwargs["verify_fn"]) in ([], [[]])
+    assert _offered_titles(kwargs["effects"].verify_fn) in ([], [[]])
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
     [candidate] = [c for c in persisted["candidates"] if c["title"] == "Silent no-op subagent contract"]
@@ -10825,11 +10853,11 @@ def test_a_surfaced_cluster_near_an_open_entry_is_still_verified(tmp_path, promo
         tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, _NOVEL_TEXT: _NEAR}, codebook_dict=cb,
         batch=[_hand_digest("novel-verified", "a genuinely new confusion shape")],
     )
-    kwargs["verify_fn"] = _make_fake_verify_fn(rejected_titles={_L6_NOVEL_TITLE})
+    _override(kwargs, verify_fn=_make_fake_verify_fn(rejected_titles={_L6_NOVEL_TITLE}))
 
     assert mod.run_census(**kwargs).status == "done"
 
-    assert _offered_titles(kwargs["verify_fn"])[0] == [_L6_NOVEL_TITLE]
+    assert _offered_titles(kwargs["effects"].verify_fn)[0] == [_L6_NOVEL_TITLE]
     assert _run_record(kwargs)["adjudication"]["attached"] == []
     screened = _report_section(kwargs["report_path"].read_text(encoding="utf-8"), "Screened")
     assert [line for line in screened.splitlines() if "surfaced" in line and "entry-fixed" in line]
@@ -10907,7 +10935,7 @@ def _queue_kwargs(tmp_path, *, verify_fn, cb=None, batch=None, **overrides):
     _write_briefing(tmp_path)
     chosen = {**dict(zip(_PAIR_A, _close_pair(0), strict=True)), **dict(zip(_PAIR_B, _close_pair(3), strict=True))}
     kwargs, _ = _similarity_kwargs(tmp_path, chosen, codebook_dict=cb or _queue_codebook(), batch=batch)
-    kwargs.update(verify_fn=verify_fn, **overrides)
+    _override(kwargs, verify_fn=verify_fn, **overrides)
     return kwargs
 
 
@@ -10956,7 +10984,7 @@ def test_the_queue_offers_its_ranked_capped_clusters_and_a_verified_representati
 
     record = _run_record(kwargs)
     assert record["withheld"] == []
-    [payload] = kwargs["submit_fn"].calls
+    [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
     assert record["method"]["cost"]["verify_calls"] == 10
     assert record["method"]["extra"]["adjudicated"] == 11
@@ -11035,7 +11063,7 @@ def test_a_queue_with_no_novel_cluster_is_gated_on_headroom_before_its_verify_ca
     assert not kwargs["report_path"].exists()
     assert not kwargs["codebook_path"].exists()
     assert not kwargs["census_state_path"].exists()
-    [escalation] = kwargs["escalate_fn"].calls
+    [escalation] = kwargs["effects"].escalate_fn.calls
     assert "verify" in escalation["summary"]
 
 
@@ -11045,7 +11073,7 @@ def test_a_queue_whose_every_representative_is_rejected_is_flagged_and_escalated
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    [escalation] = kwargs["escalate_fn"].calls
+    [escalation] = kwargs["effects"].escalate_fn.calls
     assert escalation["level"] == logging.WARNING
     assert "systemic" in escalation["detail"].lower()
     assert "queue" in escalation["summary"] and "rejected" in escalation["summary"]
@@ -11063,7 +11091,7 @@ def test_a_queue_with_a_verified_representative_is_not_flagged(tmp_path):
     assert mod.run_census(**kwargs).status == "done"
 
     assert _run_record(kwargs)["adjudication"]["mass_rejection"] is None
-    assert kwargs["escalate_fn"].calls == []
+    assert kwargs["effects"].escalate_fn.calls == []
 
 
 # Row 12 part 3: when the embedding endpoint or the vector cache fails, the
@@ -11081,15 +11109,15 @@ def _stage_skipped_kwargs(tmp_path, **overrides):
     kwargs, _ = _similarity_kwargs(
         tmp_path, {_ENTRY_A_TEXT: _ENTRY_AXIS, "Near entry a": _NEAR}, codebook_dict=cb, batch=_novel_batch(),
     )
-    kwargs.update(verify_fn=_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE}), **overrides)
+    _override(kwargs, verify_fn=_make_fake_verify_fn(verified_titles={_L6_NOVEL_TITLE}), **overrides)
     return kwargs
 
 
 def _assert_the_stage_was_skipped(kwargs, reason: str) -> None:
-    [escalation] = kwargs["escalate_fn"].calls
+    [escalation] = kwargs["effects"].escalate_fn.calls
     assert escalation["level"] == logging.WARNING
     assert "similarity stage" in escalation["summary"] and reason in escalation["summary"]
-    assert _offered_titles(kwargs["verify_fn"])[0] == [_L6_NOVEL_TITLE]
+    assert _offered_titles(kwargs["effects"].verify_fn)[0] == [_L6_NOVEL_TITLE]
 
     persisted = codebook.load(kwargs["codebook_path"])
     assert codebook.validate(persisted) == []
@@ -11117,7 +11145,7 @@ def test_an_unreachable_embedding_endpoint_skips_the_stage_with_one_escalation(t
 
 def test_an_unreadable_vector_cache_skips_the_stage_with_one_escalation_naming_it(tmp_path):
     kwargs = _stage_skipped_kwargs(tmp_path)
-    cache = kwargs["embedder"].cache_path
+    cache = kwargs["effects"].embedder.cache_path
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_bytes(b"not a sqlite database at all, just bytes" * 64)
 
@@ -11148,7 +11176,7 @@ def _synthesis_kwargs(root, *, synthesize_fn, escalate_fn=None, **overrides):
         commit=_make_fake_commit(),
         embedder=embeddings.Embedder(embed_fn=_nothing_similar_embed, cache_path=root / "vectors.sqlite"),
     )
-    kwargs.update(overrides)
+    _override(kwargs, **overrides)
     return kwargs
 
 
@@ -11521,7 +11549,7 @@ def test_a_surfaced_cluster_absorbed_into_a_queued_pending_candidate_is_verified
         batch=[_hand_digest("surfaced-twin", "the fixed shape is back")],
     )
     verify_fn = _make_fake_verify_fn(verified_titles={_SURFACED_PENDING, _QUEUE_NEIGHBOUR})
-    kwargs.update(invoke=_make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
+    _override(kwargs, invoke=_make_fake_invoke(_surfaced_pending_response), verify_fn=verify_fn)
 
     outcome = mod.run_census(**kwargs)
 
@@ -11620,7 +11648,7 @@ def test_screened_novel_candidates_attach_in_mining_order(tmp_path):
         },
         batch=[_hand_digest("many-near", "six shapes near entry a")],
     )
-    kwargs["invoke"] = _make_fake_invoke(_near_entry_a_response)
+    _override(kwargs, invoke=_make_fake_invoke(_near_entry_a_response))
 
     outcome = mod.run_census(**kwargs)
 
@@ -11738,7 +11766,7 @@ def test_a_same_title_rejected_twins_session_does_not_file_a_fresh_singleton(tmp
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     promoted = _persisted_record(kwargs, "cand-20260701-1")
     assert promoted["disposition"] == "promoted"
     entry = _persisted_record(kwargs, promoted["promoted_to"])
@@ -11755,6 +11783,6 @@ def test_a_same_title_rejected_twins_session_does_not_release_a_withheld_entry(t
 
     assert outcome.status == "done"
     assert outcome.released_entry_ids == ()
-    assert kwargs["submit_fn"].calls == []
+    assert kwargs["effects"].submit_fn.calls == []
     withheld = _persisted_record(kwargs, "entry-withheld")
     assert withheld[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
