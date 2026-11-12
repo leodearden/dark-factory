@@ -10,10 +10,12 @@ sys.path pollution — the same ``_load_module()`` helper as
 test_memory_eval_transcript_corpus.py / test_memory_eval_retrieval_probe.py.
 
 Every test here runs against in-memory record lists or a hand-written store
-double, EXCEPT the single ``@pytest.mark.integration`` smoke, which issues one
-``GRAPH.RO_QUERY`` against the live graph. Nothing here ever writes: the store
-double's tripwires enforce it offline, and ``GRAPH.RO_QUERY`` enforces it
-server-side on the live path.
+double, EXCEPT the single ``@pytest.mark.integration`` smoke, which seeds and
+deletes a throwaway graph on the scratch FalkorDB and reads it with one
+``GRAPH.RO_QUERY``. The builder's read path never writes: the store double's
+tripwires enforce it offline, and ``GRAPH.RO_QUERY`` enforces it server-side on
+the live path. Only that smoke's own seeding and teardown write, and only to
+its throwaway scratch graph.
 """
 
 from __future__ import annotations
@@ -182,9 +184,10 @@ class TestPayloadKind:
     def test_unrecognised_bracket_tag_stays_a_caller_string(self):
         """The stripped annotation set is closed: an unknown tag is not guessed away.
 
-        A new writer annotation therefore lands in ``add_episode`` and turns the
-        live smoke's payload-axis equality red, rather than being silently
-        absorbed into a category stratum.
+        A new writer annotation therefore lands in ``add_episode``, which is
+        outside ``build_corpus.KNOWN_PAYLOAD_KINDS``, so the next corpus build
+        refuses rather than silently absorbing it into a category stratum:
+        ``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestBuildRefusesAnUndeclaredPayloadKind``.
         """
         assert _mod.payload_kind('[some_future_tag] add_memory:temporal_facts') == (
             'add_episode'
@@ -203,7 +206,8 @@ class TestPayloadKind:
         literal pins here and in test_unverified_claim_tag_propagation.py could
         both be respelled while still agreeing with themselves. Classifying the
         description the writer actually hands graphiti_core makes a respelling
-        fail in the change that makes it, not later on the live smoke.
+        fail in the change that makes it, not later when the next corpus build
+        refuses the ``add_episode`` kind it would land in.
         """
         from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
 
@@ -2379,6 +2383,85 @@ class TestCliBuildMode:
         assert capsys.readouterr().err.strip()
 
 
+FUTURE_WRITER_ANNOTATION = '[some_future_tag] add_memory:temporal_facts'
+
+
+class TestBuildRefusesAnUndeclaredPayloadKind:
+    """The payload axis is closed: a build over an undeclared kind exits 1.
+
+    A new kind adds a row to the cross-tab and moves every stratum
+    denominator, so the next corpus must wait for a re-measured census rather
+    than be silently re-stratified around it.
+    """
+
+    def _rows_with(self, source_description: str) -> list[list[object]]:
+        extra = dataclasses.replace(
+            _record('ffffffff-7792-0000-0000-000000000000'),
+            source_description=source_description,
+        )
+        return _cli_rows([*_population(SYNTHETIC_CELLS), extra])
+
+    def _errors(self, capsys) -> tuple[list[str], str]:
+        captured = capsys.readouterr()
+        errors = [line for line in captured.err.splitlines() if line.startswith('error: ')]
+        return errors, captured.out
+
+    def test_a_new_writer_annotation_is_refused_and_nothing_is_written(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'm.json'
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out),
+            rows=self._rows_with(FUTURE_WRITER_ANNOTATION),
+        )
+        errors, _ = self._errors(capsys)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert len(errors) == 1, errors
+        assert 'add_episode' in errors[0]
+        assert FUTURE_WRITER_ANNOTATION in errors[0]
+        assert not out.exists()
+
+    def test_a_dry_run_is_refused_before_any_report_is_printed(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(tmp_path / 'm.json'),
+            '--dry-run', rows=self._rows_with(FUTURE_WRITER_ANNOTATION),
+        )
+        _, printed = self._errors(capsys)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'LME replay corpus' not in printed
+
+    def test_a_caller_supplied_add_episode_description_is_refused(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """``add_episode`` is outside the declared census on purpose.
+
+        An unrecognised writer annotation buckets there, so declaring it would
+        blind the check to exactly the regression it exists for.
+        """
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(tmp_path / 'm.json'),
+            rows=self._rows_with('interactive session recap'),
+        )
+        errors, _ = self._errors(capsys)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert len(errors) == 1, errors
+        assert 'add_episode' in errors[0]
+
+    def test_a_population_holding_a_subset_of_the_declared_kinds_builds(
+        self, monkeypatch, tmp_path
+    ):
+        """Subset, not equality: a kind that vanishes does not open the axis."""
+        out = tmp_path / 'm.json'
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out),
+            rows=_cli_rows(_population({('2026-05', 'temporal_facts'): 30})),
+        )
+        assert code == 0
+        assert out.exists()
+
+
 class TestCliDryRun:
     """`--dry-run` reports and writes nothing."""
 
@@ -3528,9 +3611,11 @@ def test_live_population_read_smoke(monkeypatch):
     ``build_indices_and_constraints()``, which would create indices on the
     graph it reads; docs/prds/falkordb-index-provisioning.md).
 
-    The real population's facts (its size, month span, window start and
-    payload axis) are the operator's ``build_corpus.py --verify`` against
-    production, where the corpus lives; tests never read production.
+    Tests never read production, where the corpus lives. The payload axis's
+    closure is enforced by the build refusing an undeclared kind
+    (``TestBuildRefusesAnUndeclaredPayloadKind``). The real population's size,
+    month span and window start are printed in the build's report
+    (``build_corpus.render_report``), and no automated check asserts them.
     """
     from graphiti_core.driver import falkordb_driver  # noqa: PLC0415
 
