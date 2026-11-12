@@ -534,8 +534,7 @@ class TestMechanicalGateSpot:
         """DERIVED, not re-listed: the detector's set must be the imported
         frozenset minus its one named exclusion, so a member added in
         escalation/src/escalation/authority.py propagates here instead of
-        drifting. A hand-written literal fails this even if it happens to agree
-        today."""
+        drifting."""
         excluded = {_DESIGN_CONCERN}
         assert L2_AUTO_CLOSE_DENY_CATEGORIES - excluded == GATED_CATEGORIES
 
@@ -1385,14 +1384,16 @@ class TestPolicyTableLockstep:
             'together with _PROXY_MEASURED_ROWS'
         )
 
-    def test_done_flip_is_a_reversible_action(self):
-        """PRD §3 decision 7: done_flip is waived reversible (Leo, 2026-11-04)."""
+    def test_done_flip_is_stampable_under_its_waiver(self):
+        """PRD §3 decision 7: done_flip is stampable, not reversible, under the
+        2026-11-04 waiver (Leo)."""
         assert 'done_flip' in REVERSIBLE_ACTIONS
 
-    def test_reversible_actions_derive_from_the_policy_tables_vocabulary(self):
-        """DERIVED, not re-listed, like TestMechanicalGateSpot: the codec and
-        PolicyRow.reversible must read one list, so a hand-written literal
-        fails this even when it happens to agree today."""
+    def test_reversible_actions_agree_with_the_policy_tables_vocabulary(self):
+        """A lockstep pin: the codec and PolicyRow.reversible must read one list.
+        Production derives REVERSIBLE_ACTIONS from authority's two sets; this
+        catches the two drifting apart, and cannot tell that derivation from a
+        literal that happens to agree."""
         derived = frozenset(
             action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
         )
@@ -1402,16 +1403,6 @@ class TestPolicyTableLockstep:
         """Sitting item 522 (Leo, 2026-11-09) declined to waive abandon, so a
         second waiver must arrive by ruling, not silently."""
         assert {PolicyAction.DONE_FLIP} == REVERSIBILITY_WAIVED_ACTIONS
-
-    def test_a_reversible_row_proposes_only_stampable_acts(self):
-        for row in POLICY_TABLE:
-            if not row.reversible:
-                continue
-            assert {action.value for action in row.actions} <= REVERSIBLE_ACTIONS, row.policy_class
-            assert REVERSIBILITY_WAIVED_ACTIONS.isdisjoint(row.actions), row.policy_class
-
-    def test_every_stampable_proposal_is_a_policy_table_action(self):
-        assert frozenset({action.value for action in PolicyAction}) >= REVERSIBLE_ACTIONS
 
     def test_a_landing_provenance_done_flip_stamp_round_trips(self):
         """The codec half of boundary row 2."""

@@ -41,6 +41,8 @@ from escalation.authority import (
     POLICY_TABLE,
     PROMOTE_ALLOWED,
     PROMOTE_SENTINEL_BOUND_ROLES,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
     ROLE_LEVEL_ALLOWLIST,
     ClassSwitch,
     IllegalClassTransition,
@@ -750,6 +752,12 @@ class TestPolicyRowInvariants:
             row = _row(actions=frozenset({irreversible, PolicyAction.CLOSE_ONLY}))
             assert row.reversible is False, irreversible
 
+    def test_no_act_is_both_reversible_and_waived(self) -> None:
+        """A waiver makes an act stampable, not reversible; an act in both sets
+        would make every row allowing it read reversible."""
+        overlap = REVERSIBLE_POLICY_ACTIONS & REVERSIBILITY_WAIVED_ACTIONS
+        assert not overlap, sorted(map(str, overlap))
+
     def test_audit_full_until_is_20_for_file_writing_or_recover_main(self) -> None:
         assert _row().audit_full_until == 0
         assert _row(file_writing=True).audit_full_until == 20
@@ -872,15 +880,6 @@ class TestPolicyTableRows:
         for category in ('task_failure', 'infra_issue', 'provenance_unattributed'):
             assert row.match.matches(category, 'some-agent')
         assert row.evidence_present(self._FOUND_ON_MAIN)
-
-    @pytest.mark.parametrize(
-        'slug',
-        ('red_main_recovery', 'b3_low_risk_unblock', 'dead_letter_replayed', 'verify_host_reprobed'),
-    )
-    def test_rows_with_an_irreversible_deciding_act_are_not_reversible(self, slug: str) -> None:
-        row = policy_row(slug)
-        assert row is not None
-        assert row.reversible is False
 
     @pytest.mark.parametrize('slug', ('red_main_recovery', 'b3_low_risk_unblock'))
     def test_file_writing_rows_are_fully_audited(self, slug: str) -> None:
