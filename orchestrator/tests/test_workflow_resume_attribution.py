@@ -287,10 +287,11 @@ class _ResumeRecordingBriefing(FakeBriefing):
 
     async def build_resume_prompt(
         self, task: dict, plan: dict, escalation_summary: str, resolution: str, worktree=None,
+        *, scope_drift=None,
     ) -> str:
         self.resume_calls.append((escalation_summary, resolution))
         return await super().build_resume_prompt(
-            task, plan, escalation_summary, resolution, worktree,
+            task, plan, escalation_summary, resolution, worktree, scope_drift=scope_drift,
         )
 
 

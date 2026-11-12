@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -677,6 +678,8 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'ready_to_merge.json': ArtifactRoot.LANE,
     'false_premise.json': ArtifactRoot.LANE,
     'unactionable_task.json': ArtifactRoot.LANE,
+    'scope_requests.json': ArtifactRoot.LANE,
+    'scope_drift_brief.json': ArtifactRoot.TASK,
     'plan.json': ArtifactRoot.TASK,
     'plan.lock': ArtifactRoot.TASK,
     'iterations.jsonl': ArtifactRoot.TASK,
@@ -979,15 +982,25 @@ class TaskArtifacts:
         workflow in the orchestrator stalls. Keep critical sections short, and
         never hold one across a subprocess the plan does not depend on.
         """
-        lock_path = self._plan_mutex_path()
+        with self._artifact_mutex('plan.json'):
+            yield
+
+    @contextmanager
+    def _artifact_mutex(self, name: str) -> Iterator[None]:
+        """The cross-process lock for a read-modify-write of artifact *name*.
+
+        The policy :meth:`plan_mutex` documents, for any artifact: keyed on
+        the RESOLVED path, and no lock once the root is gone.
+        """
+        lock_path = self._artifact_mutex_path(name)
         if lock_path is None:
             yield
             return
         with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
             yield
 
-    def _plan_mutex_path(self) -> Path | None:
-        lock_path = Path(os.path.realpath(self.artifact_path('plan.json'))).with_name('plan.json.mutex')
+    def _artifact_mutex_path(self, name: str) -> Path | None:
+        lock_path = Path(os.path.realpath(self.artifact_path(name))).with_name(f'{name}.mutex')
         return lock_path if lock_path.parent.is_dir() else None
 
     def write_plan_model(self, plan: Plan, *, mutex_held: bool = False) -> Plan:
@@ -1002,7 +1015,7 @@ class TaskArtifacts:
         """
         written = _at_current_schema(plan)
         with nullcontext() if mutex_held else self.plan_mutex():
-            lock_path = self._plan_mutex_path()
+            lock_path = self._artifact_mutex_path('plan.json')
             if lock_path is not None and not file_mutex.held(lock_path):
                 raise PlanMutexNotHeld(
                     f'{self.artifact_path("plan.json")} reached its write without {lock_path} held: '
@@ -1076,6 +1089,76 @@ class TaskArtifacts:
         subsequent architect invocation does not see a stale report.
         """
         self._clear_path('blocking_dependency.json')
+
+    def write_scope_request(self, request: ScopeRequest) -> int:
+        """Record a writer agent's request to add an existing file to its scope.
+
+        One entry per path: a repeat replaces the earlier entry and moves to
+        the end. Returns how many requests are now pending. The plan-tools
+        server runs concurrent tool calls on threads, so the read-modify-write
+        holds its :meth:`_artifact_mutex`. The workflow applies and removes
+        them at each writer boundary
+        (``workflow.py::TaskWorkflow._apply_scope_requests``).
+        """
+        with self._artifact_mutex('scope_requests.json'):
+            kept = [r for r in self.read_scope_requests() if r.path != request.path]
+            entries = [r.to_mapping() for r in (*kept, request)]
+            self._write_json('scope_requests.json', {'requests': entries})
+            return len(entries)
+
+    def read_scope_requests(self) -> tuple[ScopeRequest, ...]:
+        """The recorded scope requests in write order; each invalid entry is dropped with a warning."""
+        data = self._read_json_object('scope_requests.json') or {}
+        entries = data.get('requests', [])
+        if not isinstance(entries, list):
+            logger.warning('Malformed scope_requests.json: requests is %r', entries)
+            return ()
+        requests: list[ScopeRequest] = []
+        for entry in entries:
+            try:
+                requests.append(ScopeRequest.from_mapping(entry))
+            except InvalidScopeRequest as exc:
+                logger.warning('Dropping scope request %r from scope_requests.json: %s', entry, exc)
+        return tuple(requests)
+
+    def clear_scope_requests(self, applied: Iterable[ScopeRequest]) -> None:
+        """Remove the *applied* requests, keeping any filed since they were read.
+
+        The artifact goes once nothing is left in it.
+        """
+        done = set(applied)
+        with self._artifact_mutex('scope_requests.json'):
+            remaining = [r for r in self.read_scope_requests() if r not in done]
+            if remaining:
+                self._write_json(
+                    'scope_requests.json', {'requests': [r.to_mapping() for r in remaining]},
+                )
+            else:
+                self._clear_path('scope_requests.json')
+
+    def read_scope_drift_brief(self) -> ScopeDriftReport | None:
+        """The scope-drift report no writer session has received yet, or None.
+
+        TASK-rooted, so a brief outlives the dispatch that recorded it: a
+        requeue or restart before the next writer session still briefs it.
+        Only the workflow writes it, and reads it once per dispatch
+        (``workflow.py::TaskWorkflow._hold_scope_drift_brief``). A malformed
+        file reads as None with a warning.
+        """
+        data = self._read_json_object('scope_drift_brief.json')
+        if data is None:
+            return None
+        try:
+            return ScopeDriftReport.from_event_data(data)
+        except ValueError as exc:
+            logger.warning('Ignoring malformed scope_drift_brief.json: %s', exc)
+            return None
+
+    def write_scope_drift_brief(self, report: ScopeDriftReport) -> None:
+        self._write_json('scope_drift_brief.json', report.event_data())
+
+    def clear_scope_drift_brief(self) -> None:
+        self._clear_path('scope_drift_brief.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)

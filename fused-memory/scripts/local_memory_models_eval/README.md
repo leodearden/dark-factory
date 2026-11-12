@@ -155,11 +155,20 @@ record of what that pipeline produced, so it is the exact outcome proxy that
 must stay untouched. The guarantee is mechanized three ways, each tested in
 `fused-memory/tests/test_local_memory_models_eval_corpus.py`:
 
-1. **The projection cannot see it.** The single query is
-   `MATCH (e:Episodic) RETURN e.uuid, e.name, e.group_id, e.source_description,
-   e.created_at, e.content` — built from the `PROJECTED_FIELDS` constant, with
-   no `WHERE`, no `LIMIT`, and no `entity_edges`. Tests assert the RETURN list
-   by equality and assert the absence of a filter clause directly.
+1. **The projection cannot see it.** The builder reads the population through
+   `build_corpus.py::POPULATION_READ`, built from the `PROJECTED_FIELDS`
+   constant, with no `WHERE` and no `entity_edges`. The population is read
+   whole: FalkorDB truncates every answer silently at its result-set cap
+   (`fused_memory/backends/paged_read.py::RESULTSET_SIZE`), so the read is
+   paged in `e.uuid` order and checked against a `count(e)` census. The
+   `LIMIT` each page carries is the page size, not a filter. The build exits
+   1 on a short read, a missing census or the page cap, and on any row count
+   that differs from the census, which catches any single write during the
+   read. The check is on the count, not on which rows came back: two writes
+   that offset each other mid-read leave the count equal and are not
+   caught. Tests assert the
+   projected field set by equality and assert the absence of a filter clause
+   directly.
 2. **The record cannot hold it.** `EpisodeRecord` has no outcome field, so no
    sampling rule *can* condition on one. A test pins the field set exactly.
 3. **The sampler has nowhere to hide it.** Every input episode leaves
@@ -179,7 +188,8 @@ guarantee.
 
 ## Read-only, and no graphiti driver
 
-The builder issues exactly one `GRAPH.RO_QUERY`. Read-only here is
+The builder issues only `GRAPH.RO_QUERY` reads: a `count(e)` census plus
+uuid-ordered pages. Read-only here is
 **server-enforced**, not a client-side promise: a `CREATE` issued through that
 command path is refused by FalkorDB and materializes nothing. A client-side
 guard sits on top of it: the graph handle the builder reads through forwards
