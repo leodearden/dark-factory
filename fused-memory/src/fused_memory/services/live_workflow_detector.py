@@ -751,6 +751,14 @@ class ClaimantLabel(StrEnum):
     UNKNOWN = 'unknown'
 
 
+class TaskLiveness(StrEnum):
+    """UNKNOWN means a probe or its inputs failed, and is never collapsed into NOT_LIVE."""
+
+    LIVE = 'live'
+    NOT_LIVE = 'not_live'
+    UNKNOWN = 'unknown'
+
+
 def claimant_label(
     task: object,
     *,
