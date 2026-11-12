@@ -166,6 +166,21 @@ class _TasksRead:
     mode: _OnePage | _CompleteRead
     fields: tuple[str, ...] | None
 
+    def __post_init__(self) -> None:
+        """Refuse a projection :func:`_shape_task` would misread.
+
+        An omitted key reads as absent, so a projection without ``title`` or
+        ``status`` would serve rows titled ``''`` with no status rather than
+        fail. ``None`` asks for whole rows and needs no check.
+        """
+        if self.fields is None:
+            return
+        missing = [key for key in SHAPED_ROW_FIELDS if key not in self.fields]
+        if missing:
+            raise ValueError(
+                f'a projected task read must ask for every key _shape_task reads; missing {missing}',
+            )
+
     def wire_arguments(self) -> dict:
         """Build the MCP ``get_tasks`` arguments for this read.
 
@@ -212,6 +227,17 @@ Restated here rather than imported because the dashboard does not depend on
 the fused-memory package — this is the wire contract's value, held at the
 seam that speaks it.
 """
+
+
+SHAPED_ROW_FIELDS: tuple[str, ...] = (
+    'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
+    'claimant_run_id', 'heartbeat_at',
+)
+"""The top-level wire keys :func:`_shape_task` reads besides ``metadata``.
+
+A projected row read asks for all of them (:class:`_TasksRead` refuses one
+that does not) plus the ``metadata.<key>`` entries its own readers need;
+naming ``metadata`` itself would bring back every metadata key."""
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -593,7 +619,8 @@ async def fetch_tasks(
     top-level keys in ``_row_to_task``'s spelling (``updatedAt``), and
     ``metadata.<key>`` one level deep, with ``id`` always returned.  A
     projected row's ``metadata`` holds only the requested keys present on the
-    task, and :func:`_shape_task` reads an omitted key as absent.
+    task. A projection must name every :data:`SHAPED_ROW_FIELDS` key, or the
+    read raises ``ValueError`` before anything is sent.
 
     **Per-request budget.** *timeout* is threaded into
     :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the

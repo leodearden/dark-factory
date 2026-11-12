@@ -30,6 +30,7 @@ from shared.task_deferral import CarriedByDeferral, HeldBySessionDeferral, recor
 
 from dashboard.app import app
 from dashboard.data.active_tasks import task_uid
+from dashboard.data.task_snapshot import ROW_READ_FIELDS
 
 pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
@@ -110,8 +111,9 @@ def _row_reads(substrate: CannedMCP) -> list[dict[str, Any]]:
 
 
 def _assert_nothing_unprojected(substrate: CannedMCP) -> None:
-    unaudited = [args for args in _row_reads(substrate) if args.get('fields') is None]
-    assert _row_reads(substrate) and not unaudited, f'row reads the audit never saw: {unaudited}'
+    row_reads = _row_reads(substrate)
+    unaudited = [args for args in row_reads if args.get('fields') is None]
+    assert row_reads and not unaudited, f'row reads the audit never saw: {unaudited}'
     assert substrate.unprojected_reads == set(), (
         f'a reader of the dashboard row read read {sorted(substrate.unprojected_reads)}, which '
         'the read does not ask for: add them to task_snapshot.ROW_READ_FIELDS'
@@ -152,8 +154,6 @@ def test_the_prd_view_and_contention_read_only_projected_keys(client, tmp_path):
 
 
 def test_every_row_read_asks_for_row_read_fields(client, tmp_path):
-    from dashboard.data.task_snapshot import ROW_READ_FIELDS
-
     with _audited_routes(client, tmp_path) as (substrate, render_prds):
         _get(client)
         _get(client, terminal=ROOT)

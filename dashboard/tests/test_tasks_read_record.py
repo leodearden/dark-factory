@@ -6,6 +6,7 @@ statuses canonicalisation, the page window and the per-request timeout.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -297,7 +298,7 @@ class TestFetchTasksNarrowing:
 # (task 9311)
 # ---------------------------------------------------------------------------
 
-_PROJECTION = ['id', 'title', 'status', 'metadata.files']
+_PROJECTION = [*tasks_mod.SHAPED_ROW_FIELDS, 'metadata.files']
 
 
 class TestRowReadProjection:
@@ -358,3 +359,17 @@ class TestRowReadProjection:
 
         [call] = substrate.calls_to('get_tasks')
         assert call['args'] == expected
+
+    @pytest.mark.parametrize('omitted', tasks_mod.SHAPED_ROW_FIELDS)
+    async def test_a_projection_without_a_shaped_key_is_refused_before_sending(
+        self, dummy_client, dummy_config, omitted
+    ):
+        substrate = self._substrate()
+        fields = [key for key in _PROJECTION if key != omitted]
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call', new=substrate),
+            pytest.raises(ValueError, match=re.escape(f'missing {[omitted]!r}')),
+        ):
+            await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/A', fields=fields)
+
+        assert substrate.calls == []

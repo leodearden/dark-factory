@@ -63,6 +63,7 @@ from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.prd_attribution import LINEAGE_METADATA_KEYS
 from dashboard.data.tasks import (
+    SHAPED_ROW_FIELDS,
     fetch_statuses,
     fetch_task_page,
     fetch_tasks,
@@ -171,8 +172,7 @@ ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
 ``WHERE status IN (...)``."""
 
 ROW_READ_FIELDS: tuple[str, ...] = (
-    'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
-    'claimant_run_id', 'heartbeat_at',
+    *SHAPED_ROW_FIELDS,
     *(f'metadata.{key}' for key in (
         'files', 'train', 'external_deps', 'deferral', 'infra_hold',
         'task_kind', 'always_escalates', 'milestone', 'milestone_deps_satisfied_at',
@@ -180,9 +180,9 @@ ROW_READ_FIELDS: tuple[str, ...] = (
         *LINEAGE_METADATA_KEYS,
     )),
 )
-"""The wire fields every dashboard row read asks ``get_tasks`` for: what
-``tasks._shape_task`` reads, plus the metadata keys the readers of those rows
-touch. ``tests/test_row_read_projection.py`` fails when a reader reads a key
+"""The wire fields every dashboard row read asks ``get_tasks`` for:
+:data:`~dashboard.data.tasks.SHAPED_ROW_FIELDS`, plus the metadata keys the
+readers of those rows touch. ``tests/test_row_read_projection.py`` fails when a reader reads a key
 this omits."""
 
 
