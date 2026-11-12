@@ -25,7 +25,7 @@ from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 from orchestrator.review_issue_contract import REVIEW_ISSUE_OFF_CONTRACT_FACT, check_issues
 from orchestrator.review_payload import NoteDisposition, Verdict, normalize_review
-from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeDriftReport, ScopeRequest
 
 logger = logging.getLogger(__name__)
 
@@ -679,6 +679,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'false_premise.json': ArtifactRoot.LANE,
     'unactionable_task.json': ArtifactRoot.LANE,
     'scope_requests.json': ArtifactRoot.LANE,
+    'scope_drift_brief.json': ArtifactRoot.TASK,
     'plan.json': ArtifactRoot.TASK,
     'plan.lock': ArtifactRoot.TASK,
     'iterations.jsonl': ArtifactRoot.TASK,
@@ -1134,6 +1135,30 @@ class TaskArtifacts:
                 )
             else:
                 self._clear_path('scope_requests.json')
+
+    def read_scope_drift_brief(self) -> ScopeDriftReport | None:
+        """The scope-drift report no writer session has received yet, or None.
+
+        TASK-rooted, so a brief outlives the dispatch that recorded it: a
+        requeue or restart before the next writer session still briefs it.
+        Only the workflow writes it, and reads it once per dispatch
+        (``workflow.py::TaskWorkflow._hold_scope_drift_brief``). A malformed
+        file reads as None with a warning.
+        """
+        data = self._read_json_object('scope_drift_brief.json')
+        if data is None:
+            return None
+        try:
+            return ScopeDriftReport.from_event_data(data)
+        except ValueError as exc:
+            logger.warning('Ignoring malformed scope_drift_brief.json: %s', exc)
+            return None
+
+    def write_scope_drift_brief(self, report: ScopeDriftReport) -> None:
+        self._write_json('scope_drift_brief.json', report.event_data())
+
+    def clear_scope_drift_brief(self) -> None:
+        self._clear_path('scope_drift_brief.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)

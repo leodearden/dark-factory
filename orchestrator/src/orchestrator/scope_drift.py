@@ -2,12 +2,14 @@
 
 A writer agent that finds the plan's ``files`` list merely incomplete files a
 :class:`ScopeRequest` (``plan_tools.py::report_missing_plan_file``) instead of
-escalating. At the next writer boundary the workflow tries to lock each
-requested path, and :func:`build_scope_drift_report` folds the outcome into a
-:class:`ScopeDriftReport`: the paths whose locks were taken, and the paths
-another task holds, each with its holder. That report is the ``scope_drift``
-event's payload and the next briefing's input. Task 4371 extends this module
-with its own ``reason`` value rather than adding a parallel one.
+escalating. At the :class:`ScopeBoundary` that ends its session the workflow
+tries to lock each requested path, and :func:`build_scope_drift_report` folds
+the outcome into a :class:`ScopeDriftReport`: the paths whose locks were taken,
+and the paths another task holds, each with its holder. That report is the
+``scope_drift`` event's payload and, until a writer receives it, the brief
+waiting in the task root (``artifacts.py::TaskArtifacts.read_scope_drift_brief``).
+Task 4371 extends this module with its own ``reason`` value rather than adding
+a parallel one.
 """
 
 from __future__ import annotations
@@ -35,9 +37,24 @@ class ScopeDriftReason(StrEnum):
         return cls.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT if contested else cls.IMPLEMENT_SCOPE_EXPANDED
 
 
-IMPLEMENT_SCOPE_EXPANDED = ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
-IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT = ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
-_IMPLEMENT_REASONS = frozenset({IMPLEMENT_SCOPE_EXPANDED, IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT})
+_IMPLEMENT_REASONS = frozenset({
+    ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED,
+    ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
+})
+
+
+class ScopeBoundary(StrEnum):
+    """The writer session whose end applied the requests.
+
+    With the iteration it tells an execute iteration from the escalation
+    resume, amendment pass or follow-up session that reuses its number.
+    """
+
+    EXECUTE = 'execute'
+    ESCALATION_RESUME = 'escalation_resume'
+    AMENDMENT = 'amendment'
+    DEBUG_FIX = 'debug_fix'
+    FOLLOWUP = 'followup'
 
 _DOT_SLASH = './'
 _TASK_STATE_DIR = '.task'
@@ -122,6 +139,7 @@ class ScopeDriftReport:
     """What one writer boundary did with the scope requests it found."""
 
     reason: ScopeDriftReason
+    boundary: ScopeBoundary
     role: str
     iteration: int
     requested: tuple[str, ...]
@@ -131,6 +149,7 @@ class ScopeDriftReport:
     def __post_init__(self) -> None:
         reason = ScopeDriftReason(self.reason)
         object.__setattr__(self, 'reason', reason)
+        object.__setattr__(self, 'boundary', ScopeBoundary(self.boundary))
         if reason in _IMPLEMENT_REASONS and reason is not ScopeDriftReason.for_implement(
             contested=bool(self.contested)
         ):
@@ -143,7 +162,8 @@ class ScopeDriftReport:
 
         A path the later boundary acquired is no longer contested; the later
         boundary's holder wins for a path both contest. An implement-phase
-        reason is re-derived from the merged contest; any other is the later one's.
+        reason is re-derived from the merged contest; any other is the later
+        one's, as are the boundary, role and iteration.
         """
         acquired = tuple(dict.fromkeys((*self.acquired, *later.acquired)))
         contested = {
@@ -155,6 +175,7 @@ class ScopeDriftReport:
             reason = ScopeDriftReason.for_implement(contested=bool(contested))
         return ScopeDriftReport(
             reason=reason,
+            boundary=later.boundary,
             role=later.role,
             iteration=later.iteration,
             requested=tuple(dict.fromkeys((*self.requested, *later.requested))),
@@ -165,6 +186,7 @@ class ScopeDriftReport:
     def event_data(self) -> dict[str, Any]:
         return {
             'reason': self.reason.value,
+            'boundary': self.boundary.value,
             'role': self.role,
             'iteration': self.iteration,
             'requested': list(self.requested),
@@ -172,67 +194,46 @@ class ScopeDriftReport:
             'contested': dict(self.contested),
         }
 
+    @classmethod
+    def from_event_data(cls, data: object) -> ScopeDriftReport:
+        """The report whose :meth:`event_data` is *data*; ValueError for any other shape."""
+        if not isinstance(data, Mapping):
+            raise ValueError(f'scope-drift data {data!r} is not a mapping')
+        iteration = data.get('iteration')
+        if not isinstance(iteration, int) or isinstance(iteration, bool):
+            raise ValueError(f'iteration {iteration!r} is not an integer')
+        return cls(
+            reason=ScopeDriftReason(data.get('reason')),
+            boundary=ScopeBoundary(data.get('boundary')),
+            role=_string(data, 'role'),
+            iteration=iteration,
+            requested=_strings(data, 'requested'),
+            acquired=_strings(data, 'acquired'),
+            contested=_string_pairs(data, 'contested'),
+        )
 
-MAX_SCOPE_DRIFT_FOLLOWUPS = 3
+
+def _string(data: Mapping[str, object], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f'{key} {value!r} is not a string')
+    return value
 
 
-class ScopeDriftBrief:
-    """Carries a task's scope-drift report until a writer session has actually received it.
+def _strings(data: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = data.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f'{key} {value!r} is not a list of strings')
+    return tuple(value)
 
-    Each writer session follows one protocol: its prompt builder calls
-    :meth:`render`, and its boundary calls :meth:`settle` with whether the
-    session read that prompt, then :meth:`record` with the boundary's own
-    report. A report rendered into a prompt that was never read stays
-    pending, so a contested path always reaches a writer; where no writer
-    session is due, :meth:`followup_due` names the report a dedicated
-    follow-up session must deliver, at most :data:`MAX_SCOPE_DRIFT_FOLLOWUPS`
-    times per task run.
-    """
 
-    def __init__(self) -> None:
-        self._report: ScopeDriftReport | None = None
-        self._rendered = False
-        self._resumed = False
-        self._followups = 0
-
-    def render(self, *, resuming: bool) -> ScopeDriftReport | None:
-        """The report for a writer prompt; a *resuming* dispatch sends a continuation instead.
-
-        A session whose first dispatch resumed never counts as received:
-        cli_invoke's later cap-hit re-dispatches build the prompt only to ask
-        whether to retry, and keep their own continuation.
-        """
-        if resuming:
-            self._resumed = True
-        elif not self._resumed:
-            self._rendered = True
-        return self._report
-
-    def settle(self, *, delivered: bool) -> None:
-        """At a session boundary: drop the report if the session received it."""
-        if delivered and self._rendered:
-            self._report = None
-        self._rendered = False
-        self._resumed = False
-
-    def record(self, report: ScopeDriftReport) -> None:
-        """Fold a boundary's report into the one still waiting for a writer."""
-        self._report = self._report.merged_with(report) if self._report else report
-
-    def pending_contested(self) -> ScopeDriftReport | None:
-        """The waiting report, when it names a contested path."""
-        if self._report is None or not self._report.contested:
-            return None
-        return self._report
-
-    def followup_due(self) -> ScopeDriftReport | None:
-        """The contested report a follow-up session must deliver, within the bound."""
-        if self._followups >= MAX_SCOPE_DRIFT_FOLLOWUPS:
-            return None
-        return self.pending_contested()
-
-    def start_followup(self) -> None:
-        self._followups += 1
+def _string_pairs(data: Mapping[str, object], key: str) -> tuple[tuple[str, str], ...]:
+    value = data.get(key)
+    if not isinstance(value, Mapping) or not all(
+        isinstance(path, str) and isinstance(holder, str) for path, holder in value.items()
+    ):
+        raise ValueError(f'{key} {value!r} is not a mapping of strings')
+    return tuple(value.items())
 
 
 def build_scope_drift_report(
@@ -240,6 +241,7 @@ def build_scope_drift_report(
     contested: Iterable[Blocker],
     *,
     lock_depth: int,
+    boundary: ScopeBoundary,
     role: str,
     iteration: int,
     task_id: str,
@@ -268,6 +270,7 @@ def build_scope_drift_report(
             acquired.append(path)
     return ScopeDriftReport(
         reason=ScopeDriftReason.for_implement(contested=bool(contested_paths)),
+        boundary=boundary,
         role=role,
         iteration=iteration,
         requested=paths,

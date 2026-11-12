@@ -111,11 +111,11 @@ class EventType(StrEnum):
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
     # A writer's scope moving past its declared files, one row per boundary
-    # that had something to apply.  Payload: {reason, role, iteration,
-    # requested, acquired, contested: {path: holder}}.  The implement-phase
-    # reasons (implement_scope_expanded, implement_blast_radius_lock_conflict)
-    # live in orchestrator/src/orchestrator/scope_drift.py; task 4371 adds its
-    # own reason there.
+    # that had something to apply; the row's phase is the workflow phase the
+    # boundary ran in.  Payload: {reason, boundary, role, iteration,
+    # requested, acquired, contested: {path: holder}}.  The reasons and the
+    # boundary kinds live in orchestrator/src/orchestrator/scope_drift.py
+    # (ScopeDriftReason, ScopeBoundary); task 4371 adds its own reason there.
     scope_drift = 'scope_drift'
     # Declared-vs-landed at done, from
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.

@@ -16,7 +16,7 @@ from _briefing_helpers import memory_transport
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.pin_reservation import Blocker, BlockerKind
-from orchestrator.scope_drift import ScopeDriftReport, build_scope_drift_report
+from orchestrator.scope_drift import ScopeBoundary, ScopeDriftReport, build_scope_drift_report
 
 _PLAN = {'task_id': '1', 'title': 'T', 'analysis': 'A'}
 _FAILURES = '## Test Failures\n\n```\nFAILED tests/test_x.py::test_a\n```'
@@ -42,7 +42,8 @@ def briefing(tmp_path: Path) -> Iterator[BriefingAssembler]:
 
 def _report(requested: list[str], contested: list[Blocker]) -> ScopeDriftReport:
     return build_scope_drift_report(
-        requested, contested, lock_depth=12, role='implementer', iteration=1, task_id='1'
+        requested, contested, lock_depth=12, boundary=ScopeBoundary.EXECUTE,
+        role='implementer', iteration=1, task_id='1',
     )
 
 

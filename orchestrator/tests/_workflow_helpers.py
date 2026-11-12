@@ -91,9 +91,12 @@ class FakeScheduler:
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
         self.blast_radius_result = BlastRadiusResult(applied=True)
         # Live-slot widen (task 3090): each key in contested_modules comes back
-        # contested by the mapped holder; every other key is acquired. Calls
-        # are recorded as (task_id, modules, reason); status is never written.
+        # contested by the mapped holder; every other key not yet in
+        # uncontested_held is acquired, and a held key is skipped, as
+        # lock_table.py::ModuleLockTable.acquire_uncontested does. Calls are
+        # recorded as (task_id, modules, reason); status is never written.
         self.contested_modules: dict[str, str] = {}
+        self.uncontested_held: set[str] = set()
         self.acquire_uncontested_calls: list[tuple[str, list[str], str]] = []
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
         # every update_task(task_id, metadata) call is recorded here so the
@@ -178,8 +181,13 @@ class FakeScheduler:
         self, task_id: str, modules: list[str], /, *, reason: str,
     ) -> UncontestedAcquisition:
         self.acquire_uncontested_calls.append((task_id, list(modules), reason))
+        acquired = tuple(
+            m for m in modules
+            if m not in self.contested_modules and m not in self.uncontested_held
+        )
+        self.uncontested_held.update(acquired)
         return UncontestedAcquisition(
-            acquired=tuple(m for m in modules if m not in self.contested_modules),
+            acquired=acquired,
             contested=tuple(
                 Blocker(m, self.contested_modules[m], BlockerKind.HELD)
                 for m in modules

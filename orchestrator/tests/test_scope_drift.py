@@ -8,11 +8,8 @@ import pytest
 
 from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scope_drift import (
-    IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
-    IMPLEMENT_SCOPE_EXPANDED,
-    MAX_SCOPE_DRIFT_FOLLOWUPS,
     InvalidScopeRequest,
-    ScopeDriftBrief,
+    ScopeBoundary,
     ScopeDriftReason,
     ScopeDriftReport,
     ScopeRequest,
@@ -109,6 +106,7 @@ def _report(requested, contested=()):
         requested,
         contested,
         lock_depth=LOCK_DEPTH,
+        boundary=ScopeBoundary.EXECUTE,
         role='implementer',
         iteration=2,
         task_id='42',
@@ -118,7 +116,7 @@ def _report(requested, contested=()):
 class TestBuildScopeDriftReport:
     def test_all_acquired_is_scope_expanded(self):
         report = _report(['pkg/a.py', 'pkg/b.py'])
-        assert report.reason == IMPLEMENT_SCOPE_EXPANDED == 'implement_scope_expanded'
+        assert report.reason is ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
         assert report.requested == ('pkg/a.py', 'pkg/b.py')
         assert report.acquired == ('pkg/a.py', 'pkg/b.py')
         assert report.contested == ()
@@ -128,11 +126,7 @@ class TestBuildScopeDriftReport:
             ['pkg/a.py', 'pkg/b.py'],
             [Blocker('pkg/b.py', '777', BlockerKind.HELD)],
         )
-        assert (
-            report.reason
-            == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
-            == 'implement_blast_radius_lock_conflict'
-        )
+        assert report.reason is ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
         assert report.acquired == ('pkg/a.py',)
         assert report.contested == (('pkg/b.py', '777'),)
 
@@ -150,7 +144,7 @@ class TestBuildScopeDriftReport:
         report = _report(['pkg/subdir'], [Blocker('pkg/subdir', '5', BlockerKind.HELD)])
         assert report.acquired == ('pkg/subdir',)
         assert report.contested == ()
-        assert report.reason == IMPLEMENT_SCOPE_EXPANDED
+        assert report.reason is ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
 
     def test_event_data_shape(self):
         report = _report(
@@ -159,6 +153,7 @@ class TestBuildScopeDriftReport:
         )
         assert report.event_data() == {
             'reason': 'implement_blast_radius_lock_conflict',
+            'boundary': 'execute',
             'role': 'implementer',
             'iteration': 2,
             'requested': ['pkg/a.py', 'pkg/b.py'],
@@ -184,14 +179,23 @@ class TestMergedWith:
         assert merged.acquired == ('pkg/b.py',)
         assert merged.contested == (('pkg/c.py', '9'),)
         assert merged.requested == ('pkg/b.py', 'pkg/c.py')
-        assert merged.reason == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+        assert merged.reason is ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
 
     def test_an_earlier_contest_survives_a_later_unrelated_grant(self):
         earlier = _report(['pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)])
         merged = earlier.merged_with(_report(['pkg/a.py']))
         assert merged.acquired == ('pkg/a.py',)
         assert merged.contested == (('pkg/b.py', '777'),)
-        assert merged.reason == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+        assert merged.reason is ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+
+    def test_the_later_boundary_and_iteration_win(self):
+        earlier = _report(['pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)])
+        later = dataclasses.replace(
+            _report(['pkg/a.py']), boundary=ScopeBoundary.AMENDMENT, iteration=5,
+        )
+        merged = earlier.merged_with(later)
+        assert merged.boundary is ScopeBoundary.AMENDMENT
+        assert merged.iteration == 5
 
 
 class TestScopeDriftReason:
@@ -213,8 +217,8 @@ class TestScopeDriftReason:
     ):
         with pytest.raises(ValueError, match=reason.value):
             ScopeDriftReport(
-                reason=reason, role='implementer', iteration=1,
-                requested=('pkg/b.py',), acquired=(), contested=contested,
+                reason=reason, boundary=ScopeBoundary.EXECUTE, role='implementer',
+                iteration=1, requested=('pkg/b.py',), acquired=(), contested=contested,
             )
 
     def test_an_unknown_reason_string_is_refused(self):
@@ -222,65 +226,48 @@ class TestScopeDriftReason:
             ScopeDriftReason('made_up')
 
 
-_CONTESTED = [Blocker('pkg/b.py', '777', BlockerKind.HELD)]
+class TestScopeBoundary:
+    def test_an_unknown_boundary_string_is_refused(self):
+        with pytest.raises(ValueError):
+            dataclasses.replace(_report(['pkg/a.py']), boundary='made_up')
+
+    def test_a_boundary_string_is_coerced_to_the_enum(self):
+        report = dataclasses.replace(_report(['pkg/a.py']), boundary='debug_fix')
+        assert report.boundary is ScopeBoundary.DEBUG_FIX
 
 
-def _contested_report():
-    return _report(['pkg/b.py'], _CONTESTED)
-
-
-class TestScopeDriftBrief:
-    def test_a_received_report_is_dropped_at_the_next_boundary(self):
-        brief = ScopeDriftBrief()
-        brief.record(_contested_report())
-        assert brief.render(resuming=False) is not None
-        brief.settle(delivered=True)
-        assert brief.render(resuming=False) is None
-        assert brief.followup_due() is None
+class TestFromEventData:
+    @pytest.mark.parametrize(
+        'report',
+        [
+            _report(['pkg/a.py']),
+            _report(['pkg/a.py', 'pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)]),
+        ],
+        ids=['granted', 'contested'],
+    )
+    def test_round_trips_event_data(self, report):
+        assert ScopeDriftReport.from_event_data(report.event_data()) == report
 
     @pytest.mark.parametrize(
-        ('resuming', 'delivered'), [(True, True), (False, False)], ids=['resumed', 'wedged'],
+        ('field_name', 'value'),
+        [
+            ('reason', 'made_up'),
+            ('boundary', None),
+            ('role', 7),
+            ('iteration', '2'),
+            ('iteration', True),
+            ('requested', 'pkg/a.py'),
+            ('acquired', [3]),
+            ('contested', [['pkg/b.py', '777']]),
+            ('contested', {'pkg/b.py': 777}),
+        ],
     )
-    def test_a_report_the_session_did_not_receive_stays_pending(self, resuming, delivered):
-        brief = ScopeDriftBrief()
-        brief.record(_contested_report())
-        brief.render(resuming=resuming)
-        brief.settle(delivered=delivered)
-        assert brief.pending_contested() == _contested_report()
+    def test_refuses_a_malformed_field(self, field_name, value):
+        data = _report(['pkg/a.py']).event_data()
+        data[field_name] = value
+        with pytest.raises(ValueError):
+            ScopeDriftReport.from_event_data(data)
 
-    def test_a_resumed_session_never_receives_it_even_when_rebuilt_on_a_cap_hit(self):
-        brief = ScopeDriftBrief()
-        brief.record(_contested_report())
-        brief.render(resuming=True)
-        brief.render(resuming=False)
-        brief.settle(delivered=True)
-        assert brief.pending_contested() == _contested_report()
-        assert brief.render(resuming=False) is not None
-        brief.settle(delivered=True)
-        assert brief.pending_contested() is None
-
-    def test_a_later_report_is_merged_into_one_no_writer_received(self):
-        brief = ScopeDriftBrief()
-        brief.record(_contested_report())
-        brief.settle(delivered=True)
-        brief.record(_report(['pkg/a.py']))
-        pending = brief.render(resuming=False)
-        assert pending is not None
-        assert pending.contested == (('pkg/b.py', '777'),)
-        assert pending.acquired == ('pkg/a.py',)
-
-    def test_a_granted_only_report_needs_no_follow_up(self):
-        brief = ScopeDriftBrief()
-        brief.record(_report(['pkg/a.py']))
-        assert brief.followup_due() is None
-
-    def test_follow_ups_are_bounded(self):
-        brief = ScopeDriftBrief()
-        brief.record(_contested_report())
-        for _ in range(MAX_SCOPE_DRIFT_FOLLOWUPS):
-            assert brief.followup_due() is not None
-            brief.start_followup()
-            brief.render(resuming=False)
-            brief.settle(delivered=False)
-        assert brief.followup_due() is None
-        assert brief.pending_contested() is not None
+    def test_refuses_a_non_mapping(self):
+        with pytest.raises(ValueError):
+            ScopeDriftReport.from_event_data(['reason'])

@@ -25,14 +25,10 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import PlanState, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.scope_drift import (
-    IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
-    IMPLEMENT_SCOPE_EXPANDED,
-    ScopeDriftReport,
-    ScopeRequest,
-)
+from orchestrator.scope_drift import ScopeDriftReason, ScopeDriftReport, ScopeRequest
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import MAX_SCOPE_DRIFT_FOLLOWUPS, TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow_types import WorkflowState
 
 _TASK_ID = '3090'
 _DECLARED = 'pkg/a.py'
@@ -154,11 +150,13 @@ def _stub_loop_collaborators(
     *,
     escalations: Callable[[], list] | None = None,
     stub_owner_check: bool = True,
+    stub_restamp: bool = True,
 ) -> None:
     assert wf.artifacts is not None
     if stub_owner_check:
         monkeypatch.setattr(wf.artifacts, 'validate_plan_owner', MagicMock(return_value=True))
-    monkeypatch.setattr(wf.artifacts, 'stamp_plan_provenance', MagicMock())
+    if stub_restamp:
+        monkeypatch.setattr(wf.artifacts, 'stamp_plan_provenance', MagicMock())
     monkeypatch.setattr(
         wf,
         '_check_escalations',
@@ -176,6 +174,10 @@ def _stub_loop_collaborators(
 
 def _success() -> AgentResult:
     return AgentResult(success=True, output='done', cost_usd=0.5, turns=3, duration_ms=5_000)
+
+
+def _failed_before_its_first_turn() -> AgentResult:
+    return AgentResult(success=False, output='', turns=0, duration_ms=1_000)
 
 
 def _timed_out(*, transcript_turns: int) -> AgentResult:
@@ -256,11 +258,12 @@ class TestImplementerScopeRequest:
         assert _REQUESTED in _files_written(scheduler)[-1]
         assert _REQUESTED in wf.modules
         assert scheduler.acquire_uncontested_calls == [
-            (_TASK_ID, [_REQUESTED], IMPLEMENT_SCOPE_EXPANDED),
+            (_TASK_ID, [_REQUESTED], ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED),
         ]
         _assert_never_repended(scheduler)
         assert _scope_drift_events(events) == [{
-            'reason': IMPLEMENT_SCOPE_EXPANDED,
+            'reason': ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED,
+            'boundary': 'execute',
             'role': 'implementer',
             'iteration': 1,
             'requested': [_REQUESTED],
@@ -294,7 +297,7 @@ class TestImplementerScopeRequest:
         assert _REQUESTED not in wf.modules
         _assert_never_repended(scheduler)
         [drift] = _scope_drift_events(events)
-        assert drift['reason'] == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+        assert drift['reason'] == ScopeDriftReason.IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
         assert drift['acquired'] == []
         assert drift['contested'] == {_REQUESTED: _HOLDER}
         second_brief = _scope_drift_kwargs(rig.implementer_prompt)[1]
@@ -452,6 +455,97 @@ class TestImplementerScopeRequest:
         assert resumed_brief.contested == ((_REQUESTED, _HOLDER),)
         rig.followup_prompt.assert_not_awaited()
 
+    async def test_a_session_that_failed_before_its_first_turn_does_not_consume_the_brief(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        _write_dispatched_plan(wf, steps=2)
+        _stub_loop_collaborators(wf, monkeypatch)
+        assert wf.artifacts is not None
+        artifacts = wf.artifacts
+        calls = 0
+
+        async def agent(**_kwargs) -> AgentResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+                artifacts.update_step_status('step-1', 'done', None)
+            elif calls == 2:
+                return _failed_before_its_first_turn()
+            else:
+                artifacts.update_step_status('step-2', 'done', None)
+            return _success()
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        after_the_failure = _scope_drift_kwargs(rig.implementer_prompt)[-1]
+        assert after_the_failure is not None
+        assert after_the_failure.contested == ((_REQUESTED, _HOLDER),)
+
+    async def test_a_request_kept_off_an_overwritten_plan_is_applied_after_the_restamp(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch, stub_owner_check=False, stub_restamp=False)
+        assert wf.artifacts is not None and wf.worktree is not None
+        artifacts, worktree = wf.artifacts, wf.worktree
+
+        async def agent(**_kwargs) -> AgentResult:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+            artifacts.update_step_status('step-1', 'done', None)
+            TaskArtifacts(worktree).stamp_plan_provenance('foreign-session')
+            return _success()
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert _plan_files(wf) == [_DECLARED, _REQUESTED]
+        assert len(scheduler.acquire_uncontested_calls) == 1
+        assert artifacts.read_scope_requests() == ()
+        [drift] = _scope_drift_events(events)
+        assert (drift['boundary'], drift['iteration']) == ('execute', 1)
+
+    async def test_a_retry_after_a_failed_declare_still_widens_the_module_set(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        _write_dispatched_plan(wf, steps=2)
+        _stub_loop_collaborators(wf, monkeypatch)
+        assert wf.artifacts is not None
+        set_plan_files = wf.artifacts.set_plan_files
+        writes = 0
+
+        def set_plan_files_failing_once(files, session_id):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise OSError('plan.json write failed')
+            return set_plan_files(files, session_id)
+
+        monkeypatch.setattr(wf.artifacts, 'set_plan_files', set_plan_files_failing_once)
+
+        outcome = await _run_execute_loop(wf)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert len(scheduler.acquire_uncontested_calls) == 2
+        assert _plan_files(wf) == [_DECLARED, _REQUESTED]
+        assert _REQUESTED in wf.modules
+
     async def test_requests_are_applied_before_the_escalation_gate(self, tmp_path, monkeypatch):
         wf = _make_workflow(tmp_path).wf
         _write_dispatched_plan(wf, steps=2)
@@ -521,6 +615,7 @@ class TestDebuggerScopeRequest:
         assert outcome == WorkflowOutcome.DONE
         [drift] = _scope_drift_events(events)
         assert drift['role'] == 'debugger'
+        assert drift['boundary'] == 'debug_fix'
         assert drift['iteration'] == 1
         assert _plan_files(wf) == [_DECLARED, _REQUESTED]
         briefs = _scope_drift_kwargs(rig.debugger_prompt)
@@ -582,13 +677,29 @@ class TestAmendmentPassScopeRequest:
         assert ok is True
         assert _plan_files(wf) == [_DECLARED, _REQUESTED]
         assert scheduler.acquire_uncontested_calls == [
-            (_TASK_ID, [_REQUESTED], IMPLEMENT_SCOPE_EXPANDED),
+            (_TASK_ID, [_REQUESTED], ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED),
         ]
         [drift] = _scope_drift_events(events)
         assert drift['role'] == 'implementer'
+        assert drift['boundary'] == 'amendment'
         assert drift['acquired'] == [_REQUESTED]
         assert wf.artifacts is not None
         assert wf.artifacts.read_scope_requests() == ()
+
+    async def test_the_event_phase_is_the_workflow_phase_the_boundary_ran_in(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, events = rig.wf, rig.events
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+        wf._enter_phase(WorkflowState.REVIEW)
+
+        assert await _run_amendment_pass(wf) is True
+
+        [row] = events.fetch_events_by_type(EventType.scope_drift)
+        assert row['phase'] == 'review'
+        assert row['data']['boundary'] == 'amendment'
 
     async def test_a_scope_request_never_restamps_a_plan_the_agent_overwrote(
         self, tmp_path, monkeypatch
@@ -808,3 +919,36 @@ async def test_a_cap_hit_rebuild_of_a_resumed_session_does_not_consume_the_brief
     assert resumed_ids[2] == 'sess-capped'
     [followup_call] = rig.followup_prompt.await_args_list
     assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)
+
+
+@pytest.mark.asyncio
+async def test_follow_ups_are_bounded_per_run_and_the_brief_stays_waiting(tmp_path, monkeypatch):
+    rig, verify = _verify_loop_rig(tmp_path, monkeypatch, [_passing_verify()] * 5)
+    wf = rig.wf
+    assert wf.artifacts is not None
+    artifacts = wf.artifacts
+    calls = 0
+
+    async def agent(**_kwargs) -> AgentResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+            artifacts.update_step_status('step-1', 'done', None)
+            return _success()
+        return _timed_out(transcript_turns=0)
+
+    with (
+        patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        executed = await wf._execute_iterations()
+        verified = await wf._verify_debugfix_loop()
+
+    assert executed == verified == WorkflowOutcome.DONE
+    assert len(rig.followup_prompt.await_args_list) == MAX_SCOPE_DRIFT_FOLLOWUPS
+    assert verify.await_count == MAX_SCOPE_DRIFT_FOLLOWUPS
+    waiting = artifacts.read_scope_drift_brief()
+    assert waiting is not None
+    assert waiting.contested == ((_REQUESTED, _HOLDER),)
+

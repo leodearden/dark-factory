@@ -1,4 +1,8 @@
-"""TaskArtifacts' scope_requests.json trio, the agent->workflow scope-request channel (task 3090)."""
+"""TaskArtifacts' scope-request channels (task 3090).
+
+scope_requests.json carries an agent's requests to the workflow;
+scope_drift_brief.json carries a boundary's report to the next writer.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.scope_drift import ScopeRequest
+from orchestrator.pin_reservation import Blocker, BlockerKind
+from orchestrator.scope_drift import ScopeBoundary, ScopeRequest, build_scope_drift_report
 
 _PLAN = {
     'files': ['pkg/a.py'],
@@ -135,3 +140,45 @@ def test_the_trio_never_touches_plan_json(arts):
     arts.write_scope_request(ScopeRequest('pkg/b.py', 'plan omitted it'))
     arts.clear_scope_requests(arts.read_scope_requests())
     assert plan_path.read_bytes() == before
+
+
+def _contested_report():
+    return build_scope_drift_report(
+        ['pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)],
+        lock_depth=12, boundary=ScopeBoundary.DEBUG_FIX, role='debugger',
+        iteration=3, task_id='42',
+    )
+
+
+def test_the_brief_resolves_under_the_task_root(arts, task):
+    assert arts.artifact_path('scope_drift_brief.json') == task / 'scope_drift_brief.json'
+
+
+def test_a_fresh_root_has_no_brief(arts):
+    assert arts.read_scope_drift_brief() is None
+
+
+def test_the_brief_reads_back_and_clears(arts):
+    report = _contested_report()
+    arts.write_scope_drift_brief(report)
+    assert arts.read_scope_drift_brief() == report
+    arts.clear_scope_drift_brief()
+    assert arts.read_scope_drift_brief() is None
+    arts.clear_scope_drift_brief()
+
+
+def test_a_later_dispatch_into_another_lane_reads_the_brief(arts, tmp_path, task):
+    arts.write_scope_drift_brief(_contested_report())
+    other_lane = tmp_path / 'lane-2'
+    other_lane.mkdir()
+    redispatched = TaskArtifacts(tmp_path / 'wt', meta_root=other_lane, task_root=task)
+    assert redispatched.read_scope_drift_brief() == _contested_report()
+
+
+def test_a_malformed_brief_reads_as_none_with_a_warning(arts, caplog):
+    arts.artifact_path('scope_drift_brief.json').write_text(
+        json.dumps({'reason': 'made_up'}), encoding='utf-8',
+    )
+    with caplog.at_level(logging.WARNING, logger='orchestrator.artifacts'):
+        assert arts.read_scope_drift_brief() is None
+    assert any('scope_drift_brief.json' in message for message in _artifact_warnings(caplog))

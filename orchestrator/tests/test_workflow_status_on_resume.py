@@ -35,8 +35,14 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scheduler import BlastRadiusResult, TaskAssignment, files_to_modules
-from orchestrator.scope_drift import IMPLEMENT_SCOPE_EXPANDED, ScopeRequest
+from orchestrator.scope_drift import (
+    ScopeBoundary,
+    ScopeDriftReason,
+    ScopeRequest,
+    build_scope_drift_report,
+)
 from orchestrator.workflow import (
     IMPLEMENTER,
     TaskWorkflow,
@@ -749,8 +755,62 @@ class TestStatusPreservationOnResume:
         assert workflow.artifacts is not None
         assert 'new.py' in workflow.artifacts.read_plan()['files']
         assert len(scheduler.acquire_uncontested_calls) == 1
-        assert scheduler.acquire_uncontested_calls[0][2] == IMPLEMENT_SCOPE_EXPANDED
+        assert scheduler.acquire_uncontested_calls[0][2] == ScopeDriftReason.IMPLEMENT_SCOPE_EXPANDED
         assert workflow.artifacts.read_scope_requests() == ()
+
+    async def test_a_brief_a_prior_dispatch_left_waiting_reaches_the_resumed_implementer(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A contested scope-drift report no writer received outlives its dispatch (task 3090).
+
+        It waits in the task root, so this dispatch's first writer session is
+        briefed with it, and having taken a turn, consumes it.
+        """
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        left_waiting = build_scope_drift_report(
+            ['held.py'], [Blocker('held.py', '777', BlockerKind.HELD)],
+            lock_depth=config.lock_depth, boundary=ScopeBoundary.EXECUTE,
+            role='implementer', iteration=1, task_id=task_assignment.task_id,
+        )
+        # This harness runs the eval-mode external-worktree path, whose task
+        # root is its lane root (workflow.py::TaskWorkflow._artifact_roots).
+        lane_root = TaskArtifacts.for_task(wt, task_assignment.task_id).lane_root
+        prior_dispatch = TaskArtifacts(wt, meta_root=lane_root, task_root=lane_root)
+        lane_root.mkdir(parents=True, exist_ok=True)
+        prior_dispatch.write_scope_drift_brief(left_waiting)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        briefed: list[object] = []
+
+        async def build_resume_prompt(
+            task, plan, escalation_summary, resolution, worktree=None, scope_drift=None,
+        ):
+            briefed.append(scope_drift)
+            return 'Resume'
+
+        workflow.briefing.build_resume_prompt = build_resume_prompt  # type: ignore[method-assign]
+
+        async def invoke_taking_a_turn(role, build_prompt, cwd, output_schema=None):
+            await build_prompt()
+            return AgentResult(success=True, output='', turns=2)
+
+        workflow._invoke = invoke_taking_a_turn  # type: ignore[method-assign]
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        assert briefed == [left_waiting]
+        assert prior_dispatch.read_scope_drift_brief() is None
 
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,

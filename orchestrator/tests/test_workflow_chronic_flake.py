@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from orchestrator.config import ChronicFlakeConfig, OrchestratorConfig
-from orchestrator.scope_drift import ScopeDriftBrief
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -123,7 +122,7 @@ class TestVerifyDebugfixLoopInvokesChronicFlakeHook:
         artifacts_stub: Any = object()
         workflow.artifacts = artifacts_stub
         workflow._last_verify_result = None
-        workflow._scope_drift_brief = ScopeDriftBrief()
+        workflow._scope_drift_waiting = None
         workflow.task_id = '2358'
         workflow._task_verify = None
         return workflow
