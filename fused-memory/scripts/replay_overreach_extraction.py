@@ -346,10 +346,19 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
     return measurement.usage
 
 
+def _client_axis(model: str | None, effort: str | None) -> str:
+    return f"(model {model or 'as configured'}, effort {effort!r})"
+
+
 async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
-    """Raise unless *llm* can replay *arm*: on the arm's model, with attributable tokens. Calls nothing."""
-    if arm.llm.model is not None and llm.model != arm.llm.model:
-        raise ArmClientMismatch(f'arm {arm.name} extracts on {arm.llm.model}, but the client is on {llm.model}')
+    """Raise unless *llm* can replay *arm*: on the arm's model, sending exactly the arm's effort
+    (none for an arm that names none), with attributable tokens. Calls nothing."""
+    effort = client_reasoning_effort(llm)
+    if (arm.llm.model is not None and llm.model != arm.llm.model) or effort != arm.llm.reasoning_effort:
+        raise ArmClientMismatch(
+            f'arm {arm.name} extracts on {_client_axis(arm.llm.model, arm.llm.reasoning_effort)}, '
+            f'but the client is on {_client_axis(llm.model, effort)}',
+        )
     async with measure_llm_tokens(llm) as probe:
         pass
     _usage(probe)
@@ -487,7 +496,7 @@ class RecordKind(StrEnum):
 _ERROR_CHARS = 500
 
 RecordKey = tuple[str, str, str]
-"""``(arm, graph, episode_uuid)``. An arm's name fixes its model, so the key needs no model."""
+"""``(arm, graph, episode_uuid)``. An arm's name fixes its client, model and effort, so the key needs neither."""
 
 
 class ReplayFileError(ValueError):
@@ -501,7 +510,7 @@ def record_key(record: Mapping[str, Any]) -> RecordKey:
 def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str, Any]:
     return {
         'kind': RecordKind.replayed, 'arm': result.arm, 'model': result.model,
-        'instructions_version': result.instructions_version,
+        'reasoning_effort': result.reasoning_effort, 'instructions_version': result.instructions_version,
         'graph': result.graph, 'uuid': result.uuid, 'stratum': result.stratum,
         'previous_count': len(replay_input.previous),
         'entities': list(result.entities),
@@ -510,9 +519,10 @@ def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str
     }
 
 
-def failed_record(arm: ReplayArm, model: str | None, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
+def failed_record(arm: ReplayArm, llm: LLMClient, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
     return {
-        'kind': RecordKind.failed, 'arm': arm.name, 'model': model,
+        'kind': RecordKind.failed, 'arm': arm.name, 'model': llm.model,
+        'reasoning_effort': client_reasoning_effort(llm),
         'graph': row['graph'], 'uuid': row['uuid'], 'stratum': row['stratum'],
         'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS],
     }
@@ -905,7 +915,7 @@ async def _replay_rows(
                 replay_input = await readers[row['graph']].read(row)
             except (EpisodeMissing, *GRAPH_UNAVAILABLE) as exc:
                 logger.warning('reading %s/%s failed', row['graph'], row['uuid'], exc_info=True)
-                records = [failed_record(arm, llm.model, row, exc) for arm, llm in pending]
+                records = [failed_record(arm, llm, row, exc) for arm, llm in pending]
             else:
                 for arm, llm in pending:
                     try:
@@ -913,7 +923,7 @@ async def _replay_rows(
                     except Exception as exc:
                         logger.warning('replaying %s/%s under %s failed', row['graph'], row['uuid'],
                                        arm.name, exc_info=True)
-                        records.append(failed_record(arm, llm.model, row, exc))
+                        records.append(failed_record(arm, llm, row, exc))
             failures += sum(1 for record in records if record['kind'] == RecordKind.failed)
             sink.write(_jsonl(records))
             sink.flush()
