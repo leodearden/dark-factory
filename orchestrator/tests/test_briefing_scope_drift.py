@@ -6,9 +6,12 @@ briefing names each granted path and each contested path with its holder.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from _briefing_helpers import memory_transport
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -23,7 +26,7 @@ _HOLDER = '777'
 
 
 @pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
+def briefing(tmp_path: Path) -> Iterator[BriefingAssembler]:
     config = OrchestratorConfig(
         project_root=tmp_path,
         git=GitConfig(
@@ -33,7 +36,8 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
             worktree_dir='.worktrees',
         ),
     )
-    return BriefingAssembler(config)
+    with memory_transport(AsyncMock(side_effect=ConnectionRefusedError('no memory in tests'))):
+        yield BriefingAssembler(config)
 
 
 def _report(requested: list[str], contested: list[Blocker]) -> ScopeDriftReport:
@@ -56,7 +60,19 @@ async def _debugger(briefing: BriefingAssembler, **kwargs) -> str:
     )
 
 
-_BUILDERS = [_implementer, _debugger]
+async def _resume(briefing: BriefingAssembler, **kwargs) -> str:
+    return await briefing.build_resume_prompt(
+        {'id': '1', 'title': 'T', 'description': 'd'}, _PLAN, 'issue', 'resolution', **kwargs
+    )
+
+
+async def _amender(briefing: BriefingAssembler, **kwargs) -> str:
+    return await briefing.build_amender_prompt(
+        _PLAN, [], ['x/a.py'], context='', task_id='1', **kwargs
+    )
+
+
+_BUILDERS = [_implementer, _debugger, _resume, _amender]
 
 
 @pytest.mark.asyncio
@@ -83,3 +99,12 @@ async def test_all_granted_report_names_the_path_and_no_holder(briefing, build):
 @pytest.mark.parametrize('build', _BUILDERS)
 async def test_no_report_leaves_the_prompt_unchanged(briefing, build):
     assert await build(briefing, scope_drift=None) == await build(briefing)
+
+
+@pytest.mark.asyncio
+async def test_the_follow_up_prompt_names_the_contested_path_and_its_holder(briefing):
+    prompt = await briefing.build_scope_drift_followup_prompt(_PLAN, _MIXED, task_id='1')
+
+    [held_line] = [line for line in prompt.splitlines() if _HELD in line]
+    assert _HOLDER in held_line
+    assert 'revert' in prompt.lower()

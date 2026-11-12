@@ -1546,9 +1546,12 @@ class TaskWorkflow:
         # in task metadata because the verify loop is wholly within one
         # workflow run (unlike _check_infra_resume_thrash which crosses runs).
         self._failure_signature_history: list[tuple[str, str]] = []
-        # What the last writer boundary did with the agent's scope requests,
-        # briefed to the next implementer/debugger (_apply_scope_requests).
+        # What the writer boundaries since the last brief did with the agent's
+        # scope requests; kept until a writer prompt renders it
+        # (_apply_scope_requests, _scope_drift_for_brief).
         self._scope_drift_report: ScopeDriftReport | None = None
+        self._scope_drift_briefed = False
+        self._scope_drift_followed_up: set[str] = set()
         # TR-1: the atomic terminal-contract value returned by run().  Built
         # at the same choke points (_mark_blocked's _record helper, plus the
         # warm-lane-requeue and blast-radius-lock-conflict non-_mark_blocked
@@ -3339,6 +3342,7 @@ class TaskWorkflow:
                                 carried,
                             ),
                             render_carried_resolutions(carried), self.worktree,
+                            scope_drift=self._scope_drift_for_brief(),
                         )
 
                     await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
@@ -5018,12 +5022,17 @@ class TaskWorkflow:
         next writer.  Never re-pends, releases or escalates (task 3090 ruling);
         a failure keeps the requests for the next boundary.
 
+        A report no writer prompt has rendered yet is merged into, never
+        replaced, so a contested path always reaches a writer
+        (:meth:`_brief_contested_scope_drift` covers the last session).
+
         A plan this session no longer owns is never widened: ``set_plan_files``
         would restamp it to this session and hide the overwrite from the
         caller's own ``validate_plan_owner`` check, so the requests are kept.
         """
         assert self.artifacts is not None
-        self._scope_drift_report = None
+        if self._scope_drift_briefed:
+            self._scope_drift_report = None
         try:
             requests = self.artifacts.read_scope_requests()
             declared = list(self.artifacts.read_plan().get('files') or [])
@@ -5036,18 +5045,75 @@ class TaskWorkflow:
                 )
                 return
             if paths:
-                self._scope_drift_report = await self._widen_scope_uncontested(
+                report = await self._widen_scope_uncontested(
                     paths, declared, role=role, iteration=iteration,
                 )
+                carried = self._scope_drift_report
+                self._scope_drift_report = carried.merged_with(report) if carried else report
+                self._scope_drift_briefed = False
             if requests:
                 self.artifacts.clear_scope_requests()
         except Exception:
-            self._scope_drift_report = None
             logger.warning(
                 'Task %s: applying %s scope requests at iteration %s failed; '
                 'kept for the next boundary',
                 self.task_id, role, iteration, exc_info=True,
             )
+
+    def _scope_drift_for_brief(self) -> ScopeDriftReport | None:
+        """The report a writer prompt renders, marked briefed so the next boundary may drop it."""
+        self._scope_drift_briefed = True
+        return self._scope_drift_report
+
+    async def _brief_contested_scope_drift(self) -> bool:
+        """Brief a contested scope request no writer prompt has rendered; True when one ran.
+
+        Called where no further writer session is due (the execute loop's
+        exit, a green verify), so the agent told to revert or escalate a
+        contested file is always told.  Its own requests are applied at its
+        boundary like any other session's.  Runs at most once per contested
+        path, which bounds the green-verify re-loop.
+        """
+        report = self._scope_drift_report
+        if self._scope_drift_briefed or report is None:
+            return False
+        contested = {path for path, _holder in report.contested}
+        if contested <= self._scope_drift_followed_up:
+            return False
+        self._scope_drift_followed_up |= contested
+        assert self.worktree is not None
+
+        async def build_prompt() -> str:
+            drift = self._scope_drift_for_brief()
+            assert drift is not None
+            return await self.briefing.build_scope_drift_followup_prompt(
+                self._live_plan(), drift, task_id=self.task_id,
+            )
+
+        pre_head = await self._get_head_commit()
+        await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
+        assert self.artifacts is not None
+        self.artifacts.append_iteration_log({
+            'iteration': self.metrics.execute_iterations,
+            'agent': 'implementer',
+            'steps_attempted': [],
+            'steps_completed': [],
+            **await self._iteration_commit_provenance(pre_head),
+            'summary': f'Scope request follow-up for {sorted(contested)}',
+            'source': 'orchestrator',
+        })
+        await self._apply_scope_requests(
+            role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+        )
+        return True
+
+    async def _execute_done(self) -> WorkflowOutcome:
+        """EXECUTE's DONE, after briefing any contested scope request the last session filed."""
+        if await self._brief_contested_scope_drift() and any(
+            _is_gating_escalation(e) for e in self._check_escalations()
+        ):
+            return WorkflowOutcome.ESCALATED
+        return WorkflowOutcome.DONE
 
     async def _widen_scope_uncontested(
         self, paths: tuple[str, ...], declared: list[str], *, role: str, iteration: int,
@@ -9711,9 +9777,9 @@ class TaskWorkflow:
                             'summary': judge_verdict.get('reasoning', '')[:500],
                             'source': 'orchestrator',
                         })
-                        return WorkflowOutcome.DONE
+                        return await self._execute_done()
 
-        return WorkflowOutcome.DONE
+        return await self._execute_done()
 
     def _archive_then_cleanup_config_dir(self) -> None:
         """Tear down ``self._config_dir``, archiving its transcripts FIRST.
@@ -10382,7 +10448,7 @@ class TaskWorkflow:
         return await self.briefing.build_implementer_prompt(
             plan, rebase_notice=rebase_notice,
             task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
-            scope_drift=self._scope_drift_report,
+            scope_drift=self._scope_drift_for_brief(),
         )
 
     async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
@@ -11061,6 +11127,10 @@ class TaskWorkflow:
                 self._emit_rebase_verify_cost(rebase_notice, result)
             if not result.passed:
                 self._last_verify_result = result
+            if result.passed and await self._brief_contested_scope_drift():
+                if any(_is_gating_escalation(e) for e in self._check_escalations()):
+                    return WorkflowOutcome.ESCALATED
+                continue
             if result.passed:
                 self._verify_green_result = result
                 self._verify_green_runner = verdict_runner(
@@ -11190,7 +11260,7 @@ class TaskWorkflow:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
                     attempt_context=attempt_context,
-                    scope_drift=self._scope_drift_report,
+                    scope_drift=self._scope_drift_for_brief(),
                 )
 
             prior_causes.append(PriorAttemptCause(
@@ -12010,6 +12080,7 @@ class TaskWorkflow:
                 suggestions=in_scope,
                 locked_modules=locked_modules,
                 task_id=self.task_id,
+                scope_drift=self._scope_drift_for_brief(),
             )
 
         pre_head = await self._get_head_commit()

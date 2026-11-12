@@ -1231,6 +1231,7 @@ Before writing any new code, walk the pending steps in plan order:
         locked_modules: list[str],
         context: str | None = None,
         task_id: str | None = None,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for an amendment pass — implementer applies in-scope
         review suggestions without re-planning.
@@ -1283,13 +1284,15 @@ Before writing any new code, walk the pending steps in plan order:
                 block.append(f'**Suggested fix:** {fix}')
             suggestion_blocks.append('\n'.join(block))
         suggestions_body = '\n\n'.join(suggestion_blocks)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
 
 {identity}
 
-# Amendment Pass
+{scope_drift_section}# Amendment Pass
 
 The implementation for this task is complete and verification has passed.
 A code reviewer surfaced the suggestions below, all scoped to modules this
@@ -1579,10 +1582,13 @@ Your disposition is read from the `submit_merge_disposition` tool call, not from
         escalation_summary: str,
         resolution: str,
         worktree: Path | None = None,
+        scope_drift: ScopeDriftReport | None = None,
     ) -> str:
         """Build prompt for resuming after an escalation resolution."""
         context = await self._get_memory_context(BriefingScope.from_task(task), 'implementer')
         prior_proposal_section = self._format_prior_proposal(task)
+        scope_drift_block = _format_scope_drift(scope_drift)
+        scope_drift_section = f'{scope_drift_block}\n' if scope_drift_block else ''
 
         return f"""\
 {context}
@@ -1598,12 +1604,40 @@ This task was paused because an agent escalated a blocking issue.
 {resolution}
 
 {prior_proposal_section}
-## Action
+{scope_drift_section}## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
 is preserved in the worktree. Read `.task/plan.json` and
 `.task/iterations.jsonl` to understand current progress, then continue from
 where the previous agent left off.
+"""
+
+    async def build_scope_drift_followup_prompt(
+        self, plan: dict, scope_drift: ScopeDriftReport, task_id: str | None = None,
+    ) -> str:
+        """Prompt for the one session that briefs a contested scope request no writer saw.
+
+        ``workflow.py::TaskWorkflow._brief_contested_scope_drift`` runs it when
+        the session that filed the request was the last writer session due.
+        """
+        scope = _plan_scope(plan, task_id)
+        context = await self._get_memory_context(scope, 'implementer')
+        identity = self._agent_identity(scope.task_id, 'implementer')
+        return f"""\
+{context}
+
+{identity}
+
+# Scope Request Follow-up
+
+Every plan step is done, but a file reported with `report_missing_plan_file`
+is locked by another task. This session exists only to settle it.
+
+{_format_scope_drift(scope_drift)}
+## Action
+For each contested file: revert your edits to it and commit, keeping the
+task's tests passing, or escalate as the section above says. Make no other
+change. Do not edit `.task/plan.json`.
 """
 
     async def build_steward_initial_prompt(

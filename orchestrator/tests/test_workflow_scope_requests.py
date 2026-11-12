@@ -49,6 +49,7 @@ class _Rig:
     implementer_prompt: AsyncMock
     debugger_prompt: AsyncMock
     amender_prompt: AsyncMock
+    followup_prompt: AsyncMock
 
 
 def _make_workflow(tmp_path: Path) -> _Rig:
@@ -87,7 +88,9 @@ def _make_workflow(tmp_path: Path) -> _Rig:
     implementer_prompt = AsyncMock(return_value='Implement the plan')
     debugger_prompt = AsyncMock(return_value='Fix the failure')
     amender_prompt = AsyncMock(return_value='Amend')
+    followup_prompt = AsyncMock(return_value='Settle the contested file')
     briefing = MagicMock()
+    briefing.build_scope_drift_followup_prompt = followup_prompt
     briefing.build_implementer_prompt = implementer_prompt
     briefing.build_debugger_prompt = debugger_prompt
     briefing.build_amender_prompt = amender_prompt
@@ -117,6 +120,7 @@ def _make_workflow(tmp_path: Path) -> _Rig:
         implementer_prompt=implementer_prompt,
         debugger_prompt=debugger_prompt,
         amender_prompt=amender_prompt,
+        followup_prompt=followup_prompt,
     )
 
 
@@ -306,6 +310,72 @@ class TestImplementerScopeRequest:
         assert len(scheduler.acquire_uncontested_calls) == 1
         assert len(_scope_drift_events(events)) == 1
 
+    async def test_a_contested_request_in_the_last_session_gets_a_follow_up_session(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+        agent = AsyncMock(side_effect=_implementer_reporting_on_first_iteration(wf))
+
+        with (
+            patch('orchestrator.workflow.invoke_agent', agent),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._execute_iterations()
+            again = await wf._execute_iterations()
+
+        assert outcome == again == WorkflowOutcome.DONE
+        [followup_call] = rig.followup_prompt.await_args_list
+        drift = followup_call.args[1]
+        assert drift.contested == ((_REQUESTED, _HOLDER),)
+        assert agent.await_count == 2
+        _assert_never_repended(scheduler)
+
+    async def test_a_granted_request_in_the_last_session_needs_no_follow_up(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf = rig.wf
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+
+        outcome = await _run_execute_loop(wf)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert _plan_files(wf) == [_DECLARED, _REQUESTED]
+        rig.followup_prompt.assert_not_awaited()
+
+    async def test_a_contested_report_survives_the_escalation_gate_to_the_next_brief(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler = rig.wf, rig.scheduler
+        scheduler.contested_modules = {_REQUESTED: _HOLDER}
+        _write_dispatched_plan(wf, steps=2)
+        blocker = SimpleNamespace(severity='blocking', level=0)
+        gates = iter([[blocker]])
+        _stub_loop_collaborators(wf, monkeypatch, escalations=lambda: next(gates, []))
+
+        with (
+            patch(
+                'orchestrator.workflow.invoke_agent', new_callable=AsyncMock,
+                side_effect=_implementer_reporting_on_first_iteration(wf),
+            ),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            escalated = await wf._execute_iterations()
+            resumed = await wf._execute_iterations()
+
+        assert escalated == WorkflowOutcome.ESCALATED
+        assert resumed == WorkflowOutcome.DONE
+        resumed_brief = _scope_drift_kwargs(rig.implementer_prompt)[1]
+        assert resumed_brief is not None
+        assert resumed_brief.contested == ((_REQUESTED, _HOLDER),)
+        rig.followup_prompt.assert_not_awaited()
+
     async def test_requests_are_applied_before_the_escalation_gate(self, tmp_path, monkeypatch):
         wf = _make_workflow(tmp_path).wf
         _write_dispatched_plan(wf, steps=2)
@@ -465,3 +535,36 @@ class TestAmendmentPassScopeRequest:
         assert wf.artifacts.read_scope_requests() == (
             ScopeRequest(_REQUESTED, 'the fix lives here'),
         )
+
+
+@pytest.mark.asyncio
+async def test_a_contested_debugger_request_before_a_green_verify_is_followed_up_and_reverified(
+    tmp_path, monkeypatch
+):
+    rig = _make_workflow(tmp_path)
+    wf, scheduler = rig.wf, rig.scheduler
+    scheduler.contested_modules = {_REQUESTED: _HOLDER}
+    _write_dispatched_plan(wf, steps=1)
+    _stub_loop_collaborators(wf, monkeypatch)
+    rig.cfg.rebase_before_verify = False
+    rig.cfg.escalate_preexisting_main_break = False
+    rig.cfg.max_opaque_timeout_attempts = 3
+    rig.cfg.max_failure_signature_repeat = 5
+    rig.cfg.max_verify_attempts = 5
+    verify = AsyncMock(side_effect=[_failing_verify(), _passing_verify(), _passing_verify()])
+    monkeypatch.setattr(wf, '_run_scoped_verification_with_infra_retry', verify)
+    monkeypatch.setattr(wf, '_maybe_file_chronic_flakes', AsyncMock())
+
+    with (
+        patch(
+            'orchestrator.workflow.invoke_agent', new_callable=AsyncMock,
+            side_effect=_debugger_reporting_on_first_dispatch(wf),
+        ),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        outcome = await wf._verify_debugfix_loop()
+
+    assert outcome == WorkflowOutcome.DONE
+    [followup_call] = rig.followup_prompt.await_args_list
+    assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)
+    assert verify.await_count == 3

@@ -113,6 +113,28 @@ class ScopeDriftReport:
     acquired: tuple[str, ...]
     contested: tuple[tuple[str, str], ...]
 
+    def merged_with(self, later: ScopeDriftReport) -> ScopeDriftReport:
+        """This report folded with a *later* boundary's, for a writer not yet briefed.
+
+        A path the later boundary acquired is no longer contested; the later
+        boundary's holder wins for a path both contest.
+        """
+        acquired = tuple(dict.fromkeys((*self.acquired, *later.acquired)))
+        contested = {
+            path: holder for path, holder in self.contested if path not in acquired
+        }
+        contested.update(later.contested)
+        return ScopeDriftReport(
+            reason=(
+                IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT if contested else IMPLEMENT_SCOPE_EXPANDED
+            ),
+            role=later.role,
+            iteration=later.iteration,
+            requested=tuple(dict.fromkeys((*self.requested, *later.requested))),
+            acquired=acquired,
+            contested=tuple(contested.items()),
+        )
+
     def event_data(self) -> dict[str, Any]:
         return {
             'reason': self.reason,

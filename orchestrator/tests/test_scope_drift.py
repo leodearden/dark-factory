@@ -171,3 +171,21 @@ class TestBuildScopeDriftReport:
         assert isinstance(report, ScopeDriftReport)
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(report, field_name, 'other')
+
+
+class TestMergedWith:
+    def test_a_later_acquisition_clears_an_earlier_contest(self):
+        earlier = _report(['pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)])
+        later = _report(['pkg/b.py', 'pkg/c.py'], [Blocker('pkg/c.py', '9', BlockerKind.HELD)])
+        merged = earlier.merged_with(_report(['pkg/b.py'])).merged_with(later)
+        assert merged.acquired == ('pkg/b.py',)
+        assert merged.contested == (('pkg/c.py', '9'),)
+        assert merged.requested == ('pkg/b.py', 'pkg/c.py')
+        assert merged.reason == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT
+
+    def test_an_earlier_contest_survives_a_later_unrelated_grant(self):
+        earlier = _report(['pkg/b.py'], [Blocker('pkg/b.py', '777', BlockerKind.HELD)])
+        merged = earlier.merged_with(_report(['pkg/a.py']))
+        assert merged.acquired == ('pkg/a.py',)
+        assert merged.contested == (('pkg/b.py', '777'),)
+        assert merged.reason == IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT

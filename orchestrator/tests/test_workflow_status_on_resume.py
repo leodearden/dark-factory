@@ -443,7 +443,9 @@ class TestStatusPreservationOnResume:
         workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
         rendered: list[str] = []
 
-        async def build_resume_prompt(task, plan, escalation_summary, resolution, worktree=None):
+        async def build_resume_prompt(
+            task, plan, escalation_summary, resolution, worktree=None, scope_drift=None,
+        ):
             rendered.append(plan.get('analysis'))
             return 'Resume'
 

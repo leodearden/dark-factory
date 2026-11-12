@@ -122,6 +122,8 @@ class TestVerifyDebugfixLoopInvokesChronicFlakeHook:
         artifacts_stub: Any = object()
         workflow.artifacts = artifacts_stub
         workflow._last_verify_result = None
+        workflow._scope_drift_report = None
+        workflow._scope_drift_briefed = False
         workflow.task_id = '2358'
         workflow._task_verify = None
         return workflow
