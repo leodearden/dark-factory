@@ -2967,7 +2967,7 @@ def _failing_on_skip(instead: str) -> Iterator[None]:
 
 
 class TestTheFrontierArmSkipGuard:
-    """`_frontier_arm_judge` skips only an unreached provider; any other judge failure fails open and stays red."""
+    """`_frontier_arm_triage` skips only when the judge's fail-open was an unreached provider; any other fail-open fails the live test."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('handler', 'cause'), _UNREACHED_PROVIDER_CASES)
@@ -2976,10 +2976,7 @@ class TestTheFrontierArmSkipGuard:
     ) -> None:
         with patch('openai.AsyncOpenAI', side_effect=real_sdk_over(handler)), \
                 pytest.raises(pytest.skip.Exception) as excinfo:
-            await triage_write(
-                _mid_band_service(), content='c', project_id='p',
-                counter=TriageFailOpenCounter(), judge=_frontier_arm_judge([]),
-            )
+            await _frontier_arm_triage(_mid_band_service(), content='c', verdicts=[])
 
         reason = str(excinfo.value)
         assert 'api.openai.com' in reason
@@ -3004,18 +3001,14 @@ class TestTheFrontierArmSkipGuard:
     async def test_any_other_judge_failure_fails_open_and_keeps_the_live_test_red(
         self, construct: Callable[..., object], write_triage: dict[str, Any],
     ) -> None:
-        counter = TriageFailOpenCounter()
         verdicts: list[TriageJudgeVerdict] = []
 
         with patch('openai.AsyncOpenAI', side_effect=construct), \
-                _failing_on_skip('failing open'):
-            decision = await triage_write(
-                _mid_band_service(**write_triage), content='c', project_id='p',
-                counter=counter, judge=_frontier_arm_judge(verdicts),
+                _failing_on_skip('failing'), pytest.raises(pytest.fail.Exception):
+            await _frontier_arm_triage(
+                _mid_band_service(**write_triage), content='c', verdicts=verdicts,
             )
 
-        assert decision.outcome == OUTCOME_STORED
-        assert counter.live_count() == 1
         assert verdicts == []
 
 
