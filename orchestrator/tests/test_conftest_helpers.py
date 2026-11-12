@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards seven invariants that would silently regress under refactoring
+This module guards eight invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
