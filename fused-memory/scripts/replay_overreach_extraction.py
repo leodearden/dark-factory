@@ -510,6 +510,12 @@ def record_key(record: Mapping[str, Any]) -> RecordKey:
     return (record['arm'], record['graph'], record['uuid'])
 
 
+def _record_effort(record: Mapping[str, Any]) -> str | None:
+    """A record's reasoning effort. A record written before task 9065 has no such key: its
+    client sent none, so it reads as None."""
+    return record.get('reasoning_effort')
+
+
 def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str, Any]:
     return {
         'kind': RecordKind.replayed, 'arm': result.arm, 'model': result.model,
@@ -723,11 +729,11 @@ def token_totals(records: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, in
     return {stage: dict(total) for stage, total in sorted(totals.items())}
 
 
-def _only(records: Iterable[Mapping[str, Any]], field: str) -> Any:
-    values = {record[field] for record in records}
-    if len(values) != 1:
-        raise ReplayFileError(f'one arm holds records with {field} {sorted(map(str, values))}')
-    return values.pop()
+def _only(field: str, values: Iterable[Any]) -> Any:
+    distinct = set(values)
+    if len(distinct) != 1:
+        raise ReplayFileError(f'one arm holds records with {field} {sorted(map(str, distinct))}')
+    return distinct.pop()
 
 
 def arm_score(
@@ -737,8 +743,11 @@ def arm_score(
     rows = [_audit_row(record) for record in replayed.values()]
     weighted = population_weighted_rates(rows, verdicts, baseline.window_population, baseline.window_days)
     return {
-        'model': _only(replayed.values(), 'model'),
-        'instructions_version': _only(replayed.values(), 'instructions_version'),
+        'model': _only('model', (record['model'] for record in replayed.values())),
+        'reasoning_effort': _only('reasoning_effort', map(_record_effort, replayed.values())),
+        'instructions_version': _only(
+            'instructions_version', (record['instructions_version'] for record in replayed.values()),
+        ),
         'episodes': len(rows),
         'minted': sum(len(row['minted']) for row in rows),
         'rates': {
@@ -895,12 +904,6 @@ def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClien
             return None
         clients[llm] = client
     return tuple((arm, clients[arm.llm]) for arm in arms)
-
-
-def _record_effort(record: Mapping[str, Any]) -> str | None:
-    """A record's reasoning effort. A record written before task 9065 has no such key: its
-    client sent none, so it reads as None."""
-    return record.get('reasoning_effort')
 
 
 def _client_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
