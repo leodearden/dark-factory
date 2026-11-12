@@ -524,9 +524,10 @@ def needs_human(record: PinRecord) -> bool:
     """Can only a human dispose of this ONE record — no steward applies?
 
     True for a born-at-L2 severity (``critical``/``urgent``, routed straight
-    to a human) at any level, or for a ``level >= HUMAN_PARKED_MIN_LEVEL``
-    record that :func:`is_queue_handoff` calls a handoff (PRD
-    ``plans/info-l0-disposition-router-prd.md`` D3), so an info L2 never needs
+    to a human; matched exactly, not normalised) at any level, or for a
+    ``level >= HUMAN_PARKED_MIN_LEVEL`` record that :func:`is_queue_handoff`
+    calls a handoff (PRD ``plans/info-l0-disposition-router-prd.md`` D3),
+    so an info L2 never needs
     one and an unknown severity fails safe to needing one.  Consumers:
     ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation``
     together with the entry and tail checks of

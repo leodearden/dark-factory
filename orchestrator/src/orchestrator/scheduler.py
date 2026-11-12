@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     # (get_by_task) on an injected EscalationQueue instance (harness.py wires
     # the real one at startup) — no runtime import needed, avoiding a
     # scheduler<->escalation module-load coupling.
+    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
 # Geometric emission schedule for per-task diagnostics that can repeat every
@@ -1397,7 +1398,7 @@ def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, s
     return degraded
 
 
-def _describe_unpinning_records(rows: Sequence[Any]) -> str:
+def _describe_records_flipped_past(rows: Sequence[Escalation]) -> str:
     """Name the open records a stranded-blocked flip went past; the caller
     has already decided that none of them pins."""
     if not rows:
@@ -6594,7 +6595,7 @@ class Scheduler:
                     'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
                     'pending (no live claimant, deps satisfied, %s)',
                     tid,
-                    _describe_unpinning_records(rows),
+                    _describe_records_flipped_past(rows),
                 )
                 await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:

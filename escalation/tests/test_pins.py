@@ -1178,6 +1178,11 @@ _NEEDS_HUMAN_TABLE: list[tuple[Escalation, bool]] = [
     (_esc(id='esc-42-12', severity='weird', level=2), True),
     (_esc(id='esc-42-13', severity='weird', level=1), False),
     (_esc(id='esc-42-14', severity='', level=2), True),
+    # The born-at-L2 membership is raw, unlike the chain's normalised
+    # severity, so a re-spelt critical below L2 needs no human.  Normalising
+    # it would change what gates merge entry.
+    (_esc(id='esc-42-15', severity='CRITICAL', level=0), False),
+    (_esc(id='esc-42-16', severity=' critical ', level=1), False),
 ]
 
 _NON_BORN_AT_L2_TABLE_SEVERITIES = sorted(
@@ -1187,15 +1192,15 @@ _NON_BORN_AT_L2_TABLE_SEVERITIES = sorted(
 
 class TestNeedsHuman:
     """``needs_human`` answers "can only a human dispose of this ONE record?"
-    by composing the shared chain's handoff answer with the level, never by a
-    second severity predicate (INV-5)."""
+    with a raw ``BORN_AT_L2_SEVERITIES`` membership check, or, at L2 and
+    above, the shared chain's handoff answer."""
 
     @pytest.mark.parametrize(('record', 'expected'), _NEEDS_HUMAN_TABLE, ids=lambda v: getattr(v, 'id', None))
     def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
         assert needs_human(record) is expected
 
-    @pytest.mark.parametrize(('record', 'expected'), _NEEDS_HUMAN_TABLE, ids=lambda v: getattr(v, 'id', None))
-    def test_is_pure(self, record: Escalation, expected: bool) -> None:
+    @pytest.mark.parametrize('record', [record for record, _ in _NEEDS_HUMAN_TABLE], ids=lambda v: v.id)
+    def test_is_pure(self, record: Escalation) -> None:
         before = record.to_dict()
         needs_human(record)
         assert record.to_dict() == before
