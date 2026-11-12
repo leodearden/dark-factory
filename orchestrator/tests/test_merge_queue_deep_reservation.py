@@ -37,7 +37,7 @@ from _merge_lane_fakes import (
     raises,
     running_lane,
 )
-from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
+from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_lane_coalesce_admission import _TrainHooks
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -111,11 +111,13 @@ async def _request(scene: _Scene, name: str, **identity: Any) -> MergeRequest:
     )
 
 
-async def _until(predicate: Callable[[], bool], *, label: str) -> None:
+async def _until(
+    predicate: Callable[[], bool], *, label: str, timeout: float = MERGE_RESULT_TIMEOUT,
+) -> None:
     async def _poll() -> None:
         while not predicate():
             await asyncio.sleep(_POLL_SECS)
-    await wait_responsive(_poll(), label=label)
+    await wait_responsive(_poll(), timeout=timeout, label=label)
 
 
 def _reservations(lane: MergeLane) -> list[dict[str, Any]]:
@@ -244,6 +246,12 @@ def _verify_events_for(scene: _Scene, task_ids: set[str]) -> list[dict[str, Any]
         event for event in scene.events.fetch_events_by_type(EventType.merge_verify)
         if event.get('task_id') in task_ids
     ]
+
+
+def _assert_verified_on_their_own(scene: _Scene, names: tuple[str, ...]) -> None:
+    for name in names:
+        own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
+        assert own, f'{name} was never verified on its own'
 
 
 class TestAGreenTipLandsTheReservedPrefix:
@@ -386,9 +394,7 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         outcomes = await _outcomes(rnd, names)
         assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
         assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names)
-        for name in ('F1', 'F2'):
-            own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
-            assert own, f'{name} was never verified on its own'
+        _assert_verified_on_their_own(scene, ('F1', 'F2'))
         landed = await _landed_task_files(scene)
         assert (landed[:2], sorted(landed[2:])) == (['H', 'P'], sorted(names))
         assert _reservations(rnd.lane) == []
@@ -427,6 +433,141 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             rnd.reqs['S'].result.cancel()
             await self._assert_links_go_their_own_way(scene, rnd, s_status='abandoned')
+
+
+async def _tip_passed_and_landed_its_head(
+    rnd: _Round, release_s: asyncio.Event, s_entered: asyncio.Event,
+) -> str:
+    """S's tip passes while H and P are held, and H lands on the tip's
+    authority; P, still verifying on 'p-host', stands between the passed tip
+    and its finalize. Returns the reservation's tip."""
+    lane, reqs = rnd.lane, rnd.reqs
+    await wait_responsive(
+        s_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label="S's tip verify under way",
+    )
+    release_s.set()
+    outcome = await wait_responsive(reqs['H'].result, label="H landed on S's tip authority")
+    assert outcome.status == 'done', outcome
+    assert [r['link_task_ids'] for r in _reservations(lane)] == [['F1', 'F2']]
+    assert not any(reqs[name].result.done() for name in ('F1', 'F2'))
+    p_host = next(remote for remote in rnd.remotes if remote.name == 'p-host')
+    assert not reqs['P'].result.done() and p_host.live, "P's verify is no longer live on p-host"
+    (row,) = _reservations(lane)
+    return row['tip']
+
+
+class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
+    """E: a tip that passed, torn down by the head-failure cascade before its
+    own finalize, ends its reservation; its links then land on their own."""
+
+    async def test_an_abandoned_p_cascades_over_the_passed_tip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
+        ) as rnd:
+            await _tip_passed_and_landed_its_head(rnd, release_s, s_entered)
+            rnd.reqs['P'].result.cancel()
+            await _until(
+                lambda: _reservations(rnd.lane) == [],
+                label="the cascade ended the passed tip's reservation",
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            )
+            rnd.release_head.set()
+            rnd.release_p.set()
+            outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
+            assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(outcomes)
+            _assert_verified_on_their_own(scene, ('F1', 'F2'))
+            landed = await _landed_task_files(scene)
+            assert (landed[:1], sorted(landed[1:])) == (['H'], ['F1', 'F2', 'S'])
+            assert _reservations(rnd.lane) == []
+            assert rnd.lane.speculation_accounting_violations() == []
+
+
+async def _git_retrying_index_lock(repo: Path, *argv: str) -> None:
+    """Run one git command, retrying while the live lane holds the repo's index lock."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MERGE_GATE_BARRIER_TIMEOUT
+    while True:
+        rc, _, err = await _run(['git', *argv], cwd=repo)
+        if rc == 0:
+            return
+        assert 'index.lock' in err and loop.time() < deadline, err
+        await asyncio.sleep(_POLL_SECS)
+
+
+async def _move_main_by_a_foreign_commit(scene: _Scene) -> None:
+    """Move main the way a human direct commit does, disjoint from every task
+    file, which ``_landed_task_files`` reads as ``*.txt``. Its one file is
+    staged alone: ``add -A`` would race the lane's live merge worktrees."""
+    repo = scene.git_ops.project_root
+    (repo / 'FOREIGN.md').write_text('landed elsewhere\n')
+    await _git_retrying_index_lock(repo, 'add', 'FOREIGN.md')
+    await _git_retrying_index_lock(repo, 'commit', '-m', 'Foreign landing')
+
+
+def _gate_decided_reverify(scene: _Scene, task_id: str) -> bool:
+    return any(
+        event['task_id'] == task_id and event['data'].get('reverify') is True
+        for event in scene.events.fetch_events_by_type(EventType.merge_reverify_gate)
+    )
+
+
+async def _reaches_main(scene: _Scene, sha: str) -> bool:
+    rc, _, err = await _run(
+        ['git', 'merge-base', '--is-ancestor', sha, 'main'], cwd=scene.git_ops.project_root,
+    )
+    assert rc in (0, 1), err
+    return rc == 0
+
+
+class TestEBPassedTipTornDownBehindAGateDispatchedHeadReleasesItsLinks:
+    """E: a tip that passed, torn down when the head in front of it is gate
+    re-verified as a dispatch of its rebased commit (task 8525), ends its
+    reservation; nothing lands twice, and the old tip never reaches main.
+
+    'head-host' stays held until the reservation is seen gone, so the rebased
+    head or S's re-dispatch waits there and S cannot land first: S's own
+    finalize, which ends any reservation S owns, is not what releases it.
+    """
+
+    async def test_a_gate_dispatched_rebased_p_tears_down_the_passed_tip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        release_s, s_entered = asyncio.Event(), asyncio.Event()
+        async with _deep_round(
+            scene, ('F1', 'F2'), s_script=hangs_until(release_s, entered=s_entered),
+        ) as rnd:
+            lane, reqs = rnd.lane, rnd.reqs
+            old_tip = await _tip_passed_and_landed_its_head(rnd, release_s, s_entered)
+            await _move_main_by_a_foreign_commit(scene)
+            rnd.release_p.set()
+            await _until(
+                lambda: _gate_decided_reverify(scene, 'P'),
+                label="P's gate decided a full re-verify of its rebased commit",
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            )
+            await _until(
+                lambda: (
+                    all(r['tip'] != old_tip for r in _reservations(lane))
+                    and not reqs['S'].result.done()
+                ),
+                label="the gate's dispatch ended the passed tip's reservation before S landed",
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            )
+            rnd.release_head.set()
+            names = ('H', 'P', 'S', 'F1', 'F2')
+            outcomes = await _outcomes(rnd, names)
+            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
+            assert sorted(await _landed_task_files(scene)) == sorted(names)
+            assert not await _reaches_main(scene, old_tip)
+            assert _reservations(lane) == []
+            assert lane.speculation_accounting_violations() == []
+            assert lane.two_layer_invariants(await _main_sha(scene)) == []
 
 
 class TestBTheReservationIsTimeLimited:
