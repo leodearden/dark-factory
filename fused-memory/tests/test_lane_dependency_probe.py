@@ -5,16 +5,14 @@ FalkorDB is covered by its unreachable case only; a write-refusing FalkorDB woul
 
 from __future__ import annotations
 
-import errno
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +24,7 @@ from _fm_helpers import (
     load_script_module,
 )
 from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from _fm_sockets import has_pending_connection, refused_port, silent_listener
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from fused_memory.config.falkordb_endpoints import (
@@ -42,32 +41,6 @@ PROBE_LEASE_PREFIX = 'lane-dependency-probe.'
 CONFIG_PATH = FM_ROOT / 'config' / 'config.yaml'
 SUBPROCESS_TIMEOUT_SECS = 120
 EMPTY_COLLECTIONS = json.dumps({'result': {'collections': []}, 'status': 'ok', 'time': 0.0}).encode()
-
-
-@contextmanager
-def refused_port() -> Iterator[int]:
-    with closing(socket.socket()) as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        yield reservation.getsockname()[1]
-
-
-@contextmanager
-def silent_listener() -> Iterator[socket.socket]:
-    """A port that completes TCP handshakes and never answers, so a client that dials it is detectable."""
-    with closing(socket.socket()) as listener:
-        listener.bind(('127.0.0.1', 0))
-        listener.listen()
-        listener.setblocking(False)
-        yield listener
-
-
-def has_pending_connection(listener: socket.socket) -> bool:
-    try:
-        connection, _ = listener.accept()
-    except BlockingIOError:
-        return False
-    connection.close()
-    return True
 
 
 def lease_files(directory: Path) -> list[str]:
@@ -166,23 +139,6 @@ def write_refusing_qdrant(watched_lease_dir: Path | None = None) -> Iterator[Run
         thread.join()
 
 
-def test_a_refused_port_turns_connects_away_and_cannot_be_bound_while_held() -> None:
-    with refused_port() as port:
-        with pytest.raises(ConnectionRefusedError):
-            socket.create_connection(('127.0.0.1', port), timeout=5)
-        with pytest.raises(OSError) as bind:
-            ThreadingHTTPServer(('127.0.0.1', port), WriteRefusingQdrant)
-
-    assert bind.value.errno == errno.EADDRINUSE
-
-
-def test_a_silent_listener_reports_whether_anything_dialled_it() -> None:
-    with silent_listener() as undialled, silent_listener() as dialled:
-        with socket.create_connection(dialled.getsockname(), timeout=5):
-            assert has_pending_connection(dialled)
-        assert not has_pending_connection(undialled)
-
-
 def test_unreachable_qdrant_is_an_outage_naming_qdrant(lease_dir: Path) -> None:
     with refused_port() as port:
         result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{port}'})
@@ -250,7 +206,7 @@ def test_a_bad_dependency_name_is_a_broken_probe_not_an_outage(lease_dir: Path) 
     assert result.stdout == ''
 
 
-def test_the_configuration_defaults_name_the_endpoints_the_integration_tests_use(
+def test_the_probe_checks_the_endpoints_the_integration_tests_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = load_script_module(SCRIPT, 'lane_dependency_probe_under_test')

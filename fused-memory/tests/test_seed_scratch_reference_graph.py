@@ -17,10 +17,9 @@ from pathlib import Path
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, await_index_operational, falkor_skipif
 from _fm_helpers import load_script_module
-from arm_harness.test_live_replay_integration import INDEX_DEFINITION_QUERY
+from _fm_sockets import refused_port
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
-from test_lane_dependency_probe import refused_port
 
 from fused_memory.arm_harness.topology import read_topology, topology_hash
 from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
@@ -28,6 +27,7 @@ from fused_memory.config.falkordb_endpoints import PRODUCTION_FALKORDB
 SEED = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'seed_scratch_reference_graph.py'
 )
+INDEX_DEFINITION_QUERY = SEED.INDEX_DEFINITION_QUERY
 
 SEED_CYPHER = (
     'CREATE (a:Entity {uuid: "n-merge", name: "merge worker", group_id: $g, '

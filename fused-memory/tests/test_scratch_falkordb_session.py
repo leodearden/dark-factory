@@ -5,15 +5,14 @@ conftest's ``pytest_configure`` exactly as a lane or developer session does.
 """
 
 import os
-import socket
 import subprocess
 import sys
 from collections.abc import Iterator
-from contextlib import closing
 from pathlib import Path
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT
+from _fm_sockets import refused_port
 from shared.lane_probe import LANE_ROLE_VARIABLE, OFFLINE_LANE_ROLE
 
 from fused_memory.config.falkordb_endpoints import FALKOR_HOST_ENV, FALKOR_PORT_ENV, FalkorEndpoint
@@ -26,10 +25,9 @@ SESSION_STEERING_VARIABLES = frozenset({FALKOR_HOST_ENV, FALKOR_PORT_ENV, 'FALKO
 
 
 @pytest.fixture
-def refused_port() -> Iterator[int]:
-    with closing(socket.socket()) as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        yield reservation.getsockname()[1]
+def unreachable_port() -> Iterator[int]:
+    with refused_port() as port:
+        yield port
 
 
 def collect_this_file(**environment: str) -> subprocess.CompletedProcess[str]:
@@ -63,8 +61,8 @@ def test_a_session_aimed_at_production_is_a_usage_error() -> None:
     assert 'production' in output
 
 
-def test_a_lane_session_with_an_unreachable_scratch_server_fails(refused_port: int) -> None:
-    unreachable = FalkorEndpoint('127.0.0.1', refused_port)
+def test_a_lane_session_with_an_unreachable_scratch_server_is_a_usage_error(unreachable_port: int) -> None:
+    unreachable = FalkorEndpoint('127.0.0.1', unreachable_port)
 
     result = collect_this_file(**{
         LANE_ROLE_VARIABLE: OFFLINE_LANE_ROLE,
@@ -73,13 +71,13 @@ def test_a_lane_session_with_an_unreachable_scratch_server_fails(refused_port: i
     })
 
     output = result.stdout + result.stderr
-    assert result.returncode != pytest.ExitCode.OK, output
+    assert result.returncode == pytest.ExitCode.USAGE_ERROR, output
     assert unreachable.uri in output
     assert 'falkordb-scratch' in output
 
 
-def test_outside_the_lane_an_unreachable_scratch_server_still_collects(refused_port: int) -> None:
-    result = collect_this_file(**{FALKOR_HOST_ENV: '127.0.0.1', FALKOR_PORT_ENV: str(refused_port)})
+def test_outside_the_lane_an_unreachable_scratch_server_still_collects(unreachable_port: int) -> None:
+    result = collect_this_file(**{FALKOR_HOST_ENV: '127.0.0.1', FALKOR_PORT_ENV: str(unreachable_port)})
 
     assert result.returncode in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED), (
         result.stdout + result.stderr
