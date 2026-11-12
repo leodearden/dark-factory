@@ -8699,9 +8699,12 @@ def create_mcp_server(
             fields: Optional row projection.  None returns full rows, unchanged.  Each
                 entry is a top-level row key or ``metadata.<key>`` (key matching
                 ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
-                metadata key absent on a task is omitted.  An invalid entry is a
-                ValidationError carrying ``field`` and ``allowed``.  Composes with
-                ``statuses`` and ``page_size``.
+                metadata key absent on a task, or a requested row key the store's schema
+                lacks, is omitted.  An invalid entry is a ValidationError carrying
+                ``field`` and ``allowed``.  Composes with ``statuses`` and ``page_size``.
+                The row keys are ``backends/task_projection.py::TASK_ROW_KEYS``; among
+                them ``created_at`` is the filing time and ``created_at_source`` its
+                provenance (stamped | first_event | pending_since | updated_at).
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs

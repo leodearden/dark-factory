@@ -37,6 +37,7 @@ from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -1453,7 +1454,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             metadata = {}
 
     row_keys = row.keys()
-    return {
+    task: dict[str, Any] = {
         'id': str(row['id']),
         'title': row['title'],
         'description': row['description'] or '',
@@ -1472,6 +1473,12 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
         'candidate_key': row['candidate_key'] if 'candidate_key' in row_keys else None,
     }
+    # Omitted, not None, on a connection whose v6 ALTER never landed: None is
+    # reserved for a migrated row the backfill has not reached yet.
+    if 'created_at' in row_keys:
+        task['created_at'] = row['created_at']
+        task['created_at_source'] = row['created_at_source']
+    return task
 
 
 def _updated_task_response(
@@ -3006,12 +3013,13 @@ class SqliteTaskBackend:
                 # BEFORE _validate_metadata_on_write deliberately: that call
                 # must see the blob that is actually persisted, or enforce-mode
                 # validates a different value than the one on disk. One hoisted
-                # `now` is bound to BOTH the anchor and the INSERT's
-                # updated_at, so a freshly inserted pending row satisfies
-                # `pending_since == updated_at` exactly -- the same identity the
-                # one-shot v4->v5 back-fill establishes for the legacy
-                # population, rather than two `task_timestamp_now()` calls a millisecond
-                # apart. `candidate_key` above stays on the pre-stamp value: it
+                # `now` is bound to the anchor and to the INSERT's updated_at
+                # and created_at, so a freshly inserted pending row satisfies
+                # `pending_since == updated_at == created_at` exactly, rather
+                # than three `task_timestamp_now()` calls a millisecond apart;
+                # the first equality is the identity the one-shot v4->v5
+                # back-fill establishes for the legacy population.
+                # `candidate_key` above stays on the pre-stamp value: it
                 # keys off title + metadata['files'] only — neither stripped
                 # key participates, so the strip below cannot move it.
                 #
@@ -3078,14 +3086,15 @@ class SqliteTaskBackend:
                     """
                         INSERT INTO tasks (tag, id, title, description,
                                            details, test_strategy, status, priority,
-                                           metadata, updated_at, candidate_key)
-                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                                           metadata, updated_at, candidate_key,
+                                           created_at, created_at_source)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
                         """,
                     (
                         tag, next_id, title,
                         description or '', details or '',
                         status, priority or 'medium', metadata, now,
-                        candidate_key,
+                        candidate_key, now, CreatedAtSource.STAMPED.value,
                     ),
                 )
                 if self._after_insert_fault_hook is not None:
