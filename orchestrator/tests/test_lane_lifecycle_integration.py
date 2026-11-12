@@ -176,7 +176,6 @@ class TestB1WriterReaderRoundTrip:
 # ── B2 — crash->quarantine (orphaned admin-entry divergence) ───────────
 
 
-@pytest.mark.asyncio
 async def _assert_parked_once(git_ops: GitOps, lane: Path) -> None:
     """*lane* left worktree_base for exactly one quarantine parking, its branch renamed to match.
 
@@ -190,6 +189,7 @@ async def _assert_parked_once(git_ops: GitOps, lane: Path) -> None:
     assert await git_ops.resolve_branch_sha(f'task/{parkings[0].name}') is not None
 
 
+@pytest.mark.asyncio
 class TestB2CrashQuarantine:
     """B2: crash-recovery divergence between the durable record and git
     reality must QUARANTINE, never re-pin. Two distinct divergence shapes
