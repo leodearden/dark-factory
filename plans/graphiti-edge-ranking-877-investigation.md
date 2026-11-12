@@ -108,13 +108,22 @@ The mechanisms still apply to every edge search.
 ## 8. What this task changed
 
 - `GraphitiBackend.search` passes graphiti
-  `search_filter=graphiti_client.py::_active_edge_filter()`, the graphiti
-  filter spelling of `_ACTIVE_EDGE_PREDICATE`. Both legs' WHERE now carries
-  `e.invalid_at IS NULL`, so a retired edge takes no leg or fused slot.
+  `search_filter=graphiti_client.py::_active_edge_filter()`. That filter is
+  now the active-edge invariant's single home: `_ACTIVE_EDGE_PREDICATE` is
+  compiled from it with graphiti's `edge_search_filter_query_constructor`.
+  Both legs' WHERE now carries `invalid_at IS NULL`, so a retired edge takes
+  no leg or fused slot.
 - `MemoryService`'s post-hoc `_edge_is_retired` checks stay in place as
   redundant enforcement.
 - Graphiti's internal search during `add_episode` does not go through
   `GraphitiBackend.search`, so the write path is untouched.
+- Arm-harness ranks change meaning. `arm_harness/retrieval.py::probe_retrieval_utility`
+  and `arm_harness/embedding_graph_phase.py::_known_item_rank` both call
+  `GraphitiBackend.search`, so their known-item and retrieval-utility ranks
+  now exclude retired edges. A known item whose only citing edge was
+  invalidated during replay used to count as a hit and now counts as a miss.
+  Arm results recorded before task 6523 are therefore not like-for-like with
+  later ones.
 - Tests: `fused-memory/tests/test_graphiti_search_active_edges.py`, a
   default-suite Cypher pin plus a live-FalkorDB pin marked `integration`.
 - Expected effect on this query: retired `5bf20c42` leaves BM25 rank 2. This

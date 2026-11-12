@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
@@ -32,7 +32,12 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
-from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters
+from graphiti_core.search.search_filters import (
+    ComparisonOperator,
+    DateFilter,
+    SearchFilters,
+    edge_search_filter_query_constructor,
+)
 
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
@@ -537,16 +542,26 @@ class IncompleteEnumerationError(Exception):
 # `expired_at` clause would hide exactly the edges they restore (task 4714,
 # esc-4714-9).
 #
-# Every read answering "what is currently true?" interpolates this constant.
+# Every read answering "what is currently true?" applies this invariant: reads
+# through graphiti's own search pass `_active_edge_filter()`, and Cypher written
+# here interpolates `_ACTIVE_EDGE_PREDICATE`, which is compiled from that filter.
 # Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
 # retired edges; `count_foreign_relationships` most emphatically so.
-# `_active_edge_filter` is the same invariant spelled as a graphiti filter.
-_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
-
-
 def _active_edge_filter() -> SearchFilters:
-    """``_ACTIVE_EDGE_PREDICATE`` as graphiti SearchFilters, for reads through graphiti's own search; it compiles to ``((e.invalid_at IS NULL))``."""
+    """The active-edge invariant as graphiti SearchFilters, for reads through graphiti's own search."""
     return SearchFilters(invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]])
+
+
+def _compile_active_edge_predicate() -> str:
+    [predicate], params = edge_search_filter_query_constructor(
+        _active_edge_filter(), GraphProvider.FALKORDB,
+    )
+    if params:
+        raise RuntimeError(f'the active-edge predicate must bind no parameters, got {params!r}')
+    return predicate
+
+
+_ACTIVE_EDGE_PREDICATE = _compile_active_edge_predicate()
 
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
