@@ -40,6 +40,7 @@ from legibility import (
     census_findings,
     census_headroom,
     census_identity,
+    census_mining,
     census_state,
     census_trigger,
     census_window,
@@ -292,27 +293,27 @@ def _record(*, matches=None, candidates=None):
 
 def test_is_duplicate_false_when_record_has_a_candidate():
     record = _record(candidates=[{"title": "a novel shape"}])
-    assert mod.is_duplicate(record) is False
+    assert census_mining.is_duplicate(record) is False
 
 
 def test_is_duplicate_true_for_matches_only_record():
     record = _record(matches=[{"entry_id": "entry-a"}])
-    assert mod.is_duplicate(record) is True
+    assert census_mining.is_duplicate(record) is True
 
 
 def test_is_duplicate_true_for_empty_record():
     record = _record()
-    assert mod.is_duplicate(record) is True
+    assert census_mining.is_duplicate(record) is True
 
 
 def test_batch_dup_rate_nine_of_ten_duplicates():
     records = [_record(matches=[{"entry_id": "entry-a"}]) for _ in range(9)]
     records.append(_record(candidates=[{"title": "novel"}]))
-    assert mod.batch_dup_rate(records) == pytest.approx(0.9)
+    assert census_mining.batch_dup_rate(records) == pytest.approx(0.9)
 
 
 def test_batch_dup_rate_empty_batch_is_zero_no_zero_division():
-    assert mod.batch_dup_rate([]) == 0.0
+    assert census_mining.batch_dup_rate([]) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +352,7 @@ def test_mine_to_saturation_stops_after_two_consecutive_saturated_batches():
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
     fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
@@ -381,7 +382,7 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
     fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
@@ -440,7 +441,7 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
         _mining_response_fn_with_failures(novel_sessions, fail_sessions)
     )
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
@@ -496,7 +497,7 @@ def test_mine_to_saturation_stops_at_operator_batch_cap():
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
     fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
@@ -517,7 +518,7 @@ def test_mine_to_saturation_cap_not_reached_leaves_stop_reason_unchanged():
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
     fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, max_batches=99, invariant_slugs=(),
     )
@@ -540,7 +541,7 @@ def test_mine_to_saturation_saturation_at_the_cap_reports_saturated_not_capped()
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
     fake_invoke = _make_fake_invoke(_mining_response_fn({"b0-0", "b1-0"}))
 
-    result = mod.mine_to_saturation(
+    result = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
@@ -557,7 +558,7 @@ def test_mine_to_saturation_records_max_batches_on_result():
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
 
     source, novel_sessions = _never_saturating_source(3)
-    capped = mod.mine_to_saturation(
+    capped = census_mining.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions)),
         max_batches=2, invariant_slugs=(),
@@ -565,7 +566,7 @@ def test_mine_to_saturation_records_max_batches_on_result():
     assert capped.max_batches == 2, "the cap must travel on the result for the report"
 
     source2, novel_sessions2 = _never_saturating_source(3)
-    flagless = mod.mine_to_saturation(
+    flagless = census_mining.mine_to_saturation(
         source2, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)), invariant_slugs=(),
     )
@@ -585,7 +586,7 @@ def test_mine_to_saturation_rejects_a_nonpositive_batch_cap(bad_cap):
     saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
 
     with pytest.raises(ValueError, match="max_batches"):
-        mod.mine_to_saturation(
+        census_mining.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
             config=saturation, invoke=_poison("invoke"), max_batches=bad_cap, invariant_slugs=(),
         )
@@ -1000,11 +1001,11 @@ def test_build_task_payloads_priority_defaults_to_the_default_severity():
 # ---------------------------------------------------------------------------
 
 def _sample_mining_result():
-    return mod.MiningResult(
+    return census_mining.MiningResult(
         records=[],
         batch_stats=[
-            mod.BatchStats(index=0, total=10, succeeded=10, failed=0, dup_rate=0.5, saturated=False),
-            mod.BatchStats(index=1, total=10, succeeded=10, failed=0, dup_rate=0.9, saturated=True),
+            census_mining.BatchStats(index=0, total=10, succeeded=10, failed=0, dup_rate=0.5, saturated=False),
+            census_mining.BatchStats(index=1, total=10, succeeded=10, failed=0, dup_rate=0.9, saturated=True),
         ],
         stop_reason="saturated",
     )
@@ -1300,10 +1301,10 @@ def _sample_synthesis_record() -> dict[str, Any]:
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
-    return mod.MiningResult(
+    return census_mining.MiningResult(
         records=[],
         batch_stats=[
-            mod.BatchStats(
+            census_mining.BatchStats(
                 index=i, total=10, succeeded=10, failed=0, dup_rate=0.1, saturated=False,
             )
             for i in range(batches)
@@ -1320,14 +1321,14 @@ def _storm_capped_mining_result():
     provably a shape mine_to_saturation really produces, not an invented one.
     Batch 0 is healthy (10/10 coded); batch 1 is a storm (6 of 10 digests
     failed to parse and so contributed no signal). drawn = 20, coded = 14."""
-    return mod.MiningResult(
+    return census_mining.MiningResult(
         records=[],
         batch_stats=[
-            mod.BatchStats(
+            census_mining.BatchStats(
                 index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
                 saturated=False, status=coder.CodingStatus.OK,
             ),
-            mod.BatchStats(
+            census_mining.BatchStats(
                 index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
                 saturated=False, status=coder.CodingStatus.FAILURE,
             ),
@@ -1344,7 +1345,7 @@ def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
     record = _census_record(mining_result=_storm_capped_mining_result())
     restored = json.loads(json.dumps(record))
 
-    batches = [mod.BatchStats.from_record(stats) for stats in restored["mining"]["batch_stats"]]
+    batches = [census_mining.BatchStats.from_record(stats) for stats in restored["mining"]["batch_stats"]]
 
     assert batches == _storm_capped_mining_result().batch_stats
     assert all(isinstance(batch.status, coder.CodingStatus) for batch in batches)
@@ -7289,12 +7290,12 @@ def _two_batch_source_with_a_failing_second_batch():
     return source, fake_invoke, saturation, fail_a, fail_b
 
 
-def _census_warnings(caplog):
-    """Only this module's own WARNING records — never `legibility.coder`'s
+def _warnings_from(caplog, logger_name):
+    """Only the WARNING records of one census logger — never `legibility.coder`'s
     per-digest lines, which a bare substring match would happily pick up."""
     return [
         r for r in caplog.records
-        if r.name == "legibility.census" and r.levelno == logging.WARNING
+        if r.name == logger_name and r.levelno == logging.WARNING
     ]
 
 
@@ -7305,14 +7306,14 @@ def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplo
     )
 
     with caplog.at_level(logging.WARNING):
-        result = mod.mine_to_saturation(
+        result = census_mining.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
             config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
 
-    census_warnings = _census_warnings(caplog)
+    census_warnings = _warnings_from(caplog, "legibility.census.mining")
     batch1_lines = [r for r in census_warnings if "batch 1" in r.getMessage()]
     assert len(batch1_lines) == 1, (
         "exactly ONE aggregated census line for the failing batch, not one per "
@@ -7364,10 +7365,10 @@ def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_
     source, fake_invoke, saturation, fail_a, fail_b = (
         _two_batch_source_with_a_failing_second_batch()
     )
-    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+    limit = census_mining.MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
 
     with caplog.at_level(logging.WARNING):
-        result = mod.mine_to_saturation(
+        result = census_mining.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
             config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
@@ -7384,7 +7385,7 @@ def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_
 
     # (b) the drop is LOUD — the aggregate names how many lines were suppressed
     batch1_lines = [
-        r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()
+        r for r in _warnings_from(caplog, "legibility.census.mining") if "batch 1" in r.getMessage()
     ]
     assert len(batch1_lines) == 1
     message = batch1_lines[0].getMessage()
@@ -7412,7 +7413,7 @@ def test_mine_to_saturation_bound_leaves_a_later_direct_code_digests_call_untouc
     )
 
     with caplog.at_level(logging.WARNING):
-        mod.mine_to_saturation(
+        census_mining.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
             config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
@@ -7441,7 +7442,7 @@ def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog)
             raise RuntimeError("batch source blew up mid-iteration")
 
     with pytest.raises(RuntimeError, match="blew up mid-iteration"):
-        mod.mine_to_saturation(
+        census_mining.mine_to_saturation(
             _RaisingBatchSource(), live_codebook, project="dark_factory",
             model="sonnet", config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
@@ -7472,7 +7473,7 @@ def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplo
         return fake_invoke(prompt, model)
 
     with caplog.at_level(logging.DEBUG):
-        mod.mine_to_saturation(
+        census_mining.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
             config=saturation, invoke=chatty_invoke, invariant_slugs=(),
         )
@@ -7488,9 +7489,9 @@ def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplo
 
     # And the real per-digest WARNINGs still get their full allowance: the
     # chatter did not eat the budget out from under them.
-    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+    limit = census_mining.MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
     assert len(_coder_warnings(caplog)) == limit
-    batch1 = [r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()]
+    batch1 = [r for r in _warnings_from(caplog, "legibility.census.mining") if "batch 1" in r.getMessage()]
     assert len(batch1) == 1
     assert f"{6 - limit} " in batch1[0].getMessage(), (
         "and the reported suppressed count still counts only WARNINGs; got "
@@ -7921,7 +7922,7 @@ def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, capl
     outcome = _done(outcome)
     assert outcome.unresolved_verdicts == 0
     assert not [
-        r for r in _census_warnings(caplog) if "unresolved" in r.getMessage().lower()
+        r for r in _warnings_from(caplog, "legibility.census") if "unresolved" in r.getMessage().lower()
     ]
 
 
@@ -7950,13 +7951,13 @@ def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_confli
     assert outcome.unresolved_verdicts == 0
 
     summaries = [
-        r for r in _census_warnings(caplog)
+        r for r in _warnings_from(caplog, "legibility.census")
         if "unresolved" in r.getMessage().lower()
         and _THREE_NOVEL_TITLES[0] not in r.getMessage()
     ]
     assert len(summaries) == 1, (
         "exactly ONE run-summary line, distinct from the per-cluster line; got "
-        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
+        f"{[r.getMessage() for r in _warnings_from(caplog, 'legibility.census')]}"
     )
     message = summaries[0].getMessage()
     assert "0 unresolved verdict(s)" in message, "the unresolved-verdict count"
@@ -7975,7 +7976,7 @@ def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
 
     assert outcome.unresolved_verdicts == 0
     assert not [
-        r for r in _census_warnings(caplog)
+        r for r in _warnings_from(caplog, "legibility.census")
         if "unresolved" in r.getMessage().lower() or "conflict" in r.getMessage().lower()
     ], "both tallies zero -> no summary line at all"
 
