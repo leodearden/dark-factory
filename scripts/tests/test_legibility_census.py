@@ -37,6 +37,7 @@ import yaml
 from legibility import (
     account_pool,
     alarm,
+    census_filing,
     census_findings,
     census_headroom,
     census_identity,
@@ -775,7 +776,7 @@ _PAYLOAD_RUN_ID = "census-dark_factory-20260714"
 
 def test_build_task_payloads_one_payload_per_cluster_curator_path():
     clusters = [_verified_cluster(title="Cluster A"), _verified_cluster(title="Cluster B")]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         clusters, project_root="/home/leo/src/some-project", project_id="some_project",
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -793,7 +794,7 @@ def test_build_task_payloads_title_and_description_sourced_from_cluster():
     cluster = _verified_cluster(
         title="A specific novel cause", summary="A precise factual summary of what happened.",
     )
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
     )
     assert "A specific novel cause" in payloads[0]["title"]
@@ -802,7 +803,7 @@ def test_build_task_payloads_title_and_description_sourced_from_cluster():
 
 def test_build_task_payloads_description_has_no_prose_routing_intent():
     clusters = [_verified_cluster()]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         clusters, project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
     )
     description = payloads[0]["description"].lower()
@@ -818,7 +819,7 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
             target_project_id="dark_factory",
         )
     ]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         clusters, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -836,7 +837,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
             title="Only root override", target_project_root="/home/leo/src/dark-factory",
         )
     ]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         only_root, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -847,7 +848,7 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
     assert "hosted_project" in payloads[0]["description"]
 
     only_id = [_verified_cluster(title="Only id override", target_project_id="dark_factory")]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         only_id, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -894,7 +895,7 @@ _REIFY_7909_SHAPED = _verified_cluster(
 
 
 def _reify_payloads(clusters, *, harness: filing_policy.ProjectRef | None = _HARNESS):
-    return mod.build_task_payloads(
+    return census_filing.build_task_payloads(
         clusters, project_root=_REIFY_ROOT, project_id="reify", harness=harness,
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -940,7 +941,7 @@ def test_remediated_payload_stays_observed_and_describes_the_remediation():
 
 def test_build_task_payloads_without_harness_targets_the_observed_project():
     clusters = [param.values[0] for param in _MISFILED_INTO_REIFY]
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         clusters, project_root=_REIFY_ROOT, project_id="reify", run_id=_PAYLOAD_RUN_ID,
     )
     assert [payload["project_root"] for payload in payloads] == [_REIFY_ROOT] * len(clusters)
@@ -959,14 +960,14 @@ def _keyed_cluster(**overrides):
 
 
 def _single_payload(cluster):
-    [payload] = mod.build_task_payloads(
+    [payload] = census_filing.build_task_payloads(
         [cluster], project_root="/root", project_id="proj", run_id=_PAYLOAD_RUN_ID,
     )
     return payload
 
 
 def test_build_task_payloads_names_the_run_on_every_payload():
-    payloads = mod.build_task_payloads(
+    payloads = census_filing.build_task_payloads(
         [_verified_cluster(), _keyed_cluster()], project_root="/root", project_id="proj",
         run_id=_PAYLOAD_RUN_ID,
     )
@@ -4984,7 +4985,7 @@ def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, 
         for c in fake_verify_fn.calls[0]["result"]["verified"]
         if c.get("title") == "Silent no-op subagent contract"
     ]
-    expected = mod.build_task_payloads(
+    expected = census_filing.build_task_payloads(
         verified, project_root=str(tmp_path), project_id="dark_factory",
         run_id=kwargs["run_id"],
     )
