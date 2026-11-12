@@ -35,6 +35,7 @@ in-class shim's module-global reads did.  Worker methods
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from typing import TYPE_CHECKING
 
@@ -136,40 +137,12 @@ async def finalize_through_gate(
         if entry.gate is None:
             break
         on_park()
-    head = None if advanced else _take_rebased_head(worker, entry)
-    if head is None:
-        return advanced
-    head_entry = await _launch_local_verify(worker, head)
+    if advanced:
+        return True
+    head_entry = await worker.dispatch_parked_rebased_head(
+        entry.item.request.request_id, functools.partial(_launch_local_verify, worker),
+    )
     if head_entry is None:
         return False
-    worker._note_transition(
-        head.request.request_id, _mq.ItemLifecycleState.DISPATCHING,
-        _mq.ItemLifecycleState.VERIFYING, live_obj=head_entry,
-    )
     on_park()
     return await finalize_through_gate(worker, head_entry, on_park=on_park)
-
-
-def _take_rebased_head(
-    worker: SpeculativeMergeWorker, entry: InflightEntry,
-) -> RealMergeItem | None:
-    """Pop the rebased head *entry*'s gate parked for redispatch, as the lane's dispatch would.
-
-    None unless the redispatch park's front item is that head: a real item
-    for *entry*'s request carrying ``gate_rebase_of``.
-    """
-    parked = worker._intake.pending_redispatch()
-    head = parked[0] if parked else None
-    if not (
-        isinstance(head, _mq.RealMergeItem)
-        and head.gate_rebase_of is not None
-        and head.request.request_id == entry.item.request.request_id
-    ):
-        return None
-    worker._intake.next_redispatch()
-    states = _mq.ItemLifecycleState
-    request_id = head.request.request_id
-    worker._note_transition(
-        request_id, states.REDISPATCH_PARKED, states.DISPATCHING, live_obj=head,
-    )
-    return head

@@ -26,6 +26,8 @@ class DeadBaseSite(StrEnum):
     GATE_REBASED = 'gate_rebased'
     #: A successor torn down so it re-anchors on its head's gate-rebased commit.
     GATE_REANCHOR = 'gate_reanchor'
+    #: A gate-rebased commit whose head left the lane without landing it.
+    GATE_UNLANDED = 'gate_unlanded'
     #: A dead-base straggler discarded and re-merged at dispatch.
     DISPATCH_VOID = 'dispatch_void'
     #: A stale merge discarded at dispatch (Mechanism 2).

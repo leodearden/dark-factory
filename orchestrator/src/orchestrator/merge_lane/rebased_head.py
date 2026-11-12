@@ -64,6 +64,12 @@ def rebased_head_commits(entries: Iterable[InflightEntry]) -> frozenset[str]:
     return frozenset(commit for commit in commits if commit is not None)
 
 
-def reanchors_on_rebased_head(killer: DeadBaseKiller | None, anchor: RemergeBase) -> bool:
-    """True when a gate rebase killed the base and the re-merge anchored on a live tip."""
+def is_gate_reanchor(killer: DeadBaseKiller | None, anchor: RemergeBase) -> bool:
+    """True when a gate killed the base and the re-merge anchored on a live tip.
+
+    A gate kills a base two ways: the head's rebase supersedes its pre-rebase
+    commit (``GATE_REBASED``), or a successor is torn down behind a dispatched
+    rebased head (``GATE_REANCHOR``).  Re-anchoring an item stacked on either
+    onto a live tip is planned work, not a voided verdict.
+    """
     return killer is not None and killer.site in _GATE_KILL_SITES and anchor.speculative

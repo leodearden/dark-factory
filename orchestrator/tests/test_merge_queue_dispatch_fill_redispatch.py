@@ -988,8 +988,9 @@ class TestGateReverifyDoesNotParkTheLoop:
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
                 why=(
-                    "the verifier loop is parked inside the head's gate "
-                    're-verify, so nothing dispatches to a free host until it ends.'
+                    "the verifier loop is blocked on the head's dispatched "
+                    'rebased-commit verify, so nothing dispatches to a free host '
+                    'until it ends.'
                 ),
             )
 
@@ -1008,7 +1009,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
 
             lane.remote_gate.set()
@@ -1045,7 +1046,7 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
 
             verifier.gate_release.set()
@@ -1074,7 +1075,7 @@ class TestGateReverifyDoesNotParkTheLoop:
                 lambda: lane.inflight_ids() == {GATED_HEAD, GATE_WAITER}
                 and _hosts_of(lane).get('local') == [GATED_HEAD],
                 expected=f'{GATE_WAITER} verifying on a remote beside the gated head',
-                why="the verifier loop is parked inside the head's gate re-verify.",
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
             )
             assert lane.free_hosts() == 1, lane.observed()
 
@@ -1110,7 +1111,10 @@ class TestGateReverifyDoesNotParkTheLoop:
             await lane.settle(
                 lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
                 expected=f'{GATE_WAITER} dispatched to the free laptop',
-                why="the verifier loop is parked inside the head's second gate re-verify.",
+                why=(
+                    "the verifier loop is blocked on the head's second dispatched "
+                    'rebased-commit verify.'
+                ),
             )
             assert lane.states()[GATED_HEAD] == 'verifying', lane.observed()
 

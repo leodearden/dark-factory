@@ -4955,39 +4955,28 @@ class TestGetMergeQueue:
         does for the orchestrator suite.  Returns True iff main advanced.
 
         This suite's entries carry ``verify_task=None``, a pre-established
-        pass, so the followed head is finalized as one too.
+        pass, so the followed head is launched as one too.
         """
-        from orchestrator.merge_lane.worker import (
-            InflightEntry,
-            ItemLifecycleState,
-            RealMergeItem,
-        )
+        from orchestrator.merge_lane.worker import InflightEntry
+
+        async def _launch_passed(head):
+            return InflightEntry(
+                item=head, lease=None, verify_task=None, merge_wt=head.merge_wt,
+                was_speculative=False,
+            )
 
         while True:
             advanced = await worker._finalize_inflight(entry)
             if entry.gate is not None:
                 continue
-            parked = worker._intake.pending_redispatch()
-            head = parked[0] if parked else None
-            if advanced or not (
-                isinstance(head, RealMergeItem)
-                and head.gate_rebase_of is not None
-                and head.request.request_id == entry.item.request.request_id
-            ):
-                return advanced
-            worker._intake.next_redispatch()
-            worker._note_transition(
-                head.request.request_id, ItemLifecycleState.REDISPATCH_PARKED,
-                ItemLifecycleState.DISPATCHING, live_obj=head,
+            if advanced:
+                return True
+            followed = await worker.dispatch_parked_rebased_head(
+                entry.item.request.request_id, _launch_passed,
             )
-            entry = InflightEntry(
-                item=head, lease=None, verify_task=None, merge_wt=head.merge_wt,
-                was_speculative=False,
-            )
-            worker._note_transition(
-                head.request.request_id, ItemLifecycleState.DISPATCHING,
-                ItemLifecycleState.VERIFYING, live_obj=entry,
-            )
+            if followed is None:
+                return False
+            entry = followed
 
     def _make_finalize_fixture(
         self,

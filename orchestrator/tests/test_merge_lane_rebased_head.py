@@ -17,7 +17,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
 from orchestrator.merge_lane.rebased_head import (
-    reanchors_on_rebased_head,
+    is_gate_reanchor,
     rebased_head_commits,
     rebased_head_item,
 )
@@ -193,14 +193,14 @@ class TestRebasedHeadCommits:
 _LIVE = RemergeBase(tip=_REBASED, reason=RemergeReason.LIVE_TIP)
 
 
-class TestReanchorsOnRebasedHead:
+class TestIsGateReanchor:
     @pytest.mark.parametrize(
         'site', [DeadBaseSite.GATE_REBASED, DeadBaseSite.GATE_REANCHOR], ids=str,
     )
     def test_a_gate_killed_base_anchored_on_a_live_tip_is_a_reanchor(
         self, site: DeadBaseSite,
     ) -> None:
-        assert reanchors_on_rebased_head(DeadBaseKiller(site, 'a'), _LIVE) is True
+        assert is_gate_reanchor(DeadBaseKiller(site, 'a'), _LIVE) is True
 
     @pytest.mark.parametrize(
         'site',
@@ -208,10 +208,10 @@ class TestReanchorsOnRebasedHead:
         ids=str,
     )
     def test_any_other_killer_is_a_void(self, site: DeadBaseSite) -> None:
-        assert reanchors_on_rebased_head(DeadBaseKiller(site, 'a'), _LIVE) is False
+        assert is_gate_reanchor(DeadBaseKiller(site, 'a'), _LIVE) is False
 
     def test_an_unknown_killer_is_a_void(self) -> None:
-        assert reanchors_on_rebased_head(None, _LIVE) is False
+        assert is_gate_reanchor(None, _LIVE) is False
 
     @pytest.mark.parametrize(
         'reason', sorted(set(RemergeReason) - {RemergeReason.LIVE_TIP}), ids=str,
@@ -221,4 +221,4 @@ class TestReanchorsOnRebasedHead:
     ) -> None:
         killer = DeadBaseKiller(DeadBaseSite.GATE_REBASED, 'a')
 
-        assert reanchors_on_rebased_head(killer, RemergeBase(tip=None, reason=reason)) is False
+        assert is_gate_reanchor(killer, RemergeBase(tip=None, reason=reason)) is False

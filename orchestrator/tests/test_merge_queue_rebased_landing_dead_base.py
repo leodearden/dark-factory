@@ -22,7 +22,15 @@ before B's verdict is spent or adopted:
 * a depth-2 follower C stacked on B, with no host free when A's gate
   re-verify becomes a dispatch, is re-merged onto real main at its dispatch,
   because tearing B down records B's own merge commit dead too (tasks 7352,
-  8525).
+  8525);
+* a request's gate attempts leave the lane with it, so a resubmission after
+  a red rebased head counts from one again (task 8525);
+* under a main that moves inside every verify, the dispatched rebased heads
+  are bounded by the gate-retry cap; the request is then blocked and its
+  in-flight successor is re-merged by the head-failure cascade and lands
+  (task 8525);
+* a successor whose teardown raises when the gate dispatches is resolved
+  blocked, and the rebased head still lands (task 8525).
 
 Each scene runs a real lane over a real tmp repo and observes only request
 outcomes, the injected verifier and the injected event store.
@@ -31,12 +39,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _git_fixtures import seed_repo
-from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, passes
+from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, lane_scene_config, passes
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
@@ -122,6 +131,50 @@ class _LocalSlotTakenOnceFreed(HostAllocator):
             self.held_local = self.acquire_local(lambda: None)
 
 
+class _MainMovesInsideEveryVerifyOf(_BaseRecordingVerifier):
+    """Lands a foreign commit inside every verify of *task_id*, so each of its CAS attempts rebases.
+
+    The k-th such verify first waits until *remote* has been entered k times,
+    so the successor stacked on the previous head is verifying when this
+    head's gate dispatches it again.
+    """
+
+    def __init__(self, repo: Path, task_id: str, remote: Any) -> None:
+        super().__init__()
+        self._repo = repo
+        self._task_id = task_id
+        self._remote = remote
+        self.moves = 0
+
+    async def run_scoped(
+        self, worktree: Path, config: Any, module_configs: list[Any],
+        task_files: list[str] | None = None, **options: Any,
+    ):
+        if options.get('task_id') == self._task_id:
+            self.moves += 1
+            moves = self.moves
+            await _until(
+                lambda: self._remote.run_merge_verify.await_count >= moves,
+                what=f'the successor to be verifying under {self._task_id} verify {moves}',
+            )
+            await _land_foreign_commit(self._repo, f'move {moves}')
+        return await super().run_scoped(
+            worktree, config, module_configs, task_files, **options,
+        )
+
+
+class _FirstRemoteCancelRaises(HostAllocator):
+    """The first cancel-and-release of a remote lease raises; every later one succeeds."""
+
+    raised = False
+
+    async def cancel_and_release(self, lease: HostLease | None, **kwargs: Any) -> bool:
+        if lease is not None and not lease.is_local and not self.raised:
+            self.raised = True
+            raise RuntimeError('cancel RPC lost')
+        return await super().cancel_and_release(lease, **kwargs)
+
+
 async def _submitted(
     git_ops: GitOps, config: OrchestratorConfig, task_id: str,
 ) -> MergeRequest:
@@ -177,15 +230,15 @@ async def _git_until_it_takes(repo: Path, *argv: str) -> None:
         await asyncio.sleep(0.05)
 
 
-async def _land_foreign_commit(repo: Path) -> None:
+async def _land_foreign_commit(repo: Path, note: str = 'landed elsewhere') -> None:
     """Move main the way a human direct commit does, disjoint from every branch.
 
     Stages only foreign.txt: ``add -A`` also stages the lane's live ``.worktrees/_merge-*``
-    directories, and races their creation.
+    directories, and races their creation.  Each move needs its own *note*.
     """
-    (repo / 'foreign.txt').write_text('landed elsewhere\n')
+    (repo / 'foreign.txt').write_text(f'{note}\n')
     await _git_until_it_takes(repo, 'add', 'foreign.txt')
-    await _git_until_it_takes(repo, 'commit', '-m', 'Foreign landing')
+    await _git_until_it_takes(repo, 'commit', '-m', f'Foreign landing: {note}')
 
 
 def _events(store: _LateArrivalFakeEventStore, kind: EventType, task_id: str) -> list[dict]:
@@ -196,6 +249,13 @@ def _gate_retries(store: _LateArrivalFakeEventStore, task_id: str) -> list[dict]
     return [
         data for data in _events(store, EventType.merge_attempt, task_id)
         if data.get('outcome') == 'gate_retry'
+    ]
+
+
+def _merge_attempts(store: _LateArrivalFakeEventStore, task_id: str, outcome: str) -> list[dict]:
+    return [
+        data for data in _events(store, EventType.merge_attempt, task_id)
+        if data.get('outcome') == outcome
     ]
 
 
@@ -360,13 +420,14 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             assert _events(store, EventType.verdict_voided, 'mv-b') == []
             reanchors = [
                 data for data in _events(store, EventType.speculative_discard, 'mv-b')
-                if data.get('reason') == 'base_rebased'
+                if data.get('reason') == 'gate_reanchor'
             ]
             assert [
-                (d['dead_link'], d['killer'], d['anchor_reason'], d['anchor_base'])
+                (d['point'], d['dead_link'], d['killer'], d['anchor_reason'], d['anchor_base'])
                 for d in reanchors
             ] == [
-                (a_pre, {'site': 'gate_rebased', 'task_id': 'mv-a'}, 'live_tip', a_rebased),
+                ('dispatch', a_pre, {'site': 'gate_rebased', 'task_id': 'mv-a'}, 'live_tip',
+                 a_rebased),
             ]
             assert reanchors[0]['item_commit']
             assert _events(store, EventType.merge_reverify_gate, 'mv-b') == []
@@ -566,3 +627,197 @@ class TestRebasedHeadWaitsFirstForAHost:
             ]
             assert landings == ['wh-a', 'wh-x'], landings
             remote.run_merge_verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestDispatchedRebasedHeadGateAttempts:
+
+    async def test_a_resubmission_after_a_red_rebased_head_counts_its_gate_attempts_afresh(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        first_release = asyncio.Event()
+        second_release = asyncio.Event()
+        verifier = _BaseRecordingVerifier(sequence=[
+            VerifyScript(result=passes().result, release=first_release),
+            fails(category='test_failure', summary='the rebased tree is red'),
+            VerifyScript(result=passes().result, release=second_release),
+            passes(),
+        ])
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (_lane, queue):
+            try:
+                req = await _submitted(git_ops, config, 'rs-a')
+                await queue.put(req)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                await _land_foreign_commit(git_repo, 'first move')
+                first_release.set()
+                failed = await wait_responsive(req.result, label='rs-a first outcome')
+                assert failed.status != 'done', failed
+                assert verifier.verified == ['rs-a', 'rs-a'], (
+                    "precondition: the red verify was the dispatched rebased head's"
+                )
+
+                again = dataclasses.replace(
+                    req, result=asyncio.get_running_loop().create_future(),
+                    request_id=f'{req.request_id}-again',
+                )
+                await queue.put(again)
+                await asyncio.wait_for(verifier.await_entry(3), timeout=_SETTLE_TIMEOUT)
+                await _land_foreign_commit(git_repo, 'second move')
+                second_release.set()
+                landed = await wait_responsive(again.result, label='rs-a resubmission outcome')
+            finally:
+                first_release.set()
+                second_release.set()
+
+        assert landed.status == 'done', landed
+        assert verifier.verified == ['rs-a'] * 4, verifier.verified
+        assert [row['attempt'] for row in _gate_retries(store, 'rs-a')] == [1]
+
+    async def test_a_main_moving_inside_every_verify_exhausts_the_cap_and_cascades_the_successor(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        b_release = asyncio.Event()
+        b_entered = asyncio.Event()
+        remote = _gated_runner(b_release, b_entered, passed=True, name='remote-cap')
+        verifier = _MainMovesInsideEveryVerifyOf(git_repo, 'cap-a', remote)
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
+            try:
+                _inject_two_host_allocator(lane, remote)
+                cap = lane.MAX_CAS_RETRIES
+                req_a = await _submitted(git_ops, config, 'cap-a')
+                req_b = await _submitted(git_ops, config, 'cap-b')
+                await queue.put(req_a)
+                await queue.put(req_b)
+
+                outcome_a = await wait_responsive(req_a.result, label='cap-a outcome')
+                b_release.set()
+                outcome_b = await wait_responsive(req_b.result, label='cap-b outcome')
+            finally:
+                b_release.set()
+
+            assert outcome_a.status == 'blocked', outcome_a
+            assert 'Gate retry limit exhausted' in (outcome_a.reason or ''), outcome_a
+            assert verifier.verified.count('cap-a') == cap + 1, verifier.verified
+            assert [row['attempt'] for row in _gate_retries(store, 'cap-a')] == list(
+                range(1, cap + 1),
+            )
+            assert [row['attempt'] for row in _merge_attempts(store, 'cap-a', 'cas_exhausted')] == [
+                cap + 1,
+            ]
+
+            assert outcome_b.status == 'done', outcome_b
+            # B re-anchors on each dispatched rebased head, then the cascade
+            # re-merges it onto main once the cap ends A.
+            assert remote.run_merge_verify.await_count == cap + 1
+            reanchors = [
+                d for d in _events(store, EventType.speculative_discard, 'cap-b')
+                if d.get('reason') == 'gate_reanchor'
+            ]
+            assert [d['point'] for d in reanchors] == ['dispatch'] * cap, reanchors
+            assert [
+                d['base_relation'] for d in _events(store, EventType.merge_verify, 'cap-b')
+            ] == ['rebased_head'] * cap + ['main']
+            assert _events(store, EventType.verdict_voided, 'cap-b') == []
+            assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestGateSuccessorTeardownErrorIsContained:
+
+    async def test_a_successor_whose_teardown_raises_is_blocked_and_the_rebased_head_lands(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        head_gate = asyncio.Event()
+        b_release = asyncio.Event()
+        b_entered = asyncio.Event()
+        verifier = _BaseRecordingVerifier(scripts={
+            'te-a': VerifyScript(result=passes().result, release=head_gate),
+        })
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
+            try:
+                allocator = _inject_two_host_allocator(
+                    lane, _gated_runner(b_release, b_entered, passed=True, name='remote-te'),
+                    allocator_cls=_FirstRemoteCancelRaises,
+                )
+                assert isinstance(allocator, _FirstRemoteCancelRaises)
+                req_a = await _submitted(git_ops, config, 'te-a')
+                req_b = await _submitted(git_ops, config, 'te-b')
+                await queue.put(req_a)
+                await queue.put(req_b)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                await wait_responsive(b_entered.wait(), label='B to enter its remote verify')
+                a_pre = await _stacked_base(store, 'te-b')
+
+                await _land_foreign_commit(git_repo)
+                head_gate.set()
+                outcome_b = await wait_responsive(req_b.result, label='te-b outcome')
+                outcome_a = await _assert_landed_rebased(store, req_a, a_pre)
+            finally:
+                b_release.set()
+
+            assert allocator.raised, 'precondition: B\'s teardown raised'
+            assert outcome_b.status == 'blocked', outcome_b
+            assert 'cancel RPC lost' in (outcome_b.reason or ''), outcome_b
+            assert outcome_a.status == 'done', outcome_a
+            assert _leased_task_ids(lane) == [], lane.snapshot()['occupancy']
+            assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
+
+
+class _FirstWorktreeOnTipFails(GitOps):
+    """The first ephemeral verify worktree asked for on a commit whose first parent is *tip* fails."""
+
+    tip: str | None = None
+    failed_for: str | None = None
+
+    async def create_ephemeral_verify_worktree(self, sha: str) -> Path:
+        armed = self.tip is not None and self.failed_for is None
+        if armed and await _first_parent(self.project_root, sha) == self.tip:
+            self.failed_for = sha
+            raise OSError(28, 'No space left on device')
+        return await super().create_ephemeral_verify_worktree(sha)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestRebasedHeadWithNoWorktreeIsRequeued:
+
+    async def test_a_rebased_head_whose_worktree_cannot_be_made_is_requeued_and_lands(
+        self, git_config: GitConfig, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        git_ops = _FirstWorktreeOnTipFails(git_config, git_repo)
+        head_gate = asyncio.Event()
+        verifier = _BaseRecordingVerifier(scripts={
+            'nw-a': VerifyScript(result=passes().result, release=head_gate),
+        })
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
+            try:
+                req = await _submitted(git_ops, config, 'nw-a')
+                await queue.put(req)
+                await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+                await _land_foreign_commit(git_repo)
+                git_ops.tip = await git_ops.get_main_sha()
+                head_gate.set()
+                outcome = await wait_responsive(req.result, label='nw-a outcome')
+            finally:
+                head_gate.set()
+
+            assert git_ops.failed_for is not None, (
+                "precondition: the rebased head's worktree could not be made"
+            )
+            assert outcome.status == 'done', outcome
+            assert outcome.merge_sha and outcome.merge_sha != git_ops.failed_for
+            assert await _first_parent(git_repo, outcome.merge_sha) == git_ops.tip
+            assert verifier.verified == ['nw-a', 'nw-a'], verifier.verified
+            assert _gate_retries(store, 'nw-a') == []
+            assert _leased_task_ids(lane) == [], lane.snapshot()['occupancy']
+            assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
