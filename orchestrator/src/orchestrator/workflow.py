@@ -238,7 +238,7 @@ from orchestrator.verify_categories import (
     FailureCategory,
 )
 from orchestrator.verify_checkpoint import green_checkpoint_at_tip
-from orchestrator.verify_evidence import VerifySite, verify_event_fields
+from orchestrator.verify_evidence import TipUnresolved, VerifySite, workflow_verify_event_data
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
@@ -1497,11 +1497,10 @@ class TaskWorkflow:
         # workflow_verify re-emit — verify did not run this cycle, so
         # re-asserting a green would be dishonest (the honest signal is
         # phase_skipped(verify)).  Reset to False at the top of each loop pass.
-        # _verify_green_tip_sha: the branch tip captured right after a PASSING
-        # _verify_debugfix_loop and before _enter_phase(REVIEW); recorded in the
-        # workflow_verify payload as the durable checkpoint key for the next run.
+        # _verify_green_tip_sha: the tip of this pass's passing verify, or why there is
+        # none (TaskWorkflow._verified_tip); the next run's checkpoint key. Reset each VERIFY pass.
         self._verify_checkpoint_hit: bool = False
-        self._verify_green_tip_sha: str | None = None
+        self._verify_green_tip_sha: str | TipUnresolved = TipUnresolved.NOT_CAPTURED
         # The passing VerifyResult behind _verify_green_tip_sha (task 5651); reset each VERIFY pass.
         self._verify_green_result: VerifyResult | None = None
         # The host whose verdict that green is (task 6670), with the same lifetime.
@@ -2705,34 +2704,28 @@ class TaskWorkflow:
         site: VerifySite,
         result: VerifyResult | None,
         passed: bool,
-        tip_sha: str | None,
+        tip_sha: str | TipUnresolved,
         base_sha: str | None,
         runner: str,
     ) -> None:
         """Record one task-role verify verdict; both workflow sites emit through here.
 
         *runner* names the host whose verdict this is (task 6670).
-
-        The escalation-side merge_request(verified_green=True) row carries only
-        passed/base_sha/branch, and gains these keys through task 5409's shared
-        emit_workflow_verify constructor.
         """
         if self.event_store is None:
             return
         self.event_store.emit(
             EventType.workflow_verify,
             task_id=self.task_id,
-            data={
-                'passed': passed,
-                'tip_sha': tip_sha,
-                'base_sha': base_sha,
-                'branch': f'{self.config.git.branch_prefix}{self.task_id}',
-                'duration_ms': None if result is None else round(result.duration_secs * 1000),
-                'slot_wait_secs': None if result is None else result.slot_wait_secs,
-                'site': str(site),
-                'runner': runner,
-                **verify_event_fields(result),
-            },
+            data=workflow_verify_event_data(
+                passed,
+                tip_sha=tip_sha,
+                base_sha=base_sha,
+                branch=f'{self.config.git.branch_prefix}{self.task_id}',
+                result=result,
+                site=site,
+                runner=runner,
+            ),
         )
 
     async def _restamp_branch_base_if_no_own_commits(self) -> bool:
@@ -4157,13 +4150,13 @@ class TaskWorkflow:
                 event_store=self.event_store,
             )
         if self.event_store is not None:
-            tip = (await self._get_head_commit()) or None
+            tip = await self._verified_tip('the post-rebase re-verify')
             self._emit_workflow_verify(
                 site=VerifySite.PRE_MERGE,
                 result=verify,
                 passed=verify.passed,
                 tip_sha=tip,
-                base_sha=await self.git_ops.merge_base_with_main(tip) if tip else None,
+                base_sha=None if isinstance(tip, TipUnresolved) else await self.git_ops.merge_base_with_main(tip),
                 runner=LOCAL_RUNNER,
             )
         if not verify.passed:
@@ -8899,34 +8892,18 @@ class TaskWorkflow:
             # re-emit is suppressed in _enter_phase (gated on
             # _verify_checkpoint_hit) so we never assert a verify that did not
             # run this cycle.  Fail-closed on every axis: no event store, a
-            # checkpoint miss, a RAISING _get_head_commit (caught below →
-            # tip=None → miss), an empty tip, or a green_checkpoint_at_tip read
-            # error all fall through to the normal verify path
-            # (green_checkpoint_at_tip never raises, and the tip fetch is
-            # wrapped in try/except so a spawn failure cannot crash the loop).
+            # checkpoint miss, an unreadable HEAD (_head_commit_or_none), or a
+            # green_checkpoint_at_tip read error all fall through to the
+            # normal verify path.
             # Task 2749's tree-hash verdict cache then skips REVIEW below,
             # composing into the fast-path to merge.
             self._verify_checkpoint_hit = False
+            self._verify_green_tip_sha = TipUnresolved.NOT_CAPTURED
             self._verify_green_result = None
             self._verify_green_runner = LOCAL_RUNNER
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
-                try:
-                    tip = await self._get_head_commit()
-                except Exception:
-                    # A raising _get_head_commit (git not on PATH →
-                    # FileNotFoundError, a None worktree, a transient spawn
-                    # failure) must NOT crash the loop: degrade to the normal
-                    # verify path (tip=None → green_checkpoint_at_tip miss →
-                    # _verify_debugfix_loop runs).  This is exactly the
-                    # fail-safe the comment above promises for a
-                    # _get_head_commit error.
-                    logger.warning(
-                        'Task %s: VERIFY checkpoint tip fetch failed; running '
-                        'the normal verify (fail-safe) (task 2752)',
-                        self.task_id, exc_info=True,
-                    )
-                    tip = None
+                tip = await self._head_commit_or_none('the VERIFY checkpoint lookup')
                 if green_checkpoint_at_tip(
                     self.event_store, EventType.workflow_verify, self.task_id, tip,
                 ):
@@ -8968,16 +8945,9 @@ class TaskWorkflow:
                         )
                     detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
                     return await self._mark_blocked('Verification attempts exhausted', detail=detail)
-                # Passing fall-through (_verify_debugfix_loop returns DONE):
-                # capture the verified branch tip so the subsequent
-                # _enter_phase(REVIEW) records it in the workflow_verify payload
-                # as the durable checkpoint key for the next run (task 2752).
-                # Normalize an empty tip (a failed `git rev-parse` returns '' —
-                # see _get_head_commit) to None so we never record '' as a
-                # green key: a later run that also read '' must MISS the
-                # checkpoint (green_checkpoint_at_tip fails closed on an empty
-                # tip), not match '' == '' and falsely skip verify.
-                self._verify_green_tip_sha = (await self._get_head_commit()) or None
+                # Passing fall-through: the tip _enter_phase(REVIEW) records as
+                # the next run's checkpoint key (task 2752), or why it has none.
+                self._verify_green_tip_sha = await self._verified_tip('the post-verify green tip')
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
@@ -16035,6 +16005,30 @@ class TaskWorkflow:
             )
             return ''
         return stdout.decode().strip()
+
+    async def _head_commit_or_none(self, purpose: str) -> str | None:
+        """HEAD sha, or None when it cannot be read: git exits non-zero ('') or the spawn raises. For callers that must fail safe rather than crash."""
+        try:
+            return (await self._get_head_commit()) or None
+        except Exception:
+            logger.warning(
+                'Task %s: HEAD read for %s failed; treating HEAD as unknown (fail-safe)',
+                self.task_id, purpose, exc_info=True,
+            )
+            return None
+
+    async def _verified_tip(self, purpose: str) -> str | TipUnresolved:
+        """The tip a verdict is recorded at, read with one retry, or why it could not be read."""
+        for _attempt in range(2):
+            tip = await self._head_commit_or_none(purpose)
+            if tip is not None:
+                return tip
+        logger.warning(
+            'Task %s: HEAD unreadable twice for %s; recording the verdict with '
+            'tip_sha_unresolved (task 5409)',
+            self.task_id, purpose,
+        )
+        return TipUnresolved.HEAD_UNREADABLE
 
     async def _iteration_commit_provenance(self, pre_head: str) -> dict:
         """Compare pre/post HEAD and report truthful commit provenance for an
