@@ -7,10 +7,7 @@ copies (``reconciliation/harness.py::_record_placeholder_finding_drop``,
 into ``fused_memory.server.storm_counter`` "so a fourth consumer reuses rather
 than re-copies it (INV-5)". ``shared.mcp_markup_middleware`` IS that fourth
 consumer, and it lives in the base layer — ``shared`` may not import
-``fused_memory``, so the class had to come to it. The old module stays as a
-re-export shim, mirroring exactly what task 3688 did to markup_tripwire's
-``MCP_MARKUP_PATTERNS``; ``fused-memory/tests/server/test_storm_counter.py``
-keeps running unedited against that shim, which is what pins the shim honest.
+``fused_memory``, so the class had to come to it.
 
 These assertions are PORTED from that existing coverage rather than invented,
 because the contract is not supposed to change in the move — only the import
