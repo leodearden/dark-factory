@@ -553,7 +553,7 @@ class TestReplayCommand:
     def test_a_client_on_another_model_than_its_arms_exits_2_before_any_call(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         llm = _CountingLLM(model='m-small')
-        assert _run_replay(paths, llm, 'control', 'o6') == 2
+        assert _run_replay(paths, llm, 'control', 'o6-low') == 2
         assert not paths['replay'].exists() and llm.calls == []
 
     def test_a_defect_in_an_episode_read_is_raised_not_recorded_as_a_failure(self, tmp_path: Path) -> None:
@@ -576,20 +576,20 @@ class TestReplayCommand:
     def test_each_arm_model_gets_one_client_and_every_arm_one_file(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         factory = _ClientsByModel()
-        assert _run_replay_on(paths, factory, 'control', 'o6') == 0
+        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 0
         assert factory.asked == [None, mod.O6_MODEL]
         records = _records(paths['replay'])
         assert sorted((r['arm'], r['uuid']) for r in records) == sorted(
-            (arm, row['uuid']) for arm in ('control', 'o6') for row in CLI_ROWS
+            (arm, row['uuid']) for arm in ('control', 'o6-low') for row in CLI_ROWS
         )
         assert {r['model'] for r in records if r['arm'] == 'control'} == {CONFIGURED}
-        assert {r['model'] for r in records if r['arm'] == 'o6'} == {mod.O6_MODEL}
+        assert {r['model'] for r in records if r['arm'] == 'o6-low'} == {mod.O6_MODEL}
 
     def test_a_resume_adds_the_o6_arm_beside_a_recorded_control(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         assert _run_replay_on(paths, _ClientsByModel(), 'control') == 0
         second = _ClientsByModel()
-        assert _run_replay_on(paths, second, 'control', 'o6') == 0
+        assert _run_replay_on(paths, second, 'control', 'o6-low') == 0
         assert second.clients[None].calls == []
         assert sorted(second.clients[mod.O6_MODEL].episodes_called()) == ['ep-a', 'ep-b', 'ep-c']
         assert len(_records(paths['replay'])) == 6
@@ -597,7 +597,7 @@ class TestReplayCommand:
     def test_an_arm_model_with_no_client_exits_1_before_any_call(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         factory = _ClientsByModel(unavailable=frozenset({mod.O6_MODEL}))
-        assert _run_replay_on(paths, factory, 'control', 'o6') == 1
+        assert _run_replay_on(paths, factory, 'control', 'o6-low') == 1
         assert not paths['replay'].exists()
         assert all(client.calls == [] for client in factory.clients.values())
 
@@ -946,7 +946,7 @@ O6_EDGES = (('Alpha', 'Beta', 'Alpha adopts Beta'),)
 class TestOneReplayAcrossArmModels:
     def _replayed(self, tmp_path: Path) -> dict[str, Path]:
         paths = _cli_inputs(tmp_path, baseline=CLI_SCORE_BASELINE)
-        assert _run_replay_on(paths, _ClientsByModel(edges={None: CONFIGURED_EDGES, mod.O6_MODEL: O6_EDGES}), 'control', 'o6') == 0
+        assert _run_replay_on(paths, _ClientsByModel(edges={None: CONFIGURED_EDGES, mod.O6_MODEL: O6_EDGES}), 'control', 'o6-low') == 0
         return paths
 
     def test_the_worksheet_interleaves_both_models_edges_naming_no_arm(self, tmp_path: Path) -> None:
@@ -974,11 +974,11 @@ class TestOneReplayAcrossArmModels:
         assert mod.run(['score', '--replay', str(paths['replay']), '--verdicts', str(verdict_file),
                         '--baseline-report', str(paths['baseline']), '--out', str(out)]) == 0
         report = json.loads(out.read_text())
-        control, o6 = report['arms']['control'], report['arms']['o6']
+        control, o6 = report['arms']['control'], report['arms']['o6-low']
         assert (control['model'], o6['model']) == (CONFIGURED, mod.O6_MODEL)
         assert o6['instructions_version'] == mod.NO_INSTRUCTIONS
         assert o6['population_weighted']['overreach_rate_minted']['rate'] == 0.0
         assert control['population_weighted']['overreach_rate_minted']['rate'] == 0.5
-        assert report['comparison']['o6'] == mod.lever_decision(
+        assert report['comparison']['o6-low'] == mod.lever_decision(
             control['population_weighted'], o6['population_weighted'],
         )

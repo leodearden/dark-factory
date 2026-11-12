@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay ruling-class extraction under an arm, to measure levers O1 and O6 (task 9040).
+"""Replay ruling-class extraction under an arm, to measure levers O1 (task 9040) and O6 (task 9065).
 
 docs/ruling-overreach-guard-design-2026-10-01/design.md §6 names lever O1:
 ``custom_extraction_instructions`` for the ``decisions_and_rationale`` class.
@@ -9,9 +9,10 @@ re-extracted under each arm by graphiti_core 0.28.2's own
 utils/maintenance/node_operations.py::extract_nodes and
 utils/maintenance/edge_operations.py::extract_edges, unmodified, followed by
 graphiti's in-batch exact-fact dedupe (the driver-free fast path of
-edge_operations.py::resolve_extracted_edges). An arm is (instructions, model):
+edge_operations.py::resolve_extracted_edges). An arm is (instructions, client):
 control and o1 differ only in the instructions they splice into those prompts,
-on the configured model, and o6 is the control's instructions on O6_MODEL. So
+on the configured client, and o6-low and o6-medium are the control's
+instructions on O6_MODEL at reasoning effort low and medium (esc-9065-2). So
 every arm shares one replay file, one blinded worksheet and one score against
 the control.
 
@@ -31,7 +32,7 @@ Usage (from fused-memory/)::
     uv run python scripts/replay_overreach_extraction.py replay \\
         --worksheet /tmp/9040-worksheet-4716.jsonl \\
         --baseline-report ../docs/ruling-overreach-guard-design-2026-10-01/report.json \\
-        --arm control --arm o6 --out /tmp/9040-replay-o6.jsonl
+        --arm control --arm o6-low --arm o6-medium --out /tmp/9065-replay.jsonl
 
     uv run python scripts/replay_overreach_extraction.py worksheet \\
         --replay /tmp/9040-replay.jsonl --worksheet /tmp/9040-worksheet-4716.jsonl \\
@@ -143,25 +144,39 @@ CONTROL = 'control'
 
 
 @dataclass(frozen=True)
-class ReplayArm:
-    """What one arm splices into graphiti's extraction prompts, and the model it extracts on.
+class ExtractionLlm:
+    """The client an arm extracts on.
 
-    ``model`` None means config ``llm.model``, production's extraction model.
+    ``model`` None is config ``llm.model``, production's extraction model.
+    ``reasoning_effort`` None is the client build_llm_client builds, as
+    configured, temperature included. A set effort is sent as
+    ``reasoning.effort``, with no temperature.
     """
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ReplayArm:
+    """What one arm splices into graphiti's extraction prompts, and the client it extracts on."""
 
     name: str
     instructions: str | None
     instructions_version: str
-    model: str | None = None
+    llm: ExtractionLlm = ExtractionLlm()
 
 
 O6_MODEL = 'gpt-6.1-sol'
-"""Lever O6's stronger extraction model, priced in design.md §5 from score_write_triage_pairs.py::LIST_PRICES."""
+"""Lever O6's stronger extraction model, priced in the 2026-11-10 design.md §5 from
+score_write_triage_pairs.py::LIST_PRICES. Effort low is what the production write-triage
+judge runs it at; medium is the API's default."""
 
 ARMS: Mapping[str, ReplayArm] = MappingProxyType({
     CONTROL: ReplayArm(CONTROL, None, NO_INSTRUCTIONS),
     'o1': ReplayArm('o1', O1_INSTRUCTIONS, O1_INSTRUCTIONS_VERSION),
-    'o6': ReplayArm('o6', None, NO_INSTRUCTIONS, model=O6_MODEL),
+    'o6-low': ReplayArm('o6-low', None, NO_INSTRUCTIONS, ExtractionLlm(O6_MODEL, 'low')),
+    'o6-medium': ReplayArm('o6-medium', None, NO_INSTRUCTIONS, ExtractionLlm(O6_MODEL, 'medium')),
 })
 
 EDGE_TYPE_MAP: Mapping[tuple[str, str], list[str]] = MappingProxyType({('Entity', 'Entity'): []})
@@ -198,6 +213,7 @@ class MintedEdge:
 class ReplayResult:
     arm: str
     model: str | None
+    reasoning_effort: str | None
     instructions_version: str
     graph: str
     uuid: str
@@ -222,6 +238,11 @@ def build_arm_llm(cfg: FusedMemoryConfig, model: str | None) -> LLMClient | None
     if model is not None:
         arm_cfg.llm.model = model
     return build_llm_client(arm_cfg)
+
+
+def client_reasoning_effort(llm: LLMClient) -> str | None:
+    """The reasoning effort *llm* declares it sends; None for a client that declares none."""
+    return getattr(llm, 'reasoning_effort', None)
 
 
 def in_batch_dedupe(edges: Iterable[EntityEdge]) -> list[EntityEdge]:
@@ -251,8 +272,8 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
 
 async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
     """Raise unless *llm* can replay *arm*: on the arm's model, with attributable tokens. Calls nothing."""
-    if arm.model is not None and llm.model != arm.model:
-        raise ArmModelMismatch(f'arm {arm.name} extracts on {arm.model}, but the client is on {llm.model}')
+    if arm.llm.model is not None and llm.model != arm.llm.model:
+        raise ArmModelMismatch(f'arm {arm.name} extracts on {arm.llm.model}, but the client is on {llm.model}')
     async with measure_llm_tokens(llm) as probe:
         pass
     _usage(probe)
@@ -279,7 +300,8 @@ async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -
         )
     names = {node.uuid: node.name for node in nodes}
     return ReplayResult(
-        arm=arm.name, model=llm.model, instructions_version=arm.instructions_version,
+        arm=arm.name, model=llm.model, reasoning_effort=client_reasoning_effort(llm),
+        instructions_version=arm.instructions_version,
         graph=episode.graph, uuid=episode.uuid, stratum=episode.stratum,
         entities=tuple(node.name for node in nodes),
         minted=tuple(
@@ -775,13 +797,13 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
 def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
     """One client per distinct arm model, in first-seen order; None if any model has none."""
     clients: dict[str | None, LLMClient] = {}
-    for model in dict.fromkeys(arm.model for arm in arms):
+    for model in dict.fromkeys(arm.llm.model for arm in arms):
         client = llm_factory(model)
         if client is None:
             logger.error('no extraction LLM for %s; nothing is written', model or 'the configured llm.model')
             return None
         clients[model] = client
-    return tuple((arm, clients[arm.model]) for arm in arms)
+    return tuple((arm, clients[arm.llm.model]) for arm in arms)
 
 
 def _model_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
