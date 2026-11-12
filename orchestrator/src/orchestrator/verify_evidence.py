@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any, Protocol
 
 from orchestrator.verify_cache.modes import CacheMode
@@ -41,7 +41,7 @@ class UnitOutcome(StrEnum):
 
 
 class VerifySite(StrEnum):
-    """Which workflow site emitted a ``workflow_verify`` row, and what each reader makes of it.
+    """Which site emitted a ``workflow_verify`` row, and what each reader makes of it.
 
     Pinned by orchestrator/tests/test_workflow_verify_site_readers.py:
 
@@ -53,10 +53,21 @@ class VerifySite(StrEnum):
       post-rebase tip becomes the latest green tip, and a red is skipped.
     - verify_checkpoint.py::green_checkpoint_at_tip: a pre-merge green lets a redispatch
       at that tip skip VERIFY.
+    - A merge_request(verified_green=True) vouch is a green at the tip the server
+      resolved, and every reader counts it.
     """
 
     IMPLEMENT = 'implement'
     PRE_MERGE = 'pre_merge'
+    MCP_MERGE_REQUEST = 'mcp:merge_request'
+
+
+class TipUnresolved(Enum):
+    """Why a ``workflow_verify`` row has no tip."""
+
+    HEAD_UNREADABLE = 'head_unreadable'
+    NOT_CAPTURED = 'not_captured'
+    BRANCH_UNRESOLVED = 'branch_unresolved'
 
 
 def counts_as_branch_verdict(data: Mapping[str, Any]) -> bool:
@@ -147,4 +158,43 @@ def verify_event_fields(result: VerifyEvidence | None) -> dict[str, Any]:
         'plan_hash': plan_hash(result.plan),
         'cache_mode': str(result.cache_mode),
         'units': None if result.units is None else [unit.to_dict() for unit in result.units],
+    }
+
+
+class VerdictEvidence(VerifyEvidence, Protocol):
+    @property
+    def duration_secs(self) -> float: ...
+    @property
+    def slot_wait_secs(self) -> float | None: ...
+
+
+def workflow_verify_event_data(
+    passed: bool,
+    *,
+    tip_sha: str | TipUnresolved,
+    base_sha: str | None,
+    branch: str,
+    result: VerdictEvidence | None,
+    site: VerifySite,
+    runner: str,
+) -> dict[str, Any]:
+    """The single constructor of a ``workflow_verify`` row's data, for every emitter."""
+    unresolved = isinstance(tip_sha, TipUnresolved)
+    if not unresolved and not tip_sha:
+        raise ValueError(
+            'a workflow_verify tip_sha is a commit sha or a TipUnresolved reason, never '
+            f'empty: got tip_sha={tip_sha!r} for branch={branch!r} site={site}',
+        )
+    return {
+        'passed': passed,
+        'tip_sha': None if unresolved else tip_sha,
+        'tip_sha_unresolved': unresolved,
+        'tip_sha_unresolved_reason': tip_sha.value if unresolved else None,
+        'base_sha': base_sha,
+        'branch': branch,
+        'duration_ms': None if result is None else round(result.duration_secs * 1000),
+        'slot_wait_secs': None if result is None else result.slot_wait_secs,
+        'site': str(site),
+        'runner': runner,
+        **verify_event_fields(result),
     }
