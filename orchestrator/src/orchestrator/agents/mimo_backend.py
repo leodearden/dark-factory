@@ -301,7 +301,7 @@ def parse_mimo_sessions(
         )
     steps = [message['info'] for export in exports for message in _assistant_messages(export)]
     usage = sum((_Usage.of_step(step) for step in steps), _Usage())
-    root = next((export for export in exports if not export['info'].get('parentID')), exports[0])
+    root = next((export for export in exports if not _session_info(export).get('parentID')), exports[0])
     terminal = next(reversed(_assistant_messages(root)), None)
     terminal_info = terminal['info'] if terminal else {}
     error = terminal_info.get('error')
@@ -317,7 +317,7 @@ def parse_mimo_sessions(
         cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=run.duration_ms,
         turns=len(steps),
-        session_id=str(root['info'].get('id') or ''),
+        session_id=str(_session_info(root).get('id') or ''),
         subtype='success' if success else 'error',
         stderr=run.stderr,
         timed_out=run.timed_out,
@@ -327,6 +327,10 @@ def parse_mimo_sessions(
         cache_read_tokens=usage.cache_read,
         cache_create_tokens=usage.cache_write,
     )
+
+
+def _session_info(export: Mapping[str, Any]) -> Mapping[str, Any]:
+    return export.get('info') or {}
 
 
 def _assistant_messages(export: Mapping[str, Any]) -> list[Mapping[str, Any]]:

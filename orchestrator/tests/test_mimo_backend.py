@@ -305,6 +305,14 @@ class TestParseMimoSessions:
         )
         assert result.success is False
 
+    def test_an_export_without_session_info_still_counts_its_steps(self):
+        export = measured_export()
+        del export['info']
+        result = parse_mimo_sessions([export], _subprocess_result(), cost_of=_cost_of)
+        assert result.success is True
+        assert result.session_id == ''
+        assert result.input_tokens == 1400
+
     def test_no_session_is_a_failure_with_no_tokens(self):
         result = parse_mimo_sessions([], _subprocess_result(), cost_of=_cost_of)
         assert result.success is False
