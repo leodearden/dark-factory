@@ -53,6 +53,7 @@ from fused_memory.maintenance.link_heal import (
     COMPLETION_ACTIONS,
     MISFILE_VERDICTS,
     BasisSource,
+    HealAction,
     LinkBasis,
     LinkDecision,
     LinkImage,
@@ -88,6 +89,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     WriteRecords,
 )
 from fused_memory.maintenance.link_heal_store import (
+    CreatedWindow,
     LinkCensus,
     LinkHealStore,
     LiveRecord,
@@ -449,17 +451,26 @@ _STANDING = frozenset({Disposition.STAGED, Disposition.ALREADY_PENDING})
 
 
 def _stage(
-    decisions: Iterable[LinkDecision], ledger: LinkHealLedger,
+    decisions: Iterable[LinkDecision],
+    ledger: LinkHealLedger,
+    enabled_actions: frozenset[HealAction] | None = None,
 ) -> tuple[ExaminationRecord, ...]:
-    """Each decision's examination: its heal dropped when an undo took it back,
+    """Each decision's examination: its heal dropped when it is not among
+    *enabled_actions* (``None`` enables every action) or an undo took it back,
     matched to its row when already pending, else staged as new."""
-    return tuple(_examine(decision, ledger) for decision in decisions)
+    return tuple(_examine(decision, ledger, enabled_actions) for decision in decisions)
 
 
-def _examine(decision: LinkDecision, ledger: LinkHealLedger) -> ExaminationRecord:
+def _examine(
+    decision: LinkDecision,
+    ledger: LinkHealLedger,
+    enabled_actions: frozenset[HealAction] | None,
+) -> ExaminationRecord:
     planned = decision.planned
     if planned is None:
         return _examination(decision, Disposition.REPORTED)
+    if enabled_actions is not None and planned.action not in enabled_actions:
+        return _examination(decision, Disposition.NOT_ENABLED)
     if ledger.is_undo_suppressed(planned):
         return _examination(decision, Disposition.UNDO_SUPPRESSED)
     pending = ledger.find_pending(planned)
@@ -504,6 +515,7 @@ def _staged_counts(counts: RunCounts, examinations: Sequence[ExaminationRecord])
         planned_by_action=Counter(standing),
         already_pending=dispositions[Disposition.ALREADY_PENDING],
         undo_suppressed=dispositions[Disposition.UNDO_SUPPRESSED],
+        not_enabled=dispositions[Disposition.NOT_ENABLED],
     )
 
 
@@ -546,15 +558,19 @@ async def _publish_plan(
     source: RunSource,
     plan_path: Path,
     escapes: Sequence[Escape] = (),
+    escaped: Sequence[Mapping[str, Any]] = (),
+    enabled_actions: frozenset[HealAction] | None = None,
 ) -> RunReport:
     """Stage *plan* against the ledger, write its document, and finish *run_id*.
 
-    Its examinations commit with its new heals, or roll back with them.
-    *escapes*, and the backlog and share escapes an apply of *source*'s pending
-    heals would raise now, are recorded as ``would_escape``.
+    Its examinations commit with its new heals, or roll back with them; a heal
+    outside *enabled_actions* is recorded and never staged. *escapes*, and the
+    backlog and share escapes an apply of *source*'s pending heals would raise
+    now, are recorded as ``would_escape``; *escaped* discloses the escapes the
+    run has already filed.
     """
-    examinations = _stage(plan.decisions, ledger)
-    counts = _staged_counts(plan.counts, examinations)
+    examinations = _stage(plan.decisions, ledger, enabled_actions)
+    counts = replace(_staged_counts(plan.counts, examinations), escaped=tuple(escaped))
     try:
         with ledger.publishing_planned(run_id, examinations, source) as pending:
             document = render_plan_document(pending)
@@ -689,19 +705,26 @@ async def run_adjudicator_plan(
     limits: RunLimits,
     projects: Sequence[str],
     plan_path_for: Callable[[str], Path],
+    source: RunSource = RunSource.ADJUDICATOR,
+    enabled_actions: frozenset[HealAction] | None = None,
+    created_in: CreatedWindow | None = None,
+    filer: EscapeFiler | None = None,
 ) -> RunReport:
-    """A non-writing run planning heals from the link adjudicator's verdicts.
+    """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
+    Only the links whose child *created_in* admits are read, when it is given.
     The adjudicator is asked only about the links the verdict rows decide and
     that the ledger holds no adjudication of at their current texts. Every read
     and every question is made before the run row exists. The run rests on the
     adjudications it makes and on those it reuses. A failed verdict is counted,
-    never ledgered; a share over its ceiling and a failure storm are recorded as
-    ``would_escape``, never filed.
+    never ledgered. Only heals in *enabled_actions* are staged (``None`` stages
+    every one). A share over its ceiling is recorded as ``would_escape``, never
+    filed; so is a failure storm, unless *filer* is given, which files it and
+    discloses it as ``escaped``.
     """
-    reads = await read_links(store, census, projects)
+    reads = await read_links(store, census, projects, created_in)
     adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
-    run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+    run_id = ledger.start_run(source, writes=False)
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)
     ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
     bases = [
@@ -717,10 +740,15 @@ async def run_adjudicator_plan(
         adjudications_reused=len(adjudicated.reused),
         adjudication_failed=adjudicated.failed,
     )
+    storms = adjudicated.storm_escapes(projects)
+    escaped = () if filer is None else tuple(
+        entry for storm in storms for entry in _file(filer, storm)
+    )
     return await _publish_plan(
         replace(plan, counts=counts), run_id,
-        ledger=ledger, limits=limits, projects=projects, source=RunSource.ADJUDICATOR,
-        plan_path=plan_path_for(run_id), escapes=adjudicated.storm_escapes(projects),
+        ledger=ledger, limits=limits, projects=projects, source=source,
+        plan_path=plan_path_for(run_id), escapes=storms if filer is None else (),
+        escaped=escaped, enabled_actions=enabled_actions,
     )
 
 

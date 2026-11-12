@@ -18,10 +18,11 @@ Usage:
         dangling parent, an orchestrator completion record linked as a child)
         across each --project, asks no verdict source, and reports every other
         link unexamined.
-    apply [--from-adjudicator | --deterministic] [--approved-plan-sha SHA256]
-        Heal the pending plan of the corpus (default), of the adjudicator or of
-        the deterministic rows, oldest first. With the sha of the pending plan
-        document, every pending heal is applied and the per-run cap is lifted.
+    apply [--from-adjudicator | --deterministic | --sweep] [--approved-plan-sha SHA256]
+        Heal the pending plan of the corpus (default), of the adjudicator, of
+        the deterministic rows or of the scheduled sweep, oldest first. With
+        the sha of the pending plan document, every pending heal is applied and
+        the per-run cap is lifted.
         When the adjudications behind the pending heals pass a share ceiling,
         nothing is written.
     undo --run RUN_ID
@@ -99,7 +100,9 @@ NO_WRITING_RUN = 'no link-heal run has written here'
 STATUS_COUNTS = (
     'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
 )
-PLAN_SOURCES = (RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC)
+PLAN_SOURCES = (
+    RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC, RunSource.SWEEP,
+)
 
 
 def load_config(config_path: str | None) -> FusedMemoryConfig:
@@ -202,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply_source.add_argument(
         '--deterministic', dest='source', action='store_const', const=RunSource.DETERMINISTIC,
         help="heal the deterministic rows' pending plan",
+    )
+    apply_source.add_argument(
+        '--sweep', dest='source', action='store_const', const=RunSource.SWEEP,
+        help="heal the scheduled sweep's pending plan, e.g. a backlog with --approved-plan-sha",
     )
     apply.set_defaults(source=RunSource.CORPUS)
     apply.add_argument('--approved-plan-sha', metavar='SHA256')

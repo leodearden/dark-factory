@@ -672,6 +672,7 @@ class RunCounts:
     planned_by_action: Mapping[str, int] = field(default_factory=dict)
     already_pending: int = 0
     undo_suppressed: int = 0
+    not_enabled: int = 0
     bases_unlinked: int = 0
     read_failed: int = 0
     applied: int = 0

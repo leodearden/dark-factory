@@ -64,6 +64,8 @@ class RunSource(StrEnum):
     UNDO = 'undo'
     #: The adjudicator scored against rated pairs; it never plans or writes a heal.
     CALIBRATION = 'calibration'
+    #: The scheduled adjudicator sweep over the links made since the last one.
+    SWEEP = 'sweep'
 
 
 class RunKind(StrEnum):
@@ -101,6 +103,8 @@ class Disposition(StrEnum):
     STAGED = 'staged'
     ALREADY_PENDING = 'already_pending'
     UNDO_SUPPRESSED = 'undo_suppressed'
+    #: A heal outside the actions the run was enabled to stage.
+    NOT_ENABLED = 'not_enabled'
     REPORTED = 'reported'
 
 

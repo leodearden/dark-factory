@@ -92,19 +92,19 @@ def ledger(tmp_path: Path):
 
 def _seed(harness: LinkHealHarness) -> None:
     links = (
-        (MISFILED, 'misfiled sighting', SIGHTING_KIND, INSIDE, {}),
-        (EXTENDS, 'extending sighting', SIGHTING_KIND, INSIDE, {}),
-        (AMENDMENT_CORRECTS, 'correcting amendment', AMENDMENT_KIND, INSIDE, {}),
-        (SIGHTING_CORRECTS, 'correcting sighting', SIGHTING_KIND, INSIDE, {}),
-        (OLD, 'an old misfiled sighting', SIGHTING_KIND, BEFORE, {}),
-        (TRIAGE_CONTESTED, 'a triage-contested sighting', SIGHTING_KIND, INSIDE,
-         {'contested_by_triage': True}),
-        (HAND_CONTESTED, 'a hand-contested sighting', SIGHTING_KIND, INSIDE, {'contested': True}),
+        (MISFILED, 'misfiled sighting', SIGHTING_KIND, INSIDE, False, False),
+        (EXTENDS, 'extending sighting', SIGHTING_KIND, INSIDE, False, False),
+        (AMENDMENT_CORRECTS, 'correcting amendment', AMENDMENT_KIND, INSIDE, False, False),
+        (SIGHTING_CORRECTS, 'correcting sighting', SIGHTING_KIND, INSIDE, False, False),
+        (OLD, 'an old misfiled sighting', SIGHTING_KIND, BEFORE, False, False),
+        (TRIAGE_CONTESTED, 'a triage-contested sighting', SIGHTING_KIND, INSIDE, False, True),
+        (HAND_CONTESTED, 'a hand-contested sighting', SIGHTING_KIND, INSIDE, True, False),
     )
-    for n, (child, text, kind, created_at, contest) in enumerate(links):
+    for n, (child, text, kind, created_at, by_hand, by_triage) in enumerate(links):
         harness.seed_link(
             kind=kind, child=child, parent=_id('bbbbbbbb', n), child_text=text,
-            parent_text=f'the parent of {text}', meta={'created_at': created_at}, **contest,
+            parent_text=f'the parent of {text}', meta={'created_at': created_at},
+            contested=by_hand, contested_by_triage=by_triage,
         )
 
 
