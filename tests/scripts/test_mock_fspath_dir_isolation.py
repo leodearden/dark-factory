@@ -25,7 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402  # debt: task 6997
+from nested_pytest_session import (  # noqa: E402  # debt: task 6997
+    binding_conftest,
+    run_nested_pytest,
+)
 
 import df_pytest_isolation  # noqa: E402  # debt: task 6997
 from df_pytest_isolation import (  # noqa: E402  # debt: task 6997
