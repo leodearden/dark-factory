@@ -82,11 +82,17 @@ from typing import Any
 from graphiti_core.edges import EntityEdge
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.llm_client.client import LLMClient
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.maintenance.edge_operations import extract_edges
 from graphiti_core.utils.maintenance.node_operations import extract_nodes
+from openai.types.chat import ChatCompletionMessageParam
+from openai.types.responses import EasyInputMessageParam, ResponseInputParam
+from openai.types.shared import ReasoningEffort
+from openai.types.shared_params import Reasoning
+from pydantic import BaseModel
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
@@ -154,7 +160,7 @@ class ExtractionLlm:
     """
 
     model: str | None = None
-    reasoning_effort: str | None = None
+    reasoning_effort: ReasoningEffort = None
 
 
 @dataclass(frozen=True)
@@ -228,21 +234,91 @@ class UnmeasurableClient(TypeError):
     """The LLM client carries no AttributingTokenUsageTracker, so its tokens cannot be measured."""
 
 
-class ArmModelMismatch(ValueError):
-    """An arm that names its model, handed a client on another one."""
+class ArmClientMismatch(ValueError):
+    """An arm handed a client on another model or reasoning effort than its own, or an effort
+    that the configured client class cannot send."""
 
 
-def build_arm_llm(cfg: FusedMemoryConfig, model: str | None) -> LLMClient | None:
-    """The configured extraction client, on *model* when given; *cfg* itself is never modified."""
-    arm_cfg = cfg.model_copy(deep=True)
-    if model is not None:
-        arm_cfg.llm.model = model
-    return build_llm_client(arm_cfg)
+def _responses_input(messages: list[ChatCompletionMessageParam]) -> ResponseInputParam:
+    """graphiti's converted messages as Responses input. graphiti emits only system and user
+    messages with text content, so anything else is a defect, refused before it is sent."""
+    converted: ResponseInputParam = []
+    for message in messages:
+        role, content = message['role'], message.get('content')
+        if role not in ('system', 'user') or not isinstance(content, str):
+            raise TypeError(f'a {role} message with {type(content).__name__} content is not Responses input')
+        converted.append(EasyInputMessageParam(role=role, content=content))
+    return converted
+
+
+class ExplicitEffortOpenAIClient(OpenAIClient):
+    """graphiti's OpenAIClient for a reasoning model graphiti_core 0.28.2 does not recognise by name.
+
+    graphiti treats only gpt-5, o1 and o3 names as reasoning models: any other
+    model is sent temperature and never sent reasoning. This client sends no
+    temperature, and exactly the arm's reasoning effort (esc-9065-2). It wraps
+    the client build_llm_client built, reusing its SDK client, config,
+    max_tokens and token tracker.
+    """
+
+    def __init__(self, built: OpenAIClient, effort: ReasoningEffort) -> None:
+        if effort is None:
+            raise ValueError('an effort client sends a chosen effort; build the configured client instead')
+        super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens, reasoning=effort)
+        self.token_tracker = built.token_tracker
+        self._reasoning_effort: ReasoningEffort = effort
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort:
+        """The effort sent. Not graphiti's own ``reasoning``, which every OpenAIClient carries
+        ('minimal' by default), even when it sends nothing."""
+        return self._reasoning_effort
+
+    async def _create_structured_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel], reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        return await self.client.responses.parse(
+            model=model, input=_responses_input(messages), max_output_tokens=max_tokens,
+            text_format=response_model, reasoning=Reasoning(effort=self._reasoning_effort),
+        )
+
+    async def _create_completion(
+        self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
+        max_tokens: int, response_model: type[BaseModel] | None = None, reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        raise NotImplementedError(
+            'a JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it',
+        )
 
 
 def client_reasoning_effort(llm: LLMClient) -> str | None:
-    """The reasoning effort *llm* declares it sends; None for a client that declares none."""
+    """The reasoning effort *llm* declares it sends: its ``reasoning_effort``, or None when it has
+    none, as graphiti's own clients have none. The one reader of that attribute."""
     return getattr(llm, 'reasoning_effort', None)
+
+
+def build_arm_llm(cfg: FusedMemoryConfig, llm: ExtractionLlm) -> LLMClient | None:
+    """The configured extraction client on *llm*'s model, sending *llm*'s effort when it sets one.
+
+    *cfg* itself is never modified. An effort is sent on the Responses API, so
+    a configured client class that serves chat completions only is refused
+    rather than handed an effort it would drop.
+    """
+    arm_cfg = cfg.model_copy(deep=True)
+    if llm.model is not None:
+        arm_cfg.llm.model = llm.model
+    client = build_llm_client(arm_cfg)
+    if client is None or llm.reasoning_effort is None:
+        return client
+    if not isinstance(client, OpenAIClient):
+        raise ArmClientMismatch(
+            f'reasoning effort {llm.reasoning_effort} is sent on the Responses API, which the '
+            f'{cfg.llm.provider}/{cfg.llm.client_class} client ({type(client).__name__}) does not serve',
+        )
+    return ExplicitEffortOpenAIClient(client, llm.reasoning_effort)
 
 
 def in_batch_dedupe(edges: Iterable[EntityEdge]) -> list[EntityEdge]:
@@ -273,7 +349,7 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
 async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
     """Raise unless *llm* can replay *arm*: on the arm's model, with attributable tokens. Calls nothing."""
     if arm.llm.model is not None and llm.model != arm.llm.model:
-        raise ArmModelMismatch(f'arm {arm.name} extracts on {arm.llm.model}, but the client is on {llm.model}')
+        raise ArmClientMismatch(f'arm {arm.name} extracts on {arm.llm.model}, but the client is on {llm.model}')
     async with measure_llm_tokens(llm) as probe:
         pass
     _usage(probe)
@@ -785,7 +861,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _live_llm_factory(model: str | None) -> LLMClient | None:
-    return build_arm_llm(FusedMemoryConfig(), model)
+    return build_arm_llm(FusedMemoryConfig(), ExtractionLlm(model))
 
 
 def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -859,7 +935,7 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     try:
         for arm, llm in arm_clients:
             await check_arm_client(llm, arm)
-    except (ArmModelMismatch, UnmeasurableClient) as exc:
+    except (ArmClientMismatch, UnmeasurableClient) as exc:
         logger.error('an arm cannot be replayed on its client, nothing is written: %s', exc)
         return EXIT_INVALID
     if conflicts := _model_conflicts(kept, arm_clients):
