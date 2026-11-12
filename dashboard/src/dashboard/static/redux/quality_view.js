@@ -1,0 +1,188 @@
+// quality_view.js — the pure decisions behind the Quality tab
+// (tab_quality.jsx): which served metrics each section draws, the text of a
+// headline, a counting rule, an alarm verdict and a before/after comparison,
+// the arrays a metric's chart draws, and where each served marker and alarm
+// sits on that chart.
+//
+// Every figure is read from the served QUALITY / QUALITY_MARKERS values
+// (dashboard/src/dashboard/data/quality_series.py::QualitySeries.to_wire and
+// quality_markers.py::MarkerStream.to_wire own their shapes): nothing here
+// smooths, re-buckets or recomputes a statistic.
+//
+// LOAD CONTRACT. It destructures window.DF_CHART_MARKS at module scope with no
+// fallback, so index.html loads it after chart_marks.js and before the Babel
+// JSX tags (test_index_html.py::_READING_MODULES pins both edges). node
+// requires the same file as CommonJS once its test has put that global on a
+// window shim; coverage is behavioural, in
+// dashboard/tests/js/quality_view.test.mjs.
+
+// Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
+// header.
+const {
+  fractionAt: qualityFractionAt,
+  rangeFractions: qualityRangeFractions,
+  markStyleFor: qualityMarkStyleFor,
+} = window.DF_CHART_MARKS;
+
+const QUALITY_LAYOUT = Object.freeze({
+  outcomes: Object.freeze([
+    Object.freeze({ metric: 'rejected', beside: 'rejections_per_landing', title: 'Verify rejections' }),
+    Object.freeze({ metric: 'reviewer_blocking', beside: null, title: 'Reviewer blocking' }),
+    Object.freeze({ metric: 'flakes_confirmed', beside: 'flakes_real_red', title: 'Confirmed flakes' }),
+    Object.freeze({ metric: 'reverts', beside: null, title: 'Reverts' }),
+    Object.freeze({ metric: 'reverifies_per_landing', beside: null, title: 'Re-verifies per landing' }),
+  ]),
+  changeCost: Object.freeze([
+    Object.freeze({ metric: 'all_role_usd', beside: null, title: 'All-role cost per landing' }),
+    Object.freeze({ metric: 'implementer_invocations', beside: null, title: 'Implementer invocations' }),
+    Object.freeze({ metric: 'turns', beside: 'turns_capped', title: 'Turns per landing' }),
+    Object.freeze({ metric: 'review_rounds_ge2', beside: null, title: '≥2 review rounds' }),
+    Object.freeze({ metric: 'charter_blocked', beside: null, title: 'Charter blocked' }),
+  ]),
+});
+
+function qualityPercent(share) {
+  return `${(share * 100).toFixed(1)}%`;
+}
+
+function qualitySigned(text, x) {
+  return x >= 0 ? `+${text}` : text;
+}
+
+function qualityPoints(difference) {
+  return qualitySigned((difference * 100).toFixed(1), difference);
+}
+
+function qualityAmount(x, unit) {
+  return unit === 'usd' ? `$${x.toFixed(2)}` : x.toFixed(2);
+}
+
+function qualityCentred(headline, unit) {
+  const text = `${qualityAmount(headline.value, unit)} [${qualityAmount(headline.lo, unit)}–${qualityAmount(headline.hi, unit)}]`;
+  return unit === 'usd' ? text : `${text} ${unit}`;
+}
+
+const QUALITY_HEADLINE_TEXT = Object.freeze({
+  rate: headline => `${qualityPercent(headline.value)} [${qualityPercent(headline.lo)}–${qualityPercent(headline.hi)}]`,
+  k_of_n: headline => `${headline.k} of ${headline.n} [${qualityPercent(headline.lo)}–${qualityPercent(headline.hi)}]`,
+  mean: qualityCentred,
+  median: qualityCentred,
+});
+
+function headlineText(headline, unit) {
+  if (!Object.prototype.hasOwnProperty.call(QUALITY_HEADLINE_TEXT, headline.form)) {
+    throw new TypeError(`quality_view.js renders no headline form ${JSON.stringify(headline.form)}`);
+  }
+  return QUALITY_HEADLINE_TEXT[headline.form](headline, unit);
+}
+
+function ruleCaption(rule) {
+  const since = rule.measured_since === null
+    ? `no producer has written here (${rule.source})`
+    : `measured since ${rule.measured_since.slice(0, 10)}`;
+  return [
+    `counts: ${rule.counts}`,
+    `population: ${rule.population}`,
+    `headline: last ${rule.window_landings} landings`,
+    since,
+    `excludes: ${rule.excludes}`,
+  ].join(' · ');
+}
+
+function chartSeries(metric) {
+  const series = [{ key: 'center', values: metric.rolling.center }];
+  if (metric.ewma !== null) {
+    series.push({ key: 'ewma', values: metric.ewma.line }, { key: 'ucl', values: metric.ewma.ucl, dash: true });
+  }
+  const band = metric.kind === 'rate' ? { lo: metric.rolling.lo, hi: metric.rolling.hi } : null;
+  return { series, band };
+}
+
+function indexMarkers(markers) {
+  return new Map((markers || []).map(marker => [marker.id, marker]));
+}
+
+function alarmVerdict(alarm, markersById) {
+  if (alarm.explained_by === null) return `unexplained change at landing #${alarm.onset_ordinal}`;
+  const marker = markersById.get(alarm.explained_by);
+  return `explained by ${marker ? marker.label : alarm.explained_by}`;
+}
+
+const QUALITY_EFFECT_TEXT = Object.freeze({
+  rate: entry => `${qualityPoints(entry.effect)} pp [${qualityPoints(entry.lo)} to ${qualityPoints(entry.hi)} pp]`,
+  cost: entry => `×${entry.effect.toFixed(2)} [×${entry.lo.toFixed(2)} to ×${entry.hi.toFixed(2)}]`,
+});
+
+function qualityNotYetText(entry, kind) {
+  const parts = [`n ${entry.n_before} → ${entry.n_after}`];
+  if (entry.eta_days !== null) parts.push(`ETA ${Math.ceil(entry.eta_days)} d`);
+  if (entry.min_detectable !== null) {
+    parts.push(kind === 'rate' ? `MDE ${(entry.min_detectable * 100).toFixed(1)} pp` : `MDE ${entry.min_detectable}`);
+  }
+  return parts.join(' · ');
+}
+
+function beforeAfterText(entry, kind) {
+  if (entry.state === 'not_yet') return qualityNotYetText(entry, kind);
+  return `${QUALITY_EFFECT_TEXT[kind](entry)} · n ${entry.n_before} → ${entry.n_after}`;
+}
+
+function qualityAppliesTo(marker, metricId) {
+  return marker.series === null || marker.series.includes(metricId);
+}
+
+function qualityPlacement(marker, ordinals) {
+  if (qualityMarkStyleFor(marker.kind) !== 'range') {
+    const fraction = qualityFractionAt(ordinals, marker.ordinal);
+    return fraction === null ? null : { fraction };
+  }
+  const span = qualityRangeFractions(ordinals, marker.ordinal, marker.until_ordinal ?? marker.ordinal);
+  return span && { fraction: span.start, endFraction: span.end };
+}
+
+function qualityMarkerMark(marker, ordinals, verdict) {
+  const placement = qualityPlacement(marker, ordinals);
+  return placement && { key: marker.id, kind: marker.kind, label: marker.label, ...placement, ref: marker.ref, verdict };
+}
+
+function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
+  const ordinals = axis.map(point => point.ordinal);
+  const served = markers || [];
+  const verdicts = new Map(beforeAfter
+    .filter(entry => entry.metric === metricId)
+    .map(entry => [entry.marker_id, beforeAfterText(entry, kind)]));
+  const placed = served
+    .filter(marker => qualityAppliesTo(marker, metricId))
+    .map(marker => qualityMarkerMark(marker, ordinals, verdicts.get(marker.id) ?? null))
+    .filter(mark => mark !== null);
+  const byId = indexMarkers(served);
+  const alarmMarks = alarms.map(alarm => ({
+    key: `alarm:${alarm.ordinal}:${alarm.direction}`,
+    kind: 'alarm',
+    label: alarmVerdict(alarm, byId),
+    fraction: qualityFractionAt(ordinals, alarm.ordinal),
+    ref: null,
+    verdict: null,
+  })).filter(mark => mark.fraction !== null);
+  return [...placed, ...alarmMarks];
+}
+
+// Module-unique export const, never a bare `API` — the CANONICAL note in
+// datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
+const QUALITY_VIEW_API = {
+  QUALITY_LAYOUT,
+  headlineText,
+  ruleCaption,
+  chartSeries,
+  indexMarkers,
+  alarmVerdict,
+  beforeAfterText,
+  qualityMarks,
+};
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = QUALITY_VIEW_API;
+}
+if (typeof window !== 'undefined') {
+  window.DF_QUALITY_VIEW = QUALITY_VIEW_API;
+}
