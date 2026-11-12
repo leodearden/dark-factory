@@ -107,6 +107,7 @@ from orchestrator.verify_cmd import (
     parse_config_command,
     render,
     reproject,
+    serial_confirm_pytest,
     serial_pytest,
     split_and_chain_segments,
     split_chain_tail,
@@ -2411,25 +2412,49 @@ def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str |
     rewritten = serial_pytest(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
-            refused = _unspliceable_pytest_spans(parsed.raw)
-            reason = (
-                f'the matched pytest span {refused[0]!r} ends inside an unclosed '
-                'quote, so nowhere in it could take -p no:xdist -o addopts= without '
-                'landing inside a live quoted argument and silently running the '
-                'wrong tests'
-                if refused
-                else 'no pytest invocation could be located outside a quoted '
-                'argument, so there was nowhere to put -p no:xdist -o addopts='
-            )
-            logger.warning(
-                'serial recovery flags could not be applied to %s: %s. The ORIGINAL '
-                'command is being re-run unchanged, so this retry will fail for its '
-                'own reason rather than recover',
-                cmd,
-                reason,
+            _warn_serial_flags_unapplied(cmd, parsed.raw, flags='-p no:xdist -o addopts=')
+        return cmd
+    return render(rewritten)
+
+
+def _serial_confirm_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str | None:
+    """``_serial_pytest_str`` for a confirm re-run: ``verify_cmd.py::serial_confirm_pytest``.
+
+    Same shape, *invocation_dir* contract and raw-chain WARNING as
+    ``_serial_pytest_str``; only the mutator differs.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
+    rewritten = serial_confirm_pytest(parsed, ini_addopts)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            _warn_serial_flags_unapplied(
+                cmd, parsed.raw, flags='-n 0 (or -p no:xdist -o addopts= where xdist is not in play)',
             )
         return cmd
     return render(rewritten)
+
+
+def _warn_serial_flags_unapplied(cmd: str, raw: str, *, flags: str) -> None:
+    """The WARNING ``_serial_pytest_str``'s docstring explains, naming the *flags* not placed."""
+    refused = _unspliceable_pytest_spans(raw)
+    reason = (
+        f'the matched pytest span {refused[0]!r} ends inside an unclosed '
+        f'quote, so nowhere in it could take {flags} without '
+        'landing inside a live quoted argument and silently running the '
+        'wrong tests'
+        if refused
+        else 'no pytest invocation could be located outside a quoted '
+        f'argument, so there was nowhere to put {flags}'
+    )
+    logger.warning(
+        'serial re-run flags could not be applied to %s: %s. The ORIGINAL '
+        'command is being re-run unchanged instead of serially',
+        cmd,
+        reason,
+    )
 
 
 def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
@@ -2443,12 +2468,11 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     structured PYTEST command (an OPAQUE / raw-retained chain / non-pytest
     command — covers the same no-op surface as ``with_pytest_timeout``, P1).
 
-    The α confirm gate composes this OUTSIDE ``_serial_pytest_str`` — the
-    generous explicit ``--timeout`` is required because the serial recovery's
-    ``-o addopts=<value>`` overrides only pyproject ``addopts`` — the
-    ``[tool.pytest.ini_options] timeout`` default is a separate ini key, so it
-    is neither cleared nor carried and would otherwise starve the isolated
-    confirm run into a false non-suppression.
+    The α confirm gate composes this OUTSIDE ``_serial_confirm_pytest_str`` —
+    the generous explicit ``--timeout`` is required because the
+    ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+    addopts never carries, so neither serial form touches it and it would
+    otherwise starve the isolated confirm run into a false non-suppression.
     """
     if cmd is None:
         return None
@@ -10679,8 +10703,8 @@ async def run_main_tip_sweep(
 # 2370). A PASS on ANY attempt within this bound is treated as a confirmed
 # flake for that group — mirrors run_main_tip_sweep's single-retry heuristic,
 # widened slightly since this re-run is already scoped to just the named
-# tests (cheap) and serial with xdist stripped from addopts (task 2045's
-# proven xdist-contention recovery). No config flag: the gate is a strict fail-safe
+# tests (cheap) and serial (verify_cmd.py::serial_confirm_pytest).
+# No config flag: the gate is a strict fail-safe
 # improvement over the status quo (a bare, unconfirmed alarm), so it is
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
@@ -10688,9 +10712,9 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
-#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
-#: overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this
+#: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this
 #: explicit override a still-loaded host can starve the isolated confirm
 #: run into a false "still fails" verdict — and unlike the merge gate
 #: (which only holds a merge), a false verdict HERE files a red-main L1.
@@ -11055,11 +11079,12 @@ def _node_id_test_config(
     tree: Path,
     timeout_secs: int,
 ) -> ModuleConfig:
-    """The module's test leg alone, scoped to *node_ids*, forced serial, with a per-test timeout."""
+    """The module's test leg alone, scoped to *node_ids*, serial in the confirm form
+    (``verify_cmd.py::serial_confirm_pytest``), with a per-test timeout."""
     return replace(
         module_config,
         test_command=_with_pytest_timeout_str(
-            _serial_pytest_str(
+            _serial_confirm_pytest_str(
                 _scope_to_keyword(module_config.test_command, 'pytest', list(node_ids)),
                 invocation_dir=tree,
             ),
@@ -11260,9 +11285,9 @@ async def run_node_ids(
 
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
-#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
-#: recovery's ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this explicit
 #: override a still-loaded host could starve the isolated run into a false
 #: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
 #: sweep tuning is not coupled to merge-gate tuning (they are retuned on
@@ -11392,14 +11417,14 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (scoped + forced-serial with xdist
-    stripped from addopts — the task-2045 recovery — plus an explicit generous
+    re-runs JUST those tests, in ISOLATION (scoped + serial in the confirm
+    form, ``verify_cmd.py::serial_confirm_pytest``, plus an explicit generous
     ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
     the sweep's own contended worktree.
 
     The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
-    cosmetic: ``-o addopts=`` overrides only pyproject's ``addopts``, NOT its
-    ``[tool.pytest.ini_options] timeout`` default, so without the
+    cosmetic: pyproject's ``[tool.pytest.ini_options] timeout`` default is
+    its own ini key, which addopts never carries, so without the
     override a still-loaded host could starve this confirmation into a
     false "still fails" verdict — which here means filing a red-main L1
     escalation for a flake, the exact false positive this gate exists to
@@ -11576,9 +11601,9 @@ async def confirm_main_tip_failure_is_real(
 
 #: Generous per-test timeout (seconds) injected into the α confirm gate's
 #: isolated re-run command via ``_with_pytest_timeout_str``. Must comfortably
-#: exceed any legitimate single-test wall time: the serial recovery's
-#: ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
-#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
+#: exceed any legitimate single-test wall time: the
+#: ``[tool.pytest.ini_options] timeout`` default is its own ini key, which
+#: addopts never carries, so without this explicit
 #: override the isolated confirm re-run could itself starve under residual load
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
@@ -11587,8 +11612,8 @@ _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
 #: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
 #: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
 #: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
-#: signals. Same rationale as both: ``-o addopts=`` overrides only pyproject
-#: ``addopts``, NOT the ``[tool.pytest.ini_options] timeout`` default,
+#: signals. Same rationale as both: the ``[tool.pytest.ini_options] timeout``
+#: default is its own ini key, which addopts never carries,
 #: so without this explicit override a still-loaded host can starve the
 #: isolated confirm run into a false "still fails" verdict — and here that
 #: false verdict would mean a false red-main verdict (BLOCKED awaiting a
