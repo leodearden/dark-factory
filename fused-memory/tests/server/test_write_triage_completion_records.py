@@ -2,9 +2,12 @@
 
 Each task's completion record restates the same template as every other
 task's, so triage would file task B's record as a child of task A's. Two routes
-keep it standalone: the orchestrator declares ``kind='task_completion'``, which
+keep it standalone: the orchestrator declares a ``kind``, which
 ``write_triage.declares_attach_keys`` already force-stores, and a server-side
 backstop force-stores a legacy write that carries only the completion source.
+The kinded metadata is the orchestrator's own
+(orchestrator/src/orchestrator/completion_record.py::completion_record_metadata),
+so these tests check the value the writer actually emits.
 
 Harness: ``tests/server/write_triage_harness.py`` and the
 ``server._tool_manager.call_tool('add_memory', ...)`` idiom of
@@ -13,9 +16,11 @@ Harness: ``tests/server/write_triage_harness.py`` and the
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from orchestrator.completion_record import completion_record_metadata
 
 from fused_memory import memory_metadata
 from fused_memory.memory_metadata import CHILD_KINDS, ORCHESTRATOR_COMPLETION_SOURCE
@@ -31,6 +36,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    BandDecision,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
     triage_write,
@@ -50,8 +56,10 @@ _COMPLETION_CONTENT = (
     'Steps completed: 3/3\n'
     'Modules: orchestrator/src/orchestrator'
 )
-_COMPLETION_KIND = {'kind': 'task_completion'}
-_KINDS = {'kinded': _COMPLETION_KIND, 'unkinded': {}}
+_TASK_B_COMPLETION_METADATA = {
+    'kinded': completion_record_metadata('4102'),
+    'legacy-unkinded': {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE},
+}
 
 _TASK_X_GOTCHA = 'gotcha-4201'
 _GOTCHA_CONTENT = (
@@ -62,12 +70,7 @@ _GOTCHA_CONTENT = (
 
 class TestIsOrchestratorCompletionWrite:
     @pytest.mark.parametrize(
-        'metadata',
-        [
-            {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE},
-            {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE, 'kind': 'task_completion'},
-        ],
-        ids=['unkinded', 'kinded'],
+        'metadata', _TASK_B_COMPLETION_METADATA.values(), ids=_TASK_B_COMPLETION_METADATA,
     )
     def test_a_completion_write_counts(self, metadata) -> None:
         assert write_triage.is_orchestrator_completion_write(metadata) is True
@@ -82,23 +85,52 @@ class TestIsOrchestratorCompletionWrite:
         assert write_triage.is_orchestrator_completion_write(metadata) is False
 
 
+async def _triage_a_completion_record(*, declares_kind: bool) -> tuple[AsyncMock, BandDecision]:
+    mock_service = AsyncMock()
+    configure_triage_config(mock_service)
+    mock_service.search.return_value = [search_candidate('completion-4101', _HIGH_BAND)]
+    counter = TriageFailOpenCounter(time_provider=lambda: 1000.0)
+    decision = await triage_write(
+        mock_service, content='c', project_id='p', counter=counter,
+        caller_owns_attach_keys=declares_kind, caller_is_completion_record=True,
+    )
+    assert counter.live_count() == 0, 'a force-store is not a fail-open'
+    return mock_service, decision
+
+
+def _legacy_completion_lines(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if 'legacy completion record' in record.getMessage()
+    ]
+
+
 class TestTriageWriteForceStoresACompletionRecord:
     @pytest.mark.asyncio
     async def test_a_completion_record_stores_before_retrieval(self) -> None:
-        mock_service = AsyncMock()
-        configure_triage_config(mock_service)
-        mock_service.search.return_value = [search_candidate('completion-4101', _HIGH_BAND)]
-        counter = TriageFailOpenCounter(time_provider=lambda: 1000.0)
-
-        decision = await triage_write(
-            mock_service, content='c', project_id='p', counter=counter,
-            caller_is_completion_record=True,
-        )
+        mock_service, decision = await _triage_a_completion_record(declares_kind=False)
 
         assert decision.outcome == OUTCOME_STORED
         assert decision.canonical_id is None
         mock_service.search.assert_not_awaited()
-        assert counter.live_count() == 0, 'a force-store is not a fail-open'
+
+    @pytest.mark.asyncio
+    async def test_each_legacy_force_store_logs_one_line(self, caplog) -> None:
+        """The line that measures when the source backstop can be retired."""
+        with caplog.at_level(logging.INFO, logger=write_triage.logger.name):
+            await _triage_a_completion_record(declares_kind=False)
+
+        lines = _legacy_completion_lines(caplog)
+        assert len(lines) == 1, f'{caplog.text!r}'
+        assert 'project=p' in lines[0], f'{lines!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_kinded_completion_record_is_not_counted_as_legacy(self, caplog) -> None:
+        with caplog.at_level(logging.INFO, logger=write_triage.logger.name):
+            _, decision = await _triage_a_completion_record(declares_kind=True)
+
+        assert decision.outcome == OUTCOME_STORED
+        assert _legacy_completion_lines(caplog) == [], f'{caplog.text!r}'
 
 
 def _service(hit: MemoryResult) -> AsyncMock:
@@ -172,15 +204,14 @@ def _persisted_metadata(mock_service: AsyncMock) -> dict:
 class TestACompletionRecordForAnotherTaskLandsStandalone:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('score', _BANDS.values(), ids=_BANDS)
-    @pytest.mark.parametrize('declared_kind', _KINDS.values(), ids=_KINDS)
+    @pytest.mark.parametrize(
+        'metadata', _TASK_B_COMPLETION_METADATA.values(), ids=_TASK_B_COMPLETION_METADATA,
+    )
     async def test_task_b_is_not_attached_under_task_a(
-        self, score: float, declared_kind: dict,
+        self, score: float, metadata: dict,
     ) -> None:
         mock_service = _service(_task_a_completion_record(score))
         judge = AsyncMock(return_value=TriageJudgeVerdict(OUTCOME_CONTESTED, _TASK_A_COMPLETION))
-        metadata = {
-            'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE, **declared_kind,
-        }
 
         with patch(_JUDGE_PATH, new=judge):
             ack = await _write_task_b_completion(mock_service, metadata)
@@ -192,10 +223,9 @@ class TestACompletionRecordForAnotherTaskLandsStandalone:
         assert PARENT_ID_KEY not in persisted, f'{persisted!r}'
         assert is_contested_child(persisted) is False, f'{persisted!r}'
         assert persisted['task_id'] == '4102', f'{persisted!r}'
-        if declared_kind:
-            assert persisted['kind'] == 'task_completion', f'{persisted!r}'
-        else:
-            assert 'kind' not in persisted, 'the backstop routes; it does not stamp a kind'
+        assert persisted.get('kind') == metadata.get('kind'), (
+            'the backstop routes; it does not stamp a kind'
+        )
 
     @pytest.mark.asyncio
     async def test_the_same_write_under_another_source_is_attached(self) -> None:
@@ -236,9 +266,18 @@ class TestNoGenericTaskIdFilter:
         assert ack[CANONICAL_ID_KEY] == _TASK_X_GOTCHA, f'{ack!r}'
 
 
-def test_the_completion_metadata_validates_under_kind_enforcement() -> None:
-    """If the kind registry is ever enforced, completion writes must not start failing."""
-    metadata = {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE, **_COMPLETION_KIND}
+class TestTheOrchestratorsCompletionMetadata:
+    """The writer's half of the contract matches fused-memory's half."""
 
-    assert memory_metadata.validate_memory_metadata(metadata, enforce_kind_registry=True) == []
-    assert 'task_completion' not in CHILD_KINDS
+    def test_it_validates_under_kind_enforcement(self) -> None:
+        """If the kind registry is ever enforced, completion writes must not start failing."""
+        metadata = completion_record_metadata('4102')
+
+        assert memory_metadata.validate_memory_metadata(metadata, enforce_kind_registry=True) == []
+        assert metadata['kind'] not in CHILD_KINDS
+
+    def test_it_carries_the_source_fused_memory_owns(self) -> None:
+        metadata = completion_record_metadata('4102')
+
+        assert memory_metadata.is_orchestrator_completion_record(metadata) is True
+        assert write_triage.declares_attach_keys(metadata) is True

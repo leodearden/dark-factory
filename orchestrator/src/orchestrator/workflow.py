@@ -106,6 +106,7 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
+from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
@@ -18299,11 +18300,11 @@ class TaskWorkflow:
         """Write task completion summary so dependent tasks find it in briefings.
 
         The ``add_memory`` call is tagged with
-        ``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion',
-        'kind': 'task_completion'}`` so this organic completion note is findable
-        by task_id-keyed audits.  The declared ``kind`` makes fused-memory write
-        triage store the note standalone, never as a child of another task's
-        record (fused-memory/src/fused_memory/server/write_triage.py::declares_attach_keys).
+        ``completion_record_metadata(self.task_id)`` (task_id, source and a
+        declared kind; orchestrator/src/orchestrator/completion_record.py::completion_record_metadata)
+        so this organic completion note is findable by task_id-keyed audits and
+        is stored standalone by write triage, never as a child of another
+        task's record.
         Qdrant payload filters and the deterministic
         ``get_memories_by_metadata`` reconciliation audits match on
         ``metadata.task_id``; without the tag the note (which embeds the id only
@@ -18373,16 +18374,10 @@ class TaskWorkflow:
                         # note is audit-visible via metadata.task_id — found
                         # by get_memories_by_metadata sweeps and the Stage-2
                         # done-task audit's semantic-search step.
-                        # The declared kind keeps write triage from attaching
-                        # it under another task's record (see method docstring).
                         # Deliberately NO stage2_suppress: this must stay
                         # visible to the audit, not silently skip its
                         # count-gate (see method docstring).
-                        'metadata': {
-                            'task_id': str(self.task_id),
-                            'source': 'orchestrator_completion',
-                            'kind': 'task_completion',
-                        },
+                        'metadata': completion_record_metadata(self.task_id),
                     },
                     context=f'completion memory write for task {self.task_id}',
                 )

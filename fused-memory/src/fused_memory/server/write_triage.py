@@ -560,7 +560,9 @@ def is_orchestrator_completion_write(metadata: Any) -> bool:
     and never by parsing, and deliberately not by ``task_id``: an agent
     memory's ``task_id`` is provenance, not its subject (task 6956).
 
-    Retire it once no writer emits the completion source without the kind.
+    Retire it once no writer emits the completion source without the kind:
+    each write it decides logs one ``legacy completion record`` INFO line, so
+    the condition is that those lines stop.
     """
     return isinstance(metadata, dict) and is_orchestrator_completion_record(metadata)
 
@@ -1003,6 +1005,11 @@ async def triage_write(
 
     if caller_is_completion_record:
         # A legacy completion record with no kind; see is_orchestrator_completion_write.
+        logger.info(
+            'write_triage legacy completion record force-stored: project=%s; '
+            'its writer declared no kind',
+            project_id,
+        )
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     if caller_declares_supersession:
