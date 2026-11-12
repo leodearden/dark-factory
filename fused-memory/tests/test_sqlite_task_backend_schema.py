@@ -64,3 +64,40 @@ async def test_a_store_the_backend_opens_has_exactly_the_columns_task_store_ddl_
         f'only in the opened store: {sorted(opened - declared)}; '
         f'only in TASK_STORE_DDL: {sorted(declared - opened)}'
     )
+
+
+@pytest.mark.asyncio
+async def test_a_v5_store_the_backend_migrates_ends_with_exactly_the_columns_task_store_ddl_declares(
+    tmp_path,
+):
+    project_root = tmp_path / 'proj'
+    db_path = tasks_db(project_root)
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(TASK_STORE_DDL)
+        conn.execute('ALTER TABLE tasks DROP COLUMN created_at')
+        conn.execute('ALTER TABLE tasks DROP COLUMN created_at_source')
+        conn.execute('PRAGMA user_version = 5')
+        conn.commit()
+    finally:
+        conn.close()
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        await backend.get_tasks(project_root=str(project_root))
+    finally:
+        await backend.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        migrated = _column_shapes(conn)
+    finally:
+        conn.close()
+    declared = _ddl_column_shapes()
+
+    assert migrated == declared, (
+        f'only in the migrated store: {sorted(migrated - declared)}; '
+        f'only in TASK_STORE_DDL: {sorted(declared - migrated)}'
+    )
