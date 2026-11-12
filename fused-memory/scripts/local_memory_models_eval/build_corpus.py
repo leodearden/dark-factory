@@ -85,6 +85,9 @@ Unusable                      :class:`CorpusBuildError` naming the
 ``source_description``        offending value.
 ``n`` > population            :class:`CorpusBuildError` — never a quietly
                               shorter corpus.
+Payload kind outside          :class:`CorpusBuildError` naming the kinds
+:data:`KNOWN_PAYLOAD_KINDS`   and their ``source_description`` values —
+(build only)                  never a corpus silently re-stratified.
 Non-``GRAPH.RO_QUERY``        :class:`CorpusBuildError` from the reader's
 command attempted             client-side guard.
 ============================  ============================================
@@ -116,7 +119,8 @@ Status                Exit  Meaning and remedy
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
 complete at all — the store was unreachable, the requested corpus is
-unsatisfiable, stdout could not be written (a downstream reader closed the
+unsatisfiable, a build's population carries a payload kind outside
+:data:`KNOWN_PAYLOAD_KINDS`, stdout could not be written (a downstream reader closed the
 pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
 could not be written to ``--out`` (a full disk or an unwritable directory on
 the artifact path — distinct from the stdout case, which is a reader going away
@@ -141,7 +145,6 @@ import asyncio
 import dataclasses
 import hashlib
 import json
-import os
 import random
 import re
 import sys
@@ -159,6 +162,8 @@ from shared.cli_boundary import (
 )
 
 from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
+from fused_memory.config.falkordb_endpoints import FalkorEndpoint
+from fused_memory.config.schema import FusedMemoryConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -205,9 +210,10 @@ writer's category, so stripping them keeps a tagged write in its category's
 stratum instead of landing in its own bogus payload-kind stratum.
 
 The set is deliberately closed: an unrecognised bracket tag stays part of a
-caller string and buckets as :data:`ADD_EPISODE_KIND`. The live smoke's
-payload-axis equality is what catches a new writer annotation; a respelling of
-either existing one is caught offline by
+caller string and buckets as :data:`ADD_EPISODE_KIND`. A new writer
+annotation therefore buckets outside :data:`KNOWN_PAYLOAD_KINDS` and the next
+build refuses (:func:`require_known_payload_kinds`); a respelling of either
+existing one is caught offline by
 ``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestPayloadKind::test_classifies_what_the_episode_writer_persists``,
 which classifies the description the real writer persists.
 """
@@ -231,6 +237,21 @@ ADD_EPISODE_KIND = 'add_episode'
 One explicit bucket rather than one stratum per caller string: the payload axis
 must stay a small closed set, or the cross-product fragments into hundreds of
 singleton cells and stratification stops meaning anything.
+"""
+
+KNOWN_PAYLOAD_KINDS: frozenset[str] = frozenset({
+    'decisions_and_rationale',
+    'temporal_facts',
+    'entities_and_relations',
+    'procedural_knowledge',
+})
+"""The declared payload census: every kind a build may stratify over.
+
+:data:`ADD_EPISODE_KIND` is deliberately absent, because an unrecognised writer
+annotation buckets there. Extend this set only after re-measuring the census: a
+new kind adds a row to the cross-tab and moves every stratum denominator. When
+the new kind comes from a writer annotation, extend
+:data:`_WRITER_ANNOTATIONS_RE` instead.
 """
 
 
@@ -418,6 +439,28 @@ def stratum_key(record: EpisodeRecord) -> tuple[str, str]:
     the stratification report would then misreport as real coverage.
     """
     return (month_bucket(record.created_at), payload_kind(record.source_description))
+
+
+def require_known_payload_kinds(population: list[EpisodeRecord]) -> None:
+    """Refuse a population whose payload axis reaches outside the declared census.
+
+    Subset, not equality: a declared kind that vanishes leaves the axis
+    closed. Raises :class:`CorpusBuildError` naming every undeclared kind and
+    up to five of the descriptions that produced it.
+    """
+    offenders: dict[str, set[str]] = {}
+    for record in population:
+        kind = payload_kind(record.source_description)
+        if kind not in KNOWN_PAYLOAD_KINDS:
+            offenders.setdefault(kind, set()).add(record.source_description)
+    if not offenders:
+        return
+    descriptions = sorted(set().union(*offenders.values()))
+    raise CorpusBuildError(
+        f'payload kinds outside KNOWN_PAYLOAD_KINDS: {sorted(offenders)}, '
+        f'from source_description values {descriptions[:5]}; '
+        're-measure the census before building the next corpus'
+    )
 
 
 ALLOCATION_RULE = 'min-1-floor + largest-remainder proportional, capped at cell size'
@@ -743,7 +786,8 @@ class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with host/port. Either way it reads through
+    double) or with the host/port of the FalkorDB to read (the CLI passes
+    :func:`configured_corpus_source`). Either way it reads through
     ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
     owns the read-only guard and opens the ``falkordb.asyncio`` client lazily,
     on the first read, without ever constructing graphiti's ``FalkorDriver``.
@@ -757,9 +801,14 @@ class EpisodeReader:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
+        if graph is None and (host is None or port is None):
+            raise ValueError(
+                f'EpisodeReader needs a graph handle or a host and port, got host={host!r} '
+                f'port={port!r}'
+            )
         self.graph_name = graph_name
-        self.host = host if host is not None else _falkor_host_from_env()
-        self.port = port if port is not None else _falkor_port_from_env()
+        self.host = host
+        self.port = port
         self._reader = ReadOnlyGraphReader(
             graph_name=graph_name, graph=graph, host=self.host, port=self.port
         )
@@ -814,37 +863,6 @@ class EpisodeReader:
                 f'build a corpus from an empty population'
             )
         return population
-
-
-def _falkor_host_from_env() -> str:
-    """FalkorDB host from ``FALKOR_HOST``, defaulting to localhost.
-
-    Same env vars and defaults as ``fused-memory/tests/_fm_falkor_live.py``, so an
-    operator who has pointed the test suite at a FalkorDB has pointed this
-    script at the same one.
-    """
-    return os.environ.get('FALKOR_HOST', 'localhost')
-
-
-def _falkor_port_from_env() -> int:
-    """FalkorDB port from ``FALKOR_PORT``, defaulting to 6379.
-
-    The ``int()`` is load-bearing: ``os.environ`` yields str and
-    ``FalkorDB(port='6379')`` misbehaves. Unset *or empty* takes the default —
-    empty is what a CI template like ``FALKOR_PORT: ${FALKOR_PORT}`` produces
-    when the variable is not set. A non-empty non-numeric value is an operator
-    error and says so, rather than reading as "FalkorDB not reachable".
-    """
-    raw = os.environ.get('FALKOR_PORT', '').strip()
-    if not raw:
-        return 6379
-    try:
-        return int(raw)
-    except ValueError:
-        raise CorpusBuildError(
-            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
-            f'default (6379), or set it to the port your FalkorDB listens on.'
-        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -1615,6 +1633,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configured_corpus_source() -> FalkorEndpoint:
+    """The FalkorDB ``FusedMemoryConfig()`` names (``FALKORDB_URI``): where the corpus lives."""
+    return FalkorEndpoint.from_uri(FusedMemoryConfig().graphiti.falkordb.uri)
+
+
 def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     """Read the whole ``Episodic`` population from *graph_name*.
 
@@ -1636,8 +1659,10 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     the first read, so a failure from there is genuinely a store-connectivity
     condition too.
     """
+    source = configured_corpus_source()
+    reader = EpisodeReader(graph_name=graph_name, host=source.host, port=source.port)
     try:
-        return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
+        return asyncio.run(reader.fetch_population())
     except _store_error_types() as exc:
         raise CorpusBuildError(
             f'the store could not be read ({type(exc).__name__}): {exc}'
@@ -1647,6 +1672,7 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
 def _run_build(args: argparse.Namespace) -> int:
     """Build mode: sample, report, and (unless ``--dry-run``) write."""
     population = _fetch_population(args.graph)
+    require_known_payload_kinds(population)
     result = select(population, args.n, seed=args.seed)
     manifest = build_manifest(
         result, population, n=args.n, seed=args.seed, graph=args.graph
