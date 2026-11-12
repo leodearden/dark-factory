@@ -4262,7 +4262,7 @@ async def test_reopen_freshness_invalid_override_rejected_in_warn_mode(
 
 @pytest.mark.asyncio
 async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
-    tmp_path, event_buffer, monkeypatch, caplog,
+    tmp_path, event_buffer, caplog,
 ):
     """Coverage gap fix (reviewer follow-up on task 2674): distinguishes the
     transient-git-failure fail-closed path (``evidence_dt`` is None because
@@ -4272,10 +4272,10 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
 
     By the time ``_check_reopen_freshness`` runs, ``_validate_done_provenance``
     has already resolved + ancestor-checked the cited commit, so a genuine
-    "commit does not exist" scenario can never reach the gate --
-    ``_resolve_commit_committed_at`` is monkeypatched to simulate a ``git
-    show`` failure (binary hiccup, timeout) on an otherwise perfectly
-    valid, on-main commit, isolating the gate's OWN resolution step.
+    "commit does not exist" scenario can never reach the gate -- the
+    interceptor's runner scripts a timed-out ``git show`` on an otherwise
+    perfectly valid, on-main commit, isolating the gate's OWN resolution
+    step.
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
     from fused_memory.config.schema import TaskmasterConfig
@@ -4290,7 +4290,12 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
     await backend.start()
     try:
         await backend.add_task(project_root=project_root, title='T')
-        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg)
+        # rev-parse and merge-base still run for real; the first done write
+        # never reaches `git show`, because there is no reopen_at yet.
+        runner = ScriptedGitRunner(
+            {'show': GitResult(124, '', 'timed out after 5.0s', timed_out=True)},
+        )
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=cfg, git_runner=runner)
 
         first_done = await interceptor.set_task_status(
             '1', 'done', project_root,
@@ -4306,21 +4311,12 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
         reopen_at = reopened_task['metadata']['reopen_at']
 
         # A perfectly valid, resolvable, on-main commit -- NOT actually
-        # unresolvable. The monkeypatch below is what makes the gate's own
-        # `git show` step fail, isolated from commit resolution/ancestor
-        # checking in _validate_done_provenance (which runs first and would
-        # otherwise reject a genuinely bad commit before the gate even
-        # sees it).
+        # unresolvable. The scripted `git show` is what makes the gate's own
+        # date step fail, isolated from commit resolution/ancestor checking
+        # in _validate_done_provenance (which runs first and would otherwise
+        # reject a genuinely bad commit before the gate even sees it).
         evidence_sha = _commit_on_main(
             tmp_path, 'transient_failure_evidence.txt', '2099-01-01T00:00:00+00:00',
-        )
-
-        async def _simulate_git_failure(project_root, sha):
-            return None
-
-        monkeypatch.setattr(
-            'fused_memory.middleware.task_interceptor._resolve_commit_committed_at',
-            _simulate_git_failure,
         )
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
@@ -4334,6 +4330,7 @@ async def test_reopen_freshness_fails_closed_when_evidence_date_unresolvable(
                 agent_id='claude-interactive',
             )
 
+        assert any('show' in call.argv for call in runner.calls), runner.calls
         assert result['success'] is False
         assert result['error'] == 'done_evidence_stale'
         assert result['task_id'] == '1'
