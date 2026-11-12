@@ -8,17 +8,17 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
 from shared.storm_counter import KeyedStormCounters
+from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
@@ -34,7 +34,11 @@ from fused_memory.backends.mem0_client import (
     Mem0Backend,
     split_managed_metadata,
 )
-from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
+from fused_memory.config.schema import (
+    FusedMemoryConfig,
+    MemoryMetadataConfig,
+    TaskmasterConfig,
+)
 from fused_memory.memory_metadata import (
     PARENT_ID_DEAD_CODE,
     PARENT_ID_UNAVAILABLE_CODE,
@@ -43,12 +47,13 @@ from fused_memory.memory_metadata import (
     MetadataViolation,
     ParentHasChildrenError,
     check_canonical_routing,
+    is_canonical,
     is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
 )
-from fused_memory.middleware.dead_letter_escalator import (
-    emit_dead_letter_escalation,
+from fused_memory.middleware import (
+    dead_letter_escalator,  # a module import on purpose: see tests/middleware/test_dead_letter_escalator.py::TestImportsCleanlyOnItsOwn
 )
 from fused_memory.middleware.dependency_direction_check import (
     DependencyDirectionFinding,
@@ -85,7 +90,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope, build_known_projects_map
+from fused_memory.models.scope import (
+    Scope,
+    build_known_projects_map,
+    configured_primary_root,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -107,13 +116,27 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.services import overreach_guard
+from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.mem0_add_outcome import (
+    RAISED_MEM0_ADD,
+    Mem0AddOutcome,
+    read_mem0_add_result,
+)
+from fused_memory.services.mem0_write_retry import (
+    DEFAULT_MEM0_RETRY_POLICY,
+    Mem0RetryPassSummary,
+    Mem0RetryPolicy,
+    OnMem0Landed,
+    classify_transient_provider_failure,
+    mem0_write_op_landed,
+    retry_reason,
+)
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
     emit_schema_warnings,
@@ -123,6 +146,16 @@ from fused_memory.services.overreach_shadow import (
     OverreachShadow,
     open_overreach_shadow,
     shadow_job_from_write,
+)
+from fused_memory.services.queued_writes import (
+    DecodedReferents,
+    QueueCallback,
+    QueuedEpisodeWrite,
+    QueuedGraphitiMemoryWrite,
+    QueuedMem0Add,
+    QueuedMem0Fact,
+    QueuedWrite,
+    WriteEnvelope,
 )
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
@@ -136,11 +169,14 @@ from fused_memory.services.topic_anchor import (
     resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    decode_mem0_intent_metadata,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
-    ReferentResolution,
     ReferentSet,
     local_referent,
     resolve_referents,
@@ -192,7 +228,8 @@ _SUBCLOSE_TIMEOUT = 3.0
 # They run after every durable-flush close and lose nothing if cut short.
 _POOL_RELEASE_TIMEOUT = 0.5
 
-# The overreach shadow's close cancels its judge jobs rather than draining them, so it needs no SQLite-flush budget.
+# The overreach shadow's close cancels its judge jobs rather than draining them, but its sidecar's close still runs a best-effort WAL checkpoint.
+# A cut at this budget abandons only that compaction; the connection still shuts (shared/src/shared/async_sqlite_base.py::AtomicConnection.close).
 _SHADOW_CLOSE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
@@ -644,6 +681,33 @@ def _stamp_unverified_claim(meta: dict, unverified_claim: bool) -> None:
         meta[UNVERIFIED_CLAIM_TAG] = True
 
 
+def _file_unknown_key_storm_under_primary_root(
+    taskmaster: TaskmasterConfig | None,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    keys: list[str],
+) -> None:
+    """File the storm escalation into the registry's primary root
+    (``models/scope.py::configured_primary_root``), resolved per crossing.
+
+    Blocking filesystem work end to end, so it runs off the event loop.  With
+    no configured ``taskmaster.project_root`` there is no project queue to file
+    into; the census lines are already out, so only the escalation is lost.
+    """
+    project_root = configured_primary_root(taskmaster)
+    if not project_root:
+        logger.debug(
+            'memory_metadata: unknown-key storm from project_id=%r '
+            'agent_id=%r but no project_root is configured; not escalating',
+            project_id, agent_id,
+        )
+        return
+    file_unknown_key_storm_escalation(
+        project_root, project_id=project_id, agent_id=agent_id, keys=keys,
+    )
+
+
 async def _apply_memory_metadata_validation(
     meta: dict,
     *,
@@ -651,7 +715,7 @@ async def _apply_memory_metadata_validation(
     agent_id: str | None,
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
-    project_root: str,
+    taskmaster: TaskmasterConfig | None,
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
@@ -801,7 +865,9 @@ async def _apply_memory_metadata_validation(
     census and detection are pure CPU and stay inline, but
     ``file_unknown_key_storm_escalation`` does blocking filesystem I/O
     (``EscalationQueue`` construction, a queue-directory scan, a durable
-    fsync-flushed write).  Called directly from these coroutines it would run
+    fsync-flushed write), and so does resolving the root it files into, which
+    is why ``taskmaster`` is passed unresolved and resolved only inside the
+    hop, on a crossing.  Called directly from these coroutines it would run
     that I/O ON the event loop and stall every other concurrent memory write
     for its duration.  The ported precedent
     (``middleware/candidate_key_escalation``) is invoked from a synchronous
@@ -949,23 +1015,13 @@ async def _apply_memory_metadata_validation(
 
         unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
         if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
-            if project_root:
-                await asyncio.to_thread(
-                    file_unknown_key_storm_escalation,
-                    project_root,
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    keys=unknown_keys,
-                )
-            else:
-                # No configured taskmaster.project_root means no project queue to
-                # file into. The census lines are already out, so the signal is
-                # not lost — only the escalation.
-                logger.debug(
-                    'memory_metadata: unknown-key storm from project_id=%r '
-                    'agent_id=%r but no project_root is configured; not escalating',
-                    project_id, agent_id,
-                )
+            await asyncio.to_thread(
+                _file_unknown_key_storm_under_primary_root,
+                taskmaster,
+                project_id=project_id,
+                agent_id=agent_id,
+                keys=unknown_keys,
+            )
 
         if config.enforce and any(v.fatal for v in violations):
             raise MemoryMetadataValidationError([v for v in violations if v.fatal])
@@ -1108,6 +1164,8 @@ async def _check_canonical_uniqueness(
        Compared as a PAIR, not on ``canonical`` alone: a canonical record
        re-homed from topic T to topic U changes no ``canonical`` value but
        is acquiring a claim at U, where it genuinely is not the incumbent.
+       The held claim is read through ``is_canonical``, so a non-bool
+       pre-image (int ``1`` or ``1.0``) is not a held claim and is probed.
     4. the write will not reach Mem0 → return (task 3508).  The seam already
        censused — and under ``enforce`` refused — it as
        ``canonical_on_non_mem0_write``; the probe could only ever count 0.
@@ -1205,7 +1263,7 @@ async def _check_canonical_uniqueness(
     after-the-fact backstop that resolves a duplicate pair.  Do NOT add
     locking here — that would be an unreviewed scope expansion.
     """
-    if meta.get('canonical') is not True:
+    if not is_canonical(meta):
         return
 
     topic = meta.get('topic')
@@ -1215,8 +1273,10 @@ async def _check_canonical_uniqueness(
     # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
     # the docstring: this is what makes the record's own presence in the
     # store irrelevant, so no `exclude_id` is needed anywhere below.
-    if baseline is not None and (
-        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    if (
+        baseline is not None
+        and is_canonical(baseline)
+        and baseline.get('topic') == topic
     ):
         return
 
@@ -1402,282 +1462,6 @@ def _serialize_temporal(
         'valid_at': _to_iso(valid_at),
         'invalid_at': _to_iso(invalid_at),
     }
-
-
-def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
-    """Encode a resolved referent set for the durable-queue payload.
-
-    THE WIRE CONTRACT (task 3670, PRD leaf epsilon).  One additional key,
-    ``'referents'``, on the EXISTING ``add_episode`` / ``add_memory_graphiti``
-    payloads::
-
-        {'source': <one of REFERENT_SOURCES>,
-         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...],
-         'ambiguous': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
-
-    Deliberately NO ``payload_version``, no unknown-operation guard and no
-    migration (PRD "Queue compatibility is free here").  An OLD consumer
-    draining a new row ignores exactly one unknown key; a NEW consumer draining
-    an old row finds the key absent and treats it as "no referents" — which is
-    today's behaviour exactly.  A new queue OPERATION would have needed all
-    three; one additional key on an existing payload needs none of them.
-
-    Nesting everything under a single key (rather than flat ``referent_source``
-    + ``referent_refs``) keeps the back-compat story to one presence test and
-    gives :func:`_decode_referents` exactly one thing to validate.
-
-    Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
-    itself: the queue persists payloads as JSON TEXT in SQLite, so a
-    non-serializable value here would surface only in production.
-
-    AMBIGUITY RIDES THE WIRE (task 5262).  ``.ambiguous`` is a THIRD key, and
-    the reason is a consumer that cannot otherwise exist safely: gamma excludes
-    ambiguous referents from ``.referents`` on purpose ("recorded, not
-    guessed"), so a consumer reading ONLY ``refs`` sees an ambiguous endpoint as
-    a plain non-member of the set — indistinguishable from a genuine conflation.
-    Acting on that reading means leaf eta destructively repoints an edge the PRD
-    says to leave alone (boundary-test table: "Ambiguous scan | ref routed to
-    ``.ambiguous``; treated as undeclared; recorded, not guessed").  Carrying
-    the producer's own answer is what lets zeta tell the two apart.
-
-    WHY THE SET AND NOT THE INPUTS.  ``.ambiguous`` was previously recoverable
-    at the far end, because it is
-    ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
-    precedence path (referent_resolution.py: "`.ambiguous` is the scan's
-    verbatim answer on every path") and ``_execute_graphiti_write`` holds both
-    inputs.  That re-derivation was a SECOND SCAN SITE — the INV-5 lockstep
-    duplication canonical_labels exists to prevent — and it is only sound while
-    the two scans are parameterized identically.  They are not: the producer now
-    scans with the project registry (task 5262 workstream B) and runs at
-    ENQUEUE, while the consumer runs at DEQUEUE on the far side of a durable
-    SQLite queue, so a restart with a changed registry between the two
-    desynchronizes them silently.  Threading the RESULT rather than the INPUTS
-    makes the two sets incapable of disagreeing at all.
-
-    ``.conflicts`` REMAINS DROPPED, and that is a decision, not an omission.  A
-    conflict is a property of what the CALLER DECLARED versus what the prose
-    says; ``resolve_referents`` reports it to that caller at resolution time and
-    nothing downstream of the queue has a use for it.  Zeta asks a different
-    question — "did this edge land on something the write was about" — and a
-    conflict does not answer it.
-
-    STILL ADDITIVE: no ``payload_version``, no unknown-operation guard, no
-    migration, exactly as adding ``'referents'`` did.  An old consumer draining
-    a new row ignores one more unknown key; a new consumer draining an old row
-    finds ``'ambiguous'`` absent, which :func:`_decode_referents` reports as
-    ``None`` — "the producer did not tell us" — and answers with a permissive
-    re-derivation that reproduces that producer exactly.
-    """
-    def _scalars(referents: ReferentSet) -> list[dict[str, str]]:
-        # ONE rendering for both lists: `_decode_referents` validates them
-        # through one helper for the same reason, and two copies of the field
-        # set here would let the two keys drift into different shapes the day
-        # `Referent` grows a field.
-        return [
-            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
-            for r in referents
-        ]
-
-    return {
-        'source': resolution.source,
-        'refs': _scalars(resolution.referents),
-        'ambiguous': _scalars(resolution.ambiguous),
-    }
-
-
-#: The "no such key" answer for :func:`_decode_referents`' ``'ambiguous'``
-#: lookup. ``None`` cannot serve as that default: a JSON ``null`` decodes to
-#: ``None`` too, so ``blob.get('ambiguous')`` would answer identically for a
-#: legacy row (the key is genuinely absent) and a corrupt one (the key is
-#: present and unreadable) — laundering the second into the first's permissive
-#: re-derivation, silently, on refs a NARROWED producer wrote.
-_ABSENT = object()
-
-
-def _decode_referents(
-    payload: dict[str, Any],
-) -> tuple[ReferentSet, str, ReferentSet | None]:
-    """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
-
-    Returns ``(referents, source, ambiguous)``.  An ABSENT key decodes to
-    ``((), 'none', None)`` — an old-format queue row executes byte-identically
-    to today.
-
-    ``ambiguous`` IS ``None``-OR-A-SET, AND THE DISTINCTION IS LOAD-BEARING.
-    ``None`` means "the producer did not tell us": the blob predates the third
-    key, so it was written by a producer that scanned PERMISSIVELY, and the
-    consumer may reproduce it by re-deriving permissively.  ``()`` means "the
-    producer told us: nothing was ambiguous", which the consumer must BELIEVE —
-    re-deriving there would scan with whatever registry happens to be live at
-    dequeue and could manufacture an ambiguity the producer never saw.
-    Collapsing the two into a truthiness test silently reopens exactly the
-    producer/consumer drift threading the key closes.  A key PRESENT but
-    holding a non-list — JSON ``null`` included — is neither answer: it is a
-    corrupt row, and it degrades like every other unreadable field rather than
-    being read as the absent key (see :data:`_ABSENT`).
-
-    POPS the key, matching how ``_execute_graphiti_write`` already treats
-    ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
-    because ``DurableWriteQueue._process_item`` hands the executor one
-    ``parsed_payload()`` and the registered callback a SECOND, FRESH one,
-    precisely so the executor can pop what the callbacks read back.
-
-    Each entry is rebuilt through the ``Referent(...)`` constructor rather than
-    kept as a bare dict, so the frozen type's kind-registry validation runs on
-    untrusted wire data too — which is also what makes an unregistered ``kind``
-    on the wire fall into the degradation path below instead of minting a bogus
-    referent.  That constructor validates ``kind`` ONLY, so ``number`` and
-    ``project_id`` are type-checked here before it runs; see the inline comment
-    in the decode loop for the three distinct ways an unchecked field escapes.
-
-    DEGRADATION IS ALL-OR-NOTHING, ACROSS BOTH LISTS.  Any unreadable element —
-    a non-dict blob, a ``source`` outside :data:`REFERENT_SOURCES`, a non-list
-    ``refs`` or ``ambiguous``, or a SINGLE malformed entry in EITHER — degrades
-    the WHOLE blob to ``((), 'none', None)``, never a partial set and never a
-    good ``refs`` beside a dropped ``ambiguous``.  A partial set is worse than no set for the consumer this
-    exists to serve: leaf zeta's set-membership check reads "endpoint not in
-    the referent set" as a conflation and leaf eta repairs it by repointing the
-    edge, so a referent silently dropped by a lenient decoder would manufacture
-    a false conflation and drive destructive edge surgery onto the wrong node.
-    Referents are therefore accumulated into a local list and only frozen into
-    a tuple on FULL success, so a partial set cannot escape by construction.
-    Both lists run through ONE decode helper, so they cannot drift into two
-    validation policies — and that helper reports failure with a SENTINEL
-    rather than an empty list, because ``[]`` is a legitimate decode of both
-    keys.
-
-    DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
-    executor: raising would route the item to ``_handle_failure`` and
-    eventually dead-letter it, LOSING the memory over a telemetry field.
-    Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
-    that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
-    not a silent fallthrough.  TWO cases do NOT warn, for one reason: they are
-    load-bearing back-compat paths, not anomalies, and warning on them would
-    drown the log during a drain of a pre-feature queue.  An ABSENT
-    ``'referents'`` key is every row written before task 3670; a blob with no
-    ``'ambiguous'`` key is every row written before task 5262, and its refs are
-    READABLE and used.  The first is still COUNTED, in the same bucket.
-
-    Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
-    ``_execute_graphiti_write``, so this file has one idiom, not two.
-    """
-    blob = payload.pop('referents', None)
-    if blob is None:
-        return (), 'none', None
-
-    def _warn(reason: str) -> None:
-        # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
-        # queue row and this warning fires on EVERY retry attempt of that item,
-        # so an oversized corrupt value would otherwise dump its full repr into
-        # the log repeatedly. Matches how the sibling module this codec is
-        # written against (utils/referent_resolution.py) renders every one of
-        # its untrusted-value rejection messages.
-        logger.warning(
-            "Unreadable 'referents' payload key (%s); treating the write as "
-            'having no referents. Blob: %s',
-            reason, _safe_repr(blob),
-        )
-
-    def _degrade(reason: str) -> tuple[ReferentSet, str, None]:
-        _warn(reason)
-        return (), 'none', None
-
-    if not isinstance(blob, dict):
-        return _degrade(f'expected a dict, got {type(blob).__name__}')
-    source = blob.get('source')
-    if source not in REFERENT_SOURCES:
-        return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
-
-    def _decode_list(key: str, raw: Any) -> list[Referent] | None:
-        """Decode one wire list of referent dicts; ``None`` if it is unreadable.
-
-        ONE policy for both keys. A second copy for 'ambiguous' would be two
-        validation rules that must agree in lockstep, and the half they would
-        disagree about is precisely the half that decides whether an ambiguous
-        endpoint reads as a conflation.
-
-        FAILURE IS ``None``, NOT ``[]``: an empty list is a legitimate decode of
-        either key ("no referents" / "nothing was ambiguous"), so it cannot
-        double as the error report. The absent-key question is settled by the
-        caller BEFORE it gets here, so ``None`` carries exactly one meaning
-        inside this helper.
-        """
-        if not isinstance(raw, list):
-            _warn(f'{key!r} must be a list, got {type(raw).__name__}')
-            return None
-
-        decoded: list[Referent] = []
-        for entry in raw:
-            if not isinstance(entry, dict):
-                _warn(f'{key!r} entry {_safe_repr(entry)} is not a dict')
-                return None
-            # `Referent.__post_init__` validates `kind` against the kind
-            # registry but NOT `number`/`project_id` — those two fields accept
-            # any object at all, so the constructor alone does NOT harden this
-            # boundary. Each unchecked type is a distinct downstream failure:
-            #   - a non-str `number` (e.g. 3127) mints a Referent that compares
-            #     UNEQUAL to its string twin, so leaf zeta's set-membership
-            #     check would read a legitimate endpoint as a conflation and
-            #     leaf eta would repoint the edge destructively — the same
-            #     false-conflation failure the all-or-nothing rule above exists
-            #     to prevent, arriving through a mistyped field instead of a
-            #     dropped one;
-            #   - a None `number`/`project_id` mints a referent whose
-            #     `node_name` is the literal string 'Task None';
-            #   - an UNHASHABLE `number` (a list) mints a Referent that raises
-            #     TypeError the moment a consumer puts it in a set — a raise
-            #     inside the queue executor, i.e. exactly the dead-letter-and-
-            #     lose-the-memory outcome degrade-rather-than-raise exists to
-            #     prevent.
-            # `_encode_referents` only ever emits strings, so this is reachable
-            # today only from a corrupt or hand-edited SQLite row — but this
-            # function is the wire-hardening boundary, so it hardens the fields
-            # that matter rather than assuming its own encoder wrote the row.
-            number = entry.get('number')
-            project_id = entry.get('project_id', '')
-            if not isinstance(number, str) or not isinstance(project_id, str):
-                _warn(
-                    f'{key!r} entry {_safe_repr(entry)} has a non-string '
-                    'number/project_id'
-                )
-                return None
-            try:
-                decoded.append(Referent(
-                    kind=entry.get('kind', 'task'),
-                    project_id=project_id,
-                    number=number,
-                ))
-            except (KeyError, TypeError, ValueError) as e:
-                _warn(
-                    f'{key!r} entry {_safe_repr(entry)} is not a valid '
-                    f'Referent: {e}'
-                )
-                return None
-        return decoded
-
-    refs = _decode_list('refs', blob.get('refs'))
-    if refs is None:
-        return (), 'none', None
-
-    # ABSENT is not the same as EMPTY, and neither is the same as PRESENT-BUT-
-    # NULL. No 'ambiguous' key means the row predates task 5262, so the producer
-    # never told us — `None`, and the consumer may re-derive permissively. An
-    # explicit `[]` means it told us nothing was ambiguous, which the consumer
-    # must believe. A key present as JSON `null` is a corrupt row and must fall
-    # through to `_decode_list` like any other bad type; only the `_ABSENT`
-    # sentinel keeps it out of the legacy arm above.
-    raw_ambiguous = blob.get('ambiguous', _ABSENT)
-    if raw_ambiguous is _ABSENT:
-        return tuple(refs), source, None
-    ambiguous = _decode_list('ambiguous', raw_ambiguous)
-    if ambiguous is None:
-        # ALL-OR-NOTHING SPANS BOTH LISTS: the readable `refs` above go down
-        # with it. A good set beside a dropped ambiguity set is the precise
-        # half-decode that would let zeta read an ambiguous endpoint as a
-        # conflation and eta repoint the edge — worse than no blob at all.
-        return (), 'none', None
-
-    return tuple(refs), source, tuple(ambiguous)
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
@@ -2328,8 +2112,14 @@ def _elapsed_ms_since(started: float) -> float:
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+    ):
         self.config = config
+        self._mem0_retry_policy = mem0_retry_policy
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -2380,7 +2170,7 @@ class MemoryService:
         # write path: services/classification_fallback_alarm.py.
         self._classification_fallback_alarm = ClassificationFallbackAlarm()
         # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
-        # leaf epsilon). `_decode_referents` degrades an unreadable or absent
+        # leaf epsilon). `DecodedReferents.from_wire` degrades an unreadable or absent
         # blob to ('none') rather than raising — losing the memory over a
         # telemetry field would be worse — so that degradation MUST be counted
         # rather than silently fallen through. Constructed UNCONDITIONALLY, for
@@ -2427,8 +2217,9 @@ class MemoryService:
         # the degraded configuration where a repair storm is least likely to be
         # noticed any other way.
         #
-        # `_referent_repair_streaks` maps group_id -> CONSECUTIVE episodes whose
-        # repair pass moved at least one endpoint. Per group_id because the
+        # `_referent_repair_streaks` holds, per group_id, the live run of
+        # CONSECUTIVE episodes whose repair pass moved at least one endpoint.
+        # Per group_id because the
         # escalation queue is per-project: a regression in one project's graph
         # must not be masked by another project's clean writes, which is exactly
         # what a single global streak would do (any interleaved clean project
@@ -2437,7 +2228,11 @@ class MemoryService:
         # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
         # there are a handful — so unlike the per-agent mem0 storm counters
         # above it needs no pruning; there is no unbounded key space to leak.
-        self._referent_repair_streaks: dict[str, int] = {}
+        #
+        # Only the counts are read: the storm gate pages on EVERY breach and
+        # reads `_REFERENT_REPAIR_STREAK_THRESHOLD` at use time, so `fired`
+        # and the threshold given here gate nothing.
+        self._referent_repair_streaks: KeyedStreaks[str] = KeyedStreaks(threshold=1)
         # Process-lifetime totals, monotonic and never reset, keyed by a closed
         # five-member vocabulary so a reader never distinguishes "zero" from
         # "absent". Deliberately SEPARATE from the streaks: the streak is a live
@@ -2466,18 +2261,6 @@ class MemoryService:
             threshold=config.memory_metadata.unknown_key_storm_threshold,
             window_seconds=config.memory_metadata.unknown_key_storm_window_seconds,
         )
-
-    def _memory_metadata_project_root(self) -> str:
-        """Project root the unknown-key storm escalation would be filed into.
-
-        Reuses the established resolution (``config.taskmaster.project_root``
-        or empty, see ``reconciliation/harness.py`` and ``server/main.py``)
-        rather than introducing a second notion of "this project's root".
-        Returns ``''`` when unconfigured, which the caller treats as
-        "census only, do not escalate" — there is no queue to file into.
-        """
-        raw = self.config.taskmaster.project_root if self.config.taskmaster else ''
-        return os.path.expanduser(raw) if raw else ''
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -2634,14 +2417,42 @@ class MemoryService:
             on_dead_letter=self._report_queue_dead_letter,
         )
         self.durable_queue.register_callback(
-            'dual_write_episode', self._dual_write_callback
+            QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
         )
         self.durable_queue.register_callback(
-            'refresh_entity_summaries', self._refresh_summaries_callback
+            QueueCallback.REFRESH_ENTITY_SUMMARIES, self._refresh_summaries_callback
         )
         await self.durable_queue.initialize()
 
         logger.info('MemoryService initialized')
+
+    async def initialize_for_reads(self) -> None:
+        """Open only what search, count_memories_by_metadata and get_memories_by_metadata need.
+
+        Runs no Graphiti startup maintenance, starts no durable write queue and
+        opens the planned registry read-only, unless one is already wired, which
+        it keeps as initialize() does. It does NOT make the service
+        write-proof: mem0 writes would still reach Qdrant.
+        """
+        await self.graphiti.initialize(skip_maintenance=True)
+
+        if self.planned_episode_registry is None:
+            self.planned_episode_registry = await self._open_planned_registry_read_only()
+
+        logger.info('MemoryService initialized for reads')
+
+    async def _open_planned_registry_read_only(self) -> PlannedEpisodeRegistry | None:
+        from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
+        data_dir = self.config.queue.data_dir
+        try:
+            return await PlannedEpisodeRegistry.open_read_only(data_dir)
+        except FileNotFoundError:
+            logger.warning(
+                'no planned episode registry under %s; search will filter no '
+                'planned-only Graphiti edges',
+                data_dir,
+            )
+            return None
 
     async def _safe_close(self, label: str, resource: Any, timeout: float) -> None:
         """Close one resource, time-boxed and logging any failure without re-raising.
@@ -2902,14 +2713,11 @@ class MemoryService:
             )
             return
 
-        payload = event.payload or {}
-        content_preview = payload.get('content') or payload.get('fact_text') or ''
-        # The id the caller was HANDED and is holding — `add_episode`'s
-        # correlation id. NOT `payload['uuid']`: task 3561 removed that key,
-        # because graphiti_core reads a caller-supplied uuid as "LOAD this
-        # existing episode" and every add_episode write failed while it was
-        # present. See esc-3583-5.
-        caller_reference = payload.get('correlation_id')
+        value = event.value
+        content_preview = value.written_text if value is not None else event.raw_payload
+        # The id the caller was HANDED and is holding: add_episode's correlation
+        # id, never an episode uuid (esc-3583-5).
+        caller_reference = value.correlation_id if isinstance(value, QueuedEpisodeWrite) else None
 
         try:
             # to_thread is LOAD-BEARING, not stylistic: EscalationQueue.submit
@@ -2918,7 +2726,7 @@ class MemoryService:
             # directly would stall the pool that is draining every other group.
             # Same call-site discipline as _record_entity_mint.
             await asyncio.to_thread(
-                emit_dead_letter_escalation,
+                dead_letter_escalator.emit_dead_letter_escalation,
                 project_root,
                 project_id=project_id,
                 operation=event.operation,
@@ -2988,15 +2796,17 @@ class MemoryService:
     # Durable queue: execute write dispatcher
     # ------------------------------------------------------------------
 
-    async def _execute_durable_write(
-        self, operation: str, payload: dict[str, Any]
-    ) -> Any:
-        """Route a queued write to the appropriate backend handler."""
-        if operation == 'mem0_add':
-            return await self._execute_mem0_write(payload)
-        if operation == 'mem0_classify_and_add':
-            return await self._execute_mem0_classify_and_add(payload)
-        return await self._execute_graphiti_write(operation, payload)
+    async def _execute_durable_write(self, value: QueuedWrite) -> Any:
+        """Route a decoded queued write to its backend executor."""
+        match value:
+            case QueuedEpisodeWrite() | QueuedGraphitiMemoryWrite():
+                return await self._execute_graphiti_write(value)
+            case QueuedMem0Fact():
+                return await self._execute_mem0_classify_and_add(value)
+            case QueuedMem0Add():
+                return await self._execute_mem0_write(value)
+            case _:
+                assert_never(value)
 
     # ------------------------------------------------------------------
     # Dedup: remove duplicate edges created by a single add_episode call
@@ -3904,7 +3714,7 @@ class MemoryService:
         ONE site (INV-5).
 
         THE SET IS READ OFF THE WIRE, NOT RE-DERIVED (task 5262).
-        ``_encode_referents`` carries ``.ambiguous`` as a third key, so the
+        ``DecodedReferents.to_wire`` carries ``.ambiguous`` as a third key, so the
         *ambiguous* argument IS the producer's own answer and this pass simply
         believes it. That removes a SECOND SCAN SITE — the lockstep duplication
         gamma's own comment flags canonical_labels as existing to prevent — and
@@ -3976,7 +3786,7 @@ class MemoryService:
             return stats
 
         # THE PRODUCER'S AMBIGUITY SET, PREFERRED OFF THE WIRE (task 5262).
-        # `.ambiguous` is `_encode_referents`' third key, so the set that
+        # `.ambiguous` is `DecodedReferents.to_wire`'s third key, so the set that
         # decided what γ excluded from `.referents` arrives here verbatim
         # instead of being reconstructed. That removes the SECOND SCAN SITE
         # γ's own comment flags as the INV-5 lockstep duplication
@@ -4801,9 +4611,9 @@ class MemoryService:
           evidence either way: resetting on it would let a FalkorDB blip
           mid-storm disarm the alarm, and incrementing on it would let an
           outage page as a scanner regression.
-        * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
-          HEALTH SIGNAL: we looked at this episode's edge endpoints and none
-          needed moving.
+        * zero repairs but ``endpoints_checked > 0`` -> ends the run. THE
+          POSITIVE HEALTH SIGNAL: we looked at this episode's edge endpoints and
+          none needed moving.
         * zero repairs and ``endpoints_checked == 0`` -> UNCHANGED, and the key
           is not even created.
 
@@ -4831,7 +4641,7 @@ class MemoryService:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
             other three arms. Returning the value rather than having the caller
-            re-read the dict is what keeps the gate from firing on a pass that
+            re-read the streak is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
             produced no evidence for.
@@ -4845,13 +4655,11 @@ class MemoryService:
         self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
 
         if repair_stats.repaired:
-            streak = self._referent_repair_streaks.get(group_id, 0) + 1
-            self._referent_repair_streaks[group_id] = streak
-            return streak
+            return self._referent_repair_streaks.failure(group_id).count
         if repair_stats.failed:
             return None
         if stats.endpoints_checked:
-            self._referent_repair_streaks[group_id] = 0
+            self._referent_repair_streaks.success(group_id)
         return None
 
     async def _escalate_referent_repair_storm(
@@ -5497,7 +5305,7 @@ class MemoryService:
             # above would record `outcome='failed'` with `moved` never set —
             # a committed repair booked as an infrastructure failure that did
             # nothing. That would un-count it in `ReferentRepairStats.repaired`,
-            # suppress its `_referent_repair_streaks` increment, and drop the
+            # suppress its streak increment, and drop the
             # emptied node from `_cleanup_emptied_nodes` candidacy: the exact
             # "report zero repairs for an episode that performed one" shape
             # that `_backstop_endpoint_summaries` and the cleanup's own
@@ -5987,36 +5795,36 @@ class MemoryService:
         whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
-        A group appears only once a pass has produced evidence about it, so an
-        absent key means "no repair pass has drawn a conclusion here yet" —
-        distinct from a present ``0``, which means "checked, clean".
+        A group appears only while it is in a live run; absent means no live
+        run.
 
         Returns a COPY at BOTH levels — the nested streaks dict included — so a
         caller cannot mutate the escape hatch's own state. A read-only escape
         hatch a consumer can write through is not an escape hatch.
         """
         counts: dict[str, Any] = dict(self._referent_repair_counts)
-        counts['streaks'] = dict(self._referent_repair_streaks)
+        streaks = self._referent_repair_streaks
+        counts['streaks'] = {g: streaks.count(g) for g in streaks.tracked_keys}
         return counts
 
     def _submit_overreach_shadow(
-        self, result: Any, payload: dict[str, Any], category: MemoryCategory | None,
+        self, result: Any, *, group_id: str, content: str, category: MemoryCategory | None,
     ) -> None:
         """Hand a landed class write to the overreach shadow; a failure never fails the write."""
         if self.overreach_shadow is None or not overreach_guard.is_guarded_category(category):
             return
         try:
             job = shadow_job_from_write(
-                result, group_id=payload['group_id'], content=payload['content'], category=category,
+                result, group_id=group_id, content=content, category=category,
             )
             if job is not None:
                 self.overreach_shadow.submit(job)
         except Exception:
             logger.warning('overreach shadow: submit failed for group_id=%r',
-                           payload.get('group_id'), exc_info=True)
+                           group_id, exc_info=True)
 
     async def _execute_graphiti_write(
-        self, operation: str, payload: dict[str, Any]
+        self, value: QueuedEpisodeWrite | QueuedGraphitiMemoryWrite
     ) -> Any:
         """Dispatch a queued write to the Graphiti backend.
 
@@ -6036,10 +5844,11 @@ class MemoryService:
         * The add_episode branch passes ``uuid=None`` unconditionally and is
           deliberately not parameterised — there is no value other than None a
           caller could legitimately supply at this seam.
-        * A legacy ``'uuid'`` key is POPPED and warned about before the write.
-          The durable queue outlives the deploy that stopped writing that key,
-          so rows enqueued before the fix still carry it; without the pop the
-          defect would survive its own fix for as long as the backlog does.
+        * A legacy ``'uuid'`` key is ignored and warned about when the row is
+          decoded (``queued_writes``), so no value carries one. The durable
+          queue outlives the deploy that stopped writing that key; without
+          that, the defect would survive its own fix for as long as the
+          backlog does.
         * Planning-episode registration keys on ``result.episode.uuid`` — the
           uuid graphiti_core actually minted, and the ONLY place it is
           observable.  Registering anything else is silently vacuous:
@@ -6055,71 +5864,36 @@ class MemoryService:
         pass it a freshly minted one.  This function is the only production
         caller; keep it that way, or re-derive this contract at the new one.
         """
-        source_str = payload.get('source', 'text')
         try:
-            episode_type = EpisodeType[source_str]
-        except (KeyError, AttributeError):
+            episode_type = EpisodeType[value.source]
+        except KeyError:
             episode_type = EpisodeType.text
-
-        # Extract journal metadata from payload (injected at enqueue time)
-        causation_id = payload.pop('_causation_id', None)
-        write_op_id = payload.pop('_write_op_id', None)
-        temporal_context = payload.pop('temporal_context', None)
-        # task 3142: rides the same payload channel temporal_context does, so
-        # the tag reaches the persisted episodic node (and, via
-        # _dual_write_callback, every fact derived from it).
-        unverified_claim = bool(payload.pop('unverified_claim', False))
-        # task 6137: the overreach shadow's class key, on the same channel.
-        memory_category = overreach_guard.category_of(payload.pop('memory_category', None))
-        # task 3561: rows enqueued BEFORE the fix still carry the fatal 'uuid'
-        # key, and the durable queue outlives the deploy that removed it — so
-        # the defect would survive its own fix for as long as the backlog does
-        # unless execution neutralises the key too. POP rather than get, so the
-        # dead key cannot leak onward to _dual_write_callback, which receives
-        # this same payload dict.
-        legacy_uuid = payload.pop('uuid', None)
-        if legacy_uuid is not None:
-            logger.warning(
-                "Ignoring legacy 'uuid' key %r in queued add_episode payload "
-                '(group_id=%r, causation_id=%r): the key predates task 3561 and '
-                'naming an episode uuid upstream means "LOAD this existing '
-                'episode", which raises NodeNotFoundError. Letting graphiti_core '
-                'mint the uuid instead; the episode content is preserved.',
-                legacy_uuid, payload.get('group_id'), causation_id,
-            )
-        # task 3670: the referent set resolved at the write boundary, popped on
-        # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
-        # row written before this feature executes byte-identically to today.
-        #
-        # `referents` is handed to `_reconcile_episode_identity` below, which
-        # forwards it to leaf zeta's `_verify_episode_referents` (task 3671) as
-        # the LAST sub-pass — INSIDE the identity-lock critical section,
-        # deliberately, so no wrongly-attached state is ever externally visible
-        # between the write and its verification. Nothing the BACKEND sees
-        # changes, which is what keeps an old-format row byte-identical.
-        referents: ReferentSet
-        # `ambiguous` is the producer's own ambiguity set, threaded since task
-        # 5262 so the verification pass inside the lock below can tell an
-        # AMBIGUOUS endpoint from a genuine conflation without re-scanning the
-        # body. `None` (rather than `()`) means the row predates the third wire
-        # key, i.e. the producer did not tell us — see `_decode_referents`.
-        ambiguous: ReferentSet | None
-        referents, referent_source, ambiguous = _decode_referents(payload)
+        envelope = value.envelope
+        group_id = envelope.group_id
+        match value:
+            case QueuedEpisodeWrite():
+                temporal_context = value.temporal_context
+                reference_time = value.reference_time
+                correlation_id = value.correlation_id
+                memory_category = None
+            case QueuedGraphitiMemoryWrite():
+                temporal_context = None
+                reference_time = None
+                correlation_id = None
+                # task 6137: the overreach shadow's class key.
+                memory_category = overreach_guard.category_of(value.memory_category)
+        # task 3670: the referent set resolved at the write boundary. `refs`
+        # and `ambiguous` reach leaf zeta's `_verify_episode_referents` (task
+        # 3671) through `_reconcile_episode_identity` below, INSIDE the
+        # identity-lock critical section, so no wrongly-attached state is ever
+        # externally visible between the write and its verification. Nothing
+        # the BACKEND sees changes.
+        referents = value.referents
         # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
         # degraded paths are counted rather than silently falling through. See
         # `_referent_source_counts` in __init__ for why this is unconditional
         # and why all four sources are bucketed. Leaf iota reads it.
-        self._referent_source_counts[referent_source] += 1
-        reference_time_iso = payload.pop('reference_time', None)
-        reference_time = None
-        if reference_time_iso is not None:
-            try:
-                reference_time = datetime.fromisoformat(reference_time_iso)
-            except (ValueError, TypeError):
-                logger.warning(
-                    'Invalid reference_time %r in queue payload; treating as None',
-                    reference_time_iso,
-                )
+        self._referent_source_counts[referents.source] += 1
 
         # Write-time identity gate (task 2202 / W6-β): add_episode and the
         # folded post-write reconcile run as ONE critical section under α's
@@ -6127,18 +5901,16 @@ class MemoryService:
         # write-time guarantee rather than a best-effort post-hoc race. This
         # is what obsoletes the recurring "duplicate Graphiti node -> manual
         # FalkorDB merge" operator runbook (tasks 2073/2081/2110/2118, the
-        # /unblock Graphiti-dedup protocol). This method is the fallthrough
-        # dispatch target in _execute_durable_write (:474) for every queued
-        # operation other than 'mem0_add'/'mem0_classify_and_add' — so both
-        # 'add_episode' AND 'add_memory_graphiti' writes acquire this lock,
-        # meaning ALL Graphiti writes for a given group_id fully serialize,
-        # not just add_episode (intended per B1; distinct group_ids/projects
-        # still proceed concurrently). Graphiti-only critical section —
-        # _execute_mem0_write never acquires this lock (B3).
-        async with self.graphiti._identity_lock_for(payload['group_id']):
+        # /unblock Graphiti-dedup protocol). `_execute_durable_write` routes
+        # both Graphiti value types here, so ALL Graphiti writes for a given
+        # group_id fully serialize, not just add_episode (intended per B1;
+        # distinct group_ids/projects still proceed concurrently).
+        # Graphiti-only critical section — _execute_mem0_write never acquires
+        # this lock (B3).
+        async with self.graphiti._identity_lock_for(group_id):
             result = await self._journaled_backend_call(
-                write_op_id=write_op_id,
-                causation_id=causation_id,
+                write_op_id=envelope.write_op_id,
+                causation_id=envelope.causation_id,
                 backend='graphiti',
                 operation='add_episode',
                 # referent_source/referent_count (task 3670) are the DURABLE
@@ -6149,32 +5921,27 @@ class MemoryService:
                 # `_write_journal` is None); this row is what gives leaf iota
                 # per-project, time-windowed data, through a journal row that
                 # already exists — no new schema, no new table, no new write.
-                # That resolves epsilon's half of PRD open question 2 (which
-                # suggested `write_ops.params`) without pre-empting iota's
-                # read-path choice.
                 payload={
-                    'content': payload['content'][:200],
-                    'group_id': payload.get('group_id'),
-                    'referent_source': referent_source,
-                    'referent_count': len(referents),
+                    'content': value.content[:200],
+                    'group_id': group_id,
+                    'referent_source': referents.source,
+                    'referent_count': len(referents.refs),
                 },
                 coro=self.graphiti.add_episode(
-                    name=payload.get('name', ''),
-                    content=payload['content'],
+                    name=value.name,
+                    content=value.content,
                     source=episode_type,
-                    group_id=payload['group_id'],
-                    source_description=payload.get('source_description', ''),
+                    group_id=group_id,
+                    source_description=value.source_description,
                     # UNCONDITIONALLY None, and deliberately NOT parameterised
                     # (task 3561). None is the only value graphiti_core's CREATE
                     # branch accepts: any other value selects the LOAD branch
                     # (EpisodicNode.get_by_uuid), which for a not-yet-existing
-                    # episode is NodeNotFoundError. A legacy payload uuid was
-                    # popped and warned about above; nothing may re-introduce
-                    # one here.
+                    # episode is NodeNotFoundError.
                     uuid=None,
                     temporal_context=temporal_context,
                     reference_time=reference_time,
-                    unverified_claim=unverified_claim,
+                    unverified_claim=value.unverified_claim,
                 ),
                 # The only LLM-bearing graphiti path. Deletes and edge updates
                 # spend no LLM, so they stay unprobed rather than journaling a
@@ -6182,7 +5949,7 @@ class MemoryService:
                 token_probe=self.graphiti.token_probe,
             )
             reconcile_stats = await self._reconcile_episode_identity(
-                result, group_id=payload['group_id'], referents=referents,
+                result, group_id=group_id, referents=referents.refs,
                 # THREE things zeta needs beyond the decoded set.
                 # `ambiguous` is the producer's own ambiguity set, threaded off
                 # the wire since task 5262, which is what lets zeta tell an
@@ -6195,28 +5962,28 @@ class MemoryService:
                 # `referent_source` is so an ambient `metadata['task_id']`
                 # declaration is never mistaken for evidence about which node an
                 # edge belongs on.
-                ambiguous=ambiguous,
-                content=payload['content'],
-                referent_source=referent_source,
+                ambiguous=referents.ambiguous,
+                content=value.content,
+                referent_source=referents.source,
             )
             logger.debug(
                 'Reconciled episode identity for group_id=%r: %r',
-                payload['group_id'], reconcile_stats,
+                group_id, reconcile_stats,
             )
 
         # After the lock: the judge needs no identity lock, and an LLM round trip
         # inside it would serialize every decision write for the group
         # (design.md §6 'Lock placement').
-        self._submit_overreach_shadow(result, payload, memory_category)
+        self._submit_overreach_shadow(
+            result, group_id=group_id, content=value.content, category=memory_category,
+        )
 
         # Register planning episodes so they can be filtered from search results.
         #
-        # Keys on the uuid graphiti_core actually MINTED (result.episode.uuid),
-        # not on any payload uuid (task 3561). The payload never carries one
-        # any more, and even when it did the value named no graph node — so
-        # registration was vacuous and the search filter at _search_graphiti
-        # (which matches these uuids against edge episode provenance) could
-        # never match anything.
+        # Keys on the uuid graphiti_core actually MINTED (result.episode.uuid)
+        # (task 3561): no value carries an episode uuid, and the search filter
+        # at _search_graphiti matches these uuids against edge episode
+        # provenance, so any other key could never match anything.
         #
         # getattr-chained rather than attribute access because a None result
         # must not crash this path — see
@@ -6227,20 +5994,14 @@ class MemoryService:
         # the mapping is unrecoverable — nothing else in the system records it.
         # Tasks 3583/3584 key off this.
         real_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
-        # Gated on the operation, and `operation` interpolated rather than
-        # hard-coded: this method is the FALLTHROUGH dispatch target for every
-        # queued operation other than mem0's (see `_execute_durable_write`), so
-        # an unconditional line here also fires for every 'add_memory_graphiti'
-        # write. Those carry no correlation_id, so each would land in this
-        # channel mislabelled as an add_episode with `correlation_id=None`,
-        # diluting the one log stream 3583/3584 exist to mine. Keeping the emit
-        # gated leaves it a clean, greppable one-line-per-episode record.
-        if operation == 'add_episode':
+        # Episodes only: a memory write carries no correlation_id, so logging
+        # it here would mislabel it in the one stream 3583/3584 mine.
+        if isinstance(value, QueuedEpisodeWrite):
             logger.info(
                 '%s write executed: correlation_id=%r -> episode_uuid=%r '
                 '(group_id=%r, causation_id=%r)',
-                operation, payload.get('correlation_id'), real_uuid,
-                payload.get('group_id'), causation_id,
+                value.operation.value, correlation_id, real_uuid,
+                group_id, envelope.causation_id,
             )
 
         # INVARIANT (task 3561): every path below is either a register or a
@@ -6253,14 +6014,13 @@ class MemoryService:
         # and why the miss must be diagnosable from logs alone.
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
             episode_uuid = real_uuid
-            group_id = payload.get('group_id')
             if episode_uuid and group_id:
                 await self.planned_episode_registry.register(episode_uuid, group_id)
             else:
                 missing = ' and '.join(
                     part for part, absent in (
                         ('result.episode.uuid', not episode_uuid),
-                        ('payload group_id', not group_id),
+                        ('group_id', not group_id),
                     ) if absent
                 )
                 logger.warning(
@@ -6268,24 +6028,25 @@ class MemoryService:
                     'planning episode will NOT be filtered out of default search '
                     'results. correlation_id=%r group_id=%r causation_id=%r '
                     'episode_uuid=%r',
-                    missing, payload.get('correlation_id'), group_id,
-                    causation_id, episode_uuid,
+                    missing, correlation_id, group_id, envelope.causation_id,
+                    episode_uuid,
                 )
 
         return result
 
-    async def _execute_mem0_write(self, payload: dict[str, Any]) -> Any:
+    async def _execute_mem0_write(self, value: QueuedMem0Add) -> Any:
         """Execute a queued Mem0 add operation."""
-        causation_id = payload.pop('_causation_id', None)
-        write_op_id = payload.pop('_write_op_id', None)
+        envelope = value.envelope
+        causation_id = envelope.causation_id
+        write_op_id = envelope.write_op_id
         scope = Scope(
-            project_id=payload['project_id'],
-            agent_id=payload.get('agent_id'),
-            session_id=payload.get('session_id'),
+            project_id=envelope.project_id,
+            agent_id=envelope.agent_id,
+            session_id=envelope.session_id,
         )
-        metadata = payload.get('metadata', {})
+        metadata = dict(value.metadata)
         # Resolved once, outside the try, so every attempt journals against a
-        # stable id when the payload carries no '_write_op_id'.
+        # stable id when the value carries no write_op_id.
         journal_write_op_id = write_op_id or str(uuid_mod.uuid4())
 
         result = None
@@ -6300,9 +6061,9 @@ class MemoryService:
                 causation_id=causation_id,
                 backend='mem0',
                 operation='add',
-                payload={'content': payload['content'][:200]},
+                payload={'content': value.content[:200]},
                 coro=self.mem0.add(
-                    content=payload['content'], scope=scope, metadata=metadata
+                    content=value.content, scope=scope, metadata=metadata
                 ),
             )
             succeeded = True
@@ -6324,11 +6085,11 @@ class MemoryService:
                     causation_id=causation_id,
                     source='durable_queue',
                     operation='add_memory',
-                    project_id=payload['project_id'],
-                    agent_id=payload.get('agent_id'),
-                    session_id=payload.get('session_id'),
+                    project_id=envelope.project_id,
+                    agent_id=envelope.agent_id,
+                    session_id=envelope.session_id,
                     params={
-                        'content': payload['content'][:200],
+                        'content': value.content[:200],
                         'category': metadata.get('category', ''),
                     },
                     result_summary=str(result)[:500] if result else None,
@@ -6345,19 +6106,17 @@ class MemoryService:
             project_root=self._known_projects.get(project_id),
         )
 
-    async def _execute_mem0_classify_and_add(
-        self, payload: dict[str, Any]
-    ) -> Any:
+    async def _execute_mem0_classify_and_add(self, value: QueuedMem0Fact) -> Any:
         """Classify a fact extracted from an episode and write to Mem0 if appropriate."""
-        fact_text = payload['fact_text']
-        causation_id = payload.get('_causation_id')
-        temporal_context = payload.get('temporal_context')
-        unverified_claim = bool(payload.get('unverified_claim', False))
+        fact_text = value.fact_text
+        causation_id = value.envelope.causation_id
+        temporal_context = value.temporal_context
+        unverified_claim = value.unverified_claim
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
-            project_id=payload.get('project_id', 'main'),
-            agent_id=payload.get('agent_id'),
-            session_id=payload.get('session_id'),
+            project_id=value.envelope.project_id,
+            agent_id=value.envelope.agent_id,
+            session_id=value.envelope.session_id,
         )
 
         classification = await self.classifier.classify(fact_text)
@@ -6459,9 +6218,7 @@ class MemoryService:
                     node_uuid, group_id, exc,
                 )
 
-    async def _dual_write_callback(
-        self, callback_type: str, result: Any, payload: dict[str, Any]
-    ) -> None:
+    async def _dual_write_callback(self, value: QueuedWrite, result: Any) -> None:
         """Post-process callback: extract facts and enqueue each for durable Mem0
         write, then trigger a best-effort post-ingestion entity-summary refresh.
 
@@ -6473,45 +6230,46 @@ class MemoryService:
         invalidates/supersedes/dedups edges internally without any fused-memory
         code observing which nodes changed.
         """
+        if not isinstance(value, QueuedEpisodeWrite):
+            raise TypeError(
+                f'the dual-write callback takes a QueuedEpisodeWrite, got {type(value).__name__}'
+            )
         if result is None:
             return
 
         edges = getattr(result, 'edges', None) or getattr(result, 'entity_edges', None) or []
 
+        envelope = value.envelope
         if edges:
-            project_id = payload.get('project_id', 'main')
-            group_id = f'{_MEM0_GROUP_PREFIX}{project_id}'
-
+            fact_envelope = WriteEnvelope(
+                project_id=envelope.project_id,
+                group_id=f'{_MEM0_GROUP_PREFIX}{envelope.project_id}',
+                agent_id=envelope.agent_id,
+                session_id=envelope.session_id,
+                causation_id=envelope.causation_id,
+            )
+            # task 3142: each derived fact is its own queue row, so the
+            # episode's unverified_claim tag is copied onto every one — those
+            # facts ARE the artefacts the incident produced.
             batch = [
-                {
-                    'group_id': group_id,
-                    'operation': 'mem0_classify_and_add',
-                    'payload': {
-                        'fact_text': getattr(edge, 'fact', None) or str(edge),
-                        'project_id': project_id,
-                        'agent_id': payload.get('agent_id'),
-                        'session_id': payload.get('session_id'),
-                        '_causation_id': payload.get('_causation_id'),
-                        'temporal_context': payload.get('temporal_context'),
-                        # task 3142: the Mem0 half rides its own payload
-                        # channel, so the episode's tag must be copied onto
-                        # every derived fact explicitly — those facts ARE the
-                        # artefacts the incident produced.
-                        'unverified_claim': payload.get('unverified_claim', False),
-                    },
-                }
+                (
+                    QueuedMem0Fact(
+                        envelope=fact_envelope,
+                        fact_text=getattr(edge, 'fact', None) or str(edge),
+                        temporal_context=value.temporal_context,
+                        unverified_claim=value.unverified_claim,
+                    ),
+                    None,
+                )
                 for edge in edges
             ]
 
             assert self.durable_queue is not None
             await self.durable_queue.enqueue_batch(batch)
 
-        refresh_group_id = payload.get('group_id') or payload.get('project_id') or 'main'
-        await self._refresh_entity_summaries_from_result(result, group_id=refresh_group_id)
+        await self._refresh_entity_summaries_from_result(result, group_id=envelope.group_id)
 
-    async def _refresh_summaries_callback(
-        self, callback_type: str, result: Any, payload: dict[str, Any]
-    ) -> None:
+    async def _refresh_summaries_callback(self, value: QueuedWrite, result: Any) -> None:
         """Refresh-only post-ingestion callback: no Mem0 enqueue.
 
         Used by ingestion paths that already handle Mem0 elsewhere —
@@ -6521,8 +6279,7 @@ class MemoryService:
         each edge (that would double-write Mem0). It only triggers the
         best-effort post-ingestion entity-summary refresh.
         """
-        group_id = payload.get('group_id') or payload.get('project_id') or 'main'
-        await self._refresh_entity_summaries_from_result(result, group_id=group_id)
+        await self._refresh_entity_summaries_from_result(result, group_id=value.envelope.group_id)
 
     # ------------------------------------------------------------------
     # Write: add_episode
@@ -6672,33 +6429,31 @@ class MemoryService:
             # real one back off result.episode.uuid in
             # _execute_graphiti_write.
             await self.durable_queue.enqueue(
-                group_id=scope.graphiti_group_id,
-                operation='add_episode',
-                payload={
+                QueuedEpisodeWrite(
+                    envelope=WriteEnvelope(
+                        project_id=project_id,
+                        group_id=scope.graphiti_group_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        causation_id=causation_id,
+                        write_op_id=write_op_id,
+                    ),
                     # Off the RAW uuid4, deliberately — NOT off the prefixed
                     # episode_id, so the correlation prefix never leaks into
                     # episode names stored in the graph (task 3561).
-                    'name': f'episode_{correlation_uuid[:8]}',
-                    'content': content,
-                    # A non-'uuid' key, so it can never be forwarded to
+                    name=f'episode_{correlation_uuid[:8]}',
+                    content=content,
+                    # Not a uuid field, so it can never be forwarded to
                     # graphiti_core as a load instruction.
-                    'correlation_id': episode_id,
-                    'source': source_name,
-                    'group_id': scope.graphiti_group_id,
-                    'source_description': source_description,
-                    # Scope fields for callback reconstruction
-                    'project_id': project_id,
-                    'agent_id': agent_id,
-                    'session_id': session_id,
-                    # Journal metadata (popped by _execute_graphiti_write)
-                    '_causation_id': causation_id,
-                    '_write_op_id': write_op_id,
-                    'temporal_context': temporal_context,
-                    'unverified_claim': unverified_claim,
-                    'reference_time': reference_time.isoformat() if reference_time is not None else None,
-                    'referents': _encode_referents(resolution),
-                },
-                callback_type='dual_write_episode',
+                    correlation_id=episode_id,
+                    source=source_name,
+                    source_description=source_description,
+                    temporal_context=temporal_context,
+                    unverified_claim=unverified_claim,
+                    reference_time=reference_time,
+                    referents=DecodedReferents.from_resolution(resolution),
+                ),
+                callback=QueueCallback.DUAL_WRITE_EPISODE,
             )
             success = True
         except (Exception, asyncio.CancelledError) as e:
@@ -6758,6 +6513,7 @@ class MemoryService:
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
+        defer_transient_mem0_failure: bool = True,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
 
@@ -6823,6 +6579,12 @@ class MemoryService:
         write. A CONFLICTING declaration is likewise legal here: this layer is
         mechanism, and ``server/entities_gate.py`` is the policy that refuses
         it at the tool boundary.
+
+        ``defer_transient_mem0_failure=False`` is for callers that need the Mem0
+        id synchronously because they act on it in the same call: a transient
+        failure is then reported failed, not queued, and is safe to re-run
+        (an openai error proves nothing persisted, per
+        ``mem0_write_retry.classify_transient_provider_failure``).
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
@@ -6844,6 +6606,7 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
+        stores_pending_retry: list[SourceStore] = []
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
 
@@ -6887,7 +6650,7 @@ class MemoryService:
             agent_id=agent_id,
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
-            project_root=self._memory_metadata_project_root(),
+            taskmaster=self.config.taskmaster,
             reaches_mem0=write_mem0,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
@@ -6903,6 +6666,8 @@ class MemoryService:
 
         _graphiti_error = None
         _mem0_error = None
+        _mem0_pending = None
+        _mem0_empty_result: str | None = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -6939,26 +6704,24 @@ class MemoryService:
             try:
                 assert self.durable_queue is not None
                 await self.durable_queue.enqueue(
-                    group_id=scope.graphiti_group_id,
-                    operation='add_memory_graphiti',
-                    payload={
-                        'name': f'memory_{resolved_category.value}',
-                        'content': content,
-                        'source': 'text',
-                        'group_id': scope.graphiti_group_id,
-                        'source_description': f'add_memory:{resolved_category.value}',
-                        # Popped by _execute_graphiti_write for the overreach shadow.
-                        'memory_category': resolved_category.value,
-                        '_causation_id': causation_id,
-                        '_write_op_id': write_op_id,
-                        # Popped and decoded by _execute_graphiti_write.
-                        'referents': _encode_referents(resolution),
-                        # Popped by _execute_graphiti_write exactly as on
-                        # add_episode's payload, which prefixes the episodic
-                        # source_description with '[unverified_claim] '.
-                        'unverified_claim': unverified_claim,
-                    },
-                    callback_type='refresh_entity_summaries',
+                    QueuedGraphitiMemoryWrite(
+                        envelope=WriteEnvelope(
+                            project_id=scope.project_id,
+                            group_id=scope.graphiti_group_id,
+                            agent_id=scope.agent_id,
+                            session_id=scope.session_id,
+                            causation_id=causation_id,
+                            write_op_id=write_op_id,
+                        ),
+                        name=f'memory_{resolved_category.value}',
+                        content=content,
+                        source='text',
+                        source_description=f'add_memory:{resolved_category.value}',
+                        memory_category=resolved_category.value,
+                        referents=DecodedReferents.from_resolution(resolution),
+                        unverified_claim=unverified_claim,
+                    ),
+                    callback=QueueCallback.REFRESH_ENTITY_SUMMARIES,
                 )
                 # Durably persisted to SQLite — report as written
                 stores_written.append(SourceStore.graphiti)
@@ -6970,7 +6733,7 @@ class MemoryService:
         # The durable-queue path cannot return server-assigned IDs because Mem0
         # assigns IDs server-side and the queue worker has no path back to the caller.
         # Durability is retained via write_journal (log_backend_op captures every call).
-        # The _execute_durable_write 'mem0_add' dispatcher is kept intact for backward
+        # QueueOperation.MEM0_ADD rows still decode and execute for backward
         # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
             # Write-ahead intent (task 2710): durably journal the intended
@@ -7011,19 +6774,24 @@ class MemoryService:
                     payload={'content': content[:200]},
                     coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                mem0_ids = [
-                    r['id']
-                    for r in (mem0_result or {}).get('results', [])
-                    if isinstance(r, dict) and 'id' in r
-                ]
-                memory_ids.extend(mem0_ids)
-                stores_written.append(SourceStore.mem0)
-                # In-request call resolved without raising → stamp terminal.
+                mem0_outcome = read_mem0_add_result(
+                    mem0_result,
+                    operation='add',
+                    zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE,
+                )
+                memory_ids.extend(mem0_outcome.memory_ids)
+                stores_written.extend(mem0_outcome.stores_written)
+                _mem0_empty_result = mem0_outcome.empty_result_error
                 if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'completed'
-                    )
-                if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
+                    if _mem0_empty_result:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.FAILED, reason=_mem0_empty_result
+                        )
+                    else:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.COMPLETED
+                        )
+                if _mem0_empty_result:
                     # mem0.add() did not raise but returned no results — a silent
                     # dedup/infer no-op drop (task 1974). Under the pinned
                     # infer=False, a successful write always returns exactly one
@@ -7039,15 +6807,25 @@ class MemoryService:
                         },
                     )
             except Exception as e:
-                logger.error(f'Mem0 write failed: {e}')
-                _mem0_error = str(e)
-                # add() provably raised → mem0 did NOT persist. Stamp the
-                # intent 'failed' (the reconciler treats a failed-only
-                # backend_op as safe to re-issue).
-                if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'failed', reason=str(e)
+                _mem0_pending = (
+                    await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
                     )
+                    if defer_transient_mem0_failure
+                    else None
+                )
+                if _mem0_pending is not None:
+                    stores_pending_retry.append(SourceStore.mem0)
+                else:
+                    logger.error(f'Mem0 write failed: {e}')
+                    _mem0_error = str(e)
+                    # add() provably raised → mem0 did NOT persist. Stamp the
+                    # intent 'failed' (the reconciler treats a failed-only
+                    # backend_op as safe to re-issue).
+                    if self._write_journal and intent_id:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.FAILED, reason=str(e)
+                        )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -7067,9 +6845,10 @@ class MemoryService:
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_pending': [s.value for s in stores_pending_retry],
                 },
-                success=not (_graphiti_error or _mem0_error),
-                error=_graphiti_error or _mem0_error,
+                success=not (_graphiti_error or _mem0_error or _mem0_empty_result),
+                error=_graphiti_error or _mem0_error or _mem0_empty_result,
             )
 
         await self._emit_event(ReconciliationEvent(
@@ -7091,22 +6870,111 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if _mem0_empty_result:
+            msg += f' [{_mem0_empty_result}]'
+        if _mem0_pending:
+            msg += f' [mem0_pending_retry: {_mem0_pending}]'
         if classification_fallback is not None:
             msg += f' [classification_fallback: {classification_fallback.value}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
+            stores_pending_retry=stores_pending_retry,
             category=resolved_category,
             message=msg,
             classification_fallback=classification_fallback,
+        )
+
+    async def _defer_mem0_write_for_retry(
+        self, error: Exception, *, intent_id: str | None, write_op_id: str
+    ) -> str | None:
+        """Queue a transiently failed Mem0 leg for server-side retry; return why, or None.
+
+        ``None`` means the write was NOT deferred: the error is not transient,
+        or no durable ``retrying`` intent row could be made, so the caller
+        reports the leg failed.
+        """
+        failure = classify_transient_provider_failure(error)
+        if failure is None or self._write_journal is None or intent_id is None:
+            return None
+        reason = retry_reason(failure, error)
+        deferred = await self._write_journal.schedule_mem0_retry(
+            intent_id,
+            reason=reason,
+            retry_at=self._mem0_retry_policy.retry_at(attempts=1, now=datetime.now(UTC)),
+        )
+        if not deferred:
+            return None
+        logger.warning(
+            'Mem0 write deferred for server-side retry '
+            '(intent_id=%s, write_op_id=%s, failure=%s)',
+            intent_id,
+            write_op_id,
+            failure.value,
+        )
+        return reason
+
+    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
+        """Re-issue a journaled Mem0 write intent under its original write_op_id."""
+        content = intent.get('content') or ''
+        scope = Scope(
+            project_id=intent.get('project_id') or 'main',
+            agent_id=intent.get('agent_id'),
+            session_id=intent.get('session_id'),
+        )
+        metadata = decode_mem0_intent_metadata(intent)
+        raw = await self._journaled_backend_call(
+            write_op_id=intent['write_op_id'],
+            causation_id=intent.get('causation_id'),
+            backend='mem0',
+            operation='add',
+            payload={'content': content[:200]},
+            coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
+        )
+        return read_mem0_add_result(
+            raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
+        )
+
+    @property
+    def mem0_retry_policy(self) -> Mem0RetryPolicy:
+        return self._mem0_retry_policy
+
+    async def retry_due_mem0_intents(
+        self,
+        *,
+        now: datetime | None = None,
+        on_landed: OnMem0Landed | None = None,
+    ) -> Mem0RetryPassSummary:
+        """Run one server-side retry pass."""
+        if self._write_journal is None:
+            return Mem0RetryPassSummary()
+        return await mem0_write_retry.retry_due_mem0_intents(
+            self._write_journal,
+            self.reissue_mem0_intent,
+            policy=self._mem0_retry_policy,
+            now=now or datetime.now(UTC),
+            on_landed=on_landed,
+        )
+
+    async def check_mem0_retry_backlog(self, *, now: datetime | None = None) -> list[str]:
+        """Escalate each project whose Mem0 retry backlog is older than the policy allows; return the escalation ids."""
+        if self._write_journal is None:
+            return []
+        return await mem0_retry_backlog_alarm.alarm_on_stale_mem0_retries(
+            self._write_journal,
+            now=now or datetime.now(UTC),
+            max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
+            project_roots=self._known_projects,
         )
 
     # ------------------------------------------------------------------
     # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
     # ------------------------------------------------------------------
 
-    async def recover_mem0_intents(self) -> dict[str, int]:
+    async def recover_mem0_intents(
+        self, *, on_landed: OnMem0Landed | None = None
+    ) -> dict[str, int]:
         """Reconcile every crash-mid-write mem0 intent still ``pending``.
 
         A ``pending`` intent means the process died between the write-ahead
@@ -7120,8 +6988,10 @@ class MemoryService:
           re-issue.
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
-          (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          (0 prior writes + 1 = 1): ``reissue_mem0_intent``; ``completed`` on
+          success, then ``on_landed`` is told what landed, as the retry pass
+          tells it; ``retrying`` on a transient provider error (the periodic
+          retry pass takes it over), ``dead`` on any other error. Crash
           after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
@@ -7141,7 +7011,13 @@ class MemoryService:
         plus a loud log line. Idempotent — no pending intents ⇒ zeroed
         summary — so it is safe to run on every startup.
         """
-        summary = {'scanned': 0, 'reconciled': 0, 'reissued': 0, 'dead_lettered': 0}
+        summary = {
+            'scanned': 0,
+            'reconciled': 0,
+            'reissued': 0,
+            'deferred': 0,
+            'dead_lettered': 0,
+        }
         if self._write_journal is None:
             return summary
 
@@ -7156,13 +7032,12 @@ class MemoryService:
                 write_op_id
             )
             mem0_beops = [b for b in beops if b.get('backend') == 'mem0']
-            any_success = any(b.get('success') for b in mem0_beops)
 
-            if any_success:
+            if mem0_write_op_landed(beops):
                 # Write landed; only the completion stamp was lost.
                 await self._write_journal.resolve_mem0_intent(
                     intent_id,
-                    'completed',
+                    Mem0IntentStatus.COMPLETED,
                     reason='reconciled: mem0 backend_op confirms write landed',
                 )
                 summary['reconciled'] += 1
@@ -7178,26 +7053,10 @@ class MemoryService:
                 # note in this method's docstring for the narrow
                 # post-commit-failure case where this can mint a duplicate twin.
                 try:
-                    scope = Scope(
-                        project_id=intent.get('project_id') or 'main',
-                        agent_id=intent.get('agent_id'),
-                        session_id=intent.get('session_id'),
-                    )
-                    metadata = json.loads(intent.get('metadata') or '{}')
-                    content = intent.get('content') or ''
-                    await self._journaled_backend_call(
-                        write_op_id=write_op_id,
-                        causation_id=intent.get('causation_id'),
-                        backend='mem0',
-                        operation='add',
-                        payload={'content': content[:200]},
-                        coro=self.mem0.add(
-                            content=content, scope=scope, metadata=metadata
-                        ),
-                    )
+                    landed = await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
-                        'completed',
+                        Mem0IntentStatus.COMPLETED,
                         reason='reconciled: re-issued after failed-only mem0 backend_op',
                     )
                     summary['reissued'] += 1
@@ -7208,20 +7067,28 @@ class MemoryService:
                         write_op_id,
                     )
                 except Exception as e:
-                    reason = (
-                        f're-issue failed: {type(e).__name__}: {e} '
-                        f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
-                    )
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'dead', reason=reason
-                    )
-                    summary['dead_lettered'] += 1
-                    logger.error(
-                        'recover_mem0_intents: intent %s dead-lettered — re-issue '
-                        'raised: %s',
-                        intent_id,
-                        e,
-                    )
+                    if await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
+                    ):
+                        summary['deferred'] += 1
+                    else:
+                        reason = (
+                            f're-issue failed: {type(e).__name__}: {e} '
+                            f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
+                        )
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.DEAD, reason=reason
+                        )
+                        summary['dead_lettered'] += 1
+                        logger.error(
+                            'recover_mem0_intents: intent %s dead-lettered — re-issue '
+                            'raised: %s',
+                            intent_id,
+                            e,
+                        )
+                else:
+                    if on_landed is not None:
+                        await mem0_write_retry.report_mem0_landing(on_landed, intent, landed)
             else:
                 # No backend_op → UNKNOWN outcome → dead-letter (never silent).
                 reason = (
@@ -7236,7 +7103,7 @@ class MemoryService:
                     'would risk a duplicate twin; manual replay available.'
                 )
                 await self._write_journal.resolve_mem0_intent(
-                    intent_id, 'dead', reason=reason
+                    intent_id, Mem0IntentStatus.DEAD, reason=reason
                 )
                 summary['dead_lettered'] += 1
                 logger.warning(
@@ -7320,7 +7187,7 @@ class MemoryService:
             agent_id=agent_id,
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
-            project_root=self._memory_metadata_project_root(),
+            taskmaster=self.config.taskmaster,
             reaches_mem0=True,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
@@ -7330,8 +7197,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        mem0_result = None
-        mem0_ids: list[str] = []
+        mem0_outcome = RAISED_MEM0_ADD
         _mem0_error: str | None = None
         try:
             mem0_result = await self._journaled_backend_call(
@@ -7342,11 +7208,9 @@ class MemoryService:
                 payload={'content': content[:200]},
                 coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
             )
-            mem0_ids = [
-                r['id']
-                for r in (mem0_result or {}).get('results', [])
-                if isinstance(r, dict) and 'id' in r
-            ]
+            mem0_outcome = read_mem0_add_result(
+                mem0_result, operation='add_system_record', zero_ids_anomalous=True
+            )
         except Exception as e:
             # Mirrors add_memory's try/except around its Mem0 branch (task
             # 2222 amendment): without this, a raised exception would skip
@@ -7365,11 +7229,9 @@ class MemoryService:
         # empty-result check, task 1974) — and silence is exactly what this
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
-        _empty_result = not mem0_ids
-        # mem0 is claimed only when it returned an id (task 4045).
-        stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
-        _empty_result_error = 'empty_result: mem0 add_system_record returned zero memory_ids'
-        if _empty_result and not _mem0_error:
+        mem0_ids = list(mem0_outcome.memory_ids)
+        stores_written = mem0_outcome.stores_written
+        if mem0_outcome.empty_result_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
                 'returned zero memory_ids (silent empty-result drop on the '
@@ -7396,11 +7258,8 @@ class MemoryService:
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not _empty_result,
-                error=(
-                    _mem0_error if _mem0_error else
-                    (_empty_result_error if _empty_result else None)
-                ),
+                success=mem0_outcome.landed,
+                error=_mem0_error or mem0_outcome.empty_result_error,
             )
 
         # An empty result (whether from a caught exception above or a
@@ -7413,7 +7272,7 @@ class MemoryService:
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if _empty_result:
+        if not mem0_outcome.landed:
             _event_payload['empty_result'] = True
             if _mem0_error:
                 _event_payload['error'] = _mem0_error
@@ -7431,8 +7290,8 @@ class MemoryService:
         msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
-        elif _empty_result:
-            msg += f' [{_empty_result_error}]'
+        elif mem0_outcome.empty_result_error:
+            msg += f' [{mem0_outcome.empty_result_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
@@ -7467,7 +7326,7 @@ class MemoryService:
             return 0
 
         assert self.durable_queue is not None
-        batch = []
+        batch: list[tuple[QueuedWrite, QueueCallback | None]] = []
         for mem in memories:
             content = mem.get('memory', '')
             if not content:
@@ -7513,19 +7372,17 @@ class MemoryService:
                 declared=None, metadata=meta, content=content, group_id=target,
                 known_project_ids=self._known_projects,
             )
-            batch.append({
-                'group_id': target,
-                'operation': 'add_memory_graphiti',
-                'payload': {
-                    'name': f'replay_{category}',
-                    'content': content,
-                    'source': 'text',
-                    'group_id': target,
-                    'source_description': f'replay_from_mem0:{category}',
-                    'referents': _encode_referents(resolution),
-                },
-                'callback_type': 'refresh_entity_summaries',
-            })
+            batch.append((
+                QueuedGraphitiMemoryWrite(
+                    envelope=WriteEnvelope(project_id=target, group_id=target),
+                    name=f'replay_{category}',
+                    content=content,
+                    source='text',
+                    source_description=f'replay_from_mem0:{category}',
+                    referents=DecodedReferents.from_resolution(resolution),
+                ),
+                QueueCallback.REFRESH_ENTITY_SUMMARIES,
+            ))
 
         if batch:
             await self.durable_queue.enqueue_batch(batch)
@@ -8488,6 +8345,20 @@ class MemoryService:
             }
             for ep in episodes
         ]
+
+    def earliest_unfinished_graphiti_write_start(self, project_id: str) -> datetime | None:
+        """When the earliest Graphiti write still executing for *project_id* began.
+
+        graphiti_core stamps an episode's created_at when add_episode BEGINS
+        and persists the node only after extraction, so an episode created at
+        or after this instant may not be readable yet. mem0 queue writes run on
+        their own queue group and are never counted.
+        """
+        if self.durable_queue is None:
+            return None
+        return self.durable_queue.earliest_executing_start(
+            Scope(project_id=project_id).graphiti_group_id
+        )
 
     # ------------------------------------------------------------------
     # Read: get_episode_content
@@ -9851,7 +9722,7 @@ class MemoryService:
                 agent_id=agent_id,
                 config=self.config.memory_metadata,
                 storm_detector=self._metadata_storm_detector,
-                project_root=self._memory_metadata_project_root(),
+                taskmaster=self.config.taskmaster,
                 # `True` unconditionally (task 3508), as in add_system_record:
                 # this amends a record that already lives in Mem0 and never
                 # routes to Graphiti, and `category` in a patch is a metadata
@@ -10071,22 +9942,23 @@ class MemoryService:
         verdict, so a combined ``fact`` + ``clear_invalid_at`` call is
         ``verified`` only when *both* readbacks confirm. A pure
         ``invalid_at=<timestamp>`` supersede (no fact, no clear) is not
-        readback-verified — it persists reliably via the same write path
-        used for ``fact``. There is a small TOCTOU window between each save
-        and its readback — if a concurrent writer updates the same edge in
-        that window (another reconciliation cycle, an interactive agent, or
-        a retry) the readback may return a different value and ``verified``
-        will be ``False`` even though *our* save did persist.  This is a
-        known false-negative mode; reconciliation is mostly single-writer
-        per edge so it is rare in practice.  Undercounting ``edges_updated``
-        (the conservative outcome) is safer than overcounting, so the
-        behaviour is intentional.  Both readbacks (``get_edge_text`` and
-        ``get_edge_invalid_at``) resolve their Cypher through the same
-        per-``group_id`` graph object (``GraphitiBackend._graph_for``) that
-        the backend's explicit ``clear_invalid_at`` write uses, so
-        read-after-write consistency for *our own* write is expected within
-        that connection — the TOCTOU risk above is about a *different*
-        writer racing us, not about our own write lagging its readback.
+        readback-verified — it is the same targeted ``SET e.invalid_at``
+        write the clear uses, only without a readback. There is a small
+        TOCTOU window between each save and its readback — if a concurrent
+        writer updates the same edge in that window (another reconciliation
+        cycle, an interactive agent, or a retry) the readback may return a
+        different value and ``verified`` will be ``False`` even though *our*
+        save did persist.  This is a known false-negative mode; reconciliation
+        is mostly single-writer per edge so it is rare in practice.
+        Undercounting ``edges_updated`` (the conservative outcome) is safer
+        than overcounting, so the behaviour is intentional.  Both readbacks
+        (``get_edge_text`` and ``get_edge_invalid_at``) resolve their Cypher
+        through the same per-``group_id`` graph object
+        (``GraphitiBackend._graph_for``) that the backend's targeted
+        ``invalid_at`` write uses, so read-after-write consistency for
+        *our own* write is expected within that connection — the TOCTOU risk
+        above is about a *different* writer racing us, not about our own
+        write lagging its readback.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -11035,9 +10907,10 @@ class MemoryService:
             edges_incomplete_kind.  True: the read was proven complete.
             False: it was observed incomplete; the rebuild proceeded on what
             was fetched and the policy warned.  None: no verdict for that
-            read on this path, because the read was not issued or this is the
-            force=False dry_run probe (tkt_0RVHH0D37FVAWSMT1NVGSHDSZM).
-            Gate on ``is True``.  The raise/warn split is
+            read on this path, because the read was not issued.  The
+            force=False dry_run probe issues no whole-graph edge read, so its
+            edges_* are None and its entities_* carry the probe's node-read
+            verdict.  Gate on ``is True``.  The raise/warn split is
             fused-memory/src/fused_memory/backends/graphiti_client.py::apply_incompleteness_policy.
         """
         write_op_id = str(uuid_mod.uuid4())
@@ -11092,9 +10965,12 @@ class MemoryService:
                     )
             else:
                 if dry_run:
-                    stale, total_entities = await self.graphiti.detect_stale_dry_run(
-                        group_id=project_id
+                    probe = await self.graphiti.detect_stale_dry_run(
+                        group_id=project_id, log=logger
                     )
+                    stale = probe.stale
+                    total_entities = probe.total_count
+                    entities_completeness = probe.entities_completeness
                 else:
                     detect_result = await self.graphiti.detect_stale_with_edges(
                         group_id=project_id, log=logger
@@ -11226,6 +11102,8 @@ class MemoryService:
                             'rebuilt': result.get('rebuilt', 0),
                             'skipped': result.get('skipped', 0),
                             'errors': result.get('errors', 0),
+                            'entities_complete': result.get('entities_complete'),
+                            'edges_complete': result.get('edges_complete'),
                         } if success else None,
                         success=success,
                         error=error_msg,
@@ -11477,6 +11355,7 @@ class MemoryService:
 
         # Graphiti connectivity + project discovery
         graphiti_counts: dict[str, int] = {}
+        graphiti_status: dict[str, Any]
         try:
             graphs = await self.graphiti.list_graphs()
             for graph_name in graphs:
@@ -11484,9 +11363,11 @@ class MemoryService:
                     graphiti_counts[graph_name] = await self.graphiti.node_count(graph_name)
                 except Exception:
                     graphiti_counts[graph_name] = -1
-            status['graphiti'] = {'connected': True}
+            graphiti_status = {'connected': True}
         except Exception as e:
-            status['graphiti'] = {'connected': False, 'error': str(e)}
+            graphiti_status = {'connected': False, 'error': str(e)}
+        graphiti_status['server_settings'] = (await self.graphiti.read_server_settings()).to_status()
+        status['graphiti'] = graphiti_status
 
         # Mem0 connectivity + project discovery
         mem0_counts: dict[str, int] = {}

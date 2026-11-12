@@ -227,7 +227,11 @@ next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
 `confirm` run blocks (`null` for a phase that did not run), the `outcome`,
 and `effect`: `tests_counted`, `episodes_started`,
 `episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
-`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+`no_decision`, `tasks_filed`, `escalations_raised`, `debts_offered` (the tests
+this pass put on the flake ledger's due list, each with its trigger, `cleared`
+or `recovered`, and the head of its evidence) and `debts_undecided` (the cleared
+tests it did not offer because their covering fix task's status could not be
+read; the orchestrator log names each at ERROR). `effect` is `null` while
 a pass is still running, and stays `null` if the pass was cut short (it is
 written after the engine observes).
 
@@ -275,7 +279,7 @@ after 14 days without a write.
 
 **Outages.** A command may declare `outage_probe`; dark-factory's `qdrant-integration` runs `python scripts/lane_dependency_probe.py` in `fused-memory/`. After a red detection run the lane runs the probe once, at normal priority, bounded by `outage_probe_timeout_secs` (180). If it exits 0 the red goes on to the confirm as usual. If it exits 75 with a first stdout line `<dependency>: <reason>`, the pass is an outage: no confirm, no fix task and no ledger row, and each held episode gets `had_outage_pass: true`. The lane then opens one `infra_issue` level-1 escalation on the command's sentinel, naming the dependency and the pass directory, and amends it only when the probe's answer changes. While the command's `last_probe_result` reads `outage`, the lane re-runs the probe alone every `recheck_secs` on its idle poll, and held reds are not rechecked. When the probe exits 0, the lane resolves its own record and any level-2 whose only member it is (a level-2 with other members is amended instead), then runs the command again. The lane also closes the outage record when the probe turns broken, or when the probe or the command is removed or disabled. You do not need to close it. If you resolve it while the dependency is still down, the lane opens nothing until the next red pass whose probe fails. Any other probe result is a broken probe: another exit code, 75 with no line, a crash, or the timeout. The red is then handled as if no probe were declared, and a second `infra_issue` record says the probe is broken until a probe next exits 0, or 75 with a name. To run the probe by hand: `cd fused-memory && python scripts/lane_dependency_probe.py; echo $?`. Name dependencies (`qdrant falkordb embedder chat-model`) to check only those. Exit 75 means "this dependency is not usable", and the printed line names it. Any other non-zero exit is a defect in the probe. The command's record in `offline_lane_episodes.json` carries `last_probe_result` (the probe object), `last_probe_at`, `outage_escalation_id` and `probe_broken_escalation_id`.
 
-Appended by later leaves of plans/offline-lane-red-path-prd.md.
+**The flake ledger.** The lane's rows are read by call site with `orchestrator flake-ledger` (see *Reading the flake ledger*), listed under `offline_lane`, apart from the merge gate's; the de-flake task a lane debt opened is found by its metadata (`flake_debt_call_site: offline_lane`, `flake_debt_trigger: cleared` or `recovered`, `flake_debt_command: <command>`), for example with `find_tasks_by_metadata`. Every non-outage red pass writes one row per test it examined, at the pass's head and start. A cleared test, or a held red that failed and passed at one head with no fix task filed, owes flake debt, and the ledger's drain files its de-flake task; a cleared test that an open or deferred fix task covers owes none. When a fix task is filed for a test that owes debt, its details name the live de-flake owner under `Live de-flake owners:`.
 
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
@@ -602,6 +606,123 @@ CLI. Every invocation needs an explicit `--config <path>` or an
 your shell profile — it will silently redirect an unrelated invocation at
 the wrong project. Prefer a per-project `.envrc` (direnv) instead, and note
 that direnv isn't installed by default on a fresh host.
+
+### Client feed
+
+#### What the publisher is
+
+One long-running `client-feed publish --config <policy>` per client project,
+run as `client-feed@<name>.service`. Every pass writes that project's
+client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
+`cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
+the client portal writes. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed.service.template` and never enables it. The design is
+`plans/client-feed-prd.md`; what the publisher may open and write is its
+isolation invariant, §8.
+
+#### The policy file
+
+Each instance reads `~/.config/client-feed/<name>.yaml` (PRD §7.6). The schema
+and every default live in `client-feed/src/client_feed/policy.py::Policy`. The
+worked example for this repository is `client-feed/examples/dark-factory.yaml`.
+From the checkout root:
+
+```bash
+install -D -m 0600 client-feed/examples/dark-factory.yaml ~/.config/client-feed/dark-factory.yaml
+```
+
+For a client project, install it under the project's name, then edit
+`project_id`, `project_root`, `out_dir`, `in_dir` and `visible_globs`. The
+publisher refuses to start on a file it cannot read, parse or validate, on a
+`project_root` that is not the top of a git work tree, and on an `out_dir` that
+is missing, a symlink, or not the running user's
+(`client-feed/src/client_feed/policy.py::PolicyProblem`).
+
+#### The two directories
+
+| Directory | Owner:group | Mode | Written by |
+|---|---|---|---|
+| `<root>/<name>/out` | `leo:scoping-intake` | 2750, setgid | the publisher; its files are 0640 (`client-feed/src/client_feed/feed_io.py::FILE_MODE`) |
+| `<root>/<name>/in` | `scoping-intake:scoping-intake` | 2750, setgid | the portal; Leo reads it through the group |
+
+`<root>` is `/var/lib/scoping-intake-feeds` unless moved, and `scoping-intake`
+is the portal account's group. The portal repository creates both directories
+(`sudo ~leo/src/scoping-intake/deploy/install.sh feed <name>`), and the portal
+PRD owns them. The authoritative layout is that repository's
+`deploy/README.md` §"Feeds". If the root moves, point the policy's `out_dir`
+and `in_dir` at the new paths and restart the instance.
+
+`install.sh` adds Leo to the group (`usermod -aG scoping-intake leo`). The
+publisher's user units see the new membership only once Leo's user manager
+restarts. A reboot restarts it; with linger on, logging out does not.
+`sudo systemctl restart user@$(id -u).service` also restarts it, but that
+stops every user unit, the orchestrators and fused-memory included, so treat
+it as a fleet restart and drain first (§8). To check, and to keep the units
+running without a login:
+
+```bash
+systemd-run --user --pipe --wait id -nG   # must list scoping-intake
+loginctl enable-linger leo
+```
+
+#### Enabling an instance
+
+From the checkout root:
+
+```bash
+bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
+uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
+systemctl --user enable --now client-feed@<name>.service
+systemctl --user cat client-feed@<name>.service                # the template, repo root and uv path substituted
+systemctl --user show -p ExecStart client-feed@<name>.service  # --config resolved to ~/.config/client-feed/<name>.yaml
+journalctl --user -u client-feed@<name>.service
+```
+
+The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
+`client-feed`. setup-host's sync installs it, and so does
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
+and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+retries it with a 5s→60s backoff until the cause is fixed.
+
+#### Reading the heartbeat's degraded list
+
+```bash
+uv run --no-sync --project client-feed client-feed dump-state --out-dir <out>
+```
+
+prints the fold of the feed. Its `degraded` is the last heartbeat's list of
+`{source, reason}`, and its `as_of` is that heartbeat's time. An empty list is
+healthy; an `as_of` older than a few intervals means the publisher is not
+running. The sources are `client-feed/src/client_feed/contract.py::Source`.
+What a degraded source holds back is stated in `plans/client-feed-prd.md`
+§12:
+
+- `engagement`: reveals are disabled for the pass (δ entry (d)).
+- `inbox`: the inbox offset is held (δ entry (e)).
+- `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
+  Unparseable git output and a timed-out `git cat-file --batch` read degrade
+  `git` too (task 7484 entry (c)).
+- `archive`: only that run's archived details are lost (γ entry (f)).
+- `tasks`, `events`: rows that cannot be projected are counted as
+  `skipped N rows: …` (γ entry (f)).
+
+The same failures are WARNING lines in the unit's journal.
+
+#### The isolation check
+
+The isolation gate is ζ's `client-feed/tests/test_isolation.py` (task 6973;
+PRD §10 row ζ, B1, B2, B15 and B22). The deployment canary is the portal
+repository's `deploy/README.md` §"Check": step 4 (the portal account cannot
+list `/home/leo`) and step 7 (the canary feed).
+
+#### What evidence exists
+
+- Test and criteria evidence exists for pytest projects only: junit
+  injection is pytest-only (PRD §2).
+- Per-test results for merge runs exist only when the client project's
+  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
+  Otherwise only task legs carry `test_results`.
 
 ---
 
@@ -943,6 +1064,29 @@ truncate-at-conflict semantics, and the stale-CAS abort — is
 `plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
 it, not a second copy.
 
+**Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
+`scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
+**target project's own merge queue** (`scripts/_merge_queue_landing.py`) and
+hot-reloads only once that landing is confirmed on main. It never commits to
+the target's main directly. Such a commit is drift that queue never verified,
+so every merge in flight there re-verifies in full
+(`orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`).
+The landing pays one full merge verify of its own, so it can take hours.
+`MERGE_QUEUE_LANDING_TIMEOUT_SECS` (default 10800) bounds the wait. A
+request still in flight at that ceiling, or when the script is stopped, is
+cancelled. Every outcome short of a confirmed landing exits non-zero, naming
+the request's merge state.
+
+Set a calling deploy task's `before_done.timeout_secs` to at least the
+ceiling plus 300 s, not merely above it. The ceiling is checked only between
+polls, so a queue call in flight when it passes runs to its own reply
+timeout (130 s for the submit, 30 s for a poll), and the cancel after it can
+take 30 s more. The landing step can therefore end about 190 s past the
+ceiling (`scripts/_merge_queue_landing.py::land_file`), and the reload comes
+after a landing. A `before_done` timeout SIGKILLs the process group, so too
+tight a margin kills the script mid-cancel and leaves a live request that
+nothing reports.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
@@ -1215,6 +1359,44 @@ unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
 directories; they never share or overwrite one.
 
+### Remote task verifies (`verify_task_*`, task 6670)
+
+An implement-phase task verify can run on a `verify_runners` host instead of
+locally. The orchestrator keeps one quarantine set and one queue per remote
+host for its whole process life. A host either lane benches is benched for
+both, as the same `ru`/`skew`/`divergence` bench above. A readmission on the
+merge lane (reprobe or operator clear) re-offers the host to its waiting
+task verifies at once, in `verify_admission_order`. While a task holds a host, that host's
+`get_merge_queue()` row carries `task_held_by: 'task:<id>'`. A task hold
+takes no merge slot. Four keys, all green tier, read per dispatch and at each
+remote grant (contract: `plans/remote-task-leg-verify-prd.md` §5.7):
+
+- `verify_task_host_policy` (default `local`): `local` runs every task
+  verify locally, byte-identical to before, and writes no dispatch record.
+  `data/verify-logs` is unchanged. `remote_modules` makes a verify eligible
+  when its executed module set intersects `verify_task_remote_modules`.
+  `remote_all` makes every verify eligible.
+- `verify_task_remote_modules` (default `[]`): the module prefixes eligible
+  under `remote_modules`. An empty list there is rejected at load and at
+  reload, naming both keys.
+- `verify_task_remote_red_confirms_locally` (default `false`): a remote red
+  re-runs the ordinary local verify, and the local verdict is returned.
+- `verify_task_remote_cross_check_every_n` (default `0`, off): every n-th
+  verify that returns a remote verdict, green or red, is re-run locally, with
+  the local verdict authoritative. The count is per orchestrator process and
+  covers exactly the verifies whose dispatch record has `reason` `remote`,
+  `cross_check` or `red_confirm`. A verify that ran local for any other
+  reason does not advance it.
+
+Off `local`, each verify the dispatcher considers leaves
+`data/verify-logs/<task>/attempt-N.dispatch-<stamp>.json`. Its `decision`
+(`remote`/`local`), `runner` and `reason` say where the verdict came from,
+and a remote run's streams sit beside it as `attempt-N.remote-<host>.*`.
+The workflow's `workflow_verify` row records the same `runner`. **Rollback**
+is one edit, `verify_task_host_policy: local`, then
+`mcp__escalation__reload_config`. The next dispatch runs locally, and a leg
+already running finishes where it is.
+
 ---
 
 ## 6. Config reload vs restart
@@ -1248,12 +1430,25 @@ takes no arguments: it always re-reads that process's own
   `orchestrator/src/orchestrator/config.py::ScoringConfig` and
   `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
   formula's `age_alpha` / `cpm_beta` stay restart-only.
+- `deterministic.predicate_recheck_stall_cap` (default 30, `>= 1`): how many
+  consecutive exit-75 "not yet" verdicts a re-arming predicate may return
+  before the runner files `milestone_check_stalled`. Read whenever a
+  deterministic slot builds its runner, so a reload applies from the next
+  dispatch. Calibrate it from `predicate_recheck_stalled` events. Normative
+  homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
+  `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
   `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
   applies from the next verify leg — a scope already running keeps the weight
   it started with)
+- `verify_cgroup_memory.high_gib` / `.max_gib` / `.swap_max_gib` (the
+  integer-GiB `MemoryHigh` / `MemoryMax` / `MemorySwapMax` every verify scope
+  is spawned with when `verify_use_cgroup_scope` is on, one value for every
+  role; an unset leaf adds no property, and high may not exceed max; read at
+  each scope spawn, so a reload applies from the next verify leg). Normative
+  home: `orchestrator/src/orchestrator/config.py::VerifyCgroupMemoryConfig`.
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
@@ -1312,11 +1507,26 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `verify_task_host_policy`, `verify_task_remote_modules`,
+  `verify_task_remote_red_confirms_locally` and
+  `verify_task_remote_cross_check_every_n` (task 6670; default `local`, which
+  keeps every task verify local and writes nothing new). Read per dispatch and
+  at each remote grant, so rollback is one reload to `local`. See
+  [§"Remote task verifies"](#remote-task-verifies-verify_task_-task-6670).
 - `pre_merge_reverify` (default `false`; task 6580, Leo ruling 2026-10-09).
   The workflow merge phase rebases the task branch onto main and submits it
   with no task-role verify: the merge gate verifies every landing (task 1724),
   so that verdict had no reader. `true` restores the advisory post-rebase
   re-verify — a rollback switch only, read at each merge attempt.
+- `implementer_brief_variant` (default `whole-plan`; task 5385). `one-step`
+  makes each EXECUTE iteration's implementer complete exactly one plan step:
+  the iteration cap becomes the plan's item count + 3, and the implementer's
+  `max_turns`/`budget_usd` are a third of its resolved route — on every
+  implementer-role pass, so the amender and post-escalation resume passes are
+  cut too, and per-iteration eval metrics must count EXECUTE iterations
+  apart from them. An eval axis
+  (`<candidate>@one-step`, `plans/live-shadow-eval-prd.md` decision 14); no
+  production config sets it. Read at each brief, cap check and route.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -1346,7 +1556,12 @@ other's list. Its green tier currently covers several `reconciliation.*`
 leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
 `write_triage.*`, and the five in-place-update leaves below — read
 `RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
-the authoritative list rather than treating this enumeration as exhaustive:
+the authoritative list rather than treating this enumeration as exhaustive.
+`server.*` (the bind host, the port and `recon_report_port`) is not in it, so
+a bind change is restart-only in both processes (the orchestrator's
+`escalation` bind host/port is red tier above), and a port held by
+`fused-memory.socket` needs `scripts/restart-fused-memory.sh --rebind-socket`
+([§8 Socket activation](#socket-activation-mcp-ports-survive-restarts)):
 
 - `mem0_update.enabled` — **the kill switch for `update_memory`**, the
   in-place Mem0 amend tool. Green-tier on purpose: this is what you flip
@@ -1755,9 +1970,11 @@ deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
 - **Liveness = brokenness.** `main()`'s pass over the **`WATCHED`
-  orchestrator units** revives a dead unit immediately on either of two
-  signals — per-unit, uncapped, not gated by any fleet-wide clock, and it
-  never stamps that clock. The port-probe signal (wedged or port-down) is
+  orchestrator units** revives a dead unit on either of two signals. It is
+  capped to one revive per unit per `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS`
+  (900s), on per-unit clocks under `data/orchestrator/liveness-restart/`, and
+  the one cap covers both signals. It is not gated by any fleet-wide clock and
+  never stamps one. The port-probe signal (wedged or port-down) is
   unchanged. Under systemd socket activation each unit's escalation port is
   held by its own `.socket` unit, so it can keep reading LISTEN across a
   dead service; `main()` therefore also asks systemd's ActiveState
@@ -1769,9 +1986,14 @@ restart:
   `reset-failed` (targeting the unit AND its `.socket` sibling) then
   `restart --no-block`, so a revive never closes a socket-activated unit's
   listening socket out from under an open MCP connection. A single
-  wedged-unit revive is not a fleet deploy. Read "uncapped" as scoped to
-  those units: it does **not** describe `fused-memory.service`, which is
-  deliberately kept out of `WATCHED` and has had its own streak-gated,
+  wedged-unit revive is not a fleet deploy. A unit in
+  `Result=start-limit-hit` is **not** revived: no `reset-failed`, no restart.
+  It stays down with its crash-loop page open (see "Crash loop" below). The
+  cap is sized so a unit that dies again straight after each revive is revived
+  at most four times an hour, not once per 60s tick, while a genuinely wedged
+  unit still waits at most 15 minutes after an earlier revive. This cap and
+  the start-limit-hit hold are scoped to those units: `fused-memory.service`
+  is deliberately kept out of `WATCHED` and has had its own streak-gated,
   rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
@@ -1804,6 +2026,51 @@ restart:
   eligibility — bypassing the idle/debounce gates — but honors the same
   shared 8-hour clock. Since task 5371 it passes `--drain` too (it is still
   disabled by config until task 5020).
+
+**Crash loop (task 8270).** On every tick `main()` reads
+`systemctl --user show -p NRestarts,Result` for every `WATCHED` unit before
+the enabled and startup-grace gates, because the grace window is what hid the
+2026-10-26 loop. Disabled units are sampled too. The samples are kept in
+`data/orchestrator/watchdog-restart-rate.json`. The watchdog files one
+born-at-L2 `critical` escalation, task `orchestrator-crash-loop-<unit>`
+(agent role `orchestrator-watchdog`, category `infra_issue`), into
+dark-factory's `data/escalations` via `escalation submit` when either holds:
+
+- NRestarts grew by at least `ORCH_RESTART_RATE_ALARM_COUNT` (5) within
+  `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` (1800s);
+- systemd reports `Result=start-limit-hit`.
+
+NRestarts counts only `Restart=` restarts, and any manual start (a watchdog
+revive, a sweep) resets it to 0. The growth count therefore adds the new value
+whenever the counter drops, rather than taking a plain difference. At most one
+page attempt is made per window per unit, whichever kind. A start-limit-hit
+episode counts as paged only once `escalation submit` has succeeded, so a
+failed submit of either kind retries at window cadence until it lands. This
+matters because one fault can do both at once: an import error under
+`escalation/` or a broken workspace venv can crash-loop the orchestrators and
+break the submit. The unit stays down meanwhile, so the retry is the only
+path to a page. Once a start-limit-hit page has landed, no further one is
+filed until the unit leaves start-limit-hit. To find the cause, read
+`journalctl --user -u <unit>`, then the project's runs.db `exit_reason` /
+`startup_completed_at` columns (startup-hardening task γ). Once the cause is fixed, restore the unit with
+`systemctl --user reset-failed <unit> && systemctl --user start <unit>`.
+`WATCHED` is the detector's unit set; the `--report` RESTARTS column covers
+every running orchestrator unit. Code:
+`scripts/_watchdog_crash_loop.py::crash_loop_pass`; the reader is
+`scripts/orchestrator-watchdog.py::_unit_restart_status`.
+
+Env knobs for the crash-loop detector and the orchestrator revive cap. All
+are read with a fallback, so a typo'd value cannot crash the oneshot watchdog:
+
+| var | default | meaning of `<=0` |
+|---|---|---|
+| `ORCH_RESTART_RATE_ALARM_COUNT` | `5` | **Clamped to >=1.** `0` would page every unit on zero growth. |
+| `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` | `1800` | **Clamped to >=1.** Also the one-page-per-unit dedup window. |
+| `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS` | `900` | Disables the per-unit revive cap, without even reading the clock. |
+| `ORCH_RESTART_RATE_STATE` | `data/orchestrator/watchdog-restart-rate.json` | Path override for the detector's samples (not a duration). |
+| `ORCH_CRASH_LOOP_QUEUE_DIR` | `data/escalations` | Path override for the queue pages are filed into (not a duration). |
+| `ORCH_LIVENESS_RESTART_CLOCK_DIR` | `data/orchestrator/liveness-restart` | Path override for the per-unit revive clocks (not a duration). |
+| `ORCH_WATCHDOG_UV_BIN` | `/home/leo/.local/bin/uv` | The uv that runs `escalation submit`. Absolute, because the watchdog unit sets no PATH. |
 
 **Module-removal fast path (task 7198).** A watched commit that deletes or
 renames a `.py` module under `orchestrator/src`, `escalation/src` or
@@ -2017,8 +2284,11 @@ mid-restart wait in the kernel backlog and are served by the new process.
 
 | Socket unit | Ports | Service |
 |---|---|---|
-| `fused-memory.socket` | `0.0.0.0:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
+| `fused-memory.socket` | `127.0.0.1:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
 | `orchestrator-<project>.socket` | that project's `escalation.port` (8100–8108) | `orchestrator-<project>.service` |
+
+fused-memory binds its third port, the recon-report port 8003
+(`server.recon_report_port`), itself, on `server.host`, which is loopback too.
 
 The servers adopt the socket via
 `shared/src/shared/systemd_listeners.py::take_systemd_listeners`; without
@@ -2072,6 +2342,31 @@ connected sessions may drop once. Before restarting fused-memory by hand,
 check `systemctl --user is-active fm-staleness-redeploy.service`: the
 fused-memory tier has no restart lease, so a staleness redeploy in flight
 restarts it again underneath you (seen 2026-09-29).
+
+For fused-memory, `scripts/restart-fused-memory.sh --rebind-socket` is the
+procedure: it installs the committed `scripts/fused-memory.socket.template`
+and runs that stop then start. It refuses with exit 3 while
+`fm-staleness-redeploy.service` is active, exits 1 if `/health` never
+answers, and otherwise exits with `scripts/check_network_exposure.py`'s
+status. The script's header gives the exact sequence and how the mode
+composes with `--now` and `--drain`.
+
+### Network exposure check
+
+`scripts/check_network_exposure.py` checks that every factory port is
+reachable on loopback only, by real TCP connects; it reads no firewall rules
+(contract: `plans/mcp-network-exposure-prd.md` §3). It probes the ports of the
+active `fused-memory.socket` and `orchestrator-*.socket` units, the compose
+publishes and the recon-report port, on every address `ip -j addr` lists
+outside scope `host` and on `127.0.0.1`. `scripts/setup-host.sh` §11 runs it.
+
+To run it by hand (no sudo; the connects are read-only):
+`python3 scripts/check_network_exposure.py [--connect-timeout SECS]`. Exit 0
+means loopback only and 1 means a finding. Every line carries the
+`[network_exposure]` tag, and each failure line names its kind in brackets,
+then the port, its owners and the address. What each kind means and how to
+clear it is in the [§10 Troubleshooting](#10-troubleshooting) row for a
+`Network exposure:` FAIL.
 
 ### fused-memory liveness revive
 
@@ -2175,6 +2470,318 @@ writing streak state: `is_unit_enabled` (operator intent) and the 120s
 `STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
 neither failure evidence nor recovery).
 
+### FalkorDB settings and the recreate gate
+
+FalkorDB's durable settings live in `fused-memory/docker/docker-compose.yml`
+and nowhere else: `REDIS_ARGS` turns the AOF on (`appendonly yes`,
+`appendfsync everysec`), `FALKORDB_ARGS` sets the query `TIMEOUT 30000`, and
+the image is pinned by digest (FalkorDB 4.18.0; `:latest` is now the 6.0
+engine). The image runs `redis-server` with no config file, so a runtime
+`CONFIG SET` or `GRAPH.CONFIG SET` lasts only until the next container
+restart, and a crash restart drops it silently (task 6330, 6848; the 10-26
+segfault reset both). Use `CONFIG SET` only as a stop-gap, never as the fix.
+
+fused-memory checks both at startup and logs a WARNING naming the shortfall
+when `TIMEOUT` is below `graphiti.falkordb.expected_graph_timeout_ms` or
+`appendonly` is not `yes`. `get_status` reports the live values on every call
+under `graphiti.server_settings` (`ok`, `shortfalls`, `read_errors`). It never
+sets them.
+
+The unit's `ExecStartPre` (and `scripts/setup-host.sh`) runs
+`scripts/falkordb_aof_gate.py` instead of a bare compose-up, and the
+fused-memory parity checker reports a unit that does not as drift. A recreate
+starts the new server with `appendonly yes`, which loads only the AOF and
+ignores `dump.rdb`, so a stale AOF would drop every write made since it went
+stale. The gate therefore decides as follows:
+
+| falkordb container | Gate action |
+|---|---|
+| any, but the compose file binds a different host data dir than the container mounts | not touched, qdrant comes up, ERROR |
+| running, AOF current | `compose up -d falkordb qdrant` (a recreate goes ahead) |
+| running, AOF not current or unreadable | left running, qdrant comes up, ERROR with each problem's remedy |
+| created / exited, its `REDIS_ARGS` enable `--appendonly yes` | `docker start` it unchanged and bring qdrant up; any pending recreate waits for the next restart |
+| created / exited, AOF not enabled at boot | not started (it would load a stale `dump.rdb`), qdrant comes up, ERROR; fused-memory then fails at its port wait |
+| restarting / paused / dead / removing | left alone, qdrant comes up, ERROR |
+| absent, data dir empty | `compose up -d falkordb qdrant` (fresh install) |
+| absent, `dump.rdb` or `appendonlydir` present | not created, qdrant comes up, ERROR; fused-memory then fails at its port wait |
+
+"AOF current" means the live server reports `appendonly yes`, `aof_enabled:1`,
+`loading:0`, `aof_last_write_status:ok` and `aof_rewrite_in_progress:0`. It
+also means the base and incr files in the host-side manifest total exactly
+the server's `aof_current_size`, bracketed by two `INFO` reads. Size is used
+rather than mtime because an idle server's incr file mtime does not move.
+
+**When it refuses**, the journal line names each problem and its remedy:
+
+| Problem | Remedy |
+|---|---|
+| `appendonly` no, `aof_enabled:0`, no manifest on the host | `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait for `aof_rewrite_in_progress:0`, restart fused-memory |
+| `loading:1` or `aof_rewrite_in_progress:1` | wait until both read 0, then restart fused-memory |
+| `aof_last_write_status:err` | the AOF write failed: check free space and IO errors on the disk holding `fused-memory/data/falkordb`, then restart |
+| compose file and container disagree on the data dir | run the gate with the main checkout's compose file, never a worktree's (a worktree's binds an empty data dir) |
+| container restarting / paused / dead | wait for it to settle (`docker ps -a`), then restart fused-memory |
+| stopped without AOF at boot, absent over data, or an `import-data.sh` refusal | "Deciding which FalkorDB copy is newest" below, BEFORE removing any container |
+| host AOF size disagrees with the server, or state unreadable | inspect by hand before restarting anything |
+
+To check the verdict without acting, run the gate with the main checkout's
+paths (exit 0 means a recreate is allowed):
+
+```bash
+python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
+  --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
+```
+
+#### Deciding which FalkorDB copy is newest
+
+A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
+plus incr) and `dump.rdb`. A server started with `appendonly yes` loads only
+the AOF, and one started without it loads only `dump.rdb`. Whichever copy is
+older loses every write made after it. Do not assume `dump.rdb` is newer.
+Take a container whose runtime AOF was on and stop it: the AOF is fsynced
+first, and the final RDB save is SIGKILLed at compose's 10 s grace, so the AOF
+holds writes that `dump.rdb` lacks. Decide before any `docker rm`, because a
+stopped container's log is the best evidence. Everything below uses the main
+checkout.
+
+1. **Set aside a copy first**, so that a wrong choice can be undone. The files
+   are root-owned, so copy them inside a container. This needs free space
+   equal to their size.
+
+   ```bash
+   D=/home/leo/src/dark-factory/fused-memory/data/falkordb
+   IMG=falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'cp -a /d/appendonlydir /d/appendonlydir.pre-bootstrap; cp -a /d/dump.rdb /d/dump.rdb.pre-bootstrap'
+   ```
+
+2. **Read the stopped container's log**, if a container exists:
+   `docker logs --tail 50 docker-falkordb-1`. If "Saving the final RDB
+   snapshot" is followed by "DB saved on disk", the final save finished and
+   `dump.rdb` is current.
+3. **Otherwise, compare mtimes**: `stat -c '%y %n' "$D"/dump.rdb
+   "$D"/appendonlydir/*.incr.aof`. After an `import-data.sh` refusal, run this
+   on the export's files.
+4. **If the AOF is newer**, start onto it. No bootstrap is needed:
+
+   ```bash
+   docker rm docker-falkordb-1      # the stopped container, if one exists
+   docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+   ```
+
+   Then record the graph counts below and check them against what you expect.
+5. **Only if `dump.rdb` is newer**, follow the bootstrap below.
+
+**Graph counts.** Record these from the first server that loads the data, and
+compare them after each later step:
+
+```bash
+C=docker-falkordb-1   # or falkordb-bootstrap during the bootstrap
+for g in $(docker exec $C redis-cli GRAPH.LIST); do
+  printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
+done > /tmp/falkordb-graph-counts-$(date +%s).txt
+```
+
+#### Bootstrapping FalkorDB's AOF from dump.rdb
+
+Use this only when the decision above found `dump.rdb` to be the newest copy,
+for example an RDB-only export. It loads `dump.rdb` into one container that has
+no `REDIS_ARGS` (so the AOF is off and `dump.rdb` is what loads), then turns
+the AOF on, so that Redis rewrites the AOF from the loaded data. That rewrite
+replaces the old AOF; the set-aside copy from step 1 is the way back.
+
+```bash
+systemctl --user stop fused-memory
+docker rm docker-falkordb-1            # only if it exists and is stopped; never a running one
+docker run -d --name falkordb-bootstrap -p 6379:6379 -v "$D":/var/lib/falkordb/data \
+  -e FALKORDB_ARGS="MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000" "$IMG"
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until loading:0
+# record the graph counts (C=falkordb-bootstrap)
+docker exec falkordb-bootstrap redis-cli CONFIG SET appendonly yes
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until aof_rewrite_in_progress:0, aof_last_write_status:ok
+docker stop falkordb-bootstrap && docker rm falkordb-bootstrap
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+# record the graph counts again (C=docker-falkordb-1): every graph's count must match
+systemctl --user start fused-memory
+```
+
+The compose-up by hand is deliberate: with no container and data on disk, the
+gate refuses to create one. Here the AOF was written moments ago from the
+loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
+counts match.
+
+### The scratch FalkorDB
+
+Integration tests, the offline lane and the local-memory-models eval harness
+write to a second FalkorDB, never to production (task 7792). It is the compose
+service `falkordb-scratch` in `fused-memory/docker/docker-compose.yml`, on
+`127.0.0.1:6380`. It runs the same pinned image and `FALKORDB_ARGS` as
+`falkordb`, and a test pins the two equal. Its data lives in the named volume
+`falkordb-scratch-data`, not a bind mount, and it persists by RDB only
+(`--appendonly no --save 3600 1`). Everything on it is disposable except the
+seeded reference graph below.
+
+**Who starts it.** `scripts/setup-host.sh` starts it on a fresh host. On an
+existing host, start it once by hand:
+
+```bash
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch
+```
+
+`--no-deps` leaves every other service alone. Because the volume is named,
+every checkout's compose file reaches the same container and data (compose
+project `docker`, volume `docker_falkordb-scratch-data`). Use the main
+checkout's anyway, as for `falkordb`.
+
+**Who keeps it running.** Docker does, through `restart: unless-stopped`,
+across crashes, daemon restarts and reboots. A `docker stop` keeps it down
+until someone starts it again. The fused-memory unit does not start it. Its
+gate brings up `falkordb` and `qdrant` and a second hook brings up `embedder`.
+Another hook would break the unit's start budget (280 s + 15 s = 295 s <
+`TimeoutStartSec=300`, `scripts/fused-memory.service.template`), and a scratch
+outage must never hold up production's start.
+
+**How tests reach it.** Through `FALKOR_HOST`/`FALKOR_PORT`, default
+`localhost:6380`, resolved by
+`fused-memory/src/fused_memory/config/falkordb_endpoints.py::scratch_falkordb_from_env`.
+At session start a fused-memory test session sets `FALKORDB_URI` to the same
+address
+(`fused-memory/tests/_fm_falkor_live.py::prepare_scratch_falkordb_session`),
+so config-built backends follow it too.
+
+**What fails loudly.**
+
+- A test session whose `FALKOR_HOST`/`FALKOR_PORT` aim at production (`:6379`
+  on a loopback host) exits 4 at session start, inside the lane or out of it.
+- Under the offline lane (`DF_VERIFY_ROLE=offline`), an unreachable scratch
+  server ends the session at start, so a pass cannot go green by skipping
+  every FalkorDB test. The lane's outage probe
+  (`fused-memory/scripts/lane_dependency_probe.py`) checks FalkorDB on the
+  scratch server too, so the pass is recorded as an outage whose line starts
+  `falkordb: `. Outside the lane, an unreachable server still skips the
+  FalkorDB tests.
+
+**The reference graph.** The eval harness's embedding runs and `probe-set`
+copy and read `evalmem_lme_ref_incumbent_a`, so it must exist on scratch. Seed
+it from `fused-memory/`, and seed it again after a `docker compose down -v` or
+a rebuilt reference:
+
+```bash
+uv run python scripts/seed_scratch_reference_graph.py
+```
+
+The script reads the graph from the FalkorDB the config names (`FALKORDB_URI`,
+production) with `DUMP` and read-only queries. It `RESTORE`s the graph on
+scratch under the same name, checks the copy's topology hash and index
+definitions against the source, and saves. A graph's name travels inside its
+`DUMP` payload, so a restore under any other name is not a faithful copy.
+The script refuses a graph the scratch server already holds: remove that one
+first with `GRAPH.DELETE`. Exit 3 is a refusal. Exit 4 is a copy that did not
+match its source; the copy has been deleted again. Exit 1 is a run that could
+not complete: an unreachable server, a bad `FALKORDB_URI`, a copy that failed
+verification and could not be deleted (the message names it), or a failed
+`SAVE` (the verified copy is live but unsaved; run `SAVE` on scratch).
+
+**The harness reads production and writes scratch.** `harness.py` reads its
+corpus (`dark_factory`, over `GRAPH.RO_QUERY`) from the FalkorDB the config
+names, the only store that holds it. Every write, copy, index build and
+teardown goes to scratch (`fused-memory/scripts/local_memory_models_eval/README.md`).
+
+Check it:
+
+```bash
+docker exec docker-falkordb-scratch-1 redis-cli ping              # PONG
+docker exec docker-falkordb-scratch-1 redis-cli CONFIG GET save    # save / 3600 1
+docker exec docker-falkordb-scratch-1 redis-cli GRAPH.LIST         # lists evalmem_lme_ref_incumbent_a
+```
+
+### The local embedder (`embedder` compose service)
+
+`embedder` is a service in `fused-memory/docker/docker-compose.yml`, beside
+`falkordb`, `qdrant` and `fused-mcp`: vLLM serving
+`ibm-granite/granite-embedding-english-r2` (768 dims) as a pooling runner under
+the served name `granite-embedding-english-r2`. The image is pinned by the digest
+that `scripts/local-model-serving/arms.yaml` carries for the granite arm, the GPU
+share is the literal `--gpu-memory-utilization 0.062`, and Hugging Face runs
+offline from the host cache (`~/.cache/huggingface`). It publishes on
+`127.0.0.1:8420` only. Compose restarts it `on-failure:5`, so a crash-looping
+container stops instead of churning the shared GPU. `lms-arm@` units stay
+eval-only; nothing here calls `lms_serve.py`.
+
+Unlike the stores (`unless-stopped`), the embedder does not come back by itself
+after a docker daemon restart, a host reboot included, or after its fifth
+crash: Docker's `on-failure` policy skips both. It stays down until the next
+fused-memory start runs its `up`, or until you bring it back by hand:
+
+```bash
+docker compose -f fused-memory/docker/docker-compose.yml up -d --pull=never --no-deps embedder
+```
+
+Check it:
+
+```bash
+curl -s http://127.0.0.1:8420/v1/models      # readiness: lists granite-embedding-english-r2
+ss -ltn 'sport = :8420'                      # bound on 127.0.0.1, not 0.0.0.0
+docker compose -f fused-memory/docker/docker-compose.yml ps embedder
+```
+
+The `curl` is the readiness check. `ss -ltn` only shows the loopback bind, and
+the port is bound before the model serves.
+
+**Start and wait.** `fused-memory.service` carries two `-`-prefixed `ExecStartPre`
+lines for it. `up -d --pull=never --no-deps embedder` runs before the store wait,
+so the 107-123 s cold model load starts as early as possible. `--pull=never`
+makes a missing image fail fast instead of starting a multi-GB pull that would
+outlive `TimeoutStartSec`. `--no-deps` keeps that `up` from starting any other
+service, so falkordb still comes up only through the AOF gate. The `up` runs
+under `timeout 10`, which turns a hang (a stalled GPU hook, a wedged dockerd)
+into a failed exit. A 5 s `wait-for-port` on `127.0.0.1:8420` runs after the
+store wait; it shows the docker-published port is up, not that the model is
+loaded. Both lines carry `-`, so any embedder failure, including a hang the
+`timeout` cut short, leaves fused-memory starting degraded rather than failing
+its start.
+
+Worst case, the embedder hooks add 15 s to a start (10 s + 5 s). That fits
+inside the 20 s the 280 s store wait leaves under `TimeoutStartSec=300`, as
+`fused-memory/tests/test_systemd_unit_config.py::TestEmbedderStartHooks` pins.
+The sum leaves out the gate and the init path, so it bounds what the embedder
+adds, not the whole start. No wait inside that budget covers the cold load, so
+on a cold boot fused-memory starts before granite finishes loading, and β1's
+startup probe (task 6798) reports the gap. A restart of fused-memory alone finds
+the embedder already serving.
+
+`scripts/check_fused_memory_unit_parity.py` accepts an `ExecStartPre` compose `up`
+that names only `embedder` (its `UNGATED_COMPOSE_SERVICES`) and still flags any
+other compose `up` beside the FalkorDB AOF gate. The `[drift]` report prints
+each flagged line and the tokens it read as services. An option's separate value
+is read as a service too, so write options as one token (`--pull=never`).
+
+**The cutover hold.** `scripts/fused-memory-cutover-hold.conf` is a drop-in whose
+one `ConditionPathExists=!` directive names the cutover lock file. That file is
+the lock path's only definition: read the path there, never from a copy. `%h` in
+it is systemd's home specifier, which δ's `live` profile (task 6805) must expand
+when it reads the path. The drop-in is installed on both `fused-memory.service`
+and `fused-memory.socket`. While the lock file exists, systemd refuses to start
+either; with no lock it does nothing. The embedder cutover writes the lock at
+quiesce and removes it at release. The path is under the state directory rather
+than `$XDG_RUNTIME_DIR` or `/tmp` so it survives a reboot: the installed
+`orchestrator-*.service` units carry `Wants=fused-memory.service` and would start
+a held unit at boot if the lock vanished.
+
+Once α2 installs the drop-in, it stays installed; only the lock comes and goes.
+So from then on, every run of `scripts/check_fused_memory_unit_parity.py`
+reports an `[override]` naming it and exits 1, and exit 1 alone no longer
+separates real drift from this drop-in. Read the report. If its only finding is
+the `[override]` for the cutover hold, with no `[drift]` line and no other
+drop-in, the unit is at parity. A follow-up filed from task 6797 (ticket
+`tkt_0RWV3564630WNF15APKKRXVZMJ`) is to teach the checker to recognise this
+drop-in.
+
+Installing the compose service, the template lines and the drop-in on the host is
+a separate attended step (α2, task 6801); the tracked files alone change nothing
+on the host. Until α2 starts the embedder, `scripts/check_network_exposure.py`
+(whose `COMPOSE_PUBLISHED_PORTS` mirrors every compose publish, 8420 included)
+reports `[not-listening]` for 8420; that finding is expected until then.
+
 ### Dashboard unit-parity check
 
 Each orchestrator-watchdog tick also runs
@@ -2247,6 +2854,10 @@ newest-watched-commit / verdict columns, per unit:
 - **DEPLOY-AGE** — time since the last *verified* fleet deploy (the shared
   clock), fleet-wide, in hours; `unknown` if the clock has never been
   stamped.
+- **RESTARTS** — the unit's systemd `NRestarts/Result` as one token, `?`
+  where a field could not be read, placed just left of VERDICT. NRestarts
+  counts only `Restart=` restarts and resets on any manual start; see "Crash
+  loop" above for what the watchdog does with it.
 - **MERGE-IDLE** — the unit's current heartbeat classification
   (`idle` / `busy` / `stale` / `absent`) — the same classification the
   drain gate itself uses.
@@ -2337,33 +2948,35 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` path-filters its pyright stage (since task 2551 — see
-  `hooks/project-checks` for the authoritative logic), so what a commit
-  costs depends on what it stages:
-  - **No staged `.py` files** — pyright is skipped entirely; the hook
-    prints `pre-commit: pyright skipped (no Python changes)` and the
-    commit completes in seconds. A docs/plans-only commit needs no
-    bumped timeout: reach for a plain gated `git commit --only <paths>`
-    first.
-  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
-    package imports them, so the hook runs a full sweep across all seven
-    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`,
-    `shared`, `escalation`, `sampler`, `cockpit` — the members of
-    `type_check_command`). This is the 7x worst case and can comfortably
-    exceed two minutes.
-  - **Staged `.py` under exactly one of the other `PYRIGHT_PACKAGES`
-    (`fused-memory`, `orchestrator`, `dashboard`, `sampler`, `cockpit`)** — pyright runs once, for that package only.
-  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
-    root-level `conftest.py`) — pyright is skipped for the whole commit,
-    and unlike the no-Python case the hook prints *nothing*, so there is
-    no signal that it was skipped. This over-narrowing is deliberate
-    (root-level Python is itself unconfigured for pyright); if the changed
-    file is imported by a package, run `uv run pyright` there by hand.
+- On main, `pre-commit` runs the merge gate's own checks for what the
+  commit stages (task 8531; `scripts/hook_module_checks.py` derives the
+  list, `hooks/project-checks` runs it in parallel), so what a commit costs
+  depends on what it stages:
+  - **Staged `.py` under a registered module** — that module's
+    `lint_command` and `type_check_command` run verbatim, exactly as the
+    merge gate would run them, so a staged `scripts/*.py` now runs
+    `module:scripts:type`.
+  - **Staged `.py` under `shared/` or `escalation/`** — every module
+    imports them, so the type check of EVERY registered module runs. This
+    is the worst case.
+  - **A staged file under `plans/`, `docs/` or `review/`, or a
+    `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
+    whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
+    10 s warm and 45 s cold, as measured in
+    `plans/merge-pre-verify-screen-prd.md` §3, decision 4.
+  - **Nothing above** — the hook prints `pre-commit: merge-gate checks
+    skipped (no staged file maps to a module or the screen) in Ns`. A
+    commit like that needs no bumped timeout: reach for a plain gated
+    `git commit --only <paths>` first.
 
-  In the two middle cases — the only ones that actually invoke pyright —
-  pass a generous timeout (five minutes or more) to whatever you use to
-  run commit commands, or run it detached and poll, rather than letting a
-  default timeout kill it mid-hook.
+  The hook prints each unit it runs and the elapsed time. A module type
+  check can take minutes: the measurements are recorded at
+  `scripts/orchestrator.yaml::type_check_command` and
+  `shared/orchestrator.yaml::type_check_command` (orchestrator's pyright).
+  For any commit that runs a module check, pass a generous timeout (five
+  minutes or more) to whatever runs the commit, or run it detached and
+  poll, so a default timeout does not kill it mid-hook. `--no-verify` still
+  bypasses the hook, as it does for any git hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -2371,10 +2984,13 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless. Since task 2551 a
-  docs-only commit passes the hook cheaply anyway (pyright is skipped),
-  so this is a last resort for genuine index-lock contention — not a way
-  to dodge a slow hook.
+  no-code change. Reach for `--only` first regardless. A docs-only commit
+  pays for the screen (about 10 s warm) when it stages anything under
+  `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md` outside a
+  workspace package, root-level docs such as this file included. Other
+  docs-only commits skip the merge-gate checks. Either way, `--no-verify`
+  is a last resort for genuine index-lock contention, not a way to dodge
+  a slow hook.
 
 ---
 
@@ -2477,13 +3093,15 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | Escalation MCP calls (`get_pending_escalations`, `resolve_issue`, `merge_request`) time out for minutes while the orchestrator process is alive, and the journal shows starlette `ClientDisconnect` tracebacks | The orchestrator's single event loop is blocked by synchronous work, and the in-process escalation server shares that loop | `journalctl --user -u orchestrator-<name>.service \| grep loop_stall:` — the `blocked for Ns so far` WARNING from `shared/src/shared/loop_stall.py::LoopStallMonitor` carries the loop thread's stack, which names the blocking call. File it as an INV-8 defect with that stack (recursive deletes already run off-loop through `orchestrator/src/orchestrator/tree_removal.py::remove_tree`). A call that failed during a stall may still have applied, so re-read state before retrying a `resolve_issue` |
 | Reconciliation escalation queue looks permanently poisoned for a project | The project's `project_id` was never registered on fused-memory's `DASHBOARD_KNOWN_PROJECT_ROOTS` before its first task was queued | This must be prevented, not fixed after the fact — always complete project registration (factory-init Stage 6) before queuing any task. If it's already happened, this needs an operator-level fused-memory intervention, not a task-level fix |
 | A task blocks at VERIFY with failures unrelated to its own changes | Verification currently runs test/lint/typecheck **repo-wide** by default, not scoped to the task's own modules | Check whether the failures are pre-existing on main outside the task's scope; if so, fix main's cleanliness first (module-scoped verification is planned but not yet implemented) |
-| An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An agent subprocess inherits the orchestrator's environment verbatim (`orchestrator/src/orchestrator/agents/invoke.py` passes a copy of `os.environ`), so its shell carries the MAIN checkout's `VIRTUAL_ENV` and a first-party `import` resolves main's editable source rather than the worktree's edits — and a worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
+| An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An interactive session inherits its launching shell's environment, often the MAIN checkout's `VIRTUAL_ENV`, so a first-party `import` resolves main's editable source rather than the worktree's edits. Dispatched agents are scrubbed of Python-env selection (`shared/src/shared/python_env.py::without_python_env_selection`, which Claude spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so they hit this only by naming main's `.venv/bin/python` in a worktree without its own `.venv`; a bare `python` there is the system interpreter, which fails the import instead. A worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. In a dispatched agent, name the worktree's own `.venv/bin/python`. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
+| A fused-memory offline-lane pass is recorded as an outage on a line starting `falkordb: ` (with the container stopped, measured: `falkordb: connect: ConnectionError`), or a fused-memory test session under the lane exits 4 at start with `the scratch FalkorDB at redis://localhost:6380 is not reachable` | The scratch FalkorDB (compose service `falkordb-scratch`, `127.0.0.1:6380`) is not running. Docker restarts it on its own unless someone stopped it, and nothing else starts it; see [§8 The scratch FalkorDB](#the-scratch-falkordb) | `docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch`, then `docker exec docker-falkordb-scratch-1 redis-cli ping`. If `GRAPH.LIST` there lacks `evalmem_lme_ref_incumbent_a`, seed it with `scripts/seed_scratch_reference_graph.py`. The next lane pass runs normally |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
 | Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
 | `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
+| `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl` or `ip` could not be read, usually because there is no user bus for `systemctl --user` or no `ip` binary; every port it could still find was probed | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set. How to run the check: [§8 Network exposure check](#network-exposure-check) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_written` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 
 ---
@@ -2502,11 +3120,15 @@ check `applied`/`restart_required` on your reload call, per
 | `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
 | `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
 
-**Multi-account failover (`usage_cap.*`)** is entirely optional — a
-single-user setup works fine on plain CLI OAuth login with no accounts
-file configured. If you do configure a pool
+**Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
+pool whose roster resolves no token is EMPTY, and every invocation then raises
+in `UsageGate.before_invoke`: the gate never adopts the operator's `~/.claude`
+login unless told to (ruling 2026-11-01, task 8161). A single-user setup has two
+supported routes: `usage_cap.enabled: false`, or
+`usage_cap.fallback_to_default_credential: true` (interactive or single-user
+only: the whole fleet then rides that login). The pool
 (`usage_cap.accounts_file` → an external YAML of `oauth_token_env` entries
-resolved from `.env`), it gives the orchestrator per-account failover when
+resolved from `.env`) gives the orchestrator per-account failover when
 one account gets capped, plus the per-(account, model) scoped-cap
 dimension described in [§7](#7-model-routing). This whole block is
 restart-tier, not hot-reloadable.
@@ -2603,7 +3225,9 @@ missing `LoadState` detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
+| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
@@ -2616,7 +3240,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00, 04:00 and 05:00 ones, and
+for the 03:30 job; the sections below for the 02:30, 03:00, 03:15, 04:00 and 05:00 ones, and
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
@@ -2639,6 +3263,45 @@ harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
 reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
+
+### Transcript secret sweep (02:30)
+
+Agent subprocesses inherit no secret-bearing variable except their own
+`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`), and transcripts
+are redacted as they are archived (task 6820). This sweep is the backstop for
+everything already on disk.
+
+- **What it scans.** Every regular `*.jsonl` file under each orchestrator
+  unit's `data/orchestrator/agent-transcripts` (the roots
+  `scripts/orchestrator_projects.py` reads from
+  `~/.config/systemd/user/orchestrator-*.service`) and under
+  `~/.claude/projects`, subagent transcripts included. It also scans the
+  `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
+  which are redacted only after they are staged.
+- **What it matches.** Only the live values the sweep's own environment holds.
+  The wrapper sources the repo `.env` for them. It never matches a token-shaped
+  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
+  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  for that line only: the line keeps its value, the rest of the file is still
+  redacted, and the escalation names the path, the line and the variable.
+- **What it cannot see.** A secret defined only in another factory project's
+  own `.env` (simple-algo's `KRAKEN_API_KEY`, say). The wrapper sources
+  dark-factory's `.env` alone, so such a value is never matched. Task 6820
+  filed this gap as a follow-up.
+- **What it files.** One `risk_identified` info escalation per sweep that
+  redacted or refused anything, naming each path with its per-variable counts.
+  It prints one JSON record line to the journal, and never prints a value.
+- **What it skips.** Files modified in the last 15 minutes, which a live
+  session may still be appending to. The next night picks them up.
+
+Installing it is a post-merge deterministic deploy
+(`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
+run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
+At archive time a refused redaction is counted like any other archival
+failure (`transcript_archive: failed to redact` WARNING), and the transcript is
+held rather than archived with its value. At teardown, its other lines are
+still redacted in place.
 
 ### Legibility trickle accounts (03:00)
 
@@ -2786,6 +3449,96 @@ One failure is not an exhaustion. `<label>: claude CLI could not be started
 (model='haiku', cwd=...): [Errno 2] ...` means `claude` is missing from the
 unit's PATH. Every digest fails with it, so the night is a storm that exits
 1. Check the unit's `Environment=PATH=` pin.
+
+### Scheduled memory evals (03:15)
+
+**What it does.** Measures the memory subsystem once a day and files
+regressions where the recon-escalation-watcher sees them. The runner
+(`fused-memory/scripts/memory_eval_runner.py`, contract in
+`docs/prds/memory-eval-program.md` M2/M3) runs each registered producer
+read-only, judges each new series against its trailing window, writes the
+verdicts and a run report, then files `eval_regression` escalations on the
+reconciliation queue (port 8103, `data/reconciliation/escalations`). It never
+resolves one: the watcher is the sole closer.
+
+| File | Role |
+|---|---|
+| `scripts/fused-memory-memory-eval.sh` | Wrapper: service env, then `uv run --no-sync` of the runner |
+| `scripts/fused-memory-memory-eval.service` | `Type=oneshot` around the wrapper |
+| `scripts/fused-memory-memory-eval.timer` | `OnCalendar=*-*-* 03:15:00` |
+| `scripts/install-memory-eval-timer.sh` | Installer |
+| `fused-memory/scripts/memory_eval_runner.py` | The runner and its producer registry |
+| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it) |
+
+**Artifacts** live under `fused-memory/data/memory-evals/`: one directory per
+eval (its M1 series, reports and `limits-current.json`), plus
+`verdicts-<STAMP>.json`, `verdicts-current.json` (what the dashboard reads)
+and `run-report-<STAMP>.txt` at the root.
+
+**The first run is the grandfather snapshot.** An eval with no
+`limits-current.json` records today's failures as known-bad and alarms on
+nothing; its run report lists them under "Initial-state baseline". Deleting an
+eval's `limits-current.json` re-snapshots it on the next run. The installer
+therefore starts nothing: the first run happens on schedule.
+
+**Exit status and what a failed run means.** 0 means the run completed, even
+if it alarmed. 1 means something failed to run: a producer, an evaluation or
+the runner itself. Every such failure in one run collapses into one
+`eval_regression` (task id `memory-eval-program`) on the 8103 queue, and the
+unit is left `failed`. 2 means preflight refused: a bad config, a recon queue
+directory that is missing or empty, a malformed `MEMORY_EVAL_RUN_STAMP`, or
+another run holding the artifact root's `.runner.lock`. The refusal names
+that run's pid and stamp. Two runs at once could file the same fingerprint
+twice or interleave a `limits-current.json` update, so the second run writes
+nothing.
+Nothing is filed then, so the unit state and the journal are the only signal.
+A relative `--artifact-root` is resolved against the caller's directory.
+Unlike the 05:00 and 05:30 wrappers, this one does not mask a failure with
+exit 0: the escalation is the alarm. A failed
+unit does not stop its timer. `fused-memory-flag-marker-sweep.service`
+failed with status 127 on 2026-08-18, and its timer ran it again on
+2026-08-19 (journal excerpt in that unit file).
+
+```bash
+journalctl --user -u fused-memory-memory-eval.service -n 100
+systemctl --user list-timers fused-memory-memory-eval.timer
+```
+
+The run's last stdout line is a JSON summary:
+`{"alarms": …, "failures": …, "filed": …, "run_stamp": …, "suppressed": …}`.
+
+**Re-filing.** While a record is pending, the runner files nothing for its
+`dedupe_fingerprint`. A regression's fingerprint and the runner-failure
+fingerprint carry no stamp, so each stays one record across runs. The storm
+aggregate's fingerprint is scoped to its run
+(`shared/src/shared/memory_eval_verdicts.py::storm_fingerprint`). So a storm
+that persists, such as a corpus migration that trips more than K metrics for
+several days, files one new aggregate per run. The watcher folds those into
+the oldest one.
+
+**Install.**
+
+```bash
+scripts/install-memory-eval-timer.sh
+```
+
+**Deploy is a separate task.** An agent cannot run that installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set (see "The nightly
+ladder" above). The host install is a `task_kind='deterministic'`
+`before_done` task of kind `deploy` that runs
+`scripts/install-memory-eval-timer.sh`. It can be filed only once the
+installer is on main, because
+`fused-memory/src/fused_memory/middleware/deterministic_task_guard.py` rejects
+a `before_done` script that main does not have yet. The job is done when
+`systemctl --user list-timers --all` lists `fused-memory-memory-eval.timer`.
+
+That deploy task must depend on task 3217. The runner writes one verdict
+entry per tripwire item. The dashboard reader
+(`dashboard/src/dashboard/data/memory_evals.py::_read_verdicts`) still keys
+verdicts by `(eval_id, metric_id)` and keeps the first, so it would show an
+alarming tripwire as clear whenever its first item passes. Task 3217 re-keys
+that reader. Until it lands, the first scheduled run would publish a verdicts
+file the Memory tab misreads.
 
 ### Legibility trickle health probe (04:30)
 
@@ -3206,16 +3959,22 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean). Its one write
-   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
-   batch files there and runs `prepare_sitting.py record --from <file>`.
-   It is read-only otherwise, by construction: it runs
-   under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, reading no
-   settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
-   allow rule plus the absence of settings files confine the agent's own
-   file writes to that inbox. `prepare_sitting.py` confines in code what
+   ramifications, a recommendation or an explicit no-lean). It writes JSON
+   batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
+   `prepare_sitting.py record --from <file>`. Three layers confine it, all
+   in `nightly_prepare.py`. The write boundary is Landlock: the CLI runs
+   under it with the tree read-only except `data/sitting/`, `~/.cache/uv`,
+   `/tmp` and `.task/` (Landlock always grants its cwd's `.task/`, and the
+   run's cwd is the repo root because its prepare command is
+   repo-relative). Without Landlock the run is refused (`prepare=2`), never
+   launched unconfined; bwrap is not a fallback, since its mount order
+   leaves the host `/tmp` read-only. The CLI rules are the first gate, not the boundary: it runs
+   under `--permission-mode dontAsk` with an allowlist and an explicit
+   denylist of every apply verb, reading no settings file
+   (`--setting-sources ''`); the CLI matches those rules against raw
+   command text, so a shell-quoted spelling can pass a deny. Its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox, under
+   which `prepare_sitting.py` confines in code what
    `record` reads (a `.json` file directly in that inbox, never stdin or
    another path, so never an earlier night's batch) and where it writes
    (the default store in `data/sitting/`), and refuses everything but `brief`
@@ -3223,10 +3982,17 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
-   never starts. Its account comes from the shared pool, as a
-   lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. With nothing leasable, it inherits the unit's
-   environment. It stops itself after 2700s.
+   never starts. Its account comes from the shared pool, through the same
+   runner as every other session (`shared.cli_invoke.invoke_with_cap_retry`),
+   in roster order. A seat at its usage limit, or one whose credentials are
+   rejected (401/403), hands the run to the next seat, and a capped session
+   that had made progress resumes there. It never parks: after one pass
+   over the pool it gives up. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/` holding the current seat's token, which is
+   removed on every exit short of a SIGKILL. With no pool account resolved
+   the night is skipped (`prepare=1`, `no pool account resolved; skipping`):
+   the run never uses the host's own login. It stops itself after 2700s,
+   failovers and the cooldowns between them included.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3241,6 +4007,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 | `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
+| `data/sitting/config/claude-config-nightly-prepare-<run>/` | The night's CLI config dir and session transcript, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -3265,17 +4032,28 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
-  recorded nothing; its log line carries both stream tails, or, for a run
-  that recorded nothing, the counts of what the inbox offered and could not decode. That is
-  routine, not an incident:
+- `prepare=1` means the Fable run was skipped (no pool account resolved),
+  failed, timed out, found no seat that could take it, or recorded nothing.
+  A failed run's log line carries the tail of the CLI's `result` text and
+  of its stderr. A run no seat could take logs `no pool account could take
+  the run: capped [<seats>], auth-failed [<seats>]; earliest reset <ts>`.
+  A run that recorded nothing logs the counts of what the inbox offered and
+  could not decode. That is routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
-  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
-  means the agent's entries failed validation even though some were recorded.
+  is. Two exceptions. A line listing every seat as auth-failed means those
+  tokens need operator action, and no reset clears them. A line whose
+  earliest reset is `unknown` while seats are listed as capped may be a
+  local fault rather than a quota: the shared runner reads a failure that
+  cost nothing, took at most one turn and exited within 5s as a cap, so a
+  broken sandbox wrapper or a CLI rejecting a flag caps every seat in turn.
+  Read the runner's `suspicious zero-cost instant exit` lines above it,
+  which quote the CLI's output. A run that finished
+  well logs `nightly_prepare: done (... account=<seat>, ... recorded=<n> of
+  <m>, undecodable=<u>)`; a high `undecodable` means the agent's entries
+  failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH.
+  PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 
@@ -3284,8 +4062,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env, whether the
-account came from a lease or was inherited.
+`nightly_prepare.py` runs the CLI through the shared runner, which builds
+the child's env as `shared.secret_env.agent_subprocess_env` of its own (no
+API keys or other secrets, no endpoint selection, no Python-env selection),
+with the current seat's `CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
@@ -3629,13 +4409,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -3664,7 +4452,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the

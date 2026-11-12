@@ -477,9 +477,7 @@ def _inversion_failure(
         'deliberate fast bound, yet below the '
         f'--timeout={verify_cli_budget} verify passes, clamps the run that '
         'actually gates your merge to N -- less time than no marker at all. '
-        'Under timeout_method="thread" a '
-        'breach does not even fail that one test: it kills the whole xdist '
-        'worker. Which suites run thread, and why: '
+        "What a breach costs depends on the suite's timeout_method: "
         'tests/scripts/test_timeout_method_policy.py.\n\n'
         'Write one of:\n\n'
         f'{textwrap.indent(slow_test_marker, "    ")}\n\n'

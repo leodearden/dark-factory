@@ -87,7 +87,6 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__delete_episode',
     'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',
-    'mcp__fused-memory__replay_dead_letters',
     'mcp__fused-memory__refresh_entity_summary',
     'mcp__fused-memory__set_entity_summary',
     'mcp__fused-memory__rename_entity',
@@ -172,6 +171,7 @@ DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
     'mcp__fused-memory__unhalt_reconciliation',
     'mcp__fused-memory__reload_config',
     'mcp__fused-memory__rebuild_candidate_key_index',
+    'mcp__fused-memory__replay_dead_letters',
     'mcp__fused-memory__replay_event_dead_letters',
     'mcp__fused-memory__delete_dead_letters',
     'mcp__fused-memory__set_task_priority_override',
@@ -268,6 +268,24 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__resolve_escalation_shas',
 ]
 
+# SILENT standalone orchestrator RUNTIME reads (disallowed in every stage —
+# task 6553, plans/escalation-store-ambiguity-prd.md §11 OQ3): with no harness
+# attached they answer an empty-but-live result instead of an error.
+#
+# The recon escalation server is built with no orchestrator harness
+# (reconciliation/harness.py::ReconciliationHarness._start_escalation_server),
+# so escalation/server.py::create_server's get_task_runtime_state answers with
+# the snapshot model's default envelope: offline=False, tasks=[]. That is the
+# categorical empty DISALLOW_ESCALATION_READS exists to stop, made worse by a
+# positive "online, nothing running" claim. It is a separate bucket because it
+# reads orchestrator runtime state, not escalation records. Reading runtime
+# state alone does not qualify a tool: the merge-queue reads stay reviewed-safe
+# because standalone they fail loudly. S3 δ moving get_task_runtime_state off
+# create_server supersedes this bucket; OQ3's resolution names what δ retires.
+DISALLOW_ESCALATION_RUNTIME_READS = [
+    'mcp__escalation__get_task_runtime_state',
+]
+
 # Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
 #
 # The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
@@ -302,19 +320,22 @@ STAGE1_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # Stage 2 keeps its memory + task write access except the consolidation op and
-# the proposal tool; built-ins, the escalation reads, the fused-memory
-# control-plane mutators and the defect-record writers are blocked too.
+# the proposal tool; built-ins, the escalation reads, the orchestrator runtime
+# snapshot read, operator merge-lane control, the fused-memory control-plane
+# mutators and the defect-record writers are blocked too.
 STAGE2_DISALLOWED = (
     DISALLOW_CONSOLIDATION_OP
     + DISALLOW_CONSOLIDATION_PROPOSALS
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_BUILTIN
 )
@@ -327,6 +348,7 @@ STAGE3_DISALLOWED = (
     + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_DEFECT_RECORD_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_RUNTIME_READS
     + DISALLOW_ESCALATION_MERGE_LANE_CONTROL
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
@@ -684,9 +706,9 @@ def run_config_dir_path(data_dir: Path, run_id: str) -> Path:
 
     Names exactly ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(data_dir)).path``
     without constructing one. That is the point: ``TaskConfigDir.__init__``
-    mkdirs the dir and symlinks settings into it, so a read-only caller — the
-    resume-eligibility probe asking whether a transcript survives — would
-    resurrect the very directory it is probing for.
+    mkdirs the dir and symlinks settings into it, so a caller that only needs
+    the path — ``gc_run_config_dir``, removing a dir that may never have been
+    created — would resurrect the very directory it is acting on.
     """
     return recon_config_base_dir(data_dir) / f'{CONFIG_DIR_PREFIX}{run_id}'
 
@@ -821,8 +843,6 @@ async def run_stage_via_cli(
     output_schema: dict | None = None,
     session_id: str | None = None,
     config_dir: TaskConfigDir | None = None,
-    resume_session_id: str | None = None,
-    resume_delivers_prompt: bool = False,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -841,15 +861,6 @@ async def run_stage_via_cli(
     extras so the CLI can actually write the transcript inside it. Setting
     ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
     where to write and then denied the write, silently.
-
-    ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
-    forwarded straight to ``invoke_with_cap_retry`` for the startup
-    adopt-and-resume path: when set, the stage subprocess ``--resume``s an
-    in-flight session and (with ``resume_delivers_prompt=True``) receives the
-    caller's real ``payload`` as its continuation prompt instead of the generic
-    CRASH_RECOVERY placeholder. Both default to None/False so non-resume call
-    sites are byte-identical. BaseStage.run validates the transcript exists and
-    builds the recovery prompt before setting these; this runner stays generic.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -957,8 +968,6 @@ async def run_stage_via_cli(
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
-            resume_session_id=resume_session_id,
-            resume_delivers_prompt=resume_delivers_prompt,
         )
     except AllAccountsCappedException:
         logger.warning(

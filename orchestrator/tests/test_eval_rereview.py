@@ -12,6 +12,7 @@ import pytest
 from orchestrator.evals import rereview
 from orchestrator.evals.rereview import enumerate_candidates
 from orchestrator.evals.results import ResultStore
+from orchestrator.review_payload import ReviewPayload, Verdict
 
 _FAR_FUTURE = datetime(2100, 1, 1, tzinfo=UTC)
 
@@ -66,21 +67,28 @@ def test_run_ids_come_from_the_store_grammar_then_the_worktree(
     ]
 
 
-@pytest.fixture
-def fake_reviewer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The opus reviewer finds 0 blocking issues and 3 suggestions."""
-
+def _install_reviewer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: ReviewPayload,
+) -> None:
     async def diff(*_args) -> str:
         return 'diff --git a/x b/x'
 
     async def review(*_args, **_kwargs):
-        issues = [{'severity': 'suggestion'}] * 3
-        return 'opus', {'verdict': 'PASS', 'issues': issues}, 2.5
+        return 'opus', payload, 2.5
 
     monkeypatch.setattr(rereview, 'get_diff', diff)
     monkeypatch.setattr(rereview, '_run_single_reviewer', review)
     monkeypatch.setattr(rereview, 'RE_REVIEWS_DIR', tmp_path / 're_reviews')
     monkeypatch.setattr(rereview, 'PROGRESS_FILE', tmp_path / 're_reviews' / 'p.jsonl')
+
+
+@pytest.fixture
+def fake_reviewer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The opus reviewer finds 0 blocking issues and 3 suggestions."""
+    _install_reviewer(
+        tmp_path, monkeypatch,
+        ReviewPayload(Verdict.PASS, ({'severity': 'suggestion'},) * 3, 'opus'),
+    )
 
 
 def _one_candidate(tmp_path: Path, store: ResultStore) -> rereview.Candidate:
@@ -122,3 +130,39 @@ def test_a_cell_gone_unreadable_before_its_patch_is_an_error_outcome(tmp_path: P
     assert outcome.status == 'error'
     assert str(candidate.result_path) in outcome.message
     assert candidate.result_path.read_text() == '{"task_id": "df_task_1", "conf'
+
+
+def test_suggestions_are_counted_as_production_counts_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    payload = ReviewPayload(
+        Verdict.ISSUES_FOUND,
+        ({'severity': 'blocking'}, {'severity': 'suggestion'}, {'severity': 'nit'}),
+        'opus',
+    )
+    _install_reviewer(tmp_path, monkeypatch, payload)
+    store = ResultStore(tmp_path / 'results')
+    candidate = _one_candidate(tmp_path, store)
+
+    outcome = asyncio.run(rereview.rereview_one(candidate, store=store))
+
+    assert outcome.status == 'done'
+    patched = json.loads(candidate.result_path.read_text())
+    assert patched['metrics']['review_blocking_issues'] == 1
+    assert patched['metrics']['review_suggestions'] == 2
+    [raw] = (tmp_path / 're_reviews').glob('*.json')
+    assert json.loads(raw.read_text())['review'] == payload.to_record()
+
+
+def test_an_error_review_is_an_error_outcome_and_leaves_the_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _install_reviewer(tmp_path, monkeypatch, ReviewPayload(Verdict.ERROR, (), 'opus'))
+    store = ResultStore(tmp_path / 'results')
+    candidate = _one_candidate(tmp_path, store)
+    metrics_before = json.loads(candidate.result_path.read_text())['metrics']
+
+    outcome = asyncio.run(rereview.rereview_one(candidate, store=store))
+
+    assert outcome.status == 'error'
+    assert json.loads(candidate.result_path.read_text())['metrics'] == metrics_before

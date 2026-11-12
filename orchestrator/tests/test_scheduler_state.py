@@ -18,9 +18,10 @@ from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
-from orchestrator.scheduler import ModuleLockTable, Scheduler
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # Reuse the _RecordingEventStore test double from test_scheduler.py
@@ -550,7 +551,8 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
-    'is_paused', 'pause_reason', 'requeue_cooldowns', 'pin_reservations',
+    'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
+    'pin_reservations',
 })
 
 
@@ -563,9 +565,9 @@ def _arm_transient_cooldown(scheduler: Scheduler, task_id: str) -> None:
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns a SchedulerStateSnapshot with the thirteen wire keys."""
+    """get_state_snapshot() returns a SchedulerStateSnapshot with every wire key."""
 
-    def test_snapshot_returns_thirteen_top_level_keys(self):
+    def test_snapshot_returns_every_top_level_key(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()

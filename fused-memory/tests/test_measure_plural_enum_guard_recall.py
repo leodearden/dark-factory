@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
-# Shared with tests/reconciliation/test_stale_status_snapshot_edge_sweep.py,
+# Shared with tests/reconciliation/test_status_snapshot_extraction.py,
 # which parametrizes its guard tests off these same lists. ``tests/`` carries
 # no __init__.py while ``tests/reconciliation/`` does, so pytest puts
 # ``tests/`` on sys.path for modules in both directories and this package
@@ -37,11 +37,11 @@ from reconciliation.plural_enum_shapes import (
 # are the only way to catch the probe quietly growing a private copy back.
 from fused_memory.backends import graphiti_client
 
-# The PRODUCTION guard object, imported the same way the sweep suite imports
+# The PRODUCTION guard object, imported the same way the extraction suite imports
 # it. Held here only so the baseline test can assert the probe's 'shipped'
 # candidate IS this object rather than a drifted copy — an identity check that
 # has to span the module boundary to mean anything.
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+from fused_memory.reconciliation.status_snapshot_extraction import (
     _enumeration_is_prepositional_complement,
 )
 
@@ -79,7 +79,7 @@ EnumerationOutcome = _mod.EnumerationOutcome
 _CANDIDATE_GUARDS = _mod._CANDIDATE_GUARDS
 
 
-# The SAME lists the sweep suite parametrizes its guard tests off — imported,
+# The SAME lists the extraction suite parametrizes its guard tests off — imported,
 # never copied. Task 3949 requires each candidate tightening be re-validated
 # 'against the full precision-guard parametrization', and a second hardcoded
 # copy would satisfy that on the day it was written and silently stop covering
@@ -205,7 +205,7 @@ def test_scan_corpus_rejections_are_triageable_records():
 # Every pinned fact in the shared corpora, positives included (whose entries
 # are (fact, expected_ids) pairs). The near-miss subtraction below is only
 # safe while the lexical precondition is a SUPERSET of the full regex, so the
-# guard on that identity has to quantify over every shape the sweep suite
+# guard on that identity has to quantify over every shape the extraction suite
 # pins, not just the guarded ones.
 _ALL_PINNED_FACTS = _ALL_GUARDED_SHAPES + [fact for fact, _ids in _POSITIVE_SHAPES]
 
@@ -278,7 +278,7 @@ def _first_enumeration_start(fact: str) -> int:
 
 # Parametrized over the SHARED corpus, not over a copy of it. A fourth preamble
 # shape appended to reconciliation/plural_enum_shapes.py is picked up by the
-# sweep suite and by the candidate simulation automatically; hardcoding the
+# extraction suite and by the candidate simulation automatically; hardcoding the
 # three here would leave triage — the thing that decides whether a future
 # nonzero run reads as recall loss or as a correct rejection — the one consumer
 # that silently stopped covering the full set. A mislabel there UNDERSTATES

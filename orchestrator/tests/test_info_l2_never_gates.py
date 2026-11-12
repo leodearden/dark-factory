@@ -22,6 +22,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from _info_l0_router_fixtures import handing_off_steward
 from _workflow_helpers import (
     AgentStub,
     _build_workflow_with_escalation,
@@ -94,53 +95,6 @@ def _submit_l1(
     )
     queue.submit(esc)
     return esc
-
-
-def _make_handing_off_steward(
-    queue: EscalationQueue, task_id: str, filer_role: str = STEWARD.name,
-) -> type:
-    """A steward that hands the gating L0 to a human: files a level-1 under
-    *filer_role* and dismisses the L0.  With the steward's role, both producers
-    look like this in the queue — ``TaskSteward``'s own give-up path and its
-    agent's ``escalate_blocker(level=1)``.  It acts after a short delay, as the
-    real steward's background loop does, so the wait has begun before it hands
-    off."""
-
-    class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):
-            self.give_up_task: asyncio.Task | None = None
-
-        def set_outcome_channel(self, channel) -> None:
-            pass
-
-        def set_wip_probe(self, probe) -> None:
-            pass
-
-        async def _give_up(self) -> None:
-            await asyncio.sleep(0.05)
-            for esc in queue.get_by_task(task_id, status='pending', level=0):
-                queue.submit(Escalation(
-                    id=queue.make_id(task_id),
-                    task_id=task_id,
-                    agent_role=filer_role,
-                    severity=esc.severity,
-                    category=esc.category,
-                    summary=f'Steward re-escalation: {esc.summary}',
-                    level=1,
-                ))
-                queue.resolve(
-                    esc.id, 'Auto-dismissed: re-escalated to level 1',
-                    dismiss=True, resolved_by='steward',
-                )
-
-        async def start(self) -> None:
-            self.give_up_task = asyncio.create_task(self._give_up())
-
-        async def stop(self) -> None:
-            if self.give_up_task is not None:
-                await self.give_up_task
-
-    return _FakeSteward
 
 
 class TestGatingAgreesWithThePinClassifier:
@@ -315,7 +269,7 @@ class TestTheWaitTailNamesWhoActed:
     ):
         report, open_l1, _ = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            make_steward=_make_handing_off_steward,
+            make_steward=handing_off_steward,
         )
 
         assert report.outcome == WorkflowOutcome.BLOCKED
@@ -327,7 +281,7 @@ class TestTheWaitTailNamesWhoActed:
     ):
         report, open_l1, _ = await self._run_escalated(
             config, git_ops, task_assignment, monkeypatch, tmp_path,
-            make_steward=lambda queue, task_id: _make_handing_off_steward(
+            make_steward=lambda queue, task_id: handing_off_steward(
                 queue, task_id, filer_role='orchestrator',
             ),
         )

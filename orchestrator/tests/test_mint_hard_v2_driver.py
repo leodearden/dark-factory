@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 from _mint_driver_loader import load_mint_driver
 from shared.project_layout import runs_db, tasks_db
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # Matches the parents[2] convention used by conftest.py and the sibling
 # evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
@@ -1488,6 +1489,20 @@ class TestEnrichFromTaskDb:
         got = driver.enrich_from_task_db([cand], broken)
         assert got == [cand]
         assert cand.title == 'pre-existing title'
+
+    def test_stub_db_keeps_the_candidate_and_names_the_refusal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Lockstep twin of the sampler's stub test: the 0-byte decoy is
+        # named as an EMPTY_STUB refusal, not as `no such table: tasks`.
+        stub = tmp_path / 'tasks.db'
+        stub.write_bytes(b'')
+        cand = self._cand()
+        got = driver.enrich_from_task_db([cand], stub)
+        assert got == [cand]
+        assert cand.title == 'pre-existing title'
+        refusal = TaskDbUnreadable(stub.resolve(), TaskDbProblem.EMPTY_STUB)
+        assert str(refusal) in capsys.readouterr().err
 
     def test_a_blank_column_does_not_blank_an_existing_value(
         self, tmp_path: Path,

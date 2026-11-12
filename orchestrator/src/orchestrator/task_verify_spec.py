@@ -134,7 +134,7 @@ class CollapsedOverride:
 def collapsed_module_overrides(
     module_configs: Iterable[ModuleConfig],
 ) -> tuple[CollapsedOverride, ...]:
-    """The per-module overrides a TaskVerifySpec cannot carry, in module order."""
+    """The per-module overrides module_config_from_command drops, which no VerifyCommand-built spec can carry, in module order."""
     collapsed: list[CollapsedOverride] = []
     for mc in module_configs:
         if mc.verify_env:
@@ -195,6 +195,7 @@ def apply_task_verify_spec(
         global_verify_command=spec.global_verify_command,
         module_configs=module_configs,
         field_overrides={'scope_cargo': spec.scope_cargo},
+        git_field_overrides={},
         verify_cold_preprovision_command=spec.verify_cold_preprovision_command,
     )
     return applied, module_configs

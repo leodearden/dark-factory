@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
-import importlib.util
 import itertools
 import json
 import sys
@@ -44,9 +43,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Protocol, TypeVar
-from urllib.parse import urlparse
 
 import build_corpus
 from falkordb.asyncio import FalkorDB
@@ -84,6 +81,7 @@ from fused_memory.arm_harness.corpus import (
 )
 from fused_memory.arm_harness.embedding_graph_phase import (
     SEARCH_K,
+    ArmGraphClient,
     ArmScratchGraph,
     EmbeddingRunCheckFailed,
     EmbeddingSearchBackend,
@@ -212,7 +210,14 @@ from fused_memory.arm_harness.topology import (
     topology_hash,
 )
 from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
+from fused_memory.config.falkordb_endpoints import (
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+    with_falkordb,
+)
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.eval.retrieval_probe import canonical_hit, content_key
+from fused_memory.eval.topic_registry import Canonical, RegistryError, load_topic_registry
 from fused_memory.services.write_journal import WriteJournal
 
 EXIT_OK = 0
@@ -229,7 +234,6 @@ JOURNAL_DIRNAME = 'journal'
 PARITY_DIRNAME = 'parity'
 MIN_CONTROL_RUNS = 2
 
-PROBE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / 'memory_eval_retrieval_probe.py'
 MEM0_PROJECT_ID = 'dark_factory'
 EMBED_SETTINGS = EmbedSettings(batch_size=64, concurrency=4)
 EMBEDDING_CONTROL_SCRATCH_GROUPS = {
@@ -252,9 +256,7 @@ class ScratchGraph(ArmScratchGraph, Protocol):
     async def delete(self) -> None: ...
 
 
-class ScratchGraphClient(Protocol):
-    async def list_graphs(self) -> list[str]: ...
-
+class ScratchGraphClient(ArmGraphClient, Protocol):
     def select_graph(self, graph_id: str, /) -> ScratchGraph: ...
 
 
@@ -289,18 +291,26 @@ class HarnessDeps:
 
 
 def build_live_deps() -> HarnessDeps:
-    """The real dependencies, configured by ``FusedMemoryConfig()`` (its ``CONFIG_PATH``)."""
-    base = FusedMemoryConfig()
-    falkor = base.graphiti.falkordb
-    address = urlparse(falkor.uri)
-    host, port = address.hostname or 'localhost', address.port or 6379
+    """The real dependencies, configured by ``FusedMemoryConfig()`` (its ``CONFIG_PATH``).
+
+    The corpus is read, over ``GRAPH.RO_QUERY``, from the FalkorDB the config
+    names, the only store that holds it. Every write, copy, index build,
+    reference read and teardown goes to the scratch FalkorDB, which
+    ``scratch_falkordb_from_env`` resolves and never lets be production.
+    """
+    configured = FusedMemoryConfig()
+    corpus_source = FalkorEndpoint.from_uri(configured.graphiti.falkordb.uri)
+    scratch = scratch_falkordb_from_env()
+    base = with_falkordb(configured, scratch)
 
     def episode_reader(graph_name: str) -> EpisodeSource:
-        return build_corpus.EpisodeReader(graph_name=graph_name, host=host, port=port)
+        return build_corpus.EpisodeReader(
+            graph_name=graph_name, host=corpus_source.host, port=corpus_source.port
+        )
 
     @contextlib.asynccontextmanager
     async def open_falkordb() -> AsyncIterator[ScratchGraphClient]:
-        client = FalkorDB(host=host, port=port, password=falkor.password)
+        client = FalkorDB(host=scratch.host, port=scratch.port, password=None)
         try:
             yield client
         finally:
@@ -513,29 +523,6 @@ def _arm_probe_set(path: Path, spec: EmbeddingArmSpec) -> ProbeSet:
             f'arm {spec.arm_id!r} names corpus_sha {spec.corpus_sha}, but {path} hashes to {sha}',
         )
     return probe_set
-
-
-def load_probe_module() -> ModuleType:
-    """E1's ``memory_eval_retrieval_probe``, loaded by path once (scripts/ is no package).
-
-    The shape of ``scripts/retro_stamp_topics.py::_load_probe_module``: a module already
-    in ``sys.modules`` is reused, so every caller shares one set of its classes.
-    """
-    mod_name = 'memory_eval_retrieval_probe'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, PROBE_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'cannot load {PROBE_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
 
 
 # --- output ---------------------------------------------------------------------------
@@ -956,12 +943,11 @@ def _read_mem0_snapshot(path: Path) -> tuple[Mem0SnapshotPin, Mem0Snapshot]:
 
 def _mem0_known_items(registry_path: Path, snapshot: Mem0Snapshot) -> list[Mem0KnownItem]:
     """Each phrasing of E1's project topics whose canonical the snapshot holds, by hash or else id."""
-    probe = load_probe_module()
     try:
-        registry = probe.load_topic_registry(registry_path)
-    except probe.RegistryError as error:
+        registry = load_topic_registry(registry_path)
+    except RegistryError as error:
         raise _Refusal(EXIT_REFUSED, f'{registry_path}: {error}') from error
-    held_hashes = {probe.content_key(record.data) for record in snapshot.records}
+    held_hashes = {content_key(record.data) for record in snapshot.records}
     held_ids = {record.id for record in snapshot.records}
     return [
         Mem0KnownItem(
@@ -1119,30 +1105,18 @@ async def _embed_run(
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class _PinnedTopic:
-    """A registry topic as the probe set pinned it: the part of an entry canonical_hit matches on."""
-
-    topic: str
-    canonical: Any
-
-
 def _mem0_ranker(items: Sequence[Mem0KnownItem]) -> Mem0Ranker:
     """E1's own canonical_hit, over the canonical the probe set pinned for each topic."""
-    probe = load_probe_module()
-    topics = {
-        item.topic: _PinnedTopic(
-            topic=item.topic,
-            canonical=probe.Canonical(
-                content_hash=item.canonical_content_hash,
-                last_known_id=item.canonical_last_known_id,
-            ),
+    canonicals = {
+        item.topic: Canonical(
+            content_hash=item.canonical_content_hash,
+            last_known_id=item.canonical_last_known_id,
         )
         for item in items
     }
 
     def rank(topic: str, hits: Sequence[ReplicaHit]) -> Rank:
-        return probe.canonical_hit(list(hits), topics[topic], SEARCH_K).rank
+        return canonical_hit(list(hits), canonicals[topic], SEARCH_K).rank
 
     return rank
 

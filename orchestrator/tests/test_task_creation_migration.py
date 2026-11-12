@@ -4,8 +4,7 @@ Covers two scopes:
   1. Tool allowlists in STEWARD and DEEP_REVIEWER roles — neither role keeps
      ``resolve_ticket`` in its allowlist; the server-side ticket janitor
      surfaces curator failures asynchronously.
-  2. Shared instruction-helper fragments: ``submit_resolve_instructions``
-     (for callers that wait on the curator) and ``submit_only_instructions``
+  2. The shared instruction-helper fragment ``submit_only_instructions``
      (for steward / deep_reviewer, which fire-and-forget).
 """
 
@@ -15,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from _orch_helpers import pydantic_spec
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, FOLLOWUP_ITEMS_REFUSED_ERROR
 
 from orchestrator.agents.roles import (
     _FOLLOWUP_FILING_INSTRUCTIONS,
@@ -23,31 +23,10 @@ from orchestrator.agents.roles import (
     IMPLEMENTER,
     STEWARD,
     submit_only_instructions,
-    submit_resolve_instructions,
 )
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
-
-# ---------------------------------------------------------------------------
-# Helper contract tests
-# ---------------------------------------------------------------------------
-
-
-class TestSharedSubmitResolveFragment:
-    """Contract tests for the submit_resolve_instructions helper."""
-
-    def test_helper_renders_shared_skeleton(self):
-        result = submit_resolve_instructions(
-            '{"source": "X"}',
-            outcome_target='SENTINEL_OUTCOME_XYZ',
-            step_prefix=('1', '2'),
-            project_root_expr='"/tmp"',
-        )
-        # The outcome_target sentinel must appear at least twice:
-        # once in the error-shape sentence and once in the failed-branch sentence.
-        assert result.count('SENTINEL_OUTCOME_XYZ') >= 2
-
 
 # ---------------------------------------------------------------------------
 # Site-wiring tests (minimal behavioral assertions)
@@ -177,6 +156,58 @@ class TestFollowupFilingPrompts:
         assert 'Call `resolve_ticket`' not in IMPLEMENTER.system_prompt
 
 
+class TestOperationalAskRouting:
+    """The follow-up block names the real entry point for operational asks.
+
+    An operational ask is filed with ``submit_task`` plus
+    ``metadata.execution_class='operational'``, which the submit boundary
+    turns into a deterministic, born-at-L2 human gate.
+    """
+
+    def test_operational_asks_are_filed_with_execution_class(self):
+        assert '"execution_class": "operational"' in _FOLLOWUP_FILING_INSTRUCTIONS, (
+            'the follow-up block must show the execution_class metadata key: '
+            'the old carve-out sent operational asks away from the only '
+            'working filing path without naming an entry point, so they were '
+            "dropped — the dead end that stranded esc-5984-2's post-merge check"
+        )
+
+    def test_operational_route_points_at_the_authoring_reference(self):
+        doc = 'docs/task-authoring.md'
+        assert doc in _FOLLOWUP_FILING_INSTRUCTIONS, (
+            f'the operational-ask route must cite {doc}, the home of its rationale'
+        )
+        assert (Path(__file__).resolve().parents[2] / doc).is_file(), (
+            f'{doc} is cited by _FOLLOWUP_FILING_INSTRUCTIONS but does not exist'
+        )
+
+
+class TestFollowupBundlingPrompt:
+    """Architect and implementer filers send one bundle per area (plans/follow-up-filing-shape-prd.md §3).
+
+    The submit boundary derives every R4 key of a bundle (decision 3), so the template no longer
+    asks for them; the steward and deep-reviewer templates keep theirs (decision 5).
+    """
+
+    def test_the_template_carries_a_bundle_of_items(self):
+        assert f'"{FOLLOWUP_ITEMS_METADATA_KEY}":' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"summary":' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"files":' in _FOLLOWUP_FILING_INSTRUCTIONS
+
+    def test_the_template_does_not_ask_for_server_derived_keys(self):
+        assert '"suggestion_hash":' not in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"escalation_id":' not in _FOLLOWUP_FILING_INSTRUCTIONS
+
+    def test_a_bundle_refusal_is_named_as_correctable(self):
+        assert f'`{FOLLOWUP_ITEMS_REFUSED_ERROR}`' in _FOLLOWUP_FILING_INSTRUCTIONS
+
+    def test_steward_and_deep_reviewer_keep_their_templates(self):
+        for role in (STEWARD, DEEP_REVIEWER):
+            assert FOLLOWUP_ITEMS_METADATA_KEY not in role.system_prompt
+            assert FOLLOWUP_ITEMS_REFUSED_ERROR not in role.system_prompt
+            assert '"suggestion_hash":' in role.system_prompt
+
+
 class TestStewardSweepUp:
     """STEWARD prompt must carry the workflow-end info-note sweep-up (Source 3).
 
@@ -261,10 +292,10 @@ class TestHelperIndentationAlignment:
     def test_multiline_metadata_continuation_aligns_after_caller_indent(self):
         # Pass caller_indent directly — the helper applies it internally, removing
         # the need for a separate textwrap.indent() wrap at the call site.
-        result = submit_resolve_instructions(
+        result = submit_only_instructions(
             '{"a": 1,\n"b": 2}',
             outcome_target='t',
-            step_prefix=('a', 'b'),
+            step_label='a',
             extra_submit_guidance='Line1\nLine2',
             caller_indent='   ',
         )

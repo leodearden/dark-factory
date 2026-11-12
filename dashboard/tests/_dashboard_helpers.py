@@ -377,23 +377,43 @@ def mcp_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
 
 
-def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    """A ``tools/call`` result carrying *inner* as JSON text content.
+def _tool_result_envelope(inner: dict, request_id: int) -> dict:
+    """The JSON-RPC ``tools/call`` result carrying *inner* as JSON text content.
 
     MCP nests the tool's own payload as a JSON *string* inside
     ``result.content[0].text``, so *inner* is serialized, not embedded — which
     is exactly the double-encoding the dashboard readers have to undo.
     """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner*, framed as a JSON body."""
     return httpx.Response(
         200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
+        json=_tool_result_envelope(inner, request_id),
         headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_sse_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """The same ``tools/call`` result, framed as a Streamable-HTTP SSE body.
+
+    FastMCP may answer ``text/event-stream`` instead of ``application/json``;
+    the envelope inside the ``data:`` frame is identical to
+    :func:`mcp_tool_response`'s.
+    """
+    envelope = json.dumps(_tool_result_envelope(inner, request_id))
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {envelope}\n\n',
+        headers={'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION_ID},
     )
 
 
@@ -519,7 +539,7 @@ def write_escalation_record(
 
     Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
     ``created_at``) since that is what the queue serialises and what
-    ``load_queue_escalations`` passes through unchanged.  The
+    ``escalation.models.Escalation.from_dict`` reads back.  The
     ``category='eval_regression'`` / ``status='pending'`` defaults are exactly
     the pair ``memory_evals._index_escalations`` accepts; every other
     combination is dropped by that reader and can only ever appear on the
@@ -529,8 +549,9 @@ def write_escalation_record(
     VERBATIM, so a caller can hand it a JSON number and get an ``id`` that
     survives to both payloads un-coerced — which is what makes a str/int drift
     testable rather than hypothetical.  ``omit_id=True`` leaves the ``id`` key
-    out of the record entirely, the shape that makes a queue file address
-    NOTHING; ``**extra`` overrides or adds any other field.
+    out of the record entirely, a shape ``Escalation.from_dict`` rejects, so
+    both payloads report the file as unreadable; ``**extra`` overrides or adds
+    any other field.
 
     KNOWN DUPLICATION, deliberately left: ``test_memory_evals_data.py`` carries
     its own ``_write_escalation``/``_dump`` with this same field set.  Folding
@@ -756,20 +777,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
@@ -1257,13 +1264,13 @@ def strip_js_comments(source: str) -> str:
 # list they check against can never drift from what the files actually say.
 #
 # `destructure_bindings` returns (canonical, local) PAIRS, and each caller
-# projects the half it needs.  This is not fussiness — the three consumers it
-# replaces answer OPPOSITE questions over the identical line:
+# projects the half it needs.  This is not fussiness — its two DF_CHARTS
+# consumers answer OPPOSITE questions over the identical line:
 #   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
 #       must actually reference, since the alias is what it renders by;
-#   test_charts_axis_labels wants the CANONICAL/source name   — what must
-#       actually exist on the namespace object;
-#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+#   test_tab_burndown wants BOTH, as an alias -> canonical map, plus the
+#       CANONICAL/source names of the export literal — what must actually
+#       exist on the namespace object.
 # On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
 # that picked one side would silently INVERT one of the two suites, which is
 # precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
@@ -1283,10 +1290,11 @@ def strip_js_comments(source: str) -> str:
 #     object are not statically enumerable the way a destructure list is.  The
 #     defect these suites exist to catch can only exist in the destructure
 #     shape anyway.
-#   - A NESTED brace must fail loudly at the call site that names the coupling,
-#     rather than yield a half-read binding list that turns a downstream
-#     assertion red with an unrelated-looking message.  Three call sites turn
-#     the miss into a self-naming assertion for exactly that reason.
+#   - A NESTED brace must yield NO match rather than a half-read binding list:
+#     an empty result turns a downstream assertion red, where a half-read list
+#     would let a sweep go quietly wrong.  No call site names the coupling on
+#     that miss (test_tab_burndown.py's readers return an empty result), so the
+#     property is pinned in the contract below.
 #
 # Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
 # ---------------------------------------------------------------------------
@@ -1412,7 +1420,12 @@ def extract_df_data_block(src: str, key: str) -> str:
 # JSX opening-tag walk.
 #
 # Spans one opening tag, attributes included, so a probe can confine itself to
-# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# that element.  `jsx_open_tag_end` is the walk from one known `<`;
+# `jsx_open_tags` reads every opening tag a pattern finds, comment-stripped;
+# `jsx_prop_expr` reads one prop's expression out of such a tag.
+# Contracts: test_jsx_source_helpers.py::TestJsxOpenTagEnd,
+# test_jsx_source_helpers.py::TestJsxOpenTags and
+# test_jsx_source_helpers.py::TestJsxPropExpr.
 # ---------------------------------------------------------------------------
 
 
@@ -1456,6 +1469,52 @@ def jsx_open_tag_end(src: str, start: int) -> int | None:
         elif depth == 0 and c == '<':
             return None
         i += 1
+    return None
+
+
+def jsx_open_tags(src: str, pattern: re.Pattern[str]) -> list[str]:
+    """Return every opening tag *pattern* finds in comment-stripped *src*, in order.
+
+    A tag with children is returned as its opening tag, which carries every
+    attribute; ``tag[-2:] == '/>'`` tells a self-closing one.  Each match must
+    start at the tag's ``<`` (else `jsx_open_tag_end`'s ``ValueError``), and a
+    tag the walk cannot close raises rather than being dropped.
+    """
+    code = strip_js_comments(src)
+    tags: list[str] = []
+    for m in pattern.finditer(code):
+        end = jsx_open_tag_end(code, m.start())
+        if end is None:
+            raise AssertionError(
+                f'jsx_open_tags: a {pattern.pattern!r} tag never closes, or a '
+                f'bare `<` or a stray `}}` comes first, so no probe over its span '
+                f'would mean anything: {code[m.start() : m.start() + 80]!r}'
+            )
+        tags.append(code[m.start() : end])
+    return tags
+
+
+def jsx_prop_expr(opening_tag: str, prop: str) -> str | None:
+    """Return the expression inside *opening_tag*'s own ``prop={...}``, stripped.
+
+    ``None`` when the tag passes no braced *prop*.  The search and the brace
+    walk run over the `_mask_js` text, so a quoted brace or a quoted
+    ``prop={`` is not code, and only a prop at brace depth 0 counts: a nested
+    element's ``prop={...}`` is not this tag's.  Raises when the expression
+    never closes.  *opening_tag* is a `jsx_open_tags` result.
+    """
+    spans = _scan_js(opening_tag)
+    _assert_js_lexable(opening_tag, spans)
+    code = _mask_js(opening_tag, spans)
+    for m in re.finditer(rf'\b{re.escape(prop)}=\{{', code):
+        if code.count('{', 0, m.start()) != code.count('}', 0, m.start()):
+            continue
+        open_at = m.end() - 1
+        braced = walk_balanced(code, open_at)
+        assert braced, (
+            f'jsx_prop_expr: {prop}={{...}} never closes in {opening_tag[:80]!r}'
+        )
+        return opening_tag[open_at + 1 : open_at + len(braced) - 1].strip()
     return None
 
 

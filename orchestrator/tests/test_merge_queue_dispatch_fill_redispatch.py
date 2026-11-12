@@ -31,7 +31,7 @@ and parks it for re-dispatch (``snapshot()['entries']`` reports that item as
 ``awaiting_host``). That leaves both host slots free with one parked item, so
 the next fill pass is exactly the redispatch-sourced-dispatch window the guard
 governs. Verified as a genuine fence, not just a green test: restoring the
-pre-3276 clause (``if not is_from_verifier_queue and not self._redispatch:
+pre-3276 clause (``if not is_from_verifier_queue and not self._intake.pending_redispatch():
 fill_done = True``) makes
 ``test_second_host_dispatched_from_ready_queue_in_same_fill_pass`` and
 ``test_late_arrival_dispatched_to_free_host_while_head_verify_runs`` fail with
@@ -44,7 +44,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
+import time
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -61,20 +64,24 @@ from _fill_drive_harness import (  # noqa: F401,E402
     _teardown_fill_drive,
 )
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes
+from _merge_worker_drive import make_merge_request
 from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
-    _inject_two_host_allocator,
+    _inject_host_allocator,
     _make_branch_with_file,
-    _make_request,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _land_foreign_commit
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane, MergeRequest
+from orchestrator.merge_lane.types import RecoveryEvidence
+from orchestrator.remote_gate import RunnerUnavailableKind
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 #: The item whose verify fails, triggering the head-failure cascade.
@@ -134,16 +141,26 @@ class _Lane:
     requests: dict[str, Any] = dataclasses.field(default_factory=dict)
     run_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
-    async def enqueue(self, task_id: str) -> Any:
+    @staticmethod
+    def branch_file(task_id: str) -> str:
+        """The one file :meth:`enqueue` commits on *task_id*'s branch."""
+        return f'{task_id.replace("-", "_")}.py'
+
+    async def enqueue(self, task_id: str) -> MergeRequest:
         """Commit a one-file branch for *task_id* and submit it on the public queue."""
         worktree = await _make_branch_with_file(
-            self.git_ops, f'task/{task_id}', f'{task_id.replace("-", "_")}.py',
-            f'# {task_id}\n',
+            self.git_ops, f'task/{task_id}', self.branch_file(task_id), f'# {task_id}\n',
         )
-        request = _make_request(task_id, f'task/{task_id}', worktree, self.config)
+        request = make_merge_request(task_id, f'task/{task_id}', worktree, self.config)
         self.requests[task_id] = request
         await self.queue.put(request)
         return request
+
+    async def on_main(self, task_id: str) -> bool:
+        """Whether *task_id*'s branch file is on main."""
+        return await _git_rc(
+            self.git_ops.project_root, 'cat-file', '-e', f'main:{self.branch_file(task_id)}',
+        ) == 0
 
     def inflight_ids(self) -> set[str]:
         """Task ids holding a host lease right now, from the public snapshot."""
@@ -185,10 +202,15 @@ async def _running_lane(
     config: OrchestratorConfig,
     *,
     remote: Callable[[asyncio.Event], Any] = _hanging_remote,
+    verifier: FakeVerifier | None = None,
+    extra_remote_names: tuple[str, ...] = (),
 ) -> AsyncIterator[_Lane]:
     """Start a two-host lane with scripted verifies; stop it on the way out.
 
     *remote* builds the second host's runner from the lane's ``remote_gate``.
+    *verifier* replaces the default scripted ``FakeVerifier``, and each of
+    *extra_remote_names* adds one more :func:`_hanging_remote` host behind
+    ``remote_gate``; ``_Lane.remote`` stays the first remote.
 
     Teardown releases every gate before stopping, so a failing test leaves no
     verify hanging and no dangling task behind, and goes through
@@ -199,19 +221,21 @@ async def _running_lane(
     head_gate = asyncio.Event()
     local_gate = asyncio.Event()
     remote_gate = asyncio.Event()
-    verifier = FakeVerifier(
-        default=hangs_until(local_gate),
-        scripts={
-            HEAD: VerifyScript(
-                result=fails(category='test_failure', summary='head verify failed').result,
-                release=head_gate,
-            ),
-        },
-    )
+    if verifier is None:
+        verifier = FakeVerifier(
+            default=hangs_until(local_gate),
+            scripts={
+                HEAD: VerifyScript(
+                    result=fails(category='test_failure', summary='head verify failed').result,
+                    release=head_gate,
+                ),
+            },
+        )
     queue: asyncio.Queue = asyncio.Queue()
     worker = MergeLane(git_ops, queue, speculation_depth=2, verifier=verifier)
     remote_runner = remote(remote_gate)
-    allocator = _inject_two_host_allocator(worker, remote_runner)
+    extras = [_hanging_remote(remote_gate, name) for name in extra_remote_names]
+    allocator = _inject_host_allocator(worker, remote_runner, *extras)
     lane = _Lane(
         worker=worker, queue=queue, git_ops=git_ops, config=config,
         head_gate=head_gate, local_gate=local_gate, remote_gate=remote_gate,
@@ -446,8 +470,9 @@ class TestCascadeAntiDeadlockPreserved:
 # task 5303 (3277 + 4929): a host that becomes usable while the head verifies
 # ---------------------------------------------------------------------------
 
-#: A head whose local verify hangs until ``local_gate``, which these tests never
-#: release -- so any dispatch they observe happened while it was still verifying.
+#: A head whose local verify hangs until ``local_gate``, which these tests release
+#: only after their last dispatch observation -- so any dispatch they observe
+#: happened while it was still verifying.
 LONG_HEAD = 'hf-head'
 #: The item waiting for the second host.
 WAITER = 'hf-waiter'
@@ -463,10 +488,17 @@ def _hosts_of(lane: _Lane) -> dict[str, list[str]]:
     return lane.worker.snapshot()['occupancy']['inflight_by_host']
 
 
-def _unavailable_once_remote(release: asyncio.Event, name: str = 'laptop') -> MagicMock:
-    """A fake RemoteRunner whose FIRST verify raises RunnerUnavailable once the
-    runner's ``unavailable_gate`` is set; every later verify hangs until
-    *release*, like :func:`_hanging_remote`.
+def _remote_row(lane: _Lane) -> dict[str, Any]:
+    """The second host's row of the public host census."""
+    return next(h for h in lane.worker.snapshot()['hosts'] if h['name'] == lane.remote.name)
+
+
+def _unavailable_once_remote(
+    release: asyncio.Event, name: str = 'laptop', *, kind: RunnerUnavailableKind = 'transport',
+) -> MagicMock:
+    """A fake RemoteRunner whose FIRST verify raises RunnerUnavailable of *kind*
+    once the runner's ``unavailable_gate`` is set; every later verify hangs
+    until *release*, like :func:`_hanging_remote`.
     """
     calls = 0
     unavailable_gate = asyncio.Event()
@@ -476,7 +508,7 @@ def _unavailable_once_remote(release: asyncio.Event, name: str = 'laptop') -> Ma
         calls += 1
         if calls == 1:
             await unavailable_gate.wait()
-            raise RunnerUnavailable('laptop dropped off the network')
+            raise RunnerUnavailable('laptop dropped off the network', kind=kind)
         await release.wait()
         return passes().result
 
@@ -501,9 +533,10 @@ class TestHostFreedWhileHeadVerifies:
     """A host that becomes usable mid-head-verify is used within one poll
     slice, not after the head's verify finishes -- task 5303 (3277, 4929).
 
-    Every head here verifies on local and is never released, so a dispatch
-    observed at all is a dispatch bounded by ``VERIFY_ABANDON_POLL_SECS``
-    rather than by the head's verify.
+    Every head here verifies on local and is not released before the
+    dispatch under test is observed, so a dispatch observed at all is a
+    dispatch bounded by ``VERIFY_ABANDON_POLL_SECS`` rather than by the
+    head's verify.
     """
 
     async def test_cleared_quarantine_dispatches_waiting_item_beside_verifying_head(
@@ -689,3 +722,460 @@ class TestHostFreedWhileHeadVerifies:
                 f'its merge() Future was never resolved; {lane.observed()}'
             )
             assert _hosts_of(lane) == {}, lane.observed()
+
+    async def test_a_benched_follower_frees_its_host_while_the_head_verifies(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Task 7266, the dead-lease strand: WAITER's verify raises
+        RunnerUnavailable on the laptop while LONG_HEAD verifies on local.
+        The laptop must be benched and its slot freed at bench time, so the
+        reprobe primitive can readmit it and it serves a verify while the
+        head still verifies -- and verdicts still land in submission order.
+        """
+        prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
+        async with _running_lane(git_ops, prefer_local, remote=_unavailable_once_remote) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            resolved: list[str] = []
+
+            async def _enqueue_tracked(task_id: str) -> None:
+                request = await lane.enqueue(task_id)
+                request.result.add_done_callback(lambda _f: resolved.append(task_id))
+
+            await _enqueue_tracked(LONG_HEAD)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [LONG_HEAD]},
+                expected=f'{LONG_HEAD} verifying on local',
+                why='prefer_local hands the first verify the local host.',
+            )
+            await _enqueue_tracked(WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [LONG_HEAD], lane.remote.name: [WAITER]},
+                expected=f'{WAITER} verifying on the laptop beside {LONG_HEAD}',
+                why='local is busy with the head, so the follower overflows to the laptop.',
+            )
+
+            lane.remote.unavailable_gate.set()
+            await lane.settle(
+                lambda: (
+                    _remote_row(lane)['quarantined'] is True
+                    and _remote_row(lane)['slot_state'] == 'free'
+                    and _hosts_of(lane) == {'local': [LONG_HEAD]}
+                ),
+                expected='the laptop benched with its slot free while the head verifies',
+                why=(
+                    "the dead-lease strand: the RunnerUnavailable verdict is held "
+                    "in _inflight under its dead lease until the head's in-order "
+                    "finalize, so the laptop stays BUSY, untracked and unreprobeable."
+                ),
+            )
+            assert not lane.requests[LONG_HEAD].result.done(), lane.observed()
+            assert not lane.requests[WAITER].result.done(), lane.observed()
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+
+            assert lane.worker.readmit_host(
+                lane.remote.name, now=time.time(), evidence=RecoveryEvidence.SSH_HEALTH_PROBE,
+            ) is True, (
+                f'a passing reprobe could not readmit the benched laptop; {_remote_row(lane)!r}'
+            )
+
+            await _enqueue_tracked(SECOND)
+            await lane.settle(
+                lambda: bool(_hosts_of(lane).get(lane.remote.name)),
+                expected='the readmitted laptop serving a verify while the head verifies',
+                why='a readmitted host must be usable within one poll slice.',
+            )
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+
+            lane.local_gate.set()
+            lane.remote_gate.set()
+            for task_id in (LONG_HEAD, WAITER, SECOND):
+                outcome = await wait_responsive(
+                    lane.requests[task_id].result, label=f'{task_id} outcome',
+                )
+                assert outcome.status == 'done', (task_id, outcome)
+            assert resolved == [LONG_HEAD, WAITER, SECOND], (
+                f'verdicts must land in submission order, got {resolved!r}'
+            )
+
+            row = _remote_row(lane)
+            assert row['quarantined'] is False and row['streak'] is None, (
+                f"{WAITER}'s in-order finalize re-benched a host already benched "
+                f'and readmitted: {row!r}'
+            )
+
+    async def test_a_head_failure_cascade_keeps_the_benched_followers_skew_bench(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Task 7266, second defect: when the head FAILS after its follower's
+        verify benched the laptop, the cascade must keep the follower's skew
+        bench (kind and all) and send no cancel RPC to the benched host.
+        """
+        prefer_local = config.model_copy(update={'verify_host_policy': 'prefer_local'})
+        wire_shape_remote = functools.partial(_unavailable_once_remote, kind='wire_shape')
+        async with _running_lane(git_ops, prefer_local, remote=wire_shape_remote) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            await lane.enqueue(HEAD)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD]},
+                expected=f'{HEAD} verifying on local',
+                why='prefer_local hands the first verify the local host.',
+            )
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD], lane.remote.name: [WAITER]},
+                expected=f'{WAITER} verifying on the laptop beside {HEAD}',
+                why='local is busy with the head, so the follower overflows to the laptop.',
+            )
+
+            lane.remote.unavailable_gate.set()
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [HEAD]},
+                expected=f"the laptop's dead lease released while {HEAD} verifies",
+                why=(
+                    "the dead-lease strand: the RunnerUnavailable verdict is held "
+                    "in _inflight under its dead lease until the head's in-order "
+                    "finalize."
+                ),
+            )
+
+            lane.head_gate.set()
+            lane.local_gate.set()
+            waiter = await wait_responsive(lane.requests[WAITER].result, label=f'{WAITER} outcome')
+            assert waiter.status == 'done', waiter
+            head = await wait_responsive(lane.requests[HEAD].result, label=f'{HEAD} outcome')
+            assert head.status != 'done', head
+
+            row = _remote_row(lane)
+            assert (row['quarantine_class'], row['kind']) == ('skew', 'wire_shape'), row
+            assert row['slot_state'] == 'free', row
+            lane.remote.cancel_verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 6155: the head's gate re-verify must not park the verifier loop
+# ---------------------------------------------------------------------------
+
+#: A head whose CAS finds main moved under it, so it lands through the gate.
+GATED_HEAD = 'gr-head'
+#: The item submitted while GATED_HEAD's gate re-verify runs.
+GATE_WAITER = 'gr-waiter'
+
+
+class _GateVerifier(FakeVerifier):
+    """Holds GATED_HEAD's own verify and then its gate re-verifies on events.
+
+    GATED_HEAD's first call is its verify, gated on ``head_entered`` /
+    ``head_release``; its second is the gate, gated on ``gate_entered`` /
+    ``gate_release`` and returning *gate_result*; a third, the gate after a
+    second rebase, is gated on ``regate_entered`` / ``regate_release`` and
+    passes.  Every other call passes.  ``cancelled`` lists the task id of
+    every call torn down mid-run.
+    """
+
+    def __init__(self, *, gate_result: VerifyResult | None = None) -> None:
+        super().__init__()
+        self.head_entered = asyncio.Event()
+        self.head_release = asyncio.Event()
+        self.gate_entered = asyncio.Event()
+        self.gate_release = asyncio.Event()
+        self.regate_entered = asyncio.Event()
+        self.regate_release = asyncio.Event()
+        self.cancelled: list[str | None] = []
+        self.gate_result = gate_result or passes().result
+
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        if task_id != GATED_HEAD:
+            return self.default
+        call = self.verified.count(task_id)
+        if call == 1:
+            return VerifyScript(
+                result=passes().result, release=self.head_release, entered=self.head_entered,
+            )
+        if call == 2:
+            return VerifyScript(
+                result=self.gate_result, release=self.gate_release, entered=self.gate_entered,
+            )
+        if call == 3:
+            return VerifyScript(
+                result=passes().result, release=self.regate_release, entered=self.regate_entered,
+            )
+        return self.default
+
+    async def run_scoped(
+        self,
+        worktree: Path,
+        config: Any,
+        module_configs: list[Any],
+        task_files: list[str] | None = None,
+        **options: Any,
+    ) -> VerifyResult:
+        try:
+            return await super().run_scoped(
+                worktree, config, module_configs, task_files, **options,
+            )
+        except asyncio.CancelledError:
+            self.cancelled.append(options.get('task_id'))
+            raise
+
+
+async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[MergeRequest, str]:
+    """Drive GATED_HEAD into its gate re-verify on local and hold it there.
+
+    Main moves by a direct commit while the head verifies, so its CAS rebases.
+    That commit is unverified drift, so the gate cannot take the disjoint skip
+    and really re-verifies, as a dispatch of the head's rebased commit (task
+    8525).  Returns the head's request and that main sha.
+    """
+    head = await lane.enqueue(GATED_HEAD)
+    await wait_responsive(verifier.head_entered.wait(), label=f'{GATED_HEAD} verify under way')
+    assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
+    await _land_foreign_commit(lane.git_ops.project_root)
+    drift = await lane.git_ops.get_main_sha()
+    verifier.head_release.set()
+    await wait_responsive(
+        verifier.gate_entered.wait(), label=f'{GATED_HEAD} gate re-verify under way',
+    )
+    await lane.settle(
+        lambda: lane.states().get(GATED_HEAD) == 'verifying'
+        and _hosts_of(lane).get('local') == [GATED_HEAD],
+        expected=f'{GATED_HEAD} verifying its rebased commit on local',
+        why='main moved under the verified head, so its CAS must rebase and re-verify.',
+    )
+    return head, drift
+
+
+@pytest.mark.asyncio
+class TestGateReverifyDoesNotParkTheLoop:
+    """The head's gate re-verify runs as a head verify, a dispatch of its
+    rebased commit (task 8525): through the lane's verify port, and without
+    parking DISPATCH-FILL or FINALIZE-HEAD.
+    """
+
+    async def test_gate_reverify_runs_through_the_lanes_verify_port(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        verifier.gate_release.set()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            head = await lane.enqueue(GATED_HEAD)
+            await wait_responsive(
+                verifier.head_entered.wait(), label=f'{GATED_HEAD} verify under way',
+            )
+            await _land_foreign_commit(lane.git_ops.project_root)
+            verifier.head_release.set()
+
+            outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+
+            assert outcome.status == 'done', outcome
+            assert verifier.verified.count(GATED_HEAD) == 2, verifier.verified
+            assert verifier.gate_entered.is_set(), verifier.verified
+
+    async def test_item_dispatched_to_free_host_while_head_gate_reverify_runs(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
+            progress = lane.worker.snapshot()['verify_in_progress']
+            assert (progress['task_id'], progress['phase']) == (
+                GATED_HEAD, 'verifying',
+            ), progress
+
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why=(
+                    "the verifier loop is blocked on the head's dispatched "
+                    'rebased-commit verify, so nothing dispatches to a free host '
+                    'until it ends.'
+                ),
+            )
+
+            assert lane.states()[GATED_HEAD] == 'verifying', lane.observed()
+            assert not head.result.done(), lane.observed()
+            assert lane.worker.frozen_prefix() == (head.request_id, waiter.request_id)
+
+    async def test_finished_follower_waits_for_gated_head_and_lands_after_it(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
+            )
+
+            lane.remote_gate.set()
+            for _ in range(10):
+                await asyncio.sleep(_FAST_POLL_SECS)
+                assert not waiter.result.done(), lane.observed()
+                assert await lane.git_ops.get_main_sha() == drift, lane.observed()
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert head_outcome.merge_sha is not None and waiter_outcome.merge_sha is not None, (
+                head_outcome, waiter_outcome,
+            )
+            assert await lane.git_ops.is_ancestor_checked(
+                head_outcome.merge_sha, waiter_outcome.merge_sha,
+            ) is True, (head_outcome, waiter_outcome)
+
+    async def test_red_gate_cascades_the_follower_dispatched_beside_it(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier(
+            gate_result=fails(category='test_failure', summary='gate re-verify red').result,
+        )
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
+            )
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            assert head_outcome.status not in ('done', 'already_merged'), head_outcome
+
+            lane.remote_gate.set()
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert await lane.on_main(GATE_WAITER), "the waiter's file never reached main"
+            assert not await lane.on_main(GATED_HEAD), "the red-gated head's file reached main"
+
+    async def test_gate_completion_wakes_the_fill_ahead_race(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(
+            git_ops, config, verifier=verifier, extra_remote_names=('laptop2',),
+        ) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: lane.inflight_ids() == {GATED_HEAD, GATE_WAITER}
+                and _hosts_of(lane).get('local') == [GATED_HEAD],
+                expected=f'{GATE_WAITER} verifying on a remote beside the gated head',
+                why="the verifier loop is blocked on the head's dispatched rebased-commit verify.",
+            )
+            assert lane.free_hosts() == 1, lane.observed()
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(
+                head.result,
+                label=(
+                    f'{GATED_HEAD} outcome: a finished gate must end the fill-ahead '
+                    f'race, which otherwise waits on {GATE_WAITER}\'s verify'
+                ),
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert GATE_WAITER in lane.inflight_ids(), lane.observed()
+            assert not waiter.result.done(), lane.observed()
+
+    async def test_a_second_rebase_dispatches_the_head_a_second_time(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            await _land_another_foreign_commit(lane.git_ops.project_root)
+            second_drift = await lane.git_ops.get_main_sha()
+
+            verifier.gate_release.set()
+            await wait_responsive(
+                verifier.regate_entered.wait(),
+                label=f'{GATED_HEAD} gate re-verify after main moved again',
+            )
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why=(
+                    "the verifier loop is blocked on the head's second dispatched "
+                    'rebased-commit verify.'
+                ),
+            )
+            assert lane.states()[GATED_HEAD] == 'verifying', lane.observed()
+
+            verifier.regate_release.set()
+            lane.remote_gate.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert head_outcome.merge_sha is not None and waiter_outcome.merge_sha is not None, (
+                head_outcome, waiter_outcome,
+            )
+            assert await lane.git_ops.is_ancestor_checked(
+                second_drift, head_outcome.merge_sha,
+            ) is True, head_outcome
+            assert await lane.git_ops.is_ancestor_checked(
+                head_outcome.merge_sha, waiter_outcome.merge_sha,
+            ) is True, (head_outcome, waiter_outcome)
+
+    async def test_stop_preempts_a_parked_gate_reverify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, drift = await _gate_head(lane, verifier)
+            assert lane.run_task is not None
+
+            await lane.worker.stop()
+
+            assert head.result.done(), lane.observed()
+            outcome = head.result.result()
+            assert (outcome.status, outcome.reason) == (
+                'blocked', MERGE_WORKER_SHUTDOWN_REASON,
+            ), outcome
+            assert verifier.cancelled == [GATED_HEAD], (
+                f"the parked gate's verify was orphaned, not torn down; "
+                f'cancelled={verifier.cancelled!r} {lane.observed()}'
+            )
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(f'the lane never finished after stop(); {lane.observed()}')
+            assert _hosts_of(lane) == {}, lane.observed()
+            assert await lane.git_ops.get_main_sha() == drift, lane.observed()
+
+
+async def _land_another_foreign_commit(repo: Path) -> None:
+    """Move main again, as :func:`_land_foreign_commit` does, on a file of its own."""
+    (repo / 'foreign_again.txt').write_text('landed elsewhere again\n')
+    await _git_until_it_takes(repo, 'add', 'foreign_again.txt')
+    await _git_until_it_takes(repo, 'commit', '-m', 'Second foreign landing')
+
+
+async def _git_rc(repo: Path, *args: str) -> int:
+    """Exit status of ``git *args`` run in *repo*."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', *args, cwd=repo,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    return await proc.wait()

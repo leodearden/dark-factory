@@ -18,22 +18,13 @@ import pytest
 import pytest_asyncio
 from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 
-from fused_memory.config.schema import (
-    FusedMemoryConfig,
-    ReconciliationConfig,
-)
 from fused_memory.models.reconciliation import (
     AssembledPayload,
-    ReconciliationRun,
     RunStatus,
-    RunType,
-    StageId,
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import ReconciliationHarness
-from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.overreach_flags import (
     FLAGS_SECTION_HEADER,
     FLAGS_SECTION_LIMIT,
@@ -42,10 +33,7 @@ from fused_memory.reconciliation.overreach_flags import (
     render_overreach_flags_section,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    IntegrityCheck,
-    TaskKnowledgeSync,
-)
+from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 from fused_memory.services.overreach_guard import PROMPT_VERSION
 from fused_memory.services.overreach_shadow import (
     OverreachFlag,
@@ -53,6 +41,7 @@ from fused_memory.services.overreach_shadow import (
     OverreachShadowStore,
 )
 from reconciliation.consolidator_fixtures import make_consolidator
+from reconciliation.harness_fixtures import make_harness_config, open_harness, stub_stage_runs
 
 MODULE_LOGGER = 'fused_memory.reconciliation.overreach_flags'
 PROJECT, OTHER = 'proj', 'other'
@@ -389,40 +378,6 @@ class TestHarnessWiring:
         ] * 2
 
     @pytest.mark.asyncio
-    async def test_a_resumed_run_that_skips_stage_1_acknowledges_nothing(
-        self, cycle_harness, shadow, stage_1_pages,
-    ) -> None:
-        cycle_harness.memory.overreach_shadow = shadow
-        interrupted_at = datetime.now(UTC) - timedelta(minutes=10)
-        interrupted = ReconciliationRun(
-            id='run-to-resume',
-            project_id=PROJECT,
-            run_type=RunType.full,
-            trigger_reason='test-trigger',
-            started_at=interrupted_at,
-            status=RunStatus.interrupted,
-            stage_reports={StageId.memory_consolidator.value: StageReport(
-                stage=StageId.memory_consolidator,
-                started_at=interrupted_at,
-                completed_at=interrupted_at,
-            )},
-            session_id='S',
-            stage_cursor=StageId.task_knowledge_sync.value,
-            instance_id=cycle_harness.buffer.instance_id,
-        )
-        await cycle_harness.journal.start_run(interrupted)
-
-        resumed = await cycle_harness.run_full_cycle(
-            PROJECT, 'resume_after_restart', resume_run=interrupted, events=[],
-        )
-        fresh = await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
-
-        assert (resumed.status, fresh.status) == (RunStatus.completed, RunStatus.completed)
-        assert [_keys(page) for page in stage_1_pages] == [
-            [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
-        ]
-
-    @pytest.mark.asyncio
     async def test_no_shadow_runs_the_cycle_without_flags(self, cycle_harness, stage_1_pages) -> None:
         cycle_harness.memory.overreach_shadow = None
         run = await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
@@ -432,50 +387,28 @@ class TestHarnessWiring:
 
 @pytest_asyncio.fixture
 async def cycle_harness(tmp_path):
-    journal = ReconciliationJournal(tmp_path / 'journal')
-    await journal.initialize()
-    buffer = EventBuffer(
-        db_path=tmp_path / 'events.db', buffer_size_threshold=2, max_staleness_seconds=3600,
-    )
-    await buffer.initialize()
-    memory = AsyncMock()
-    memory.search = AsyncMock(return_value=[])
-    memory.get_episodes = AsyncMock(return_value=[])
-    memory.get_status = AsyncMock(return_value={
-        'graphiti': {'connected': True}, 'mem0': {'connected': True}, 'projects': {},
-    })
-    memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    memory.get_memories_by_metadata = AsyncMock(return_value=[])
-    memory.mem0.get_all = AsyncMock(return_value={'results': []})
-    config = FusedMemoryConfig(reconciliation=ReconciliationConfig(
-        enabled=True, explore_codebase_root='/tmp/test', agent_llm_provider='anthropic',
-        agent_llm_model='claude-sonnet-4-20250514', judge_enabled=False,
-    ))
     taskmaster = AsyncMock()
     taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
-    yield ReconciliationHarness(
-        memory_service=memory, taskmaster=taskmaster, journal=journal, event_buffer=buffer,
-        config=config, known_projects={PROJECT: '/tmp/test-project'},
-    )
-    await buffer.close()
-    await journal.close()
+    async with open_harness(
+        tmp_path,
+        taskmaster=taskmaster,
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT: '/tmp/test-project'},
+    ) as harness:
+        yield harness
 
 
 @pytest.fixture
-def stage_1_pages():
+def stage_1_pages(monkeypatch):
     """Stub every stage's run; record the flag page Stage 1 was configured with."""
     pages: list[OverreachFlagPage | None] = []
 
-    async def fake_run(self, events, watermark, prior_reports, run_id, model=None,
-                       resume_session_id=None) -> StageReport:
+    async def fake_run(self, events, watermark, prior_reports, run_id,
+                       model=None) -> StageReport:
         if isinstance(self, MemoryConsolidator):
             pages.append(self.overreach_flags)
         now = datetime.now(UTC)
         return StageReport(stage=self.stage_id, started_at=now, completed_at=now)
 
-    with (
-        patch.object(MemoryConsolidator, 'run', fake_run),
-        patch.object(TaskKnowledgeSync, 'run', fake_run),
-        patch.object(IntegrityCheck, 'run', fake_run),
-    ):
-        yield pages
+    stub_stage_runs(monkeypatch, fake_run)
+    return pages

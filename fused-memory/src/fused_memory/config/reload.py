@@ -189,11 +189,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Storm-alarm knobs, read live off the shared config by
     # MemoryService.update_memory and passed INTO StormCounter.record() on every
     # call. That per-call argument is the non-obvious part: the shared
-    # StormCounter (server/storm_counter.py) deliberately does NOT capture
-    # threshold/window in __init__, because a value captured at construction
-    # cannot observe an in-place mutation (see this module's reload-safety
-    # rule) -- which would make these two leaves restart-only while sitting in
-    # this allowlist as if they were green-tier.
+    # StormCounter (shared/src/shared/storm_counter.py) deliberately does NOT
+    # capture threshold/window in __init__, because a value captured at
+    # construction cannot observe an in-place mutation (see this module's
+    # reload-safety rule) -- which would make these two leaves restart-only
+    # while sitting in this allowlist as if they were green-tier.
     'mem0_update.storm_threshold',
     'mem0_update.storm_window_seconds',
     # ensure_entity_node authorization (task 4932). Read live per tool call by
@@ -220,8 +220,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Mint-path storm-alarm knobs, read live off the shared config by
     # MemoryService.ensure_entity_node and passed INTO StormCounter.record() on
     # every call, for exactly the reason spelled out for the mem0_update storm
-    # leaves above: the shared StormCounter (server/storm_counter.py)
-    # deliberately does NOT capture threshold/window in __init__.
+    # leaves above: the shared StormCounter
+    # (shared/src/shared/storm_counter.py) deliberately does NOT capture
+    # threshold/window in __init__.
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
     # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----

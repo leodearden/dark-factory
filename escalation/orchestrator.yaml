@@ -4,7 +4,7 @@
 # Verification commands
 test_command: "uv run --directory escalation pytest tests/ --tb=short -q --timeout=300"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
-lint_command: "uv run --directory escalation ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests"
+lint_command: "uv run --directory escalation ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests && python3 tests/scripts/raw_envelope_literal_guard.py escalation"
 type_check_command: "uv run --directory escalation pyright src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, escalation declared

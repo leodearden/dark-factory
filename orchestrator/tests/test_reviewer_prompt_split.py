@@ -36,6 +36,10 @@ _FROZEN_CONTRACT_TOKENS = (
     '"blocking"',
     '"suggestion"',
     '**summary**',
+    '**note_dispositions**',
+    '"addressed"',
+    '"no_action"',
+    '"work"',
 )
 
 
@@ -68,8 +72,8 @@ class TestReviewerPromptSplit:
         assert isinstance(spec, PromptSpec)
         assert spec.prompt_id == 'reviewer_comprehensive'
 
-    def test_prompt_harness_version_is_reviewer_v1(self):
-        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v1'
+    def test_prompt_harness_version_is_reviewer_v2(self):
+        assert REVIEWER_COMPREHENSIVE.prompt_harness_version == 'reviewer-v2'
 
     # -- (a) structure/partition: machine-contract landmarks in .contract only --
 

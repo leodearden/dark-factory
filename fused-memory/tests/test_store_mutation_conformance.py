@@ -772,6 +772,7 @@ EXPECTED_GUARDED_SCRIPTS: frozenset[str] = frozenset({
     'normalize_topic_slugs.py',
     'prune_recon_cycle_summaries.py',
     'purge_knowlive_namespace.py',
+    'replay_failed_mem0_intents.py',
     'retro_stamp_topics.py',
     'sweep_orphan_flag_markers.py',
     'sweep_toolcall_xml_leak.py',
@@ -933,11 +934,15 @@ _MIN_SUBSTANTIVE_REASON_LENGTH = 40
 #: any WIDENING of PREFLIGHT_EXEMPT_SCRIPTS requires a deliberate edit in
 #: BOTH this file and fused_memory/utils/store_mutation_preflight.py. The
 #: list is expected to SHRINK as scripts are migrated onto the guard
-#: directly, never to grow -- a newly-written mutating script should call
-#: assert_store_mutation_allowed, not earn an entry here.
+#: directly -- a newly-written mutating script should call
+#: assert_store_mutation_allowed. An entry is justified only when the
+#: script's mutations are statically bounded to scratch substrate and it
+#: writes no shared mem0 SQLite history; each entry's reason states the
+#: bound it was measured against.
 EXPECTED_EXEMPT_SCRIPTS = frozenset({
     'bake_off_storage_shape.py',
     'cleanup_test_collections.py',
+    'seed_scratch_reference_graph.py',
 })
 
 

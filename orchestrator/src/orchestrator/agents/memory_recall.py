@@ -17,6 +17,7 @@ from typing import Any
 
 from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
 from shared.mcp_session import is_timeout_failure
+from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 from shared.project_id import normalize_project_id
 
 from orchestrator.mcp_lifecycle import (
@@ -44,8 +45,9 @@ stamps the tags this reads; the two are copies, pinned equal by a test.
 GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
 """Where fused-memory nests child bodies inside a kept result's ``grouped`` block.
 
-``group_search_results`` hangs amendment digests under ``amendments`` and
-full swallowed bodies under ``matched_children``. Both render into the
+``group_search_results`` hangs amendment entries under ``amendments``, each
+carrying its text as ``content`` capped at the judge's field cap, and full
+swallowed bodies under ``matched_children``. Both render into the
 ``# Context`` block, so both are filtered and rendered. ``grouped['parent']``
 is absent because only ``get_memory_by_id`` produces it, and recall never
 calls that tool.
@@ -54,7 +56,7 @@ calls that tool.
 CONTESTED_CHILD_KEY = 'contested'
 """The flag fused-memory stamps on a grouped child that contests its parent.
 
-``fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry`` stamps
+``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry`` stamps
 it from ``is_contested_child``, the single definition of contested. It is read
 here exactly as stamped (``is True``), never re-derived from the child's own
 ``x_contested`` metadata. A copy rather than an import, because the
@@ -244,11 +246,24 @@ def _entry_id(entry: dict) -> str | None:
 
 
 def _entry_text(entry: Any) -> str | None:
-    """What an entry has to read, its ``content`` else its ``digest``; None when blank."""
+    """What an entry has to read, its ``content`` else its ``digest``; None when blank.
+
+    ``content`` is what fused-memory emits since task 7518: an amendment's text
+    capped at the judge's field cap. ``digest`` is the 240-char text a
+    pre-7518 server emits instead, kept so a briefing renders while the two
+    are redeployed at different times.
+    """
     if not isinstance(entry, dict):
         return None
     text = entry.get('content') or entry.get('digest')
     return text if isinstance(text, str) and text.strip() else None
+
+
+def _superseded_by(entry: dict) -> str | None:
+    """The id of the record that superseded *entry*, when its metadata names one."""
+    metadata = entry.get('metadata')
+    mark = metadata.get(SUPERSEDED_BY_METADATA_KEY) if isinstance(metadata, dict) else None
+    return mark if isinstance(mark, str) and mark else None
 
 
 def _memory_bullet(
@@ -256,16 +271,19 @@ def _memory_bullet(
 ) -> str | None:
     """Render one recalled entry as ``- [category · date · store] content``.
 
-    A *label* leads the tag when given. None for an entry with no text: an
-    empty bullet spends tokens announcing something unreadable. Content
-    renders WHOLE, with continuation lines indented so a multi-paragraph
-    memory stays inside its own bullet.
+    A superseded entry's tag opens ``superseded by <id>``, and a *label* leads
+    the tag when given. None for an entry with no text: an empty bullet spends
+    tokens announcing something unreadable. Content renders WHOLE, with
+    continuation lines indented so a multi-paragraph memory stays inside its
+    own bullet.
     """
     text = _entry_text(entry)
     if text is None:
         return None
     body = text.strip().replace('\n', '\n' + indent + '  ')
     tag = f'{_entry_category(entry)} · {_entry_date(entry)} · {store}'
+    if (superseded_by := _superseded_by(entry)) is not None:
+        tag = f'superseded by {superseded_by} · {tag}'
     if label is not None:
         tag = f'{label} · {tag}'
     return f'{indent}- [{tag}] {body}'
@@ -304,9 +322,12 @@ def _contesting_bullet(
 ) -> str | None:
     """Render a child that contests its parent, tagged ``contests its parent``.
 
-    The child's full body is on the wire only as its own top-level hit, so
-    that hit renders, under its own store, when the reply carries one. The
-    child entry itself is the fallback, under its parent's store.
+    When the reply carries the child's own top-level hit, that hit renders,
+    with its whole uncapped body under its own store. Otherwise the grouped
+    entry renders under its parent's store:
+    ``fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry``
+    gives every amendment entry its text as ``content``, capped at the judge's
+    field cap, and :func:`_entry_text` shows that.
     """
     label = 'contests its parent'
     child_id = _entry_id(child)
@@ -346,9 +367,11 @@ def render_memory_results(results: Sequence[Any]) -> str:
     Each grouped child (:data:`GROUPED_CHILD_KEYS`) renders as a nested bullet
     tagged with its parent's store, since a collapsed child has none of its own.
     A child marked :data:`CONTESTED_CHILD_KEY` renders first under its parent,
-    tagged ``contests its parent``, from its own top-level hit and that hit's
-    store when the reply carries one; that hit is then not rendered again at
-    its own rank.
+    tagged ``contests its parent``, in full: from its own top-level hit and
+    that hit's store when the reply carries one, which is then not rendered
+    again at its own rank, else from the grouped entry's capped ``content``.
+    A superseded entry is tagged ``superseded by <id>`` in place,
+    never dropped or reordered.
     """
     entries = [entry for entry in results if isinstance(entry, dict)]
     hits_by_id: dict[str, dict] = {}

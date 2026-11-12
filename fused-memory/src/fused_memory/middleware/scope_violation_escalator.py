@@ -531,8 +531,10 @@ class ScopeViolationEscalator:
             # "queued for curation" / "resolved asynchronously" would be the
             # same class of unverified claim in a new direction.  The stamp
             # sentence is conditional on a task actually being CREATED:
-            # _execute_combine merges only curator_* keys onto the target, so
-            # a combine target never receives this candidate's
+            # _execute_combine never copies a candidate's
+            # possible_scope_mismatch onto the target (its writes are the
+            # curator_* markers, declared_scope and followup_items), so a
+            # combine target never receives this candidate's
             # possible_scope_mismatch.
             detail_lines.append(
                 'A task creation request cited paths that look like they belong '

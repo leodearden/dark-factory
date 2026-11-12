@@ -1,0 +1,674 @@
+prd: plans/review-all-s10-task-write-contract-metadata-modes-success-signal-and-registry-prd.md
+schema_version: 1
+signal_leaves: ["ω", "ι", "ρ"]
+tasks:
+  - label: "α"
+    task_id: 9180
+    title: "Two typed write axes on the wire; the backend resolves once"
+    note: "Closes fk-ff5234ac1013 (backend half) and fk-116481623cfb. Chain head: waits on 4867 (hand-carried; ruled by Leo 2026-11-10, never inverted), 6621, 5281, 6719, 6720, 6721, 8143 and S5 μ (6708 is done). Produces C1."
+    capabilities:
+      - name: "write-modes-resolver-exists"
+        binding: "capability→producer (α) — shared.task_metadata_wire::write_modes, the one resolver (C1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def write_modes"
+          paths: ["shared/src/shared/task_metadata_wire.py"]
+          expect: present
+      - name: "backend-mode-resolver-removed"
+        binding: "anti-inversion — sqlite_task_backend::_resolve_metadata_mode deleted once write_modes resolves"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _resolve_metadata_mode"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "fused-memory-src-off-append"
+        binding: "anti-inversion — no fused-memory source or sitting payload instructs or sends append=True / 'append': True (Stage 2 system and user prompts, enumeration_guard's guidance, error texts, hints, payloads)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "append['\"]?(=|: *)(True|true)"
+          paths: ["fused-memory/src/", "scripts/sitting/"]
+          expect: absent
+      - name: "append-refused-on-the-live-tool"
+        binding: "rejection-mechanism — produced by α; boundary rows 1-2 plus the live MCP probe"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live server call (metadata without metadata_mode, and append=True) returns metadata_mode_required / append_retired; not a tree property"
+  - label: "β1"
+    task_id: 9187
+    title: "Client signature: metadata_mode required, append gone, facade and fakes in parity"
+    note: "Closes the client half of fk-ff5234ac1013 and the carried fk-5c98cc0bb7e0 (from cancelled 3150). Waits on α, 6766, 6724. Keeps -> bool; mechanical. Includes scheduled_deploy_settle.TaskStore and workflow._write_branch_base_sha's append=not overwrite."
+    capabilities:
+      - name: "client-side-resolver-removed"
+        binding: "anti-inversion — scheduler::_reject_contradictory_metadata_mode deleted with the client resolver"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_reject_contradictory_metadata_mode"
+          paths: ["orchestrator/src/", "orchestrator/tests/"]
+          expect: absent
+      - name: "facade-suppressions-removed"
+        binding: "anti-inversion — the five reportCallIssue suppressions on metadata_mode= calls go once SchedulerFacade declares metadata_mode"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "type: ignore\\[reportCallIssue\\]"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: absent
+  - label: "β2"
+    task_id: 9191
+    title: "Scheduler.update_task raises MetadataWriteFailed; nothing reads its result"
+    note: "Closes fk-de964b86bdd8. Produces C2 (S9 λ1 depends on β2; S9 μ1 depends on β1 and follows β2 through λ1). The 14 workflow except arms are kept and made live (R3); the result-never-read guard (OQ-13 ruled (a); bool reads and gather/create_task consumption) replaces the pyright assumption. 12 readers and 14 outside-try sites at e634cfe658, scheduled_deploy_settle and _write_branch_base_sha included."
+    capabilities:
+      - name: "metadata-write-failed-exists"
+        binding: "capability→producer (β2) — orchestrator.task_write::MetadataWriteFailed (C2; OQ-2 ruled)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MetadataWriteFailed"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "false-return-doubles-removed"
+        binding: "anti-inversion — no test double models a False return from update_task"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "update_task(\\.return_value *= *False| *= *AsyncMock\\(return_value=False)"
+          paths: ["orchestrator/tests/", "escalation/tests/"]
+          expect: absent
+      - name: "update-task-result-never-read"
+        binding: "rejection-mechanism and producer (β2) — AST guard over orchestrator/src and escalation/src with a seeded fixture (pyright does not flag a bool read of -> None)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_update_task_result_never_read.py"]
+          expect: present
+      - name: "persist-failure-arm-fires"
+        binding: "rejection-mechanism — produced by β2; boundary row 7 drives a refusal through FakeMetadataBackend and observes _mark_blocked(escalate_to_human=True)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural: the arm firing is judged by β2's boundary test (and ω end to end), not a grep"
+  - label: "γ"
+    task_id: 9195
+    title: "One parse per request, every rejection a dict through one renderer, invariants on update"
+    note: "Closes fk-f6224c565a9b, fk-1f8a4c69798f, fk-cc04e61d23ec. Renderer: exc.to_error_dict() else S14 ξ's error_envelope, homed in shared.mcp_envelope (OQ-12 ruled; 6719 amended)."
+    capabilities:
+      - name: "discard-helper-copy-removed"
+        binding: "anti-inversion — the interceptor's own census-line emitter goes; metadata_dict is the one emitter"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_METADATA_DISCARD_CODES"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+      - name: "interceptor-parse-helper-removed"
+        binding: "anti-inversion — task_interceptor::_parse_metadata_value deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _parse_metadata_value"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "csv-success-predicate-unified"
+        binding: "anti-inversion — the set_task_status CSV branch uses write_failure_reason; the _consolidation_not_closed_error docstring that restates the old predicate is rewritten"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "\\['result'\\]\\.get\\('error'\\) is None"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+      - name: "deterministic-invariants-on-update"
+        binding: "capability→producer (γ) — TaskInterceptor.update_task calls deterministic_task_error on a delta touching task_kind/before_done (milestone-only deltas skip the script clause)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "deterministic_task_error\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+  - label: "π"
+    task_id: 9199
+    title: "Prose callers of update_task state the two axes"
+    note: "Companion of α and γ; closes no key of its own. complexity='simple'. Head of the docs/task-authoring.md chain: waits on γ (task 6392 is done). Also removes the reference's three files_to_modify mentions (OQ-9 ruled)."
+    capabilities:
+      - name: "skills-off-append"
+        binding: "anti-inversion — no skill or the task-authoring reference instructs append=True"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "append=(True|true)"
+          paths: ["skills/", "docs/task-authoring.md"]
+          expect: absent
+      - name: "reference-off-files-to-modify"
+        binding: "anti-inversion — docs/task-authoring.md names metadata.files as the one declared-files key (OQ-9 ruled)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "files_to_modify"
+          paths: ["docs/task-authoring.md"]
+          expect: absent
+  - label: "δ"
+    task_id: 9204
+    title: "shared.declared_files: one key, one reader; files_to_modify refused and unread; lock_charter_guard imports shared.locking"
+    note: "Closes fk-fa3e3d765f50 (with ε) and fk-fa355c2c0498. OQ-9 ruled: files only; the refusal checks incoming keys only; a guard test pins absence of readers; the lead backfills the rows that differ after the deploy. Absorbs task 6653 (cancelled into δ). Produces C4. Task 7748 waits on it."
+    capabilities:
+      - name: "declared-files-reader-exists"
+        binding: "capability→producer (δ) — shared.declared_files::declared_files (C4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def declared_files"
+          paths: ["shared/src/shared/declared_files.py"]
+          expect: present
+      - name: "retired-files-key-refusal-exists"
+        binding: "capability→producer (δ) — shared.declared_files::FilesToModifyRetiredError, the write-time refusal naming metadata.files (C4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FilesToModifyRetiredError"
+          paths: ["shared/src/shared/declared_files.py"]
+          expect: present
+      - name: "retired-files-key-refusal-wired"
+        binding: "capability→producer (δ) — the interceptor calls refuse_retired_files_key on submit_task's and update_task's incoming metadata"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "refuse_retired_files_key\\("
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+      - name: "retired-files-key-reader-guard-exists"
+        binding: "rejection-mechanism and producer (δ) — AST guard over */src flagging the literal 'files_to_modify' as a .get argument, subscript key or key-collection element; seeded fixture; no exemption entries"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/tests/test_retired_files_key_unread.py"]
+          expect: present
+      - name: "store-key-reader-removed"
+        binding: "anti-inversion — sqlite_task_backend::_files_for_key deleted; candidate_key reads declared_files"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _files_for_key"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "interceptor-key-tuple-removed"
+        binding: "anti-inversion — task_interceptor::_DELIVERABLE_SIGNAL_KEYS deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_DELIVERABLE_SIGNAL_KEYS"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "curator-metadata-arm-removed"
+        binding: "anti-inversion — task_curator::_task_files no longer reads metadata.files_to_modify (task 6653's half)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "meta\\.get\\('files_to_modify'\\)"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "lock-charter-copy-removed"
+        binding: "anti-inversion — lock_charter_guard no longer defines its own FILE_EXTENSIONS"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^FILE_EXTENSIONS"
+          paths: ["fused-memory/src/fused_memory/middleware/lock_charter_guard.py"]
+          expect: absent
+      - name: "live-rows-keep-their-candidate-key"
+        binding: "measured 2026-11-10 across all 11 stores: 4 rows carry metadata.files_to_modify, all done, 0 non-terminal — no live candidate key or lock changes; δ re-measures with the _migrate_v3_to_v4 audit query before landing"
+        verdict: PASS
+  - label: "ε"
+    task_id: 9209
+    title: "Orchestrator reads declared files through shared.declared_files; one sanitizer"
+    note: "Contributes to fk-fa3e3d765f50. Waits on δ and β2 (same orchestrator files). Callers call shared.locking.strip_directory_locks (D5)."
+    capabilities:
+      - name: "orchestrator-sanitizer-removed"
+        binding: "anti-inversion — module_charter::sanitize_files_for_persist deleted; callers call shared.locking.strip_directory_locks"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sanitize_files_for_persist"
+          paths: ["orchestrator/src/", "scripts/"]
+          expect: absent
+      - name: "lock-derivation-boundary-test"
+        binding: "capability→producer (ε) — a CI boundary test derives locks for a str-valued files task and a legacy task also carrying files_to_modify (0 such live rows, so a live signal would be vacuous)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_lock_derivation_declared_files.py"]
+          expect: present
+  - label: "ζ"
+    task_id: 9214
+    title: "The combine writes a union it computes into metadata.files; a collision is a counted refusal"
+    note: "Closes fk-de3df95984a5. Waits on λ (same file) and task 8453 (extracts the write half ζ edits); consumes C4 and C5; produces C7 (combine_audit.py). Collision → refused_reason candidate_key_collision with survivor_id (OQ-14 ruled); legacy rows left (OQ-15 ruled (a))."
+    capabilities:
+      - name: "details-prefix-removed"
+        binding: "anti-inversion — the combine stops prefixing details with the FILES_TO_MODIFY marker (and the false comment goes)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FILES_TO_MODIFY"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+      - name: "collision-refusal-token-exists"
+        binding: "capability→producer (ζ) — combine_audit::CombineRefusal.CANDIDATE_KEY_COLLISION, the distinct token ρ counts (C7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CANDIDATE_KEY_COLLISION"
+          paths: ["fused-memory/src/fused_memory/middleware/combine_audit.py"]
+          expect: present
+      - name: "live-combine-never-shrinks-files"
+        binding: "INV-13 producer proof, PASS (ζ delivers) — ζ adds old.files/new.files/survivor_id to the combine audit (today it records no files); after merge, the next fleet combine leaves metadata.files a superset of the old.files data/combine_audit.jsonl records"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live store read after a real combine; not a tree property"
+  - label: "ρ"
+    task_id: 9237
+    title: "Combine-collision census script"
+    note: "OQ-14 ruled. Reads combine_audit_path() and CombineRefusal through C7; exit 0 below, 1 at or above (>= 5 collisions or >= 1% of combine rows in the window); trailing JSON verdict. Waits on ζ. Its landing is the lead's trigger to file σ. A signal leaf: no in-batch leaf depends on it."
+    capabilities:
+      - name: "census-script-exists"
+        binding: "capability→producer (ρ) — scripts/combine_collision_census.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/combine_collision_census.py"]
+          expect: present
+      - name: "census-reads-the-producer-token"
+        binding: "capability→producer (ρ) — the script reads the refusal token through C7, never a re-spelled string (INV-13)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CombineRefusal"
+          paths: ["scripts/combine_collision_census.py"]
+          expect: present
+  - label: "σ"
+    task_id: null
+    title: "Deterministic 30-day combine-collision check"
+    note: "OQ-14 ruled. Filed by the lead once ρ is on main (submit_task validates before_done.script), not in the decompose batch: task_kind deterministic; before_done {script scripts/combine_collision_census.py, args [--days, 30], kind predicate, timeout_secs 120}; milestone {mode delayed, after_secs 2592000}; always_escalates false; deps ζ, ρ. Exit 1 files a born-at-L2 milestone_check_failed to Leo."
+    capabilities:
+      - name: "collision-rate-verdict"
+        binding: "rejection-mechanism — the predicate's exit code at the milestone is the verdict; its own before_done is the check"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a time-delayed predicate over live audit rows; judged by the deterministic runner at its milestone, not a tree property"
+  - label: "η"
+    task_id: 9240
+    title: "The slice table: static, downward, one home"
+    note: "Closes fk-f528087f44c7 (θ promotes the invariant). Waits on γ (shared test file; α and 5281 upstream). 14 slices at e634cfe658, five registered by import side effect (followup_items.py new). Produces C3 (S9 ξ consumes)."
+    capabilities:
+      - name: "registry-mutator-removed"
+        binding: "anti-inversion — register_metadata_submodel deleted; no import-side-effect registration remains"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "register_metadata_submodel"
+          paths: ["shared/src/", "fused-memory/src/", "orchestrator/src/", "dashboard/src/"]
+          expect: absent
+      - name: "slice-table-read-view-exists"
+        binding: "capability→producer (η) — shared.task_metadata::registered_slices (C3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def registered_slices"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+      - name: "external-dep-leaf-exists"
+        binding: "capability→producer (η) — ExternalDep moves to the leaf module shared/external_dep.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/external_dep.py"]
+          expect: present
+      - name: "registration-chain-test-removed"
+        binding: "anti-inversion — the per-key registration-chain pin is replaced by one table test"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_deploy_state_registration.py"]
+          expect: absent
+  - label: "θ"
+    task_id: 9242
+    title: "INV-16 metadata-slices-one-table: lockstep edit and fixture"
+    note: "Lands R22 item 4 (owned by S10). OQ-5 revised by the lead 2026-11-10: S6 α (INV-15) → S10 θ (INV-16) → S7 ζ (INV-17); θ depends on S6 α; checks anchor on the slug."
+    capabilities:
+      - name: "invariant-registered"
+        binding: "capability→producer (θ) — lockstep edit guarded by scripts/tests/test_design_invariants_consistency.py::PINNED_SITES"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "metadata-slices-one-table"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+      - name: "parity-fixture-exists"
+        binding: "capability→producer (θ) — the fresh-interpreter parity fixture plus AST backstop"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/tests/test_metadata_slices_one_table.py"]
+          expect: present
+      - name: "checkout-binding-contract-available"
+        binding: "substrate — scripts/_checkout.py binds every member src on import and exposes MEMBER_SRC (S25 C1, task 6758 done); the child binds through import _checkout, not the private _member_srcs"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring (MEMBER_SRC and the import-time bind in scripts/_checkout.py at e634cfe658); a mechanical present-check would be vacuous and the polarity gate rejects it"
+      - name: "fixture-flags-a-side-effect-registrant"
+        binding: "rejection-mechanism — produced by θ; its seeded fixture module is flagged (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by the fixture's own test, not a grep"
+  - label: "ι"
+    task_id: 9244
+    title: "The blessed-key table in docs §8; the code keeps the frozenset"
+    note: "Closes fk-941b5369a3d7 (333 comment lines around 58 keys at e634cfe658). Waits on η and π. Task 7173 waits on it. A signal leaf: no in-batch leaf depends on it."
+    capabilities:
+      - name: "docs-table-markers-exist"
+        binding: "capability→producer (ι) — docs/task-authoring.md §8 Tier-A table between tier-a-blessed-keys-table markers"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tier-a-blessed-keys-table"
+          paths: ["docs/task-authoring.md"]
+          expect: present
+      - name: "mirror-block-replaced"
+        binding: "anti-inversion — the bare key-list mirror becomes the table; all three marker readers follow"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tier-a-blessed-keys-mirror"
+          paths: ["docs/task-authoring.md", "tests/scripts/"]
+          expect: absent
+      - name: "census-essays-leave-the-code"
+        binding: "anti-inversion — the frozenset block carries at most one comment line per key"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a comment-density ratio over one block; measured by the leaf in its commit message"
+  - label: "κ1"
+    task_id: 9248
+    title: "One transition verdict, enforced in the backend only"
+    note: "Closes fk-d80c1c44bca1. OQ-6 ruled by Leo (amends R3's 'as well as the interceptor'): one call site in SqliteTaskBackend._write_status_and_verify, actor required, reopen reason passed; the interceptor's gate 2a refusal and gate 2e are deleted and the backend's refusal is rendered with today's tokens. Waits on δ and S26 γ (server/main.py). task_status defaults to TaskStatusConfig(); production constructors pass the loaded config."
+    capabilities:
+      - name: "transition-verdict-exists"
+        binding: "capability→producer (κ1) — shared.task_transitions::transition_verdict, the one terminal/edge rule (C5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def transition_verdict"
+          paths: ["shared/src/shared/task_transitions.py"]
+          expect: present
+      - name: "illegal-transition-error-exists"
+        binding: "capability→producer (κ1) — task_backend_errors::IllegalTransitionError"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class IllegalTransitionError"
+          paths: ["fused-memory/src/fused_memory/backends/task_backend_errors.py"]
+          expect: present
+      - name: "backend-applies-transition-verdict"
+        binding: "capability→producer (κ1) — SqliteTaskBackend._write_status_and_verify calls transition_verdict, the one call site"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "transition_verdict\\("
+          paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
+          expect: present
+      - name: "backend-status-writers-require-actor"
+        binding: "capability→producer (κ1) — the backend's status writers declare actor: ActorClass with no default"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "actor: ActorClass[,)]"
+          paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
+          expect: present
+      - name: "interceptor-holds-no-transition-gate"
+        binding: "anti-inversion — the interceptor's terminal-exit and legality gates are deleted; no middleware module computes a transition verdict"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "is_legal_transition\\(|def _terminal_exit_error|def _illegal_transition_error"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: absent
+  - label: "κ2"
+    task_id: 9251
+    title: "Privileged-writer protocol, census failure, candidate-key scope"
+    note: "Closes fk-260352fa900a, fk-c41aa02e0779, fk-d4d61005457b. Migrations keep frozen literal DDL; a check pins the live index WHERE to the constant (D9a)."
+    capabilities:
+      - name: "privileged-writer-protocol-exists"
+        binding: "capability→producer (κ2) — task_backend_protocol::PrivilegedAuditWriter"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class PrivilegedAuditWriter"
+          paths: ["fused-memory/src/fused_memory/backends/task_backend_protocol.py"]
+          expect: present
+      - name: "attr-defined-suppressions-removed"
+        binding: "anti-inversion — the three type: ignore[attr-defined] calls go once the interceptor is typed as TaskStore"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "type: ignore\\[attr-defined\\]"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+      - name: "integrity-error-substring-sniff-removed"
+        binding: "anti-inversion — collisions classified by sqlite_errorname plus a survivor lookup"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "'candidate_key' not in str"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "census-failure-type-exists"
+        binding: "capability→producer (κ2) — task_backend_errors::StatusCensusUnavailable raised by get_statuses_fresh"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class StatusCensusUnavailable"
+          paths: ["fused-memory/src/fused_memory/backends/task_backend_errors.py"]
+          expect: present
+      - name: "scope-constant-exists"
+        binding: "capability→producer (κ2) — sqlite_task_backend::CANDIDATE_KEY_SCOPE_SQL, the live survivor scope"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CANDIDATE_KEY_SCOPE_SQL"
+          paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
+          expect: present
+  - label: "λ"
+    task_id: 9254
+    title: "One gate rule: deterministic and always_escalates"
+    note: "Closes fk-06ab2d3e9148. OQ-10 ruled by Leo: is_human_gate (stored shape; a submission after inject_operational_routing) with named refinements; the blocked-gate audit and the curator sweep keep honestly named selectors; the combine guard, recon duplicate-gate guard, phrasing selector, live-workflow detector, closure readers and the dashboard's copy move onto it. Produces C6, which owns CONSOLIDATION_GATE_METADATA_KEY."
+    capabilities:
+      - name: "gate-declaration-exists"
+        binding: "capability→producer (λ) — shared.gate_declaration::GateDeclaration (C6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class GateDeclaration"
+          paths: ["shared/src/shared/gate_declaration.py"]
+          expect: present
+      - name: "one-gate-rule-exists"
+        binding: "capability→producer (λ) — GateDeclaration.is_human_gate, the one rule dispatch acts on"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_human_gate"
+          paths: ["shared/src/shared/gate_declaration.py"]
+          expect: present
+      - name: "private-gate-predicate-removed"
+        binding: "anti-inversion — TaskInterceptor._is_gate_metadata deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_is_gate_metadata"
+          paths: ["fused-memory/src/", "fused-memory/tests/"]
+          expect: absent
+      - name: "detector-pure-gate-copy-removed"
+        binding: "anti-inversion — live_workflow_detector::is_pure_gate_metadata deleted; its readers use is_pure_human_gate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_pure_gate_metadata"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "dashboard-gate-copy-removed"
+        binding: "anti-inversion — dashboard prd_view::is_human_gate (a second copy of the rule) deleted; its readers use the shared property"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_human_gate"
+          paths: ["dashboard/src/"]
+          expect: absent
+      - name: "recon-duplicate-gate-refusals-counted"
+        binding: "rejection-mechanism — the one-week count of RecurringGateViolation refusals to recon-stage callers after λ deploys, against the week before (OQ-10 ruling's live signal)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a live journal count over a week; recorded by λ's verifier, not a tree property"
+  - label: "μ1"
+    task_id: 9278
+    title: "One interceptor test factory"
+    note: "Contributes to fk-85e1293e0aa4. Waits on task 6332 (which waits on ζ; if 6332 is already in progress or done at decompose, ζ and μ1 depend on it instead, PRD D15). Tests only; 49 constructing test files at e634cfe658, the two shared stacks included."
+    capabilities:
+      - name: "interceptor-test-factory-exists"
+        binding: "capability→producer (μ1) — fused-memory/tests/_interceptor_helpers.py::build_interceptor, the one test construction seam"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/_interceptor_helpers.py"]
+          expect: present
+  - label: "μ2"
+    task_id: 9280
+    title: "Collaborators at construction; the setters go"
+    note: "Closes fk-85e1293e0aa4. Waits on μ1 and S26 γ. The lifecycle-reset filer is the one provider member (OQ-3 ruled)."
+    capabilities:
+      - name: "post-construction-setters-removed"
+        binding: "anti-inversion — the four setters are no longer defined on TaskInterceptor"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def set_(write_journal|lifecycle_reset_filer|audit_trail_archive|consolidation_scroll)\\b"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+      - name: "collaborator-bundle-exists"
+        binding: "capability→producer (μ2) — InterceptorCollaborators"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class InterceptorCollaborators"
+          paths: ["fused-memory/src/fused_memory/middleware/"]
+          expect: present
+  - label: "ν"
+    task_id: 9282
+    title: "task_interceptor.py partitioned: status transition and path-scope routing as composed objects"
+    note: "Closes fk-1eb04ceac9e8 and fk-e3e99447e11e. Waits on μ2 (6332 and S5 μ upstream). StatusTransitionGate holds only the context gates; Table A is the backend's (κ1)."
+    capabilities:
+      - name: "status-transition-module-exists"
+        binding: "capability→producer (ν) — middleware/status_transition.py::StatusTransitionGate"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/middleware/status_transition.py"]
+          expect: present
+      - name: "path-scope-module-exists"
+        binding: "capability→producer (ν) — middleware/path_scope_routing.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/middleware/path_scope_routing.py"]
+          expect: present
+      - name: "gate-chain-left-the-interceptor"
+        binding: "anti-inversion — _apply_status_transition no longer defined in task_interceptor.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _apply_status_transition"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+  - label: "ξ"
+    task_id: 9283
+    title: "Orchestrator task-status comparisons use TaskStatus members; the literal guard lands"
+    note: "Contributes to fk-1695d6b02400 (ο closes). The guard lands here scoped to orchestrator/src (D13, OQ-4 ruled), so ξ's signal is its own."
+    capabilities:
+      - name: "literal-guard-exists"
+        binding: "capability→producer (ξ) — shared/tests/test_task_status_literals.py with a seeded fixture, SCAN_ROOTS = ('orchestrator/src',)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/tests/test_task_status_literals.py"]
+          expect: present
+      - name: "harness-merge-deferred-literal-removed"
+        binding: "anti-inversion — the finding's cited example (harness `current != 'merge-deferred'`) compares a TaskStatus member"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "current != 'merge-deferred'"
+          paths: ["orchestrator/src/"]
+          expect: absent
+  - label: "ο"
+    task_id: 9285
+    title: "fused-memory and dashboard task-status comparisons use TaskStatus members"
+    note: "Closes fk-1695d6b02400. Appends fused-memory/src and dashboard/src to the guard's SCAN_ROOTS; no exemption list (INV-12)."
+    capabilities:
+      - name: "guard-scans-fused-memory"
+        binding: "capability→producer (ο) — the guard's one-line SCAN_ROOTS tuple names fused-memory/src"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SCAN_ROOTS *=.*'fused-memory/src'"
+          paths: ["shared/tests/test_task_status_literals.py"]
+          expect: present
+      - name: "stall-detector-literal-removed"
+        binding: "anti-inversion — a representative fused-memory task-status literal (`get('status') != 'blocked'`) becomes a member"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get\\('status'\\) != 'blocked'"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "guard-flags-a-seeded-literal"
+        binding: "rejection-mechanism — produced by ξ/ο; boundary row 25"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by the guard's own fixture test"
+  - label: "ω"
+    task_id: 9286
+    title: "Integration gate: the task-write contract end to end"
+    note: "The B+H integration gate (gates.md §What B + H adds item 3). Waits on β2, γ, ζ, κ2, θ, ο. Priority high (gate 6698 dependency). Swaps the rig's dispatch_tool→interceptor bridge for the registered tools (create_mcp_server). Replays rows 1, 2, 5, 7, 12, 14, 19, 21, 27."
+    capabilities:
+      - name: "contract-e2e-suite-exists"
+        binding: "capability→producer (ω) — orchestrator/tests/test_task_write_contract_e2e.py replays rows 1, 2, 5, 7, 12, 14, 19, 21, 27 through the real seams"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_task_write_contract_e2e.py"]
+          expect: present
+      - name: "tool-bridge-exists"
+        binding: "capability→producer (ω) — orchestrator/tests/_fused_memory_tool_bridge.py builds the server with server/tools.py::create_mcp_server over the rig's interceptor and backend (the existing rig's _bridge_dispatch_tool accepts only set_task_status)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/_fused_memory_tool_bridge.py"]
+          expect: present
+      - name: "real-rig-available"
+        binding: "substrate — orchestrator/tests/test_reopen_sticks_e2e.py builds a real SqliteTaskBackend + interceptor rig; green by design"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring (file present at e634cfe658); a mechanical present-check would be vacuous"
+      - name: "contract-holds-end-to-end"
+        binding: "rejection-mechanism — produced by ω; a refusal travels tool → interceptor → backend → MetadataWriteFailed with rejection populated"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behavioural; judged by the e2e suite"

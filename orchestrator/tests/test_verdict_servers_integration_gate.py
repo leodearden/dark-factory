@@ -44,7 +44,8 @@ Two scope corrections from premise verification (see plan.json
    canonical, full-coverage guard.
 
 Scenario → test class map:
-    1-3   TestMergerBoundary                    (plan step S1)
+    1-3   TestMergerBoundary                    (plan step S1; plus the task-5107
+                                                 fail-safe reporting cases)
     4-5   TestReviewerBoundary                  (plan step S2)
     6,7,9 TestJudgeBoundary                     (plan step S3)
     8     TestJudgeStructuredOutputIgnoredPostEta (plan step S4, reframed)
@@ -55,7 +56,6 @@ Scenario → test class map:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -67,10 +67,12 @@ from _workflow_helpers import (
     AgentStub,
     _build_workflow,
     _init_repo,
+    agent_side_artifacts,
 )
 from escalation.models import Escalation
 from shared.cli_invoke import (
     _SCHEMA_OUTPUT_TOOL,
+    AgentFailureKind,
     AgentResult,
     _SubprocessResult,
     invoke_claude_agent,
@@ -81,6 +83,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp.verdict_tools import _envelope, _submit_review_verdict, _submit_triage
+from orchestrator.merger_failure import CHECK_MERGE_STATUS_BEFORE_RETRY
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -99,7 +102,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -146,19 +149,6 @@ def task_assignment() -> TaskAssignment:
 # ---------------------------------------------------------------------------
 
 
-def _artifacts_for(worktree: Path) -> TaskArtifacts:
-    """Real on-disk TaskArtifacts at the derived .task-meta sibling root for
-    *worktree* — the SAME root ``_invoke``'s ``_inject_verdict_tools_mcp``
-    derives (via ``_meta_root_for_worktree``) and ``TaskWorkflow.artifacts`` /
-    ``TaskSteward``'s own internal ``TaskArtifacts`` read from. Mirrors
-    ``AgentStub``'s explicit-meta_root construction in ``_workflow_helpers.py``
-    (rather than relying on the autouse ``_derive_meta_root_like_production``
-    shim, which exists for legacy bare-``TaskArtifacts(cwd)`` call sites) so
-    this module is self-contained.
-    """
-    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
-
-
 def _seed_workflow_artifacts(
     workflow: TaskWorkflow, *, tmp_path: Path, task_id: str = '42',
 ) -> TaskArtifacts:
@@ -174,7 +164,7 @@ def _seed_workflow_artifacts(
     """
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
-    artifacts = _artifacts_for(worktree)
+    artifacts = TaskArtifacts.for_task(worktree, task_id)
     artifacts.init(task_id, 'Verdict boundary task', 'desc', base_commit='oldbase')
     workflow.artifacts = artifacts
     workflow.worktree = worktree
@@ -204,6 +194,17 @@ def _setup_merger_workflow(
     return workflow
 
 
+def _bind_merger_outcome_doubles(
+    workflow: TaskWorkflow, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Swap in outcome doubles the caller holds, so assertions need no private read."""
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    submit = AsyncMock(return_value=WorkflowOutcome.DONE)
+    monkeypatch.setattr(workflow, '_mark_blocked', mark_blocked)
+    monkeypatch.setattr(workflow, '_submit_to_merge_queue', submit)
+    return mark_blocked, submit
+
+
 def _setup_reviewer_workflow(
     config: OrchestratorConfig, git_ops: GitOps, task_assignment: TaskAssignment, tmp_path: Path,
 ) -> TaskWorkflow:
@@ -222,9 +223,7 @@ def _setup_judge_workflow(
 
     ``get_diff_from_base`` is mocked to return a non-empty diff (mirrors
     ``test_judge_completion_verdict.py``'s ``_setup``) so the judge is
-    actually invoked rather than empty-diff-skipped — ``base_commit='oldbase'``
-    is stamped at ``artifacts.init()`` time (via ``_seed_workflow_artifacts``),
-    so ``_run_completion_judge`` takes the ``get_diff_from_base`` branch.
+    actually invoked rather than empty-diff-skipped.
     """
     workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, AgentStub())
     _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
@@ -252,7 +251,7 @@ def _setup_judge_workflow(
 
 def _fake_invoke_writes_merger_verdict(
     *, blocked: bool | None, reason: str = '', output: str = '', success: bool = True,
-    session_id: str = 'sid',
+    session_id: str = 'sid', subtype: str = '', turns: int = 0, cost_usd: float = 0.0,
 ) -> Callable[..., Any]:
     """``blocked=None`` writes NO verdict at all (agent never called
     ``submit_merge_disposition``) — the absent/fail-safe scenario.
@@ -260,10 +259,12 @@ def _fake_invoke_writes_merger_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if blocked is not None:
-            _artifacts_for(cwd).write_verdict(
+            agent_side_artifacts(cwd).write_verdict(
                 'merger', _envelope('merger', session_id, {'blocked': blocked, 'reason': reason}),
             )
-        return AgentResult(success=success, output=output)
+        return AgentResult(
+            success=success, output=output, subtype=subtype, turns=turns, cost_usd=cost_usd,
+        )
 
     return _fake
 
@@ -285,7 +286,7 @@ def _fake_invoke_writes_reviewer_verdict(
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if verdict is not None:
             _submit_review_verdict(
-                _artifacts_for(cwd), role_name, session_id, role_name, verdict,
+                agent_side_artifacts(cwd), role_name, session_id, role_name, verdict,
                 issues or [], summary,
             )
         return AgentResult(success=success, output=output, timed_out=timed_out)
@@ -306,7 +307,7 @@ def _fake_invoke_writes_judge_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if artifact is not None:
-            _artifacts_for(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
+            agent_side_artifacts(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
         return AgentResult(success=success, output=output, structured_output=structured_output)
 
     return _fake
@@ -317,19 +318,15 @@ def _fake_invoke_writes_triage_verdict(
     skipped: list | None = None, proposed_task_groups: list | None = None,
     success: bool = True, output: str = '', session_id: str = 'sid',
 ) -> Callable[..., Any]:
-    """Closes over *worktree* explicitly rather than reading ``cwd`` from
-    kwargs: ``_pre_triage_suggestions`` invokes with
-    ``cwd=self.config.project_root`` (so the agent can browse the whole repo)
-    but derives its verdict meta_root from ``self.worktree`` — the two
-    deliberately differ (steward.py:727/760/796), so the fake must target the
-    worktree-derived root the steward actually reads back from, not the
-    invocation cwd.
+    """Closes over *worktree* explicitly: the fake must write to the roots
+    ``_pre_triage_suggestions`` derives from ``self.worktree`` and reads back
+    from (``TaskArtifacts.for_task``), whatever cwd the invocation carries.
     """
 
     async def _fake(**kwargs: Any) -> AgentResult:
         if write:
             _submit_triage(
-                _artifacts_for(worktree), 'triage', session_id,
+                agent_side_artifacts(worktree), 'triage', session_id,
                 accepted or [], skipped or [], proposed_task_groups or [],
             )
         return AgentResult(success=success, output=output)
@@ -353,12 +350,12 @@ def _make_triage_escalation(
 
 @pytest.fixture
 def triage_steward(make_steward) -> TaskSteward:
-    """conftest's ``make_steward`` steward, its .task-meta root pre-initialised
+    """conftest's ``make_steward`` steward, its .task-meta roots pre-initialised
     as ``TaskWorkflow._setup`` does in production, so
-    ``_pre_triage_suggestions``'s "meta-root missing" branch never fires.
+    ``_pre_triage_suggestions``'s "artifact root missing" branch never fires.
     """
     steward = make_steward()
-    _artifacts_for(steward.worktree).init(
+    TaskArtifacts.for_task(steward.worktree, steward.task_id).init(
         steward.task_id, steward.task['title'], steward.task['description'],
     )
     return steward
@@ -476,6 +473,74 @@ class TestMergerBoundary:
         args, _kwargs = workflow._mark_blocked.await_args  # type: ignore[attr-defined]
         assert 'Merger invocation failed' in args[0]
         workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_empty_output_invocation_failure_reports_kind_and_evidence(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """An empty-output merger failure blocks with a reason naming the
+        failure kind and subtype (no bare ``'Merger invocation failed: '``),
+        the classifier's diagnostics in the detail, structured evidence, and
+        a check-merge-status-first suggested action (task 5107). The block
+        itself is unchanged: I-FAIL-SAFE, merge_phase kept, no resubmit.
+        """
+        workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        mark_blocked, submit = _bind_merger_outcome_doubles(workflow, monkeypatch)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_merger_verdict(
+                blocked=None, success=False, output='',
+                subtype='error_empty_output', turns=7, cost_usd=1.25,
+            ),
+        )
+
+        outcome = await workflow._resolve_and_resubmit(
+            'task/42', 'conflict in lib.py', merge_phase=True,
+        )
+
+        mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
+        args, kwargs = mark_blocked.await_args
+        assert 'Merger invocation failed' in args[0]
+        assert f'kind={AgentFailureKind.EMPTY_OUTPUT.value}' in args[0]
+        assert 'error_empty_output' in args[0]
+        assert not args[0].rstrip().endswith(':')
+        assert 'turns=7' in kwargs['detail']
+        assert kwargs['evidence']
+        observations = '\n'.join(entry['observation'] for entry in kwargs['evidence'])
+        assert 'error_empty_output' in observations
+        assert 'turns=7' in observations
+        assert kwargs['suggested_action'] == CHECK_MERGE_STATUS_BEFORE_RETRY
+        assert kwargs['merge_phase'] is True
+        submit.assert_not_awaited()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_no_disposition_with_empty_output_has_no_dangling_colon(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """A merger that succeeded with no output and no disposition blocks
+        with a reason that says so, never ``'...disposition: '`` with
+        nothing after it, and still attaches evidence (task 5107).
+        """
+        workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        mark_blocked, submit = _bind_merger_outcome_doubles(workflow, monkeypatch)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_merger_verdict(blocked=None, success=True, output=''),
+        )
+
+        outcome = await workflow._resolve_and_resubmit(
+            'task/42', 'conflict in lib.py', merge_phase=True,
+        )
+
+        mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
+        args, kwargs = mark_blocked.await_args
+        assert args[0].startswith('Merger emitted no/invalid disposition')
+        assert 'Merger invocation failed' not in args[0]
+        assert not args[0].rstrip().endswith(':')
+        assert kwargs['evidence']
+        submit.assert_not_awaited()
         assert outcome == WorkflowOutcome.BLOCKED
 
 
@@ -807,7 +872,7 @@ class TestTriageBoundary:
         NOT leak through as a modified escalation.
         """
         escalation = _make_triage_escalation(self._SUGGESTIONS)
-        _artifacts_for(triage_steward.worktree).write_verdict(
+        agent_side_artifacts(triage_steward.worktree).write_verdict(
             'triage',
             _envelope('triage', 'stale-sid', {
                 'accepted': [{
@@ -851,7 +916,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_judge_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'judge',
             _envelope('judge', 'stale-sid', {
                 'complete': True, 'reasoning': 'stale', 'uncovered_plan_steps': [],
@@ -877,7 +942,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'merger', _envelope('merger', 'stale-sid', {'blocked': False, 'reason': ''}),
         )
         monkeypatch.setattr(

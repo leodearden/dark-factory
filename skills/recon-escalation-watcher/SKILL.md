@@ -53,14 +53,13 @@ claude --strict-mcp-config --mcp-config "$DARK_FACTORY_ROOT/recon-watch/mcp.json
   "/recon-escalation-watcher"
 ```
 
-**Default lane: tmux.** This is a long-running loop session (PRD
-`plans/fleet-cockpit-prd.md` §3 fork 1) — run it in the crash-survivable, reattachable tmux lane
-by default: wrap the invocation above via `skills/spawn/spawn-claude.sh` with
-`CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window. A killed watcher is reattachable
-with `tmux attach`, and its record persists across the crash. Interactive one-offs are unaffected
-— this watcher never spawns interactive sessions of its own (see the table above: no `/unblock`,
-no worktree).
+**Lane.** This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The
+operator runs it as a **T3 Code thread** (hosted; no `CLAUDE_SPAWN_BACKEND` needed). Launched from a
+plain terminal, run it in the crash-survivable, reattachable tmux lane: wrap the invocation above via
+`skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the
+session gets a `display.kind=tmux` session-registry record and a `tmux attach`-reattachable window
+that persists across a crash. This watcher never spawns interactive sessions of its own (see the
+table above: no `/unblock`, no worktree).
 
 `recon-watch/mcp.json` (created by the setup; both servers required):
 
@@ -554,14 +553,13 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
-   elif res["status"] == "awaiting_curation":
-       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+   elif res["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (_shared/ticket-failure-handling.md)
+       # No task_id yet, NOT a failure. Still open after the re-resolve:
        resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
-       # Retryable (`server_restart`, `timeout`): apply
-       # _shared/ticket-failure-handling.md's retry policy (retry
-       # `resolve_ticket` first under `timeout`; re-submit the pair once
-       # under `server_restart`) within its 2-submit/2-resolve cap, then
+       # Retryable (`server_restart`): apply
+       # _shared/ticket-failure-handling.md's retry policy (re-submit the
+       # pair once) within its 2-submit/2-resolve cap, then
        # re-enter this dispatch on the retry's outcome. Once the reason is
        # terminal — or that budget is exhausted — do NOT call resolve_issue:
        # leave the escalation pending. Record res["reason"], tell the human,
@@ -571,9 +569,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # See _shared/ticket-failure-handling.md for the full retryable/
        # terminal reason matrix and R4 idempotency guidance.
    else:
-       # Unrecognized status (e.g. `cancelled`, written by cancel_ticket —
-       # the ticket status column has no CHECK constraint, and tools.py's
-       # docstring documents only the four statuses above). Same
+       # `cancelled` (withdrawn by cancel_ticket: terminal, no task_id) or a
+       # status outside _shared/ticket-failure-handling.md's vocabulary (the
+       # ticket status column has no CHECK constraint). Same
        # follow-through as the `failed` arm above (tell the human, file a
        # DecisionRecord, append this esc-id to the exclude file; do NOT call
        # resolve_issue) — plus record the raw `res`, since the status itself
@@ -631,6 +629,42 @@ check ran in. Single normative statement of the rule:
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`eval_regression`** (blocking) — filed at level 1 by the scheduled
+  memory-eval runner (`fused-memory/scripts/memory_eval_runner.py`, timer
+  `fused-memory-memory-eval.timer`, daily 03:15; OPERATIONS.md §"Scheduled
+  memory evals (03:15)"). The program never resolves its own escalations: you
+  are the sole closer. While a record is pending, the runner suppresses
+  re-filing its `dedupe_fingerprint`. Three shapes, told apart by summary:
+  - *Regression* — task id `memory-eval-<eval_id>`, summary `memory-eval
+    <eval_id>: <metric>[<item>] regressed at <stamp> ...`. **verify-fixed**
+    against `fused-memory/data/memory-evals/verdicts-current.json`: when its
+    `run_stamp` is later than the record's, and the entry whose `fingerprint`
+    equals this record's `dedupe_fingerprint` is no longer `alarm`,
+    `resolve_issue(..., action='resume', resolution="Verified fixed: <eval_id>
+    <metric> verdict=<v> at <run_stamp>")`. If it still alarms, or no newer run
+    carries the entry, file-a-real-task (for retrieval findings, link the
+    3111/3112/3200 fix lineage), `stamp_triage` the record with the filed task
+    id, and **leave it pending**. Never dismiss a still-alarming fingerprint:
+    the ratchet never grandfathers a regression, so the next run re-files it as
+    soon as the record closes.
+  - *Storm aggregate* — task id `memory-eval-program`, summary `memory-eval
+    storm at <stamp>: <n> alarms exceed K=<k>`. More alarms than K in one run
+    usually share one cause. **Infrastructure first**: check fused-memory,
+    Qdrant and FalkorDB health and read the run report the record names
+    before triaging any single metric. Tell the human, file a DecisionRecord
+    via `write-decision`, and leave it pending. Unlike the other two shapes,
+    its fingerprint is scoped to its run, so a storm that persists files one
+    new aggregate per run. Fold them: keep the oldest pending aggregate as the
+    one you triage, and dismiss each later one that has the same cause with
+    `resolve_issue(..., action='close_only', resolution="Same storm as
+    <oldest esc-id>")`. Dismissing one suppresses nothing, because no later run
+    reuses its fingerprint.
+  - *Runner failure* — task id `memory-eval-program`, summary `memory-eval
+    runner: <n> failure(s) at <stamp> (...)`. Handle it as `infra_issue`: tell
+    the human and leave it pending until a clean run. Its fingerprint carries
+    no stamp, so while it is pending a later failure files nothing: read the
+    journal (`journalctl --user -u fused-memory-memory-eval.service`) and the
+    run reports for those.
 - **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
   `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
   detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
@@ -740,7 +774,7 @@ check ran in. Single normative statement of the rule:
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
-  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  `TargetStoreUnpopulated` rather than manufacturing an empty queue and reporting a
   false clean run (see
   `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
   absolute `--queue-dir` if you cannot control the cwd.
@@ -1014,7 +1048,11 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a line on stderr that starts `write-decision --id <your id>`,
+  names `$CLAUDE_PID` and says `BLANK record_slug` (it carries no `WARNING` prefix). That line alone
+  is not a failed filing: an id on stdout still means the filing landed, and the row is only
+  unfocusable in the cockpit. Re-filing from the same session resolves the same way, so it does not
+  repair the link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried

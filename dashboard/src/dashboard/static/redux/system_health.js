@@ -18,7 +18,7 @@
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
 const {
-  plainDatum: plainHealthDatum,
+  undeliveredDatum: undeliveredHealthDatum,
   EM_DASH: HEALTH_EM_DASH,
 } = window.DF_DATUM;
 const { tasksBannerNoticesFor: taskStoreNotices } = window.DF_TASKS_OFFLINE_BANNER;
@@ -30,12 +30,9 @@ const HEALTH_RECON_ENDPOINT = '/api/v2/dashboard/recon';
 // Red first: the header names the worst news first.
 const HEALTH_FAULT_TONES = Object.freeze(['bad', 'warn']);
 
-// "Has this endpoint delivered?" is ASKED of datum.js, as derivedDatum asks
-// it: a probe value plainDatum cannot call absent comes back a hole only when
-// there is no receipt, and that hole's reason is the row's title.
-function undeliveredHole(data, endpointKey) {
-  const probe = plainHealthDatum(0, endpointKey, data.__receipt || {});
-  return probe.state === 'unknown' ? probe : null;
+// Never undefined, so no row falls through to datum.js's browser-global default.
+function healthReceipts(data) {
+  return data.__receipt || {};
 }
 
 // Unmeasured is amber: never green, since nothing was measured, and never red,
@@ -55,7 +52,7 @@ function healthMemoryStatus(data) {
 // ── Graphiti / Mem0: connectivity as fused-memory's get_status measured it ──
 
 function connectionHealth(data, storeKey) {
-  const hole = undeliveredHole(data, HEALTH_MEMORY_ENDPOINT);
+  const hole = undeliveredHealthDatum(HEALTH_MEMORY_ENDPOINT, healthReceipts(data));
   if (hole) return unmeasuredRow(hole.reason);
 
   const status = healthMemoryStatus(data);
@@ -86,7 +83,7 @@ function projectsAnswering(count) {
 }
 
 function taskStoreHealth(data) {
-  const hole = undeliveredHole(data, HEALTH_TASKS_ENDPOINT);
+  const hole = undeliveredHealthDatum(HEALTH_TASKS_ENDPOINT, healthReceipts(data));
   if (hole) return unmeasuredRow(hole.reason);
 
   const notices = taskStoreNotices(data);
@@ -113,7 +110,7 @@ function taskStoreHealth(data) {
 // `sub` key here, spreading this after the JSX's own sub never overwrites it.
 
 function fusedMemoryHealth(data) {
-  const hole = undeliveredHole(data, HEALTH_MEMORY_ENDPOINT);
+  const hole = undeliveredHealthDatum(HEALTH_MEMORY_ENDPOINT, healthReceipts(data));
   if (hole) return unmeasuredTone(hole.reason);
 
   const status = healthMemoryStatus(data);
@@ -129,7 +126,7 @@ function fusedMemoryHealth(data) {
 // but no judge found anything serious.
 
 function reconHealth(data) {
-  const hole = undeliveredHole(data, HEALTH_RECON_ENDPOINT);
+  const hole = undeliveredHealthDatum(HEALTH_RECON_ENDPOINT, healthReceipts(data));
   if (hole) return unmeasuredRow(hole.reason);
 
   const verdict = (data.RECON_STATE || {}).verdict;
@@ -152,7 +149,7 @@ function storesCurrent(count) {
 }
 
 function walHealth(data) {
-  const hole = undeliveredHole(data, HEALTH_MEMORY_ENDPOINT);
+  const hole = undeliveredHealthDatum(HEALTH_MEMORY_ENDPOINT, healthReceipts(data));
   if (hole) return unmeasuredRow(hole.reason);
 
   const wal = healthMemoryStatus(data).wal || {};

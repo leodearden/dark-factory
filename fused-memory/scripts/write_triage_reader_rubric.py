@@ -19,7 +19,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
-from fused_memory.server.grouped_read import _digest
+from fused_memory.server.grouped_read import amendment_text
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -71,11 +71,14 @@ class Role(StrEnum):
     PRIMARY = 'primary'
     SECOND = 'second'
     THIRD = 'third'
+    CROSS_FAMILY = 'cross_family'
     DERIVED = 'derived'
 
 
-RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD})
-"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers."""
+RATER_ROLES = frozenset({Role.PRIMARY, Role.SECOND, Role.THIRD, Role.CROSS_FAMILY})
+"""The roles of a row a rater answered; only these rows carry evidence or non_consumed answers.
+
+A cross_family row keeps the same contract but never votes: ``resolve_judgements`` refuses it."""
 
 
 class Resolved(StrEnum):
@@ -228,9 +231,12 @@ def resolve_judgements(rows: Iterable[Mapping[str, Any]]) -> Mapping[PairKey, Ju
     votes: defaultdict[PairKey, dict[str, tuple[int, Vote]]] = defaultdict(dict)
     for index, row in enumerate(rows):
         pair = (row.get('entry_id'), row.get('target_id'), row.get('basis'))
-        violation = _row_violation(row)
+        violation = row_violation(row)
         if violation is not None:
             raise ValueError(f'verdict row {index} on pair {pair}: {violation}')
+        if row['role'] == Role.CROSS_FAMILY:
+            raise ValueError(f'verdict row {index} on pair {pair}: role cross_family never votes'
+                             ' in a corpus; it is compared with the corpus, not counted in it')
         key = PairKey(row['entry_id'], row['target_id'], Basis(row['basis']))
         if row['rater'] in votes[key]:
             raise ValueError(
@@ -277,8 +283,12 @@ def _refuse_mixed_votes(key: PairKey, indexed: list[tuple[int, Vote]]) -> None:
             )
 
 
-def _row_violation(row: Mapping[str, Any]) -> str | None:
-    """The first rubric invariant *row* breaks, naming the offending value; None if none."""
+def row_violation(row: Mapping[str, Any]) -> str | None:
+    """The first rubric invariant *row* alone breaks, naming the offending value; None if none.
+
+    :func:`resolve_judgements` makes this check of every row before counting it;
+    a cross_family row, which is never counted, is checked here alone.
+    """
     missing = [key for key in _REQUIRED_KEYS if key not in row]
     if missing:
         return f'lacks {", ".join(missing)}'
@@ -430,11 +440,15 @@ def quote_found(quote: str, text: str) -> bool:
 
 
 def digest_visible(loss_spans: Sequence[str], child_text: str) -> bool:
-    """Whether every span lies inside the digest a reader of the parent sees of *child_text*."""
+    """DIGEST: whether every span lies in the amendment text a reader of the parent sees of *child_text*.
+
+    That text is ``grouped_read.amendment_text`` at its shipped default cap, so
+    an offline re-score is reproducible from git.
+    """
     if not loss_spans:
         raise ValueError('digest_visible needs at least one loss span')
-    digest = _digest(child_text)
-    return all(quote_found(span, digest) for span in loss_spans)
+    shown = amendment_text(child_text)
+    return all(quote_found(span, shown) for span in loss_spans)
 
 
 def _normalised(text: str) -> str:
@@ -465,7 +479,7 @@ CELL_RULES: Mapping[Cell, str] = MappingProxyType({
     ),
     Cell.DIGEST_CONFLICT: (
         'An amended write disputes its record (CONFLICT), and a reader of the record'
-        ' meets the dispute only as an untagged 240-character digest.'
+        ' meets the dispute only as an untagged amendment, not as a correction.'
     ),
     Cell.WRONG_HOME: (
         "An attached write is not about its record's claim (HOME=NO); a contest whose"

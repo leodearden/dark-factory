@@ -14,7 +14,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from dotenv import load_dotenv
 
@@ -28,6 +28,9 @@ from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
+)
+from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
+    RebuildResult,
 )
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
@@ -59,7 +62,19 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.consolidation_ops import MemoryUpdater
     from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+    from fused_memory.services.mem0_retry_backlog_alarm import Mem0RetryBacklogChecker
+    from fused_memory.services.mem0_write_retry import Mem0RetryRunner, OnMem0Landed
+
+    class _Mem0WriteDurabilityService(
+        Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
+    ):
+        """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
+
+        async def recover_mem0_intents(
+            self, *, on_landed: OnMem0Landed | None = None
+        ) -> object: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -573,11 +588,9 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.journal_retention import prune_every_table_at_startup
     from fused_memory.services.write_journal import WriteJournal
-    from fused_memory.services.write_ops_retention import (
-        prune_write_ops_pass,
-        run_periodic_write_ops_prune,
-    )
+    from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -589,43 +602,12 @@ async def run_server():
     # self.mem0 / self.durable_queue), so this must run here rather than inside
     # initialize(). Idempotent — no pending intents ⇒ no-op — so it is safe to
     # run on every startup; a partial dual write is thus never left SILENT.
-    _mem0_recovery = await memory_service.recover_mem0_intents()
-    logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
+    await _recover_mem0_intents_at_startup(memory_service)
 
-    # Bounded retention: age out old terminal mem0_intents so the write-ahead
-    # journal does not grow without bound (one row accrues per successful mem0
-    # write). Runs after recovery so no still-pending intent is ever pruned;
-    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
-    _mem0_pruned = await write_journal.prune_mem0_intents()
-    if _mem0_pruned:
-        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
-
-    # Bounded retention: age out old idempotent_ops so the client-idempotency
-    # key table does not grow without bound (one row accrues per mutating task
-    # write). An idempotency key only needs to outlive the transport-retry
-    # window it guards, so the default TTL is aggressive. Fire-and-forget.
-    _idempotent_pruned = await write_journal.prune_idempotent_ops()
-    if _idempotent_pruned:
-        logger.info(
-            f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
-        )
-
-    # Bounded retention: age out old write_ops so the journal does not grow
-    # without bound. UNLIKE its two siblings above this prune is BATCHED,
-    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
-    # 16 GB, and an unbounded DELETE here would hold the write lock past the
-    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
-    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
-    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. The periodic loop
-    # started below now carries the drain, not successive restarts; this pass
-    # catches up after downtime, and every partial pass discloses its backlog at
-    # WARNING. Fire-and-forget.
-    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
-    if _write_ops_pruned:
-        logger.info(
-            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
-        )
+    # Must follow mem0 intent recovery, so no still-pending intent is pruned.
+    _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
+    if any(_pruned.values()):
+        logger.info(f'write journal retention prune at startup: {_pruned}')
 
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
@@ -656,8 +638,8 @@ async def run_server():
         ScopeViolationEscalator,
     )
     from fused_memory.models.scope import (
-        build_known_projects_map,
-        known_project_roots_from_env,
+        configured_known_projects_map,
+        configured_primary_root,
     )
 
     curator_escalator = CuratorEscalator(
@@ -670,17 +652,12 @@ async def run_server():
     # configured falls back to the built-in single-project dark_factory
     # registry (ProjectPrefixRegistry.default(), task 2208) — the guard
     # always runs, just against a smaller registry.
-    _primary_root = (
-        config.taskmaster.project_root if config.taskmaster else ''
-    ) or ''
-    if _primary_root:
-        _primary_root = str(Path(_primary_root).expanduser().resolve())
-    _extra_roots = known_project_roots_from_env()
-    # Single source of truth for the project registry — derived once and used to
-    # build the path-scope guard (ProjectPrefixRegistry), then passed through to
-    # ReconciliationHarness and TicketJanitor so all three consumers share the
-    # same snapshot (task 1164).
-    _known_projects_map = build_known_projects_map(_primary_root, _extra_roots)
+    _primary_root = configured_primary_root(config.taskmaster)
+    # The registry's derivation rule lives in
+    # models/scope.py::configured_known_projects_map (GraphitiBackend calls it
+    # too).  This SNAPSHOT is shared with ProjectPrefixRegistry, MemoryService,
+    # ReconciliationHarness and TicketJanitor (task 1164).
+    _known_projects_map = configured_known_projects_map(config.taskmaster)
     # Task 3088: the same snapshot, injected into MemoryService so update_memory's
     # storm escalator can resolve a project_root. Deliberately HERE — before the
     # `if config.reconciliation ... enabled:` block below — because the alarm is
@@ -740,7 +717,8 @@ async def run_server():
     # Stage-2 LLM adjudicator for path-scope guard (task 1822): wired only in
     # multi-project mode when config.path_scope_adjudicator.enabled is True.
     # In single-project/back-compat mode the adjudicator is None and the guard
-    # behaves exactly as before (heuristic-only, not weakened).
+    # behaves exactly as before (heuristic-only, not weakened).  It borrows the
+    # curator's gate and ledger store; _graceful_shutdown keeps owning the store's close.
     path_scope_adjudicator = None
     if _multi_project_mode and config.path_scope_adjudicator.enabled:
         from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
@@ -748,6 +726,7 @@ async def run_server():
         path_scope_adjudicator = PathScopeAdjudicator(
             config.path_scope_adjudicator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             cwd=Path(_primary_root) if _primary_root else None,
             scope_violation_escalator=scope_violation_escalator,
         )
@@ -785,9 +764,6 @@ async def run_server():
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
-        from fused_memory.services.orchestrator_detector import (
-            is_orchestrator_live_for,
-        )
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
@@ -814,6 +790,7 @@ async def run_server():
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
+            coalesce_task_events=config.reconciliation.coalesce_task_events,
         )
         await event_buffer.initialize()
 
@@ -846,7 +823,6 @@ async def run_server():
         backlog_policy = BacklogPolicy(
             event_buffer,
             event_queue,
-            is_orchestrator_live_for,
             hard_limit=config.reconciliation.backlog_hard_limit,
             hard_limit_overrides=config.reconciliation.backlog_hard_limit_overrides,
             rate_limit_seconds=(
@@ -1167,6 +1143,8 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
+    mem0_retry_task = _start_mem0_retry_loop(memory_service)
+
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
         task_interceptor.remint_broken_recurrence_chains,
@@ -1349,6 +1327,9 @@ async def run_server():
         write_ops_prune_task.cancel()
         with contextlib.suppress(BaseException):
             await write_ops_prune_task
+        mem0_retry_task.cancel()
+        with contextlib.suppress(BaseException):
+            await mem0_retry_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):
@@ -1629,6 +1610,60 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
+def _mark_supersedes_on_landing(memory_service: MemoryUpdater) -> OnMem0Landed:
+    """The hook every Mem0 re-issue path runs when it lands: mark the write's journaled supersedes.
+
+    Composed here because the service layer cannot import supersession_mark
+    without pulling server modules up into it.
+    """
+    from fused_memory.services.supersession_mark import mark_superseded_after_retry
+
+    return partial(mark_superseded_after_retry, memory_service)
+
+
+async def _recover_mem0_intents_at_startup(memory_service: _Mem0WriteDurabilityService) -> None:
+    summary = await memory_service.recover_mem0_intents(
+        on_landed=_mark_supersedes_on_landing(memory_service)
+    )
+    logger.info(f'mem0 intent recovery at startup: {summary}')
+
+
+def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> asyncio.Task[None]:
+    """Spawn the Mem0 write retry pass and its backlog check on the service's own policy; RETURN one handle for teardown.
+
+    Each runs in its own loop, so a failing pass never skips the check.
+    """
+    from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry
+
+    policy = memory_service.mem0_retry_policy
+
+    async def _run_both() -> None:
+        async with asyncio.TaskGroup() as loops:
+            loops.create_task(run_periodic_mem0_retry(
+                partial(
+                    memory_service.retry_due_mem0_intents,
+                    on_landed=_mark_supersedes_on_landing(memory_service),
+                ),
+                interval_seconds=policy.poll_interval_seconds,
+                what='retry pass',
+            ))
+            loops.create_task(run_periodic_mem0_retry(
+                memory_service.check_mem0_retry_backlog,
+                interval_seconds=policy.backlog_check_interval_seconds,
+                what='retry backlog check',
+            ))
+
+    task = asyncio.create_task(_run_both(), name='mem0_write_retry')
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass; '
+        'backlog age checked every %.0fs',
+        policy.poll_interval_seconds,
+        policy.batch_size,
+        policy.backlog_check_interval_seconds,
+    )
+    return task
+
+
 def _start_remint_sweep(
     task_backend: TaskBackendProtocol | None,
     remint: Callable[[str], Awaitable[object]],
@@ -1760,16 +1795,17 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
     tests can exercise the fan-out without waiting for
     ``cfg.interval_seconds``.
 
-    Each project's result dict (``rebuilt``/``stale_entities``/``skipped``/
-    ``errors``) is logged so an operator can see whether the sweep is
-    actually reducing staleness — at WARNING when the project reported any
-    per-entity errors, INFO otherwise.
+    Each project's result (``rebuilt``/``stale_entities``/``skipped``/
+    ``errors`` and the four read-completeness keys) is logged so an operator
+    can see whether the sweep is actually reducing staleness — at WARNING
+    when the project reported any per-entity errors OR its corpus is not
+    proven complete (either verdict not ``is True``), INFO otherwise.
     """
     if not cfg.enabled or not cfg.projects:
         return
     for project_id in cfg.projects:
         try:
-            result = await memory_service.rebuild_entity_summaries(
+            raw = await memory_service.rebuild_entity_summaries(
                 project_id=project_id,
                 force=cfg.force,
                 _source='periodic_maintenance',
@@ -1777,16 +1813,20 @@ async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
         except Exception:
             logger.exception('rebuild_entity_summaries failed for project %s', project_id)
             continue
-        result = result or {}
-        errors = result.get('errors', 0)
-        log_fn = logger.warning if errors else logger.info
+        result = RebuildResult.from_service_result(raw or {})
+        log_fn = (
+            logger.warning
+            if result.errors or not result.corpus_proven_complete
+            else logger.info
+        )
         log_fn(
-            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s',
+            'summary rebuild project=%s rebuilt=%s stale=%s skipped=%s errors=%s %s',
             project_id,
-            result.get('rebuilt'),
-            result.get('stale_entities'),
-            result.get('skipped'),
-            errors,
+            result.rebuilt,
+            result.stale_entities,
+            result.skipped,
+            result.errors,
+            result.completeness_summary,
         )
 
 
@@ -1915,18 +1955,16 @@ def _build_ticket_janitor(
 ) -> TicketJanitor | None:
     """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
     from fused_memory.middleware.ticket_janitor import TicketJanitor
+    from fused_memory.models.scope import configured_primary_root
 
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is None or not janitor_cfg.enabled:
         return None
-    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
-    if primary_root:
-        primary_root = str(Path(primary_root).expanduser().resolve())
     return TicketJanitor(
         ticket_store,
         cooldown_secs=janitor_cfg.cooldown_seconds,
         batch_limit=janitor_cfg.batch_limit,
-        primary_project_root=primary_root,
+        primary_project_root=configured_primary_root(config.taskmaster),
         liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
         signal_ticket_resolved=(
             task_interceptor._signal_ticket_event if task_interceptor is not None else None
@@ -2073,54 +2111,77 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 def _install_tool_dispatch_guards(
     mcp: Any, *, known_projects: dict[str, str] | None = None
 ) -> None:
-    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+    """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
-    Two independent concerns share this chokepoint, and the order they are
-    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
-    therefore what the caller sees when both fire:
+    Three independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — each call wraps whatever ``call_tool`` it
+    finds, so the order decides which one ends up OUTSIDE, and therefore what
+    the caller sees when more than one fires:
 
-    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
-       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
-       otherwise poison StreamableHTTPSessionManager's shared task group and
-       cascade into uvicorn's main loop. Re-raises CancelledError, which
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth, INNERMOST.
+       Catches BaseException escapes (SystemExit, BaseExceptionGroup, ...) that
+       would otherwise poison StreamableHTTPSessionManager's shared task group
+       and cascade into uvicorn's main loop. Re-raises CancelledError, which
        asyncio cancellation semantics require.
-    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+    2. :func:`~fused_memory.server.unknown_argument_guard.install_unknown_argument_guard`
+       — refuses a call naming an argument the tool does not declare, which
+       the bundled FastMCP would otherwise drop silently (task 4867).
+    3. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
        write-boundary markup guard (task 4458, PRD
-       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
-       argument absorbed MCP tool-call envelope markup and hands the caller a
-       ``repaired_call`` to resubmit verbatim.
+       ``plans/toolcall-markup-containment-prd.md``), OUTERMOST. Rejects a call
+       whose argument absorbed MCP tool-call envelope markup and hands the
+       caller a ``repaired_call`` to resubmit verbatim.
 
-    DO NOT tidy these two calls into the other order. The guard REJECTS by
-    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
-    that survives every output schema, since a returned dict is destroyed by
-    the output validation of any tool annotated ``-> str``. Installed second it
-    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
-    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
-    BaseException and flattens the rejection into its own
-    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
-    stops being a key the caller can read and survives only as text inside an
-    opaque string, so the agent cannot resubmit the repair.
+    DO NOT tidy these calls into another order. Both guards REJECT by raising
+    :class:`fastmcp.exceptions.ToolError` — measured as the only shape that
+    survives every output schema, since a returned dict is destroyed by the
+    output validation of any tool annotated ``-> str``. A guard installed
+    BEFORE ``_install_safe_tool_wrapper`` ends up inside ``_safe_call_tool``,
+    which catches BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: the structured payload
+    survives only as text inside an opaque string.
 
     Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
     the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
     such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
     pins. Order is the whole mechanism.
 
+    The unknown-argument guard sits INSIDE the markup guard because the markup
+    remedy, ``metadata={'allow_mcp_markup': True}``, is legal on every tool:
+    on a tool that declares no ``metadata`` the markup guard strips it before
+    forwarding, so the unknown-argument guard must see the post-strip call.
+
     *known_projects* is run_server's ``project_id -> project_root`` registry,
-    which the guard's storm-escalation sink uses to place a burst in the right
-    queue.
+    which the markup guard's storm-escalation sink uses to place a burst in the
+    right queue.
 
     REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
     C2), declared HERE at the interception point rather than inferred per tool
-    (INV-1). This is also the primary server only: the recon-report server
-    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    (INV-1). The recon-report server hosts no write tools and gets no markup
+    guard; it gets the other two through :func:`_install_recon_report_guards`.
     """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
     _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
     install_markup_guard(
         mcp,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=known_projects,
     )
+
+
+def _install_recon_report_guards(mcp: Any) -> None:
+    """The recon-report server's wrappers: the safe wrapper inside, the unknown-argument guard outside.
+
+    Recon LLM agents call its cite_* and report tools over MCP, so a misnamed
+    argument there is dropped exactly as on the primary server. Order: see
+    :func:`_install_tool_dispatch_guards`.
+    """
+    from fused_memory.server.unknown_argument_guard import install_unknown_argument_guard
+
+    _install_safe_tool_wrapper(mcp)
+    install_unknown_argument_guard(mcp)
 
 
 def _build_uvicorn_config(
@@ -2233,7 +2294,7 @@ def _build_recon_report_components(
         state.known_projects = known_projects
 
     mcp = create_recon_report_server(state)
-    _install_safe_tool_wrapper(mcp)
+    _install_recon_report_guards(mcp)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.recon_report_port

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import subprocess
 from collections import Counter
+from collections.abc import Collection
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -22,23 +24,29 @@ from _reviewer_trial_mining_fixtures import (
 from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
-from orchestrator.evals.reviewer_trial.__main__ import (
-    _infer_language,
-    _select_spot_check_subset,
-    cli,
-)
-from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
+from orchestrator.evals.reviewer_trial.__main__ import cli
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog, select_spot_check_subset
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
+    RecoveredCandidate,
+    admit_mined_diff,
     assign_split,
     audit_corpus,
+    backfill_hand_authored,
+    candidate_pool,
+    fetch_task_titles,
+    frontier_description,
+    infer_language,
     mine_escalation_refs,
     mine_fn_candidates,
+    mined_corpus_diff,
     propose_labels_frontier,
+    recover_candidates,
     recover_diff,
     resolve_merge_sha_by_task_id,
+    save_corpus,
 )
 
 
@@ -249,19 +257,19 @@ class TestResolveMergeShaByTaskId:
             ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
         ).stdout.strip()
 
-        sha = resolve_merge_sha_by_task_id('9999', repo)
+        sha = resolve_merge_sha_by_task_id('9999', repo, branch_prefix='task/', main_branch='main')
 
         assert sha == expected_sha
 
     def test_returns_none_when_no_matching_commit(self, tmp_path: Path) -> None:
         repo, _merge_sha = make_git_repo_with_merge(tmp_path)
 
-        sha = resolve_merge_sha_by_task_id('no-such-task', repo)
+        sha = resolve_merge_sha_by_task_id('no-such-task', repo, branch_prefix='task/', main_branch='main')
 
         assert sha is None
 
     def test_returns_none_for_nonexistent_repo(self, tmp_path: Path) -> None:
-        sha = resolve_merge_sha_by_task_id('1234', tmp_path / 'does-not-exist')
+        sha = resolve_merge_sha_by_task_id('1234', tmp_path / 'does-not-exist', branch_prefix='task/', main_branch='main')
 
         assert sha is None
 
@@ -515,63 +523,8 @@ class TestAuditCorpus:
         assert 'spot_check_subset_empty' in report.failures
 
 
-class TestSelectSpotCheckSubset:
-    """``__main__._select_spot_check_subset`` -- deterministic, evenly-spread
-    spot-check sampling with a floor and sticky (grow-only) membership.
-
-    Colocated here (rather than in test_reviewer_trial_main.py) because
-    these are CLI helpers that back the `mine` pipeline machinery this file
-    already tests end to end."""
-
-    def test_empty_input_returns_empty_set(self) -> None:
-        assert _select_spot_check_subset([]) == set()
-
-    def test_below_minimum_floor_selects_everything(self) -> None:
-        # n=3 < minimum=5 -> k is capped at n (not padded past the pool size).
-        diff_ids = ['a', 'b', 'c']
-        result = _select_spot_check_subset(diff_ids, minimum=5)
-        assert result == {'a', 'b', 'c'}
-
-    def test_fraction_rounds_to_target_size(self) -> None:
-        diff_ids = [f'd{i:03d}' for i in range(100)]
-        result = _select_spot_check_subset(diff_ids, fraction=0.1, minimum=5)
-        assert len(result) == 10
-
-    def test_deterministic_across_calls_and_input_order(self) -> None:
-        diff_ids = [f'd{i:03d}' for i in range(37)]
-        first = _select_spot_check_subset(diff_ids)
-        reordered = _select_spot_check_subset(list(reversed(diff_ids)))
-        again = _select_spot_check_subset(diff_ids)
-        assert first == reordered == again
-
-    def test_sticky_ids_survive_even_when_sampling_would_drop_them(self) -> None:
-        """A diff flagged in a smaller corpus must stay flagged after the
-        corpus grows, even though the deterministic even-spread sample over
-        the larger id set no longer lands on it -- this is the bug the
-        `sticky` param fixes: prior human sign-off silently disappearing on
-        a later `mine` resave."""
-        small = [f'd{i:02d}' for i in range(10)]
-        prior_subset = _select_spot_check_subset(small)
-        assert prior_subset == {'d00', 'd02', 'd04', 'd06', 'd08'}
-
-        grown = [f'd{i:02d}' for i in range(40)]
-        naive = _select_spot_check_subset(grown)  # no sticky: simulates the pre-fix bug
-        assert not prior_subset <= naive, 'test premise: naive resample must drop some prior ids'
-
-        result = _select_spot_check_subset(grown, sticky=prior_subset)
-        assert prior_subset <= result, 'sticky ids must never be dropped'
-        assert result - prior_subset, 'new ids should still be sampled to grow the subset'
-
-    def test_sticky_ids_no_longer_in_corpus_are_dropped(self) -> None:
-        """A sticky id that no longer exists in diff_ids (e.g. removed from
-        the corpus) must not leak into the result."""
-        diff_ids = ['a', 'b', 'c']
-        result = _select_spot_check_subset(diff_ids, sticky={'zzz-not-present'})
-        assert 'zzz-not-present' not in result
-
-
 class TestInferLanguage:
-    """``__main__._infer_language`` -- majority-vote language sniff from a
+    """``infer_language`` -- majority-vote language sniff from a
     unified diff's ``diff --git`` headers."""
 
     def test_majority_language_wins(self) -> None:
@@ -580,28 +533,28 @@ class TestInferLanguage:
             'diff --git a/b.py b/b.py\n'
             'diff --git a/c.rs b/c.rs\n'
         )
-        assert _infer_language(diff_text) == 'python'
+        assert infer_language(diff_text) == 'python'
 
     def test_tie_breaks_by_first_encountered_file(self) -> None:
         diff_text = (
             'diff --git a/c.rs b/c.rs\n'
             'diff --git a/a.py b/a.py\n'
         )
-        assert _infer_language(diff_text) == 'rust'
+        assert infer_language(diff_text) == 'rust'
 
     def test_unrecognized_extension_defaults_to_python(self) -> None:
         diff_text = 'diff --git a/README.md b/README.md\n'
-        assert _infer_language(diff_text) == 'python'
+        assert infer_language(diff_text) == 'python'
 
     def test_empty_diff_defaults_to_python(self) -> None:
-        assert _infer_language('') == 'python'
+        assert infer_language('') == 'python'
 
     def test_typescript_extension_recognized(self) -> None:
         diff_text = (
             'diff --git a/a.tsx b/a.tsx\n'
             'diff --git a/b.tsx b/b.tsx\n'
         )
-        assert _infer_language(diff_text) == 'typescript'
+        assert infer_language(diff_text) == 'typescript'
 
 
 class TestMineRunsDbValidation:
@@ -622,3 +575,299 @@ class TestMineRunsDbValidation:
         assert result.exit_code == 1
         assert 'runs.db not found' in result.output
         assert str(missing_db) in result.output
+
+
+_SEED = 'test-seed'
+_MINED_IDS = [f'mined_{i:02d}' for i in range(12)]
+
+
+def _issue(diff_id: str) -> GroundTruthIssue:
+    return GroundTruthIssue(
+        id=f'{diff_id}_gt', location='a.py:1', category='bug', severity='blocking',
+        description=f'a bug in {diff_id}', mutation_type='logic',
+    )
+
+
+def _corpus_and_log(*, mined_flagged: Collection[str] = ()) -> tuple[CorpusManifest, AdjudicationLog]:
+    """3 synthetic plus 12 mined diffs, each with a log entry; *mined_flagged* start in the spot-check subset."""
+    synthetic = [
+        CorpusDiff(diff_id=f'syn_{i}', language='python', source='synthetic',
+                   diff_text=f'syn {i}\n', description=f'syn {i}', ground_truth=[_issue(f'syn_{i}')])
+        for i in range(3)
+    ]
+    mined = [
+        CorpusDiff(diff_id=diff_id, language='python', source='mined', diff_text=f'{diff_id}\n',
+                   description=diff_id, ground_truth=[_issue(diff_id)], provenance={'kind': 'mined'})
+        for diff_id in _MINED_IDS
+    ]
+    manifest = CorpusManifest(diffs=[*synthetic, *mined])
+    log = AdjudicationLog()
+    for diff in manifest.diffs:
+        log.append(diff.diff_id, diff.ground_truth, in_spot_check_subset=diff.diff_id in mined_flagged)
+    return manifest, log
+
+
+def _flagged(log: AdjudicationLog) -> set[str]:
+    return {e.diff_id for e in log.spot_check_subset()}
+
+
+class TestSaveCorpus:
+    """save_corpus grows the spot-check subset over mined diffs, re-splits every diff, and saves both."""
+
+    @staticmethod
+    def _save(tmp_path: Path, manifest: CorpusManifest, log: AdjudicationLog) -> tuple[Path, Path]:
+        manifest_path = tmp_path / 'corpus' / 'manifest.json'
+        log_path = tmp_path / 'corpus' / 'adjudication_log.jsonl'
+        save_corpus(manifest, log, seed=_SEED, manifest_path=manifest_path, log_path=log_path)
+        return manifest_path, log_path
+
+    def test_every_diff_is_split_under_the_seed(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        self._save(tmp_path, manifest, log)
+
+        assert {d.diff_id: d.split for d in manifest.diffs} == assign_split(
+            [d.diff_id for d in manifest.diffs], seed=_SEED,
+        )
+        assert manifest.split_seed == _SEED
+
+    def test_the_spot_check_subset_is_sampled_over_mined_diffs_only(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        self._save(tmp_path, manifest, log)
+
+        assert _flagged(log) == select_spot_check_subset(_MINED_IDS)
+
+    def test_what_it_saves_reads_back(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        manifest_path, log_path = self._save(tmp_path, manifest, log)
+
+        loaded = CorpusManifest.load(manifest_path)
+        assert {d.diff_id: d.split for d in loaded.diffs} == {d.diff_id: d.split for d in manifest.diffs}
+        assert loaded.split_seed == _SEED
+        assert _flagged(AdjudicationLog.load(log_path)) == _flagged(log)
+
+    def test_a_flagged_mined_entry_stays_flagged(self, tmp_path: Path) -> None:
+        unsampled = sorted(set(_MINED_IDS) - select_spot_check_subset(_MINED_IDS))[0]
+        manifest, log = _corpus_and_log(mined_flagged={unsampled})
+
+        self._save(tmp_path, manifest, log)
+
+        assert unsampled in _flagged(log)
+
+
+class TestBackfillHandAuthored:
+    """backfill_hand_authored logs each unlogged hand-authored diff with its own ground truth."""
+
+    def test_each_unlogged_hand_authored_diff_gets_one_entry(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+
+        backfill_hand_authored(manifest, log)
+
+        assert [
+            (e.diff_id, e.frontier_model, e.frontier_proposal, e.in_spot_check_subset) for e in log.entries
+        ] == [
+            (d.diff_id, 'hand-authored', [asdict(gt) for gt in d.ground_truth], False)
+            for d in manifest.diffs if d.source != 'mined'
+        ]
+
+    def test_mined_and_already_logged_diffs_are_skipped(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+        log.append('syn_0', [], in_spot_check_subset=False, frontier_model='opus')
+
+        backfill_hand_authored(manifest, log)
+
+        assert [(e.diff_id, e.frontier_model) for e in log.entries] == [
+            ('syn_0', 'opus'), ('syn_1', 'hand-authored'), ('syn_2', 'hand-authored'),
+        ]
+
+    def test_it_returns_how_many_it_added(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+
+        assert backfill_hand_authored(manifest, log) == 3
+        assert backfill_hand_authored(manifest, log) == 0
+
+
+def _candidate(task_id: str, merge_sha: str | None) -> FnCandidate:
+    return FnCandidate(
+        task_id=task_id, project_id='dark_factory', outcome='requeued', review_cycles=2,
+        verify_attempts=3, merge_sha=merge_sha, signal_reason=['outcome=requeued', 'verify_attempts=3'],
+    )
+
+
+def _commit_task_merge(repo: Path, task_id: str, content: str) -> str:
+    """Commit *content* under the ``Merge task/<id> into main`` message convention; return its sha."""
+    (repo / f'{task_id}.txt').write_text(content)
+    subprocess.run(['git', 'add', f'{task_id}.txt'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', f'Merge task/{task_id} into main'], cwd=repo, check=True)
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+class TestFetchTaskTitles:
+    """fetch_task_titles reads task_results.title for the requested task ids."""
+
+    def test_returns_the_requested_titles_only(self, tmp_path: Path) -> None:
+        db = build_synthetic_runs_db(tmp_path, [
+            {'task_id': '1', 'title': 'one'}, {'task_id': '2', 'title': 'two'}, {'task_id': '3', 'title': 'three'},
+        ])
+
+        assert fetch_task_titles(db, ['1', '3']) == {'1': 'one', '3': 'three'}
+
+    def test_no_ids_returns_no_titles(self, tmp_path: Path) -> None:
+        db = build_synthetic_runs_db(tmp_path, [{'task_id': '1', 'title': 'one'}])
+
+        assert fetch_task_titles(db, []) == {}
+
+    def test_more_ids_than_one_chunk_still_returns_every_title(self, tmp_path: Path) -> None:
+        rows = [{'task_id': str(i), 'title': f'title {i}'} for i in range(1201)]
+        db = build_synthetic_runs_db(tmp_path, rows)
+
+        assert fetch_task_titles(db, [r['task_id'] for r in rows]) == {r['task_id']: r['title'] for r in rows}
+
+
+class TestRecoverCandidates:
+    """recover_candidates pairs each new candidate with its merge sha and diff, smallest diff first."""
+
+    def test_a_candidate_with_a_merge_sha_is_recovered_from_it(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+
+        [recovered] = recover_candidates(
+            [_candidate('1', merge_sha)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        )
+
+        assert (recovered.candidate.task_id, recovered.merge_sha) == ('1', merge_sha)
+        assert recovered.diff_text.strip()
+
+    def test_a_candidate_already_in_the_corpus_is_skipped(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+        candidate = _candidate('1', merge_sha)
+
+        assert candidate.diff_id == 'mined_1'
+        assert recover_candidates(
+            [candidate], existing_ids={'mined_1'}, repo_path=repo, branch_prefix='task/', main_branch='main',
+        ) == []
+
+    def test_an_unknown_sha_is_skipped(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+
+        assert recover_candidates(
+            [_candidate('1', '0' * 40)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        ) == []
+
+    def test_a_candidate_without_a_sha_is_found_by_its_merge_message(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+        sha = _commit_task_merge(repo, '77', 'fallback\n')
+
+        [recovered] = recover_candidates(
+            [_candidate('77', None)], existing_ids=set(), repo_path=repo, branch_prefix='task/', main_branch='main',
+        )
+
+        assert recovered.merge_sha == sha
+        assert '+fallback' in recovered.diff_text
+
+    def test_the_smallest_diff_comes_first(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+        big = _commit_task_merge(repo, '88', ''.join(f'line {i}\n' for i in range(200)))
+
+        recovered = recover_candidates(
+            [_candidate('88', big), _candidate('1', merge_sha)], existing_ids=set(), repo_path=repo,
+            branch_prefix='task/', main_branch='main',
+        )
+
+        assert [r.candidate.task_id for r in recovered] == ['1', '88']
+
+
+def _recovered(n: int) -> list[RecoveredCandidate]:
+    return [RecoveredCandidate(_candidate(str(i), f'sha{i}'), f'sha{i}', 'x' * (i + 1)) for i in range(n)]
+
+
+class TestCandidatePool:
+    """candidate_pool attempts what the corpus still needs plus an attrition buffer."""
+
+    @pytest.mark.parametrize('corpus_size', [100, 120])
+    def test_a_full_corpus_attempts_nothing(self, corpus_size: int) -> None:
+        assert candidate_pool(_recovered(10), corpus_size=corpus_size, target_total=100, limit=None) == []
+
+    @pytest.mark.parametrize(('corpus_size', 'pool_size'), [(90, 15), (60, 50)])
+    def test_the_pool_is_what_is_needed_plus_a_buffer(self, corpus_size: int, pool_size: int) -> None:
+        recovered = _recovered(100)
+
+        assert candidate_pool(recovered, corpus_size=corpus_size, target_total=100, limit=None) == (
+            recovered[:pool_size]
+        )
+
+    def test_limit_caps_the_pool(self) -> None:
+        recovered = _recovered(100)
+
+        assert candidate_pool(recovered, corpus_size=60, target_total=100, limit=7) == recovered[:7]
+
+
+class TestMinedCorpusDiff:
+    """mined_corpus_diff builds a mined dark-factory diff whose provenance says where it came from."""
+
+    def test_it_is_a_mined_dark_factory_diff(self, tmp_path: Path) -> None:
+        diff_text = 'diff --git a/x.rs b/x.rs\n+fn main() {}\n'
+        issues = [_issue('mined_42')]
+
+        diff = mined_corpus_diff(
+            RecoveredCandidate(_candidate('42', None), 'abc123', diff_text),
+            issues=issues, description='desc', escalation_refs=[], runs_db=tmp_path / 'runs.db',
+        )
+
+        assert (diff.diff_id, diff.source, diff.split, diff.project) == ('mined_42', 'mined', None, 'dark-factory')
+        assert diff.language == infer_language(diff_text) == 'rust'
+        assert (diff.diff_text, diff.description, diff.ground_truth) == (diff_text, 'desc', issues)
+
+    def test_its_provenance_names_the_candidate_merge_runs_db_and_escalations(self, tmp_path: Path) -> None:
+        candidate = _candidate('42', None)
+        ref = EscalationRef(
+            task_id='42', category='review_suggestions', severity='info', summary='s', level=1,
+            path=tmp_path / 'esc-42-1.json',
+        )
+        runs_db = tmp_path / 'runs.db'
+
+        diff = mined_corpus_diff(
+            RecoveredCandidate(candidate, 'abc123', 'diff'),
+            issues=[_issue('mined_42')], description='desc', escalation_refs=[ref], runs_db=runs_db,
+        )
+
+        provenance = diff.provenance
+        assert provenance is not None
+        candidate_fields = {k: v for k, v in asdict(candidate).items() if k != 'merge_sha'}
+        assert {k: provenance[k] for k in candidate_fields} == candidate_fields
+        assert (provenance['kind'], provenance['merge_sha'], provenance['runs_db_path']) == (
+            'mined', 'abc123', str(runs_db),
+        )
+        assert provenance['escalation_refs'] == [{**asdict(ref), 'path': str(ref.path)}]
+
+
+class TestFrontierDescription:
+    def test_it_names_the_task_project_title_and_every_signal(self) -> None:
+        text = frontier_description(_candidate('42', None), 'Fix the widget')
+
+        for part in ('42', 'dark_factory', 'Fix the widget', 'outcome=requeued', 'verify_attempts=3'):
+            assert part in text, (part, text)
+
+
+class TestAdmitMinedDiff:
+    def test_it_appends_the_diff_and_its_log_entry(self) -> None:
+        manifest, log = CorpusManifest(diffs=[]), AdjudicationLog()
+        diff = CorpusDiff(
+            diff_id='mined_42', language='python', source='mined', diff_text='d', description='d',
+            ground_truth=[_issue('mined_42')], provenance={'kind': 'mined'},
+        )
+
+        admit_mined_diff(manifest, log, diff, frontier_model='opus')
+
+        assert manifest.diffs == [diff]
+        [entry] = log.entries
+        assert (entry.diff_id, entry.frontier_model, entry.frontier_proposal, entry.in_spot_check_subset) == (
+            'mined_42', 'opus', [asdict(gt) for gt in diff.ground_truth], False,
+        )
+        assert '42' in entry.notes

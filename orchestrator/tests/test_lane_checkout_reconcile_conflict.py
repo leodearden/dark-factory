@@ -1,0 +1,247 @@
+"""A lane whose WIP cannot be snapshotted must not kill orchestrator startup (task 4053).
+
+The escape chain this file pins, one layer per test class:
+
+1. ``GitOps.commit`` refuses to snapshot a lane: it raises
+   ``WorktreeConflictError`` on an unmerged index and ``RuntimeError('Commit
+   failed: ...')`` when ``git commit`` itself fails (e.g. a rejecting hook).
+2. ``GitOps.detach_lane_checkout`` awaits that commit before
+   ``git checkout --detach``; its contract is a bool, False meaning "the
+   branch was not freed".
+3. ``Harness._reconcile_lane_checkouts`` calls it at three sites
+   (dup-checkout, deleted-id, terminal) and handles only the False return.
+4. ``Harness.run`` runs the sweep as startup step 2c2 through the startup-step
+   runner (``orchestrator/src/orchestrator/startup_steps.py``), which reports an
+   escaping exception and carries on; that layer is pinned in
+   ``test_harness_startup_steps.py``.
+
+A conflicted lane can never be detached anyway (``git checkout --detach``
+refuses on an unmerged index), so the correct outcome at every layer is:
+leave the checkout attached, keep or restore the pin, warn, and carry on.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+from _workflow_helpers import _build_harness, _init_git_repo
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.startup_steps import EntryFailures
+
+_BARE_ID = '3965'
+_TASK_BRANCH = f'task/{_BARE_ID}'
+_HOOK_REJECTION = 'test pre-commit hook: snapshot rejected'
+
+
+async def _git(cwd: Path, *args: str) -> str:
+    rc, out, err = await _run(['git', *args], cwd=cwd)
+    assert rc == 0, f'git {" ".join(args)} failed in {cwd}: {err}'
+    return out.strip()
+
+
+async def _pool_with_lane(
+    tmp_path: Path,
+    *,
+    bare_id: str = _BARE_ID,
+    lane_name: str = '_lane-5',
+    pool_size: int = 6,
+) -> tuple[OrchestratorConfig, GitOps, Path]:
+    """A pool-enabled GitOps over a real repo with ``task/<bare_id>`` checked out at *lane_name*."""
+    repo = tmp_path / 'repo'
+    _init_git_repo(repo)
+    config = OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=pool_size,
+        git=GitConfig(warm_lane_pool=True),
+        worktree_identity_guard_enabled=False,
+    )
+    git_ops = GitOps(config.git, repo, warm_lane_pool_size=pool_size)
+    assert git_ops.warm_lane_pool is not None
+
+    lane = git_ops.worktree_base / lane_name
+    lane.parent.mkdir(parents=True, exist_ok=True)
+    await _git(repo, 'worktree', 'add', str(lane), '-b', f'task/{bare_id}', 'main')
+    return config, git_ops, lane
+
+
+async def _make_index_conflicted(repo: Path, lane: Path) -> None:
+    """Leave *lane* mid-merge with README.md unmerged (``UU``)."""
+    (lane / 'README.md').write_text('lane side\n')
+    await _git(lane, 'commit', '-am', 'lane side of README')
+
+    await _git(repo, 'checkout', '-b', 'other', 'main')
+    (repo / 'README.md').write_text('other side\n')
+    await _git(repo, 'commit', '-am', 'other side of README')
+    await _git(repo, 'checkout', 'main')
+
+    rc, _, _ = await _run(['git', 'merge', 'other'], cwd=lane)
+    assert rc != 0, 'the merge was expected to conflict'
+    assert 'UU README.md' in await _git(lane, 'status', '--porcelain')
+
+
+async def _make_commit_hook_reject(repo: Path, lane: Path) -> None:
+    """Leave uncommitted WIP in *lane* under a pre-commit hook that rejects every commit."""
+    hooks = repo.parent / 'failhooks'
+    hooks.mkdir()
+    pre_commit = hooks / 'pre-commit'
+    pre_commit.write_text(f'#!/bin/sh\necho "{_HOOK_REJECTION}" >&2\nexit 1\n')
+    pre_commit.chmod(0o755)
+    await _git(repo, 'config', 'core.hooksPath', str(hooks))
+    (lane / 'README.md').write_text('uncommitted lane WIP\n')
+
+
+class TestDetachLaneCheckoutRefusedSnapshot:
+    """``detach_lane_checkout`` answers False, never raises, when its WIP snapshot is refused."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('make_refused', 'detail'),
+        [
+            pytest.param(_make_index_conflicted, 'README.md', id='index_conflicted'),
+            pytest.param(_make_commit_hook_reject, _HOOK_REJECTION, id='commit_hook_rejects'),
+        ],
+    )
+    async def test_returns_false_and_leaves_checkout_attached(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        make_refused: Callable[[Path, Path], Awaitable[None]],
+        detail: str,
+    ):
+        _config, git_ops, lane = await _pool_with_lane(tmp_path)
+        repo = git_ops.project_root
+        await make_refused(repo, lane)
+        tip_before = await _git(repo, 'rev-parse', _TASK_BRANCH)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            detached = await git_ops.detach_lane_checkout(lane, _BARE_ID)
+
+        assert detached is False
+        assert await _git(lane, 'symbolic-ref', '-q', 'HEAD') == f'refs/heads/{_TASK_BRANCH}', (
+            'a lane whose WIP could not be snapshotted must stay attached to its branch'
+        )
+        assert await _git(repo, 'rev-parse', _TASK_BRANCH) == tip_before, (
+            'no snapshot (and so no conflict markers) may have been committed'
+        )
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.git_ops' and record.levelno >= logging.WARNING
+        ]
+        assert any(str(lane) in message and detail in message for message in warnings), warnings
+
+
+class TestReconcileLaneCheckoutsConflictedLane:
+    """The startup sweep absorbs a conflicted lane at each of its three detach sites."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('statuses', 'trusted_pin_name'),
+        [
+            pytest.param({_BARE_ID: 'done'}, None, id='terminal'),
+            pytest.param({'999': 'pending'}, None, id='deleted_id'),
+            pytest.param({_BARE_ID: 'in-progress'}, '_lane-2', id='dup_checkout'),
+        ],
+    )
+    async def test_sweep_completes_and_keeps_the_conflicted_lane_pinned(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        statuses: dict[str, str],
+        trusted_pin_name: str | None,
+    ):
+        config, git_ops, lane = await _pool_with_lane(tmp_path)
+        await _make_index_conflicted(git_ops.project_root, lane)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None
+        conflicted_lane = checkouts[_BARE_ID]
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(return_value=(statuses, None))
+        if trusted_pin_name is None:
+            expected_pin = conflicted_lane
+        else:
+            expected_pin = git_ops.worktree_base / trusted_pin_name
+            pool.restore_assignment(_BARE_ID, expected_pin)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_lane_checkouts()
+
+        assert await _git(lane, 'symbolic-ref', '-q', 'HEAD') == f'refs/heads/{_TASK_BRANCH}'
+        assert pool.assignment_for(_BARE_ID) == expected_pin, (
+            'the conflicted lane must stay pinned (or the trusted pin stay put), '
+            'never handed to a fresh dispatch'
+        )
+        assert any(
+            'FAILED to detach' in record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.harness' and record.levelno == logging.WARNING
+        ), caplog.text
+
+
+class TestReconcileLaneCheckoutsPerLaneGuard:
+    """One lane whose detach raises does not stop the sweep (task 7701)."""
+
+    @pytest.mark.asyncio
+    async def test_removed_lane_is_repinned_and_the_other_lane_is_still_detached(
+        self, tmp_path: Path,
+    ):
+        config, git_ops, _first = await _pool_with_lane(tmp_path, lane_name='_lane-1')
+        repo = git_ops.project_root
+        second = git_ops.worktree_base / '_lane-2'
+        await _git(repo, 'worktree', 'add', str(second), '-b', 'task/3966', 'main')
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None and len(checkouts) == 2
+        faulty_id, faulty_lane = next(iter(checkouts.items()))
+        [(other_id, other_lane)] = [(k, v) for k, v in checkouts.items() if k != faulty_id]
+        shutil.rmtree(faulty_lane)
+        still_listed = await git_ops.lane_branch_checkouts()
+        assert still_listed is not None and faulty_id in still_listed
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({faulty_id: 'done', other_id: 'done'}, None),
+        )
+
+        failures = await harness._reconcile_lane_checkouts()
+
+        rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=other_lane)
+        assert rc != 0, 'the healthy lane must still be detached'
+        assert pool.assignment_for(faulty_id) == faulty_lane
+        assert isinstance(failures, EntryFailures)
+        assert len(failures.failures) == 1
+        assert faulty_id in failures.failures[0].entry
+
+    @pytest.mark.asyncio
+    async def test_failed_duplicate_detach_keeps_the_trusted_pin(self, tmp_path: Path):
+        config, git_ops, lane = await _pool_with_lane(tmp_path)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        trusted_pin = git_ops.worktree_base / '_lane-2'
+        pool.restore_assignment(_BARE_ID, trusted_pin)
+        git_ops.detach_lane_checkout = AsyncMock(side_effect=OSError('boom'))
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({_BARE_ID: 'in-progress'}, None),
+        )
+
+        failures = await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for(_BARE_ID) == trusted_pin
+        assert isinstance(failures, EntryFailures)
+        [failure] = failures.failures
+        assert _BARE_ID in failure.entry and lane.name in failure.entry

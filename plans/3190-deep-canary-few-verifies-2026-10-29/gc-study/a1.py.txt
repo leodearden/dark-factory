@@ -1,0 +1,67 @@
+import re,datetime as dt,collections,statistics as st,json
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+R=re.compile(r'^(\S+) \S+ (\S+?)\[(\d+)\]: (.*)$')
+sum_=[];reap=[];pres=collections.Counter();start={};resets=[];free=[];cons=[];presl=collections.Counter()
+gens=[];warn=collections.Counter();em=0
+for l in open('sweep.log',errors='replace'):
+    m=R.match(l.rstrip())
+    if not m: continue
+    t=T(m.group(1));src,pid,msg=m.group(2),m.group(3),m.group(4)
+    msg=re.sub(r'#033\[[0-9;]*m','',msg)
+    if src=='reify-pool-health-alert.sh':
+        f=re.search(r'free=(\d+)GiB',msg)
+        if f: free.append((t,int(f.group(1))))
+        continue
+    if 'Consumed' in msg and 'reify-warm-lane-gc' in msg:
+        c=re.search(r'Consumed (?:(\d+)h )?(?:(\d+)min )?([\d.]+)s',msg)
+        if c: cons.append((t,(int(c.group(1) or 0))*3600+(int(c.group(2) or 0))*60+float(c.group(3))))
+        continue
+    a=re.search(r'reclaim complete: reset=(\d+) removed=(\d+) preserved=(\d+) preserved_live_ref=(\d+) reset_cold=(\d+)',msg)
+    if a: sum_.append((t,pid)+tuple(map(int,a.groups())));continue
+    if 'reaped stale' in msg:
+        a=re.search(r'\.reseed-trash/(\S+)\.(\d+) ',msg);reap.append((t,pid,a.group(1)));continue
+    if 'EMERGENCY' in msg: em+=1
+    a=re.search(r'preserving (\S+): (.*)',msg)
+    if a: pres[a.group(2)[:40]]+=1;presl[a.group(1)]+=1;continue
+    a=re.search(r'resetting lane(?: \(disk-pressure\))?: (\S+)',msg)
+    if a: start[(pid,a.group(1))]=t;continue
+    a=re.search(r'\[ok\]\s+reset lane(?: \(disk-pressure\))?: (\S+)',msg)
+    if a and (pid,a.group(1)) in start:
+        resets.append((start.pop((pid,a.group(1))),t,a.group(1),pid));continue
+    a=re.search(r'pinned base gen \S*target\.gen\.(\d+) for (\S+)',msg)
+    if a: gens.append((t,int(a.group(1)),a.group(2)))
+    a=re.search(r'\[seed\] \[(warn|error)\]\s+(.*)',msg)
+    if a: warn[a.group(1)+' '+re.sub(r'\d+','9',a.group(2))[:70]]+=1
+print('window',resets[0][0],resets[-1][1]);
+d=(resets[-1][1]-resets[0][0]).total_seconds()/86400;print('days',round(d,2))
+print('resets',len(resets),'per day',round(len(resets)/d,1))
+du=[(e-s).total_seconds() for s,e,_,_ in resets];print('dur p50',round(pct(du,.5)),'p90',round(pct(du,.9)),'mean',round(st.mean(du)),'total lane-hours/day',round(sum(du)/3600/d,1))
+ev=sorted([(s,1) for s,_,_,_ in resets]+[(e,-1) for _,e,_,_ in resets]);c=0;busy=0;prev=None
+for t,dl in ev:
+    if prev is not None and c>0: busy+=(t-prev).total_seconds()
+    c+=dl;prev=t
+print('busy frac',round(busy/(d*86400),3))
+print('by lane top',collections.Counter(x[2] for x in resets).most_common(4),'bottom',collections.Counter(x[2] for x in resets).most_common()[-6:],'n lanes',len(set(x[2] for x in resets)))
+print('summaries',len(sum_))
+for k,i in (('reset',2),('removed',3),('preserved',4),('live_ref',5),('cold',6)):
+    v=[s[i] for s in sum_];print(k,'min',min(v),'p50',st.median(v),'max',max(v),'sum',sum(v))
+gaps=[(sum_[i+1][0]-sum_[i][0]).total_seconds()/3600 for i in range(len(sum_)-1)];print('sweep cadence h p50',round(st.median(gaps),2),'max',round(max(gaps),2))
+print('reaped',len(reap),collections.Counter(r[2] for r in reap).most_common(10))
+# reap relative to prev sweep end
+ends=[s[0] for s in sum_];rel=[]
+for t,pid,lane in reap:
+    p=[e for e in ends if e<t]
+    if p: rel.append((t-p[-1]).total_seconds())
+print('reap after prev-sweep-end secs p50',round(st.median(rel)),'min',round(min(rel)),'max',round(max(rel)))
+print('preserve reasons',pres.most_common(6));print('preserve lanes top',presl.most_common(8))
+print('emergency',em);print('seed warn/err',warn.most_common(10))
+print('gen values', sorted(set(g[1] for g in gens)))
+print('consumed n',len(cons),'cpu-h/day',round(sum(c for _,c in cons)/3600/d,2))
+daily=collections.defaultdict(float)
+for t,c in cons: daily[t.date()]+=c
+print({str(k):round(v/3600,1) for k,v in sorted(daily.items())})
+print('free n',len(free),'min',min(f for _,f in free),'max',max(f for _,f in free),'first',free[0],'last',free[-1])
+json.dump({'free':[(t.isoformat(),f) for t,f in free],'resets':[(s.isoformat(),e.isoformat(),l,p) for s,e,l,p in resets],'sums':[(s[0].isoformat(),)+s[1:] for s in sum_],'gens':[(t.isoformat(),g,l) for t,g,l in gens]},open('a1.json','w'))

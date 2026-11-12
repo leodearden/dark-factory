@@ -697,3 +697,80 @@ class TestDefaultRegistry:
         assert mod.DARK_FACTORY_PROJECT_ID == 'dark_factory'
         assert mod.DARK_FACTORY_ROOT == '/home/leo/src/dark-factory'
         assert mod.DARK_FACTORY_PATH_PREFIXES == self._EXPECTED_PREFIXES
+
+
+# ---------------------------------------------------------------------------
+# attributed_owner — filer-first attribution of relative paths (task 7515).
+#
+# The global prefix table drops colliding prefixes and is snapshotted at build
+# time, so a filer's own top-level dir can classify unowned (collision) or as
+# another project's (stale snapshot). attributed_owner consults the FILING
+# project's root on disk first.
+# ---------------------------------------------------------------------------
+
+
+class TestAttributedOwner:
+    @pytest.fixture
+    def collision_registry(self, tmp_path):
+        roots = [
+            _mkproj(tmp_path, 'stream-touch', ['crates', 'sessions']),
+            _mkproj(tmp_path, 'reify', ['crates']),
+            _mkproj(tmp_path, 'mission-control', ['sessions']),
+            _mkproj(tmp_path, 'dark-factory', ['orchestrator']),
+        ]
+        return ProjectPrefixRegistry.from_roots([str(r) for r in roots])
+
+    @pytest.fixture
+    def stale_registry(self, tmp_path):
+        filer = _mkproj(tmp_path, 'stream-touch', ['crates'])
+        foreign = _mkproj(tmp_path, 'mission-control', ['sessions'])
+        registry = ProjectPrefixRegistry.from_roots([str(filer), str(foreign)])
+        (filer / 'sessions').mkdir()
+        return registry
+
+    def test_collision_dropped_dir_attributes_to_filer(self, collision_registry):
+        r = collision_registry
+        assert r.project_for_path('crates/touch-session/src/plan.rs') is None
+        assert r.project_for_path('sessions/plans/lp-starter-v1.toml') is None
+        assert r.attributed_owner(
+            'crates/touch-session/src/plan.rs', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner(
+            'sessions/plans/lp-starter-v1.toml', 'stream_touch') == 'stream_touch'
+
+    def test_filer_without_the_dir_sees_the_table_verdict(self, collision_registry):
+        assert collision_registry.attributed_owner('crates/x.rs', 'dark_factory') is None
+
+    def test_dir_grown_after_build_attributes_to_filer(self, stale_registry):
+        path = 'sessions/plans/lp-starter-v1.toml'
+        assert stale_registry.project_for_path(path) == 'mission_control'
+        assert stale_registry.attributed_owner(path, 'stream_touch') == 'stream_touch'
+
+    def test_dir_only_another_project_has_stays_foreign(self, collision_registry):
+        assert collision_registry.attributed_owner(
+            'orchestrator/src/x.py', 'stream_touch') == 'dark_factory'
+
+    def test_generic_dirs_and_top_level_files_stay_neutral(self, collision_registry):
+        filer_root = Path(collision_registry.root_for_project('stream_touch') or '')
+        (filer_root / 'docs').mkdir()
+        (filer_root / 'README.md').write_text('hi')
+        assert collision_registry.attributed_owner('docs/x.md', 'stream_touch') is None
+        assert collision_registry.attributed_owner('README.md', 'stream_touch') is None
+
+    def test_spellings_share_project_for_path_normalisation(self, collision_registry):
+        r = collision_registry
+        assert r.attributed_owner('./sessions/x.toml', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner('foo/../sessions/x.toml', 'stream_touch') == 'stream_touch'
+        assert r.attributed_owner('../sessions/x.toml', 'stream_touch') is None
+        assert r.attributed_owner('', 'stream_touch') is None
+
+    def test_absolute_paths_stay_root_authoritative(self, collision_registry):
+        r = collision_registry
+        mc_root = r.root_for_project('mission_control')
+        filer_root = r.root_for_project('stream_touch')
+        assert r.attributed_owner(f'{mc_root}/sessions/x.md', 'stream_touch') == 'mission_control'
+        assert r.attributed_owner(f'{filer_root}/sessions/x.md', 'stream_touch') == 'stream_touch'
+
+    def test_unregistered_filer_falls_back_to_the_table(self, stale_registry):
+        path = 'sessions/x.toml'
+        assert stale_registry.project_for_path(path) == 'mission_control'
+        assert stale_registry.attributed_owner(path, 'outsider') == 'mission_control'

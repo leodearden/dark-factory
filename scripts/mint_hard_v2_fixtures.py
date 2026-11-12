@@ -55,7 +55,7 @@ from pathlib import Path
 
 import _checkout as _checkout
 
-from shared import merge_subject, project_layout
+from shared import merge_subject, project_layout, tasks_db_readonly
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -581,22 +581,17 @@ def enrich_from_task_db(
     Mirrors ``task_sampler.enrich_candidates_from_task_db``'s read-only access
     and best-effort degradation, extended to also read ``status`` (the
     cancelled / pending candidates need their own explicit curation decision).
-    Its own open rather than ``scripts/_task_db_scan.py::connect_ro``, kept in
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``, in
     lockstep with the sampler pass it mirrors; the degraded stub is refused
     later, at the mint boundary.
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        print(f'WARNING: no task db at {db_path}; candidates stay stubs',
-              file=sys.stderr)
-        return candidates
-
-    # Same guard as the sampler's: a locked or schema-drifted db degrades to
-    # recorded stubs rather than aborting with a raw traceback. The stubs are
-    # not silently minted — `_run_mint` refuses an include row that resolves
-    # to an empty title/description.
+    # Same guard as the sampler's: a refused, locked or schema-drifted db
+    # degrades to recorded stubs rather than aborting with a raw traceback.
+    # The stubs are not silently minted — `_run_mint` refuses an include row
+    # that resolves to an empty title/description.
     try:
-        conn = connect_ro(db_path)
+        conn = tasks_db_readonly.connect_ro(db_path)
+        conn.row_factory = sqlite3.Row
         try:
             rows = {
                 str(r['id']): r for r in conn.execute(
@@ -605,9 +600,8 @@ def enrich_from_task_db(
             }
         finally:
             conn.close()
-    except sqlite3.Error as exc:
-        print(f'WARNING: read of {db_path} failed ({exc}); candidates stay stubs',
-              file=sys.stderr)
+    except (tasks_db_readonly.TaskDbUnreadable, sqlite3.Error) as exc:
+        print(f'WARNING: {exc}; candidates stay stubs', file=sys.stderr)
         return candidates
 
     for cand in candidates:
@@ -1206,7 +1200,8 @@ def render_curation_md(manifest: dict) -> str:
         'either. Both spellings are in live use (censused over reify\'s '
         '`main`: 2741 of the first, 74 of the second) and both are derived in '
         'one place, `shared.merge_subject.merge_subject_pattern`, '
-        'mirroring `git_ops.py::_merge_subject`.')
+        'which shares its fragments with the writer, '
+        '`shared.merge_subject.format_merge_subject`.')
     add('')
 
     # A POINTER plus DERIVED counts, not a second copy of the prose. The rule

@@ -20,12 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
-// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
-// scope, no fallback, RENAMED, for the same reason as the destructure above.
+// poll_scope.js's surface -> endpoint maps, which decide what is polled
+// (pollSetFor). Module scope, no fallback, RENAMED, for the same reason as the
+// destructure above: poll_scope.js owns the bare names.
 const {
   TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
   CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
-} = window.DF_ENDPOINT_STALENESS;
+} = window.DF_POLL_SCOPE;
 
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
@@ -60,7 +61,8 @@ function endpointsFor(win) {
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
-                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN,
+                                                        'TASKS_COUNT_STALE_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -75,6 +77,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/escalations':                  { 'ESCALATIONS': PLAIN },
     '/api/v2/dashboard/escalation-analytics':         { 'ESCALATION_ANALYTICS': PLAIN },
     '/api/v2/dashboard/memory-evals':                 { 'MEMORY_EVALS': PLAIN },
+    '/api/v2/dashboard/prds':                         { 'PRD_VIEW': PLAIN, 'PRD_CONTENTION': PLAIN },
   };
 }
 
@@ -91,9 +94,10 @@ const NARROWED_POLL_URLS = Object.freeze({
 // by the one value its caller already holds. Two declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
-// `?terminal=<project>`, and `taskProse`, the Task Detail pane's
-// description/details for the selected task, addressed by the row's own uid
-// (`<project>/T-<id>`).
+// `?terminal=<project>`, and `taskProse`, a task's description/details
+// addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
+// pane reads for the selected task and the Escalations drawer for the linked
+// one.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -132,6 +136,12 @@ const ON_DEMAND_KEYS = {
   },
 };
 
+// A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
+// active_tasks.py::task_uid, which builds the uid every served row carries.
+function taskUid(project, id) {
+  return `${project}/T-${id}`;
+}
+
 // Keys whose array reference is captured at module-load by shell.jsx — mutate
 // in place rather than reassigning, so cached references stay valid.
 const STABLE_ARRAY_KEYS = new Set(['PROJECTS', 'AGENTS']);
@@ -153,6 +163,8 @@ window.DF_DATA = {
   // the done count was never measured — neither offline nor degraded. Without
   // this list they would render as healthy with a confident "0 done".
   TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // Projects whose census is shown from its last measurement, with its age.
+  TASKS_COUNT_STALE_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
@@ -177,6 +189,12 @@ window.DF_DATA = {
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
+  // PRD_VIEW, PRD_CONTENTION: {project: Datum} each, the /prds body's per-PRD
+  //   view and contention line. Seeded EMPTY and stamped with the /prds
+  //   receipt by prd_lanes_view.js's readers, as TASKS_SNAPSHOT is by
+  //   task_snapshot.js.
+  PRD_VIEW: {},
+  PRD_CONTENTION: {},
   // INVARIANTS: one claimant-invariant record per known root (E-1). Seeded
   //   EMPTY so a project with no record renders no chip: unknown is not clean.
   INVARIANTS: [],
@@ -199,14 +217,15 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
+  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
   //   active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
-  //   member_task_ids, ...event-specific keys}}]}}; every recent and active
-  //   row's title is a Datum. The payload's top-level served_at is the receipt
-  //   merge_queue.js stamps those Datums with.
+  //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
+  //   every recent and active row's title is a Datum. The payload's top-level
+  //   served_at is the receipt merge_queue.js stamps those Datums with.
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -659,6 +678,27 @@ function onDemandDatum(name, param, outcome) {
   return view === ON_DEMAND_VIEWS.ready ? value : unknownDatumPlaceholder(ON_DEMAND_HOLE_REASONS[view]);
 }
 
+// The on-demand protocol for a component, built over the caller's React as
+// task_snapshot.js::createTerminalWindowHooks is, since data.js also loads
+// under node without one. useOnDemand(name, param) requests the row's value
+// whenever `param` changes and ignores the answer to a request a newer param
+// superseded. It returns { view, value }: onDemandView's answer and the value
+// now in DF_DATA, so a caller only chooses what each view looks like.
+function createOnDemandHook({ useState, useEffect }) {
+  function useOnDemand(name, param) {
+    const [outcome, setOutcome] = useState(null);
+    useEffect(() => {
+      let current = true;
+      setOutcome(null);
+      requestOnDemand(name, param).then(settled => { if (current) setOutcome(settled); });
+      return () => { current = false; };
+    }, [name, param]);
+    const value = window.DF_DATA[onDemandRow(name).key(param)];
+    return { view: onDemandView(value, outcome), value };
+  }
+  return { useOnDemand };
+}
+
 // `stateKey` names the flow-control, staleness and receipt entry this request
 // owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
 // and every existing direct caller keeps working. An on-demand request passes
@@ -757,9 +797,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel
@@ -1088,11 +1129,13 @@ const DF_DATA_LOADER_API = {
   pollKey,
   datumFor,
   ON_DEMAND_KEYS,
+  taskUid,
   requestOnDemand,
   REFRESH_OUTCOMES,
   ON_DEMAND_VIEWS,
   onDemandView,
   onDemandDatum,
+  createOnDemandHook,
   pollSetFor,
   scopePollingToTab,
 };

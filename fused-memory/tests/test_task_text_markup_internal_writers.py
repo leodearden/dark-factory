@@ -76,9 +76,8 @@ async def ticket_store(tmp_path):
 
 
 @pytest_asyncio.fixture
-async def build_interceptor(backend, ticket_store, tmp_path, monkeypatch):
+async def build_interceptor(backend, ticket_store, tmp_path):
     """Build TaskInterceptors around an injected curator; each is closed at teardown."""
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
     buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
     await buffer.initialize()
     built: list[TaskInterceptor] = []

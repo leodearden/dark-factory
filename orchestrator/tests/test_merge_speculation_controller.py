@@ -25,11 +25,17 @@ as test_merge_request_ledger.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.merge_lane.speculation_controller import (
+    LiveTip,
+    PermitLedger,
+    SpeculationController,
+)
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
@@ -918,3 +924,165 @@ class TestCanCoalesceGate:
                 f'reachable only when merges FAIL'
             )
             assert controller.is_idle() is False
+
+
+# ---------------------------------------------------------------------------
+# task 8524: the merger is re-anchored when a base it holds dies
+# (plans/merge-lane-policy-prd.md D2)
+# ---------------------------------------------------------------------------
+
+
+async def _controller_holding(depth: int = 2) -> SpeculationController:
+    controller = SpeculationController(PermitLedger(asyncio.Semaphore(depth), depth), depth)
+    await controller.acquire_for_lookahead()
+    return controller
+
+
+async def _state_a() -> SpeculationController:
+    """A look-ahead found the next request stacked on 'sha-dead'."""
+    controller = await _controller_holding()
+    controller.on_lookahead_found(_make_pending_request('next'), 'sha-dead')
+    return controller
+
+
+async def _state_b() -> SpeculationController:
+    """The merger took the prefetched request and is mid-iteration."""
+    controller = await _state_a()
+    assert controller.take_prefetched() is not None
+    return controller
+
+
+async def _pending_state() -> SpeculationController:
+    """Nothing pickable yet; a late ATTACH onto 'sha-dead' is armed."""
+    controller = await _controller_holding()
+    controller.on_lookahead_pending('sha-dead', _make_pending_request('pred'))
+    return controller
+
+
+_State = Callable[[], Awaitable[SpeculationController]]
+
+
+def _tip() -> LiveTip:
+    """The live frontier tip 't', owned by the in-flight request 'tip-owner'."""
+    return LiveTip('t', _make_pending_request('tip-owner'))
+
+
+@pytest.mark.asyncio
+class TestOnBaseInvalidated:
+    """``on_base_invalidated(dead_sha, live_tip)`` re-points or lets go; it
+    never acquires (task 8524)."""
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    async def test_holds_base_names_only_the_held_commit(self, state: _State) -> None:
+        controller = await state()
+
+        assert controller.holds_base(' sha-dead ')
+        assert not controller.holds_base('sha-other')
+        assert not controller.holds_base('')
+
+    async def test_state_a_re_points_onto_the_live_tip(self) -> None:
+        controller = await _state_a()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        after = controller.snapshot()
+        assert after['spec_base'] == 't'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_state_a_falls_back_with_no_live_tip(self) -> None:
+        controller = await _state_a()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        after = controller.snapshot()
+        assert after['spec_base'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available'] + 1
+        assert after['prefetched_task_id'] == 'next'
+
+    async def test_mid_iteration_with_no_live_tip_leaves_base_and_permit(self) -> None:
+        controller = await _state_b()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        assert controller.snapshot() == before
+        assert before['spec_base'] == 'sha-dead'
+        assert before['held_by_merger'] == 1
+
+    async def test_mid_iteration_re_points_onto_the_live_tip(self) -> None:
+        controller = await _state_b()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        assert controller.snapshot()['spec_base'] == 't'
+        assert controller.snapshot()['held_by_merger'] == 1
+
+    async def test_pending_attach_re_points_onto_the_live_tip_and_its_owner(self) -> None:
+        controller = await _pending_state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', _tip())
+
+        after = controller.snapshot()
+        assert after['pending_spec_base'] == 't'
+        assert after['pending_predecessor_task_id'] == 'tip-owner'
+        assert after['held_by_merger'] == 1
+        assert after['slot_available'] == before['slot_available']
+
+    async def test_pending_attach_is_dropped_with_no_live_tip(self) -> None:
+        controller = await _pending_state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        after = controller.snapshot()
+        assert after['pending_spec_base'] is None
+        assert after['pending_predecessor_task_id'] is None
+        assert after['held_by_merger'] == 0
+        assert after['slot_available'] == before['slot_available'] + 1
+
+    async def test_the_next_dequeue_after_a_dropped_attach_releases_nothing(self) -> None:
+        controller = await _pending_state()
+        controller.on_base_invalidated('sha-dead', None)
+        before = controller.snapshot()
+
+        assert controller.on_dequeue(_make_pending_request('late')) is None
+
+        assert controller.snapshot()['slot_available'] == before['slot_available']
+        assert controller.snapshot()['held_by_merger'] == 0
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    async def test_an_unrelated_sha_changes_nothing(self, state: _State) -> None:
+        controller = await state()
+        before = controller.snapshot()
+
+        controller.on_base_invalidated('sha-other', None)
+        controller.on_base_invalidated('sha-other', _tip())
+
+        assert controller.snapshot() == before
+
+    @pytest.mark.parametrize('state', [_state_a, _pending_state])
+    async def test_a_repeat_call_releases_nothing_more(self, state: _State) -> None:
+        controller = await state()
+        controller.on_base_invalidated('sha-dead', None)
+        once = controller.snapshot()
+
+        controller.on_base_invalidated('sha-dead', None)
+
+        assert controller.snapshot() == once
+
+    @pytest.mark.parametrize('state', [_state_a, _state_b, _pending_state])
+    @pytest.mark.parametrize('has_tip', [True, False])
+    async def test_never_acquires(self, state: _State, has_tip: bool) -> None:
+        controller = await state()
+        before = controller.snapshot()['slot_available']
+        live_tip = _tip() if has_tip else None
+
+        controller.on_base_invalidated('sha-dead', live_tip)
+        controller.on_base_invalidated('sha-dead', live_tip)
+
+        assert controller.snapshot()['slot_available'] >= before

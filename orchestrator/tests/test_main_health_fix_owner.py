@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from os.path import commonprefix
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.elision import elision_marker
 from shared.task_submit import SubmitFailed, SubmittedTask
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
@@ -30,8 +32,10 @@ from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.main_health_fix_owner import (
     REPRODUCE_FIRST,
     SIGNATURE_KEY,
+    FixSpawnContext,
     MainBreak,
     MainFixTaskFiler,
+    build_main_fix_task_arguments,
     ensure_main_fix_owner,
 )
 from orchestrator.merge_lane.worker import (
@@ -41,7 +45,7 @@ from orchestrator.merge_lane.worker import (
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import INHERITED_BREAK_NO_FIX_OWNER_LINE, TaskWorkflow, WorkflowOutcome
 
 OTHER_MAIN_SHA = 'cafef00d0987654321'
 
@@ -151,6 +155,40 @@ def _ensure(store: FakeTaskStore, brk: MainBreak, filer: MainFixTaskFiler | None
 
 
 TEST_BREAK = MainBreak('test_failure', 'tests/test_foo.py::test_bar', 'main red')
+
+
+def _fix_arguments(brk: MainBreak) -> dict:
+    return build_main_fix_task_arguments(brk, project_root='/p', spawn_context=FixSpawnContext.FILED)
+
+
+class TestFixMainTaskArguments:
+    """The fix-main task carries the whole failure report, and a long cause is clipped visibly."""
+
+    def test_the_whole_failure_report_rides_in_details(self) -> None:
+        reason = 'FAILED tests/test_foo.py::test_bar\n' + 'E   assert widget == gadget\n' * 300
+
+        args = _fix_arguments(MainBreak('test_failure', 'tests/test_foo.py::test_bar', reason))
+
+        assert args['details'] == reason.strip()
+
+    def test_a_long_cause_clips_the_title_at_a_word_with_a_counted_marker(self) -> None:
+        cause = ' '.join(f'tests/test_mod_{i}.py::test_case' for i in range(10))
+        full = f'fix main: {cause}'
+
+        args = _fix_arguments(MainBreak('test_failure', cause, 'main red'))
+
+        title = args['title']
+        head = commonprefix([title, full])
+        assert len(title) <= 100
+        assert title == head + elision_marker(len(full) - len(head))
+        assert full[len(head)].isspace()
+        assert f'Cause: {cause}' in args['description']
+
+    def test_a_short_cause_titles_the_task_verbatim(self) -> None:
+        assert _fix_arguments(TEST_BREAK)['title'] == 'fix main: tests/test_foo.py::test_bar'
+
+    def test_an_empty_reason_files_no_details(self) -> None:
+        assert 'details' not in _fix_arguments(MainBreak('compile_error', 'hint', ''))
 
 
 class TestMainFixTaskFiler:
@@ -373,8 +411,8 @@ def _inherited_info(verify: VerifyResult) -> dict:
 def _run_site(
     site: str, case: str, tmp_path: Path, store: FakeTaskStore | None,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[MainBreak, list[str]]:
-    """Drive one classification site; return the break and every next action it filed."""
+) -> tuple[MainBreak, list[tuple[str, str]]]:
+    """Drive one classification site; return the break and the (next action, detail) of every escalation it filed."""
     queue = EscalationQueue(tmp_path / 'escalations')
     worker = _make_worker(tmp_path, queue, store, monkeypatch)
     verify = {**MERGE_LANE_CASES, **VERIFY_ARM_CASES}[case]
@@ -382,7 +420,7 @@ def _run_site(
     brk = _break_of(outcome)
     _arrange(case, worker, store, brk)
 
-    async def _drive() -> list[str]:
+    async def _drive() -> list[tuple[str, str]]:
         if site == 'deferred_worker':
             await worker._auto_heal_main_health_deferred(
                 outcome, _make_req('42', tmp_path / 'task-wt', _make_config(tmp_path)),
@@ -397,11 +435,12 @@ def _run_site(
         await workflow._block_on_inherited_break(_inherited_info(verify))
         mark_blocked = workflow._mark_blocked
         assert isinstance(mark_blocked, AsyncMock)
-        return [mark_blocked.call_args.kwargs['suggested_action']]
+        filed = mark_blocked.call_args.kwargs
+        return [(filed['suggested_action'], filed['detail'])]
 
     filed_by_mark_blocked = asyncio.run(_drive())
-    actions = [esc.suggested_action for esc in queue.get_pending()] + filed_by_mark_blocked
-    return brk, actions
+    queued = [(esc.suggested_action, esc.detail) for esc in queue.get_pending()]
+    return brk, queued + filed_by_mark_blocked
 
 
 SITE_CASES = [
@@ -409,31 +448,68 @@ SITE_CASES = [
     *(('task_verify', case) for case in VERIFY_ARM_CASES),
 ]
 
+SITE_ACTIONS = {
+    'deferred_worker': OWNED_ACTIONS,
+    'sync_workflow': OWNED_ACTIONS,
+    'task_verify': frozenset({MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION}),
+}
+
 
 class TestNoOutcomeTerminatesOwnerless:
     """Every (site, outcome) ends with an open fix-main task for its signature, and
-    every escalation it files names an owned next action."""
+    every escalation it files names that site's next action."""
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
-    def test_every_outcome_has_an_open_fix_task_and_an_owned_escalation(
+    def test_every_outcome_has_an_open_fix_task_and_files_its_sites_next_action(
         self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = FakeTaskStore()
 
-        brk, actions = _run_site(site, case, tmp_path, store, monkeypatch)
+        brk, filed = _run_site(site, case, tmp_path, store, monkeypatch)
 
         assert len(store.open_owners(brk.signature)) == 1, store.tasks
-        assert actions, f'{site}/{case} filed no escalation'
-        assert set(actions) <= OWNED_ACTIONS, actions
+        assert filed, f'{site}/{case} filed no escalation'
+        assert {action for action, _ in filed} <= SITE_ACTIONS[site], filed
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
     def test_without_a_task_store_every_outcome_still_files_an_escalation(
         self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        brk, actions = _run_site(site, case, tmp_path, None, monkeypatch)
+        brk, filed = _run_site(site, case, tmp_path, None, monkeypatch)
 
-        assert actions, f'{site}/{case} ended with neither a task nor an escalation'
-        assert all(action in set(MainHealthNextAction) for action in actions), actions
+        assert filed, f'{site}/{case} ended with neither a task nor an escalation'
+        assert all(action in set(MainHealthNextAction) for action, _ in filed), filed
+
+
+class TestTaskVerifyArmGuidesTheSteward:
+    """The task-verify L0 asks its steward to re-run the failures in isolation,
+    and its detail names the fix owner the steward defers to if they fail again,
+    or, with none, asks for a re-escalation so one is filed."""
+
+    @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
+    def test_the_l0_asks_for_an_isolated_rerun_and_names_the_owner(
+        self, tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = FakeTaskStore()
+
+        brk, filed = _run_site('task_verify', case, tmp_path, store, monkeypatch)
+
+        [(action, detail)] = filed
+        assert action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
+        [owner] = store.open_owners(brk.signature)
+        assert f'task {owner}' in detail
+        assert detail.startswith(VERIFY_ARM_CASES[case].failure_report())
+        assert INHERITED_BREAK_NO_FIX_OWNER_LINE not in detail
+
+    @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
+    def test_without_a_task_store_the_l0_asks_for_an_isolated_rerun_then_a_re_escalation(
+        self, tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _brk, filed = _run_site('task_verify', case, tmp_path, None, monkeypatch)
+
+        [(action, detail)] = filed
+        assert action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
+        assert detail == f'{VERIFY_ARM_CASES[case].failure_report()}\n\n{INHERITED_BREAK_NO_FIX_OWNER_LINE}'
 
 
 class TestOneTaskPerSignature:

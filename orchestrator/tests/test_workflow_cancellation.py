@@ -589,7 +589,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -1176,6 +1176,7 @@ def _make_harness_for_run_slot() -> Harness:
     h._merge_queue = None  # type: ignore[assignment]
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
+    h._task_verify_dispatcher = MagicMock()
     h.cost_store = None
     h._run_store = None
     h._run_id = None

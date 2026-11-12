@@ -299,7 +299,7 @@ class TestBriefingArms:
             spec.name, spec.specialization, ReviewBriefing.CONTEXT_COMPLETE,
         )
 
-        assert role.prompt_harness_version == 'reviewer-d2-v1'
+        assert role.prompt_harness_version == 'reviewer-d2-v2'
         assert role.system_prompt == production.system_prompt
         assert role.allowed_tools == [*production.allowed_tools, 'mcp__jcodemunch__*']
         assert (role.default_model, role.default_budget) == (spec.model, spec.budget)

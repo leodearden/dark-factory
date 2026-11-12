@@ -234,6 +234,7 @@ class KeyedStreaks(Generic[K]):
     def count(self, key: K) -> int
     def forget(self, keys: Iterable[K]) -> None
     def retain(self, keep: Callable[[K], bool]) -> None
+    @property tracked_keys(self) -> frozenset[K]     # keys in a live failure run (snapshot)
 ```
 
 Invariants every implementation and consumer keeps:

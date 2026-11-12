@@ -25,7 +25,6 @@ from shared import config_dir as config_dir_module
 from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
-    _pid_alive,
     reset_sweep_once_state,
     sweep_stale_pid_dirs,
     sweep_stale_pid_dirs_once,
@@ -78,53 +77,6 @@ def plant(base: Path, name: str, *, aged: bool = True) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# PID liveness — the predicate every deletion is gated on
-# ---------------------------------------------------------------------------
-
-
-class TestPidAlive:
-    """`_pid_alive`'s conservative branches (task 3086).
-
-    ``find_dead_pid`` deliberately skips unsignalable candidates, so nothing
-    else in this file reaches the ``PermissionError`` handler. It is the one
-    branch whose loss is genuinely dangerous, so it is pinned directly.
-    """
-
-    def test_non_positive_pids_are_not_alive(self):
-        assert _pid_alive(0) is False
-        assert _pid_alive(-1) is False
-
-    def test_this_process_is_alive(self):
-        assert _pid_alive(os.getpid()) is True
-
-    def test_permission_error_means_alive(self):
-        """Visible but unsignalable — another user's live process."""
-        with patch('shared.config_dir.os.kill', side_effect=PermissionError):
-            assert _pid_alive(4242) is True
-
-    def test_other_oserror_means_dead(self):
-        with patch('shared.config_dir.os.kill', side_effect=OSError('EINVAL')):
-            assert _pid_alive(4242) is False
-
-    def test_another_users_live_process_dir_survives_the_sweep(self, tmp_path):
-        """The dangerous failure mode, end to end.
-
-        A future simplification collapsing the PermissionError handler into
-        the generic ``except OSError: return False`` would flip an
-        unsignalable-but-LIVE process to "dead" and delete a live peer's
-        credential dir. It fails here instead of in production.
-        """
-        foreign = plant(tmp_path, f'{PROBE_PREFIX}work-4242')
-
-        with patch('shared.config_dir.os.kill', side_effect=PermissionError):
-            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
-
-        assert foreign.exists()
-        assert (foreign / '.credentials.json').exists()
-        assert removed == 0
-
-
-# ---------------------------------------------------------------------------
 # Selection semantics — what the sweep does and does not consider a candidate
 # ---------------------------------------------------------------------------
 
@@ -161,6 +113,36 @@ class TestSweepStalePidDirsSelection:
 
         assert live.exists()
         assert (live / '.credentials.json').exists()
+
+    def test_another_users_live_process_dir_survives_the_sweep(self, tmp_path):
+        """The dangerous failure mode, end to end.
+
+        ``find_dead_pid`` skips unsignalable candidates, so nothing else here
+        reaches the PermissionError branch. Reading an unsignalable-but-LIVE
+        process as dead would delete a live peer's credential dir; it fails
+        here instead of in production.
+        """
+        foreign = plant(tmp_path, f'{PROBE_PREFIX}work-4242')
+
+        with patch('os.kill', side_effect=PermissionError):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert foreign.exists()
+        assert (foreign / '.credentials.json').exists()
+        assert removed == 0
+
+    def test_reclaims_dir_whose_trailing_digits_overflow_pid_t(self, tmp_path):
+        """Digits no pid_t can hold name no live process, so the dir is reclaimed.
+
+        The overflow must not abort the sweep: the dead-pid sibling goes too.
+        """
+        unrepresentable = plant(tmp_path, f'{PROBE_PREFIX}work-{10**20}')
+        dead_sibling = plant(tmp_path, f'{PROBE_PREFIX}work-{find_dead_pid()}')
+
+        sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert not dead_sibling.exists()
+        assert not unrepresentable.exists()
 
     def test_keeps_dir_with_no_parseable_trailing_pid(self, tmp_path):
         """Never delete what we cannot attribute to a process."""
@@ -434,6 +416,63 @@ class TestSweepStalePidDirsBounding:
 
         assert removed == len(planted)
         assert not any(p.exists() for p in planted)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestSweepStalePidDirsReclaim:
+    """An injected *reclaim* replaces the delete; selection is unchanged (task 6008)."""
+
+    def test_reclaim_replaces_the_delete_for_each_eligible_dir(self, tmp_path):
+        dead = find_dead_pid()
+        eligible = plant(tmp_path, f'{PROBE_PREFIX}work-{dead}')
+        plant(tmp_path, f'{PROBE_PREFIX}live-{os.getpid()}')
+        plant(tmp_path, f'{PROBE_PREFIX}fresh-{dead}', aged=False)
+        plant(tmp_path, f'{PROBE_PREFIX}nopid')
+        reclaimed: list[Path] = []
+
+        removed = sweep_stale_pid_dirs(
+            PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaimed.append,
+        )
+
+        assert reclaimed == [eligible]
+        assert eligible.exists(), 'with reclaim given, the sweep must not delete on its own'
+        assert removed == 1
+
+    def test_a_reclaim_that_raises_oserror_is_loud_and_uncounted(self, tmp_path, caplog):
+        dead = find_dead_pid()
+        failing = plant(tmp_path, f'{PROBE_PREFIX}failing-{dead}')
+        succeeding = plant(tmp_path, f'{PROBE_PREFIX}succeeding-{dead}')
+        reclaimed: list[Path] = []
+
+        def reclaim(path: Path) -> None:
+            if path.name == failing.name:
+                raise OSError('simulated held transcript')
+            reclaimed.append(path)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaim)
+
+        assert reclaimed == [succeeding]
+        assert removed == 1
+        assert any(
+            'failed to reclaim' in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    def test_a_reclaim_that_finds_the_dir_already_gone_is_quietly_skipped(
+        self, tmp_path, caplog,
+    ):
+        dead = find_dead_pid()
+        plant(tmp_path, f'{PROBE_PREFIX}raced-{dead}')
+
+        def reclaim(path: Path) -> None:
+            raise FileNotFoundError(path)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, reclaim=reclaim)
+
+        assert removed == 0
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
@@ -760,3 +799,20 @@ class TestTaskConfigDirCleanupAtExit:
             TaskConfigDir('probe-personal', base_dir=tmp_path, cleanup_at_exit=True)
 
         assert register.call_count == 2
+
+
+class TestRemoveCredentials:
+    def test_removes_the_token_and_keeps_the_rest(self, tmp_path):
+        config_dir = TaskConfigDir('creds', base_dir=tmp_path)
+        config_dir.write_credentials('tok')
+        transcript = config_dir.path / 'projects' / 'p' / 's.jsonl'
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{}')
+
+        config_dir.remove_credentials()
+
+        assert not (config_dir.path / '.credentials.json').exists()
+        assert transcript.exists()
+
+    def test_is_a_no_op_without_credentials(self, tmp_path):
+        TaskConfigDir('creds', base_dir=tmp_path).remove_credentials()

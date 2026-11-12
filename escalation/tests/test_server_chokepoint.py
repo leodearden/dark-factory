@@ -4,11 +4,9 @@ Exercises the auto-resolve path: when the target task is already 'done' or
 'cancelled', escalate_blocker / escalate_info should auto-resolve the
 escalation immediately rather than leaving it pending.
 
-Uses the same async FastMCP unit-test pattern as test_release_workflow.py:
-    tool = await server.get_tool('escalate_blocker')
-    result = await tool.fn(...)
-
-and the same tmp_path isolation as test_server_dedupe.py.
+Drives tools through the shared wrappers in ``_filing_tools.py`` and
+``_merge_tool_calls.py`` (thin delegates over ``_tool_calls.py::call_tool``),
+with the same tmp_path isolation as test_server_dedupe.py.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from _merge_tool_calls import (
     call_merge_status,
 )
 from shared.merge_state import EPISTEMIC_STATES, MergeReason
+from shared.task_read import TaskFound
 
 from escalation.dedupe import DedupeConfig
 from escalation.merge_status_answer import hint_for
@@ -637,13 +636,14 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     """Install *stub* where both readers of ``patch_content_contained`` look it up.
 
     The server reads it through the façade, whose home for it is
-    ``orchestrator.merge_lane.landing_evidence``; the worker's
-    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
     """
     import orchestrator.merge_lane.landing_evidence as landing_evidence
-    import orchestrator.merge_lane.worker as worker
+    import orchestrator.merge_lane.tip_relation as tip_relation
 
-    for module in (worker, landing_evidence):
+    for module in (tip_relation, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
 
 
@@ -2081,10 +2081,8 @@ class TestMergeCancel:
             EventStore,
             EventType,
         )
-        from orchestrator.merge_lane.worker import (
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
+        from orchestrator.merge_lane.worker import TerminalOutcomeRetention
 
         event_store = EventStore(db_path=tmp_path / 'events-cancel.db', run_id='cancel')
         event_store.emit(
@@ -2308,7 +2306,7 @@ class TestBoundaryTableMcpSurface:
 
         queued_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._emit_merge_queued',
+            'orchestrator.merge_lane.intake._emit_merge_queued',
             lambda *a, **kw: queued_spy.append(1),
         )
 
@@ -2779,7 +2777,7 @@ class TestBoundaryTableMcpSurface:
         """
         coalesced_spy: list[int] = []
         monkeypatch.setattr(
-            'orchestrator.merge_lane.worker._emit_merge_coalesced',
+            'orchestrator.merge_lane.intake.emit_merge_coalesced',
             lambda *a, **kw: coalesced_spy.append(1),
         )
 
@@ -3714,10 +3712,8 @@ class TestBoundary9CancelRetire:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
-        from orchestrator.merge_lane.worker import (
-            TerminalOutcomeRecord,
-            TerminalOutcomeRetention,
-        )
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
+        from orchestrator.merge_lane.worker import TerminalOutcomeRetention
 
         TIP = 'b9b9b9b9deadbeef'
         # Planted AFTER the first dispatch (models the verify worktree the worker
@@ -3981,7 +3977,7 @@ async def _run_fast_path_probe(
     They default to the same value; pass differing ones (with
     ``metadata_by_id``) to pin WHICH of them the degeneracy guard keys its
     metadata lookup off.  ``requested_ids``, when supplied, is appended to
-    with every id ``scheduler.get_task`` is actually called with.
+    with every id ``scheduler.read_task`` is actually called with.
     """
     from orchestrator.merge_lane.worker import MergeOutcome
 
@@ -4010,16 +4006,16 @@ async def _run_fast_path_probe(
     )
     harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
     if with_scheduler:
-        async def _get_task(tid: str):
+        async def _read_task(tid: str) -> TaskFound:
             if requested_ids is not None:
                 requested_ids.append(tid)
             if scheduler_raises:
                 raise RuntimeError('scheduler unreachable')
             if metadata_by_id is not None:
-                return {'metadata': metadata_by_id.get(tid) or {}}
-            return {'metadata': metadata or {}}
+                return TaskFound({'metadata': metadata_by_id.get(tid) or {}})
+            return TaskFound({'metadata': metadata or {}})
 
-        harness_stub.scheduler = types.SimpleNamespace(get_task=_get_task)
+        harness_stub.scheduler = types.SimpleNamespace(read_task=_read_task)
 
     async def _patch_content_contained(head, upstream, git_ops):
         return patch_contained
@@ -4232,10 +4228,10 @@ class TestMergeRequestDegenerateBranchFastPath:
         )
         assert mq.empty()
 
-    async def test_scheduler_get_task_raises_preserves_fast_path(
+    async def test_scheduler_read_task_raises_preserves_fast_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A raising get_task degrades the guard, and merge_request does not raise.
+        """A raising read_task degrades the guard, and merge_request does not raise.
 
         NOTE this does NOT reach merge_request's own fast-path ``except``: the
         RuntimeError is swallowed one level deeper, inside
@@ -4337,7 +4333,7 @@ class TestMergeRequestDegenerateBranchFastPath:
         and by its design decision 5: honouring ``metadata.merge_lane``
         requires reading the metadata, so a submission that supplies no
         explicit ``lane`` now pays exactly one memoized
-        ``scheduler.get_task``.  The superseded assertion rested on the
+        ``scheduler.read_task``.  The superseded assertion rested on the
         premise that the read could have no possible effect on a plain
         not-yet-merged submission — true while the PROBE was its only
         consumer, false now that the same read also resolves the lane.

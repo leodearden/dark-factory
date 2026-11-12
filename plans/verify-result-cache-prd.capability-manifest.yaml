@@ -87,6 +87,37 @@ tasks:
     delivered_check:
       kind: manual
       reason: timing; proved by η's integration gate on the fixture repo
+- label: γ2
+  task_id: 9123
+  title: Remote runners decide against a dispatcher-shipped registry view (Amendment A5)
+  capabilities:
+  - name: decision-against-a-view
+    binding: "`grep:orchestrator/src/orchestrator/verify_cache/policy.py::decide` wired — reads the RegistryView | Unavailable that consult returns"
+    verdict: PASS
+  - name: runner-keyed-input
+    binding: built here — toolchain.runner is a keyed input on every key
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: toolchain\.runner
+      paths:
+      - orchestrator/src/orchestrator/verify_cache/
+      expect: present
+  - name: view-rides-both-verify-specs
+    binding: built here — a verify_cache block on MergeVerifySpec and TaskVerifySpec
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_cache
+      paths:
+      - orchestrator/src/orchestrator/task_verify_spec.py
+      expect: present
+  - name: remote-replay-observable
+    binding: built here; judged by η rows 21 to 24 and live laptop merge_verify events
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; proved by η's integration gate rows 21 to 24
 - label: δ
   task_id: 5654
   title: Repo-wide guard module — move whole-tree tests out of shared, scripts and

@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from _briefing_helpers import (
+    AMENDMENT_BODY_FIXTURES,
+    WORST_CASE_AMENDMENT_LIST_CHARS,
     _edge,
     _entity_envelope,
     _grouped_parent,
@@ -28,6 +30,7 @@ from _briefing_helpers import (
     _node,
     _result,
     _search_arguments,
+    amendment_list_chars,
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
     recorded_search_envelope,
@@ -356,7 +359,7 @@ class TestDistilledRendering:
     async def test_grouped_children_render_as_nested_bullets(
         self, briefing: BriefingAssembler,
     ):
-        """A filtered amendment digest still renders, as a nested bullet, or
+        """A filtered amendment entry still renders, as a nested bullet, or
         the nested-drop note would announce blocking a leak nobody renders."""
         context = await self._render(briefing, [_grouped_parent()])
 
@@ -368,7 +371,7 @@ class TestDistilledRendering:
         self, briefing: BriefingAssembler,
     ):
         """The other half of ``GROUPED_CHILD_KEYS``: ``matched_children``
-        carries ``content`` where an amendment digest carries ``digest``."""
+        carries a full swallowed body where an amendment entry carries capped text."""
         parent = _grouped_parent(grouped={
             'matched_children': [
                 {'id': 's1', 'content': 'NATIVE SIGHTING BODY', 'created_at': None,
@@ -383,21 +386,24 @@ class TestDistilledRendering:
         assert '- [uncategorized · undated · mem0] Native canonical.' in context
         assert '  - [sighting · undated · mem0] NATIVE SIGHTING BODY' in context
 
+    @pytest.mark.parametrize('scenario', ['child-also-matched', 'only-parent-matched'])
     async def test_the_briefing_shows_the_contesting_child_in_full(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, scenario: str,
     ):
-        """A correction recalled with the claim it contests reaches the agent
-        whole and marked as contesting it, not as a cut digest under it."""
+        """A correction reaches the agent whole and marked as contesting its
+        parent, not as a plain amendment under it — whether the correction itself
+        matched the query or only the claim it contests did."""
+        # The oracle is the scenario where the correction is its own top-level
+        # hit, so its full body comes from a field the render under test never
+        # has to produce.
         results = json.loads(recorded_search_text('child-also-matched'))['results']
         parent = next(entry for entry in results if 'grouped' in entry)
-        contesting_id = next(
-            child['id'] for child in parent['grouped']['amendments'] if child.get('contested')
+        contesting = next(
+            child for child in parent['grouped']['amendments'] if child.get('contested')
         )
-        full_body = next(entry['content'] for entry in results if entry['id'] == contesting_id)
+        full_body = next(entry['content'] for entry in results if entry['id'] == contesting['id'])
 
-        context = await _recall(
-            briefing, _answering(recorded_search_envelope('child-also-matched')),
-        )
+        context = await _recall(briefing, _answering(recorded_search_envelope(scenario)))
 
         assert any(
             line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
@@ -1125,3 +1131,36 @@ class TestSearchReplyShapes:
         assert 'Own fact.' in conventions
         assert 'filtered out' not in context
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.asyncio
+class TestTheBriefingsAmendmentTextIsBounded:
+    """Every search answered with its limit's worth of a parent carrying a full amendment list.
+
+    The parent is a reply recorded from the real fused-memory ``search`` tool
+    (``fixtures/grouped_search_amendment_bodies/PROVENANCE.md``): ten
+    amendments, each cut at the amendment text cap. Every result fired renders
+    its own list, even when two queries return the same parent, so the
+    amendment bullets are bounded by one list's ceiling per result. The
+    results' own bodies and matched-child bodies are uncapped and not bounded
+    here.
+    """
+
+    async def test_its_amendment_bullets_stay_within_one_list_ceiling_per_result(
+        self, briefing: BriefingAssembler,
+    ):
+        recorded = recorded_search_text(
+            'ten-amendments-over-the-cap', fixtures=AMENDMENT_BODY_FIXTURES,
+        )
+        [parent] = json.loads(recorded)['results']
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['name'] == 'get_entity':
+                return _entity_envelope(nodes=[], edges=[])
+            return _mcp_search_envelope([parent] * params['arguments']['limit'])
+
+        context = await _recall(briefing, AsyncMock(side_effect=dispatch))
+
+        fired = sum(spec.limit for spec, _query in queries_for(_SCOPE))
+        assert context.count('DETAIL-09') == fired, context[:2_000]
+        assert amendment_list_chars(context) <= fired * WORST_CASE_AMENDMENT_LIST_CHARS

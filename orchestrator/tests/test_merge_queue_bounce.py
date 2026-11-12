@@ -17,9 +17,9 @@ Covers:
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
 seeded ``_inflight`` with a hand-built ``InflightEntry`` carrying a fake
-merge commit, pushed requests straight into ``_lane_buffers``, assigned a
-``_suffix_conflict_graph``, then called the private
-``_bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
+merge commit, pushed requests straight into the lane buffers, assigned a
+``suffix_conflict_graph``, then called the private
+``bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
 test going as far as replacing three private methods with stubs purely to
 pin the ORDER they are called in. That froze the lane's internals rather
 than its behaviour: none of it would have noticed the bounce being wired
@@ -53,24 +53,24 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until, lane_state
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, lane_state
 from _orch_helpers import wait_responsive
 from shared.task_metadata import RetryLedger
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     ItemLifecycleState,
-    MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
 )
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
-from orchestrator.workflow import _evaluate_merge_thrash
+from orchestrator.workflow import evaluate_merge_thrash
 
 _STOP_TIMEOUT = 30.0
 
@@ -119,7 +119,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Helpers: a running lane over a real repo ─────────────────────────────────
@@ -291,7 +291,7 @@ def _make_tracker(
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lambda: lane_buffers,
-        frozen_prefix=lambda: (),
+        frozen_requests=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
         retire_item=_record,
     )
@@ -372,7 +372,7 @@ def _fold_through_thrash_ladder(
     ledger = RetryLedger()
     escalations: list[bool] = []
     for outcome in outcomes:
-        verdict = _evaluate_merge_thrash(
+        verdict = evaluate_merge_thrash(
             ledger, ledger.last_merge_outcome_signature, _signature(outcome), threshold,
         )
         ledger = verdict.ledger
@@ -506,6 +506,10 @@ class TestBounceDrivenByTheLane:
                 assert 'suffix-b' not in verifier.verified, (
                     'the bounced item consumed a verify slot: the bounce must divert it '
                     f'before dispatch, but the verifier was asked for {verifier.verified!r}'
+                )
+                assert outcome.block_category is MergeBlockCategory.MERGE_NEEDS_REBASE
+                assert outcome.conflict_evidence == ConflictEvidence(
+                    conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-a',),
                 )
             finally:
                 release.set()
@@ -870,7 +874,7 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
     ``consecutive_merge_thrash`` reaches its threshold of 2 -- a false L1 for
     what is a fresh collision each time.
 
-    Every outcome here is folded through the SHIPPED ``_evaluate_merge_thrash``
+    Every outcome here is folded through the SHIPPED ``evaluate_merge_thrash``
     at the SHIPPED ``max_consecutive_merge_thrash``; the control proves that
     fold escalates on genuinely identical input.
     """

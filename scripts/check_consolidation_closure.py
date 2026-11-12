@@ -89,9 +89,10 @@ import _checkout as _checkout
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
-# invoke this via `python -m`. It is the single home for the tasks.db path and
-# its read-only open.
-from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+# invoke this via `python -m`. It is the single home for the tasks.db path; the
+# read-only open is shared.tasks_db_readonly's.
+from _task_db_scan import tasks_db_path
+from fused_memory.middleware.metadata_dict import extract_metadata_dict
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
     EXIT_CLOSED,
@@ -103,6 +104,7 @@ from fused_memory.reconciliation.consolidation_gate import (
 )
 from shared.project_id import project_id_for_root
 from shared.project_layout import CheckoutRootError, default_project_root
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
 #: see the EXIT-CODE CONTRACT above.
@@ -126,12 +128,12 @@ class UsageError(Exception):
 def extract_gate_block(metadata: Any) -> dict:
     """Return the gate block from a task's *metadata*, or raise UsageError.
 
-    *metadata* may be a dict or a JSON string: normalised through the seam's
-    own ``TaskInterceptor._extract_metadata_dict`` (a staticmethod), never a
-    hand-rolled ``json.loads``, so the CLI and the seam apply one shape
-    policy to the same blob.
+    *metadata* may be a dict or a JSON string: normalised through
+    ``metadata_dict.py::extract_metadata_dict``, the function the seam itself
+    calls, never a hand-rolled ``json.loads``, so the CLI and the seam apply
+    one shape policy to the same blob.
     """
-    meta = TaskInterceptor._extract_metadata_dict(metadata)
+    meta = extract_metadata_dict(metadata, source='check_consolidation_closure')
     if not isinstance(meta, dict):
         raise UsageError(
             "metadata could not be parsed as a dict, so there is no gate "
@@ -195,9 +197,9 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
 def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
     """Read one task's raw metadata column from tasks.db, READ-ONLY.
 
-    Opens through ``_task_db_scan.py::connect_ro``, whose refusal of a wrong
-    file already names the path and the remedy, so it becomes the UsageError
-    verbatim.
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``, whose
+    refusal of a wrong file already names the path and the remedy, so it
+    becomes the UsageError verbatim.
     """
     db_path = tasks_db_path(project_root)
     try:

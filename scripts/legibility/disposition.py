@@ -20,7 +20,7 @@ from typing import Any
 if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
     sys.path.insert(0, _SHARED_SRC)
 
-from legibility import codebook, task_store, verdict
+from legibility import codebook, codebook_lifecycle, task_store, verdict
 from shared.toolcall_markup import escape_envelope_literals
 
 logger = logging.getLogger("legibility.disposition")
@@ -56,6 +56,7 @@ class Resolution(enum.StrEnum):
     COMBINED = "combined"
     REFUSED = "refused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     EXISTING = "existing"
 
 
@@ -119,6 +120,7 @@ _RESOLUTION_OF = {
     task_store.TicketStatus.COMBINED: Resolution.COMBINED,
     task_store.TicketStatus.REFUSED: Resolution.REFUSED,
     task_store.TicketStatus.FAILED: Resolution.FAILED,
+    task_store.TicketStatus.CANCELLED: Resolution.CANCELLED,
 }
 
 _require_the_codebook_vocabulary("Step", (step.value for step in Step), codebook.FILED_TICKET_STEPS)
@@ -622,8 +624,7 @@ class Backfill:
 def _entry_ids_by_filed_title(cb: Mapping[str, Any]) -> dict[str, str]:
     """Each entry under the task title its own title files as, and under that
     of any candidate promoted to it, which a later correction may have
-    retitled away from. Where titles collide the last entry wins, as in
-    census._find_adjudicated_candidate."""
+    retitled away from. Where titles collide the last entry wins."""
     promoted_titles: dict[str, list[str]] = {}
     for candidate in cb.get("candidates") or []:
         if isinstance(candidate.get("promoted_to"), str) and isinstance(candidate.get("title"), str):
@@ -898,7 +899,6 @@ class Reverify:
 _ACCEPTED_STATUS = "accepted"
 _FIXED_STATUS = "fixed"
 _RETIRED_STATUS = "retired"
-_OPEN_STATUS = "open"
 _SETTLED_STATUSES = frozenset({_FIXED_STATUS, _RETIRED_STATUS})
 
 
@@ -1151,9 +1151,22 @@ class StatusChange:
 
 @dataclass(frozen=True)
 class _Projected:
-    status: str
+    """The transition a projection makes, None for one that keeps the status,
+    and the accepting task or fix sha it sets."""
+
+    transition: codebook_lifecycle.Transition | None
     accepted_by: int | None = None
     fixed_at_sha: str | None = None
+
+    def status(self, entry: Mapping[str, Any]) -> str:
+        if self.transition is None:
+            return entry["status"]
+        return codebook_lifecycle.TABLE[self.transition].target
+
+    def changes(self, entry: Mapping[str, Any]) -> bool:
+        return (self.status(entry), self.accepted_by, self.fixed_at_sha) != (
+            entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha"),
+        )
 
 
 def _projection(
@@ -1168,25 +1181,23 @@ def _projection(
     if status == _RETIRED_STATUS or governing is None or governing.ref is None:
         return None
     if governing.standing is Standing.ACCEPTED:
-        return _Projected(_ACCEPTED_STATUS, accepted_by=governing.ref.task_id)
+        return _Projected(codebook_lifecycle.Transition.ACCEPT, accepted_by=governing.ref.task_id)
     if (
         governing.standing is Standing.DONE
         and again is not None
         and again.result is ReverifyResult.GONE
         and again.task == governing.ref
     ):
-        return _Projected(_FIXED_STATUS, fixed_at_sha=as_of_sha)
+        return _Projected(codebook_lifecycle.Transition.FIX, fixed_at_sha=as_of_sha)
     if status == _FIXED_STATUS and governing.standing is not Standing.FILED:
         return None
-    return _Projected(_OPEN_STATUS if status in (_ACCEPTED_STATUS, _FIXED_STATUS) else status)
-
-
-def _projected_state(entry: Mapping[str, Any]) -> _Projected:
-    return _Projected(entry["status"], entry.get("accepted_by"), entry.get("fixed_at_sha"))
+    reopen = codebook_lifecycle.Transition.REOPEN
+    return _Projected(reopen if status in codebook_lifecycle.TABLE[reopen].sources else None)
 
 
 def _apply(entry: dict[str, Any], projected: _Projected) -> None:
-    entry["status"] = projected.status
+    if projected.transition is not None:
+        codebook_lifecycle.transit(entry, projected.transition)
     for field, value in (("accepted_by", projected.accepted_by), ("fixed_at_sha", projected.fixed_at_sha)):
         if value is None:
             entry.pop(field, None)
@@ -1209,10 +1220,10 @@ def project(
             None if outcome is None
             else _projection(entry, outcome, reverified.get(entry["id"]), as_of_sha=as_of_sha)
         )
-        if projected is None or projected == _projected_state(entry):
+        if projected is None or not projected.changes(entry):
             continue
         changes.append(StatusChange(
-            entry["id"], entry["status"], projected.status, projected.accepted_by, projected.fixed_at_sha,
+            entry["id"], entry["status"], projected.status(entry), projected.accepted_by, projected.fixed_at_sha,
         ))
         _apply(entry, projected)
     codebook.assert_no_deletion(cb, result)

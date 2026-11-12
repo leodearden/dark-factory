@@ -41,6 +41,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _live_merge_worker import running_merge_worker
+from _merge_lane_fakes import lane_scene_config, remerge_on_main
 from _orch_helpers import make_placeholder_future, wait_responsive
 from _resolution_merges import resolution_merge
 
@@ -49,6 +50,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.gates import DropGuardResult
+from orchestrator.merge_lane.intake_buffers import MergeIntake
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
@@ -105,7 +107,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1037,7 @@ class TestPathEquivalence:
         worker1 = SpeculativeMergeWorker(git_ops, queue, event_store=es_merger)
         # Neutralise the eta/1892 suffix-conflict-graph pre-dequeue bounce
         # (_acquire_next_request -> recompute_suffix_conflict_graph ->
-        # _bounce_conflicting_suffix_items): it dry-run-detects a conflict
+        # bounce_conflicting_suffix_items): it dry-run-detects a conflict
         # against main BEFORE the item is even dequeued and reroutes it to a
         # rebase/escalate outcome, which is an orthogonal, already-shipped
         # feature (task 1892) — not part of classify_and_merge's equivalence
@@ -1043,11 +1045,11 @@ class TestPathEquivalence:
         # merger-path outcome is decided by that pre-flight bounce instead of
         # classify_and_merge's own conflict branch.
         monkeypatch.setattr(
-            worker1, 'recompute_suffix_conflict_graph',
+            MergeIntake, 'recompute_suffix_conflict_graph',
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            worker1, '_bounce_conflicting_suffix_items',
+            MergeIntake, 'bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
         async with running_merge_worker(worker1):
@@ -1064,7 +1066,7 @@ class TestPathEquivalence:
         es_remerge = _make_event_store(tmp_path / 'remerge')
         queue2: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker2 = SpeculativeMergeWorker(git_ops, queue2, event_store=es_remerge)
-        item = await worker2._remerge(remerge_req, time.monotonic())
+        item = await remerge_on_main(worker2, remerge_req, time.monotonic())
 
         # A flowing (non-decided) item means _remerge merged successfully
         # without hitting any guard.  None is a deliberately distinct

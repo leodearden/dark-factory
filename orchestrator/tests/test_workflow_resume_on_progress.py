@@ -20,13 +20,15 @@ circuit breaker trips at call_count==3 instead of 4.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import fixed_prompt
+from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT, PROGRESS_TIMEOUT_RESUME_PROMPT
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, TaskWorkflow, WorkflowOutcome
@@ -43,6 +45,7 @@ def _make_workflow(
     max_execute_iterations: int = 10,
     max_consecutive_zero_output_timeouts: int = 2,
     max_progress_resume_iterations: int = 20,
+    resume_session_id: dict | None = None,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow harness for resume-on-progress tests.
 
@@ -86,6 +89,7 @@ def _make_workflow(
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
+        resume_session_id=resume_session_id,
     )
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
@@ -602,3 +606,81 @@ class TestInvokeResumesConsumesFields:
             f'Expected resume_session_id=None (fresh session), '
             f'got {call_kwargs.get("resume_session_id")!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3985: what the resumed agent is TOLD about why it was resumed
+# ---------------------------------------------------------------------------
+
+
+async def _invoke_recording(wf: TaskWorkflow, tmp_path: Path, prompt_text: str) -> dict:
+    """Run the real ``_invoke`` and return the kwargs the agent received.
+
+    Patches only the ``invoke_fn`` seam (``orchestrator.workflow.invoke_agent``),
+    so the real ``invoke_with_cap_retry`` (usage_gate None: single invocation)
+    decides the prompt that reaches the agent.
+    """
+    seen: dict = {}
+
+    async def fake(**kwargs):
+        seen.update(kwargs)
+        return AgentResult(success=True, output='ok', turns=1)
+
+    with (
+        patch('orchestrator.workflow.invoke_agent', new=fake),
+        patch.object(wf, '_build_agent_env', return_value=None),
+    ):
+        await wf._invoke(IMPLEMENTER, fixed_prompt(prompt_text), tmp_path)
+    return seen
+
+
+async def _arm_progress_timeout_resume(wf: TaskWorkflow) -> None:
+    """Drive the real γ branch so it arms a resume of 'killed-sid'."""
+    _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+    wf._last_invoke_session_id = 'killed-sid'
+    await wf._execute_iterations()
+    del wf._invoke
+
+
+@pytest.mark.asyncio
+class TestProgressTimeoutResumePrompt:
+    """A γ resume follows a watchdog kill, not an orchestrator restart, so the
+    agent must receive PROGRESS_TIMEOUT_RESUME_PROMPT; a crash-recovery resume
+    keeps CRASH_RECOVERY_RESUME_PROMPT.
+    """
+
+    async def test_progress_timeout_resume_delivers_progress_timeout_prompt(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path, max_execute_iterations=1)
+        await _arm_progress_timeout_resume(wf)
+
+        seen = await _invoke_recording(wf, tmp_path, 'real-task-prompt')
+
+        assert seen['resume_session_id'] == 'killed-sid'
+        assert seen['prompt'] == PROGRESS_TIMEOUT_RESUME_PROMPT
+
+    async def test_dispatch_after_progress_timeout_resume_is_fresh_with_real_prompt(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path, max_execute_iterations=1)
+        await _arm_progress_timeout_resume(wf)
+        await _invoke_recording(wf, tmp_path, 'real-task-prompt')
+
+        seen2 = await _invoke_recording(wf, tmp_path, 'real-task-prompt')
+
+        assert seen2.get('resume_session_id') is None
+        assert seen2['prompt'] == 'real-task-prompt'
+
+    async def test_crash_recovery_resume_still_delivers_crash_recovery_prompt(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            resume_session_id={'session_id': 'crash-sid', 'role': 'implementer'},
+        )
+
+        seen = await _invoke_recording(wf, tmp_path, 'real-task-prompt')
+
+        assert seen['resume_session_id'] == 'crash-sid'
+        assert seen['prompt'] == CRASH_RECOVERY_RESUME_PROMPT

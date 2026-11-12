@@ -23,7 +23,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from shared.scheduler_state import SchedulerStateSnapshot
 
+from dashboard.data.scheduler import clear_scheduler_state
 from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _forget_scheduler_state():
+    """Each test reads its own scheduler state rather than one an earlier test cached."""
+    clear_scheduler_state()
+    yield
+    clear_scheduler_state()
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
@@ -601,28 +610,24 @@ async def test_degraded_project_parks_are_never_reported_stranded(
 
 
 # ---------------------------------------------------------------------------
-# task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
-# contract that the upcoming _one_project -> first_success conversion must
-# preserve.
+# The first_success + None-sentinel contract, and the two retry axes: the
+# scheduler state fails over inside its own access datum (task 6584), the
+# two event reads fail over together on their own.
 # ---------------------------------------------------------------------------
 
 
-async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_events_fail(
+async def test_collect_scheduler_state_fails_over_only_the_events_when_events_fail(
     dummy_client, two_url_config
 ):
-    """A mid-run failure on url1 re-issues EVERY call on url2, not just events.
+    """A failed events read on url1 re-issues the two event reads on url2, not the state.
 
-    url1's get_scheduler_state succeeds but get_scheduler_events raises; the
-    whole (state, skip-events, recovery-events) group is then re-issued against
-    url2 rather than reusing url1's already-successful snapshot. Distinguishes
-    the two URLs' snapshots (skip_counts 99 vs 7) so a stray use of url1's
-    snapshot would be caught, and asserts get_scheduler_state is called again
-    on url2 (total 2 calls) rather than only retrying the events leg (which
-    would be 1 state call + N events calls).
+    url1's get_scheduler_state succeeds but get_scheduler_events raises. The
+    state is ``acquire_scheduler_state``'s datum, answered once by url1; only
+    the events legs move to url2. Distinguishes the two URLs' snapshots
+    (skip_counts 99 vs 7), so a row reading url2's snapshot would be caught.
 
-    The two event classes are fetched with independent row budgets, so a
-    successful project issues THREE calls, not two — the retry axis is still
-    the whole group.
+    The two event classes are fetched with independent row budgets, so url2
+    answers TWO events calls.
     """
     from unittest.mock import AsyncMock, patch
 
@@ -676,9 +681,8 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     assert project not in offline_projects
     assert len(rows) == 1
-    assert rows[0]['skip_count'] == 7, (
-        'row must reflect url2 snapshot (7) — a stray url1 value (99) means '
-        'the pair was not fully re-issued on url2'
+    assert rows[0]['skip_count'] == 99, (
+        "row must reflect url1's snapshot (99), the state datum's one answer"
     )
 
     composite_key = f'{project}/1'
@@ -687,13 +691,12 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     state_calls = [c for c in calls if c[1] == 'get_scheduler_state']
     events_calls = [c for c in calls if c[1] == 'get_scheduler_events']
-    assert len(state_calls) == 2, (
-        'get_scheduler_state must be re-issued on url2, not reused from url1'
+    assert state_calls == [(url1, 'get_scheduler_state')], (
+        'get_scheduler_state is answered once, by url1, inside its own access datum'
     )
     # url1: the skip-events call raises before the recovery one is reached.
     # url2: both event classes are fetched (independent row budgets).
-    assert len(events_calls) == 3
-    assert [c[0] for c in calls] == [url1, url1, url2, url2, url2]
+    assert [c[0] for c in events_calls] == [url1, url2, url2]
 
 
 async def test_collect_scheduler_state_all_urls_fail_marks_project_offline(
@@ -801,6 +804,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, [], []])
     mock_active2 = AsyncMock(return_value=_tasks_read())
 
@@ -820,6 +824,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, [], []])
     mock_active3 = AsyncMock(return_value=_tasks_read())
 
@@ -1449,23 +1454,7 @@ def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
             resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
 
     assert resp.status_code == 400
-    # Background monitoring tasks call mcp_tool_call via get_memory_status /
-    # get_queue_stats (both defined in memory.py, so they resolve through the
-    # patched module attribute).  Build a robust tool-name extractor that handles
-    # both positional and kwarg-style invocations, then assert an explicit
-    # allowlist: only the two known background tools are permitted; anything else
-    # (including 'set_task_priority_override') signals a regression where the
-    # override endpoint is invoking MCP before validation completes.
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
     if expected_error is not None:
         assert resp.json().get('error') == expected_error
 
@@ -1519,6 +1508,9 @@ _CLEAR_INVALID_BODIES = [
     pytest.param({'task_id': ''}, id='empty-task_id'),
     pytest.param({'task_id': 'T1', 'fields': 'not-a-list'}, id='fields-not-list'),
     pytest.param({'task_id': 'T1', 'fields': ['bad_field']}, id='invalid-field'),
+    pytest.param(
+        {'task_id': 'T1', 'project_root': '/proj', 'fields': []}, id='fields-empty',
+    ),
 ]
 
 
@@ -1640,7 +1632,7 @@ def test_reorder_pin_queue_proxies_verbatim_on_success(client):
     assert resp.json() == mcp_result
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'reorder_pin_queue'
-    assert args['task_ids'] == ['T1', 'T2']
+    assert args == {'ordered_task_ids': ['T1', 'T2'], 'project_root': '/proj'}
     assert args['project_root'] == '/proj'
 
 
@@ -1676,7 +1668,7 @@ _EVICT_PARK_INVALID_BODIES = [
 
 @pytest.mark.parametrize('body,expected_error', _EVICT_PARK_INVALID_BODIES)
 def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
-    """Invalid body → 400 with no request_park_eviction MCP call."""
+    """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
     with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
@@ -1691,17 +1683,7 @@ def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
 
     assert resp.status_code == 400
     assert resp.json().get('error') == expected_error
-
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
 
 
 def test_evict_park_endpoint_proxies_verbatim_on_success(client):
@@ -1995,9 +1977,55 @@ def test_clear_override_translates_ttl_until_to_mcp_ttl(client):
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'clear_task_priority_override'
     # Dashboard must translate 'ttl_until' → 'ttl' before forwarding to MCP
-    assert args.get('fields') == ['ttl'], (
-        f"Expected MCP fields=['ttl'], got {args.get('fields')!r}"
-    )
+    assert args == {'task_id': 'T1', 'project_root': '/p', 'field': 'ttl'}
+
+
+def test_clear_override_clears_each_named_field_by_its_own_call(client):
+    """The tool declares one ``field`` per call; a 'fields' key would be refused."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'boost_tier']},
+        )
+
+    assert resp.status_code == 200
+    sent = [call.args[3] for call in mock_mcp.call_args_list]
+    assert sent == [
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'pinned'},
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'boost_tier'},
+    ]
+
+
+def test_clear_override_without_fields_clears_the_whole_row(client):
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value={'status': 'ok'})) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p'},
+        )
+
+    assert resp.status_code == 200
+    assert [call.args[3] for call in mock_mcp.call_args_list] == [
+        {'task_id': 'T1', 'project_root': '/p'},
+    ]
+
+
+def test_clear_override_stops_at_the_first_field_that_is_not_found(client):
+    from unittest.mock import AsyncMock, patch
+
+    not_found = {'error': 'not_found', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=not_found)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'ttl_until']},
+        )
+
+    assert resp.status_code == 404
+    assert mock_mcp.call_count == 1
 
 
 # ---------------------------------------------------------------------------

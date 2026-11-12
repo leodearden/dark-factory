@@ -209,9 +209,11 @@ still holds the loop for ~60 s) — and which work
 inside the body is invariant across iterations? If it shells out, does
 the process spawn itself (fork/exec) run on the loop thread?
 
-**Evidence**: `_render_live_workflow_section`
-(`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`
-— a sync `def` called from `async def assemble_payload`) fanned three
+**Evidence**: the renderer that task 3778 measured (today's home:
+`fused-memory/src/fused_memory/reconciliation/live_workflow_section.py::build_live_workflow_snapshot`,
+now an `async def`; it was `_render_live_workflow_section` in
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`,
+a sync `def` called from `async def assemble_payload`) fanned three
 blocking `subprocess.run(['git', ...])` calls over the uncapped
 `filtered.active_tasks`: 56.7 ms/task × 514 (dark_factory) and
 82.7 ms/task × 525 (reify) => 29-43 s per render on the loop thread.

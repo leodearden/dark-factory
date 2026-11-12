@@ -112,7 +112,9 @@ _completion_claim_gate -> verify_claims; its sibling row,
 create_mcp_server._claim_commit_presence, was then fixed and deleted by
 task 4853) and three added by widening the vocabulary to shutil.rmtree.  Task 5099 re-measured at HEAD b4e1349e1c
 after widening it to the directory-walk/metadata calls: 190 files scanned,
-91 findings (55 before; census section 4c).
+91 findings (55 before; census section 4c).  Task 6089 re-measured at HEAD
+d8b04e7aaa after widening it to Path.resolve / os.path.realpath: 290 files
+scanned, 90 findings (80 before; census section 4d).
 """
 
 from __future__ import annotations
@@ -160,52 +162,6 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
-#: The shared justification of every ``reconciliation/backlog_policy.py`` row.
-_BACKLOG_POLICY_RECORD_IO_WHY = (
-    'ROOT CAUSE (one defect): BacklogPolicy scans, reads and '
-    'writes its escalation records on the loop thread. on_judge_unhalt '
-    'is_dirs data/escalations, then globs every judge_halt*.json record '
-    'in the queue root -- an O(N) directory read that grows with the '
-    'pending queue -- read_texts each match and reaches '
-    '_restore_policy_keys; _maybe_write_escalation reaches '
-    '_merge_onto_persisted; both helpers read_text then write_text the '
-    'located record under escalation_id_lock. UNDERSTATED BY THESE '
-    'ROWS, and recorded here because no row can carry it: the dominant '
-    'blocking work on the write path is the '
-    'escalation.dedupe.submit_or_dedupe call one line ABOVE the '
-    '_merge_onto_persisted site -- find_dedupe_parent globs and '
-    'JSON-parses every pending record in the project queue '
-    '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-    'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-    'The scanner reports only _merge_onto_persisted because those '
-    'primitives live in the escalation package, across a boundary its '
-    'fused-memory/src scope cannot follow -- so another row would be a '
-    'blessing test_no_stale_blessings rejects, and this paragraph is '
-    'the only honest place to state it. Filesystem, the limb task '
-    '3778\'s subprocess-only vocabulary omitted. The record '
-    'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
-    '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
-    '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
-    'added when it widened the vocabulary are TASK 6086, filed to fold '
-    'into the same offload.'
-)
-
-#: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
-_VERIFIER_LLM_TOOL_IO_WHY = (
-    'ROOT CAUSE (one defect): the async tools '
-    'CodebaseVerifier.verify hands the codebase-verification LLM do '
-    'their filesystem work inline on the loop thread, once per tool '
-    'call the model chooses to make -- an LLM-driven, unbounded call '
-    'count. read_file does full_path.read_text(); glob_search runs '
-    'codebase_root.glob(pattern) with an LLM-CHOSEN pattern and sorts '
-    'every match before keeping 50, so a "**/*" walks the whole '
-    'codebase root. The read_file row is OWNED BY TASK 5270 -- do not '
-    'file again: task 4484 step-9\'s ticket '
-    'tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ became task 5078, coalesced into '
-    '5270. The glob_search row task 5099 added when it widened the '
-    'vocabulary is TASK 6088, filed to fold into the same offload.'
-)
-
 #: Task 5099: an idempotent mkdir of a store's own data dir as it opens.
 _MKDIR_ON_STORE_OPEN_WHY = (
     'ACCEPTED, measured cheap (one cause): one idempotent '
@@ -241,29 +197,54 @@ _DECLARED_FILES_STAT_WHY = (
     'read.'
 )
 
-#: Task 5099: the curator COMBINE audit line.
+#: Task 5099: the curator COMBINE audit line; task 8415 added its item fields.
 _COMBINE_AUDIT_APPEND_WHY = (
     'ACCEPTED, bounded by an LLM decision (one cause): '
     'TaskInterceptor._execute_combine reaches _append_combine_audit, an '
     'idempotent mkdir (6-11us, task 5099 timeit) plus one open(\'a\') '
-    'append of a single JSON line under 2 KB (descriptions truncated to '
-    '500 chars), with no fsync. It runs once per curator COMBINE decision, '
+    'append of a single JSON line, with no fsync. The line is about 2 KB '
+    '(descriptions and justification truncated to 500 chars) plus, since '
+    'task 8415, the items_before/items_after lists: one 16-hex item key '
+    'per follow-up item on the target, so roughly 40 bytes per item. It '
+    'runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
-    'on a hot or storm-coupled path. The EventQueue dead-letter append is '
-    'the one defect of this shape, because it fires during a drop storm.'
+    'on a hot or storm-coupled path. The one storm-coupled defect of this '
+    'shape, the EventQueue dead-letter append that fires during a drop '
+    'storm, was moved onto a dedicated writer thread by task 6085.'
 )
 
-#: Task 5099: EventQueue._write_dead_letter's inline append.
-_DEAD_LETTER_APPEND_WHY = (
-    'ROOT CAUSE (one defect): EventQueue._write_dead_letter runs '
-    'mkdir + exists + stat + the cascade rotation + open(\'a\') + write '
-    'inline on the loop thread, and its async callers reach it without a '
-    'hop. The enqueue overflow_drop branch fires EXACTLY when the loop is '
-    'saturated, so the blocking append is coupled to the storm it '
-    'records, and a rotation renames files on the same thread. '
-    'UNDERSTATED BY THESE ROWS: the scanner resolves only self.enqueue, '
-    'not other receivers\' event_queue.enqueue(...), so the real caller '
-    'population is larger. Filed by task 5099 as TASK 6085.'
+#: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
+_CHEAP_RESOLVE_OWNER_WHY = (
+    ' OWNED BY TASK 7572, created from task 6089\'s follow-up ticket '
+    'tkt_0RW94QBGG9RSRP47XQXGGV1KFK. Under the INV-12 day-one ruling '
+    '(esc-5603-1) a measured-cheap site is no longer a resting state in this '
+    'ledger, so 7572 offloads it (asyncio.to_thread, or anyio.Path.resolve '
+    'for a Path) and deletes the row, or obtains a per-row Policy ruling.'
+)
+
+#: Task 6089: one canonicalising resolve() in front of an awaited open.
+_PATH_RESOLVE_GUARD_WHY = (
+    'ROOT CAUSE (one debt, measured cheap): one Path.resolve() per '
+    'invocation of a single root or database path -- never a walk over what '
+    'a directory holds -- canonicalising it immediately before awaited work '
+    'that costs far more (an aiosqlite or connect_daemon open). Its cost '
+    '(census section 4d) scales with the path\'s component count, which is '
+    'set by the path the code, configuration or caller supplies, not by '
+    'what is on disk.'
+    + _CHEAP_RESOLVE_OWNER_WHY
+)
+
+#: Task 6089: run_server canonicalising configured paths before it serves.
+_STARTUP_PATH_RESOLVE_WHY = (
+    'ROOT CAUSE (one debt, startup only): run_server canonicalises a '
+    'configured path with Path.resolve() once per process, while it builds '
+    'the server and before server.serve() binds, so no request is in flight '
+    'to be delayed. A background loop run_server has already started (the '
+    'reconciliation harness, the event queue) can be stalled for that one '
+    'resolve (cost: census section 4d), once per process lifetime. If it '
+    'ever moves onto a request or reload path, '
+    'its content_hash changes and the gate re-asks.'
+    + _CHEAP_RESOLVE_OWNER_WHY
 )
 
 #: The shared justification of both ``gc_run_config_dir`` rows in harness.py.
@@ -340,6 +321,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'accepted',
         _FIXED_STAT_GUARD_WHY,
     ),
+    (
+        'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py',
+        'read_scheduler_events',
+        '14947dd93734',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
+    ),
 
     # ---- middleware/task_interceptor.py ----
     (
@@ -352,16 +340,38 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        '15bda1dd6b34',
+        '0a7e982628a1',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
     ),
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._execute_combine',
-        'd7b1b643f3fe',
+        'ab64655040c9',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
+    ),
+
+    # ---- middleware/task_curator.py ----
+    (
+        'fused-memory/src/fused_memory/middleware/task_curator.py',
+        'TaskCurator._invoke_curator',
+        '2be781b317a0',
+        'filed',
+        'ROOT CAUSE (one debt, bounded by an LLM call): _invoke_curator reaches '
+        '_resolve_curator_prompt -> self._prompt_store.resolve(...). The '
+        'scanner matches the method name resolve, but the receiver is '
+        'shared.prompt_artifact.PromptArtifactStore.resolve, not '
+        'Path.resolve. That code lives under shared/src, outside the '
+        'scanner\'s fused-memory/src scope, and it does block: unpinned it is '
+        'one exists() probe of the key\'s heuristics.txt (cost: census '
+        'section 4d); pinned it adds a JSON provenance load and a '
+        'heuristics.txt read. '
+        'PromptArtifactStore.resolve\'s own docstring states this I/O and '
+        'the once-per-invocation granularity it expects. It runs once per '
+        'curator LLM round-trip, immediately before the awaited self._invoke '
+        'of seconds -- the same bound the COMBINE audit append rests on.'
+        + _CHEAP_RESOLVE_OWNER_WHY,
     ),
 
     # ---- middleware/ticket_store.py ----
@@ -371,43 +381,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'f485b909e349',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
-    ),
-
-    # ---- reconciliation/backlog_policy.py ----
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '8f53c74a5d76',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '08a103635fd7',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy._maybe_write_escalation',
-        '0d761c10e563',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        'cb226477b1bf',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '48269c8edbbd',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
 
     # ---- reconciliation/cli_stage_runner.py ----
@@ -426,34 +399,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd325858ad5fe',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.recover',
-        '2f9ae36b2bc7',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.close',
-        'c8191bbaf10a',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._commit_with_retry',
-        '93d589ee10dd',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._enqueue_on_loop',
-        'f46e02910e17',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
     ),
 
     # ---- reconciliation/harness.py ----
@@ -482,13 +427,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_stale_runs',
         'cc7999e2d4b6',
-        'filed',
-        _ESCALATE_ARCHIVE_SCAN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._resume_interrupted_runs',
-        'bc3672ec502c',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
@@ -693,20 +631,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     # ---- reconciliation/verify.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.read_file',
-        'c04bd0d302eb',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.glob_search',
-        '29916e02709d',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify',
         'ab04e5fd6d64',
         'accepted',
@@ -741,6 +665,15 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'coroutine; its git probes, the real cost, are awaited.',
     ),
 
+    # ---- services/overreach_shadow.py ----
+    (
+        'fused-memory/src/fused_memory/services/overreach_shadow.py',
+        'OverreachShadowStore.open_read_only',
+        'fa698adde643',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
+    ),
+
     # ---- services/planned_episode_registry.py ----
     (
         'fused-memory/src/fused_memory/services/planned_episode_registry.py',
@@ -763,12 +696,12 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'f38dc5fc1e4c',
+        '06814d9a4e68',
         'accepted',
-        'ACCEPTED: run_server calls build_known_projects_map '
-        '(models/scope.py -- open() of each project manifest, then '
-        'yaml.safe_load; the sweep reports whichever the walk reaches '
-        'first) during process STARTUP, before the server binds '
+        'ACCEPTED: run_server calls configured_known_projects_map '
+        '(models/scope.py -- Path.resolve() of the primary root, then '
+        'open() and yaml.safe_load of each project manifest; the sweep '
+        'reports whichever the walk reaches first) during process STARTUP, before the server binds '
         'and begins serving traffic, so there is no concurrent work for it '
         'to stall and no request whose latency it can affect. This is what '
         'an accepted row must say -- what makes the cost acceptable, not '
@@ -783,11 +716,32 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ACCEPTED, startup only: run_server reaches '
         'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
         'SQLite open matched by the method name open. It genuinely blocks, '
-        'but like the build_known_projects_map row beside it, it runs once '
+        'but like the configured_known_projects_map row beside it, it runs once '
         'during process STARTUP, before the server binds and begins '
         'serving traffic, so there is no concurrent work to stall. If it '
         'ever moves onto a request or reload path, the content_hash '
         'changes and the gate re-asks.',
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        '8a884f86a26c',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        'f6a7ff40db1f',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        '43c97372205c',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
     ),
 
     # ---- server/tools.py ----
@@ -1221,6 +1175,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'handler cannot be added silently under a blessed 22. Follow-up '
         'filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        'create_mcp_server.request_park_eviction',
+        'a0b1b5c60eed',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',

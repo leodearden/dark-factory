@@ -11,8 +11,15 @@ import { loadClient, payload } from './_boundary_client.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  escalationRow,
+  escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  qualityMetric,
+  qualityPayload,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
   tasksSnapshotEntry,
   wireDatum,
@@ -84,4 +91,81 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {
+  const served = payload('scheduler_offline').SCHEDULER;
+  const built = schedulerSnapshot({
+    offlineProjects: ['P'],
+    rows: [schedulerLockRow({ project: 'H', taskId: '1', lockSet: ['src/m'] })],
+    modules: [schedulerModule({ project: 'H', path: 'src/m', holder: '1', holderProject: 'H', parkedBy: '2', parkedOwnerLive: true })],
+  });
+
+  assertBuiltKeysServed(built, served, 'SCHEDULER');
+});
+
+test('an /escalations payload, a check-owner row included, is built only with keys /escalations serves', () => {
+  const served = payload('escalations_check_owner').ESCALATIONS;
+  const row = escalationRow({
+    id: 'esc-3-1',
+    taskId: '3',
+    summary: 's',
+    project: 'dark-factory',
+    deliveredCheckOwner: { task_id: '4', check_name: 'c', sidecar: { path: 'p', on_main: 'declares' } },
+  });
+
+  assertBuiltKeysServed(escalationsPayload([{ project: 'dark-factory', rows: [row] }]), served, 'ESCALATIONS');
+});
+
+test("an /escalations payload's counts and views agree with the served ones for its one pending row", () => {
+  const served = payload('escalations_check_owner').ESCALATIONS;
+  const servedQueue = served.subsections.find(subsection => subsection.kind === 'orchestrator');
+  const servedRow = servedQueue.escalations[0];
+  const row = escalationRow({
+    id: servedRow.id,
+    taskId: servedRow.task_id,
+    level: servedRow.level,
+    status: servedRow.status,
+    summary: servedRow.summary,
+    project: 'dark-factory',
+  });
+  const built = escalationsPayload([{ project: 'dark-factory', rows: [row] }]);
+  const viewValues = views => Object.fromEntries(Object.entries(views).map(([name, datum]) => [name, datum.value]));
+
+  for (const [where, builtPart, servedPart] of [
+    ['ESCALATIONS', built, served],
+    ['the orchestrator subsection', built.subsections[0], servedQueue],
+  ]) {
+    assert.deepEqual(builtPart.summary, servedPart.summary, `${where}.summary`);
+    assert.deepEqual(viewValues(builtPart.views), viewValues(servedPart.views), `${where}.views`);
+  }
+});
+
+test('a QUALITY series, a measured and a no-producer metric included, is built only with keys /quality serves', () => {
+  const served = payload('quality_fresh').QUALITY;
+  const measured = qualityMetric({
+    kind: 'rate',
+    points: [0, 1, 0],
+    headlineForm: 'rate',
+    ewma: { line: [0.2, 0.25, 0.22], ucl: [0.4, 0.4, 0.4] },
+  });
+  const unproduced = qualityMetric({ kind: 'count', points: [null, null, null], measuredSince: null });
+  const built = qualityPayload({
+    axis: [{}, { git_first_parent: false }, { late_claim: true }],
+    metrics: { rejected: measured, reverts: unproduced },
+  });
+  const servedMetrics = served.value.metrics;
+
+  assertSameKeys(wireDatum(null), served, 'the QUALITY Datum');
+  assertBuiltKeysServed(built, served.value, 'QUALITY.value');
+  assertSameKeys(built, served.value, 'QUALITY.value');
+  assertSameKeys(built.axis[0], served.value.axis[0], 'QUALITY.value.axis[0]');
+  for (const [id, metric] of Object.entries(built.metrics)) {
+    assertSameKeys(metric, servedMetrics[id], `QUALITY.value.metrics.${id}`);
+    assertSameKeys(metric.rule, servedMetrics[id].rule, `QUALITY.value.metrics.${id}.rule`);
+    assertSameKeys(metric.headline, servedMetrics[id].headline, `QUALITY.value.metrics.${id}.headline`);
+  }
+  assertSameKeys(measured.headline.value, servedMetrics.rejected.headline.value, 'a measured headline value');
+  assert.equal(servedMetrics.reverts.rule.measured_since, null, 'this check expects reverts to have no producer');
+  assert.equal(unproduced.headline.state, servedMetrics.reverts.headline.state);
 });

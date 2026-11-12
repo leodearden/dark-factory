@@ -10,6 +10,8 @@ say UNSATISFIED only on affirmative evidence and UNKNOWN on absence of it.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from orchestrator.dependency_verdict import (
@@ -87,7 +89,12 @@ def test_a_verdict_names_a_kind_exactly_when_it_is_not_satisfied(state, kind):
 
 
 def test_dependency_kind_wire_values():
-    assert [kind.value for kind in DepKind] == ['local', 'external', 'delivered_check']
+    assert [kind.value for kind in DepKind] == [
+        'local',
+        'external',
+        'delivered_check',
+        'scheduled_deploy',
+    ]
 
 
 EXTERNAL_DEP = 'other_project:7'
@@ -171,6 +178,108 @@ def test_a_blocked_local_dependency_wins_over_an_unknown_external_one():
         external_status_cache={},
     )
     assert verdict == DepsVerdict.unsatisfied(DepKind.LOCAL)
+
+
+def _scheduled_dep(phase: str, provenance_kind: str = 'deterministic-deploy-scheduled') -> dict:
+    return {
+        'id': 'D',
+        'status': 'done',
+        'metadata': {
+            'done_provenance': {
+                'kind': provenance_kind,
+                'unit': 'orchestrator-dark-factory.service',
+                'transient_unit': 'orch-redeploy-restart-D.service',
+                'fire_delay_secs': 60,
+            },
+            'before_done_scheduled_at': {
+                'at': '2026-11-09T10:00:00+00:00',
+                'transient_unit': 'orch-redeploy-restart-D.service',
+                'fire_delay_secs': 60,
+            },
+            'deploy_state': {'phase': phase},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ('phase', 'expected'),
+    [
+        ('scheduled', DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)),
+        ('failed', DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)),
+        ('verified', SATISFIED),
+        ('done', SATISFIED),
+    ],
+)
+def test_a_done_scheduled_self_deploy_holds_its_dependent_until_the_restart_is_verified(
+    phase, expected
+):
+    verdict = deps_verdict(
+        _dependent('D'),
+        {'D': 'done'},
+        {},
+        terminal_dep_records={'D': _scheduled_dep(phase)},
+    )
+    assert verdict == expected
+
+
+def test_a_scheduled_self_deploy_record_in_tasks_by_id_also_holds():
+    verdict = deps_verdict(_dependent('D'), {'D': 'done'}, {'D': _scheduled_dep('scheduled')})
+    assert verdict == DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)
+
+
+@pytest.mark.parametrize('terminal_dep_records', [{}, None], ids=['absent', 'no-backfill'])
+def test_a_done_dependency_without_a_record_does_not_hold(terminal_dep_records):
+    verdict = deps_verdict(
+        _dependent('D'), {'D': 'done'}, {}, terminal_dep_records=terminal_dep_records
+    )
+    assert verdict == SATISFIED
+
+
+def test_a_done_dependency_the_backfill_deferred_before_caching_is_unknown():
+    verdict = deps_verdict(
+        _dependent('D'), {'D': 'done'}, {}, terminal_dep_records={}, deferred_terminal_deps={'D'}
+    )
+    assert verdict == DepsVerdict.unknown(DepKind.SCHEDULED_DEPLOY)
+
+
+@pytest.mark.parametrize(
+    ('phase', 'expected'),
+    [
+        ('scheduled', DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY)),
+        ('verified', SATISFIED),
+    ],
+)
+def test_a_deferred_dependency_with_a_record_follows_its_record(phase, expected):
+    verdict = deps_verdict(
+        _dependent('D'),
+        {'D': 'done'},
+        {},
+        terminal_dep_records={'D': _scheduled_dep(phase)},
+        deferred_terminal_deps={'D'},
+    )
+    assert verdict == expected
+
+
+def test_a_done_deploy_that_was_not_scheduled_does_not_hold():
+    record = _scheduled_dep('scheduled', provenance_kind='deterministic-deploy')
+    verdict = deps_verdict(_dependent('D'), {'D': 'done'}, {}, terminal_dep_records={'D': record})
+    assert verdict == SATISFIED
+
+
+def test_a_non_terminal_dependency_is_reported_by_the_local_arm_first():
+    verdict = deps_verdict(
+        _dependent('D'), {'D': 'pending'}, {}, terminal_dep_records={'D': _scheduled_dep('scheduled')}
+    )
+    assert verdict == DepsVerdict.unsatisfied(DepKind.LOCAL)
+
+
+def test_the_scheduled_deploy_hold_is_logged(caplog):
+    with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduler'):
+        deps_verdict(
+            _dependent('D'), {'D': 'done'}, {}, terminal_dep_records={'D': _scheduled_dep('scheduled')}
+        )
+    held = [r.getMessage() for r in caplog.records if r.name == 'orchestrator.scheduler']
+    assert any('Task T' in m and 'dep D' in m and "'scheduled'" in m for m in held), held
 
 
 class TestTaskExternalDeps:

@@ -38,7 +38,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo, load_script_module
+from _fm_git_repos import _init_git_repo
+from _fm_helpers import load_script_module
 from shared.briefing_queries import (
     CONVENTIONS_AREA,
     CONVENTIONS_GENERIC,
@@ -1216,6 +1217,23 @@ class TestTheJournalPathIsAnchoredOnTheMainCheckout:
         result = _load_copy_in(plain).harvest(journal, tail_sample=5)
 
         assert result.journal_path == 'data/j.db'
+
+
+class TestTheDefaultJournalIsTheMainCheckouts:
+    """The default `--journal` is derived from where the checkout really lives.
+
+    It names no user's home directory, and a lane run reads the same live
+    journal as a run from the main checkout.
+    """
+
+    def test_a_lane_copy_defaults_to_the_main_checkouts_journal(self, tmp_path):
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+
+        args = _load_copy_in(lane).build_parser().parse_args(
+            ['--out', str(tmp_path / 'out.jsonl')]
+        )
+
+        assert Path(args.journal).resolve() == main / 'data' / 'reconciliation' / 'write_journal.db'
 
 
 class TestTheCommittedArtifactsCarryNoAbsolutePath:

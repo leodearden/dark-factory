@@ -42,7 +42,8 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import QDRANT_URL, MockEdge, load_script_module, qdrant_skipif
+from _fm_helpers import MockEdge, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 from qdrant_client import QdrantClient
 
 from fused_memory.backends.mem0_client import Mem0Backend
@@ -53,7 +54,6 @@ from fused_memory.services.memory_service import RRF_K, MemoryService
 
 pytestmark = [
     qdrant_skipif(),
-    pytest.mark.timeout(120),
     # Real Qdrant + real OpenAI embedder: the integration/offline lane per task
     # 3019 / the integration-test-lane PRD, never a merge-lane gate.
     pytest.mark.integration,
@@ -194,9 +194,6 @@ async def test_seeded_mem0_needle_reaches_the_merged_top5(
 
     scope = Scope(project_id=rrf_project_id)
     backend = Mem0Backend(rrf_config)
-    inst = await backend._get_instance(scope)
-    # Shared SQLite history writer: xdist-contended and irrelevant here.
-    inst.db.add_history = lambda *a, **kw: None
 
     try:
         for content in (*DISTRACTORS, NEEDLE):

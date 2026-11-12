@@ -25,12 +25,12 @@ from dataclasses import dataclass
 import pytest
 import pytest_asyncio
 from _falkor_index_live import (
-    injected_driver,
     live_backends,
     missing_production_indices,
     scratch_graphs,
 )
-from _fm_helpers import await_index_operational, falkor_skipif, retry_until_observed
+from _fm_falkor_live import await_index_operational, falkor_skipif
+from _fm_polling import retry_until_observed
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.graph_queries import (
     NEO4J_TO_FALKORDB_MAPPING,
@@ -50,10 +50,6 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 
 pytestmark = [
     falkor_skipif(),
-    # Provisioning and settling are bounded well under this; `timeout_method =
-    # "thread"` os._exit(1)s the xdist worker, so an under-budget timeout would
-    # read as an infrastructure crash.
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 
@@ -231,7 +227,7 @@ class TestCanaryDistinguishesPresentFromServing:
     ):
         name, graph = scratch('under_construction')
         backend = live_backend_factory(set())
-        driver = injected_driver(backend)
+        driver = live_backend_factory.driver_of(backend)
         entity = next(t for t in production_fulltext_targets() if t.label == 'Entity')
         statement = _production_fulltext_statement(entity)
         await _seed_filler(graph, entity, group_id=name, count=_UNDER_CONSTRUCTION_CORPUS)
@@ -284,7 +280,7 @@ class TestProductionIndexesServe:
             await seed_canary_element(graph, target, group_id=name)
 
         assert await backend.list_indices(group_id=name) == []
-        driver = injected_driver(backend)
+        driver = live_backend_factory.driver_of(backend)
         verdicts = {
             t.label: (await bm25_canary(graph, t, group_id=name, driver=driver)).serving
             for t in targets
@@ -305,7 +301,7 @@ class TestProductionIndexesServe:
         await backend.provision_registered_graphs()
         await await_index_operational(graph)
 
-        driver = injected_driver(backend)
+        driver = live_backend_factory.driver_of(backend)
         readings = [
             await bm25_canary(graph, t, group_id=name, driver=driver) for t in targets
         ]

@@ -76,7 +76,7 @@ class _HeartbeatSurvivesOneCancel(FakeScheduler):
 def config(tmp_path: Path) -> OrchestratorConfig:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=1,

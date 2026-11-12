@@ -1,0 +1,422 @@
+prd: plans/review-all-s6-merge-lane-lifecycle-outcome-types-and-provenance-prd.md
+schema_version: 1
+signal_leaves: ["ι"]
+tasks:
+  - label: "α"
+    task_id: 9140
+    title: "Lane timing budgets derived from the merge-verify budget; the load-time validator; INV-15 lane-budgets-exceed-verify-timeouts"
+    note: "Closes fk-4b76c9695674 (high). Subsumes tasks 4581 and 7396 (cancelled at decompose naming α; S6-1). One cascade in orchestrator/verify_budget.py; four constants replaced; merge_verify_progress is red-tier. Performs the INV-15 four-site lockstep edit (lead order revised 2026-11-10: S6 α lane-budgets-exceed-verify-timeouts INV-15 first, then S10 θ metadata-slices-one-table INV-16, then S7 ζ merge-gate-unmeasured-typed INV-17; S10 θ depends on α); the former docs leaf ν is folded in. No cross-stream dependency (lead 2026-11-10, after the fold-verifiers): α lands first on every file it shares; S5 α, S5 λ0, S7 δ and S7 β depend on α there, S7 ε on the resource-audit file, S3 β on harness.py; never held behind S3 or task 4833. The verify_budget resolver's keyword is merge_cold, no default."
+    capabilities:
+      - name: "authorised-budget-computable"
+        binding: "substrate — orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs and ::_resolve_verify_timeout (task 5371)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs"
+      - name: "constants-replaced-by-derived-budgets"
+        binding: "anti-inversion — the four hand-derived timing constants LaneTimingBudgets replaces are gone from the package (a bumped literal still fails)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS|INFLIGHT_VERIFY_PROGRESS_PROBE_SECS|RESOURCE_AUDIT_WORKTREE_GRACE_SECS|PERIODIC_REAP_MIN_AGE_SECS"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+      - name: "verify-timeout-cascade-one-home"
+        binding: "capability→producer (α) — orchestrator/verify_budget.py::resolve_verify_timeout, the one definition of authorised"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def resolve_verify_timeout\\("
+          paths: ["orchestrator/src/orchestrator/verify_budget.py"]
+          expect: present
+      - name: "lane-timing-budgets-type-exists"
+        binding: "capability→producer (α) — merge_lane/types.py::LaneTimingBudgets.derive"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class LaneTimingBudgets"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "load-time-refusal-fixture"
+        binding: "rejection-mechanism — produced by α; the fixture yaml (pin 9000, merge-cold 10800) fails load_config (boundary row 1b) while row 1a loads"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/fixtures/lane_budget_below_timeout.yaml"]
+          expect: present
+      - name: "invariant-registered"
+        binding: "capability→producer (α) — INV-15 four-site lockstep edit guarded by scripts/tests/test_design_invariants_consistency.py; the check anchors on the slug, never the number"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane-budgets-exceed-verify-timeouts"
+          paths: ["docs/legibility/design-invariants.md"]
+          expect: present
+  - label: "β1"
+    task_id: 9144
+    title: "MergeOutcome.kind and GroupMergeRequest.train_kind; consumers route on kind, reason strings frozen"
+    note: "Closes fk-e61eed486dbc, fk-fd91b14b3ead, fk-80a790e6f793. Subsumes task 5046 (cancelled naming β1; 5047 and 6416 repointed first; S6-4). Produces C1. Depends on α, S3 κ (harness.py order, lead 2026-11-10: S6 α, then S3 β, δ, κ, then S6 β1 … μ), S5 λ0 (types.py/worker.py/harness.py imports; every later S6 leaf follows it through the chain) and S7 β (S6's remaining worker.py leaves follow it through the chain)."
+    capabilities:
+      - name: "producers-know-the-kind"
+        binding: "substrate — merge_lane/gates.py::GateVerdict.block(emit_subtype: OutcomeKind)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: orchestrator/src/orchestrator/merge_lane/gates.py::GateVerdict.block (emit_subtype: OutcomeKind)"
+      - name: "train-kind-exists"
+        binding: "capability→producer (β1) — merge_lane/types.py::TrainKind"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TrainKind"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "no-reason-prefix-routing"
+        binding: "anti-inversion — workflow routes MergeOutcome on kind (unblock_types.classify_block_reason is S9 η's)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "result\\.reason\\.startswith"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: absent
+      - name: "no-coalesce-prefix-routing"
+        binding: "anti-inversion — the three train_id prefix routes read train_kind"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "startswith\\(_COALESCE_TRAIN_ID_PREFIX\\)"
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py"]
+          expect: absent
+  - label: "β2"
+    task_id: 9155
+    title: "MergeOutcome test constructions on one builder; kind mandatory for blocked/error"
+    note: "Completes C1 (no keys of its own). 51 test files, mechanical."
+    capabilities:
+      - name: "one-blocked-outcome-builder"
+        binding: "capability→producer (β2) — orchestrator/tests/_merge_lane_fakes.py::blocked_outcome"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def blocked_outcome\\("
+          paths: ["orchestrator/tests/_merge_lane_fakes.py"]
+          expect: present
+      - name: "unclassified-failure-refused"
+        binding: "rejection-mechanism — produced by β2; boundary row 3b (MergeOutcome('blocked') without kind raises ValueError)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "construction-time refusal judged by the outcome-kind boundary test, not a grep"
+  - label: "γ1"
+    task_id: 9159
+    title: "LandedOutbox injected by the harness into worker, build_workflow and TaskGroundTruth; MergeProvenance deleted"
+    note: "Closes fk-2c9b6486d554 and the journal half of fk-e501862ffe2c (detector consolidation is S9 ι). Subsumes task 8164. Produces C4 (S6-3: one construction edit at the existing site)."
+    capabilities:
+      - name: "journal-store-exists"
+        binding: "substrate — merge_lane/landed_outbox.py::LandedOutbox (lookup/consume/record)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: orchestrator/src/orchestrator/merge_lane/landed_outbox.py::LandedOutbox"
+      - name: "class-global-deleted"
+        binding: "anti-inversion — no MergeProvenance in production code"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MergeProvenance"
+          paths: ["orchestrator/src/"]
+          expect: absent
+      - name: "autouse-rebinding-deleted"
+        binding: "anti-inversion — the conftest fixture that masked the global is gone"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_isolated_merge_provenance"
+          paths: ["orchestrator/tests/conftest.py"]
+          expect: absent
+      - name: "live-journal-read-after-restart"
+        binding: "INV-13 producer proof — the startup reconcile report names the harness-held journal on a live orchestrator; not a tree property"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed on the running orchestrator after merge (startup reconcile_landed_outbox report); not a tree property"
+  - label: "γ2"
+    task_id: 9165
+    title: "TaskWorkflow test constructions through the helper; landed_outbox a required keyword"
+    note: "Completes C4 (no keys of its own). 95 test files, mechanical."
+    capabilities:
+      - name: "absent-journal-is-a-type-error"
+        binding: "rejection-mechanism — produced by γ2; boundary row 5 second half (TaskWorkflow without landed_outbox raises TypeError)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "construction-time refusal judged by the journal boundary test; the keyword's default is not grep-distinguishable from γ1's"
+  - label: "δ"
+    task_id: 9171
+    title: "One MainHealthAutoHeal collaborator, grown from 5040's responder, for the workflow sync arm and the deferred arm; fingerprint and eligibility move into the lane"
+    note: "Closes fk-7f2bce2d482c, fk-75fc1b96098d (the scheduler import residue is S17's). Depends on task 5040 (S6-2 = B: its part 2 moves the deferred arm into main_health_probe.py::MainHealthResponder). Produces C3."
+    capabilities:
+      - name: "collaborator-exists"
+        binding: "capability→producer (δ) — merge_lane/main_health.py::MainHealthAutoHeal (OQ-9's module name)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MainHealthAutoHeal"
+          paths: ["orchestrator/src/orchestrator/merge_lane/main_health.py"]
+          expect: present
+      - name: "workflow-copy-deleted"
+        binding: "anti-inversion — the workflow's MAIN_HEALTH_RED arm calls the collaborator; its own auto-heal copy is gone (robust whether or not 5040 moved the lane's copy)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def _auto_heal_main_health\\("
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: absent
+      - name: "no-upward-workflow-import"
+        binding: "anti-inversion — the fingerprint lives in the lane; no merge_lane module imports workflow (covers 5040's main_health_probe.py too)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from orchestrator\\.workflow import"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: absent
+  - label: "θ"
+    task_id: 9176
+    title: "A lane's halt is its holder set (operator, WIP, auto-heal, train advance, lifecycle refused); train advance failures hold with an owner"
+    note: "Closes fk-83625b943aa5, fk-ba531799522b (high; coalesce arm dormant, named in the acceptance task; declared-train arm live on reify). Depends on tasks 4838 and 3876 (S6-8). Declares the lifecycle_refused kind φ places (S6-5). Produces C7."
+    capabilities:
+      - name: "halt-state-is-one-object"
+        binding: "substrate — merge_lane/halt.py::HaltState (task 5305)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: orchestrator/src/orchestrator/merge_lane/halt.py::HaltState"
+      - name: "holder-set-api"
+        binding: "capability→producer (θ) — HaltState.hold / HaltState.release per lane and holder"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def release\\(self, lane"
+          paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
+          expect: present
+      - name: "lifecycle-refused-holder-kind"
+        binding: "capability→producer (θ) — HaltKind gains lifecycle_refused and HaltHolder its refused_edge (S6-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lifecycle_refused"
+          paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
+          expect: present
+      - name: "bare-asserts-gone"
+        binding: "anti-inversion — no assert-based owner check in halt.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^\\s+assert "
+          paths: ["orchestrator/src/orchestrator/merge_lane/halt.py"]
+          expect: absent
+  - label: "ζ"
+    task_id: 9182
+    title: "ItemLifecycle as the operative state in merge_lane/item_lifecycle.py; one synchronous retire(item, outcome) with drained hooks; snapshot derived from the registry; refusals typed"
+    note: "Closes fk-313f404f3cc6, fk-a2984bf98f85 (both high). Depends on θ, task 5040 (S6-2 = B; ζ follows the terminal edges into 5040's extracted modules), S3 α and task 4833 (lands first in today's files, lead 2026-11-10). Produces C2, consumed by φ, 5042, 5306, κ, μ."
+    capabilities:
+      - name: "registry-exists-today"
+        binding: "substrate — worker.py::ItemLifecycle and _LEGAL_TRANSITIONS (task 2164)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: orchestrator/src/orchestrator/merge_lane/worker.py::ItemLifecycle"
+      - name: "retire-chokepoint-exists"
+        binding: "capability→producer (ζ) — merge_lane/item_lifecycle.py::ItemLifecycle.retire"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def retire\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/item_lifecycle.py"]
+          expect: present
+      - name: "duplicate-resolution-identity-checked"
+        binding: "capability→producer (ζ) — ItemLifecycle.resolve_duplicate (the re-entrant duplicate never retires the live original)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def resolve_duplicate\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/item_lifecycle.py"]
+          expect: present
+      - name: "no-raw-future-resolution"
+        binding: "anti-inversion — every request future is resolved through the registry (code lines in today's files and 5040's verify_dispatch.py; the AST guard over the package is the full check)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^\\s+[A-Za-z_][A-Za-z_.]*\\.result\\.set_result\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/worker.py", "orchestrator/src/orchestrator/merge_lane/intake_buffers.py", "orchestrator/src/orchestrator/merge_lane/intake.py", "orchestrator/src/orchestrator/suffix_graph.py", "orchestrator/src/orchestrator/merge_lane/verify_dispatch.py"]
+          expect: absent
+      - name: "illegal-transition-refused-and-typed"
+        binding: "rejection-mechanism — produced by ζ; boundary row 9 observes TransitionRefused, the L1 with today's event shape, and no retire"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by the lifecycle boundary tests, not a grep"
+  - label: "φ"
+    task_id: 9186
+    title: "The lifecycle-refusal policy: escalate | hold_lane (restart-only, default escalate), the lifecycle_refused hold arm with its storm guard, the refusal census script and the decision-4 amendment"
+    note: "Leo's ruling S6-5 = B staged (2026-11-10); no finding key. Depends on ζ. Amends decision 4 of plans/merge-queue-modularization-invariants-prd.md. Ships scripts/lifecycle_refusal_census.py, which ξ runs; the lead files ξ and υ once φ is on main."
+    capabilities:
+      - name: "refusal-policy-config"
+        binding: "capability→producer (φ) — config.py::MergeLaneConfig.lifecycle_refusal_policy (Literal escalate | hold_lane, red tier)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lifecycle_refusal_policy"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "refusal-census-script"
+        binding: "capability→producer (φ) — the read-only census ξ's predicate runs (boundary row 18)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/lifecycle_refusal_census.py"]
+          expect: present
+      - name: "decision-4-amended"
+        binding: "capability→producer (φ) — decision 4 of plans/merge-queue-modularization-invariants-prd.md names the lifecycle_refused exception"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lifecycle_refused"
+          paths: ["plans/merge-queue-modularization-invariants-prd.md"]
+          expect: present
+      - name: "hold-arm-and-storm-guard"
+        binding: "rejection-mechanism — produced by φ; boundary rows 9b-9e (holder before filing, request frozen, one holder per lane per refused edge, rehydrated on restart, restart_required on reload)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "behaviour judged by the refusal-policy boundary tests, not a grep"
+  - label: "κ"
+    task_id: 9192
+    title: "LaneLimits and RetryBudget replace the class constants and per-task dicts; pipeline functions take a narrow host; test pins move onto LaneLimits"
+    note: "Closes fk-769c3bb58ce1, fk-201d70aaf409, fk-e7deb8bcfa95 (high). Depends on φ (same files), task 5040 (S6-2 = B), 5446, 5777, S4 β (VerifyContext), S5 θ (same files) and task 4833 (lands first in today's files, lead 2026-11-10). Moves the 19 constants α leaves (18 if S7 δ deleted the narrowed-retry cap). Subsumes task 6162 (cancelled naming κ)."
+    capabilities:
+      - name: "verify-dispatcher-lands-first"
+        binding: "producer = task 5040 (κ of plans/merge-lane-quality-prd.md, pending, half-built branch) — the dependency edge is the gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "upstream task, edge only: a grep for class VerifyDispatcher would turn vacuous if 5040 lands before S6 is decomposed (S6-2 = B lets it finish first)"
+      - name: "lane-limits-exists"
+        binding: "capability→producer (κ) — merge_lane/types.py::LaneLimits"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class LaneLimits"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "class-constants-gone"
+        binding: "anti-inversion — no upper-case int class constant anywhere in the package (LaneLimits fields are lowercase; a move to another lane module still fails)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MAX_CAS_RETRIES\\s*:\\s*int"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: absent
+      - name: "retry-budget-exists"
+        binding: "capability→producer (κ) — one ledger for the per-task counters"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class RetryBudget"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+  - label: "λ"
+    task_id: 9197
+    title: "Drift and shadow satellites own their state objects; no worker-private reach"
+    note: "Closes fk-a0f6af37f0d6. Depends on κ (worker.py edge)."
+    capabilities:
+      - name: "drift-reach-gone"
+        binding: "anti-inversion — DriftCheckState injected"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "worker\\._drift_land_count"
+          paths: ["orchestrator/src/orchestrator/merge_lane/drift.py"]
+          expect: absent
+      - name: "shadow-reach-gone"
+        binding: "anti-inversion — ShadowCompareState injected"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "worker\\._shadow_state_path"
+          paths: ["orchestrator/src/orchestrator/merge_lane/shadow.py"]
+          expect: absent
+  - label: "μ"
+    task_id: 9201
+    title: "S3's MergeLaneQueries built natively over the lifecycle registry with the total LIVE_STATE_OF table; landing-evidence verdict API exported"
+    note: "Closes fk-d9e6c03dc259. Depends on λ (chain κ → λ → μ, so S4 μ0 → S6 μ follows S6's last worker.py/shadow.py leaf) and S3 α only (S3-1 = A: no adapter; S3 ε1 and ε2 depend on μ, never the reverse). Priority low, raised by the scheduler's priority inheritance once S3's moves are filed."
+    capabilities:
+      - name: "port-defined-upstream"
+        binding: "producer = S3's port task α (C1, merge_lane/queries.py: Protocol, records, QueryUnavailable; no adapter) — the dependency edge is the gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "upstream leaf in another stream, edge only"
+      - name: "lane-implements-port"
+        binding: "capability→producer (μ) — merge_lane/queries.py::LaneQueries"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class LaneQueries"
+          paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
+          expect: present
+      - name: "live-state-table-total"
+        binding: "capability→producer (μ) — merge_lane/queries.py::LIVE_STATE_OF, ItemLifecycleState to MergeState, exhaustiveness-tested (S3-5; boundary row 17)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^LIVE_STATE_OF"
+          paths: ["orchestrator/src/orchestrator/merge_lane/queries.py"]
+          expect: present
+  - label: "ι"
+    task_id: 9206
+    title: "S6 lane integration gate: boundary rows through the facade after the decomposition chain"
+    note: "Closes fk-1432a52e4753, fk-153195971a14, fk-e521254a5b71, fk-e768d50f8363 via dependencies on tasks 5045, 5047, 5048, S7 β, θ, φ, κ, λ and μ. Signal leaf."
+    capabilities:
+      - name: "ratchet-instrument-exists"
+        binding: "substrate — scripts/merge_lane_metrics.py and orchestrator/tests/test_merge_lane_ratchet.py"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "substrate verified at authoring: scripts/merge_lane_metrics.py and orchestrator/tests/test_merge_lane_ratchet.py"
+      - name: "gate-module-exists"
+        binding: "capability→producer (ι) — the boundary rows as one test module"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/tests/test_merge_lane_s6_integration_gate.py"]
+          expect: present
+      - name: "boundary-rows-hold"
+        binding: "produced by ι; the gate module drives S6's boundary rows and re-runs the ratchet; the ceilings are task 5048's"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rows and ratchet are asserted by the gate module executing them, not by a grep"
+  - label: "ξ"
+    task_id: null
+    title: "Lifecycle-refusal quiet period: 14 days with zero refusals on dark-factory and reify (deterministic predicate gate)"
+    note: "S6-5. task_kind=deterministic; milestone delayed 1209600 s after φ; before_done kind=predicate running scripts/lifecycle_refusal_census.py over both projects' runs.db with --window-days 14; always_escalates false (exit 0 -> done, any refusal -> born-at-L2 milestone_check_failed to Leo). Filed by the lead once φ is on main (the script must exist at submit_task)."
+    capabilities:
+      - name: "census-on-main"
+        binding: "producer = φ (scripts/lifecycle_refusal_census.py) — the dependency edge and the lead's filing order are the gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a deterministic gate's verdict is its predicate's exit code, run by the DeterministicRunner; nothing for a tree check to add"
+  - label: "υ"
+    task_id: null
+    title: "Arm hold_lane on dark-factory: merge_lane.lifecycle_refusal_policy: hold_lane"
+    note: "S6-5. complexity simple. Depends on ξ; filed by the lead with ξ. Takes effect at the next fleet redeploy (restart-only). Reify's identical one-line flip is the lead's yaml-only commit after ξ (reify's scheduler is halted)."
+    capabilities:
+      - name: "hold-lane-armed-on-dark-factory"
+        binding: "capability→producer (υ) — dark-factory-orchestrator.yaml sets the policy to hold_lane"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lifecycle_refusal_policy: hold_lane"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present

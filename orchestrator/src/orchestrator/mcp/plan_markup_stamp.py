@@ -73,7 +73,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -606,10 +606,11 @@ def make_plan_stamp(
     This is a bookkeeping read of one machine-written key and touches no prose
     field.
 
-    WRITTEN THROUGH ``artifacts.write_plan``, the single owner of
+    WRITTEN THROUGH ``artifacts.write_plan_model``, the single owner of
     ``plan.json``'s byte format and of its atomic/durable write — never an
     open-and-dump here, which would drop ``_schema_version`` and the atomicity
-    every other writer on this file depends on.
+    every other writer on this file depends on. The block is no step-set
+    edit, so the plan's confirmation is kept.
 
     ASYNC, with the blocking work on a worker thread: the middleware calls this
     from inside the server's event loop, and one record costs a read and a
@@ -620,7 +621,7 @@ def make_plan_stamp(
     inside the read-merge-write. The pending buffer has its own lock, taken
     inside it: see :data:`_PENDING_LOCK`.
     """
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
 
     def stamp(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
@@ -648,7 +649,7 @@ def make_plan_stamp(
             plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
                 plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
             )
-            artifacts.write_plan(plan, mutex_held=True)
+            artifacts.write_plan_model(Plan.from_json(plan), mutex_held=True)
         return str(plan_path)
 
     async def plan_stamp(record: dict[str, Any]) -> str | None:

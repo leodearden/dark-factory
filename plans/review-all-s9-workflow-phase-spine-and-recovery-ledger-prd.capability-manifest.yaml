@@ -1,0 +1,938 @@
+prd: plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md
+schema_version: 1
+signal_leaves:
+- ω
+tasks:
+- label: π
+  task_id: 9164
+  title: 'The L0 settle check script: stranded and wrongly dismissed blocking L0s from the escalation archive'
+  note: 'Lands C10. Contributes fk-bab6058b23c8, fk-e39550272df9 (measures ε; closes neither). No dependencies; ε depends on π. Ruled: OQ-5 plus Leo''s check (sitting key S9-7). The lead files the 14-day
+    check task once π is on main (lead action).'
+  capabilities:
+  - name: l0-settle-check-script
+    binding: capability→producer (π) — scripts/check_l0_settle_outcomes.py, read-only over the escalation archive (C10)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/check_l0_settle_outcomes.py
+      expect: present
+  - name: check-thresholds-cli
+    binding: capability→producer (π) — the ruled threshold flags the lead-filed check task passes (C10)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max-reaper-wrong
+      paths:
+      - scripts/check_l0_settle_outcomes.py
+      expect: present
+  - name: check-script-tested
+    binding: capability→producer (π) — boundary row 26 over an archive fixture
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/tests/test_check_l0_settle_outcomes.py
+      expect: present
+  - name: escalation-archive-substrate
+    binding: substrate (PASS today) — escalation.archive keeps resolved records 30 days (prune_archive)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def prune_archive
+      paths:
+      - escalation/src/escalation/archive.py
+      expect: present
+  - name: deterministic-guard-substrate
+    binding: substrate (PASS today) — the deterministic task guard refuses a missing or non-executable before_done.script, so the check task is filed only after π lands
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: os\.X_OK
+      paths:
+      - fused-memory/src/fused_memory/middleware/deterministic_task_guard.py
+      expect: present
+  - name: check-task-filed
+    binding: 'manual — lead action: the deterministic delayed-milestone check task (C10 fields) is filed once π is on main, depending on ε'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a task-store fact, not a tree property; the lead files it
+- label: α
+  task_id: 9170
+  title: Typed Plan model; every plan.json writer through it; structural edits clear confirmation; the replan prompt confirms
+  note: 'Lands C1. Contributes fk-37190b541196 (β closes). No dependencies (task 3155, the draft''s gate, landed ef96d32603). Ruled: OQ-1, Q-C1 (a).'
+  capabilities:
+  - name: plan-state-type
+    binding: capability→producer (α) — artifacts.PlanState derived from the typed Plan lifecycle
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class PlanState
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: structural-edit-clears-confirmation
+    binding: capability→producer (α) — Plan.restructured, used by the step-set plan-tools mutators only (files-only edits keep confirmation) [Q-C1]
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def restructured
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: per-pass-confirmation-fact
+    binding: capability→producer (α) — Plan.confirmed_since(pre), the typed per-pass fact fingerprint minting reads (critic2 N5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def confirmed_since
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: non-repairing-plan-read
+    binding: 'capability→producer (α) — TaskArtifacts.peek_plan_model mirrors peek_plan (task 4052): normalized, never written'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def peek_plan_model
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: no-finalization-backfill
+    binding: 'anti-inversion — stamp_plan_provenance builds Plan.stamped; the setdefault backfill is gone (moved here from β: α removes it)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: setdefault\('_finalized_at'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: plan-tools-writes-through-model
+    binding: anti-inversion — plan_tools (incl. _read_plan_repaired) and plan_markup_stamp write plan.json only through write_plan_model (write_plan_model( does not match)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.write_plan\(
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      - orchestrator/src/orchestrator/mcp/plan_markup_stamp.py
+      expect: absent
+  - name: plan-tools-no-hand-marker-writes
+    binding: anti-inversion — plan_tools confirms through Plan.confirmed, never by subscript
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \['_finalized_at'\]
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: absent
+  - name: plan-tools-already-imports-artifacts
+    binding: substrate (PASS today) — plan_tools.py imports TaskArtifacts; the MCP process already loads the model module
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator.artifacts import TaskArtifacts
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: replan-prompt-confirms
+    binding: manual — BriefingAssembler.build_replan_prompt ends in confirm_plan (function-scoped; not greppable to one function) [Q-C1]
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: read build_replan_prompt after merge; boundary row 4 drives the real tool sequence
+  - name: live-plan-carries-confirmed-by
+    binding: INV-13 producer proof — a live architect run writes _confirmed_by via confirm_plan
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live plan.json read after merge; not a tree property
+- label: β
+  task_id: 9175
+  title: Every plan reader on PlanState; finalization a precondition at every stamp site; recovered plans keep their lifecycle
+  note: 'Closes fk-37190b541196. Depends on α. Tasks 5645 and 7345 depend on β. Ruled: OQ-2.'
+  capabilities:
+  - name: workflow-reads-plan-state
+    binding: anti-inversion — workflow.py reads Plan.state, not marker keys
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: get\('_session_id'\)|get\('_finalized_at'\)
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: harness-stops-predicting-plan-branch
+    binding: anti-inversion — Harness._recover_crashed_tasks reads Plan.state
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: plan\.get\('_session_id'\)
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: recovered-plan-origin
+    binding: capability→producer (β) — TaskWorkflow takes initial_plan_origin; a recovered plan keeps its lifecycle (D3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: initial_plan_origin
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: meta-root-locator-moved
+    binding: anti-inversion — evals import artifacts.meta_root_for_worktree, not a workflow.py private
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _meta_root_for_worktree
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: plan-stamp-readers-folded
+    binding: anti-inversion — the module readers plan_base_commit/plan_task_text_fp become Plan.lifecycle fields (task 3157 added them after the draft)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def plan_(base_commit|task_text_fp)\b
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: absent
+  - name: unconfirmed-pass-not-executed
+    binding: rejection-mechanism — produced by α+β; boundary rows 4/4b drive the real replan/revalidation tool sequence cut off before confirm; 3c keeps a tightening pass STAMPED; 4c keeps the fingerprint
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary rows 3c, 4, 4b, 4c, 5b, 5c, 5d'
+- label: γ
+  task_id: 9178
+  title: IterationEntry union with writer-decided is_work; the completion judge reads typed entries
+  note: Closes fk-9973521f4f59. Depends on β; lands before S5 ν on read_iteration_log. Subsumes task 7391.
+  capabilities:
+  - name: iteration-entry-union
+    binding: capability→producer (γ) — artifacts.IterationEntry
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^(type )?IterationEntry\b[^=]*=
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: label-classifier-deleted
+    binding: anti-inversion — readers consume entry.is_work
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _iteration_entry_is_work
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: debugger-attempt-not-iteration
+    binding: anti-inversion — the debugger kind writes verify_attempt
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''iteration'': verify_attempt'
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: judge-prompt-excludes-agent-lines
+    binding: rejection-mechanism — produced by γ; boundary row 8b
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary row 8b'
+  - name: source-guard-substrate
+    binding: substrate (PASS today) — append_iteration_log refuses a source outside ORCHESTRATOR_ITERATION_SOURCES (task 5726)
+    verdict: PASS
+- label: δ
+  task_id: 9184
+  title: BlockReason and the one-argument _mark_blocked; report-handler and recovery families converted
+  note: Lands C3. Closes fk-d2ba7601c130; contributes fk-b8efaa973162 (λ2 closes). Depends on γ and S5 ν (typed exits) [Q-C2].
+  capabilities:
+  - name: block-reason-type
+    binding: capability→producer (δ) — workflow_types.BlockReason
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class BlockReason
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: block-route-replaces-two-flags
+    binding: capability→producer (δ) — BlockRoute makes the contradictory pair unrepresentable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class BlockRoute
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: registered-category-vocabulary
+    binding: substrate (PASS today) — escalation.categories.EscalationCategory holds every category the workflow files
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class EscalationCategory
+      paths:
+      - escalation/src/escalation/categories.py
+      expect: present
+  - name: typed-architect-exits-upstream
+    binding: 'producer: S5 ν (D13; _read_model and five *Exit dataclasses) — upstream of δ; edge at decompose [Q-C2]'
+    verdict: PASS
+  - name: merge-phase-derivation-premise
+    binding: OPEN — δ proves (D7) every merge_phase=True path runs in WorkflowState.MERGE, else BlockReason gains a phase field
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: 'the premise is δ''s own proof obligation (D7): the reviewer confirms δ''s tests cover every merge_phase=True call path running in WorkflowState.MERGE, or that BlockReason gained a phase field instead'
+- label: ε
+  task_id: 9190
+  title: The steward decides every published variant; the workflow believes it; one L0 settle
+  note: 'Lands C4. Closes fk-e39550272df9, fk-bab6058b23c8. Depends on δ and π (task 5563, the draft''s other dependency, landed 3fd6ccb3dd). Ruled: OQ-5 (S9-7).'
+  capabilities:
+  - name: consumer-override-removed
+    binding: anti-inversion — _await_steward_completion returns a published outcome verbatim
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _outcome_requeues\(
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: producer-publishes-terminal-decision
+    binding: capability→producer (ε) — TaskSteward publishes StewardTerminalDecision after a session that set the row terminal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: StewardTerminalDecision\(
+      paths:
+      - orchestrator/src/orchestrator/steward.py
+      expect: present
+  - name: one-l0-settle
+    binding: capability→producer (ε) — the one workflow dismissal site with a per-disposition scope
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _settle_own_l0s
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: degraded-never-terminal
+    binding: rejection-mechanism — a failed row read never yields StewardTerminalDecision; the open-L1 arm applies only to the _outcome_requeues set (budget exhaustion exits BLOCKED, row 14d); the reads follow a chained follow-on's pre-session give-up (row 15c)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary rows 14b, 14c, 14d, 15b, 15c, 16b'
+  - name: escalation-scoped-envelope
+    binding: substrate (PASS today) — PublishedStewardOutcome(escalation_id, outcome) and the scoped wait landed with task 5563 (3fd6ccb3dd)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class PublishedStewardOutcome
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: fourteen-day-l0-check
+    binding: 'manual — S9-7 ruling: the lead-filed C10 check task, 14 days after ε is done, exits 0'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a deterministic milestone task's outcome 14 days after landing; not a tree property
+- label: ζ1
+  task_id: 9196
+  title: '_invoke in three parts: ResumeArm, invocation, accounting'
+  note: Lands C7. Closes fk-2c0594928a18; contributes fk-7d410939a337 and fk-f37f7e253cd5 (branch 5). Depends on ε.
+  capabilities:
+  - name: restore-outcome-enum
+    binding: capability→producer (ζ1) — RestoreOutcome replaces the four-valued string
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class RestoreOutcome
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: restore-by-design-one-home
+    binding: capability→producer (ζ1) — RestoreOutcome.is_by_design replaces the harness set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_by_design
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: restore-set-has-one-home
+    binding: anti-inversion — no string set restates the by-design restore outcomes anywhere in orchestrator/src (scoped wide so S8 γ moving the set to session_resume_storm.py cannot turn it green)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'BY_DESIGN_RESTORE_OUTCOMES: frozenset'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: restore-string-gone
+    binding: anti-inversion — _invoke reads ResumeArm.restore
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: restore_outcome = 'disabled'
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: stand-in-result-getattr-gone
+    binding: 'anti-inversion — branch 5: accounting reads the typed AgentResult'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: getattr\(result, 'resume_fallback_session_ids'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: storm-sampler-reads-restore-outcome
+    binding: 'rejection-mechanism — storm_window_bound.py stops importing the harness private and still carves out disabled and miss (missed by the draft; no grep: S8 γ moving the set could turn one green)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: python -c import orchestrator.storm_window_bound; its sampler carve-out equals the by-design members'
+- label: ζ2
+  task_id: 9202
+  title: One route resolver with one scope-capacity read; MCP-injection helpers leave workflow.py
+  note: 'Closes fk-5ea52a0f89ad; contributes fk-a503ccb37b4b. Depends on ζ1 and task 6766 (S25 C4). Ruled: OQ-7 (lead).'
+  capabilities:
+  - name: resolver-takes-usage-gate
+    binding: capability→producer (ζ2) — resolve_and_record_route computes scope_capacity from an optional usage_gate (D12)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: usage_gate
+      paths:
+      - orchestrator/src/orchestrator/routing_dispatch.py
+      expect: present
+  - name: in-band-route-copy-gone
+    binding: anti-inversion — _invoke calls routing_dispatch.resolve_and_record_route
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _record_routing_decision
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: routing-helper-copies-gone
+    binding: anti-inversion — the mirrored helpers and the in-band capacity read exist only once
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def (_trailing_24h_window|_routing_inputs_digest|_ceiling_spend_by_model|_scope_capacity_snapshot)
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: steward-no-workflow-private-import
+    binding: anti-inversion — steward imports _inject_verdict_tools_mcp from its new home at module level
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator.workflow import _inject_verdict_tools_mcp
+      paths:
+      - orchestrator/src/orchestrator/steward.py
+      expect: absent
+  - name: mcp-composer-moved
+    binding: anti-inversion — compose_invocation_mcp_config (task 5386) moves to mcp_lifecycle.py with the inject helpers it composes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def compose_invocation_mcp_config
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: out-of-band-resolver-substrate
+    binding: substrate (PASS today) — routing_dispatch.resolve_and_record_route exists
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def resolve_and_record_route
+      paths:
+      - orchestrator/src/orchestrator/routing_dispatch.py
+      expect: present
+- label: η
+  task_id: 9207
+  title: Merge-side blocks from OutcomeKind; the merge stash goes
+  note: Contributes fk-d2ba7601c130, fk-44bc973b1cc4, fk-7d410939a337, fk-b8efaa973162. Depends on ζ2, S6 C1 (β1), S6 C3 (δ), S6 C7 (θ), task 4838.
+  capabilities:
+  - name: outcome-kind-block-table
+    binding: capability→producer (η) — one OutcomeKind → BlockReason table
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: OUTCOME_KIND_BLOCK
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: merge-stash-gone
+    binding: anti-inversion — the thrash signature reads MergeOutcome directly
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _last_merge_(block_reason|failure_category|failure_cause_hint)
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: merge-outcome-kind-upstream
+    binding: 'producer: S6 C1 (MergeOutcome.kind, S6 β1) — upstream of η; edge at decompose'
+    verdict: PASS
+  - name: halt-owner-upstream
+    binding: 'producer: S6 C7 (HaltState owner semantics, S6 θ) — upstream of η; edge at decompose'
+    verdict: PASS
+- label: θ
+  task_id: 9213
+  title: Merge-done classification and the stranded_merge_failed filer in stranded_verified_green.py
+  note: Lands C5. Closes fk-108cdd00d122 (pairs 1–2). Depends on η, S6 C1 (β1), task 7277. 3354 and S8 ε2b depend on θ (ε2b then moves the re-pointed Harness._on_stranded_merge_done into stranded_reconcile.py).
+    Subsumes 7985.
+  capabilities:
+  - name: shared-classifier
+    binding: capability→producer (θ) — classify_merge_future routes on MergeOutcome.kind
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def classify_merge_future
+      paths:
+      - orchestrator/src/orchestrator/stranded_verified_green.py
+      expect: present
+  - name: shared-filer
+    binding: capability→producer (θ) — one stranded_merge_failed filer
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def file_stranded_merge_failed
+      paths:
+      - orchestrator/src/orchestrator/stranded_verified_green.py
+      expect: present
+  - name: workflow-twin-filer-gone
+    binding: anti-inversion — the workflow copy is deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _file_architect_merge_failed
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: harness-twin-filer-gone
+    binding: anti-inversion — the harness copy is deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _file_stranded_merge_failed
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: submit-path-substrate
+    binding: substrate (PASS today) — submit_verified_green_merge_request already shared by both callers
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def submit_verified_green_merge_request
+      paths:
+      - orchestrator/src/orchestrator/stranded_verified_green.py
+      expect: present
+- label: ι
+  task_id: 9239
+  title: One corroborated landing reader for the recovery guards and the ground-truth journal rung
+  note: Lands C6. Closes fk-a152341e38ed. Depends on θ, S6 C4 (γ1), task 7277. Subsumes 7769.
+  capabilities:
+  - name: corroborated-landing-reader
+    binding: capability→producer (ι) — corroborated_landing checks is_ancestor_checked before trusting a row
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def corroborated_landing
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: guards-call-the-reader
+    binding: capability→consumer wiring (ι) — the three workflow guards call it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: corroborated_landing\(
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: ground-truth-rung-calls-the-reader
+    binding: capability→consumer wiring (ι) — task_ground_truth._resolve_branch_state journal rung
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: corroborated_landing\(
+      paths:
+      - orchestrator/src/orchestrator/task_ground_truth.py
+      expect: present
+  - name: ancestry-substrate
+    binding: substrate (PASS today) — GitOps.is_ancestor_checked (True/False/None)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def is_ancestor_checked
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+  - name: injected-outbox-upstream
+    binding: 'producer: S6 C4 (LandedOutbox injected; MergeProvenance deleted, S6 γ1) — upstream of ι; edge at decompose'
+    verdict: PASS
+- label: κ
+  task_id: 9241
+  title: Execute, verify and planning legs return BlockReason; the stash dicts go
+  note: Closes fk-44bc973b1cc4, fk-7d410939a337. Depends on ι, S4 C2 (α) and S4 C1 (β); keeps S4 α's bare-crash rule (S4-5 ruling).
+  capabilities:
+  - name: stash-dicts-gone
+    binding: anti-inversion — each leg returns its BlockReason
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _infra_hold_info|_inherited_break_info|_zero_output_hang_info|_progress_resume_churn_info
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: verify-transients-gone
+    binding: anti-inversion — the VERIFY→REVIEW emission takes the tip and the verdict runner as arguments (task 6670 added _verify_green_runner after the draft)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _verify_green_result|_verify_green_runner|_verify_checkpoint_hit|_last_verify_result
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: typed-verify-result-upstream
+    binding: 'producer: S4 C2 (α: infra_transient property, VerifyInfraError retired) and S4 C1 (β: VerifyContext at the two call sites) — upstream of κ; edges at decompose'
+    verdict: PASS
+- label: λ1
+  task_id: 9246
+  title: The _drive ladder onto disposition rows; MetadataWriteFailed blocks; two dead columns go
+  note: Closes fk-4f7a933c0dd4, fk-67b5971ed72d; contributes fk-b8efaa973162. Depends on κ, S5 C3 (δ), S10 C2 (β2), S4 C2 (α).
+  capabilities:
+  - name: oserror-arm-is-a-row
+    binding: 'anti-inversion — the infra-OSError re-switch arm becomes a table row (retargeted: S4 α repoints the import, so the import is not λ1-specific)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: isinstance\(e, OSError\) and _?is_infra_oserror
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: dead-block-class-column-dropped
+    binding: anti-inversion — BlockDisposition loses block_class (always AGENT_FAILURE)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: block_class=BlockClass
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      - orchestrator/src/orchestrator/block_disposition.py
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: absent
+  - name: terminal-report-dead-category-gone
+    binding: anti-inversion — TerminalReport.category (set from the dead column, read nowhere) is deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'category: FailureCategory \| None'
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: absent
+  - name: metadata-write-failed-upstream
+    binding: 'producer: S10 C2 (MetadataWriteFailed from Scheduler.update_task, S10 β2) — upstream of λ1; edge at decompose'
+    verdict: PASS
+  - name: block-disposition-home-upstream
+    binding: 'producer: S5 C3 (block_disposition.py, derived warm-lane rows, S5 δ) — upstream of λ1; edge at decompose'
+    verdict: PASS
+  - name: verify-vocabulary-upstream
+    binding: 'producer: S4 C2 (α: VerifyInfraError arm and row removed; is_infra_oserror public) — upstream of λ1; edge at decompose'
+    verdict: PASS
+- label: λ2
+  task_id: 9249
+  title: The keyword form is deleted; the remaining keyword-form tests migrate
+  note: Closes fk-b8efaa973162. Depends on λ1.
+  capabilities:
+  - name: keyword-form-deleted
+    binding: anti-inversion — _mark_blocked takes only BlockReason; the transitional adapter is gone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'escalate_to_human: bool = False|skip_escalation: bool = False|from_legacy_kwargs'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: transitional-test-reader-gone
+    binding: 'anti-inversion — tests assert on TerminalReport and the filed record; δ''s transitional blocked_with helper is deleted (no grep: the helper does not exist until δ, so an absent-check would
+      pass today)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: read _workflow_helpers.py after λ2; the suite asserts on TerminalReport/the filed record
+- label: μ1
+  task_id: 9253
+  title: Protocol-typed seams, hand-written fakes, conformance; fixture-tolerance branches deleted
+  note: Lands C8 ports. Contributes fk-f37f7e253cd5 (branches 3, 6, 7). Depends on λ2, S10 β1 (SchedulerFacade/FakeScheduler parity).
+  capabilities:
+  - name: steward-port
+    binding: capability→producer (μ1) — StewardPort Protocol
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class StewardPort
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: fixture-tolerance-gone
+    binding: anti-inversion — branches 3 and 6 (code shape, not comments)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: getattr\(self, '_process_run_id'|getattr\(steward, 'metrics'
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: test-only-attribute-gone
+    binding: 'anti-inversion — branch 7: _merge_recovery_basis deleted; tests read mark_done kind'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _merge_recovery_basis
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: dry-run-scheduler-typed
+    binding: anti-inversion — run_dry_run_unblock types its scheduler with DryRunScheduler
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'scheduler: Any'
+      paths:
+      - orchestrator/src/orchestrator/dry_run_unblock.py
+      expect: absent
+  - name: scheduler-facade-substrate
+    binding: substrate (PASS today) — scheduler.SchedulerFacade runtime_checkable Protocol with test-side conformance blocks
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class SchedulerFacade
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+- label: μ2
+  task_id: 9279
+  title: A spec'd scheduler double replaces the bare mocks; the double-tolerance branches go
+  note: 'Contributes fk-f37f7e253cd5 (branches 4, 9, the dry-run trims, the is-True check; μ3 closes). Depends on μ1. Subsumes 6962. Ruled: Q-C4 (a).'
+  capabilities:
+  - name: spec-scheduler-helper
+    binding: capability→producer (μ2) — orchestrator/tests/_orch_helpers.py::spec_scheduler
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def spec_scheduler
+      paths:
+      - orchestrator/tests/_orch_helpers.py
+      expect: present
+  - name: mock-tolerance-gone
+    binding: anti-inversion — the is-True identity check (code shape); branch 1 is μ3's
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: blocked_writes_suppressed\(self\.task_id\) is True
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: liveness-mock-precedent-substrate
+    binding: substrate (PASS today) — _orch_helpers.wire_scheduler_liveness_mock is the spec'd-default precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def wire_scheduler_liveness_mock
+      paths:
+      - orchestrator/tests/_orch_helpers.py
+      expect: present
+  - name: exit-contract-still-judges
+    binding: rejection-mechanism — a migrated suite's exit is judged (boundary row 23b); a bare MagicMock would blind it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary row 23b'
+- label: μ3
+  task_id: 9281
+  title: A spec'd config double replaces the bare config mocks; branch 1 goes
+  note: 'Closes fk-f37f7e253cd5 (branch 1, after μ1/μ2/ζ1 delete the rest). Depends on μ2 (same files). Ruled: Q-C4 (a).'
+  capabilities:
+  - name: spec-config-helper
+    binding: capability→producer (μ3) — orchestrator/tests/_orch_helpers.py::spec_config (real OrchestratorConfig with overrides)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def spec_config
+      paths:
+      - orchestrator/tests/_orch_helpers.py
+      expect: present
+  - name: mock-config-tolerance-gone
+    binding: 'anti-inversion — branch 1: the MagicMock-interval isinstance guard in _claimant_heartbeat_loop (code shape)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: isinstance\(interval, \(int, float\)\)
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: heartbeat-runs-on-real-config
+    binding: 'rejection-mechanism — boundary row 23c: a migrated suite runs the heartbeat on a real interval with no background TypeError'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary row 23c'
+- label: ν
+  task_id: 9284
+  title: WorkflowStateMachine is the single writer of phase and row
+  note: 'Lands C9. Closes fk-ee708be4436f; contributes fk-f37f7e253cd5 (branch 8). Depends on μ3. Ruled: OQ-3, Q-C5 (b).'
+  capabilities:
+  - name: machine-enter
+    binding: capability→producer (ν) — WorkflowStateMachine.enter writes the projected row
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def enter\(
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: write-failure-recorded
+    binding: 'capability→producer (ν) — machine.last_write_failure feeds the judge''s STORE_UNAVAILABLE relaxation (ruled: Q-C5 (b), record and keep going)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def last_write_failure
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: phase-comparison-gone
+    binding: anti-inversion — the machine holds report and state, so the judge's phase comparison is deleted (retargeted from _note_exit_status_write)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: report_phase != machine_state
+      paths:
+      - orchestrator/src/orchestrator/exit_contract.py
+      expect: absent
+  - name: force-set-and-stash-gone
+    binding: anti-inversion — tests pass initial_state=; run() returns machine.terminal_report
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'def force_set|self\._terminal_report = '
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: write-only-on-change
+    binding: rejection-mechanism — enter writes the row only when the projection changes; a harness write during EXECUTE survives the move to VERIFY (row 24c, INV-6)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary row 24c'
+  - name: done-write-outside-machine
+    binding: rejection-mechanism — done and cancelled writes stay outside the machine and keep Scheduler.mark_done's raise-on-failure (S9-5 contract sentence, row 24d)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'behavioural: boundary row 24d'
+- label: ξ
+  task_id: 9287
+  title: 'Retry budgets: one run-length rule on shared.streak, one steward guard clear, a typed first-enqueue time'
+  note: 'Closes fk-9eb149f0706d (narrow). Depends on ν, S10 C3 (η), task 6724. Ruled: OQ-4.'
+  capabilities:
+  - name: one-run-length-rule
+    binding: capability→producer (ξ) — shared.streak.run_length beside KeyedStreaks
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def run_length
+      paths:
+      - shared/src/shared/streak.py
+      expect: present
+  - name: one-steward-guard-clear
+    binding: capability→producer (ξ) — TaskSteward._clear_guards
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _clear_guards
+      paths:
+      - orchestrator/src/orchestrator/steward.py
+      expect: present
+  - name: verify-reach-back-gone
+    binding: anti-inversion — verify.py stops importing a workflow.py private
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator.workflow import _normalize_cause_hint
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: shared-streak-substrate
+    binding: substrate (PASS today) — shared.streak.KeyedStreaks (S14 λ, task 6712)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class KeyedStreaks
+      paths:
+      - shared/src/shared/streak.py
+      expect: present
+- label: ο
+  task_id: 9288
+  title: 'DryRunProposal: one typed entry for metadata.dry_run_proposals'
+  note: Closes fk-e43472e7d5d7. Depends on μ2 (same file dry_run_unblock.py).
+  capabilities:
+  - name: proposal-model
+    binding: capability→producer (ο) — unblock_types.DryRunProposal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class DryRunProposal
+      paths:
+      - orchestrator/src/orchestrator/unblock_types.py
+      expect: present
+  - name: duplicate-timestamp-key-gone
+    binding: anti-inversion — one investigated_at plus reaffirmed_at
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''timestamp'':'
+      paths:
+      - orchestrator/src/orchestrator/dry_run_unblock.py
+      expect: absent
+  - name: b3-gate-reads-typed-status
+    binding: anti-inversion — b3_gate no longer reads absence of status as success
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''status'' in entry'
+      paths:
+      - orchestrator/src/orchestrator/b3_gate.py
+      expect: absent
+  - name: live-proposal-typed
+    binding: INV-13 producer proof — the live dry-run hook writes the typed entry
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live metadata read after a real block; not a tree property
+- label: ω
+  task_id: 9289
+  title: 'Integration gate: the boundary matrix on real fixtures; heuristic-14 re-measure of workflow.py'
+  note: Signal leaf. Closes fk-a503ccb37b4b, fk-a71254176a81. Depends on π and α–ο.
+  capabilities:
+  - name: integration-gate-module
+    binding: capability→producer (ω) — the boundary matrix as one gate module
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_workflow_spine_integration_gate.py
+      expect: present
+  - name: h14-measurement-recorded
+    binding: manual — the heuristic-14 measurement is recorded in the task record
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: judged from the task record, not the tree

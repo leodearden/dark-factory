@@ -1,10 +1,40 @@
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    # FalkorDB 4.18.0 by digest: :latest is now the 6.0 engine, whose RDB/AOF load bugs a recreate would hit.
+    image: falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
     ports:
-      - "6379:6379"
+      # Loopback only, pinned by fused-memory/tests/test_docker_compose_config.py.
+      - "127.0.0.1:6379:6379"
     volumes:
       - ../data/falkordb:/var/lib/falkordb/data
+    environment:
+      # Durable only here: the image runs redis-server with no config file, so a
+      # runtime CONFIG SET / GRAPH.CONFIG SET does not survive a restart (task 6330).
+      # The fused-memory unit recreates this container only through
+      # scripts/falkordb_aof_gate.py, which refuses while the live AOF is not current.
+      - REDIS_ARGS=--appendonly yes --appendfsync everysec
+      # Replaces the image's FALKORDB_ARGS wholesale, so it restates the image
+      # defaults and raises only TIMEOUT (task 6848). Legacy TIMEOUT bounds reads
+      # only; TIMEOUT_DEFAULT/TIMEOUT_MAX would also time out writes and roll them back.
+      - FALKORDB_ARGS=MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  falkordb-scratch:
+    # The FalkorDB tests and evals write to, never production (OPERATIONS.md "The scratch FalkorDB").
+    image: falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - falkordb-scratch-data:/var/lib/falkordb/data
+    environment:
+      # One rare RDB snapshot and no AOF: a fork in flight makes GRAPH.COPY refuse.
+      - REDIS_ARGS=--appendonly no --save 3600 1
+      - FALKORDB_ARGS=MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -15,8 +45,8 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - ../data/qdrant:/qdrant/storage
     healthcheck:
@@ -32,12 +62,59 @@ services:
       retries: 5
     restart: unless-stopped
 
+  embedder:
+    # Permanent local embedder: vLLM pooling runner serving granite-embedding-english-r2
+    # (768 dims). Contract: fused-memory's embedder.model must equal the served name
+    # below (C3), and config-docker.yaml addresses this service by the name
+    # `embedder` (κ2, task 6810). The image digest and the model parameters are the
+    # granite entry of scripts/local-model-serving/arms.yaml.
+    image: vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+    command:
+      - --model
+      - ibm-granite/granite-embedding-english-r2
+      - --served-model-name
+      - granite-embedding-english-r2
+      - --runner
+      - pooling
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "32"
+      # A literal, not computed: est_vram_gib 1.0 + 0.5 GiB over a 24576 MiB card
+      # (lms_serve.py::_memory_share_for). Bounds vLLM's KV cache so whisper-writer
+      # stays resident on the shared card.
+      - --gpu-memory-utilization
+      - "0.062"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      # Loopback only. Never 0.0.0.0: the endpoint is unauthenticated.
+      - "127.0.0.1:8420:8000"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Bounded: a crash-looping container (NVIDIA runtime error, bad cache) stops
+    # after 5 restarts instead of churning the shared GPU forever.
+    restart: on-failure:5
+
   fused-mcp:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
     env_file:
       - ../.env
     environment:
@@ -49,3 +126,5 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+volumes:
+  falkordb-scratch-data: {}

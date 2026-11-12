@@ -51,7 +51,7 @@ try:
     import exception_register
     from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
-    from legibility import census_trigger
+    from inline_suppressions import BASELINE_PATH
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -59,6 +59,8 @@ try:
         owner_from_record,
         owner_record,
     )
+    from shared.mcp_post import mcp_server_base
+    from shared.mcp_session import SyncMcpSession
     from shared.project_layout import default_project_root
     from shared.safe_io import atomic_write_text
     from shared.task_statuses import OwnerLiveness
@@ -684,10 +686,15 @@ MAX_OUTPUTS_PER_RUN = 10
 """INV-4's storm bound: filings and escalations per run, plus one overflow roll-up."""
 
 
-def _tighten_body(slack: int) -> _Body:
+def _tighten_body(slack: int, measured_at: datetime.datetime) -> _Body:
+    """The store's (title, files) candidate_key index covers done rows, so the measurement time
+    keeps each recurrence distinct from its closed predecessor (precedent:
+    ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
+    """
     remedy = f'Run `{TIGHTEN_COMMAND}` and commit the tightened baseline.'
+    as_of = measured_at.isoformat(timespec='seconds')
     return _Body(
-        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack)',
+        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack as of {as_of})',
         detail='\n'.join(
             [
                 f'The inline-suppression baseline allows {slack} more unowned sites than the tree holds.',
@@ -697,6 +704,7 @@ def _tighten_body(slack: int) -> _Body:
         ),
         remedy=remedy,
         observation=f'baseline slack_total {slack}',
+        files=(BASELINE_PATH,),
     )
 
 
@@ -924,7 +932,7 @@ def _act_on(scan: Scan, outputs: _Outputs) -> None:
             step = outputs.raise_finding(key, _dead_owner_body(citation, verdict))
         outputs.reports.append(Report(citation.scope, citation.owner, verdict, step))
     if scan.register.slack_total > 0:
-        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
+        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total, scan.measured_at))
     outputs.roll_up()
     _reconcile_notes(outputs.reports, outputs.ports, outputs.now)
 
@@ -1131,18 +1139,21 @@ def escalation_url(project_root: Path) -> str:
     return url
 
 
+def _call_tool(base_url: str, tool: str, arguments: dict[str, object], *, timeout: float) -> dict:
+    with SyncMcpSession(base_url, client_name='exception-owner-sweep', timeout=timeout) as session:
+        return session.call_tool(tool, arguments)
+
+
 def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_mcp_url: str | None) -> Ports:
     """Both MCP servers over the real transport; a URL left None takes its default."""
     fused_memory = fused_memory_url or os.environ.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
     return Ports(
         project_root=project_root,
         db=tasks_db_path(project_root),
-        fused_memory=functools.partial(
-            census_trigger.post_mcp_tool_call, f'{fused_memory}/mcp', timeout=SUBMIT_RESOLVE_WAIT_SECS + 15
-        ),
+        fused_memory=functools.partial(_call_tool, fused_memory, timeout=SUBMIT_RESOLVE_WAIT_SECS + 15),
         escalation=functools.partial(
-            census_trigger.post_mcp_tool_call,
-            escalation_mcp_url or escalation_url(project_root),
+            _call_tool,
+            mcp_server_base(escalation_mcp_url or escalation_url(project_root)),
             timeout=ESCALATION_TIMEOUT_SECS,
         ),
     )

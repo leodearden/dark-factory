@@ -12,7 +12,7 @@ it trivially.  The gate can still fire POSITIVE there, because
 alternative, so a *sibling* task's landing commit whose subject mentions
 ``(#<TASK_ID>)`` satisfies it.  The fix stamps the CITING sha instead --
 byte-identical to what
-``escalation/src/escalation/server.py::_found_on_main_response`` returns
+``escalation/src/escalation/git_authority.py::found_on_main_response`` returns
 on the same evidence.
 
 This module pins that MECHANISM, not the runbooks' wording.  Both tests
@@ -58,6 +58,12 @@ as ``plans/found-on-main-provenance-integrity-prd.md`` label delta, a
 where the runbook edit that must follow is one file away, instead of both
 copies passing quietly while the behaviour this fix rests on has moved.
 
+Step 1's marker precondition is asserted through the real
+``GitOps.find_merge_marker`` only: the shell form an agent types is
+executed against production's rule by
+``tests/scripts/test_merge_marker_search_snippets.py``, so it is not
+transcribed here.
+
 ``GitOps`` is constructed directly from a default ``GitConfig``, the way
 ``orchestrator/tests/test_git_ops.py::TestFindTaskCitationCommit`` does
 through its ``git_ops``/``git_repo`` fixtures; those fixtures are not
@@ -77,7 +83,7 @@ import subprocess
 from pathlib import Path
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 
 TASK_ID = '4924'
 
@@ -142,7 +148,9 @@ def _citation_walk(root: Path, tid: str) -> str | None:
     AGREES with `_real_citation_walk` on the same repo, which is what
     keeps the runbook's transcription honest as production moves.
     """
-    pattern_str = DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(tid))
+    pattern_str = render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, tid, branch_prefix='task/', main_branch='main',
+    )
     compiled = re.compile(pattern_str)
     out = _git(
         root, 'log', 'main', '--extended-regexp',
@@ -157,12 +165,10 @@ def _citation_walk(root: Path, tid: str) -> str | None:
     return None
 
 
-def _marker_search(root: Path, tid: str) -> str:
-    """Step 1's exact-subject merge-marker search (empty == no marker)."""
-    return _git(
-        root, 'log', 'main', '--fixed-strings',
-        f'--grep=Merge task/{tid} into main', '--max-count=1', '--format=%H',
-    )
+def _real_marker_search(root: Path, tid: str) -> str | None:
+    """Step 1's exact-subject marker search via the REAL `GitOps.find_merge_marker` (None == no marker)."""
+    git_ops = GitOps(GitConfig(main_branch='main', branch_prefix='task/'), root)
+    return asyncio.run(git_ops.find_merge_marker(f'task/{tid}', gate_on_existing_ref=False))
 
 
 def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
@@ -197,8 +203,13 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
         'if this stops holding, the rc=0 arm is no longer reachable in this state'
     )
 
-    # Step 1: no merge marker, so the ladder does not stop there.
-    assert _marker_search(root, TASK_ID) == '', (
+    # Step 1: no merge marker, so the ladder does not stop there.  The search
+    # finds 4700's marker in this same history, so its None is not a git failure.
+    assert _real_marker_search(root, '4700') == base, (
+        'positive control: find_merge_marker must find the `Merge task/4700 into main` '
+        'marker in this history, or its None for this task proves nothing'
+    )
+    assert _real_marker_search(root, TASK_ID) is None, (
         'expected no `Merge task/<ID> into main` marker on main for this task'
     )
 
@@ -225,7 +236,9 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
     assert tip == base, 'the phantom branch tip must be main\'s own old base commit'
     assert tip != sibling, 'the tip and the citing sha must be distinct commits'
-    compiled = re.compile(DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(TASK_ID)))
+    compiled = re.compile(render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, TASK_ID, branch_prefix='task/', main_branch='main',
+    ))
     base_subject = _git(root, 'log', '-1', '--format=%s', base)
     assert not compiled.search(base_subject), (
         f'the branch tip subject {base_subject!r} must NOT cite task {TASK_ID} -- that is '
@@ -244,7 +257,7 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
     nothing.  It also shows the two shas diverge ordinarily -- a trailing
     non-citing commit on the branch is enough -- so a fix that preserved
     the tip form "just for real fast-forwards" would still disagree with
-    `escalation/src/escalation/server.py::_found_on_main_response`.
+    `escalation/src/escalation/git_authority.py::found_on_main_response`.
     """
     root = tmp_path / 'repo'
     _new_repo(root)

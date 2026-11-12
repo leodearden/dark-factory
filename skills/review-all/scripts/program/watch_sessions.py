@@ -22,6 +22,9 @@ import apply_return
 import sessions
 import state
 from sessions import SpawnedSession, Standing
+from shared.proc_liveness import pid_alive
+from shared.process_identity import Liveness
+from shared.session_liveness import judge
 
 from shared import safe_io
 
@@ -34,7 +37,6 @@ from orchestrator.session_registry import (
     CorruptSessionRecord,
     ResultOutcome,
     SessionRecord,
-    _pid_alive,
     parse_result_outcome,
     parse_spawn_identity,
     read_record,
@@ -177,11 +179,15 @@ def read_hand_back(record_dir: Path) -> HandBack | None:
 
 
 def is_over(record: SessionRecord) -> bool:
-    """Whether the session has ended: a terminal status, or a self-exit attempt whose owner is dead."""
+    """Whether the session has ended: a terminal status, or a self-exit attempt whose owner is judged dead."""
     if record.status in TERMINAL_STATUSES:
         return True
     owner = record.claude_owner_pid
-    return record.exit_requested_at is not None and owner is not None and not _pid_alive(owner)
+    return (
+        record.exit_requested_at is not None
+        and owner is not None
+        and judge(record.claude_owner_identity, owner, pid_alive=pid_alive) is Liveness.DEAD
+    )
 
 
 def is_final(outcome: ResultOutcome | None, *, over: bool) -> bool:
@@ -227,6 +233,11 @@ def archive(
     return target
 
 
+def _host(record: SessionRecord) -> str:
+    """The host the record's launcher ran on, or ``unqualified`` for a record without an identity."""
+    return 'unqualified' if record.launcher_identity is None else record.launcher_identity.host
+
+
 def _observed(home: state.Home, session: SpawnedSession, record_dir: Path) -> Seen:
     record = read_resolved(record_dir)
     hand_back = read_hand_back(record_dir)
@@ -235,7 +246,7 @@ def _observed(home: state.Home, session: SpawnedSession, record_dir: Path) -> Se
         home, session, hand_back, final=now is Standing.FINAL,
     )
     outcome = 'none' if hand_back is None or hand_back.outcome is None else hand_back.outcome
-    return Seen(now, archived, f' (outcome {outcome}, status {record.status})')
+    return Seen(now, archived, f' (outcome {outcome}, status {record.status}, host={_host(record)})')
 
 
 def observe(

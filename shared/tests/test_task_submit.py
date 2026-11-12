@@ -12,9 +12,12 @@ import json
 import pytest
 
 from shared.task_submit import (
+    TICKET_ID_PREFIX,
     SubmitFailed,
     SubmittedTask,
     SubmittedTicket,
+    is_ticket_id,
+    looks_like_task_id,
     parse_submit_task_result,
 )
 
@@ -93,3 +96,32 @@ class TestSubmitFailed:
         outcome = parse_submit_task_result(result)
         assert isinstance(outcome, SubmitFailed)
         assert prose in outcome.reason
+
+
+class TestIdPredicates:
+    def test_is_ticket_id_recognises_tkt_prefix(self):
+        assert is_ticket_id('tkt_0000000000000000000000000000') is True
+        assert is_ticket_id('tkt_abc') is True
+        assert is_ticket_id('') is False
+        assert is_ticket_id('123') is False
+        assert is_ticket_id('1.2') is False
+        assert is_ticket_id(None) is False
+
+    def test_is_ticket_id_reads_the_prefix_constant(self):
+        assert is_ticket_id(TICKET_ID_PREFIX + 'X') is True
+
+    @pytest.mark.parametrize('value', ['42', '  42  ', '0', 42, 0])
+    def test_looks_like_task_id_accepts_non_negative_integers(self, value):
+        assert looks_like_task_id(value) is True
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_looks_like_task_id_rejects_bool(self, value):
+        assert looks_like_task_id(value) is False
+
+    @pytest.mark.parametrize('value', [-1, '-1', 'abc', '', '   ', None, 'tkt_abc', '1.5'])
+    def test_looks_like_task_id_rejects_negative_and_non_numeric(self, value):
+        assert looks_like_task_id(value) is False
+
+    @pytest.mark.parametrize('value', ['²', '١٢', '４２'], ids=['superscript', 'arabic-indic', 'fullwidth'])
+    def test_looks_like_task_id_rejects_non_ascii_digits(self, value):
+        assert looks_like_task_id(value) is False

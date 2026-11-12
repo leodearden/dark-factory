@@ -12,9 +12,10 @@ The assertion itself is NOT defined here.  It was written for task 3333
 tests/scripts/test_dashboard_service_template.py, and task 3408 lifted it
 into the importable tests/scripts/systemd_unit_invariants.py so that this
 fleet-wide sweep and the dashboard suite share ONE implementation rather
-than two copies that can drift apart.  test_restart_backoff_guard_rejects_
-ineffective_units in the dashboard module remains the helper's negative-case
-guard; this module supplies its fleet-wide application.
+than two copies that can drift apart.
+tests/scripts/test_dashboard_unit_restart_policy.py::
+test_restart_backoff_guard_rejects_ineffective_units is the helper's
+negative-case guard; this module supplies its fleet-wide application.
 """
 import pathlib
 import subprocess

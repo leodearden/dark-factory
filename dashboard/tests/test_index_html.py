@@ -455,35 +455,6 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: prd_grouping.js must load BEFORE tab_tasks.jsx (task 2530)
-# ---------------------------------------------------------------------------
-
-_PRD_GROUPING_PREFIX = '/static/redux/prd_grouping.js'
-
-
-def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
-    """prd_grouping.js must load as a classic synchronous script BEFORE
-    tab_tasks.jsx.
-
-    tab_tasks.jsx destructures window.DF_PRD_GROUPING at top-level execution
-    time — if prd_grouping.js loaded after (or not at all), that destructure
-    would silently produce undefined, and the "group by PRD" view would throw
-    the moment it tries to call one of those functions.
-    """
-    assert_script_loads_before(
-        index_html_body,
-        _PRD_GROUPING_PREFIX,
-        _TAB_TASKS_PREFIX,
-        before_label='prd_grouping.js',
-        after_label='tab_tasks.jsx',
-        consumer_note=(
-            'tab_tasks.jsx destructures window.DF_PRD_GROUPING at top level; '
-            'prd_grouping.js must define it first.'
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Regression guard: runtime_format.js must load BEFORE tabs.jsx and
 # tab_tasks.jsx (task 2637)
 # ---------------------------------------------------------------------------
@@ -1365,23 +1336,33 @@ def test_task_snapshot_js_load_order(
     )
 
 
-# prd_grouping.js builds its PRD tally from the generated vocabulary and its
-# PRD-box count from datum.js::combinedDatum and task_snapshot.js's readings,
-# all destructured at module scope (task 5590). Its edge to tab_tasks.jsx is
-# test_prd_grouping_js_loads_before_tab_tasks.
-_PRD_GROUPING_ORDER_CASES = [
-    (_DATUM_PREFIX, 'datum.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
-    (_TASK_VOCAB_PREFIX, 'task_vocab.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
-    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
+# prd_lanes_view.js stamps the /prds Datums through datum.js::servedDatum, and
+# prd_lanes.jsx renders the page through shell.jsx's readings, charts.jsx's
+# palette and prd_lanes_view.js's decisions; tab_tasks.jsx hosts it. Each
+# destructures the module before it at module scope (task 6585).
+_PRD_LANES_VIEW_PREFIX = '/static/redux/prd_lanes_view.js'
+_PRD_LANES_PREFIX = '/static/redux/prd_lanes.jsx'
+_PRD_LANES_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_SHELL_PREFIX, 'shell.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_CHARTS_PREFIX, 'charts.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_PREFIX, 'prd_lanes.jsx', _TAB_TASKS_PREFIX, 'tab_tasks.jsx', _READS_AT_MODULE_SCOPE),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label, why',
-    _PRD_GROUPING_ORDER_CASES,
-    ids=['datum-before-prd-grouping', 'vocab-before-prd-grouping', 'snapshot-before-prd-grouping'],
+    _PRD_LANES_ORDER_CASES,
+    ids=[
+        'datum-before-prd-lanes-view',
+        'prd-lanes-view-before-prd-lanes',
+        'shell-before-prd-lanes',
+        'charts-before-prd-lanes',
+        'prd-lanes-before-tab-tasks',
+    ],
 )
-def test_prd_grouping_js_load_order(
+def test_prd_lanes_load_order(
     index_html_body: str,
     before_prefix: str,
     before_label: str,
@@ -1389,7 +1370,7 @@ def test_prd_grouping_js_load_order(
     after_label: str,
     why: str,
 ) -> None:
-    """The PRD grouping module loads after every module it reads."""
+    """The PRD lanes page's modules load after every module they read."""
     assert_script_loads_before(
         index_html_body,
         before_prefix,
@@ -1959,7 +1940,7 @@ def test_spend_readings_js_load_order(
 
 # ---------------------------------------------------------------------------
 # Regression guard: dependency-free classic modules are served, versioned, and
-# load before every .jsx that reads them (task 5743)
+# load before every consumer that reads them (task 5743)
 #
 # A module in this table reads no window.DF_* global, so its only load-order
 # edges are to its consumers, each of which destructures the module's global
@@ -1969,12 +1950,16 @@ def test_spend_readings_js_load_order(
 
 _DEPENDENCY_FREE_MODULES = {
     'escalation_focus.js': ('tab_escalations.jsx',),
+    'escalation_check_owner.js': ('tab_escalations.jsx',),
     'persisted_state.js': (
         'tab_memory_evals.jsx',
         'tabs.jsx',
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
+        'tab_tasks.jsx',
     ),
+    'render_failure.js': ('app.jsx',),
+    'poll_scope.js': ('data.js', 'app.jsx'),
 }
 _DEPENDENCY_FREE_CONSUMER_CASES = [
     (module, consumer)
@@ -2065,8 +2050,8 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'graph_layout.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
-    assert re.search(r'/static/redux/prd_grouping\.js\?v=\d+', index_html_body), (
-        'prd_grouping.js is not present among the versioned /static/redux/* '
+    assert re.search(r'/static/redux/prd_lanes_view\.js\?v=\d+', index_html_body), (
+        'prd_lanes_view.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (

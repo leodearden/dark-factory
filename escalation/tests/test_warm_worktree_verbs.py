@@ -12,9 +12,7 @@ in-memory stubs — mirrors test_merge_status_git_authority.py's split.
 Shared patterns from the existing test suite:
 - Cross-package orchestrator import guard (mirrors test_server.py:31-55 /
   test_merge_status_git_authority.py:31-43)
-- ``_call_tool`` helper — FastMCP async unit-test pattern
-  (``tool = await server.get_tool(name); await tool.fn(...)``), mirrors
-  test_server.py's ``_call_tool`` (line 3661).
+- ``_tool_calls.py::call_tool`` — the shared in-process tool-call helper.
 - Real-repo fixtures (``_init_repo``/``_add_seed_script``/``_run``,
   ``GitConfig()``+``GitOps(config, repo)``) copied from
   orchestrator/tests/test_interactive_worktree.py.
@@ -27,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -130,12 +129,6 @@ def server(tmp_path: Path, harness: types.SimpleNamespace) -> Any:
     return create_server(EscalationQueue(tmp_path / 'esc'), harness=harness)
 
 
-async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
-    """Invoke an async MCP tool by name (mirrors test_server.py's _call_tool)."""
-    tool = await server.get_tool(name)
-    return await tool.fn(**kwargs)
-
-
 # ---------------------------------------------------------------------------
 # step-1 (RED) / step-2 (GREEN): claim_warm_worktree happy path
 # ---------------------------------------------------------------------------
@@ -154,7 +147,7 @@ class TestClaimWarmWorktreeHappyPath:
         assert rc == 0, 'setup: rev-parse main failed'
         main_sha = main_sha.strip()
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'claim_warm_worktree', slug='demo', project_root=str(warm_repo),
         )
 
@@ -177,7 +170,7 @@ class TestClaimWarmWorktreeHappyPath:
         """start_ref is forwarded verbatim — base_ref reflects the pinned commit."""
         second_sha = await _commit_file(warm_repo, 'second.txt', 'x', 'second commit')
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'claim_warm_worktree',
             slug='demo2', project_root=str(warm_repo), start_ref=second_sha,
         )
@@ -200,7 +193,7 @@ class TestClaimWarmWorktreeGuards:
     async def test_a_standalone_returns_error(self, tmp_path: Path) -> None:
         """(a) No harness wired → {'error'} — already green from step-2; regression."""
         server = create_server(EscalationQueue(tmp_path / 'esc'))  # no harness
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree', slug='x', project_root=str(tmp_path),
         )
         assert 'error' in result, f'expected an error key, got: {result}'
@@ -212,7 +205,7 @@ class TestClaimWarmWorktreeGuards:
         other = warm_repo.parent / 'not-the-repo'
         other.mkdir()
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree',
             slug='mismatch-slug', project_root=str(other),
         )
@@ -243,7 +236,7 @@ class TestClaimWarmWorktreeGuards:
         stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
         server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree', slug='x', project_root=str(root),
         )
 
@@ -266,7 +259,7 @@ class TestClaimWarmWorktreeGuards:
         stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
         server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree', slug='x', project_root=str(root),
         )
 
@@ -289,7 +282,7 @@ class TestClaimWarmWorktreeGuards:
         stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
         server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree', slug='x', project_root=str(root),
         )
 
@@ -308,7 +301,7 @@ class TestClaimWarmWorktreeGuards:
         stub_harness = types.SimpleNamespace(git_ops=git_ops)
         server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'claim_warm_worktree', slug='cold', project_root=str(repo),
         )
 
@@ -330,12 +323,12 @@ class TestReleaseWarmWorktreeRemoval:
     async def test_release_by_path_removes_worktree(
         self, warm_repo: Path, server: Any,
     ) -> None:
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='rel1', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(warm_repo),
         )
@@ -352,17 +345,17 @@ class TestReleaseWarmWorktreeRemoval:
     async def test_release_by_path_is_idempotent(
         self, warm_repo: Path, server: Any,
     ) -> None:
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='rel1b', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
-        first = await _call_tool(
+        first = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(warm_repo),
         )
         assert first['removed'] is True, f'setup: first release failed: {first}'
 
-        second = await _call_tool(
+        second = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(warm_repo),
         )
@@ -388,7 +381,7 @@ class TestReleaseWarmWorktreeRemoval:
         """A genuine (non-idempotent) removal failure carries a 'detail' with git's stderr."""
         never_claimed = warm_repo / '_iact-never-claimed'
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=str(never_claimed), project_root=str(warm_repo),
         )
@@ -401,7 +394,7 @@ class TestReleaseWarmWorktreeRemoval:
     async def test_release_standalone_returns_error(self, tmp_path: Path) -> None:
         """(i) No harness wired → {'error'}."""
         server = create_server(EscalationQueue(tmp_path / 'esc'))  # no harness
-        result = await _call_tool(
+        result = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=str(tmp_path / 'nonexistent'), project_root=str(tmp_path),
         )
@@ -411,14 +404,14 @@ class TestReleaseWarmWorktreeRemoval:
         self, warm_repo: Path, server: Any,
     ) -> None:
         """(ii) project_root mismatch → {'error'} and nothing removed."""
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='rel2', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
         other = warm_repo.parent / 'not-the-repo'
         other.mkdir()
 
-        result = await _call_tool(
+        result = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(other),
         )
@@ -447,12 +440,12 @@ class TestReleaseWarmWorktreeBranchPrune:
         self, warm_repo: Path, server: Any,
     ) -> None:
         """(a) task/mrg tip == main tip (already an ancestor) → pruned + gone."""
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='mrg', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(warm_repo),
         )
@@ -466,13 +459,13 @@ class TestReleaseWarmWorktreeBranchPrune:
         self, warm_repo: Path, server: Any,
     ) -> None:
         """(b) task/wip has a commit beyond main → branch_pruned False, kept."""
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='wip', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
         await _commit_file(Path(claim['path']), 'wip.txt', 'x', 'wip commit')
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch=claim['path'], project_root=str(warm_repo),
         )
@@ -486,12 +479,12 @@ class TestReleaseWarmWorktreeBranchPrune:
         self, warm_repo: Path, server: Any,
     ) -> None:
         """(c) path_or_branch='task/bybr' (branch-mode) resolves + removes."""
-        claim = await _call_tool(
+        claim = await call_tool(
             server, 'claim_warm_worktree', slug='bybr', project_root=str(warm_repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
 
-        res = await _call_tool(
+        res = await call_tool(
             server, 'release_warm_worktree',
             path_or_branch='task/bybr', project_root=str(warm_repo),
         )
