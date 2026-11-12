@@ -31,6 +31,7 @@ from _link_heal_harness import (
     corpus_basis,
     run_corpus_apply,
     run_corpus_plan,
+    run_deterministic_plan,
 )
 
 from fused_memory.maintenance.link_heal import (
@@ -39,6 +40,7 @@ from fused_memory.maintenance.link_heal import (
     LinkBasis,
     LinkImage,
     Plan,
+    Report,
     RunCounts,
     build_plan,
 )
@@ -52,7 +54,13 @@ from fused_memory.maintenance.link_heal_executor import (
     render_plan_document,
     run_plan,
 )
-from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
+from fused_memory.maintenance.link_heal_ledger import (
+    ActionState,
+    CandidateRecord,
+    Disposition,
+    LinkHealLedger,
+    RunSource,
+)
 from fused_memory.maintenance.link_heal_store import (
     COUNT_TOOL,
     CensusFailed,
@@ -642,3 +650,217 @@ class TestReportModeEscapes:
 
         assert WRITE_FAILURE_ANCHOR not in report.counts.would_escape
         assert report.counts.would_escape == (BACKLOG_ANCHOR,)
+
+
+SAME_CHILD = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+SAME_PARENT = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+CONTESTED_CHILD = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+CONTESTED_PARENT = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+PENDING_CHILD = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+PENDING_PARENT = '77777777-7777-4777-8777-777777777777'
+UNREAD_CHILD = '88888888-8888-4888-8888-888888888888'
+SAME_TEXT, SAME_PARENT_TEXT = 'a sighting of the same fact', 'the same fact'
+PENDING_TEXT, PENDING_PARENT_TEXT = 'a child planned last night', 'its unrelated parent'
+
+
+def pending_basis() -> LinkBasis:
+    return corpus_basis(
+        'UNRELATED', child=PENDING_CHILD, parent=PENDING_PARENT, key='H004',
+        child_text=PENDING_TEXT, parent_text=PENDING_PARENT_TEXT,
+    )
+
+
+def seed_examined_links(harness: LinkHealHarness) -> tuple[LinkBasis, ...]:
+    """A misfile, a SAME sighting, a hand-declared contest and a dangling link.
+
+    The pending link is seeded by :func:`plan_the_pending_heal` first.
+    """
+    harness.seed_link()
+    harness.seed_link(
+        child=SAME_CHILD, parent=SAME_PARENT, kind=SIGHTING_KIND,
+        child_text=SAME_TEXT, parent_text=SAME_PARENT_TEXT,
+    )
+    harness.seed_link(
+        child=CONTESTED_CHILD, parent=CONTESTED_PARENT, contested=True,
+        child_text='a hand-contested child', parent_text='the contested parent',
+    )
+    harness.seed_link(
+        child=DANGLING_CHILD, parent=DELETED_PARENT, parent_text=None,
+        child_text='a note whose parent was deleted',
+    )
+    return (
+        corpus_basis('RELATED'),
+        corpus_basis(
+            'SAME', child=SAME_CHILD, parent=SAME_PARENT, key='H002',
+            child_text=SAME_TEXT, parent_text=SAME_PARENT_TEXT,
+        ),
+        pending_basis(),
+    )
+
+
+async def plan_the_pending_heal(harness, ledger, tmp_path) -> int:
+    """An earlier corpus run that leaves one detach pending; its action row's id."""
+    harness.seed_link(
+        child=PENDING_CHILD, parent=PENDING_PARENT,
+        child_text=PENDING_TEXT, parent_text=PENDING_PARENT_TEXT,
+    )
+    earlier = await run_corpus_plan(harness, ledger, tmp_path / 'earlier.json', (pending_basis(),))
+    (row,) = ledger.run_actions(earlier.run_id)
+    return row.action_id
+
+
+def by_child(records: list[CandidateRecord]) -> dict[str, CandidateRecord]:
+    found = {record.child_id: record for record in records}
+    assert len(found) == len(records), 'one record per examined link'
+    return found
+
+
+def action_id_for(ledger: LinkHealLedger, run_id: str, child_id: str) -> int:
+    (row,) = [row for row in ledger.run_actions(run_id) if row.planned.child_id == child_id]
+    return row.action_id
+
+
+class TestPlanRunsRecordEveryExamination:
+    @pytest.mark.asyncio
+    async def test_a_corpus_plan_records_one_candidate_per_examined_link(
+        self, harness, ledger, tmp_path,
+    ):
+        pending_id = await plan_the_pending_heal(harness, ledger, tmp_path)
+        bases = seed_examined_links(harness)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        records = ledger.run_records(report.run_id)
+        assert len(records) == report.counts.examined == 5
+        found = by_child(records)
+        outcomes = {
+            child: (record.decision, record.disposition) for child, record in found.items()
+        }
+        assert outcomes == {
+            CHILD: (HealAction.DETACH, Disposition.STAGED),
+            SAME_CHILD: (Report.NO_ACTION, Disposition.REPORTED),
+            CONTESTED_CHILD: (Report.CONTESTED_REPORTED, Disposition.REPORTED),
+            DANGLING_CHILD: (HealAction.DETACH, Disposition.STAGED),
+            PENDING_CHILD: (HealAction.DETACH, Disposition.ALREADY_PENDING),
+        }
+        assert found[CHILD].action_id == action_id_for(ledger, report.run_id, CHILD)
+        assert found[DANGLING_CHILD].action_id == action_id_for(
+            ledger, report.run_id, DANGLING_CHILD,
+        )
+        assert found[PENDING_CHILD].action_id == pending_id
+        assert found[SAME_CHILD].action_id is None
+        assert found[CONTESTED_CHILD].action_id is None
+        assert {record.run_id for record in records} == {report.run_id}
+
+    @pytest.mark.asyncio
+    async def test_a_record_carries_the_full_before_state_and_its_basis(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+        live_child = await harness.store().read(DF, CHILD)
+        live_parent = await harness.store().read(DF, PARENT)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        record = by_child(ledger.run_records(report.run_id))[CHILD]
+        assert (record.project_id, record.child_id, record.parent_id) == (DF, CHILD, PARENT)
+        assert (record.basis_source, record.basis_key) == (BasisSource.CORPUS, 'H001')
+        assert live_child is not None and live_parent is not None
+        child = record.before_child
+        assert child.memory_id == CHILD
+        assert child.content == CHILD_TEXT
+        assert child.content_sha256 == text_sha256(CHILD_TEXT)
+        assert child.metadata == live_child.metadata
+        assert child.created_at == harness.mem0.payload(DF, CHILD)['created_at']
+        assert record.before_parent is not None
+        assert record.before_parent.content == PARENT_TEXT
+        assert record.before_parent.metadata == live_parent.metadata
+
+    @pytest.mark.asyncio
+    async def test_nothing_taken_leaves_the_after_state_the_before_state(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        for record in ledger.run_records(report.run_id):
+            assert record.action_taken == 'none', record.child_id
+            assert record.after_child == record.before_child, record.child_id
+
+    @pytest.mark.asyncio
+    async def test_a_dangling_parent_has_no_parent_snapshot_and_a_verdictless_basis(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        record = by_child(ledger.run_records(report.run_id))[DANGLING_CHILD]
+        assert record.parent_id == DELETED_PARENT
+        assert record.before_parent is None
+        assert (record.basis_source, record.basis_key) == (BasisSource.DETERMINISTIC, None)
+
+    @pytest.mark.asyncio
+    async def test_a_deterministic_plan_records_its_examinations_too(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+        corpus = await run_corpus_plan(harness, ledger, tmp_path / 'corpus.json', bases)
+
+        report = await run_deterministic_plan(harness, ledger, tmp_path / 'plan.json')
+
+        found = by_child(ledger.run_records(report.run_id))
+        assert len(found) == report.counts.examined == 4
+        assert (found[CHILD].decision, found[CHILD].disposition) == (
+            Report.UNEXAMINED, Disposition.REPORTED,
+        )
+        assert (found[CHILD].basis_source, found[CHILD].basis_key) == (None, None)
+        dangling = found[DANGLING_CHILD]
+        assert (dangling.decision, dangling.disposition) == (
+            HealAction.DETACH, Disposition.ALREADY_PENDING,
+        )
+        assert dangling.action_id == action_id_for(ledger, corpus.run_id, DANGLING_CHILD)
+        assert found[CONTESTED_CHILD].decision is Report.CONTESTED_REPORTED
+
+    @pytest.mark.asyncio
+    async def test_a_link_whose_read_failed_has_no_record_but_is_counted(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+        harness.seed_link(
+            child=UNREAD_CHILD, parent=OTHER_PARENT,
+            child_text='a child that will not read', parent_text='its parent',
+        )
+        harness.mem0.read_failures.add(UNREAD_CHILD)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        assert report.counts.read_failed == 1
+        assert UNREAD_CHILD not in by_child(ledger.run_records(report.run_id))
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_document_rolls_the_examinations_back(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_examined_links(harness)
+
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'missing' / 'plan.json', bases,
+        )
+
+        assert report.counts.stopped_by == PLAN_DOCUMENT_STOP
+        assert ledger.run_records(report.run_id) == []
+
+    @pytest.mark.asyncio
+    async def test_a_parent_examined_twice_is_snapshotted_once(self, harness, ledger, tmp_path):
+        bases = seed_examined_links(harness)
+        first = await run_corpus_plan(harness, ledger, tmp_path / 'first.json', bases)
+
+        second = await run_corpus_plan(harness, ledger, tmp_path / 'second.json', bases)
+
+        before = by_child(ledger.run_records(first.run_id))[CHILD]
+        after = by_child(ledger.run_records(second.run_id))[CHILD]
+        assert before.before_parent is not None and after.before_parent is not None
+        assert after.before_parent.snapshot_id == before.before_parent.snapshot_id
+        assert after.before_child.snapshot_id == before.before_child.snapshot_id
