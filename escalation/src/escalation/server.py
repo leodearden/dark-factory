@@ -4143,9 +4143,13 @@ def create_server(
         it.  When True (and an event store is wired), emits a
         ``workflow_verify`` event so the merge-skew classifier can attribute
         a later skewed merge failure to ``INTEGRATION_SKEW`` instead of
-        degrading to ``INDETERMINATE``.  Default ``False`` — no attribution,
-        emits nothing (mirrors the orchestrator's own emission at the
-        VERIFY→REVIEW transition for its own submissions).
+        degrading to ``INDETERMINATE``.  The vouch records the branch tip the
+        server resolved: a redispatch at that tip skips VERIFY, and the
+        stranded-green reaper and the architect's ready_to_merge gate treat
+        that tip as verified.  The merge worker's own gate still runs.
+        Default ``False`` — no attribution, emits nothing (mirrors the
+        orchestrator's own emission at the VERIFY→REVIEW transition for its
+        own submissions).
 
         *retry_failed_only* — set True to vouch that this request's post-merge
         verify retries should re-run only the previously-failed tests instead
@@ -4657,9 +4661,10 @@ def create_server(
         # returns immediately with in_flight=True — no future await, no duplicate
         # enqueue.  On dispatch acquires the registry slot and awaits the future
         # exactly as the original enqueue_merge_request path.
-        # Task 2411: mirror the orchestrator's own workflow_verify emission
-        # (workflow.py:1724-1733) for non-orchestrator submission pathways
-        # (/merge-queue, /unblock, /do) so the merge-skew classifier's I5
+        # The payload's single definition is
+        # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data.
+        # Task 2411: non-orchestrator submission pathways
+        # (/merge-queue, /unblock, /do) vouch here so the merge-skew classifier's I5
         # branch-green fact (merge_disposition._branch_pre_merge_verify_green,
         # keyed by task_id, reads only data['passed']) can source from these
         # too.  verified_green is a caller-supplied vouch — only the caller
@@ -4676,6 +4681,12 @@ def create_server(
             from orchestrator.merge_lane import (
                 resolve_dispatch_time_merge_base,
             )
+            from orchestrator.task_verify_dispatch import LOCAL_RUNNER
+            from orchestrator.verify_evidence import (
+                TipUnresolved,
+                VerifySite,
+                workflow_verify_event_data,
+            )
             base_sha = (
                 await resolve_dispatch_time_merge_base(
                     orch_config.project_root, orch_config.git.main_branch, resolved_tip,
@@ -4683,25 +4694,24 @@ def create_server(
                 if resolved_tip is not None
                 else None
             )
-            # SYNC CONTRACT (reviewer follow-up on step-4): this payload shape —
-            # keys 'passed' / 'base_sha' / 'branch', task_id-keyed — MUST stay
-            # byte-identical to the orchestrator's own emission at
-            # workflow.py:1724-1733, since merge_disposition._branch_pre_merge_verify_green
-            # reads both call sites as one logical event stream.  A shared
-            # canonical constructor (e.g. an `emit_workflow_verify(...)` helper)
-            # would remove this manual-sync risk, but its natural home is
-            # orchestrator (workflow.py would need to call it too) — out of
-            # this task's locked scope (escalation/server.py + tests +
-            # skills/{merge-queue,unblock}/SKILL.md only).  Deferred as a
-            # follow-up rather than expanding this task's file locks.
+            if resolved_tip is None:
+                logger.warning(
+                    'merge_request: branch %s (task %s) did not resolve; recording the '
+                    'verified_green vouch with tip_sha_unresolved',
+                    full_branch, task_id,
+                )
             event_store.emit(
                 EventType.workflow_verify,
                 task_id=task_id,
-                data={
-                    'passed': True,
-                    'base_sha': base_sha,
-                    'branch': canonical_queued_branch_name(branch, orch_config.git.branch_prefix),
-                },
+                data=workflow_verify_event_data(
+                    True,
+                    tip_sha=resolved_tip if resolved_tip is not None else TipUnresolved.BRANCH_UNRESOLVED,
+                    base_sha=base_sha,
+                    branch=full_branch,
+                    result=None,
+                    site=VerifySite.MCP_MERGE_REQUEST,
+                    runner=LOCAL_RUNNER,
+                ),
             )
 
         # classifier_git_ops: the same harness GitOps handle is reused here so

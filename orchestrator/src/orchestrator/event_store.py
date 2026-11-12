@@ -259,15 +259,10 @@ class EventType(StrEnum):
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; the workflow's rows
-    # (TaskWorkflow._emit_workflow_verify, task 5651) carry {passed, tip_sha,
-    # base_sha, branch, site, duration_ms, slot_wait_secs, plan_hash,
-    # cache_mode, units}, site per verify_evidence.py::VerifySite and the
-    # last three per verify_evidence.py::verify_event_fields.  duration_ms is
-    # the verify run's own wall
-    # (VerifyResult.duration_secs), excluding the admission queueing that
-    # slot_wait_secs records.  Escalation-side vouch rows carry only
-    # {passed, base_sha, branch} until task 5409.  A 2752 checkpoint hit emits
+    # already merged onto CURRENT main).  task_id-keyed; data is defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data,
+    # and both emitters (TaskWorkflow._emit_workflow_verify and the
+    # merge_request(verified_green=True) vouch) build it there.  A 2752 checkpoint hit emits
     # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
     # row.  Consumed by the merge-skew
     # attribution classifier's I5 branch-green fact (merge_disposition.

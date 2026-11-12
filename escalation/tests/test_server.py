@@ -4519,8 +4519,8 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
 # merge-skew classifier's I5 branch-green fact (merge_disposition.
 # _branch_pre_merge_verify_green, keyed by task_id, reads only data['passed'])
 # can source from non-orchestrator submission pathways (/merge-queue,
-# /unblock, /do) — mirroring the orchestrator's own emission at
-# workflow.py:1724-1733 (task 2381 alpha / 2383 beta).
+# /unblock, /do). Both emitters build the row with
+# orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data (task 5409).
 
 
 @pytest.mark.asyncio
