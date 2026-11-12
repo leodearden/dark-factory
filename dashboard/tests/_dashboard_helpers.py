@@ -1,4 +1,10 @@
-"""Non-fixture test helpers for dashboard tests.
+"""Runtime and fixture harness for the dashboard test suites.
+
+The isolation env, the aiosqlite worker census, TTLCache bypass-refresh
+wedging, the background-loop drivers, mocked MCP envelopes, the dual
+escalation artifact tree, the reconciliation schema, and the node/caplog
+helpers.  Source-text probes over the served JS, JSX and HTML do not belong
+here: they live in `_jsx_source_helpers.py`.
 
 Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
