@@ -758,7 +758,8 @@ it, and the gate slug where one corresponds:
   (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
   or a config without project_id or project_root) is asked like any other milestone gate. The
   spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
-  before any agent runs.
+  before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
+  `--launched-from` go-gate lands).
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -2093,15 +2094,21 @@ Filed by `orchestrator-deterministic` when a completion-driven chain's completio
 (`plans/completion-driven-triggers-prd.md` C4/C5). Read the typed `review_due` payload (`skill`,
 `project_root`, `launched_from`, `verdict`), never the summary text; an interim `milestone_gate`
 has no payload, so its fields come from the interim bullet below. Never stamp it or auto-close
-it: it lands in `deterministic_runner_filing`, a human-forever gate. For the brief line,
+it: it lands in `deterministic_runner_filing`, a human-forever gate. Whenever it is left pending
+(spawned, AFK, or "not now"), append `<esc-id>` to the exclude-file. For the brief line,
 `scripts/check_run_completion.py --pending` gives the live share.
 
 - **Attended: spawn directly, no prior ask.** `/spawn` (multi-turn case of "Sub-agent or `/spawn`")
   with `prompt="/<skill> <project_root> --launched-from <launched_from>"`, built from the payload
-  (the stored `skill` is bare; you add the slash), `cwd=<project_root>`. Only the leading `/<skill>`
-  token is load-bearing, as in the `/unblock` convention above.
+  (the stored `skill` is bare; you add the slash), `terminal_title="<skill>:<project_id>
+  <launched_from>"` (a project-level spawn, no task id), `cwd=<project_root>`. The leading
+  `/<skill>` token and `--launched-from <launched_from>` are both load-bearing: the first invokes
+  the skill, the second is how its supersede step (`skills/_shared/filing-the-trigger-chain.md`
+  §5 step 2) knows this escalation launched it. The positional `<project_root>` is read only by
+  `/review-all`; `cwd` carries the project for the others.
 - **AFK: digest line plus a DecisionRecord via `write-decision`.** Never spawn, and never a
-  sub-agent that runs the skill (ruling 2). Append `<esc-id>` to the exclude-file.
+  sub-agent that runs the skill (ruling 2). On Leo's return, handle it under the attended branch
+  (spawn, no prior ask) unless he has already said "not now".
 - **Never resolve it when you spawn.** The spawned run resolves it once, in its supersede step
   (C5 step 5), with `resume` and `ran as <run_id>`; resolving it here too would double-resolve it.
   Leave it pending until the spawn reports back.
@@ -2111,16 +2118,21 @@ it: it lands in `deterministic_runner_filing`, a human-forever gate. For the bri
   (filed before ζ deployed) and whose detail lacks the withheld line is handled like `review_due`:
   attended spawn, AFK digest, never resolve on spawn, decline. Its spawn fields come from three
   places, never the summary: `skill` from the task's `metadata.trigger_chain.skill`, read with
-  `mcp__fused-memory__get_task` (stored bare; add the slash); `project_root` is this watcher's own
+  `mcp__fused-memory__get_task` (it must be exactly `review`, `hotspot-survey` or `review-all`,
+  per `shared/src/shared/task_metadata.py::TriggerChainSkill`; add the slash; any other value is
+  asked like a withheld gate); `project_root` is this watcher's own
   `<project_root>`, since an escalation record has no project_root field
   (`escalation/src/escalation/models.py::Escalation`); `launched_from` is the record's own
   escalation id. A withheld gate, whose detail carries "This human gate files milestone_gate
   rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
   is asked like any other milestone gate, per "Always ask".
-- **`milestone_check_stalled`** (the completion gate's predicate re-armed to its cap; see the PRD's
-  C1). Three resolutions: `resume` keeps waiting (streak restarted); `abandon` on the completion
-  gate fires the human gate now; `abandon` on the human gate first, then on the completion gate,
-  ends the chain. Which one is Leo's to pick: it is a milestone gate, so it is asked.
+
+### `milestone_check_stalled` (trigger chain, completion gate)
+
+Filed on a chain's completion gate when its predicate re-armed to its cap (the PRD's C1). Three
+resolutions: `resume` keeps waiting (streak restarted); `abandon` on the completion gate fires
+the human gate now; `abandon` on the human gate first, then on the completion gate,
+ends the chain. Which one is Leo's to pick: it is a milestone gate, so it is asked.
 
 ### `design_concern` (info or blocking)
 
