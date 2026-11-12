@@ -749,7 +749,10 @@ it, and the gate slug where one corresponds:
   work is curating memories in place (its text says it is curator-sitting work, edits no
   repository file, and names the memories to amend) is handled under self-execute line 14, with
   every check that line requires, and reported afterwards (Leo, 2026-11-10, scoping_intake
-  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked.
+  esc-866-1; precedent esc-787-1). Any other milestone gate is still asked. **Second exception:**
+  `review_due` is handled under "`review_due` (born-at-L2, human gate)", which spawns the attended
+  run with no prior ask (D10, Leo 2026-10-05). The spawn itself is not a `spend_or_eval_launch`:
+  the spawned skill confirms scope and cost with Leo before any agent runs.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -2077,6 +2080,32 @@ fallback, the field meanings and why not `get_escalation` are in the "Investigat
 Once the check passes on main, resolve with `action='resume'` to re-pend the dependent. Other
 dependents of the same owner may hold their own records for the same check: one fix on the owner
 serves them all, so close each against the ruling.
+
+### `review_due` (born-at-L2, human gate)
+
+Filed by `orchestrator-deterministic` when a completion-driven chain's completion gate passes
+(`plans/completion-driven-triggers-prd.md` C4/C5). Read the typed `review_due` payload (`skill`,
+`project_root`, `launched_from`, `verdict`), never the summary text. Never stamp it or auto-close
+it: it lands in `deterministic_runner_filing`, a human-forever gate. For the brief line,
+`scripts/check_run_completion.py --pending` gives the live share.
+
+- **Attended: spawn directly, no prior ask.** `/spawn` (multi-turn case of "Sub-agent or `/spawn`")
+  with `prompt="/<skill> <project_root> --launched-from <launched_from>"`, built from the payload
+  (the stored `skill` is bare; you add the slash), `cwd=<project_root>`. Only the leading `/<skill>`
+  token is load-bearing, as in the `/unblock` convention above.
+- **AFK: digest line plus a DecisionRecord via `write-decision`.** Never spawn, and never a
+  sub-agent that runs the skill (ruling 2). Append `<esc-id>` to the exclude-file.
+- **Never resolve it when you spawn.** The spawned run resolves it once, in its supersede step
+  (C5 step 5), with `resume` and `ran as <run_id>`; resolving it here too would double-resolve it.
+  Leave it pending until the spawn reports back.
+- **Decline (C5 step 6).** "Not now": leave it pending, a standing brief item that re-files
+  nothing. "End the cadence": `resolve_issue(action='abandon')` on the human gate.
+- **Interim gate.** A `milestone_gate` whose task carries `trigger_chain.role='human_gate'` (filed
+  before ζ deployed) is handled identically.
+- **`milestone_check_stalled`** (the completion gate's predicate re-armed to its cap; see the PRD's
+  C1). Three resolutions: `resume` keeps waiting (streak restarted); `abandon` on the completion
+  gate fires the human gate now; `abandon` on the human gate first, then on the completion gate,
+  ends the chain. Which one is Leo's to pick: it is a milestone gate, so it is asked.
 
 ### `design_concern` (info or blocking)
 
