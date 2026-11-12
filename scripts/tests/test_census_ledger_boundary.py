@@ -7,7 +7,6 @@ fakes, passed through ``run_census``'s own parameters.
 """
 from __future__ import annotations
 
-import dataclasses
 import itertools
 import json
 import logging
@@ -32,6 +31,7 @@ from legibility import (
     unlanded,
 )
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
+from legibility_census_scaffold import journaled, narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
@@ -188,13 +188,9 @@ class _Census:
             commit=_Recorder(_LANDED),
             roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
         )
-        seams = {
-            name: overrides.pop(name)
-            for name in list(overrides)
-            if name in {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
-        }
+        effects, overrides = with_seams(effects, overrides)
         kwargs: dict[str, Any] = dict(
-            effects=dataclasses.replace(effects, **seams),
+            effects=effects,
             codebook_dict={"version": 2, "entries": [], "candidates": []},
             config=self.cfg,
             project_root=self.cwd,
@@ -222,19 +218,9 @@ def census(tmp_path):
     return _Census(tmp_path)
 
 
-def _done(outcome) -> mod.Done:
-    assert isinstance(outcome, mod.Done), outcome
-    return outcome
-
-
-def _deferred(outcome) -> mod.Deferred:
-    assert isinstance(outcome, mod.Deferred), outcome
-    return outcome
-
-
-def _unlanded(outcome) -> mod.Unlanded:
-    assert isinstance(outcome, mod.Unlanded), outcome
-    return outcome
+_done = narrowing(mod.Done)
+_deferred = narrowing(mod.Deferred)
+_unlanded = narrowing(mod.Unlanded)
 
 
 def _record_of(report_path: Path) -> tuple[str, dict[str, Any]]:
@@ -292,7 +278,7 @@ def test_any_source_whose_selection_is_declared_is_ledgered(census):
 
     outcome = _done(mod.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered)))
 
-    assert outcome.ledger_rows_written == 1
+    assert outcome.ledger == mod.Ledgered(rows=1)
     assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
     state = json.loads(census.state_path.read_text(encoding="utf-8"))
     assert window_source.selection is not None
@@ -314,8 +300,7 @@ def test_row1_a_trickle_coded_session_is_skipped_and_the_rest_ledgered(census):
         ("S-sierra", "trickle", "trickle-p-20261005"),
         ("S-tango", "census", _RUN_ID),
     ]
-    assert outcome.ledger_rows_written == 1
-    assert outcome.ledger_write_error is None
+    assert outcome.ledger == mod.Ledgered(rows=1)
 
 
 def test_row2_a_capped_run_is_resumed_by_the_next(census):
@@ -380,46 +365,19 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
     assert census.ledger_rows() == []
 
 
-def _journaled(effects, journal: list[str], *, labels: dict[Path, str]):
-    """*effects* with every persisting seam appending its label to *journal*
-    before it delegates, so the real writes still happen."""
-    def logged(label, seam):
-        def call(*args, **kwargs):
-            journal.append(label)
-            return seam(*args, **kwargs)
-
-        return call
-
-    def write_text(path, text):
-        journal.append(labels[Path(path)])
-        return effects.write_text(path, text)
-
-    return dataclasses.replace(
-        effects,
-        submit_fn=logged("file tickets", effects.submit_fn),
-        write_text=write_text,
-        dump_codebook=logged("dump codebook", effects.dump_codebook),
-        advance_state=logged("advance state", effects.advance_state),
-        gate=logged("gate", effects.gate),
-        commit=logged("commit", effects.commit),
-        roll_back=logged("roll back", effects.roll_back),
-        record_codings=logged("ledger", effects.record_codings),
-    )
-
-
 def test_row16_a_landed_run_ledgers_its_sessions_last(census):
     census.session("S-tango")
     kwargs = census.kwargs()
     report_path = kwargs["report_path"]
     journal: list[str] = []
-    kwargs["effects"] = _journaled(
+    kwargs["effects"] = journaled(
         kwargs["effects"], journal,
         labels={report_path.with_suffix(".json"): "write record", report_path: "write report"},
     )
 
     outcome = _done(mod.run_census(**kwargs))
 
-    assert outcome.ledger_rows_written == 1
+    assert outcome.ledger == mod.Ledgered(rows=1)
     assert journal == [
         "write record", "write report", "dump codebook", "advance state", "gate", "commit", "ledger",
     ]
@@ -436,7 +394,7 @@ def test_row3_a_deletion_shaped_coding_is_skipped_and_never_ledgered(census):
     outcome = _done(outcome)
     assert [skipped.session for skipped in outcome.skipped_deletions] == ["S-sierra"]
     assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
-    assert outcome.ledger_rows_written == 1
+    assert outcome.ledger == mod.Ledgered(rows=1)
 
 
 def test_a_preflight_defer_ledgers_nothing(census):
@@ -462,9 +420,8 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
         )
 
     outcome = _done(outcome)
-    assert outcome.ledger_rows_written is None
-    assert outcome.ledger_write_error is not None
-    assert str(census.ledger_path) in outcome.ledger_write_error
+    assert isinstance(outcome.ledger, mod.LedgerFailed)
+    assert str(census.ledger_path) in outcome.ledger.error
     ledger_warnings = [
         r for r in caplog.records
         if r.levelno == logging.WARNING and str(census.ledger_path) in r.getMessage()

@@ -15,7 +15,7 @@ from __future__ import annotations
 import subprocess
 
 from legibility import census as mod
-from legibility import census_trigger, filing_policy, landing_gate, session_runner
+from legibility import census_trigger, disposition, filing_policy, landing_gate, session_runner
 from legibility import config as config_mod
 
 
@@ -49,6 +49,9 @@ def _make_fake_main_run_census():
             run_id="census-dark_factory-20260927",
             stop_reason="exhausted",
             gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls

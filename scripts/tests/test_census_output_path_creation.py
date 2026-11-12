@@ -27,7 +27,6 @@ which is precisely and only the surface under test here.
 """
 from __future__ import annotations
 
-import dataclasses
 import itertools
 import json
 from typing import Any
@@ -35,6 +34,7 @@ from typing import Any
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import embeddings, landing_gate, unlanded
+from legibility_census_scaffold import narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
@@ -75,14 +75,8 @@ def _never_roll_back(**kwargs):
     raise AssertionError("roll_back must not run on a landed commit")
 
 
-def _done(outcome) -> mod.Done:
-    assert isinstance(outcome, mod.Done), outcome
-    return outcome
-
-
-def _deferred(outcome) -> mod.Deferred:
-    assert isinstance(outcome, mod.Deferred), outcome
-    return outcome
+_done = narrowing(mod.Done)
+_deferred = narrowing(mod.Deferred)
 
 
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
@@ -113,13 +107,9 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
         roll_back=_never_roll_back,
     )
-    seams = {
-        name: overrides.pop(name)
-        for name in list(overrides)
-        if name in {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
-    }
+    effects, overrides = with_seams(effects, overrides)
     kwargs: dict[str, Any] = dict(
-        effects=dataclasses.replace(effects, **seams),
+        effects=effects,
         codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
             project_id="target_project",

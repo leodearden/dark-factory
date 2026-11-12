@@ -576,7 +576,7 @@ class CensusHeadroomExhausted(Exception):
     """
 
     def __init__(
-        self, *, stage: str, reason: str, verified: int = 0, rejected: int = 0,
+        self, *, stage: CensusStage, reason: str, verified: int = 0, rejected: int = 0,
         unverified: int = 0,
     ):
         super().__init__(f"census headroom exhausted during {stage}: {reason}")
@@ -641,7 +641,7 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     return HeadroomResult(ok=True, reason=None)
 
 
-def _stage_headroom_gate(invoke, *, model: str, stage: str) -> HeadroomResult:
+def _stage_headroom_gate(invoke, *, model: str, stage: CensusStage) -> HeadroomResult:
     """Re-probe headroom at a stage boundary, logging which stage asked.
 
     Deliberately NOT a second probe implementation -- it is a thin wrapper
@@ -2166,8 +2166,8 @@ class DeferralCounts:
 
 @dataclass(frozen=True)
 class Deferred:
-    """A headroom gate failed at *stage*; nothing was persisted, so a re-run
-    loses nothing."""
+    """A headroom gate failed at *stage*; no census output or state was
+    persisted, so a re-run loses nothing."""
 
     stage: CensusStage
     reason: str
@@ -2175,14 +2175,31 @@ class Deferred:
 
 
 @dataclass(frozen=True)
+class Ledgered:
+    """A landed run's coded sessions went into the session ledger."""
+
+    rows: int
+
+
+@dataclass(frozen=True)
+class LedgerFailed:
+    """A landed run's ledger write failed, so the next census re-mines its
+    coded sessions."""
+
+    error: str
+
+
+@dataclass(frozen=True)
 class Done:
-    """The full pipeline ran and its commit landed."""
+    """The full pipeline ran and its commit landed. ``ledger`` is ``None``
+    when the run's batch source kept no session ledger."""
 
     report_path: str
     record_path: str
     run_id: str
     stop_reason: str
     gate: landing_gate.GateVerdict
+    filing: disposition.FilingReport
     filed_ticket_ids: tuple[str, ...] = ()
     cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
     released_entry_ids: tuple[str, ...] = ()
@@ -2190,9 +2207,7 @@ class Done:
     withheld: tuple[filing_policy.WithheldCluster, ...] = ()
     skipped_deletions: tuple[codebook.SkippedRecord, ...] = ()
     dry_run: DryRunFiling | None = None
-    filing: disposition.FilingReport | None = None
-    ledger_rows_written: int | None = None
-    ledger_write_error: str | None = None
+    ledger: Ledgered | LedgerFailed | None = None
 
     @property
     def unresolved_verdicts(self) -> int:
@@ -2201,9 +2216,10 @@ class Done:
 
 @dataclass(frozen=True)
 class Unlanded:
-    """The pipeline ran and filed its tickets, but its commit did not land, so
-    every written output was rolled back; ``rollback`` says where each one is
-    now. ``dry_run.path`` names where the payloads file was WRITTEN."""
+    """The pipeline ran but its commit did not land, so every written output
+    was rolled back; ``rollback`` says where each one is now.
+    ``filed_ticket_ids`` names the tickets filed before the commit, if any;
+    ``dry_run.path`` names where the payloads file was WRITTEN."""
 
     rollback: unlanded.Rollback
     gate: landing_gate.GateVerdict
@@ -2562,7 +2578,9 @@ def adjudicate(run: CensusRun, effects: CensusEffects, mined: Mined, merged: Mer
     probes = 0
     if merged.to_verify or merged.offered:
         probes += 1
-        stage_headroom = _stage_headroom_gate(effects.invoke, model=run.config.models.trickle, stage="verify")
+        stage_headroom = _stage_headroom_gate(
+            effects.invoke, model=run.config.models.trickle, stage=CensusStage.VERIFY,
+        )
         if not stage_headroom.ok:
             return _defer(
                 CensusStage.VERIFY,
@@ -3203,8 +3221,10 @@ def run_census(
     ``mine``, ``merge``, ``adjudicate``, ``place_verdicts``, ``synthesize``,
     ``plan_filing`` and ``persist``.
 
-    Only ``persist`` writes, so a ``Deferred`` -- at preflight or at the
-    verify gate -- persists nothing and a re-run loses nothing. What the
+    Only ``persist`` writes census outputs and state, so a ``Deferred`` -- at
+    preflight or at the verify gate -- leaves none behind and a re-run loses
+    nothing. Before ``persist`` the run writes only the output directories
+    and, in ``merge``, the embedder's vector cache. What the
     operator caps (*max_batches*, *max_verify_clusters*) and
     *dry_run_payloads_path* cost and leave behind is stated in ``main``'s
     flag help and in ``VerifyCoverage``.
@@ -3277,8 +3297,8 @@ def _ledger_census_codings(
             "census: %d coded session(s) NOT ledgered, the next census re-mines them: %s",
             len(rows), exc,
         )
-        return replace(landed, ledger_write_error=str(exc))
-    return replace(landed, ledger_rows_written=written)
+        return replace(landed, ledger=LedgerFailed(str(exc)))
+    return replace(landed, ledger=Ledgered(written))
 
 
 # ---------------------------------------------------------------------------
@@ -3605,7 +3625,7 @@ def _build_default_verify_fn(
                     probe = _probe()
                     if not probe.ok:
                         raise CensusHeadroomExhausted(
-                            stage="verify",
+                            stage=CensusStage.VERIFY,
                             reason=(
                                 "verify invocation failed and the headroom re-probe "
                                 f"reports no capacity: {probe.reason or 'no headroom'}"
@@ -3632,7 +3652,7 @@ def _build_default_verify_fn(
                     probe = _probe()
                     if not probe.ok:
                         raise CensusHeadroomExhausted(
-                            stage="verify",
+                            stage=CensusStage.VERIFY,
                             reason=(
                                 "verify reply failed to parse and carries a banner "
                                 f"marker {marker!r}; headroom probe confirms no "
@@ -3683,7 +3703,7 @@ def _build_default_verify_fn(
                 probe = _probe()
                 if not probe.ok:
                     raise CensusHeadroomExhausted(
-                        stage="verify",
+                        stage=CensusStage.VERIFY,
                         reason=(
                             "headroom backstop probe after "
                             f"{index + 1} cluster(s) reports no capacity: "
@@ -4198,8 +4218,8 @@ def _exit_code(outcome: CensusOutcome) -> int:
 def _done_line(done: Done) -> str:
     """The landed run's summary line; each optional clause appears only when
     it carries information, so a normal run's line stays byte-identical."""
-    ledger_failed = f" ledger_write_failed: {done.ledger_write_error}" if done.ledger_write_error else ""
-    unreachable = None if done.filing is None else done.filing.disposal.unreachable
+    ledger_failed = f" ledger_write_failed: {done.ledger.error}" if isinstance(done.ledger, LedgerFailed) else ""
+    unreachable = done.filing.disposal.unreachable
     dedup_unreachable = f" dedup_unreachable: {unreachable}" if unreachable else ""
     if done.dry_run is not None:
         return (

@@ -66,6 +66,7 @@ from legibility import (
 from legibility import census as mod
 from legibility import config as config_mod
 from legibility import digest as digest_mod
+from legibility_census_scaffold import journaled, narrowing, with_seams
 from legibility_task_store_fake import FakeTaskStore
 from quality_doc_texts import code_quality
 from shared.cap_markers import (
@@ -272,6 +273,11 @@ def _passing_gate():
     """The `gate() -> landing_gate.GateVerdict` seam of a project whose
     landing gate passes."""
     return landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0)
+
+
+_NOTHING_FILED = disposition.FilingReport(
+    disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2531,26 +2537,13 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
 
 def _override(kwargs: dict[str, Any], **overrides) -> None:
     """Apply *overrides* to run_census *kwargs*, each seam into its ``effects``."""
-    effect_names = {seam.name for seam in dataclasses.fields(mod.CensusEffects)}
-    seams = {name: overrides.pop(name) for name in list(overrides) if name in effect_names}
-    if seams:
-        kwargs["effects"] = dataclasses.replace(kwargs["effects"], **seams)
-    kwargs.update(overrides)
+    kwargs["effects"], rest = with_seams(kwargs["effects"], overrides)
+    kwargs.update(rest)
 
 
-def _done(outcome) -> mod.Done:
-    assert isinstance(outcome, mod.Done), outcome
-    return outcome
-
-
-def _deferred(outcome) -> mod.Deferred:
-    assert isinstance(outcome, mod.Deferred), outcome
-    return outcome
-
-
-def _unlanded(outcome) -> mod.Unlanded:
-    assert isinstance(outcome, mod.Unlanded), outcome
-    return outcome
+_done = narrowing(mod.Done)
+_deferred = narrowing(mod.Deferred)
+_unlanded = narrowing(mod.Unlanded)
 
 
 def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
@@ -3372,38 +3365,11 @@ def _write_labels(kwargs) -> dict[Path, str]:
     return labels
 
 
-def _journaled(effects, journal: list[str], *, labels: dict[Path, str]):
-    """*effects* with every persisting seam appending its label to *journal*
-    before it delegates, so the real writes still happen."""
-    def logged(label, seam):
-        def call(*args, **kwargs):
-            journal.append(label)
-            return seam(*args, **kwargs)
-
-        return call
-
-    def write_text(path, text):
-        journal.append(labels[Path(path)])
-        return effects.write_text(path, text)
-
-    return dataclasses.replace(
-        effects,
-        submit_fn=logged("file tickets", effects.submit_fn),
-        write_text=write_text,
-        dump_codebook=logged("dump codebook", effects.dump_codebook),
-        advance_state=logged("advance state", effects.advance_state),
-        gate=logged("gate", effects.gate),
-        commit=logged("commit", effects.commit),
-        roll_back=logged("roll back", effects.roll_back),
-        record_codings=logged("ledger", effects.record_codings),
-    )
-
-
 def test_row16_a_commit_that_does_not_land_after_filing_rolls_back_last(tmp_path):
     rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
     kwargs = _unlanded_kwargs(tmp_path, roll_back=_make_fake_roll_back(rollback))
     journal: list[str] = []
-    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+    kwargs["effects"] = journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
 
     outcome = _unlanded(mod.run_census(**kwargs))
 
@@ -3428,7 +3394,7 @@ def test_row16_a_dry_run_its_gate_refuses_writes_its_payloads_first_and_never_co
     )
     submit_fn = kwargs["effects"].submit_fn
     journal: list[str] = []
-    kwargs["effects"] = _journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
+    kwargs["effects"] = journaled(kwargs["effects"], journal, labels=_write_labels(kwargs))
 
     _unlanded(mod.run_census(**kwargs))
 
@@ -3445,13 +3411,19 @@ def test_row16_a_submit_that_raises_is_reported_and_the_run_still_lands(tmp_path
 
     kwargs = _mined_run_kwargs(tmp_path, commit=_make_fake_commit())
     journal: list[str] = []
-    kwargs["effects"] = _journaled(
+    kwargs["effects"] = journaled(
         dataclasses.replace(kwargs["effects"], submit_fn=raising_submit), journal, labels=_write_labels(kwargs),
     )
 
     outcome = _done(mod.run_census(**kwargs))
 
     assert outcome.filed_ticket_ids == ()
+    raised = "submit_task raised RuntimeError: the curator is down"
+    [decision] = outcome.filing.disposal.decisions
+    assert (decision.step, decision.ticket, decision.task_id) == (disposition.Step.CURATOR, None, None)
+    assert raised in (decision.note or "")
+    [recorded] = json.loads(Path(outcome.record_path).read_text(encoding="utf-8"))["filing"]["decisions"]
+    assert raised in recorded["note"]
     assert journal == [
         "file tickets", "write record", "write report", "dump codebook", "advance state",
         "gate", "commit",
@@ -3650,7 +3622,7 @@ def _dropped_verdict_warnings(caplog):
     Used to assert the drop is ANNOUNCED at all (a silent drop is the whole
     defect) and, in one place, that the announcement names the record it came
     from. What KIND of drop it is comes off
-    `CensusOutcome.dropped_verdicts`, not out of this English."""
+    `Done.dropped_verdicts`, not out of this English."""
     return [
         r.getMessage() for r in caplog.records
         if r.levelno == logging.WARNING
@@ -3741,10 +3713,10 @@ def test_run_census_clean_reject_run_emits_no_run_summary(tmp_path, caplog):
 
 
 def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, caplog):
-    """The count is a FIELD on `CensusOutcome`, not something to be parsed out
+    """The count is `Done.unresolved_verdicts`, not something to be parsed out
     of log prose -- assertable structurally, exactly like
-    `unverified_clusters`. Asserted on both a dropping and a clean run so the
-    field cannot be a constant."""
+    `Deferred.counts.unverified`. Asserted on both a dropping and a clean run
+    so the count cannot be a constant."""
     dropping = _two_surfaced_drops_kwargs(
         tmp_path / "dropping", _make_fake_verify_fn(rejected_titles={_REJECTED_TITLE, _L6_NOVEL_TITLE}),
     )
@@ -3844,10 +3816,8 @@ def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
 
 
 def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, caplog):
-    """The counter's own comment claims it is "shared by both adjudication
-    loops" and `CensusOutcome.unresolved_verdicts` says "verify verdicts",
-    loop-agnostically. This is what makes those two statements TRUE rather
-    than aspirational.
+    """Both adjudication loops feed one count: `Done.unresolved_verdicts`
+    counts the dropped verdicts of the verify loop and the reject loop alike.
 
     A reject-only counter satisfies every other test in this block, so the
     mixed run is the only shape that can tell the two apart: one dropped
@@ -3900,7 +3870,7 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
             outcome=mod.Done(
                 report_path="plans/confusion-census-2026-01-02.md",
                 record_path="plans/confusion-census-2026-01-02.json",
-                run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(),
+                run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED,
                 filed_ticket_ids=("tkt_1234",),
                 dropped_verdicts=(_sample_dropped_verdicts() * 2)[:unresolved],
             ),
@@ -3933,7 +3903,7 @@ def test_main_done_line_names_skipped_deletions_only_when_there_were_some(
             outcome=mod.Done(
                 report_path="plans/confusion-census-2026-01-02.md",
                 record_path="plans/confusion-census-2026-01-02.json",
-                run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(),
+                run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED,
                 filed_ticket_ids=("tkt_1234",),
                 skipped_deletions=skipped_deletions,
             ),
@@ -5293,7 +5263,7 @@ def _make_fake_main_run_census(outcome=None):
         return outcome or mod.Done(
             report_path="plans/confusion-census-2026-01-02.md",
             record_path="plans/confusion-census-2026-01-02.json",
-            run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(),
+            run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED,
             filed_ticket_ids=("tkt_1234",),
         )
 
@@ -5438,23 +5408,25 @@ def test_a_done_outcome_counts_its_unresolved_verdicts_from_its_dropped_records(
     dropped = _sample_dropped_verdicts()
     done = mod.Done(
         report_path="plans/r.md", record_path="plans/r.json", run_id="census-dark_factory-20260714",
-        stop_reason="exhausted", gate=_passing_gate(), dropped_verdicts=dropped,
+        stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED, dropped_verdicts=dropped,
     )
 
     assert done.unresolved_verdicts == len(dropped) == 2
 
 
-@pytest.mark.parametrize("ledger_error", [None, "/state/coded-sessions.sqlite: disk I/O error"])
+@pytest.mark.parametrize("ledger", [
+    None, mod.Ledgered(rows=1), mod.LedgerFailed("/state/coded-sessions.sqlite: disk I/O error"),
+])
 def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
-    tmp_path, monkeypatch, capsys, ledger_error,
+    tmp_path, monkeypatch, capsys, ledger,
 ):
     _census_project(tmp_path)
     monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.Done(
         report_path="plans/confusion-census-2026-01-02.md",
         record_path="plans/confusion-census-2026-01-02.json",
-        run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(),
+        run_id="census-dark_factory-20260102", stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED,
         filed_ticket_ids=("tkt_1234",),
-        ledger_write_error=ledger_error,
+        ledger=ledger,
     )))
 
     exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
@@ -5463,14 +5435,14 @@ def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
     [done_line] = [
         line for line in capsys.readouterr().out.splitlines() if line.startswith("census: done")
     ]
-    if ledger_error is None:
+    if isinstance(ledger, mod.LedgerFailed):
+        assert "ledger_write_failed" in done_line
+        assert ledger.error in done_line
+    else:
         assert done_line == (
             "census: done -- report=plans/confusion-census-2026-01-02.md "
             "filed_tickets=1 stop_reason=exhausted"
         )
-    else:
-        assert "ledger_write_failed" in done_line
-        assert ledger_error in done_line
 
 
 def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypatch):
@@ -5822,7 +5794,7 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
             record_path="plans/confusion-census-2026-07-30.json",
             run_id="census-dark_factory-20260730",
             stop_reason="capped",
-            gate=_passing_gate(),
+            gate=_passing_gate(), filing=_NOTHING_FILED,
             dry_run=mod.DryRunFiling(path=payloads_path, payload_count=7),
         )
     )
@@ -5858,7 +5830,7 @@ def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeyp
             record_path="plans/confusion-census-2026-07-30.json",
             run_id="census-dark_factory-20260730",
             stop_reason="exhausted",
-            gate=_passing_gate(),
+            gate=_passing_gate(), filing=_NOTHING_FILED,
             filed_ticket_ids=("tkt_1", "tkt_2", "tkt_3"),
         )
     )
@@ -6076,7 +6048,7 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
         sources.append((source, kwargs["effects"].selection_of()))
         return mod.Done(
             report_path="plans/r.md", record_path="plans/r.json", run_id="census-dark_factory-20261006",
-            stop_reason="exhausted", gate=_passing_gate(),
+            stop_reason="exhausted", gate=_passing_gate(), filing=_NOTHING_FILED,
         )
 
     monkeypatch.setattr(mod, "run_census", fake_run_census)
@@ -6496,7 +6468,7 @@ def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
         verify_fn(_clusters(5), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.reason and "banner" in exc.reason.lower()
     assert exc.verified == 2, "the two clusters adjudicated before the cap"
     assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
@@ -6712,7 +6684,7 @@ def test_default_verify_fn_raises_when_an_unparseable_banner_reply_is_probe_conf
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     reason = (exc.reason or "").lower()
@@ -6761,7 +6733,7 @@ def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert len(probe.calls) == 1, "exactly one re-probe, on a path that already failed"
@@ -6831,7 +6803,7 @@ def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, c
     """
     def raising_verify_fn(clusters, *, model):
         raise mod.CensusHeadroomExhausted(
-            stage="verify",
+            stage=mod.CensusStage.VERIFY,
             reason="verify reply carries a banner marker: 'weekly limit'",
             verified=1,
             unverified=4,
@@ -6941,7 +6913,7 @@ def test_default_verify_fn_backstop_raises_at_the_first_failing_boundary():
         verify_fn(_clusters(12), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 5
     assert exc.unverified == 7, "clusters 6-12, none of them adjudicated"
     assert len(probe.calls) == 1
@@ -7176,7 +7148,7 @@ def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower(), (
@@ -7197,7 +7169,7 @@ def test_default_verify_fn_backstop_treats_a_raising_probe_as_no_headroom():
         verify_fn(_clusters(12), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 5
     assert exc.unverified == 7
     assert "raised" in (exc.reason or "").lower()
@@ -7209,9 +7181,9 @@ def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path,
     `outcome.reason` reads much the same for the two defer flavours, but they
     cost an operator completely different things: a preflight defer spent
     nothing, a verify defer sank the whole mining spend and left N clusters
-    unadjudicated. deferred_stage/unverified_clusters exist to make that
-    distinguishable by field -- printing neither hides it from the one person
-    watching the run.
+    unadjudicated. `Deferred.stage` and `Deferred.counts.unverified` exist to
+    make that distinguishable by field -- printing neither hides it from the
+    one person watching the run.
     """
     _census_project(tmp_path)
 
@@ -7248,7 +7220,7 @@ def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headr
         verify_fn(_clusters(4), model="sonnet")
 
     exc = excinfo.value
-    assert exc.stage == "verify"
+    assert exc.stage is mod.CensusStage.VERIFY
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower()
@@ -7660,7 +7632,7 @@ def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
     3 never reached. The message must name all three counts AND the total."""
     def raising_verify_fn(clusters, *, model):
         raise mod.CensusHeadroomExhausted(
-            stage="verify",
+            stage=mod.CensusStage.VERIFY,
             reason="probe reports no capacity",
             verified=1, rejected=1, unverified=3,
         )
@@ -8019,7 +7991,7 @@ def test_main_done_line_names_unresolved_verdicts_when_nonzero(
                 record_path="plans/confusion-census-2026-07-30.json",
                 run_id="census-dark_factory-20260730",
                 stop_reason="exhausted",
-                gate=_passing_gate(),
+                gate=_passing_gate(), filing=_NOTHING_FILED,
                 filed_ticket_ids=("tkt_1234",),
                 dropped_verdicts=(_sample_dropped_verdicts() * 2)[:unresolved],
             )
@@ -9843,7 +9815,7 @@ def _reverifying_verify_fn(answer: str):
             found = _fake_verdict(_IN_TREE_REMEDIATION)
             return {"verified": [{**c, "verdict": found} for c in clusters], "rejected": [], "fixed": []}
         if answer == "headroom":
-            raise mod.CensusHeadroomExhausted(stage="verify", reason="capped mid-reverify", unverified=len(marked))
+            raise mod.CensusHeadroomExhausted(stage=mod.CensusStage.VERIFY, reason="capped mid-reverify", unverified=len(marked))
         if answer in ("present", "structural"):
             route = verdict.Route.MECHANICAL if answer == "present" else verdict.Route.STRUCTURAL
             found = _fake_verdict(_IN_TREE_REMEDIATION, route=route)
@@ -11119,7 +11091,7 @@ def _queue_verify_fn(*, verified_titles=(), raise_on_queue=False):
         calls.append({"clusters": clusters, "model": model})
         if raise_on_queue and any(cluster["title"] != _L6_NOVEL_TITLE for cluster in clusters):
             raise mod.CensusHeadroomExhausted(
-                stage="verify", reason="usage limit reached", unverified=len(clusters),
+                stage=mod.CensusStage.VERIFY, reason="usage limit reached", unverified=len(clusters),
             )
         verified = [cluster for cluster in clusters if cluster["title"] in verified_titles]
         result = _verifying_unremediated_at_the_row5_anchor(verified, model=model)

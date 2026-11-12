@@ -29,7 +29,14 @@ from pathlib import Path
 
 import census as mod
 import pytest
-from legibility import account_pool, census_trigger, landing_gate, session_runner, synthesis
+from legibility import (
+    account_pool,
+    census_trigger,
+    disposition,
+    landing_gate,
+    session_runner,
+    synthesis,
+)
 
 import config as config_mod
 
@@ -94,6 +101,9 @@ def _make_seam_driving_run_census():
             run_id="census-dark_factory-20260803",
             stop_reason="exhausted",
             gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls
