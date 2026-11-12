@@ -5,13 +5,15 @@ the run ends when the command itself (the group LEADER) exits, whatever its
 descendants still hold. When the run ends, however it ends, every descendant
 that stayed in the leader's process group is SIGKILLed.
 
-The leader gets a process group of its own, not a new session: verify reaps a
-defeated command's subtree by its session as well as its process group
-(``orchestrator/src/orchestrator/verify.py::_reap_command_subtree``), and a new
-session would take this command out of that reap.
+The leader gets a process group of its own, not a new session: verify finds
+the cgroup scopes a defeated command's subtree moved into through the members
+of that command's session
+(``orchestrator/src/orchestrator/relocated_scopes.py::relocated_scopes``), and a
+new session would hide this command from that discovery.
 
-Task 9478: a nested pytest probe that had already printed its summary was held
-open to its budget by a pipe a descendant still held.
+Task 9478: a nested pytest probe that had printed its summary overran its
+budget. With files instead of pipes no descendant can be the cause, and an
+overrun lists the live group to show what was.
 """
 
 from __future__ import annotations
@@ -27,23 +29,23 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO
 
-from df_pytest_isolation import ProcState, read_proc_state
+from shared.proc_group import ProcessGroupMember, process_group_members
 
 _EXIT_POLL_SECS = 0.05
 _PROC = Path('/proc')
-_UNREADABLE = '?'
+UNREADABLE = '?'
 
 
 @dataclasses.dataclass(frozen=True)
 class GroupMember:
-    """A live process-group member: its ``/proc`` state, command line and each thread's wait channel.
+    """A live process-group member, with its command line and each thread's wait channel.
 
     ``thread_wchans`` lists the kernel wait channel of the main thread first,
-    then of every other thread by tid.
+    then of every other thread by tid. An unreadable command line, thread list
+    or wait channel reads as :data:`UNREADABLE`.
     """
 
-    pid: int
-    state: ProcState
+    process: ProcessGroupMember
     cmdline: str
     thread_wchans: tuple[str, ...]
 
@@ -76,9 +78,10 @@ class ProcessGroupOverrun(Exception):
         ])
 
     def _member_line(self, member: GroupMember) -> str:
-        role = ' (leader)' if member.pid == self.leader_pid else ''
+        process = member.process
+        role = ' (leader)' if process.pid == self.leader_pid else ''
         return (
-            f'  pid {member.pid}{role} ppid {member.state.ppid} state {member.state.state} '
+            f'  pid {process.pid}{role} ppid {process.ppid} state {process.state} '
             f'wchan {",".join(member.thread_wchans)}: {member.cmdline}'
         )
 
@@ -126,35 +129,25 @@ def _await_exit_unreaped(pid: int, *, deadline: float) -> bool:
 
 
 def _group_members(pgid: int) -> tuple[GroupMember, ...]:
-    """Every live process in group *pgid*, the leader first; a pid that vanishes mid-walk is skipped."""
-    pids = sorted(_pids_in_group(pgid), key=lambda pid: (pid != pgid, pid))
-    members = (_member(pid) for pid in pids)
-    return tuple(member for member in members if member is not None)
+    """Every live process in group *pgid*, the leader first.
 
-
-def _pids_in_group(pgid: int) -> list[int]:
-    found: list[int] = []
-    for entry in os.listdir(_PROC):
-        if not entry.isdigit():
-            continue
-        with contextlib.suppress(ProcessLookupError):
-            if os.getpgid(int(entry)) == pgid:
-                found.append(int(entry))
-    return found
-
-
-def _member(pid: int) -> GroupMember | None:
-    state = read_proc_state(pid)
-    if state is None:
-        return None
-    return GroupMember(pid, state, _cmdline(pid), _thread_wchans(pid))
+    The walk is :func:`shared.proc_group.process_group_members`, which skips a
+    pid that vanishes or whose stat is malformed, so the snapshot never masks
+    the overrun it reports.
+    """
+    live = (process for process in process_group_members(pgid) if not process.terminated)
+    ordered = sorted(live, key=lambda process: (process.pid != pgid, process.pid))
+    return tuple(
+        GroupMember(process, _cmdline(process.pid), _thread_wchans(process.pid))
+        for process in ordered
+    )
 
 
 def _cmdline(pid: int) -> str:
     try:
         raw = (_PROC / str(pid) / 'cmdline').read_bytes()
     except OSError:
-        return _UNREADABLE
+        return UNREADABLE
     return raw.rstrip(b'\0').replace(b'\0', b' ').decode('utf-8', errors='replace')
 
 
@@ -163,15 +156,15 @@ def _thread_wchans(pid: int) -> tuple[str, ...]:
     try:
         tids = sorted((int(tid) for tid in os.listdir(tasks)), key=lambda tid: (tid != pid, tid))
     except OSError:
-        return (_UNREADABLE,)
+        return (UNREADABLE,)
     return tuple(_wchan(tasks / str(tid)) for tid in tids)
 
 
 def _wchan(task: Path) -> str:
     try:
-        return (task / 'wchan').read_text().strip() or _UNREADABLE
+        return (task / 'wchan').read_bytes().decode('ascii', errors='replace').strip() or UNREADABLE
     except OSError:
-        return _UNREADABLE
+        return UNREADABLE
 
 
 def _kill_group(pgid: int) -> None:
