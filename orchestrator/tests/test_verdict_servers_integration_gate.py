@@ -193,6 +193,17 @@ def _setup_merger_workflow(
     return workflow
 
 
+def _bind_merger_outcome_doubles(
+    workflow: TaskWorkflow, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Swap in outcome doubles the caller holds, so assertions need no private read."""
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    submit = AsyncMock(return_value=WorkflowOutcome.DONE)
+    monkeypatch.setattr(workflow, '_mark_blocked', mark_blocked)
+    monkeypatch.setattr(workflow, '_submit_to_merge_queue', submit)
+    return mark_blocked, submit
+
+
 def _setup_reviewer_workflow(
     config: OrchestratorConfig, git_ops: GitOps, task_assignment: TaskAssignment, tmp_path: Path,
 ) -> TaskWorkflow:
@@ -473,6 +484,7 @@ class TestMergerBoundary:
         itself is unchanged: I-FAIL-SAFE, merge_phase kept, no resubmit.
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        mark_blocked, submit = _bind_merger_outcome_doubles(workflow, monkeypatch)
         monkeypatch.setattr(
             'orchestrator.workflow.invoke_agent',
             _fake_invoke_writes_merger_verdict(
@@ -485,8 +497,9 @@ class TestMergerBoundary:
             'task/42', 'conflict in lib.py', merge_phase=True,
         )
 
-        workflow._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
-        args, kwargs = workflow._mark_blocked.await_args  # type: ignore[attr-defined]
+        mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
+        args, kwargs = mark_blocked.await_args
         assert 'Merger invocation failed' in args[0]
         assert 'empty_output' in args[0]
         assert 'error_empty_output' in args[0]
@@ -498,7 +511,7 @@ class TestMergerBoundary:
         assert 'turns=7' in observations
         assert kwargs['suggested_action'] == CHECK_MERGE_STATUS_BEFORE_RETRY
         assert kwargs['merge_phase'] is True
-        workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
+        submit.assert_not_awaited()
         assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_no_disposition_with_empty_output_has_no_dangling_colon(
@@ -509,6 +522,7 @@ class TestMergerBoundary:
         nothing after it, and still attaches evidence (task 5107).
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        mark_blocked, submit = _bind_merger_outcome_doubles(workflow, monkeypatch)
         monkeypatch.setattr(
             'orchestrator.workflow.invoke_agent',
             _fake_invoke_writes_merger_verdict(blocked=None, success=True, output=''),
@@ -518,13 +532,14 @@ class TestMergerBoundary:
             'task/42', 'conflict in lib.py', merge_phase=True,
         )
 
-        workflow._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
-        args, kwargs = workflow._mark_blocked.await_args  # type: ignore[attr-defined]
+        mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
+        args, kwargs = mark_blocked.await_args
         assert args[0].startswith('Merger emitted no/invalid disposition')
         assert 'Merger invocation failed' not in args[0]
         assert not args[0].rstrip().endswith(':')
         assert kwargs['evidence']
-        workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
+        submit.assert_not_awaited()
         assert outcome == WorkflowOutcome.BLOCKED
 
 
