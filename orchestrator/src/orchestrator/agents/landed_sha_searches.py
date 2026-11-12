@@ -33,14 +33,17 @@ class CitationGateUnavailable(Enum):
     PATTERN_INVALID = auto()
 
 
-def _citation_walk(main: str, task_id: str, template: str | None) -> str | CitationGateUnavailable:
+def _citation_walk(task_id: str, git: GitConfig) -> str | CitationGateUnavailable:
     try:
-        pattern = task_citation_pattern(task_id, template)
+        pattern = task_citation_pattern(
+            task_id, git.commit_citation_pattern,
+            branch_prefix=git.branch_prefix, main_branch=git.main_branch,
+        )
     except CitationPatternInvalid:
         return CitationGateUnavailable.PATTERN_INVALID
     if pattern is None:
         return CitationGateUnavailable.OPTED_OUT
-    return f"git log {main} --extended-regexp --format='%H %s' --grep={shlex.quote(pattern)}"
+    return f"git log {shlex.quote(git.main_branch)} --extended-regexp --format='%H %s' --grep={shlex.quote(pattern)}"
 
 
 @dataclass(frozen=True)
@@ -65,7 +68,7 @@ class LandedShaSearches:
                 f"git log {main} --fixed-strings --grep={quoted_branch} --format='%H%x09%s'"
                 f" | awk -F'\\t' -v s={shlex.quote(subject)} 'NF==2 && $2==s && !seen {{print $1; seen=1}}'"
             ),
-            citation_walk=_citation_walk(main, task_id, git.commit_citation_pattern),
+            citation_walk=_citation_walk(task_id, git),
         )
 
     def containment(self, marker_sha: str) -> str:

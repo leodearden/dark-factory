@@ -12383,7 +12383,7 @@ def _mm_configure_project_root(svc, root):
 
     REQUIRED SETUP for the storm cases, not decoration — do not delete it.
     The shared ``mock_config`` fixture (``tests/conftest.py:184``) leaves
-    ``taskmaster=None``, so ``_memory_metadata_project_root()`` returns ``''``
+    ``taskmaster=None``, so ``configured_primary_root`` returns ``''``
     and ``_apply_memory_metadata_validation`` takes its documented
     "no project queue to file into — census only, do not escalate" branch.
     Without this install the storm escape is UNREACHABLE under the fixture:
@@ -12781,6 +12781,30 @@ class TestMemoryMetadataValidationAtSeam:
         assert project_id == 'dark_factory'
         assert agent_id == 'claude-drifter'
         assert keys == ['drifting_key']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_escalation_root_is_the_registry_normalised_root(
+        self, mock_config, entry_point, tmp_path
+    ):
+        """The storm escalation files under the same root the project registry holds."""
+        target = tmp_path / 'Target-Proj'
+        target.mkdir()
+        link = tmp_path / 'Link-Proj'
+        link.symlink_to(target)
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(link))
+        mock_config.memory_metadata.unknown_key_storm_threshold = 1
+        service = _mocked_service(mock_config)
+        filed = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filed.append(project_root)
+            return 'esc-memory-metadata-unknown-key-storm-1'
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+
+        assert filed == [str(target.resolve())]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)

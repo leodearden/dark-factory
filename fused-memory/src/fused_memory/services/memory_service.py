@@ -8,7 +8,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 import uuid as uuid_mod
@@ -35,7 +34,11 @@ from fused_memory.backends.mem0_client import (
     Mem0Backend,
     split_managed_metadata,
 )
-from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
+from fused_memory.config.schema import (
+    FusedMemoryConfig,
+    MemoryMetadataConfig,
+    TaskmasterConfig,
+)
 from fused_memory.memory_metadata import (
     PARENT_ID_DEAD_CODE,
     PARENT_ID_UNAVAILABLE_CODE,
@@ -87,7 +90,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageAgentOutcome,
 )
-from fused_memory.models.scope import Scope, build_known_projects_map
+from fused_memory.models.scope import (
+    Scope,
+    build_known_projects_map,
+    configured_primary_root,
+)
 from fused_memory.reconciliation.flag_record_contract import (
     enforce_flag_record_write_contract,
 )
@@ -674,6 +681,33 @@ def _stamp_unverified_claim(meta: dict, unverified_claim: bool) -> None:
         meta[UNVERIFIED_CLAIM_TAG] = True
 
 
+def _file_unknown_key_storm_under_primary_root(
+    taskmaster: TaskmasterConfig | None,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    keys: list[str],
+) -> None:
+    """File the storm escalation into the registry's primary root
+    (``models/scope.py::configured_primary_root``), resolved per crossing.
+
+    Blocking filesystem work end to end, so it runs off the event loop.  With
+    no configured ``taskmaster.project_root`` there is no project queue to file
+    into; the census lines are already out, so only the escalation is lost.
+    """
+    project_root = configured_primary_root(taskmaster)
+    if not project_root:
+        logger.debug(
+            'memory_metadata: unknown-key storm from project_id=%r '
+            'agent_id=%r but no project_root is configured; not escalating',
+            project_id, agent_id,
+        )
+        return
+    file_unknown_key_storm_escalation(
+        project_root, project_id=project_id, agent_id=agent_id, keys=keys,
+    )
+
+
 async def _apply_memory_metadata_validation(
     meta: dict,
     *,
@@ -681,7 +715,7 @@ async def _apply_memory_metadata_validation(
     agent_id: str | None,
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
-    project_root: str,
+    taskmaster: TaskmasterConfig | None,
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
@@ -831,7 +865,9 @@ async def _apply_memory_metadata_validation(
     census and detection are pure CPU and stay inline, but
     ``file_unknown_key_storm_escalation`` does blocking filesystem I/O
     (``EscalationQueue`` construction, a queue-directory scan, a durable
-    fsync-flushed write).  Called directly from these coroutines it would run
+    fsync-flushed write), and so does resolving the root it files into, which
+    is why ``taskmaster`` is passed unresolved and resolved only inside the
+    hop, on a crossing.  Called directly from these coroutines it would run
     that I/O ON the event loop and stall every other concurrent memory write
     for its duration.  The ported precedent
     (``middleware/candidate_key_escalation``) is invoked from a synchronous
@@ -979,23 +1015,13 @@ async def _apply_memory_metadata_validation(
 
         unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
         if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
-            if project_root:
-                await asyncio.to_thread(
-                    file_unknown_key_storm_escalation,
-                    project_root,
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    keys=unknown_keys,
-                )
-            else:
-                # No configured taskmaster.project_root means no project queue to
-                # file into. The census lines are already out, so the signal is
-                # not lost — only the escalation.
-                logger.debug(
-                    'memory_metadata: unknown-key storm from project_id=%r '
-                    'agent_id=%r but no project_root is configured; not escalating',
-                    project_id, agent_id,
-                )
+            await asyncio.to_thread(
+                _file_unknown_key_storm_under_primary_root,
+                taskmaster,
+                project_id=project_id,
+                agent_id=agent_id,
+                keys=unknown_keys,
+            )
 
         if config.enforce and any(v.fatal for v in violations):
             raise MemoryMetadataValidationError([v for v in violations if v.fatal])
@@ -2235,18 +2261,6 @@ class MemoryService:
             threshold=config.memory_metadata.unknown_key_storm_threshold,
             window_seconds=config.memory_metadata.unknown_key_storm_window_seconds,
         )
-
-    def _memory_metadata_project_root(self) -> str:
-        """Project root the unknown-key storm escalation would be filed into.
-
-        Reuses the established resolution (``config.taskmaster.project_root``
-        or empty, see ``reconciliation/harness.py`` and ``server/main.py``)
-        rather than introducing a second notion of "this project's root".
-        Returns ``''`` when unconfigured, which the caller treats as
-        "census only, do not escalate" — there is no queue to file into.
-        """
-        raw = self.config.taskmaster.project_root if self.config.taskmaster else ''
-        return os.path.expanduser(raw) if raw else ''
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -6636,7 +6650,7 @@ class MemoryService:
             agent_id=agent_id,
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
-            project_root=self._memory_metadata_project_root(),
+            taskmaster=self.config.taskmaster,
             reaches_mem0=write_mem0,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
@@ -7173,7 +7187,7 @@ class MemoryService:
             agent_id=agent_id,
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
-            project_root=self._memory_metadata_project_root(),
+            taskmaster=self.config.taskmaster,
             reaches_mem0=True,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
@@ -9708,7 +9722,7 @@ class MemoryService:
                 agent_id=agent_id,
                 config=self.config.memory_metadata,
                 storm_detector=self._metadata_storm_detector,
-                project_root=self._memory_metadata_project_root(),
+                taskmaster=self.config.taskmaster,
                 # `True` unconditionally (task 3508), as in add_system_record:
                 # this amends a record that already lives in Mem0 and never
                 # routes to Graphiti, and `category` in a patch is a metadata

@@ -143,6 +143,10 @@ more — reverts to human routing until it has been re-shadowed.
   (Leo, 2026-11-04; `plans/decision-stream-prd.md` §3 decision 7), and it is
   scored as the `close_only` it ends in.
 
+`escalation/src/escalation/authority.py::PolicyRow.reversible` reads the same
+list, so a row is reversible only when every act it allows is listed above other
+than `done_flip`: the waiver makes `done_flip` stampable, not reversible.
+
 Only `close_only` and `resume` are C1 `resolution_action` values, so only those
 two leave a trace the weekly count can compare against. `done_flip` is compared
 through its trailing `close_only`. The other three are task-side and are
@@ -240,9 +244,11 @@ as `live` after a shadow period that only measures.
   been recovered into a task. Proposal: amend that task, then close.
 - `owner_finding_appended` — item 5: a finding the owning pending task can carry.
   Proposal: append it to that task, then close.
-- `completion_claim_true` — item 11, class 1a's true arm: an
-  `unverified_completion_claim` whose task really is done, landed and has no
-  dependents. Proposal: `abandon`.
+- `completion_claim_true` — class 1a's true arm: an
+  `unverified_completion_claim` whose cited task really is done and landed.
+  Proposal: close it, quoting the task status and the ancestry probe (Leo,
+  2026-11-09, sitting item 522, esc-8475-2; humans always closed these records
+  `close_only`, and none was ever resolved `abandon`).
 - `superseded_main_sweep` — a task-2630 carve-out class: a main-sweep record
   superseded by a newer sweep on a main that is green again. Proposal: close it.
 - `self_cleared_infra` — a task-2630 carve-out class: an `infra_issue` whose
@@ -252,6 +258,15 @@ as `live` after a shadow period that only measures.
 - `applies_named_ruling` — item 6's carve-out half and item 7, the "applies a
   named ruling" row: a record that a dated, cited ruling already decides.
   Proposal: `close_only` or `resume`, as the ruling says.
+
+Item 11, cancelling the task the router spawned from an
+`unverified_completion_claim`, has no row. It stays interactive-only, under
+self-execute item 11 of `skills/escalation-watcher/SKILL.md`. The spawned task's
+`spawned_from: unverified-claim-<n>` provenance is task metadata
+(`orchestrator/src/orchestrator/escalation_router.py::_submit_arguments`). Its
+`task_failure` L2 carries that provenance in no field, and a row matches only a
+record's category and agent role, so a row could find that L2 only by free-text
+matching.
 
 ### New delegations
 
@@ -398,6 +413,31 @@ lands in exactly one bucket:
 The rate is computed over the comparable subset only, and the comparable
 denominator is printed beside it, so "95% or better over at least 10 items" is
 decidable from a pasted report alone.
+
+## Classes measured on a proxy act
+
+Four rows allow a deciding act that is not in the reversible-action list. The
+only one of the row's acts a stamp can meaningfully propose is the trailing
+`close_only` (or `resume`), so the class's agreement rate measures whether the
+record should close, not whether the deciding act should run (Leo, 2026-11-09,
+sitting item 522). The codec checks a proposal against the reversible-action
+list only, not against the row's own acts; task 8478 adds that per-row check.
+
+- `red_main_recovery` (`recover_main`) and `b3_low_risk_unblock` (`b3_apply`) —
+  file-writing, audited at 100% until n ≥ 20 (`PolicyRow.audit_full_until`;
+  `plans/decision-stream-prd.md` §3 decisions 5-6). That audit is the real
+  check on the act; the agreement rate is not.
+- `verify_host_reprobed` (`reprobe_quarantine`) — the verify-host monitor
+  resolves these records itself
+  (`orchestrator/src/orchestrator/merge_lane/liveness.py::_resolve_pending_alarm`):
+  a non-human resolver, with no `resolution_action`. Every stamp therefore
+  lands in `non_human_resolver`, and the class's agreement rate is `None` while
+  the monitor closes them. η cannot flip it on this measurement.
+- `dead_letter_replayed` (`replay_dead_letters`) — not file-writing, so only the
+  random audit draw checks the replay. No ruling yet names a stronger check.
+
+`escalation/tests/test_shadow_ruling.py` holds this set of four equal to the
+table.
 
 ## Pointers
 

@@ -579,6 +579,8 @@ def mine(
     repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
 
     async def _run() -> int:
+        from orchestrator.config import GitConfig
+
         from .adjudication import AdjudicationLog
         from .mining import (
             RecoveredCandidate,
@@ -634,8 +636,10 @@ def mine(
         click.echo(f'  {len(candidates)} FN candidates mined from runs.db')
 
         titles = fetch_task_titles(runs_db, [c.task_id for c in candidates])
+        git = GitConfig()
         recovered = recover_candidates(
             candidates, existing_ids={d.diff_id for d in manifest.diffs}, repo_path=repo_path,
+            branch_prefix=git.branch_prefix, main_branch=git.main_branch,
         )
         pool = candidate_pool(
             recovered, corpus_size=len(manifest.diffs), target_total=target_total, limit=limit,

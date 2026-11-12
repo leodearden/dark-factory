@@ -696,12 +696,12 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'f38dc5fc1e4c',
+        '06814d9a4e68',
         'accepted',
-        'ACCEPTED: run_server calls build_known_projects_map '
-        '(models/scope.py -- open() of each project manifest, then '
-        'yaml.safe_load; the sweep reports whichever the walk reaches '
-        'first) during process STARTUP, before the server binds '
+        'ACCEPTED: run_server calls configured_known_projects_map '
+        '(models/scope.py -- Path.resolve() of the primary root, then '
+        'open() and yaml.safe_load of each project manifest; the sweep '
+        'reports whichever the walk reaches first) during process STARTUP, before the server binds '
         'and begins serving traffic, so there is no concurrent work for it '
         'to stall and no request whose latency it can affect. This is what '
         'an accepted row must say -- what makes the cost acceptable, not '
@@ -716,7 +716,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ACCEPTED, startup only: run_server reaches '
         'build_topic_cluster_store -> TopicClusterStore.open(), a sync '
         'SQLite open matched by the method name open. It genuinely blocks, '
-        'but like the build_known_projects_map row beside it, it runs once '
+        'but like the configured_known_projects_map row beside it, it runs once '
         'during process STARTUP, before the server binds and begins '
         'serving traffic, so there is no concurrent work to stall. If it '
         'ever moves onto a request or reload path, the content_hash '
@@ -732,7 +732,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
-        'beb5b61c6b9a',
+        'f6a7ff40db1f',
         'filed',
         _STARTUP_PATH_RESOLVE_WHY,
     ),

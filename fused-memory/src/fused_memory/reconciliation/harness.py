@@ -10,11 +10,12 @@ import os
 import socket
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -43,7 +44,8 @@ from fused_memory.models.scope import (
     ProjectId,
     ProjectRoot,
     ProjectScope,
-    build_known_projects_map,
+    configured_known_projects_map,
+    configured_primary_root,
 )
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -834,25 +836,17 @@ class ReconciliationHarness:
         # accepting connections.  None when no recon_report server is started.
         self._server_ready_event = server_ready_event
         self._recon_report_port: int = config.server.recon_report_port
-        _raw_root = config.taskmaster.project_root if config.taskmaster else ''
-        if _raw_root:
-            _raw_root = os.path.expanduser(_raw_root)
-        self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
+        self._project_root = configured_primary_root(config.taskmaster)
         self.config = config.reconciliation
         self._full_cycle_deadline = full_cycle_deadline
         self._backlog_policy = backlog_policy
-        # Multi-project routing: build a {project_id → project_root} map from
-        # the configured project + DASHBOARD_KNOWN_PROJECT_ROOTS env var so
-        # Stage 2 can surface other projects to its LLM and authorise
-        # cross-project task filing.  Reuses the dashboard's existing env var
-        # to avoid two sources of truth — see plans/deep-squishing-lagoon.md
-        # for the trade-off (rename to a neutral name is a tracked followup).
-        # When a known_projects kwarg is supplied (server startup), the harness
-        # uses that snapshot instead of building its own — single source of
-        # truth across harness, ticket janitor, and path-scope guard (task 1164).
+        # Multi-project routing: Stage 2 surfaces the registered projects to
+        # its LLM and authorises cross-project task filing.  Server startup
+        # passes its known_projects snapshot (task 1164); otherwise derive it
+        # by the same rule, models/scope.py::configured_known_projects_map.
         self._known_projects: dict[str, str] = (
             dict(known_projects) if known_projects is not None
-            else build_known_projects_map(self._project_root)
+            else configured_known_projects_map(config.taskmaster)
         )
         # Task 2998 GAP A: seed the policy's project_root cache NOW, at
         # construction.  Its only other writer is BacklogPolicy.check(), which
@@ -1157,6 +1151,11 @@ class ReconciliationHarness:
         scope-returning per task 2146 β).
         """
         return self._project_root
+
+    @property
+    def known_projects(self) -> Mapping[str, str]:
+        """The ``{project_id: project_root}`` registry this harness routes by, read-only."""
+        return MappingProxyType(self._known_projects)
 
     def _known_project_scope_for(self, project_id: str) -> ProjectScope:
         """Return the canonical ProjectScope for *project_id* from the registry.
