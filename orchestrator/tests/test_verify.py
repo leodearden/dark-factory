@@ -28,9 +28,10 @@ from _xdist_crash_fixtures import (
     XDIST_IN_FLIGHT_NODEID,
     XDIST_MAX_WORKERS_REACHED_OUTPUT,
     XDIST_PARTIAL_TALLY,
+    XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT,
     XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
-    XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
     XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
     XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
     XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT,
     XDIST_Q_TRUNCATED_OUTPUT,
@@ -4182,7 +4183,8 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
     Every ``-q`` module-scoped verify leg lacks the bailout literal (xdist
     gates it on ``verbose >= 0``), so these specimens exercise the
     progress-line witness alone: a crash signature, a final progress line
-    below ``[100%]``, and pytest's own failure tally after it.
+    below ``[100%]``, pytest's own failure tally after it, and no
+    interrupted-run banner after that line.
     """
 
     HEADING = '## Session Aborted After Worker Death'
@@ -4256,21 +4258,36 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
             f'Unexpected summary: {result.summary!r}'
         )
 
-    def test_a_maxfail_stop_after_a_recovered_crash_is_labelled_without_masking(self):
-        """ACCEPTED RESIDUAL, pinned: once xdist has replaced a crashed worker,
-        a -x/--maxfail stop satisfies all three witness facts, so the leg is
-        labelled. Its tally IS partial; only the named cause is imprecise. The
-        real failure that stopped the run must still be reported beside it."""
-        output = XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT
-        summary = _test_leg_result(output).summary
-        fragments = summary.removeprefix('Failures: ').split(', ')
-        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
-        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+    @pytest.mark.parametrize(
+        'output',
+        [
+            XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
+            XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+        ],
+        ids=['maxfail-stop', 'keyboard-interrupt'],
+    )
+    def test_an_interrupted_run_after_a_recovered_crash_is_not_labelled(self, output):
+        """task 5905: the stop came from pytest's interrupted run loop, not
+        from xdist abandoning the queue, so failure_report must not claim the
+        --max-worker-restart cap was exceeded."""
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
-        assert hint == (
-            f'{WORKER_DEATH_SUMMARY_MARKER}; '
-            f'first surviving failure: {XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip()}'
-        ), f'Unexpected hint: {hint!r}'
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_bailout_that_maxfail_also_counted_is_still_labelled(self):
+        """task 5905: a genuine bailout under -x prints pytest's 'stopping
+        after N failures' banner too, so that banner is no interruption."""
+        output = XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT
+        _assert_labelled_aborted(output)
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 46% of collected tests', (
+            f'Unexpected hint: {hint!r}'
+        )
 
     def test_a_run_stopped_short_without_a_worker_crash_is_not_labelled(self):
         """An -x/--maxfail stop: progress below 100% alone is never enough."""

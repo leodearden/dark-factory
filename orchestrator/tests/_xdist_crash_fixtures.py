@@ -120,9 +120,13 @@ _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY = (
 
 _XDIST_Q_TRUNCATED_TALLY = '1 failed, 9851 passed, 8 warnings in 1553.83s (0:25:53)\n'
 
-XDIST_Q_TRUNCATED_OUTPUT = (
+_XDIST_Q_PROGRESS_UP_TO_TRUNCATION = (
     _XDIST_Q_PROGRESS_UP_TO_CRASH
     + 'F..............'.ljust(73) + '[ 46%]\n'
+)
+
+XDIST_Q_TRUNCATED_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_TRUNCATION
     + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
     + _XDIST_Q_TRUNCATED_TALLY
 )
@@ -151,12 +155,13 @@ XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT = (
     + '.' * 30 + '\n'
 )
 
-# task 5337: the -q witness's ACCEPTED RESIDUAL. xdist REPLACED the crashed
-# worker (``--max-worker-restart > 0``), then ``-x`` stopped the session on a
-# real failure: the last percentage line reads below 100% and pytest's tally
-# follows, exactly as in a bailout. Measured live (pytest 9.0.3, pytest-xdist
-# 3.8.0, ``-n 2 -q --max-worker-restart=2 -x``), trimmed and rebased like the
-# specimens above.
+# task 5337: xdist REPLACED the crashed worker (``--max-worker-restart > 0``),
+# then ``-x`` stopped the session on a real failure: the last percentage line
+# reads below 100% and pytest's tally follows, as in a bailout. The
+# ``xdist.dsession.Interrupted: ...`` banner tells it apart (task 5905): pytest
+# prints it only when its run loop ended by an exception. Measured live (pytest
+# 9.0.3, pytest-xdist 3.8.0, ``-n 2 -q --max-worker-restart=2 -x``), trimmed and
+# rebased like the specimens above.
 XDIST_Q_MAXFAIL_REAL_FAILED_LINE = 'FAILED orchestrator/tests/test_x.py::test_real - assert False\n'
 XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT = (
     _XDIST_Q_PROGRESS_UP_TO_CRASH
@@ -167,6 +172,33 @@ XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT = (
     + ' stopping after 2 failures '.center(80, '!') + '\n'
     + ' xdist.dsession.Interrupted: stopping after 1 failures '.center(80, '!') + '\n'
     + '2 failed, 9880 passed, 8 warnings in 1560.02s (0:26:00)\n'
+)
+
+# task 5905: a SIGINT to the controller after xdist replaced a crashed worker.
+# Measured live (pytest 9.0.3, pytest-xdist 3.8.0,
+# ``-n 2 -q --max-worker-restart=2``), and rebased onto this module's progress
+# because the live crash preceded its first percentage line.
+XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_CRASH
+    + 'F' + '.' * 71 + ' [ 46%]\n'
+    + '.' * 31 + '\n'
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + ' KeyboardInterrupt '.center(80, '!') + '\n'
+    + '/usr/lib/python3.13/threading.py:363: KeyboardInterrupt\n'
+    + '(to show a full traceback on KeyboardInterrupt use --full-trace)\n'
+    + '1 failed, 9880 passed, 8 warnings in 1560.02s (0:26:00)\n'
+)
+
+# task 5905: a GENUINE bailout under ``-x``. Measured live (pytest 9.0.3,
+# pytest-xdist 3.8.0, ``-n 2 -q --max-worker-restart=0 -x``). The report xdist
+# synthesizes for the crashed test counts toward --maxfail, so pytest prints
+# its ``stopping after`` banner; there is no Interrupted banner, because
+# xdist's triggershutdown() let the run loop end.
+XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT = (
+    _XDIST_Q_PROGRESS_UP_TO_TRUNCATION
+    + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
+    + ' stopping after 1 failures '.center(80, '!') + '\n'
+    + _XDIST_Q_TRUNCATED_TALLY
 )
 
 # task 5337: a DEFAULT-verbosity bailout, on which both truncation witnesses
