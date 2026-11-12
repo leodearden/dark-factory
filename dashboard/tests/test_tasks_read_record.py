@@ -9,7 +9,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _canned_mcp import canned_get_tasks_result
+from _canned_mcp import CannedMCP, _raw_row, canned_get_tasks_result
 
 import dashboard.data.tasks as tasks_mod
 
@@ -290,3 +290,71 @@ class TestFetchTasksNarrowing:
             f'strictly tighter than mcp_tool_call default={mcp_default}'
         )
         assert tasks_mod.DEFAULT_PER_CALL_TIMEOUT > 0
+
+
+# ---------------------------------------------------------------------------
+# TestRowReadProjection — the row reads forward a ``fields`` projection
+# (task 9311)
+# ---------------------------------------------------------------------------
+
+_PROJECTION = ['id', 'title', 'status', 'metadata.files']
+
+
+class TestRowReadProjection:
+    """``fields`` crosses the wire as the caller's list; omitted, it is not sent."""
+
+    @staticmethod
+    def _substrate() -> CannedMCP:
+        return CannedMCP(rows=[
+            _raw_row(1, 'pending', description='prose',
+                     metadata={'files': ['a.py'], 'routing': {'model': 'm'}}),
+            _raw_row(2, 'done', metadata={'files': ['b.py']}),
+        ])
+
+    async def test_fetch_tasks_sends_the_projection_beside_its_statuses(
+        self, dummy_client, dummy_config
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            rows = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/A',
+                statuses=['pending'], fields=list(_PROJECTION),
+            )
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args']['fields'] == _PROJECTION
+        assert type(call['args']['fields']) is list
+        assert call['args']['statuses'] == ['pending']
+        assert isinstance(rows, list)
+        assert [row['metadata'] for row in rows] == [{'files': ['a.py']}]
+
+    async def test_fetch_task_page_sends_the_projection_beside_its_window(
+        self, dummy_client, dummy_config
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            await tasks_mod.fetch_task_page(
+                dummy_client, dummy_config, '/proj/A',
+                page_size=2, offset=0, fields=list(_PROJECTION),
+            )
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args'] == {
+            'project_root': '/proj/A', 'page_size': 2, 'offset': 0, 'fields': _PROJECTION,
+        }
+
+    @pytest.mark.parametrize(('reader', 'kwargs', 'expected'), [
+        ('fetch_tasks', {'statuses': ['pending']},
+         {'project_root': '/proj/A', 'statuses': ['pending']}),
+        ('fetch_task_page', {'page_size': 2, 'offset': 0},
+         {'project_root': '/proj/A', 'page_size': 2, 'offset': 0}),
+    ])
+    async def test_an_omitted_projection_sends_no_fields_key(
+        self, dummy_client, dummy_config, reader, kwargs, expected
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            await getattr(tasks_mod, reader)(dummy_client, dummy_config, '/proj/A', **kwargs)
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args'] == expected
