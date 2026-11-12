@@ -139,9 +139,13 @@ XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT = (
     + _XDIST_Q_TRUNCATED_TALLY
 )
 
-XDIST_Q_RECOVERED_OUTPUT = (
+_XDIST_Q_PROGRESS_PAST_RECOVERED_CRASH = (
     _XDIST_Q_PROGRESS_UP_TO_CRASH
     + 'F' + '.' * 71 + ' [ 46%]\n'
+)
+
+XDIST_Q_RECOVERED_OUTPUT = (
+    _XDIST_Q_PROGRESS_PAST_RECOVERED_CRASH
     + '.' * 72 + ' [ 99%]\n'
     + '..........'.ljust(73) + '[100%]\n'
     + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
@@ -149,8 +153,7 @@ XDIST_Q_RECOVERED_OUTPUT = (
 )
 
 XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT = (
-    _XDIST_Q_PROGRESS_UP_TO_CRASH
-    + 'F' + '.' * 71 + ' [ 46%]\n'
+    _XDIST_Q_PROGRESS_PAST_RECOVERED_CRASH
     + '.' * 72 + ' [ 71%]\n'
     + '.' * 30 + '\n'
 )
@@ -164,8 +167,7 @@ XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT = (
 # rebased like the specimens above.
 XDIST_Q_MAXFAIL_REAL_FAILED_LINE = 'FAILED orchestrator/tests/test_x.py::test_real - assert False\n'
 XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT = (
-    _XDIST_Q_PROGRESS_UP_TO_CRASH
-    + 'F' + '.' * 71 + ' [ 46%]\n'
+    _XDIST_Q_PROGRESS_PAST_RECOVERED_CRASH
     + '.' * 25 + 'F...\n'
     + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
     + XDIST_Q_MAXFAIL_REAL_FAILED_LINE
@@ -179,8 +181,7 @@ XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT = (
 # ``-n 2 -q --max-worker-restart=2``), and rebased onto this module's progress
 # because the live crash preceded its first percentage line.
 XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT = (
-    _XDIST_Q_PROGRESS_UP_TO_CRASH
-    + 'F' + '.' * 71 + ' [ 46%]\n'
+    _XDIST_Q_PROGRESS_PAST_RECOVERED_CRASH
     + '.' * 31 + '\n'
     + _XDIST_Q_CRASH_FAILURES_AND_SHORT_SUMMARY
     + ' KeyboardInterrupt '.center(80, '!') + '\n'
