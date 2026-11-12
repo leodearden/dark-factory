@@ -19,7 +19,8 @@ What the ticker reports is the WORST GAP between its turns, not how many turns
 it got: a wedge puts a hard floor under that gap, while a tick count also
 tracks machine speed and would red on a busy CI box.
 
-The harness and its stores come from ``reconciliation.harness_fixtures``.
+The pass driver comes from ``reconciliation.remediation_pass_fixtures`` and the
+stores from ``reconciliation.harness_fixtures``.
 """
 from __future__ import annotations
 
@@ -29,38 +30,25 @@ import logging
 import os
 import shlex
 import time
-import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from shared.scheduler_state import SchedulerStateSnapshot
 
 import fused_memory.reconciliation.harness as harness_module
-from fused_memory.models.reconciliation import (
-    ReconciliationRun,
-    RunStatus,
-    RunType,
-    StageReport,
-)
 from fused_memory.reconciliation import escalation_archive
-from fused_memory.reconciliation.harness import (
-    _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
-    TierConfig,
-    _derive_affected_ids,
-)
-from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
-from fused_memory.reconciliation.task_filter import FilteredTaskTree
-from reconciliation.consolidator_fixtures import make_scope
+from fused_memory.reconciliation.harness import _derive_affected_ids
 from reconciliation.harness_fixtures import (
-    make_harness,
-    make_harness_config,
     make_memory_service,
     open_event_buffer,
     open_journal,
-    stub_stage_runs,
+)
+from reconciliation.remediation_pass_fixtures import (
+    finding_citing,
+    in_progress_task,
+    make_remediation_harness,
+    prepare_remediation_pass,
 )
 
 pytest.importorskip('escalation.queue')
@@ -70,9 +58,6 @@ from escalation.queue import EscalationQueue  # noqa: E402
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-PROJECT_ID = 'test-project'
-PROJECT_ROOT = '/tmp/test-project'
 
 TICK_SECONDS = 0.005
 
@@ -111,59 +96,6 @@ async def event_buffer(tmp_path):
 @pytest.fixture
 def memory_service():
     return make_memory_service()
-
-
-def _make_harness(journal, event_buffer, memory_service, **harness_kwargs):
-    return make_harness(
-        journal=journal,
-        event_buffer=event_buffer,
-        memory_service=memory_service,
-        taskmaster=AsyncMock(),
-        config=make_harness_config(judge_enabled=False),
-        known_projects={PROJECT_ID: PROJECT_ROOT},
-        **harness_kwargs,
-    )
-
-
-def _finding_citing(
-    *task_ids: str, description: str | None = None, routed_to: str | None = None,
-) -> dict:
-    """An actionable stranded-work finding citing each of *task_ids*.
-
-    *routed_to* sets the bare ``task_id`` field, which
-    ``resolve_finding_task_target`` prefers over ``cited_tasks`` — the way to
-    build a finding whose ROUTED target is not one of its cited ids, and so the
-    only way to reach the routed-target liveness gate.
-    """
-    cited = ','.join(task_ids)
-    finding = {
-        'description': description or f'Implementation-complete but not merged: {cited}',
-        'severity': 'urgent',
-        'actionable': True,
-        'category': 'stranded_work',
-        'cited_tasks': [
-            {'project_id': PROJECT_ID, 'task_id': tid} for tid in task_ids
-        ],
-        'suggested_action': 'Manual merge required',
-    }
-    if routed_to is not None:
-        finding['task_id'] = routed_to
-        finding['description'] = description or (
-            f'Implementation-complete but not merged: {cited} (routed to {routed_to})'
-        )
-    return finding
-
-
-def _in_progress_task(task_id: str) -> dict:
-    return {
-        'id': int(task_id),
-        'title': f'In-progress task {task_id}',
-        'status': 'in-progress',
-        'claimant_run_id': f'run-{task_id}',
-        'heartbeat_at': datetime.now(UTC).isoformat(),
-        'metadata': {'task_kind': 'normal'},
-        'dependencies': [],
-    }
 
 
 # ── The loop-responsiveness probe ────────────────────────────────────────────
@@ -211,88 +143,6 @@ async def _worst_loop_stall(coro) -> tuple[int, float]:
 # ── Driving the pass ─────────────────────────────────────────────────────────
 
 
-async def _seed_persistence(journal, findings: list[dict]) -> None:
-    """Seed threshold-1 prior completed runs carrying *findings*.
-
-    Together with this pass's own persisted S3 report that reaches
-    ``_INTEGRITY_FINDING_RECURRENCE_THRESHOLD`` so the live-workflow gate fires.
-    Uses the journal's PUBLIC async API (start_run / update_run_stage_reports /
-    complete_run), never its storage internals.
-    """
-    n_seed = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 1
-    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
-    for i in range(n_seed):
-        rid = str(uuid.uuid4())
-        await journal.start_run(
-            ReconciliationRun(
-                id=rid,
-                project_id=PROJECT_ID,
-                run_type=RunType.full,
-                trigger_reason='buffer_size:1',
-                started_at=base_time + timedelta(minutes=i),
-                events_processed=1,
-                status=RunStatus.running,
-            )
-        )
-        await journal.update_run_stage_reports(
-            rid, {'integrity_check': {'items_flagged': findings}}
-        )
-        await journal.complete_run(rid, 'completed')
-
-
-async def _prepare_pass(
-    *, journal, event_buffer, memory_service, tmp_path, monkeypatch,
-    findings: list[dict], cited_tasks: list[dict] | None = None,
-):
-    """Wire a harness to drive ``_run_remediation_pass`` over *findings*.
-
-    Returns ``(harness, esc_queue, run_pass)`` where ``run_pass()`` returns a
-    fresh coroutine for the pass — so a caller can hand it to
-    ``_worst_loop_stall``.
-    """
-    esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness = _make_harness(
-        journal, event_buffer, memory_service, escalation_queue=esc_queue,
-    )
-
-    # Pin the two on-disk corroboration inputs to their empty forms so neither
-    # of the other corroboration signals can fire against the shared,
-    # pytest-unmanaged /tmp/test-project root.
-    monkeypatch.setattr(
-        harness_module, 'read_scheduler_state',
-        lambda _root: SchedulerStateSnapshot.empty(),
-    )
-    monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
-
-    await _seed_persistence(journal, findings)
-
-    async def fake_run(
-        self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
-    ):
-        now = datetime.now(UTC)
-        items_flagged = findings if isinstance(self, IntegrityCheck) else []
-        return StageReport(
-            stage=self.stage_id, started_at=now, completed_at=now, items_flagged=items_flagged,
-        )
-
-    stub_stage_runs(monkeypatch, fake_run)
-
-    tree = FilteredTaskTree(
-        active_tasks=list(cited_tasks or []), total_count=len(cited_tasks or []),
-    )
-    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
-
-    def run_pass():
-        return harness._run_remediation_pass(
-            PROJECT_ID, 'parent-run-id', findings, tier,
-            scope=make_scope(PROJECT_ID, PROJECT_ROOT),
-            filtered_task_tree=tree,
-            filtered_task_tree_fetched_at=datetime.now(UTC),
-        )
-
-    return harness, esc_queue, run_pass
-
-
 def _stub_scan(monkeypatch, calls: list, *, block: float = SCAN_BLOCK_SECONDS):
     """Replace the archive scan with a blocking stub that records its calls."""
 
@@ -323,11 +173,11 @@ class TestArchiveScanLeavesTheLoop:
         calls: list = []
         _stub_scan(monkeypatch, calls)
         _stub_probe(monkeypatch, [], live_ids=frozenset({'901'}), block=0.0)
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901')],
-            cited_tasks=[_in_progress_task('901')],
+            findings=[finding_citing('901')],
+            cited_tasks=[in_progress_task('901')],
         )
 
         ticks, worst = await _worst_loop_stall(run_pass())
@@ -353,13 +203,13 @@ class TestArchiveScanLeavesTheLoop:
         """
         calls: list = []
         _stub_scan(monkeypatch, calls, block=0.0)
-        findings = [_finding_citing('901'), _finding_citing('902'), _finding_citing('903')]
-        _, _, run_pass = await _prepare_pass(
+        findings = [finding_citing('901'), finding_citing('902'), finding_citing('903')]
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
             findings=findings,
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902'),
-                         _in_progress_task('903')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902'),
+                         in_progress_task('903')],
         )
 
         with caplog_silent():
@@ -384,12 +234,12 @@ class TestArchiveScanLeavesTheLoop:
             harness_module, 'scan_recently_resolved_fingerprints', _raising_scan,
         )
         _stub_probe(monkeypatch, [], block=0.0)
-        findings = [_finding_citing('901'), _finding_citing('902')]
-        _, esc_queue, run_pass = await _prepare_pass(
+        findings = [finding_citing('901'), finding_citing('902')]
+        _, esc_queue, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
             findings=findings,
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
@@ -481,12 +331,12 @@ class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
         measured instead of the probes'."""
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, live_ids=frozenset({'901', '902'}))
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901', '902'), _finding_citing('901'),
-                      _finding_citing('902')],
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            findings=[finding_citing('901', '902'), finding_citing('901'),
+                      finding_citing('902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         ticks, worst = await _worst_loop_stall(run_pass())
@@ -512,12 +362,12 @@ class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
         """
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, block=0.0)
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901', '902'), _finding_citing('901'),
-                      _finding_citing('902')],
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            findings=[finding_citing('901', '902'), finding_citing('901'),
+                      finding_citing('902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         with caplog_silent():
@@ -534,13 +384,13 @@ class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
         """VERDICT PARITY — memoising False must not silence an escalation."""
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, block=0.0)
-        findings = [_finding_citing('901', '902'), _finding_citing('901'),
-                    _finding_citing('902')]
-        _, esc_queue, run_pass = await _prepare_pass(
+        findings = [finding_citing('901', '902'), finding_citing('901'),
+                    finding_citing('902')]
+        _, esc_queue, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
             findings=findings,
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         with caplog_silent():
@@ -563,12 +413,12 @@ class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
         """VERDICT PARITY — a live cited task still suppresses, and says so."""
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, live_ids=frozenset({'901'}), block=0.0)
-        _, esc_queue, run_pass = await _prepare_pass(
+        _, esc_queue, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901', '902'), _finding_citing('901'),
-                      _finding_citing('902')],
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            findings=[finding_citing('901', '902'), finding_citing('901'),
+                      finding_citing('902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
@@ -605,11 +455,11 @@ class TestRoutedTargetGateUsesTheSameMemo:
         """A routed id the cited gate never saw must still consult the detector."""
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, block=0.0)
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901', routed_to='903')],
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('903')],
+            findings=[finding_citing('901', routed_to='903')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('903')],
         )
 
         with caplog_silent():
@@ -626,12 +476,12 @@ class TestRoutedTargetGateUsesTheSameMemo:
         """Cross-gate memo: 902 is probed once, as a cited id, then served."""
         probed: list[str] = []
         _stub_probe(monkeypatch, probed, block=0.0)
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901', '902'),
-                      _finding_citing('901', routed_to='902')],
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+            findings=[finding_citing('901', '902'),
+                      finding_citing('901', routed_to='902')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902')],
         )
 
         with caplog_silent():
@@ -661,11 +511,11 @@ class TestHoistedWorktreeIndexLeavesTheLoop:
         git_calls = _slow_git_first_on_path(monkeypatch, tmp_path, block=GIT_BLOCK_SECONDS)
         _stub_scan(monkeypatch, [], block=0.0)
         _stub_detector(monkeypatch, [], live_ids=frozenset({'901'}), block=0.0)
-        _, _, run_pass = await _prepare_pass(
+        _, _, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
-            findings=[_finding_citing('901')],
-            cited_tasks=[_in_progress_task('901')],
+            findings=[finding_citing('901')],
+            cited_tasks=[in_progress_task('901')],
         )
 
         ticks, worst = await _worst_loop_stall(run_pass())
@@ -734,7 +584,7 @@ def esc_queue(tmp_path):
 @pytest.fixture
 def escalating_harness(journal, event_buffer, memory_service, esc_queue):
     """A harness with a real EscalationQueue, for driving `_escalate` directly."""
-    return _make_harness(journal, event_buffer, memory_service, escalation_queue=esc_queue)
+    return make_remediation_harness(journal, event_buffer, memory_service, escalation_queue=esc_queue)
 
 
 class TestFallbackArmIsBoundedToOneScanPerRun:
@@ -756,7 +606,7 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
             escalating_harness._escalate(
                 'recon_integrity_issue', 'run-aaaa1111',
                 f'Persistently unresolved: finding {i}',
-                finding=_finding_citing('901', description=f'finding {i}'),
+                finding=finding_citing('901', description=f'finding {i}'),
             )
 
         assert len(calls) == 1, (
@@ -771,7 +621,7 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         for run_id in ('run-aaaa1111', 'run-aaaa1111', 'run-bbbb2222'):
             escalating_harness._escalate(
                 'recon_integrity_issue', run_id, f'Persistently unresolved: {run_id}',
-                finding=_finding_citing('901', description=f'finding for {run_id}'),
+                finding=finding_citing('901', description=f'finding for {run_id}'),
             )
 
         assert len(calls) == 2, (
@@ -792,7 +642,7 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         def _escalate_in_run() -> None:
             escalating_harness._escalate(
                 'recon_integrity_issue', 'run-dddd4444', 'Persistently unresolved: x',
-                finding=_finding_citing('901', description='x'),
+                finding=finding_citing('901', description='x'),
             )
 
         _escalate_in_run()
@@ -823,8 +673,8 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         calls: list = []
         _count_scans(monkeypatch, calls)
 
-        suppressed_finding = _finding_citing('901', description='recently resolved')
-        refiring_finding = _finding_citing('902', description='resolved long ago')
+        suppressed_finding = finding_citing('901', description='recently resolved')
+        refiring_finding = finding_citing('902', description='resolved long ago')
         fp_in = _fingerprint_of(suppressed_finding)
         fp_out = _fingerprint_of(refiring_finding)
         _seed_resolved(esc_queue, 'esc-in-window', fp_in, age=timedelta(seconds=60))
@@ -865,14 +715,14 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         calls: list = []
         _count_scans(monkeypatch, calls)
         _stub_probe(monkeypatch, [], block=0.0)
-        findings = [_finding_citing('901'), _finding_citing('902'),
-                    _finding_citing('903')]
-        _, esc_queue, run_pass = await _prepare_pass(
+        findings = [finding_citing('901'), finding_citing('902'),
+                    finding_citing('903')]
+        _, esc_queue, run_pass = await prepare_remediation_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
             findings=findings,
-            cited_tasks=[_in_progress_task('901'), _in_progress_task('902'),
-                         _in_progress_task('903')],
+            cited_tasks=[in_progress_task('901'), in_progress_task('902'),
+                         in_progress_task('903')],
         )
 
         with caplog_silent():
