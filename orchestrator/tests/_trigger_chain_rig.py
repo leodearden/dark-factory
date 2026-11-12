@@ -139,7 +139,7 @@ class LiveFusedMemory:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._main())
-        except BaseException as exc:  # noqa: BLE001 - surfaced by start()
+        except BaseException as exc:
             self._serve_error = exc
         finally:
             _drain_pending_tasks(self._loop)
@@ -178,7 +178,7 @@ class LiveFusedMemory:
                 async with asyncio.timeout(remaining):
                     await probe()
                 return
-            except Exception as exc:  # noqa: BLE001 - any failure means not ready yet
+            except Exception as exc:
                 last_error = exc
             await asyncio.sleep(_READY_POLL_S)
         raise FusedMemoryNotReady(
