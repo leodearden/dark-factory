@@ -725,9 +725,40 @@ class RunCounts:
 
 
 @dataclass(frozen=True)
+class LinkDecision:
+    """One examined link: as read, the verdict matched to it, and the table's outcome.
+
+    ``planned`` is the heal the outcome plans, set exactly when ``decision`` is a
+    :class:`HealAction`.
+    """
+
+    state: LinkState
+    basis: LinkBasis | None
+    decision: HealAction | Report
+    planned: PlannedAction | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.decision, HealAction) != (self.planned is not None):
+            raise ValueError(f'{self.decision} plans a heal exactly when it is a HealAction')
+
+    @property
+    def basis_ref(self) -> tuple[BasisSource | None, str | None]:
+        """The source and key the decision rests on: its heal's, else the matched verdict's."""
+        if self.planned is not None:
+            return self.planned.basis_source, self.planned.basis_key
+        if self.basis is not None:
+            return self.basis.source, self.basis.key
+        return None, None
+
+
+@dataclass(frozen=True)
 class Plan:
-    actions: tuple[PlannedAction, ...]
+    decisions: tuple[LinkDecision, ...]
     counts: RunCounts
+
+    @property
+    def actions(self) -> tuple[PlannedAction, ...]:
+        return tuple(item.planned for item in self.decisions if item.planned is not None)
 
 
 async def read_link_state(
@@ -840,15 +871,13 @@ class _PlanTally:
         self._matched: set[tuple[str, str, str | None]] = set()
         self._unread: set[tuple[str, str]] = set()
         self._reports: Counter[Report] = Counter()
-        self._actions: list[PlannedAction] = []
-        self._examined = 0
+        self._decisions: list[LinkDecision] = []
         self._adjudicated = 0
 
     def record_read_failure(self, project_id: str, child_id: str) -> None:
         self._unread.add((project_id, child_id))
 
     def record(self, state: LinkState) -> None:
-        self._examined += 1
         key = _link_key(state.project_id, state.child.memory_id, state.link.parent_id)
         basis = self._bases.get(key)
         if basis is not None:
@@ -856,10 +885,14 @@ class _PlanTally:
             if not is_stale(state, basis):
                 self._adjudicated += 1
         decision = decide(state, basis)
+        planned = None
         if isinstance(decision.outcome, HealAction):
-            self._actions.append(_planned_action(state, decision.outcome, decision.basis_source, basis))
+            planned = _planned_action(state, decision.outcome, decision.basis_source, basis)
         else:
             self._reports[decision.outcome] += 1
+        self._decisions.append(
+            LinkDecision(state=state, basis=basis, decision=decision.outcome, planned=planned),
+        )
 
     def _bases_unlinked(self) -> int:
         return sum(
@@ -870,17 +903,19 @@ class _PlanTally:
 
     def plan(self) -> Plan:
         reported: dict[str, Any] = {report.value: self._reports[report] for report in Report}
+        decisions = tuple(self._decisions)
+        actions = [item.planned for item in decisions if item.planned is not None]
         counts = RunCounts(
-            links_total=self._examined + len(self._unread),
-            examined=self._examined,
+            links_total=len(decisions) + len(self._unread),
+            examined=len(decisions),
             adjudicated=self._adjudicated,
-            planned=len(self._actions),
-            planned_by_action=Counter(action.action.value for action in self._actions),
+            planned=len(actions),
+            planned_by_action=Counter(action.action.value for action in actions),
             bases_unlinked=self._bases_unlinked(),
             read_failed=len(self._unread),
             **reported,
         )
-        return Plan(actions=tuple(self._actions), counts=counts)
+        return Plan(decisions=decisions, counts=counts)
 
 
 def _planned_action(

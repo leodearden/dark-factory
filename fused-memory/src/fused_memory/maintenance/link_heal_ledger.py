@@ -5,7 +5,9 @@ verdicts: an adjudication is stored nowhere else (D8). Every table keys on an
 AUTOINCREMENT id, so a ``sqlite_sequence`` row proves something has written
 here (INV-13). Detail and counts are stored as JSON. A record a run read is
 kept whole as a content-addressed :class:`RecordSnapshot`, stored once per
-distinct state. Nothing here is ever pruned.
+distinct state. Every plan run records one examination per link it decided,
+committed with its planned rows; :meth:`LinkHealLedger.run_records` joins them
+into the run's :class:`CandidateRecord` view. Nothing here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -36,6 +38,7 @@ from fused_memory.maintenance.link_heal import (
     HealAction,
     LinkImage,
     PlannedAction,
+    Report,
     Verdict,
 )
 from fused_memory.maintenance.link_heal_store import (
@@ -84,6 +87,24 @@ class ActionState(StrEnum):
 
 
 PENDING_STATES = frozenset({ActionState.PLANNED, ActionState.SKIPPED_CAP})
+
+
+class Disposition(StrEnum):
+    """What a plan run did with one examined link's decision."""
+
+    STAGED = 'staged'
+    ALREADY_PENDING = 'already_pending'
+    UNDO_SUPPRESSED = 'undo_suppressed'
+    REPORTED = 'reported'
+
+
+#: What a candidate record says was done when no heal of it applied.
+NO_ACTION_TAKEN = 'none'
+
+_DECISIONS: Mapping[str, HealAction | Report] = MappingProxyType({
+    **{action.value: action for action in HealAction},
+    **{report.value: report for report in Report},
+})
 _PENDING_VALUES = tuple(sorted(state.value for state in PENDING_STATES))
 
 _SCHEMA = """
@@ -152,6 +173,22 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_by_state
     ON snapshots (project_id, memory_id, content_sha256, metadata_sha256);
+CREATE TABLE IF NOT EXISTS examinations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    child_id TEXT NOT NULL,
+    parent_id TEXT,
+    child_snapshot_id INTEGER NOT NULL REFERENCES snapshots (id),
+    parent_snapshot_id INTEGER REFERENCES snapshots (id),
+    basis_source TEXT,
+    basis_key TEXT,
+    decision TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    action_id INTEGER REFERENCES actions (id),
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS examinations_by_run ON examinations (run_id);
 """
 
 #: Columns added after their table first shipped: an older ledger gains them in place.
@@ -309,6 +346,61 @@ class RecordSnapshot:
 
 
 @dataclass(frozen=True)
+class ExaminationRecord:
+    """One link a plan run examined, as read and as decided.
+
+    ``staged`` is the heal this examination adds as a new pending row, set
+    exactly for :attr:`Disposition.STAGED`; ``pending_action_id`` is the row its
+    heal was already pending as, set exactly for :attr:`Disposition.ALREADY_PENDING`.
+    """
+
+    project_id: str
+    child: LiveRecord
+    parent_id: str | None
+    parent: LiveRecord | None
+    basis_source: BasisSource | None
+    basis_key: str | None
+    decision: HealAction | Report
+    disposition: Disposition
+    staged: PlannedAction | None = None
+    pending_action_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.disposition is Disposition.STAGED) != (self.staged is not None):
+            raise ValueError('an examination carries a staged heal exactly when it is staged')
+        if (self.disposition is Disposition.ALREADY_PENDING) != (self.pending_action_id is not None):
+            raise ValueError(
+                'an examination names a pending row exactly when its heal is already pending',
+            )
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
+    """One examined link of a plan run: its before-state, decision, and what became of it.
+
+    ``action_taken`` is the linked heal's action once it applied, else
+    :data:`NO_ACTION_TAKEN`. ``after_child`` is the child as the applying write's
+    verification read it, the before-state when nothing applied, and ``None`` for
+    an applied heal whose after-state went unrecorded.
+    """
+
+    run_id: str
+    project_id: str
+    child_id: str
+    parent_id: str | None
+    before_child: RecordSnapshot
+    before_parent: RecordSnapshot | None
+    basis_source: BasisSource | None
+    basis_key: str | None
+    decision: HealAction | Report
+    disposition: Disposition
+    action_id: int | None
+    action_taken: str
+    after_child: RecordSnapshot | None
+    at: str
+
+
+@dataclass(frozen=True)
 class UndoStepRow:
     """One write an undo run made (or skipped) to take a heal back."""
 
@@ -404,13 +496,81 @@ class LinkHealLedger:
 
     @contextlib.contextmanager
     def publishing_planned(
-        self, run_id: str, actions: Sequence[PlannedAction], source: RunSource,
+        self, run_id: str, examinations: Sequence[ExaminationRecord], source: RunSource,
     ) -> Iterator[list[ActionRow]]:
-        """Add *actions* as *run_id*'s planned rows and yield *source*'s pending rows, theirs
-        included. The rows commit when the body returns and are rolled back when it raises."""
+        """Record *examinations* as *run_id*'s, adding each staged heal as a planned row,
+        and yield *source*'s pending rows, the new ones included. Everything commits
+        when the body returns and is rolled back when it raises."""
         with self._conn:
-            self._insert_all_planned(run_id, actions)
+            at = _now()
+            for examination in examinations:
+                action_id = (
+                    examination.pending_action_id
+                    if examination.staged is None
+                    else self._insert_planned(run_id, examination.staged, at)
+                )
+                self._insert_examination(run_id, examination, action_id, at)
             yield self.pending_actions(source)
+
+    def _insert_examination(
+        self, run_id: str, examination: ExaminationRecord, action_id: int | None, at: str,
+    ) -> None:
+        project_id = examination.project_id
+        parent = examination.parent
+        self._conn.execute(
+            'INSERT INTO examinations (run_id, project_id, child_id, parent_id, '
+            'child_snapshot_id, parent_snapshot_id, basis_source, basis_key, decision, '
+            'disposition, action_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                run_id, project_id, examination.child.memory_id, examination.parent_id,
+                self._snapshot_id(project_id, examination.child),
+                None if parent is None else self._snapshot_id(project_id, parent),
+                None if examination.basis_source is None else examination.basis_source.value,
+                examination.basis_key, examination.decision.value,
+                examination.disposition.value, action_id, at,
+            ),
+        )
+
+    def run_records(self, run_id: str) -> list[CandidateRecord]:
+        """Every link plan run *run_id* examined, in the order it examined them."""
+        rows = self._conn.execute(
+            'SELECT examinations.*, actions.action AS action_value, actions.state AS action_state, '
+            'actions.after_child_snapshot_id AS after_child_snapshot_id FROM examinations '
+            'LEFT JOIN actions ON actions.id = examinations.action_id '
+            'WHERE examinations.run_id = ? ORDER BY examinations.id',
+            (run_id,),
+        ).fetchall()
+        return [self._candidate_record(row) for row in rows]
+
+    def _candidate_record(self, row: sqlite3.Row) -> CandidateRecord:
+        before_child = self.read_snapshot(row['child_snapshot_id'])
+        parent_snapshot_id = row['parent_snapshot_id']
+        applied = row['action_state'] == ActionState.APPLIED.value
+        after_child_snapshot_id = row['after_child_snapshot_id']
+        if not applied:
+            after_child: RecordSnapshot | None = before_child
+        elif after_child_snapshot_id is None:
+            after_child = None
+        else:
+            after_child = self.read_snapshot(after_child_snapshot_id)
+        return CandidateRecord(
+            run_id=row['run_id'],
+            project_id=row['project_id'],
+            child_id=row['child_id'],
+            parent_id=row['parent_id'],
+            before_child=before_child,
+            before_parent=(
+                None if parent_snapshot_id is None else self.read_snapshot(parent_snapshot_id)
+            ),
+            basis_source=None if row['basis_source'] is None else BasisSource(row['basis_source']),
+            basis_key=row['basis_key'],
+            decision=_DECISIONS[row['decision']],
+            disposition=Disposition(row['disposition']),
+            action_id=row['action_id'],
+            action_taken=row['action_value'] if applied else NO_ACTION_TAKEN,
+            after_child=after_child,
+            at=row['at'],
+        )
 
     def _insert_all_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
         at = _now()

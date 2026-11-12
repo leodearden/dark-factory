@@ -1,8 +1,8 @@
 """Link-heal runs (plans/write-triage-link-healing-prd.md H1, H2).
 
-A plan run decides every live link, ledgers the heals it stands behind and
-writes the plan document: a deterministic rendering of every pending heal,
-whose sha256 an operator can approve. It writes nothing to the store, and
+A plan run decides every live link, ledgers the heals it stands behind with one
+examination per decided link, and writes the plan document: a deterministic
+rendering of every pending heal, whose sha256 an operator can approve. It writes nothing to the store, and
 files nothing: every escape it would raise is recorded as ``would_escape``.
 Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
 link adjudicator (:func:`run_adjudicator_plan`), which is asked only about the
@@ -54,6 +54,7 @@ from fused_memory.maintenance.link_heal import (
     MISFILE_VERDICTS,
     BasisSource,
     LinkBasis,
+    LinkDecision,
     LinkImage,
     LinkReads,
     LinkState,
@@ -79,6 +80,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
     AdjudicationRecord,
     AdjudicationRow,
+    Disposition,
+    ExaminationRecord,
     LinkHealLedger,
     RunSource,
     UndoTarget,
@@ -401,33 +404,66 @@ def _plan_entry(row: ActionRow) -> dict[str, Any]:
     }
 
 
-@dataclass(frozen=True)
-class _StagedHeals:
-    """A plan's heals sorted against the ledger."""
-
-    standing: tuple[PlannedAction, ...]
-    new: tuple[PlannedAction, ...]
-    already_pending: int
-    undo_suppressed: int
+#: The dispositions of a heal the plan stands behind: new, or pending from before.
+_STANDING = frozenset({Disposition.STAGED, Disposition.ALREADY_PENDING})
 
 
-def _stage(actions: Iterable[PlannedAction], ledger: LinkHealLedger) -> _StagedHeals:
-    """Drop the heals an undo took back, and find those already pending."""
-    standing: list[PlannedAction] = []
-    new: list[PlannedAction] = []
-    suppressed = 0
-    for action in actions:
-        if ledger.is_undo_suppressed(action):
-            suppressed += 1
-            continue
-        standing.append(action)
-        if ledger.find_pending(action) is None:
-            new.append(action)
-    return _StagedHeals(
-        standing=tuple(standing),
-        new=tuple(new),
-        already_pending=len(standing) - len(new),
-        undo_suppressed=suppressed,
+def _stage(
+    decisions: Iterable[LinkDecision], ledger: LinkHealLedger,
+) -> tuple[ExaminationRecord, ...]:
+    """Each decision's examination: its heal dropped when an undo took it back,
+    matched to its row when already pending, else staged as new."""
+    return tuple(_examine(decision, ledger) for decision in decisions)
+
+
+def _examine(decision: LinkDecision, ledger: LinkHealLedger) -> ExaminationRecord:
+    planned = decision.planned
+    if planned is None:
+        return _examination(decision, Disposition.REPORTED)
+    if ledger.is_undo_suppressed(planned):
+        return _examination(decision, Disposition.UNDO_SUPPRESSED)
+    pending = ledger.find_pending(planned)
+    if pending is None:
+        return _examination(decision, Disposition.STAGED, staged=planned)
+    return _examination(decision, Disposition.ALREADY_PENDING, pending_action_id=pending.action_id)
+
+
+def _examination(
+    decision: LinkDecision,
+    disposition: Disposition,
+    *,
+    staged: PlannedAction | None = None,
+    pending_action_id: int | None = None,
+) -> ExaminationRecord:
+    state = decision.state
+    basis_source, basis_key = decision.basis_ref
+    return ExaminationRecord(
+        project_id=state.project_id,
+        child=state.child,
+        parent_id=state.link.parent_id,
+        parent=state.parent,
+        basis_source=basis_source,
+        basis_key=basis_key,
+        decision=decision.decision,
+        disposition=disposition,
+        staged=staged,
+        pending_action_id=pending_action_id,
+    )
+
+
+def _staged_counts(counts: RunCounts, examinations: Sequence[ExaminationRecord]) -> RunCounts:
+    dispositions = Counter(examination.disposition for examination in examinations)
+    standing = [
+        examination.decision.value
+        for examination in examinations
+        if examination.disposition in _STANDING
+    ]
+    return replace(
+        counts,
+        planned=len(standing),
+        planned_by_action=Counter(standing),
+        already_pending=dispositions[Disposition.ALREADY_PENDING],
+        undo_suppressed=dispositions[Disposition.UNDO_SUPPRESSED],
     )
 
 
@@ -473,19 +509,14 @@ async def _publish_plan(
 ) -> RunReport:
     """Stage *plan* against the ledger, write its document, and finish *run_id*.
 
+    Its examinations commit with its new heals, or roll back with them.
     *escapes*, and the backlog and share escapes an apply of *source*'s pending
     heals would raise now, are recorded as ``would_escape``.
     """
-    staged = _stage(plan.actions, ledger)
-    counts = replace(
-        plan.counts,
-        planned=len(staged.standing),
-        planned_by_action=Counter(action.action.value for action in staged.standing),
-        already_pending=staged.already_pending,
-        undo_suppressed=staged.undo_suppressed,
-    )
+    examinations = _stage(plan.decisions, ledger)
+    counts = _staged_counts(plan.counts, examinations)
     try:
-        with ledger.publishing_planned(run_id, staged.new, source) as pending:
+        with ledger.publishing_planned(run_id, examinations, source) as pending:
             document = render_plan_document(pending)
             await asyncio.to_thread(atomic_write_text, plan_path, document.decode('utf-8'))
     except OSError as failure:

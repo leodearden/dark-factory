@@ -23,6 +23,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
     AdjudicationRecord,
     AmbiguousRun,
+    Disposition,
+    ExaminationRecord,
     LinkHealLedger,
     NothingToUndo,
     RunKind,
@@ -691,13 +693,30 @@ class TestActions:
         assert (step.undo_run_id, step.after) == (first_undo, part_way)
 
 
+def _staged(planned: PlannedAction) -> ExaminationRecord:
+    """The examination that stages *planned* as a new heal."""
+    return ExaminationRecord(
+        project_id=planned.project_id,
+        child=LiveRecord(
+            memory_id=planned.child_id, text='child', metadata=planned.pre_image.as_dict(),
+        ),
+        parent_id=planned.pre_image.parent_id,
+        parent=None,
+        basis_source=planned.basis_source,
+        basis_key=planned.basis_key,
+        decision=planned.action,
+        disposition=Disposition.STAGED,
+        staged=planned,
+    )
+
+
 class TestPublishingPlanned:
     def test_yields_the_pending_rows_with_the_new_ones_and_commits_them(self, ledger):
         earlier = ledger.start_run(RunSource.CORPUS, writes=False)
         ledger.add_planned(earlier, [_planned(1)])
         run_id = ledger.start_run(RunSource.CORPUS, writes=False)
 
-        with ledger.publishing_planned(run_id, [_planned(2)], RunSource.CORPUS) as pending:
+        with ledger.publishing_planned(run_id, [_staged(_planned(2))], RunSource.CORPUS) as pending:
             assert [row.planned for row in pending] == [_planned(1), _planned(2)]
 
         assert [row.planned for row in ledger.run_actions(run_id)] == [_planned(2)]
@@ -707,7 +726,7 @@ class TestPublishingPlanned:
 
         with (
             pytest.raises(OSError, match='disk full'),
-            ledger.publishing_planned(run_id, [_planned(1)], RunSource.CORPUS),
+            ledger.publishing_planned(run_id, [_staged(_planned(1))], RunSource.CORPUS),
         ):
             raise OSError('disk full')
 
