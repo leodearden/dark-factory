@@ -14,15 +14,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _zcode_fixture import (
-    BASE_URL,
+from _operator_home_fixture import (
     OPERATOR_EMAIL,
     OPERATOR_ENV_VARS,
     OPERATOR_IGNORED_FILE,
-    measured_output,
-    plan_tools_mcp,
     write_operator_home,
 )
+from _zcode_fixture import BASE_URL, measured_output, plan_tools_mcp
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch

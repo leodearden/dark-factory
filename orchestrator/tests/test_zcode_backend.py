@@ -15,14 +15,8 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from _zcode_fixture import (
-    BASE_URL,
-    OPERATOR_EMAIL,
-    OPERATOR_IGNORED_FILE,
-    measured_output,
-    plan_tools_mcp,
-    write_operator_home,
-)
+from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
+from _zcode_fixture import BASE_URL, measured_output, plan_tools_mcp
 from shared.cli_invoke import _SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
