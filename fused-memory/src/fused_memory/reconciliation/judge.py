@@ -3,7 +3,9 @@
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -246,6 +248,25 @@ class JudgeInfraError(Exception):
         self.code = code
 
 
+class NoVerdictReason(StrEnum):
+    RUN_NOT_FOUND = 'run_not_found'
+    PROJECT_HALTED = 'project_halted'
+    JUDGE_INFRA_FAILURE = 'judge_infra_failure'
+    REVIEW_ERROR = 'review_error'
+
+
+@dataclass(frozen=True)
+class NoVerdict:
+    """Why :meth:`Judge.review_run` produced no verdict for *run_id*.
+
+    Never truthy-tested as a verdict: callers dispatch with ``isinstance``.
+    """
+
+    run_id: str
+    reason: NoVerdictReason
+    detail: str = ''
+
+
 class Judge:
     """Async LLM reviewer that evaluates reconciliation run quality."""
 
@@ -320,17 +341,17 @@ class Judge:
                 f'grace={dict(self._unhalt_grace_remaining)} reasons={reasons}'
             )
 
-    async def review_run(self, run_id: str) -> JudgeVerdict | None:
+    async def review_run(self, run_id: str) -> JudgeVerdict | NoVerdict:
         """Review a completed reconciliation run asynchronously."""
         try:
             run = await self.journal.get_run(run_id)
             if run is None:
                 logger.warning(f'Judge: run {run_id} not found')
-                return None
+                return NoVerdict(run_id, NoVerdictReason.RUN_NOT_FOUND)
 
             if run.project_id in self._halted_projects:
                 logger.warning(f'Judge: project {run.project_id} is halted, skipping review')
-                return None
+                return NoVerdict(run_id, NoVerdictReason.PROJECT_HALTED)
 
             combined_actions = await self.journal.get_run_actions_combined(run_id)
             recent_verdicts = await self.journal.get_recent_verdicts(
@@ -429,12 +450,12 @@ class Judge:
             return verdict
 
         except Exception as e:
-            logger.error(f'Judge review failed for run {run_id}: {e}')
-            return None
+            logger.error(f'Judge review failed for run {run_id}: {e}', exc_info=True)
+            return NoVerdict(run_id, NoVerdictReason.REVIEW_ERROR, f'{type(e).__name__}: {e}')
 
     async def _handle_infra_failure(
         self, project_id: str, run_id: str, err: JudgeInfraError,
-    ) -> None:
+    ) -> NoVerdict:
         """Bounded-backoff handling for a judge transport/infra failure (task 2947).
 
         A JudgeInfraError means the judge CLI was unreachable/broken for this run
@@ -444,7 +465,7 @@ class Judge:
         infra failures per project:
 
         - below ``config.judge_infra_max_consecutive_failures``: log a structured
-          warning and return None — no verdict is stamped and no halt fires, so a
+          warning and return no verdict — none is stamped and no halt fires, so a
           transient outage (e.g. an account-cap storm) is given room to recover.
         - at the threshold: reset the streak (so a post-halt recovery
           starts clean) and, when ``halt_on_judge_serious`` is set, apply a
@@ -452,7 +473,8 @@ class Judge:
           infra_issue escalation via the harness. Gated on the same master switch
           as the serious-verdict halt.
 
-        Always returns None (review_run propagates it as the run's result). The
+        Always returns a JUDGE_INFRA_FAILURE :class:`NoVerdict` (review_run
+        propagates it as the run's result). The
         infra streak is reset elsewhere on any successful transport (see
         review_run), so only genuinely-consecutive failures reach the threshold.
         """
@@ -478,7 +500,7 @@ class Judge:
                     'code': getattr(err, 'code', None),
                 },
             )
-            return None
+            return NoVerdict(run_id, NoVerdictReason.JUDGE_INFRA_FAILURE, str(err))
 
         # Threshold reached: reset the streak so a later recovery starts clean,
         # then (if enabled) halt truthfully.
@@ -500,7 +522,7 @@ class Judge:
                 f'{project_id}, but halt_on_judge_serious is disabled — not '
                 f'halting; last error: {err}'
             )
-        return None
+        return NoVerdict(run_id, NoVerdictReason.JUDGE_INFRA_FAILURE, str(err))
 
     def _build_review_prompt(self, run, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
