@@ -9,8 +9,9 @@ import os
 import sys
 from pathlib import Path
 
-from df_pytest_isolation import wait_pid_gone
 from process_group_run import run_process_group
+
+from df_pytest_isolation import wait_pid_gone
 
 
 def test_the_run_returns_the_leaders_exit_status_and_each_stream_separately(
