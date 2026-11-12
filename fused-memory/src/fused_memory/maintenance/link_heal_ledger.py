@@ -3,7 +3,9 @@
 ``link_heal.db`` is the one home of heal history and of the link adjudicator's
 verdicts: an adjudication is stored nowhere else (D8). Every table keys on an
 AUTOINCREMENT id, so a ``sqlite_sequence`` row proves something has written
-here (INV-13). Detail and counts are stored as JSON.
+here (INV-13). Detail and counts are stored as JSON. A record a run read is
+kept whole as a content-addressed :class:`RecordSnapshot`, stored once per
+distinct state. Nothing here is ever pruned.
 
 :class:`RunLock` keeps runs one at a time: an exclusive ``flock`` plus a JSON
 record of its holder. The kernel drops a crashed holder's ``flock``, which is
@@ -24,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
@@ -34,6 +37,12 @@ from fused_memory.maintenance.link_heal import (
     LinkImage,
     PlannedAction,
     Verdict,
+)
+from fused_memory.maintenance.link_heal_store import (
+    CREATED_AT_KEY,
+    UPDATED_AT_KEY,
+    LiveRecord,
+    text_sha256,
 )
 
 LEDGER_FILENAME = 'link_heal.db'
@@ -130,7 +139,29 @@ CREATE TABLE IF NOT EXISTS actions (
     undone_run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS actions_by_link ON actions (project_id, child_id);
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    metadata_sha256 TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS snapshots_by_state
+    ON snapshots (project_id, memory_id, content_sha256, metadata_sha256);
 """
+
+#: Columns added after their table first shipped: an older ledger gains them in place.
+_ADDED_COLUMNS = (
+    ('runs', 'plan_path', 'TEXT'),
+    ('adjudications', 'prompt_sha256', 'TEXT'),
+    ('actions', 'before_child_snapshot_id', 'INTEGER'),
+    ('actions', 'before_parent_snapshot_id', 'INTEGER'),
+    ('actions', 'after_child_snapshot_id', 'INTEGER'),
+)
 
 _ACTION_COLUMNS = (
     'actions.id, actions.run_id, project_id, child_id, action, pre_image_json, '
@@ -167,6 +198,10 @@ def _loads_or_none(text: str | None) -> Any:
 
 class UnknownRun(LookupError):
     """No run has that id or prefix."""
+
+
+class UnknownSnapshot(LookupError):
+    """No snapshot has that id."""
 
 
 class AmbiguousRun(LookupError):
@@ -253,6 +288,27 @@ class AdjudicationRow:
 
 
 @dataclass(frozen=True)
+class RecordSnapshot:
+    """One record exactly as a link-heal read returned it."""
+
+    snapshot_id: int
+    project_id: str
+    memory_id: str
+    content: str
+    content_sha256: str
+    metadata: Mapping[str, Any]
+    metadata_sha256: str
+    created_at: str | None
+    updated_at: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'metadata', MappingProxyType(dict(self.metadata)))
+
+    def link_image(self) -> LinkImage:
+        return LinkImage.from_metadata(self.metadata)
+
+
+@dataclass(frozen=True)
 class UndoStepRow:
     """One write an undo run made (or skipped) to take a heal back."""
 
@@ -277,8 +333,8 @@ class LinkHealLedger:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        # A ledger written before runs.plan_path existed.
-        add_column_if_missing_sync(self._conn, 'runs', 'plan_path', 'TEXT')
+        for table, column, column_ddl in _ADDED_COLUMNS:
+            add_column_if_missing_sync(self._conn, table, column, column_ddl)
         self._conn.commit()
 
     def close(self) -> None:
@@ -551,6 +607,40 @@ class LinkHealLedger:
         )
         return [Verdict(verdict) for (verdict,) in rows]
 
+    def snapshot(self, project_id: str, record: LiveRecord) -> int:
+        """The id of *record*'s snapshot, stored now unless this exact state already is."""
+        with self._conn:
+            return self._snapshot_id(project_id, record)
+
+    def _snapshot_id(self, project_id: str, record: LiveRecord) -> int:
+        """:meth:`snapshot` inside the caller's transaction."""
+        metadata_json = json.dumps(dict(record.metadata), sort_keys=True)
+        state = (project_id, record.memory_id, record.text_sha256, text_sha256(metadata_json))
+        self._conn.execute(
+            'INSERT OR IGNORE INTO snapshots (project_id, memory_id, content_sha256, '
+            'metadata_sha256, content, metadata_json, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                *state, record.text, metadata_json,
+                _payload_text(record.metadata, CREATED_AT_KEY),
+                _payload_text(record.metadata, UPDATED_AT_KEY),
+            ),
+        )
+        (snapshot_id,) = self._conn.execute(
+            'SELECT id FROM snapshots WHERE project_id = ? AND memory_id = ? '
+            'AND content_sha256 = ? AND metadata_sha256 = ?',
+            state,
+        ).fetchone()
+        return snapshot_id
+
+    def read_snapshot(self, snapshot_id: int) -> RecordSnapshot:
+        row = self._conn.execute(
+            'SELECT * FROM snapshots WHERE id = ?', (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise UnknownSnapshot(f'no link-heal snapshot {snapshot_id} in {self.db_path}')
+        return _snapshot(row)
+
     def _action_rows(self, sql: str, params: Sequence[Any]) -> list[ActionRow]:
         return [_action_row(row) for row in self._conn.execute(sql, params)]
 
@@ -560,6 +650,25 @@ def _lastrowid(cursor: sqlite3.Cursor) -> int:
     if rowid is None:
         raise RuntimeError('sqlite reported no row id for an insert')
     return rowid
+
+
+def _payload_text(metadata: Mapping[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _snapshot(row: sqlite3.Row) -> RecordSnapshot:
+    return RecordSnapshot(
+        snapshot_id=row['id'],
+        project_id=row['project_id'],
+        memory_id=row['memory_id'],
+        content=row['content'],
+        content_sha256=row['content_sha256'],
+        metadata=json.loads(row['metadata_json']),
+        metadata_sha256=row['metadata_sha256'],
+        created_at=row['created_at'],
+        updated_at=row['updated_at'],
+    )
 
 
 def _run_row(row: sqlite3.Row) -> RunRow:

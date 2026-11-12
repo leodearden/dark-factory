@@ -260,13 +260,13 @@ SNAPSHOT_META = {
 }
 
 
-def _record(text: str = 'the child note', **meta_changes) -> LiveRecord:
+def _live_record(text: str = 'the child note', **meta_changes) -> LiveRecord:
     return LiveRecord(memory_id=_child(1), text=text, metadata={**SNAPSHOT_META, **meta_changes})
 
 
 class TestSnapshots:
     def test_a_snapshot_holds_the_full_record_and_its_hashes(self, ledger):
-        snapshot_id = ledger.snapshot(PROJECT, _record())
+        snapshot_id = ledger.snapshot(PROJECT, _live_record())
 
         assert isinstance(snapshot_id, int)
         snapshot = ledger.read_snapshot(snapshot_id)
@@ -291,9 +291,9 @@ class TestSnapshots:
         assert snapshot.updated_at is None
 
     def test_an_identical_record_reuses_its_snapshot(self, ledger):
-        first = ledger.snapshot(PROJECT, _record())
+        first = ledger.snapshot(PROJECT, _live_record())
 
-        assert ledger.snapshot(PROJECT, _record()) == first
+        assert ledger.snapshot(PROJECT, _live_record()) == first
 
     @pytest.mark.parametrize(
         'changed',
@@ -305,17 +305,17 @@ class TestSnapshots:
         ids=['content', 'one-key', 'nested-value'],
     )
     def test_a_changed_record_is_a_new_snapshot(self, ledger, changed):
-        first = ledger.snapshot(PROJECT, _record())
+        first = ledger.snapshot(PROJECT, _live_record())
 
-        assert ledger.snapshot(PROJECT, _record(**changed)) != first
+        assert ledger.snapshot(PROJECT, _live_record(**changed)) != first
 
     def test_the_same_record_in_another_project_is_a_new_snapshot(self, ledger):
-        first = ledger.snapshot(PROJECT, _record())
+        first = ledger.snapshot(PROJECT, _live_record())
 
-        assert ledger.snapshot('reify', _record()) != first
+        assert ledger.snapshot('reify', _live_record()) != first
 
     def test_a_snapshot_is_frozen_and_reads_its_link(self, ledger):
-        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, _record()))
+        snapshot = ledger.read_snapshot(ledger.snapshot(PROJECT, _live_record()))
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             snapshot.content = 'changed'  # type: ignore[misc]
@@ -326,7 +326,7 @@ class TestSnapshots:
             ledger.read_snapshot(4242)
 
     def test_sqlite_sequence_carries_snapshots_once_one_is_written(self, ledger):
-        ledger.snapshot(PROJECT, _record())
+        ledger.snapshot(PROJECT, _live_record())
 
         conn = sqlite3.connect(ledger.db_path)
         try:
