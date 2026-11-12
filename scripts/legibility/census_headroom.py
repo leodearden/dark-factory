@@ -46,7 +46,7 @@ class CensusHeadroomExhausted(Exception):
 
     Not an error in the census -- an external condition that makes the
     stage's output untrustworthy. It exists so an infra failure can never
-    be laundered into a verdict: ``adjudicate`` catches it and defers
+    be laundered into a verdict: ``census_run.adjudicate`` catches it and defers
     before any persistence, instead of the cap-poisoned clusters landing
     in the codebook as ordinary rejections.
 
@@ -65,7 +65,7 @@ class CensusHeadroomExhausted(Exception):
     and ``unverified == remaining``; at the backstop site it already IS
     adjudicated, so ``verified + rejected == index + 1`` and ``unverified
     == remaining - 1``. The total is therefore derivable by any reader and
-    is NOT threaded separately -- see ``_defer``, which sums it, so the
+    is NOT threaded separately -- see ``census_run.py::_defer``, which sums it, so the
     raise sites cannot disagree about what "total" means.
     """
 
@@ -143,7 +143,7 @@ def stage_headroom_gate(invoke, *, model: str, stage: CensusStage) -> HeadroomRe
     Gates exist only where an unnoticed cap CORRUPTS output, not at every
     stage transition. Today that means the preflight and this one, before
     verification. There is deliberately NO gate before synthesis: a cap
-    there makes ``synthesize_fn`` RAISE, which propagates into ``main()``'s
+    there makes ``synthesize_fn`` RAISE, which propagates into ``census.main()``'s
     hard-failure path and is already loud and already distinguishable from
     a verification result -- so a gate there would only abort a run whose
     ``verified`` list is complete and honest, discarding work that was

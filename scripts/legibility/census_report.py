@@ -150,8 +150,8 @@ class DryRunFiling:
 
     ``payload_count`` is how many payloads the file holds. Reused by both
     ``render_report`` (which must not let a run that filed nothing read as a
-    normal run that had nothing to file) and ``Done``/``Unlanded`` (so
-    ``main``'s summary line can name the review file instead of printing a
+    normal run that had nothing to file) and ``census_run.Done``/``census_run.Unlanded``
+    (so ``census.main``'s summary line can name the review file instead of printing a
     misleading ``filed_tickets=0``). ``None`` in place of this record means
     the run filed normally."""
 
@@ -672,7 +672,7 @@ class DroppedVerdict:
 
     verdict: str
     """``"verified"`` or ``"rejected"`` -- which adjudication loop paid for it.
-    Inverts against ``standing_disposition``; see :func:`_dropped_verdict`."""
+    Inverts against ``standing_disposition``; see :func:`dropped_verdict`."""
 
     title: str | None
     kind: str
@@ -712,7 +712,7 @@ _DROPPED_VERDICT_LOSS = {
     ),
 }
 """What a CONTRADICTED drop actually COSTS, per loop -- the one clause
-:func:`_dropped_verdict_message` cannot render uniformly, because the two
+:func:`dropped_verdict_message` cannot render uniformly, because the two
 losses differ in substance and not merely in wording."""
 
 

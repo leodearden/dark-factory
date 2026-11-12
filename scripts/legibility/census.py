@@ -1,38 +1,17 @@
 #!/usr/bin/env python3
-"""scripts/legibility/census.py — periodic legibility census runner.
+"""The legibility census CLI: ``census.py --project-root <root> [--force] ...``.
 
-Task eta (η) of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.7 "Census runner", contract §7, decisions 4/5/6/9, boundary test §8.7).
-The LEAF that consumes every prior legibility module: beta's (β)
-inventory/sampling, alpha's (α) digest, delta's (δ) trickle coder, gamma's
-(γ) codebook merger, zeta's (ζ) census trigger/state.
+:func:`main` gates on ``census_trigger.decide_for_project`` unless
+``--force``, wires the real seams -- one pooled session runner whose
+per-stage invokes (:func:`census_stage_specs`) back mining, the headroom
+probe, ``census_verify.build_verify_fn`` and :func:`build_synthesize_fn`;
+the fused-memory ``submit_task`` poster and task store
+(``alarm.post_tool_call``); ``alarm.raise_alarm`` for escalations; the
+landing gate, the scoped commit and its rollback -- and runs
+``census_run.run_census``. A deferral, a NO-FIRE or a landed run exits 0; a
+run that did not land, or any fail-loud error, exits 1.
 
-Flow (§5.7): ``run_census`` runs a usage-headroom preflight, then the
-stages ``mine`` (Sonnet miners, to saturation), ``merge``, ``adjudicate``
-(Sonnet verification against current main), ``place_verdicts``,
-``synthesize`` (Fable; the origin x manifestation matrix of a dated
-``plans/confusion-census-<date>.md`` report), ``plan_filing`` and
-``persist`` (curator-path filing, the report, the codebook, the census
-state, the project's landing gate and one scoped commit, or a rollback).
-``--force`` for operator-initiated runs.
-
-Every LLM / MCP / git / disk side effect of a run is a field of
-``CensusEffects``, always faked in this module's own test suite.
-
-Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
-adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
-Fable ONLY for synthesis, read from ``config.Models``
-(``census_miner``/``census_verify``/``census_synthesis``).
-
-Codebook handling (PRD decision 1 -- sole writer, never delete): new
-mining sightings/candidates merge through the EXISTING
-``codebook.apply_coding_records``. The census's lifecycle transitions
-(promote/reject/retire/file) are ``codebook_lifecycle``'s transforms over
-its legal-transition table, persisted via ``codebook.dump()`` after
-``codebook.validate()`` and ``codebook.assert_no_deletion()`` confirm the
-write is safe. The contract finding fields those transforms stamp (finding
-identity, run history) are defined in ``codebook.py``'s schema and minted by
-``census_findings.py``.
+Layers (measured in task 6753's plan): census_headroom, census_mining < census_report, census_verify < census_filing < census_run < census.
 """
 from __future__ import annotations
 
@@ -55,23 +34,15 @@ from typing import assert_never
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Bind `shared` to the SAME checkout as this script via a __file__-relative
-# path, never a hardcoded absolute. An editable install puts the MAIN
-# checkout's shared/src on sys.path for a bare `python3`, so without this a
-# copy of this script running from a worktree would scan cap-banner text using
-# the MAIN checkout's marker list rather than its own. Same reasoning and same
-# form as scripts/audit_combine_gate_marker_loss.py:74-84 and
-# scripts/repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329), with
-# parents[2] rather than parent.parent because census.py sits one directory
-# deeper (scripts/legibility/, not scripts/). Unconditional -- NOT inside the
-# `__main__` guard above -- because the `shared.cap_markers` import it enables
-# is module-level, so it must resolve under pytest and package import too.
+# Bind `shared` and `orchestrator` to the SAME checkout as this script via a
+# __file__-relative path, never the MAIN checkout an editable install puts on
+# sys.path (tasks 2881/2882/3329). Unconditional, not inside the `__main__`
+# guard above, so it holds under pytest and package import too;
+# `orchestrator.agents.code_quality` renders the synthesis prompt's quality
+# definition (docs/quality-findings-contract.md §10).
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
-# orchestrator/src is bound the same way, for the stdlib-only quality
-# definition renderer `orchestrator.agents.code_quality` both census prompts
-# embed (docs/quality-findings-contract.md §10).
 _ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
@@ -105,15 +76,6 @@ logger = logging.getLogger("legibility.census")
 class CensusPreconditionFailed(RuntimeError):
     """A check before any spend refused this run."""
 
-
-# ---------------------------------------------------------------------------
-# Real default seams for the standalone CLI -- every one of these is
-# ALWAYS replaced by a fake in this module's own test suite; nothing here
-# is unit-tested directly (integration-only, exercised by a live --force
-# run per this task's acceptance criterion). Mirrors nightly.py's /
-# census_trigger.py's identical "module-level default_* builders behind
-# the real subprocess/httpx boundary" convention.
-# ---------------------------------------------------------------------------
 
 DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 """Root of the encoded ~/.claude/projects session-transcript tree that
@@ -158,7 +120,7 @@ def _synthesis_prompt(brief: synthesis.Brief, *, quality_block: str) -> str:
 def build_synthesize_fn(invoke):
     """Build the real ``synthesize_fn(brief, *, model) -> str`` seam: one
     Fable call via *invoke*, its raw reply left for ``synthesis.parse``. It
-    always calls: run_census makes no call for an empty brief."""
+    always calls: census_run.run_census makes no call for an empty brief."""
     quality_block = code_quality.guidance()
 
     def _synthesize_fn(brief: synthesis.Brief, *, model: str) -> str:
@@ -186,11 +148,6 @@ def default_submit_fn(**kwargs) -> dict:
         _fused_memory_base_url(), "submit_task", kwargs, timeout=30.0, client_name="legibility-census",
     )
 
-
-# ---------------------------------------------------------------------------
-# main(argv) -- CLI: `python scripts/legibility/census.py --project-root <root>
-#                      [--config <path>] [--force]`
-# ---------------------------------------------------------------------------
 
 def _parse_cli_date(value: str) -> date:
     return date.fromisoformat(value)
@@ -278,7 +235,7 @@ def build_stage_invokes(cfg, *, project_root, runner):
     """The three per-stage ``invoke(prompt, model)`` seams on *runner*:
     ``(mining_invoke, verify_invoke, synthesis_invoke)``, one per
     :func:`census_stage_specs` entry. ``mining_invoke`` also backs the
-    headroom probe (``run_census`` routes both through its single ``invoke``
+    headroom probe (``census_run.run_census`` routes both through its single ``invoke``
     param), so the probe rotates over the pool exactly as mining does."""
     return tuple(
         runner.invoker(spec)
@@ -294,7 +251,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     task epsilon's nightly trickle, only launches this entrypoint when
     zeta already fired) and no-ops -- prints the NO-FIRE reasons, exit 0 --
     when it would not fire. ``--force`` bypasses the gate entirely and is
-    recorded in the report header as operator-initiated (``run_census``'s
+    recorded in the report header as operator-initiated (``census_run.run_census``'s
     own ``force`` parameter).
 
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
@@ -304,7 +261,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     a :class:`census_window.WindowBatchSource` over the mining window,
     ``unlanded.commit_only`` for the scoped commit, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
-    ``run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
+    ``census_run.run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
     names the project whose task tree receives harness-owned fix surfaces,
     and is loaded before the trigger gate so an unloadable one fails loud
     rather than quietly filing them into the censused project.
@@ -332,7 +289,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     ``type=_positive_int``, so a nonsense value (0 or negative) exits 2 at
     the CLI boundary instead of being half-applied. None of the three lets
     a bounded run masquerade as a complete one -- see
-    ``census_report_sections``.
+    ``census_report.census_report_sections``.
 
     Each run gets a fresh ``census_identity.RunIdentity``
     (``census_identity.allocate_run_identity``), so a second census on one
@@ -343,7 +300,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     Returns non-zero only on a genuine fail-loud error. Every such exit
     after the config has loaded has raised exactly one ERROR alarm:
     :func:`alarm.fail_loud_boundary`'s for any raise, a refused precondition
-    included, or ``run_census``'s own for an ``Unlanded`` census whose
+    included, or ``census_run.run_census``'s own for an ``Unlanded`` census whose
     commit did not land. Before the config loads there is no escalation target, so a bad
     ``--project-root`` or an unloadable config is reported on stderr only.
     A deferred (headroom-preflight) outcome still exits 0, mirroring
@@ -430,7 +387,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
     # passed relative by an operator. An unresolved relative root would make
     # the stage cwd binding below vacuous (cwd="." IS the launcher's cwd —
     # exactly the bug that binding exists to close) and would silently falsify
-    # _verify_prompt's own "ABSOLUTE paths only" contract, since it
+    # census_verify.py::_verify_prompt's "ABSOLUTE paths only" contract, since it
     # interpolates str(project_root) straight into the prompt. One resolve()
     # at the CLI boundary makes the prompt text, the subprocess cwd and all
     # four output paths name the same absolute tree.
@@ -482,7 +439,7 @@ def _run_configured_census(
     config_path: Path, escalate_fn,
 ) -> int:
     """:func:`main`'s run once *cfg* has loaded. Raises on every failure but an
-    ``Unlanded`` outcome, which ``run_census`` has already escalated."""
+    ``Unlanded`` outcome, which ``census_run.run_census`` has already escalated."""
     mismatch = config.project_root_mismatch(project_root, cfg, config_path)
     if mismatch is not None:
         raise CensusPreconditionFailed(mismatch)
@@ -616,7 +573,7 @@ def _run_configured_census(
 
 def _exit_code(outcome: census_run.CensusOutcome) -> int:
     """Print *outcome*'s one summary line and return main's exit code: 0 for a
-    deferral or a landed run, 1 for a run that did not land, which run_census
+    deferral or a landed run, 1 for a run that did not land, which census_run.run_census
     has already escalated."""
     match outcome:
         case census_run.Deferred(stage=stage, reason=reason, counts=counts):

@@ -108,7 +108,7 @@ class BatchStats:
 
     ``status`` mirrors ``coder.RunResult.status`` (``coder.CodingStatus``;
     FAILURE is a storm, PRD §8.6, when this batch's failed/total fraction
-    strictly exceeds 0.5): surfaced so a caller (``run_census``,
+    strictly exceeds 0.5): surfaced so a caller (``census_run.run_census``,
     or any future one) can tell a batch's ``dup_rate`` was drawn from a
     small, skewed, storm-degraded sample rather than a healthy one, even
     though ``saturated`` already accounts for it (a storm batch is never
@@ -124,7 +124,7 @@ class BatchStats:
 
     @classmethod
     def from_record(cls, stats: Mapping[str, Any]) -> BatchStats:
-        """The batch as the census record holds it (:func:`build_census_record`),
+        """The batch as the census record holds it (:func:`census_report.build_census_record`),
         its status a JSON string; one outside ``coder.CodingStatus`` raises
         ``ValueError``."""
         return cls(**{**stats, "status": coder.CodingStatus(stats["status"])})
@@ -141,7 +141,7 @@ class MiningResult:
 
     ``max_batches`` echoes the operator cap this run was given (``None``
     when uncapped -- the default). It travels on the result so
-    ``render_report`` can state the cap and its coverage consequence from
+    ``census_report.render_report`` can state the cap and its coverage consequence from
     the mining facts it is already handed, without a second parameter."""
 
     records: list[dict] = field(default_factory=list)
@@ -201,7 +201,7 @@ def mine_to_saturation(
     The aggregate does not merely ADD to the flood: the
     ``coder.code_digests`` call is wrapped in ``_bounded_coder_warnings``,
     which caps its per-digest WARNINGs at
-    ``_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH`` for the duration of THIS
+    ``MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH`` for the duration of THIS
     call only, and the aggregate names how many lines that bound dropped.
     The bound is caller-scoped by construction and removed in a ``finally``
     -- ``nightly.run_nightly``'s trickle keeps full per-digest visibility.
@@ -217,7 +217,7 @@ def mine_to_saturation(
     pulled, so a capped-away batch costs no digest render and no
     ``coder.code_digests`` call. A capped run is deliberately PARTIAL
     coverage: sessions beyond the cap were never mined, and
-    ``render_report`` says so in as many words. The saturation check
+    ``census_report.render_report`` says so in as many words. The saturation check
     deliberately PRECEDES the cap check, so a run that saturates on
     exactly the capped batch reports the stronger, more informative
     ``"saturated"`` (novelty genuinely exhausted -- coverage was

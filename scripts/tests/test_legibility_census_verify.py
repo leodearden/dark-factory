@@ -76,7 +76,7 @@ def _quality_block_of(prompt):
 # task 3645 / DEFECT 3: a cap arriving DURING verification must never be
 # laundered into a verdict.
 #
-# _build_default_verify_fn fails CLOSED per cluster: any invocation error or
+# census_verify.build_verify_fn fails CLOSED per cluster: any invocation error or
 # parse failure appends the cluster to `rejected` and continues. That is the
 # right default for a genuinely unverifiable CLAIM, and exactly wrong for an
 # infra failure -- a cap mid-verify silently mass-rejects the remaining
@@ -572,7 +572,7 @@ def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headr
 # whole run: an operator reading "1 verified, 3 unverified" of a 5-cluster
 # run cannot tell whether the missing cluster was work already spent or a
 # bookkeeping bug. A rejection is real, paid-for adjudication, not an
-# absence. Every case below drives the REAL `_build_default_verify_fn` (never
+# absence. Every case below drives the REAL `census_verify.build_verify_fn` (never
 # a hand-raised exception) and arranges at least one PRECEDING rejection, so
 # the divergence the current two counts hide is actually present.
 # ---------------------------------------------------------------------------

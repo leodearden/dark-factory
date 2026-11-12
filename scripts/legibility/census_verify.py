@@ -21,7 +21,7 @@ logger = logging.getLogger("legibility.census.verify")
 
 _VERIFY_PROBE_EVERY = 5
 """How many clusters the default verifier adjudicates between backstop
-headroom probes (``_build_default_verify_fn``'s third, weakest detector).
+headroom probes (``build_verify_fn``'s third, weakest detector).
 
 The trade-off this number sets: one extra trickle-tier probe per N
 clusters, against up to N-1 clusters of misattributed verdicts in the one
@@ -41,7 +41,7 @@ def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> s
     judged against *quality_block* (``code_quality.guidance``).
 
     The CLI subprocess this prompt is delivered to runs with its cwd set to
-    *project_root* (``census_stage_specs`` binds it). That is load-bearing
+    *project_root* (``census.census_stage_specs`` binds it). That is load-bearing
     for a reason that is NOT relative-path resolution: the CLI
     SANDBOXES tool access to the cwd tree, so a verifier launched from
     anywhere else has every Read/Bash against this tree permission-denied,
@@ -109,7 +109,7 @@ def _verdict_of(cluster: dict, *, project_root: str) -> verdict_mod.Verdict:
 
 def verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
     """*verified*, every cluster carrying a Verdict (``_verdict_of``) and
-    that Verdict's remediation (``_with_verdict``)."""
+    that Verdict's remediation (``with_verdict``)."""
     verdictless = [
         cluster.get("title")
         for cluster in verified
@@ -136,118 +136,42 @@ def build_verify_fn(
 ):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (in production the pooled runner's verify
-    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``
-    and then ``verdict.parse_verdict``: verified and refuted clusters carry
-    their parsed Verdict under ``"verdict"``. Any per-cluster failure (invocation error, unparseable output) rejects
-    that cluster rather than crashing the whole census -- a conservative
-    fail-closed default for an unverifiable claim. This default never
-    reports a "fixed" entry (a stronger claim than a per-cluster verify
-    prompt is designed to elicit).
+    stage, ``census.census_stage_specs``), parsed via
+    ``coder.parse_coder_output`` and then ``verdict.parse_verdict``: verified
+    and refuted clusters carry their parsed Verdict under ``"verdict"``.
 
-    That fail-closed default is correct, and it is also what made the
-    2026-08-03 sandbox gap SILENT: with the CLI subprocess rooted outside
-    the censused tree, every permission-denied verifier read became an
-    ordinary per-cluster rejection, so a whole census mass-rejected without
-    a single error surfacing. What keeps the default honest rather than
-    indiscriminate is ``census_stage_specs`` scoping the subprocess cwd to
-    *project_root* -- a rejection then means the claim really could not be
-    verified, not that the verifier could not see the tree.
+    Fail-closed per cluster: any per-cluster failure (an invocation error,
+    unparseable output, a reply that is no verdict) rejects that cluster
+    rather than crashing the census, and no "fixed" entry is ever reported.
+    A rejection means the claim could not be verified only because
+    ``census.census_stage_specs`` roots the verifier's cwd in *project_root*;
+    ``census_run.run_census`` flags the all-rejected signature any other
+    infra cause leaves.
 
-    Scoping the cwd removed one CAUSE, not the class: a model that goes
-    unreachable mid-run, a different permission denial, or persistently
-    unparseable verdicts all still land here as ordinary rejections. So
-    ``run_census`` additionally DETECTS the signature -- clusters offered,
-    none verified -- and says so loudly rather than quietly reporting an
-    empty census.
+    A usage cap is carved out of that default: it is an infra failure, never
+    a verdict. With *headroom_probe* supplied, three detectors raise
+    ``census_headroom.CensusHeadroomExhausted`` (stage VERIFY; the hitting
+    cluster is counted unverified, never rejected):
 
-    **The cap case is carved out of the fail-closed default.** A usage cap
-    is an infra failure, not a verdict about a claim, and must never be
-    laundered into one -- that is the same silent-mass-rejection class the
-    2026-08-03 incident above describes, arriving by a different route and
-    invisible to the all-rejected detector whenever a cap lands partway
-    through (some clusters verified, so the total-wipeout signature never
-    fires). When *headroom_probe* is supplied, two detectors fire at the
-    FIRST corrupted cluster:
+    (a) a reply that FAILED TO PARSE and carries a blocking-banner marker
+        triggers one re-probe, and the probe, never the content, decides. A
+        reply that parses into a verdict is never scanned: verify replies
+        quote cap-themed clusters, so the loose marker list matches healthy
+        content. Every ``REAL_CLI_CAP_MESSAGES`` entry fails to parse
+        (``test_every_real_cli_cap_message_fails_to_parse_as_a_verdict``), so
+        the split loses no real banner.
+    (b) a per-cluster invocation exception triggers one re-probe; headroom
+        still available means the cluster rejects as before.
+    (c) every *probe_every* clusters, a backstop probe, never after the last
+        cluster. It is the weakest detector -- up to ``probe_every - 1``
+        clusters may reject before it notices -- and covers the one case (a)
+        and (b) cannot see: a cap presenting as a clean-but-wrong verdict.
 
-    (a) a reply that FAILED TO PARSE as a verdict carries a blocking banner,
-        and ONE re-probe then confirms no capacity. Banner-matching CONTENT
-        may only TRIGGER a probe, never itself decide that the account is
-        capped -- which makes (a) structurally identical to (b): content or
-        exception triggers, the probe decides.
-
-        The scan is confined to the parse-failure path because **a reply that
-        parses into a verdict IS a verdict and must never be re-read as a
-        banner.** The loose OR-substring marker list is safe on the ``"ping"``
-        -> ``"pong"`` preflight probe precisely because that reply is fixed
-        and contentless; it is unsafe the moment it is pointed at arbitrary
-        model output, because a verify reply is a model-authored
-        ``{"verified":..., "reason":...}`` whose reason legitimately QUOTES the
-        cluster under adjudication -- and this repo's codebook is dominated by
-        clusters ABOUT usage/weekly limits, so the markers match ordinary
-        healthy content. Scanning pre-parse aborted the run on those clusters,
-        and because the abort precedes ``census_state.advance`` the next run
-        re-mined the same window and aborted again: a permanent census stall
-        plus a stream of false "the account is capped" escalations. The
-        probe-confirmation closes the residual half of that class, where the
-        model ignores the prompt's STRICT-JSON instruction and answers in
-        prose about a cap-themed cluster.
-
-        Splitting on parse success loses no detection -- a real CLI cap banner
-        is plain prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
-        ``CoderParseError``, so all of them still reach the scan. That premise
-        is load-bearing, so it is pinned directly rather than asserted here:
-        ``test_every_real_cli_cap_message_fails_to_parse_as_a_verdict``
-        parametrizes the whole corpus, and the detector's own test does too --
-        a newly-observed phrasing that happened to embed a ``{...}`` fragment
-        would parse, bypass this detector and go red there. The probe is
-        reliable in BOTH directions here: ``preflight_headroom`` folds any
-        probe exception into ``HeadroomResult(ok=False)``, so a genuinely
-        capped account confirms whether its probe returns a banner or raises.
-        Cost is bounded and paid only on a path that has ALREADY failed to
-        parse AND matched a marker -- one trickle-tier probe, against a
-        cap-themed cluster permanently stalling the census.
-    (b) a per-cluster invocation exception triggers ONE re-probe. No
-        headroom means ``CensusHeadroomExhausted``, and the hitting cluster
-        is NOT recorded as rejected. Headroom still available means the
-        claim really was unverifiable, and it rejects exactly as before --
-        the fail-closed default is narrowed to non-cap causes, not removed.
-
-    (c) every *probe_every* clusters, a backstop probe. Ordered LAST because
-        it is the weakest: it is the only detector that can miss the first
-        corrupted cluster, letting up to ``probe_every - 1`` clusters be
-        fail-closed rejected before the cap is noticed -- which is the defect
-        above reproduced in miniature. It earns its place by covering the one
-        residual case neither (a) nor (b) can see: a cap presenting as a
-        clean-but-wrong verdict, where the reply parses fine and nothing
-        raises. It is a BACKSTOP for (a) and (b), never the primary, and a
-        counter alone would not be an acceptable design.
-
-        The cost trade-off, stated plainly: one extra trickle-tier probe per
-        *probe_every* clusters, against up to ``probe_every - 1`` clusters of
-        misattributed verdicts in that residual case. No probe is spent after
-        the last cluster, where it would guard a stage already over.
-
-    All three are no-ops without a *headroom_probe* -- literally, now that (a)
-    confirms rather than assumes -- so every existing call site keeps its
-    current behaviour exactly. Production reach is unaffected: ``main()``
-    wires ``headroom_probe=functools.partial(preflight_headroom,
-    verify_invoke, model=cfg.models.trickle)``, so every real run keeps full
-    detection.
-
-    Two properties of the probe seam itself, both owned by the ``_probe()``
-    wrapper below rather than restated at the three call sites:
-
-    * **It is counted.** The result dict carries ``headroom_probes`` -- how
-      many probes this verifier actually spent -- which ``adjudicate`` folds
-      into the report's cost note. Reported through the return value rather
-      than a counter passed in, because the seam is wired by ``main()`` and a
-      counter would need a second wiring site nothing forces anyone to
-      connect. A caller that ignores the key loses only the count.
-    * **It never raises.** *headroom_probe* is injected and carries no
-      exception contract, so a raising seam is folded into
-      ``HeadroomResult(ok=False)`` exactly as ``preflight_headroom`` folds an
-      invocation error -- a deferral, not an exception escaping into
-      ``main()``'s exit-1 path after the whole mining spend.
+    All three are no-ops without a *headroom_probe*. Every probe goes through
+    one wrapper that counts it (the result's ``headroom_probes``, which
+    ``census_run.adjudicate`` folds into the report's cost note) and never
+    raises: a raising seam reads as ``HeadroomResult(ok=False)``, a deferral
+    rather than an exception escaping into ``census.main()``'s exit-1 path.
     """
     quality_block = code_quality.guidance()
 
@@ -256,7 +180,8 @@ def build_verify_fn(
         # Every probe THIS verifier spends, reported back in the result dict
         # so the report's cost note can state the run's real probe spend.
         # It rides the return value rather than a mutable counter passed in
-        # because the probe seam is wired by main(), not by run_census: a
+        # because the probe seam is wired by census.main(), not by
+        # census_run.run_census: a
         # counter would need a second wiring site that nothing forces anyone
         # to connect, and an unwired counter is exactly how the cost note
         # came to under-report in the first place.
@@ -266,13 +191,14 @@ def build_verify_fn(
             """Call the injected probe seam: counted, and never raising.
 
             *headroom_probe* is an injected seam with no exception contract.
-            Production wires ``preflight_headroom``, which folds any failure
-            into ``HeadroomResult(ok=False)`` -- but a seam that RAISES here
-            would escape ``_verify_fn``, sail past ``adjudicate``'s
-            ``except CensusHeadroomExhausted`` and land in ``main()``'s
-            hard-failure path: exit 1 plus a traceback escalation, after the
-            whole mining spend, on a path that has ALREADY failed once.
-            Matching ``preflight_headroom``'s own fail-safe stance turns that
+            Production wires ``census_headroom.preflight_headroom``, which
+            folds any failure into ``HeadroomResult(ok=False)`` -- but a seam
+            that RAISES here would escape ``_verify_fn``, sail past
+            ``census_run.adjudicate``'s ``except CensusHeadroomExhausted`` and
+            land in ``census.main()``'s hard-failure path: exit 1 plus a
+            traceback escalation, after the whole mining spend, on a path that
+            has ALREADY failed once. Matching ``preflight_headroom``'s own
+            fail-safe stance turns that
             into the deferral this guard exists to produce.
             """
             if headroom_probe is None:
@@ -295,7 +221,7 @@ def build_verify_fn(
             # about what "unverified" means. The `rejected` term is passed
             # the same way, from `len(rejected)` at every site, for the same
             # reason -- together with `verified` the three always sum to the
-            # clusters offered (see CensusHeadroomExhausted's INVARIANT).
+            # clusters offered (census_headroom.CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
             prompt = _verify_prompt(
                 cluster, project_root=project_root, quality_block=quality_block,

@@ -259,7 +259,7 @@ def _synthesize(
 ) -> synthesis.Synthesis | synthesis.Unavailable | None:
     """The validated synthesis of *brief*, or why the reply was refused; None,
     with no call made, when *brief* is empty. A raising *synthesize_fn*
-    propagates (see :func:`_stage_headroom_gate`)."""
+    propagates (see :func:`census_headroom.stage_headroom_gate`)."""
     if brief.is_empty:
         return None
     return synthesis.parse(synthesize_fn(brief, model=model), brief)
@@ -1366,7 +1366,7 @@ def _census_record(
     verify_calls = len(merged.to_verify) + len(merged.offered) + dispositions_record["reverify"]["offered"]
     probe_calls = 1 + verdicts.probes + plan.reverify_probes
     storm_batch_indices = _storm_batch_indices(mining_result)
-    # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
+    # verify is ONE call PER CLUSTER (census_verify.build_verify_fn), not one call
     # total -- and the per-cluster count, novel clusters plus queue clusters
     # plus re-verifies, is precisely what an operator using
     # --max-verify-clusters reads this line to check. headroom-probe is the
@@ -1573,8 +1573,8 @@ def run_census(
     nothing. Before ``persist`` the run writes only the output directories
     and, in ``merge``, the embedder's vector cache. What the
     operator caps (*max_batches*, *max_verify_clusters*) and
-    *dry_run_payloads_path* cost and leave behind is stated in ``main``'s
-    flag help and in ``VerifyCoverage``.
+    *dry_run_payloads_path* cost and leave behind is stated in ``census.main``'s
+    flag help and in ``census_report.VerifyCoverage``.
     """
     run = CensusRun(
         standing=codebook_dict,

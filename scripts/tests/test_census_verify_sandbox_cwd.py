@@ -7,7 +7,7 @@ Regression origin: fleet session census-reify-3386101, 2026-08-03
 /home/leo/src/dark-factory cwd. `claude -p` sandboxes its tool access to
 the cwd tree, so every verifier Read/Bash against /home/leo/src/reify was
 permission-denied — and non-interactively there is no prompt to approve.
-Because `_build_default_verify_fn` fails CLOSED per cluster (census.py, "an
+Because `census_verify.build_verify_fn` fails CLOSED per cluster ("an
 unverifiable claim rejects, never crashes"), that surfaced not as a crash
 but as a SILENT mass rejection of every single cluster. The fail-closed
 default is right; what made it dishonest was the subprocess being rooted in

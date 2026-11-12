@@ -296,12 +296,12 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     A ``--dry-run-filing`` payload file is a human-review deliverable AND
     the only remaining handle on that run's remediation work -- the run
     advances the codebook and census-state, so nothing can regenerate it
-    (see the dry-run WARNING in ``_write_dry_run_payloads``). A second dry
+    (see the dry-run WARNING in ``write_dry_run_payloads``). A second dry
     run on the same date must therefore never overwrite the first.
 
     The probe is bounded by *limit*; exhausting it raises ``RuntimeError``
     naming the directory. Raising here leaves nothing persisted, because
-    ``persist`` writes the payloads before any other output.
+    ``census_run.persist`` writes the payloads before any other output.
     """
     if not path.exists():
         return path

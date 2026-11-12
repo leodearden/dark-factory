@@ -4649,7 +4649,7 @@ def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tm
     assert "pending candidate" in lowered
 
     # (c2) the Cost section must agree with it. verify is ONE call PER CLUSTER
-    # (_build_default_verify_fn), so a hardcoded "verify=1" would render a
+    # (census_verify.build_verify_fn), so a hardcoded "verify=1" would render a
     # report claiming 150 clusters verified at a cost of one call -- and this
     # line is exactly what an operator reads to check the cap did anything.
     cost_section = report_text.split("## Cost", 1)[1]
@@ -4694,7 +4694,7 @@ def test_run_census_warns_and_escalates_when_every_cluster_is_rejected(tmp_path,
     empty census in the same voice as an unremarkable one.
 
     Scoping the subprocess cwd (2026-08-03) removed one CAUSE of that
-    silence, not the class: _build_default_verify_fn fails CLOSED per
+    silence, not the class: census_verify.build_verify_fn fails CLOSED per
     cluster, so a model that goes unreachable mid-run, a different
     permission denial, or persistently unparseable verdicts all still land
     as ordinary rejections with nothing surfacing the pattern.
@@ -6386,7 +6386,7 @@ def test_the_headroom_probe_defers_only_when_no_pool_account_has_headroom(
 # task 3645 / DEFECT 3: a cap arriving DURING verification must never be
 # laundered into a verdict.
 #
-# _build_default_verify_fn fails CLOSED per cluster: any invocation error or
+# census_verify.build_verify_fn fails CLOSED per cluster: any invocation error or
 # parse failure appends the cluster to `rejected` and continues. That is the
 # right default for a genuinely unverifiable CLAIM, and exactly wrong for an
 # infra failure -- a cap mid-verify silently mass-rejects the remaining
@@ -6461,7 +6461,7 @@ def _cap_themed_verdict(marker, *, verified=True, remediation=None):
 def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts(tmp_path):
     """END-TO-END: a cap-themed verdict must not stall the census.
 
-    Uses the REAL `_build_default_verify_fn`, not a fake, so the whole
+    Uses the REAL `census_verify.build_verify_fn`, not a fake, so the whole
     detector -> _defer -> abort-before-persistence chain is in the loop.
 
     The load-bearing assertions are that report_path / codebook_path /
@@ -6722,7 +6722,7 @@ def _twelve_novel_batch():
 def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
     """END-TO-END: the cost note counts the REAL verifier's own probes.
 
-    Wires the REAL `_build_default_verify_fn` with a real `preflight_headroom`
+    Wires the REAL `census_verify.build_verify_fn` with a real `preflight_headroom`
     probe -- the production shape -- over 12 novel clusters at probe_every=5.
     The honest count is 4: preflight, the pre-verify stage gate, and the two
     backstops after clusters 5 and 10.
