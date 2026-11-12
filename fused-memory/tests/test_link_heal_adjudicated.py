@@ -20,6 +20,7 @@ from _link_heal_harness import (
     CHILD_TEXT,
     DF,
     FAKE_ADJUDICATOR_MODEL,
+    FAKE_PROMPT_SHA256,
     PARENT,
     PARENT_TEXT,
     PROJECTS,
@@ -160,6 +161,80 @@ class TestAnAdjudicatedVerdictPlansAHeal:
         assert report.plan_path == tmp_path / 'p.json'
         assert report.plan_sha256 is not None
         assert run.plan_path == tmp_path / 'p.json'
+
+
+SECOND_PROMPT_SHA256 = 'b' * 64
+
+
+def by_child(records):
+    return {record.child_id: record for record in records}
+
+
+class TestTheRecordsCarryTheAdjudication:
+    @pytest.mark.asyncio
+    async def test_a_new_adjudication_stores_the_adjudicators_prompt_version(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(kind=SIGHTING_KIND)
+
+        await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'p.json')
+
+        adjudication = ledger.adjudication_at(
+            DF, CHILD, PARENT, text_sha256(CHILD_TEXT), text_sha256(PARENT_TEXT),
+        )
+        assert adjudication is not None
+        assert adjudication.record.prompt_sha256 == FAKE_PROMPT_SHA256
+        assert adjudication.record.model == FAKE_ADJUDICATOR_MODEL
+
+    @pytest.mark.asyncio
+    async def test_every_adjudicated_record_joins_its_verdict_reason_model_and_prompt(
+        self, harness, ledger, tmp_path,
+    ):
+        children = seed_sightings(harness, 2)
+        fake = scripted({0: Verdict.EXTENDS, 1: Verdict.SAME})
+
+        report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'p.json')
+
+        found = by_child(ledger.run_records(report.run_id))
+        for child, word in zip(children, (Verdict.EXTENDS, Verdict.SAME), strict=True):
+            record = found[child]
+            assert record.basis_source is BasisSource.ADJUDICATOR
+            assert record.verdict is word
+            assert record.reason == f'scripted {word}'
+            assert record.model == FAKE_ADJUDICATOR_MODEL
+            assert record.prompt_sha256 == FAKE_PROMPT_SHA256
+            assert record.adjudication_id == int(record.basis_key)
+        assert found[children[0]].decision is HealAction.RELABEL
+
+    @pytest.mark.asyncio
+    async def test_a_reused_adjudication_shows_its_original_prompt_and_id(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(kind=SIGHTING_KIND)
+        first = await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'a.json')
+        (original,) = ledger.run_records(first.run_id)
+        later = FakeAdjudicator(lambda _text: Verdict.RELATED, prompt_sha256=SECOND_PROMPT_SHA256)
+
+        second = await adjudicated_plan(harness, ledger, later, tmp_path / 'b.json')
+
+        (reused,) = ledger.run_records(second.run_id)
+        assert later.pairs == []
+        assert reused.adjudication_id == original.adjudication_id
+        assert reused.prompt_sha256 == FAKE_PROMPT_SHA256
+        assert reused.verdict is Verdict.EXTENDS
+
+    @pytest.mark.asyncio
+    async def test_a_corpus_record_has_no_adjudication_joined(self, harness, ledger, tmp_path):
+        harness.seed_link()
+
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'p.json', (corpus_basis('RELATED'),),
+        )
+
+        (record,) = ledger.run_records(report.run_id)
+        assert (record.basis_source, record.basis_key) == (BasisSource.CORPUS, 'H001')
+        assert (record.verdict, record.reason, record.model) == (None, None, None)
+        assert (record.prompt_sha256, record.adjudication_id) == (None, None)
 
 
 class TestOnlyVerdictRowLinksAreSent:

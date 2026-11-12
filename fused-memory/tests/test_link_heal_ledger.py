@@ -186,6 +186,46 @@ class TestSchema:
         LinkHealLedger(db).close()
 
 
+def test_an_adjudication_written_before_prompt_versions_reads_back_with_none(tmp_path):
+    db = tmp_path / 'link_heal.db'
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(_SCHEMA_BEFORE_RECORDS)
+        conn.execute(
+            'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
+            'parent_sha256, verdict, reason, model, run_id, at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA, Verdict.SAME.value,
+                'old reason', 'opus', 'c' * 32, '2026-11-01T00:00:00+00:00',
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ledger = LinkHealLedger(db)
+    try:
+        row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+    finally:
+        ledger.close()
+
+    assert row is not None
+    assert row.record.prompt_sha256 is None
+    assert row.record.verdict is Verdict.SAME
+
+
+def test_a_prompt_version_round_trips(ledger):
+    run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+    record = dataclasses.replace(_record(1), prompt_sha256='d' * 64)
+
+    ledger.add_adjudications(run_id, [record])
+
+    row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+    assert row is not None
+    assert row.record == record
+
+
 def _columns(db: Path, table: str) -> set[str]:
     conn = sqlite3.connect(db)
     try:
