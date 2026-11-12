@@ -114,8 +114,6 @@ from legibility import (  # noqa: E402
     unlanded,
 )
 from legibility import verdict as verdict_mod  # noqa: E402
-from legibility.config import LegibilityConfig  # noqa: E402
-from legibility.task_store import TaskStore  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
@@ -2363,7 +2361,7 @@ class CensusEffects:
     synthesize_fn: Callable[..., str]
     embedder: embeddings.Embedder
     submit_fn: Callable[..., Any]
-    task_store: TaskStore
+    task_store: task_store.TaskStore
     status_fetcher: Callable[[], Any]
     escalate_fn: Callable[..., object]
     gate: Callable[[], landing_gate.GateVerdict]
@@ -2381,7 +2379,7 @@ class CensusRun:
     its output paths."""
 
     standing: dict
-    config: LegibilityConfig
+    config: config.LegibilityConfig
     project_root: str
     project_id: str
     codebook_path: Path | str
