@@ -467,8 +467,7 @@ class TestContextAssemblerCancellation:
         The production path:
           mock_memory.search raises CancelledError
           → _ctx_memory_added calls self.memory.search → CancelledError propagates
-          → _fetch_context's ``except Exception`` does NOT catch BaseException subclasses
-            that are not Exception (i.e., CancelledError bypasses the except-clause)
+          → _fetch_context does not catch it
           → asyncio.gather(return_exceptions=True) captures it as a value in batch_contexts
           → the buggy ``isinstance(ctx_result, BaseException)`` guard converts it to []
             (current behaviour: assemble() returns normally — test DID NOT RAISE)
@@ -500,8 +499,7 @@ class TestContextAssemblerCancellation:
         cancellation check.
 
         Patches assembler._fetch_context via patch.object to emit a RuntimeError for
-        event_one and a CancelledError for event_two — bypassing _fetch_context's
-        internal ``except Exception`` wrapper and forcing the exact mix into
+        event_one and a CancelledError for event_two, forcing the exact mix into
         batch_contexts (in deterministic slot order, since gather preserves input-order
         in its result list regardless of scheduling) that the propagation pass must
         handle correctly.
@@ -550,8 +548,7 @@ class TestContextAssemblerCancellation:
         BaseException)``), a RuntimeError would be re-raised by Pass 1 instead of
         being swallowed by Pass 2 and degraded to an event-only entry.
 
-        Directly patches assembler._fetch_context — bypassing _fetch_context's own
-        ``except Exception`` wrapper (lines 221-225) — so the RuntimeError lands in
+        Directly patches assembler._fetch_context so the RuntimeError lands in
         batch_contexts exactly as the Pass 1 guard sees it.  assemble() must return
         normally with all events present in degraded event-only mode and no context
         items.
