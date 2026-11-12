@@ -34,6 +34,7 @@ from escalation.models import (
     IndexHealthState,
     LateResolution,
     ParkStopTripFacts,
+    ReviewDueState,
     TrainState,
     max_severity,
     normalised_severity,
@@ -559,6 +560,68 @@ class TestEscalationDeliveredCheckOwnerField:
         restored = Escalation.from_json(json.dumps(payload))
         assert restored.delivered_check_owner is None
 
+
+
+class TestReviewDueField:
+    """Escalation carries the human gate's review_due payload (PRD
+    completion-driven-triggers C4). Same additive zero-migration contract as
+    `index_health`."""
+
+    _FINAL: ReviewDueState = {
+        'skill': 'review',
+        'project_id': 'dark_factory',
+        'project_root': '/home/leo/src/dark-factory',
+        'run_id': 'review-dark_factory-20261004',
+        'human_gate_task_id': '42',
+        'completion_gate_task_id': '41',
+        'verdict': {'verdict': 'pass', 'share': 0.75, 'by_priority': {'high': [3, 1, 0]}},
+        'fired_at': '2026-10-05T00:00:00+00:00',
+        'launched_from': 'esc-42-1',
+    }
+    _INTERIM: ReviewDueState = {
+        **_FINAL,
+        'completion_gate_task_id': None,
+        'verdict': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-42-1',
+            'task_id': '42',
+            'agent_role': 'orchestrator-deterministic',
+            'severity': 'critical',
+            'category': 'review_due',
+            'summary': 'Run /review on dark_factory (review-dark_factory-20261004 landed)',
+            'level': 2,
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.review_due is None
+        d = esc.to_dict()
+        assert 'review_due' in d
+        assert d['review_due'] is None
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_dict_from_dict(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.review_due == payload
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_json_from_json(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.review_due == payload
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['review_due']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.review_due is None
 
 _EWA_RATE_TRIP: EwaRateTripFacts = {
     'ewa': 73.59,

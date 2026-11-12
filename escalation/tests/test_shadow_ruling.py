@@ -454,6 +454,7 @@ _EXPECTED_CATEGORY_SLUGS: dict[str, str] = {
     'milestone_check_failed': 'milestone_gate',
     'milestone_check_stalled': 'milestone_gate',
     'curator_adjudication_missing': 'deterministic_runner_filing',
+    'review_due': 'deterministic_runner_filing',
 }
 
 
