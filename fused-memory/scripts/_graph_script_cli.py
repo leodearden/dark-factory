@@ -5,8 +5,8 @@ Every graph read goes through
 fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader. A script names
 its graph by ``--graph-uri``, else env ``FALKORDB_URI``, else the config's
 ``graphiti.falkordb.uri``, or by ``--graph-host``/``--graph-port`` instead of a
-uri. Its outputs are written only after every input has validated, all
-staged before any replaces its target.
+uri. Its outputs are written only after every input has validated, each
+replaced atomically through shared/src/shared/safe_io.py::atomic_write_text.
 
 A script imports this module beside itself::
 
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from redis.exceptions import RedisError
+from shared.safe_io import atomic_write_text
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.config.schema import FusedMemoryConfig
@@ -77,11 +78,6 @@ def read_json(path: str | Path) -> Any:
 
 
 def write_files_atomically(texts: Mapping[Path, str]) -> None:
-    """Stage every file before any replaces its target, so a failed write leaves none half-done."""
-    staged: dict[Path, Path] = {}
+    """Write each file atomically, so none is ever left half-written."""
     for path, text in texts.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staged[path] = path.with_name(path.name + '.tmp')
-        staged[path].write_text(text)
-    for path, tmp in staged.items():
-        tmp.replace(path)
+        atomic_write_text(path, text, mkdir=True)
