@@ -382,3 +382,86 @@ class TestDebuggerScopeRequest:
         assert briefs[0] is None
         assert briefs[1] is not None
         assert briefs[1].acquired == (_REQUESTED,)
+
+
+_SUGGESTIONS = [{'reviewer': 'r', 'category': 'c', 'location': _DECLARED, 'description': 'd'}]
+
+
+def _amender_reporting_on_first_dispatch(wf: TaskWorkflow, *, overwrite_plan: bool = False):
+    """The first pass files a request; with *overwrite_plan* it also restamps plan.json.
+
+    The restamp goes through a fresh TaskArtifacts over the same root, the way
+    an agent-side write would, so the workflow's own patched stamp is bypassed.
+    """
+    assert wf.artifacts is not None and wf.worktree is not None
+    artifacts = wf.artifacts
+    worktree = wf.worktree
+    calls = 0
+
+    async def agent(**_kwargs) -> AgentResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'the fix lives here'))
+            if overwrite_plan:
+                TaskArtifacts(worktree).stamp_plan_provenance('foreign-session')
+        return _success()
+
+    return agent
+
+
+async def _run_amendment_pass(wf: TaskWorkflow, *, overwrite_plan: bool = False) -> bool:
+    with (
+        patch(
+            'orchestrator.workflow.invoke_agent', new_callable=AsyncMock,
+            side_effect=_amender_reporting_on_first_dispatch(wf, overwrite_plan=overwrite_plan),
+        ),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        return await wf._amend(_SUGGESTIONS, 1)
+
+
+@pytest.mark.asyncio
+class TestAmendmentPassScopeRequest:
+    async def test_a_request_filed_during_an_amendment_pass_is_applied_not_orphaned(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch)
+
+        ok = await _run_amendment_pass(wf)
+
+        assert ok is True
+        assert _plan_files(wf) == [_DECLARED, _REQUESTED]
+        assert scheduler.acquire_uncontested_calls == [
+            (_TASK_ID, [_REQUESTED], IMPLEMENT_SCOPE_EXPANDED),
+        ]
+        [drift] = _scope_drift_events(events)
+        assert drift['role'] == 'implementer'
+        assert drift['acquired'] == [_REQUESTED]
+        assert wf.artifacts is not None
+        assert wf.artifacts.read_scope_requests() == ()
+
+    async def test_a_scope_request_never_restamps_a_plan_the_agent_overwrote(
+        self, tmp_path, monkeypatch
+    ):
+        rig = _make_workflow(tmp_path)
+        wf, scheduler, events = rig.wf, rig.scheduler, rig.events
+        _write_dispatched_plan(wf, steps=1)
+        _stub_loop_collaborators(wf, monkeypatch, stub_owner_check=False)
+        overwrite = MagicMock()
+        monkeypatch.setattr(wf, '_escalate_plan_overwrite', overwrite)
+
+        ok = await _run_amendment_pass(wf, overwrite_plan=True)
+
+        assert ok is False
+        overwrite.assert_called_once()
+        assert scheduler.acquire_uncontested_calls == []
+        assert _plan_files(wf) == [_DECLARED]
+        assert _scope_drift_events(events) == []
+        assert wf.artifacts is not None
+        assert wf.artifacts.read_scope_requests() == (
+            ScopeRequest(_REQUESTED, 'the fix lives here'),
+        )

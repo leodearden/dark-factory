@@ -36,6 +36,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import BlastRadiusResult, TaskAssignment, files_to_modules
+from orchestrator.scope_drift import IMPLEMENT_SCOPE_EXPANDED, ScopeRequest
 from orchestrator.workflow import (
     IMPLEMENTER,
     TaskWorkflow,
@@ -699,6 +700,55 @@ class TestStatusPreservationOnResume:
             'Implementer must NOT be resumed while the granted file lock '
             'is held by a sibling task.'
         )
+
+    async def test_a_scope_request_filed_by_the_resumed_implementer_is_applied(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """The escalation resume is an implementer session, so it ends at a
+        scope-request boundary like an execute iteration does (task 3090).
+
+        Without it, a request the resumed implementer files is left in
+        scope_requests.json and the reported file is edited unlocked.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+            steward_factory=_make_resolving_steward(
+                queue, task_assignment.task_id,
+            ),
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        monkeypatch.setattr(workflow, '_execute_verify_review_loop', evrl_mock)
+        invocations = 0
+
+        async def resumed_implementer(*_args, **_kwargs) -> AgentResult:
+            nonlocal invocations
+            invocations += 1
+            if invocations == 1:
+                assert workflow.artifacts is not None
+                workflow.artifacts.write_scope_request(
+                    ScopeRequest('new.py', 'plan omitted it'),
+                )
+            return AgentResult(success=True, output='')
+
+        invoke_mock = AsyncMock(side_effect=resumed_implementer)
+        monkeypatch.setattr(workflow, '_invoke', invoke_mock)
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        role = invoke_mock.await_args_list[0].args[0]
+        assert getattr(role, 'name', '') == 'implementer'
+        assert workflow.artifacts is not None
+        assert 'new.py' in workflow.artifacts.read_plan()['files']
+        assert len(scheduler.acquire_uncontested_calls) == 1
+        assert scheduler.acquire_uncontested_calls[0][2] == IMPLEMENT_SCOPE_EXPANDED
+        assert workflow.artifacts.read_scope_requests() == ()
 
     async def test_already_on_main_short_circuit_runs_before_status_check(
         self, config, git_ops, task_assignment, tmp_path,
