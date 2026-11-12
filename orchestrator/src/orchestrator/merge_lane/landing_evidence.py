@@ -1072,6 +1072,7 @@ async def _delivered_checks_differential(
 
 async def _resolve_main_reachable_evidence(
     git_ops: GitOps, task_id: str, head: str, probe: dict[str, Any],
+    *, pattern_template: str | None,
 ) -> str | None:
     """Resolve a MAIN-REACHABLE commit carrying *task_id*'s work, or None.
 
@@ -1079,7 +1080,8 @@ async def _resolve_main_reachable_evidence(
     anchors provenance on must be a commit reachable from main that carries
     this task's work.  Two tiers, tried in order, and NO third tier:
 
-    1. **Citation** — ``find_task_citation_commit`` walks
+    1. **Citation** — ``find_task_citation_commit``, by the project's
+       *pattern_template* (none on a ``''`` opt-out), walks
        ``config.main_branch``'s own history, so anything it returns is
        main-reachable by construction; no extra reachability check is needed
        (and none is done, which is what keeps this leg off the decaying
@@ -1104,7 +1106,9 @@ async def _resolve_main_reachable_evidence(
     reader of the escalation can see WHICH tier answered, or which one
     declined.
     """
-    citation = await git_ops.find_task_citation_commit(task_id)
+    citation = await git_ops.find_task_citation_commit(
+        task_id, pattern_template=pattern_template,
+    )
     if citation:
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
@@ -1425,6 +1429,7 @@ async def branch_work_landed(
     *,
     branch_tip_sha: str | None,
     metadata: dict[str, Any] | None = None,
+    pattern_template: str | None = None,
     escalation_queue: EscalationQueue | None = None,
     recovery_emission: RecoveryEmissionConfig | None = None,
 ) -> LandingVerdict:
@@ -1601,6 +1606,12 @@ async def branch_work_landed(
             Contract's sketched signature — boundary row B6 needs
             ``branch_base_sha``, which the sketched four-argument form cannot
             supply.  Consumed by the degenerate-branch guard.
+        pattern_template: The citation tier's pattern, with the same meaning
+            as :func:`validate_landing_evidence`'s.  ``None`` means
+            ``DEFAULT_COMMIT_CITATION_PATTERN``; ``''`` is the project's
+            opt-out, so the citation tier answers None and attribution falls
+            to the patch-id twin.  A consumer holding an OrchestratorConfig
+            passes ``config.git.commit_citation_pattern``.
         escalation_queue: The queue the ``git_error`` storm-escape L1 is filed
             on (see :func:`file_landing_git_error_storm_escalation`).
             ``None`` means "no queue available", which is a SUPPORTED shape
@@ -1689,7 +1700,9 @@ async def branch_work_landed(
         if rejection is not None:
             return _reject(rejection)
 
-        evidence_sha = await _resolve_main_reachable_evidence(git_ops, task_id, head, probe)
+        evidence_sha = await _resolve_main_reachable_evidence(
+            git_ops, task_id, head, probe, pattern_template=pattern_template,
+        )
         if evidence_sha is None:
             return _reject(LandingReason.no_attribution)
         return _accept(evidence_sha)
