@@ -1325,11 +1325,11 @@ class _ScannedTestFile(NamedTuple):
 
 
 def _rule_c_count(tree: ast.Module, lines: list[str], entry: str) -> int:
-    """Count *tree*'s Rule C violations with the checker's own predicate, before any debt budget."""
+    """Count *tree*'s Rule C violations at every node, before any debt budget, as
+    ``check_bare_magicmock_config.py::_wall_clock_deadline_violations`` dispatches on node type."""
     return sum(
         len(_checker._wall_clock_deadline_violations(node, lines, entry))
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
     )
 
 
