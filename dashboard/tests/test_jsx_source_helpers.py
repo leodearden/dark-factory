@@ -1,4 +1,4 @@
-"""Contract for the shared JSX source-slicing helpers in `_dashboard_helpers`.
+"""Contract for the shared JSX source-slicing helpers in `_jsx_source_helpers`.
 
 The dashboard suite asserts structural contracts against the *served* .jsx
 text (there is no JS runtime in this project), and nearly every such
@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     ScriptTagCollector,
