@@ -5,7 +5,7 @@ Pinned on real ``AgentResult`` values through the module's public API only.
 
 from __future__ import annotations
 
-from shared.cli_invoke import AgentResult, classify_agent_failure
+from shared.cli_invoke import AgentFailureKind, AgentResult, classify_agent_failure
 
 from orchestrator.merger_failure import (
     CHECK_MERGE_STATUS_BEFORE_RETRY,
@@ -36,7 +36,7 @@ class TestInvocationFailed:
         report = merger_failure_report(_empty_output_failure(), observed_at=OBSERVED_AT)
 
         assert 'Merger invocation failed' in report.reason
-        assert 'empty_output' in report.reason
+        assert f'kind={AgentFailureKind.EMPTY_OUTPUT.value}' in report.reason
         assert 'error_empty_output' in report.reason
         assert not report.reason.rstrip().endswith(':')
 

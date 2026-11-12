@@ -11,18 +11,10 @@ Driven against a real ``EscalationQueue`` and a real ``OrchestratorConfig``.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.models import EvidenceEntry
-from escalation.queue import EscalationQueue
-
-from orchestrator.config import GitConfig, OrchestratorConfig, UnblockAutoConfig
-from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
-
-TASK_ID = '5107'
+from test_workflow_mark_blocked_l0_coverage import TASK_ID, _make_workflow
 
 ENTRY = EvidenceEntry(
     observation='merger kind=empty_output',
@@ -31,41 +23,9 @@ ENTRY = EvidenceEntry(
 )
 
 
-def _make_workflow(tmp_path: Path) -> tuple[TaskWorkflow, EscalationQueue]:
-    assignment = TaskAssignment(
-        task_id=TASK_ID,
-        task={
-            'id': TASK_ID, 'title': 'evidence threading', 'description': '',
-            'status': 'in-progress', 'metadata': {}, 'dependencies': [],
-        },
-        modules=[],
-    )
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        max_concurrent_tasks=1,
-        git=GitConfig(
-            main_branch='main', branch_prefix='task/',
-            remote='origin', worktree_dir='.worktrees',
-        ),
-        unblock_auto=UnblockAutoConfig(enabled=False),
-    )
-    queue = EscalationQueue(tmp_path / 'escalations')
-    workflow = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=MagicMock(),
-        scheduler=FakeScheduler(),
-        briefing=FakeBriefing(),
-        mcp=FakeMcp(),
-        escalation_queue=queue,
-    )
-    workflow.worktree = tmp_path / 'wt'
-    return workflow, queue
-
-
 @pytest.mark.asyncio
 async def test_evidence_lands_on_the_l0_and_the_fall_through_l1(tmp_path: Path):
-    workflow, queue = _make_workflow(tmp_path)
+    workflow, queue, _ = _make_workflow(tmp_path)
 
     await workflow._mark_blocked('r', evidence=[ENTRY])
 
@@ -76,7 +36,7 @@ async def test_evidence_lands_on_the_l0_and_the_fall_through_l1(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_evidence_lands_on_the_escalate_to_human_l1(tmp_path: Path):
-    workflow, queue = _make_workflow(tmp_path)
+    workflow, queue, _ = _make_workflow(tmp_path)
 
     await workflow._mark_blocked('r', escalate_to_human=True, evidence=[ENTRY])
 
@@ -87,7 +47,7 @@ async def test_evidence_lands_on_the_escalate_to_human_l1(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_no_evidence_keeps_the_empty_default(tmp_path: Path):
-    workflow, queue = _make_workflow(tmp_path)
+    workflow, queue, _ = _make_workflow(tmp_path)
 
     await workflow._mark_blocked('r')
 

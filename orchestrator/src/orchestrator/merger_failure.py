@@ -1,6 +1,7 @@
-"""What the merger fail-safe reports when ``TaskWorkflow._resolve_and_resubmit``
+"""What the merger fail-safe reports when
+``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._resolve_and_resubmit``
 blocks a merge on an untrustworthy disposition; the block decision itself stays
-in workflow.py.
+there.
 """
 
 from __future__ import annotations

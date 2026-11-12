@@ -72,6 +72,7 @@ from _workflow_helpers import (
 from escalation.models import Escalation
 from shared.cli_invoke import (
     _SCHEMA_OUTPUT_TOOL,
+    AgentFailureKind,
     AgentResult,
     _SubprocessResult,
     invoke_claude_agent,
@@ -501,7 +502,7 @@ class TestMergerBoundary:
         assert mark_blocked.await_args is not None
         args, kwargs = mark_blocked.await_args
         assert 'Merger invocation failed' in args[0]
-        assert 'empty_output' in args[0]
+        assert f'kind={AgentFailureKind.EMPTY_OUTPUT.value}' in args[0]
         assert 'error_empty_output' in args[0]
         assert not args[0].rstrip().endswith(':')
         assert 'turns=7' in kwargs['detail']
