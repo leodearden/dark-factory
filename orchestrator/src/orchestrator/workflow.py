@@ -210,6 +210,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.scope_drift import (
     IMPLEMENT_SCOPE_EXPANDED,
+    ScopeDriftBrief,
     ScopeDriftReport,
     build_scope_drift_report,
     pending_scope_paths,
@@ -1551,12 +1552,8 @@ class TaskWorkflow:
         # in task metadata because the verify loop is wholly within one
         # workflow run (unlike _check_infra_resume_thrash which crosses runs).
         self._failure_signature_history: list[tuple[str, str]] = []
-        # What the writer boundaries since the last brief did with the agent's
-        # scope requests; kept until a writer prompt renders it
-        # (_apply_scope_requests, _take_scope_drift_for_brief).
-        self._scope_drift_report: ScopeDriftReport | None = None
-        self._scope_drift_briefed = False
-        self._scope_drift_followed_up: set[str] = set()
+        # The scope-drift report waiting for a writer session to receive it.
+        self._scope_drift_brief = ScopeDriftBrief()
         # TR-1: the atomic terminal-contract value returned by run().  Built
         # at the same choke points (_mark_blocked's _record helper, plus the
         # warm-lane-requeue and blast-radius-lock-conflict non-_mark_blocked
@@ -3347,12 +3344,15 @@ class TaskWorkflow:
                                 carried,
                             ),
                             render_carried_resolutions(carried), self.worktree,
-                            scope_drift=self._take_scope_drift_for_brief(IMPLEMENTER),
+                            scope_drift=self._render_scope_drift(IMPLEMENTER),
                         )
 
-                    await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
+                    resumed = await self._invoke(
+                        IMPLEMENTER, build_resume_prompt, self.worktree,
+                    )
                     await self._apply_scope_requests(
                         role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+                        delivered=not is_zero_output_timeout(resumed),
                     )
                     continue
                 if outcome != WorkflowOutcome.DONE:
@@ -5029,21 +5029,16 @@ class TaskWorkflow:
         next writer.  Never re-pends, releases or escalates (task 3090 ruling);
         a failure keeps the requests for the next boundary.
 
-        A report no writer has received yet is merged into, never replaced,
-        so a contested path always reaches a writer
-        (:meth:`_brief_contested_scope_drift` covers the last session).  A
-        session that never read its prompt (a zero-output timeout) passes
-        *delivered* False, which un-briefs what its prompt rendered.
+        *delivered* is False for a session that never read its prompt (a
+        zero-output timeout); ``scope_drift.py::ScopeDriftBrief`` then keeps
+        what that prompt rendered for the next writer.
 
         A plan this session no longer owns is never widened: ``set_plan_files``
         would restamp it to this session and hide the overwrite from the
         caller's own ``validate_plan_owner`` check, so the requests are kept.
         """
         assert self.artifacts is not None
-        if not delivered:
-            self._scope_drift_briefed = False
-        if self._scope_drift_briefed:
-            self._scope_drift_report = None
+        self._scope_drift_brief.settle(delivered=delivered)
         try:
             requests = self.artifacts.read_scope_requests()
             declared = list(self.artifacts.read_plan().get('files') or [])
@@ -5056,12 +5051,9 @@ class TaskWorkflow:
                 )
                 return
             if paths:
-                report = await self._widen_scope_uncontested(
+                self._scope_drift_brief.record(await self._widen_scope_uncontested(
                     paths, declared, role=role, iteration=iteration,
-                )
-                carried = self._scope_drift_report
-                self._scope_drift_report = carried.merged_with(report) if carried else report
-                self._scope_drift_briefed = False
+                ))
             if requests:
                 self.artifacts.clear_scope_requests(requests)
         except Exception:
@@ -5071,45 +5063,54 @@ class TaskWorkflow:
                 self.task_id, role, iteration, exc_info=True,
             )
 
-    def _take_scope_drift_for_brief(self, role: AgentRole) -> ScopeDriftReport | None:
-        """The report a writer prompt renders, marked briefed so the next boundary may drop it.
+    def _render_scope_drift(self, role: AgentRole) -> ScopeDriftReport | None:
+        """The scope-drift report for a *role* writer prompt.
 
-        Not marked when this dispatch resumes a *role* session: cli_invoke then
-        sends the continuation prompt instead of the rendered one, so the
-        report waits for the next fresh writer or the follow-up session.
+        A dispatch that resumes a *role* session sends cli_invoke's
+        continuation prompt instead of the rendered one, so it does not count.
         """
         resuming = bool(self._pending_resume_session_id) and self._pending_resume_role == role.name
-        if not resuming:
-            self._scope_drift_briefed = True
-        return self._scope_drift_report
+        return self._scope_drift_brief.render(resuming=resuming)
+
+    def _drop_pending_resume(self, role: AgentRole) -> None:
+        if self._pending_resume_role == role.name:
+            self._pending_resume_session_id = None
+            self._pending_resume_role = None
+            self._pending_resume_count = 0
+            self._pending_resume_prompt = None
 
     async def _brief_contested_scope_drift(self) -> bool:
-        """Brief a contested scope request no writer prompt has rendered; True when one ran.
+        """Run a fresh session to deliver a contested report no writer received; True when one ran.
 
         Called where no further writer session is due (the execute loop's
-        exit, a green verify), so the agent told to revert or escalate a
-        contested file is always told.  Its own requests are applied at its
-        boundary like any other session's.  Runs at most once per contested
-        path, which bounds the green-verify re-loop.
+        exit, a green verify).  It never resumes an earlier session, which
+        would send a continuation instead of this brief.  Its own requests
+        are applied at its boundary like any other session's.
         """
-        report = self._scope_drift_report
-        if self._scope_drift_briefed or report is None:
+        report = self._scope_drift_brief.followup_due()
+        if report is None:
+            stranded = self._scope_drift_brief.pending_contested()
+            if stranded is not None:
+                logger.error(
+                    'Task %s: contested scope requests %s reached no writer after the '
+                    'follow-up bound',
+                    self.task_id, dict(stranded.contested),
+                )
             return False
-        contested = {path for path, _holder in report.contested}
-        if contested <= self._scope_drift_followed_up:
-            return False
-        self._scope_drift_followed_up |= contested
+        self._scope_drift_brief.start_followup()
+        self._drop_pending_resume(IMPLEMENTER)
+        contested = sorted(path for path, _holder in report.contested)
         assert self.worktree is not None
 
         async def build_prompt() -> str:
-            drift = self._take_scope_drift_for_brief(IMPLEMENTER)
+            drift = self._render_scope_drift(IMPLEMENTER)
             assert drift is not None
             return await self.briefing.build_scope_drift_followup_prompt(
                 self._live_plan(), drift, task_id=self.task_id,
             )
 
         pre_head = await self._get_head_commit()
-        await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
+        result = await self._invoke(IMPLEMENTER, build_prompt, self.worktree)
         assert self.artifacts is not None
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
@@ -5117,11 +5118,12 @@ class TaskWorkflow:
             'steps_attempted': [],
             'steps_completed': [],
             **await self._iteration_commit_provenance(pre_head),
-            'summary': f'Scope request follow-up for {sorted(contested)}',
+            'summary': f'Scope request follow-up for {contested}',
             'source': 'orchestrator',
         })
         await self._apply_scope_requests(
             role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+            delivered=not is_zero_output_timeout(result),
         )
         return True
 
@@ -10467,7 +10469,7 @@ class TaskWorkflow:
         return await self.briefing.build_implementer_prompt(
             plan, rebase_notice=rebase_notice,
             task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
-            scope_drift=self._take_scope_drift_for_brief(IMPLEMENTER),
+            scope_drift=self._render_scope_drift(IMPLEMENTER),
         )
 
     async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
@@ -11279,7 +11281,7 @@ class TaskWorkflow:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
                     attempt_context=attempt_context,
-                    scope_drift=self._take_scope_drift_for_brief(DEBUGGER),
+                    scope_drift=self._render_scope_drift(DEBUGGER),
                 )
 
             prior_causes.append(PriorAttemptCause(
@@ -12102,7 +12104,7 @@ class TaskWorkflow:
                 suggestions=in_scope,
                 locked_modules=locked_modules,
                 task_id=self.task_id,
-                scope_drift=self._take_scope_drift_for_brief(IMPLEMENTER),
+                scope_drift=self._render_scope_drift(IMPLEMENTER),
             )
 
         pre_head = await self._get_head_commit()

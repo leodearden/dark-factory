@@ -644,3 +644,86 @@ async def test_a_contested_debugger_request_before_a_green_verify_is_followed_up
     [followup_call] = rig.followup_prompt.await_args_list
     assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)
     assert verify.await_count == 3
+
+
+def _verify_loop_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verify_results: list):
+    rig = _make_workflow(tmp_path)
+    rig.scheduler.contested_modules = {_REQUESTED: _HOLDER}
+    _write_dispatched_plan(rig.wf, steps=1)
+    _stub_loop_collaborators(rig.wf, monkeypatch)
+    rig.cfg.rebase_before_verify = False
+    rig.cfg.escalate_preexisting_main_break = False
+    rig.cfg.max_opaque_timeout_attempts = 3
+    rig.cfg.max_failure_signature_repeat = 5
+    rig.cfg.max_verify_attempts = 5
+    rig.cfg.max_consecutive_zero_output_timeouts = 3
+    verify = AsyncMock(side_effect=verify_results)
+    monkeypatch.setattr(rig.wf, '_run_scoped_verification_with_infra_retry', verify)
+    monkeypatch.setattr(rig.wf, '_maybe_file_chronic_flakes', AsyncMock())
+    return rig, verify
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_follow_up_does_not_consume_the_brief(tmp_path, monkeypatch):
+    rig, verify = _verify_loop_rig(
+        tmp_path, monkeypatch, [_passing_verify(), _passing_verify(), _passing_verify()],
+    )
+    wf = rig.wf
+    assert wf.artifacts is not None
+    artifacts = wf.artifacts
+    calls = 0
+
+    async def agent(**_kwargs) -> AgentResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+            artifacts.update_step_status('step-1', 'done', None)
+        elif calls == 2:
+            return _timed_out(transcript_turns=0)
+        return _success()
+
+    with (
+        patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        executed = await wf._execute_iterations()
+        verified = await wf._verify_debugfix_loop()
+
+    assert executed == verified == WorkflowOutcome.DONE
+    assert calls == 3
+    assert [c.args[1].contested for c in rig.followup_prompt.await_args_list] == [
+        ((_REQUESTED, _HOLDER),),
+    ] * 2
+    assert verify.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_the_follow_up_is_a_fresh_session_not_a_dangling_progress_resume(
+    tmp_path, monkeypatch
+):
+    rig, _verify = _verify_loop_rig(tmp_path, monkeypatch, [])
+    wf = rig.wf
+    assert wf.artifacts is not None
+    artifacts = wf.artifacts
+    resumed_ids: list[object] = []
+
+    async def agent(**kwargs) -> AgentResult:
+        resumed_ids.append(kwargs.get('resume_session_id'))
+        if len(resumed_ids) == 1:
+            artifacts.write_scope_request(ScopeRequest(_REQUESTED, 'plan omitted it'))
+            artifacts.update_step_status('step-1', 'done', None)
+            return _timed_out(transcript_turns=5)
+        return _success()
+
+    with (
+        patch('orchestrator.workflow.invoke_agent', AsyncMock(side_effect=agent)),
+        patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+    ):
+        outcome = await wf._execute_iterations()
+
+    assert outcome == WorkflowOutcome.DONE
+    assert len(resumed_ids) == 2
+    assert resumed_ids[1] is None
+    [followup_call] = rig.followup_prompt.await_args_list
+    assert followup_call.args[1].contested == ((_REQUESTED, _HOLDER),)

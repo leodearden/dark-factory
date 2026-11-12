@@ -173,6 +173,59 @@ class ScopeDriftReport:
         }
 
 
+MAX_SCOPE_DRIFT_FOLLOWUPS = 3
+
+
+class ScopeDriftBrief:
+    """Carries a task's scope-drift report until a writer session has actually received it.
+
+    Each writer session follows one protocol: its prompt builder calls
+    :meth:`render`, and its boundary calls :meth:`settle` with whether the
+    session read that prompt, then :meth:`record` with the boundary's own
+    report. A report rendered into a prompt that was never read stays
+    pending, so a contested path always reaches a writer; where no writer
+    session is due, :meth:`followup_due` names the report a dedicated
+    follow-up session must deliver, at most :data:`MAX_SCOPE_DRIFT_FOLLOWUPS`
+    times per task run.
+    """
+
+    def __init__(self) -> None:
+        self._report: ScopeDriftReport | None = None
+        self._rendered = False
+        self._followups = 0
+
+    def render(self, *, resuming: bool) -> ScopeDriftReport | None:
+        """The report for a writer prompt; a *resuming* dispatch sends a continuation instead."""
+        if not resuming:
+            self._rendered = True
+        return self._report
+
+    def settle(self, *, delivered: bool) -> None:
+        """At a session boundary: drop the report if the session received it."""
+        if delivered and self._rendered:
+            self._report = None
+        self._rendered = False
+
+    def record(self, report: ScopeDriftReport) -> None:
+        """Fold a boundary's report into the one still waiting for a writer."""
+        self._report = self._report.merged_with(report) if self._report else report
+
+    def pending_contested(self) -> ScopeDriftReport | None:
+        """The waiting report, when it names a contested path."""
+        if self._report is None or not self._report.contested:
+            return None
+        return self._report
+
+    def followup_due(self) -> ScopeDriftReport | None:
+        """The contested report a follow-up session must deliver, within the bound."""
+        if self._followups >= MAX_SCOPE_DRIFT_FOLLOWUPS:
+            return None
+        return self.pending_contested()
+
+    def start_followup(self) -> None:
+        self._followups += 1
+
+
 def build_scope_drift_report(
     requested: Iterable[str],
     contested: Iterable[Blocker],

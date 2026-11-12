@@ -10,7 +10,9 @@ from orchestrator.pin_reservation import Blocker, BlockerKind
 from orchestrator.scope_drift import (
     IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
     IMPLEMENT_SCOPE_EXPANDED,
+    MAX_SCOPE_DRIFT_FOLLOWUPS,
     InvalidScopeRequest,
+    ScopeDriftBrief,
     ScopeDriftReason,
     ScopeDriftReport,
     ScopeRequest,
@@ -218,3 +220,56 @@ class TestScopeDriftReason:
     def test_an_unknown_reason_string_is_refused(self):
         with pytest.raises(ValueError):
             ScopeDriftReason('made_up')
+
+
+_CONTESTED = [Blocker('pkg/b.py', '777', BlockerKind.HELD)]
+
+
+def _contested_report():
+    return _report(['pkg/b.py'], _CONTESTED)
+
+
+class TestScopeDriftBrief:
+    def test_a_received_report_is_dropped_at_the_next_boundary(self):
+        brief = ScopeDriftBrief()
+        brief.record(_contested_report())
+        assert brief.render(resuming=False) is not None
+        brief.settle(delivered=True)
+        assert brief.render(resuming=False) is None
+        assert brief.followup_due() is None
+
+    @pytest.mark.parametrize(
+        ('resuming', 'delivered'), [(True, True), (False, False)], ids=['resumed', 'wedged'],
+    )
+    def test_a_report_the_session_did_not_receive_stays_pending(self, resuming, delivered):
+        brief = ScopeDriftBrief()
+        brief.record(_contested_report())
+        brief.render(resuming=resuming)
+        brief.settle(delivered=delivered)
+        assert brief.pending_contested() == _contested_report()
+
+    def test_a_later_report_is_merged_into_one_no_writer_received(self):
+        brief = ScopeDriftBrief()
+        brief.record(_contested_report())
+        brief.settle(delivered=True)
+        brief.record(_report(['pkg/a.py']))
+        pending = brief.render(resuming=False)
+        assert pending is not None
+        assert pending.contested == (('pkg/b.py', '777'),)
+        assert pending.acquired == ('pkg/a.py',)
+
+    def test_a_granted_only_report_needs_no_follow_up(self):
+        brief = ScopeDriftBrief()
+        brief.record(_report(['pkg/a.py']))
+        assert brief.followup_due() is None
+
+    def test_follow_ups_are_bounded(self):
+        brief = ScopeDriftBrief()
+        brief.record(_contested_report())
+        for _ in range(MAX_SCOPE_DRIFT_FOLLOWUPS):
+            assert brief.followup_due() is not None
+            brief.start_followup()
+            brief.render(resuming=False)
+            brief.settle(delivered=False)
+        assert brief.followup_due() is None
+        assert brief.pending_contested() is not None
