@@ -4957,7 +4957,7 @@ class TestGetMergeQueue:
         This suite's entries carry ``verify_task=None``, a pre-established
         pass, so the followed head is finalized as one too.
         """
-        from orchestrator.merge_lane.worker import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             RealMergeItem,
