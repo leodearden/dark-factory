@@ -193,7 +193,9 @@ _HOP_BY_HOP = frozenset(
 )
 # host: aiohttp derives it from the upstream URL; a forwarded loopback Host gets 421.
 # content-length: the bridge re-encodes request bodies.
-_NOT_FORWARDED = _HOP_BY_HOP | {'host', 'content-length'}
+# accept-encoding: the bridge decodes the upstream body and returns it without
+# Content-Encoding, so only codings its own aiohttp client decodes may be offered.
+_NOT_FORWARDED = _HOP_BY_HOP | {'host', 'content-length', 'accept-encoding'}
 
 
 def _upstream_request_headers(client_headers: Mapping[str, str]) -> dict[str, str]:
