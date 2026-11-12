@@ -265,3 +265,9 @@ def test_config_default_falkordb_uri_is_production(monkeypatch) -> None:
     monkeypatch.delenv("FALKORDB_URI", raising=False)
 
     assert FusedMemoryConfig().graphiti.falkordb.uri == PRODUCTION_FALKORDB.uri
+
+
+def test_schema_default_falkordb_uri_is_production() -> None:
+    from fused_memory.config.schema import FalkorDBProviderConfig
+
+    assert FalkorDBProviderConfig().uri == PRODUCTION_FALKORDB.uri

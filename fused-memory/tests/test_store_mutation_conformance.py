@@ -935,8 +935,10 @@ _MIN_SUBSTANTIVE_REASON_LENGTH = 40
 #: BOTH this file and fused_memory/utils/store_mutation_preflight.py. The
 #: list is expected to SHRINK as scripts are migrated onto the guard
 #: directly -- a newly-written mutating script should call
-#: assert_store_mutation_allowed, unless, like these three, it never
-#: touches mem0 or Qdrant and is bounded to scratch substrate.
+#: assert_store_mutation_allowed. An entry is justified only when the
+#: script's mutations are statically bounded to scratch substrate and it
+#: writes no shared mem0 SQLite history; each entry's reason states the
+#: bound it was measured against.
 EXPECTED_EXEMPT_SCRIPTS = frozenset({
     'bake_off_storage_shape.py',
     'cleanup_test_collections.py',
