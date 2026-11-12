@@ -18,7 +18,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import test_stranded_verified_green as verified_green
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from test_stranded_verified_green import (
@@ -30,11 +29,10 @@ from test_stranded_verified_green import (
     _merge_queue_depth,
     _wire_exists_off_main,
 )
+from test_stranded_verified_green import _reset_merge_provenance as _reset_merge_provenance
+from test_stranded_verified_green import harness as harness
 
 from orchestrator.harness import Harness
-
-harness = verified_green.harness
-_reset_merge_provenance = verified_green._reset_merge_provenance
 
 
 def _seed_stranded_blocked(
