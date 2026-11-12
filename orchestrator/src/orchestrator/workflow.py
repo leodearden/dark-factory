@@ -22,19 +22,12 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
-# Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
-# escalation.models is listed under TYPE_CHECKING for the Escalation
-# type annotation; a separate runtime import is needed here because
-# _needs_human evaluates the set at call time, not just for type hints.
-# This is cycle-safe: escalation/src/escalation/models.py imports only stdlib and
-# nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
-# severity semantics _needs_human consumes) is pure and imports only
-# escalation.models, so it is cycle-safe too; harness.py already imports it at
-# module top.  escalation.classify is likewise pure over escalation.models.
+# escalation.pins is pure and imports only escalation.models, so it is
+# cycle-safe at module top (harness.py imports it the same way);
+# escalation.classify is likewise pure over escalation.models.
 from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
-from escalation.models import BORN_AT_L2_SEVERITIES
-from escalation.pins import is_queue_handoff
+from escalation.pins import is_queue_handoff, needs_human
 from pydantic import ValidationError
 from shared.cli_invoke import (
     PROGRESS_TIMEOUT_RESUME_PROMPT,
@@ -470,38 +463,16 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
 
-def _needs_human(e: Escalation) -> bool:
-    """Return True if only a human can dispose of *e* — no steward applies.
-
-    Either disjunct suffices:
-    - Born-at-L2 severity: ``severity in BORN_AT_L2_SEVERITIES``, i.e.
-      'critical' or 'urgent' — these bypass the auto-watcher and route
-      straight to a human regardless of level.
-    - A level ≥ 2 record that ``escalation.pins`` classifies a queue handoff
-      (PRD ``plans/info-l0-disposition-router-prd.md`` D3): an info-severity
-      L2 never needs a human here, while an unknown severity fails safe to
-      needing one.  Severity semantics live in ``escalation.pins`` (INV-5) —
-      never hand-roll ``severity != 'info'`` here.
-
-    The single home of that rule for both consumers: disjuncts 2 and 3 of
-    :func:`_is_gating_escalation`, and the stop-the-line checks at the entry
-    and the tail of ``TaskWorkflow._wait_for_resolution``.
-    """
-    return e.severity in BORN_AT_L2_SEVERITIES or (
-        e.level >= 2 and is_queue_handoff(e)
-    )
-
-
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
 
     Gating policy — an escalation gates when ANY disjunct fires:
     1. Plain blocking L0: ``severity == 'blocking' and level == 0``
        (fresh agent-filed blocker awaiting steward triage).
-    2. Born-at-L2 severity — see :func:`_needs_human`.
+    2. Born-at-L2 severity — see :func:`escalation.pins.needs_human`.
     3. A level ≥ 2 queue handoff (escalation-watcher promoted to L2; a human
        must decide before the workflow proceeds; never an info record) — see
-       :func:`_needs_human`.
+       :func:`escalation.pins.needs_human`.
 
     Deliberately NOT gating:
     - Plain blocking L1 (``severity == 'blocking' and level == 1``): this is a
@@ -512,7 +483,7 @@ def _is_gating_escalation(e: Escalation) -> bool:
       DOES gate the current run — that is the intended stop-the-line semantics
       for high-severity escalations (D4 accepted consequence).
     """
-    return (e.severity == 'blocking' and e.level == 0) or _needs_human(e)
+    return (e.severity == 'blocking' and e.level == 0) or needs_human(e)
 
 
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
@@ -576,7 +547,7 @@ class _StewardReescalated(_HumanHandoff):
     """The steward filed a hand-off during this wait — an L1 through its own
     give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
     auto-watcher, which may promote to L2 for a human), or a record
-    :func:`_needs_human` selects."""
+    :func:`escalation.pins.needs_human` selects."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
@@ -584,15 +555,15 @@ class _StewardReescalated(_HumanHandoff):
 
 class _NoStewardApplicable(_HumanHandoff):
     """Open records end the wait that no steward acted on: the stop-the-line
-    records :func:`_needs_human` selects, raised before the wait ever awaits or
+    records :func:`escalation.pins.needs_human` selects, raised before the wait ever awaits or
     at its tail, or L1 hand-offs left open by anyone but this wait's steward.
     The block reason names each record under its own tier: ``L2`` for a record
     that needs a human, else ``L1``."""
 
     def __init__(self, escalations: list[Escalation]):
         tiers = (
-            ('L2', [e.id for e in escalations if _needs_human(e)]),
-            ('L1', [e.id for e in escalations if not _needs_human(e)]),
+            ('L2', [e.id for e in escalations if needs_human(e)]),
+            ('L1', [e.id for e in escalations if not needs_human(e)]),
         )
         gated_by = ' and '.join(f'{tier} {", ".join(ids)}' for tier, ids in tiers if ids)
         super().__init__(escalations, f'Gated by open {gated_by}; no steward applicable')
@@ -4688,7 +4659,7 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         # SINGLE-SHOT re-check, deliberately redundant with the wait's tail.
-        # That tail applies _needs_human to the full pending set, so a
+        # That tail applies needs_human to the full pending set, so a
         # born-at-L2 filed mid-resolution already raises inside the wait.  It
         # cannot see a gating record filed AFTER its read — including a plain
         # blocking L0, which it deliberately does not gate — and at merge entry
@@ -15733,7 +15704,7 @@ class TaskWorkflow:
         """Wait until no pending level-0 record holds the wait: every L0 while a
         steward is live, else only the steward-owned ones.
 
-        Pending escalations that :func:`_needs_human` selects (a born-at-L2
+        Pending escalations that :func:`escalation.pins.needs_human` selects (a born-at-L2
         severity, or a level≥2 queue handoff — never an info record) are
         stop-the-line events — they cannot be resolved by the
         auto-watcher/steward and require immediate human intervention.
@@ -15745,7 +15716,7 @@ class TaskWorkflow:
         - ``_NoStewardApplicable`` if any pending escalation needs a human —
           immediate terminal, stop the line, before any await; OR,
           once the level-0 wait ends with open records that the same
-          :func:`_needs_human` rule selects over the FULL pending set (so a
+          :func:`escalation.pins.needs_human` rule selects over the FULL pending set (so a
           record filed during the wait is caught), or with level-1 queue
           handoffs open (never an info record, PRD D3):
         - ``_StewardReescalated`` if this wait's steward filed one of them, else
@@ -15864,7 +15835,7 @@ class TaskWorkflow:
         # human intervention rather than looping; the reason says no steward
         # was applicable (D13).
         open_at_entry = self.escalation_queue.get_by_task(self.task_id, status='pending')
-        pending_l2 = [e for e in open_at_entry if _needs_human(e)]
+        pending_l2 = [e for e in open_at_entry if needs_human(e)]
         if pending_l2:
             raise _NoStewardApplicable(pending_l2)
         open_ids_at_entry = {e.id for e in open_at_entry}
@@ -16038,7 +16009,7 @@ class TaskWorkflow:
         open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
         handoffs = [
             e for e in open_at_tail
-            if _needs_human(e) or (e.level == 1 and is_queue_handoff(e))
+            if needs_human(e) or (e.level == 1 and is_queue_handoff(e))
         ]
         if handoffs:
             steward_filed_one = any(
