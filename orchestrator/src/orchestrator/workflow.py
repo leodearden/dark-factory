@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
@@ -206,6 +207,12 @@ from orchestrator.scheduler import (
     TerminalExitRejection,
     files_to_modules,
     normalize_lock,
+)
+from orchestrator.scope_drift import (
+    IMPLEMENT_SCOPE_EXPANDED,
+    ScopeDriftReport,
+    build_scope_drift_report,
+    pending_scope_paths,
 )
 from orchestrator.session_registry import build_session_slug
 from orchestrator.stranded_verified_green import (
@@ -681,6 +688,7 @@ class _BriefingLike(Protocol):
         self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
+        *, scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict,
@@ -691,6 +699,7 @@ class _BriefingLike(Protocol):
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
         *, attempt_context: VerifyAttemptContext | None = ...,
+        scope_drift: ScopeDriftReport | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
         self, reviewer_type: str, diff: str, context: str | None = ...,
@@ -918,6 +927,11 @@ def classify_rebase_cohort(
 # reviewer line-number drift so genuine delta-adjacent findings are not routed
 # away, while fresh nits far from the amendment are still filtered (task 2750).
 _AMENDMENT_DELTA_CONTEXT_LINES = 3
+
+_SCOPE_REQUEST_PHASE: Mapping[str, str] = MappingProxyType({
+    IMPLEMENTER.name: 'execute',
+    DEBUGGER.name: 'verify',
+})
 
 
 # Dedicated role for the task-2523 resettled-suggestion adjudication.
@@ -1532,6 +1546,9 @@ class TaskWorkflow:
         # in task metadata because the verify loop is wholly within one
         # workflow run (unlike _check_infra_resume_thrash which crosses runs).
         self._failure_signature_history: list[tuple[str, str]] = []
+        # What the last writer boundary did with the agent's scope requests,
+        # briefed to the next implementer/debugger (_apply_scope_requests).
+        self._scope_drift_report: ScopeDriftReport | None = None
         # TR-1: the atomic terminal-contract value returned by run().  Built
         # at the same choke points (_mark_blocked's _record helper, plus the
         # warm-lane-requeue and blast-radius-lock-conflict non-_mark_blocked
@@ -4984,6 +5001,78 @@ class TaskWorkflow:
                 new_files, log_context='task-scope files persist',
             )
         return reconciled
+
+    async def _apply_scope_requests(self, *, role: str, iteration: int) -> None:
+        """Lock and declare the paths a writer reported missing from plan.files.
+
+        Runs after each implementer/debugger session on the requests
+        ``mcp/plan_tools.py::report_missing_plan_file`` left in
+        ``scope_requests.json``.  Free paths advance plan.files, metadata.files,
+        the held locks and ``self.modules`` together; a contested path advances
+        nothing.  The outcome is emitted as ``scope_drift`` and briefed to the
+        next writer.  Never re-pends, releases or escalates (task 3090 ruling);
+        a failure keeps the requests for the next boundary.
+        """
+        assert self.artifacts is not None
+        self._scope_drift_report = None
+        try:
+            requests = self.artifacts.read_scope_requests()
+            declared = list(self.artifacts.read_plan().get('files') or [])
+            paths = pending_scope_paths(requests, declared)
+            if paths:
+                self._scope_drift_report = await self._widen_scope_uncontested(
+                    paths, declared, role=role, iteration=iteration,
+                )
+            if requests:
+                self.artifacts.clear_scope_requests()
+        except Exception:
+            self._scope_drift_report = None
+            logger.warning(
+                'Task %s: applying %s scope requests at iteration %s failed; '
+                'kept for the next boundary',
+                self.task_id, role, iteration, exc_info=True,
+            )
+
+    async def _widen_scope_uncontested(
+        self, paths: tuple[str, ...], declared: list[str], *, role: str, iteration: int,
+    ) -> ScopeDriftReport:
+        lock_depth = self.config.lock_depth
+        acquisition = await self.scheduler.acquire_uncontested(
+            self.task_id, derive_modules(list(paths), lock_depth, task_id=self.task_id),
+            reason=IMPLEMENT_SCOPE_EXPANDED,
+        )
+        report = build_scope_drift_report(
+            paths, acquisition.contested, lock_depth=lock_depth,
+            role=role, iteration=iteration, task_id=self.task_id,
+        )
+        if report.acquired:
+            await self._declare_widened_scope(
+                [*declared, *report.acquired], acquired_modules=acquisition.acquired,
+            )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.scope_drift,
+                task_id=self.task_id,
+                phase=_SCOPE_REQUEST_PHASE[role],
+                role=role,
+                data=report.event_data(),
+            )
+        return report
+
+    async def _declare_widened_scope(
+        self, files: list[str], *, acquired_modules: tuple[str, ...],
+    ) -> None:
+        """A files-only plan edit (``artifacts.py::Plan.with_files``) keeps the plan confirmed."""
+        assert self.artifacts is not None
+        self.plan['files'] = files
+        self.artifacts.set_plan_files(files, self.session_id)
+        if await self._persist_metadata_files(files, log_context='implement scope request') is None:
+            logger.warning(
+                'Task %s: the backend refused metadata.files=%s for a scope request',
+                self.task_id, files,
+            )
+        self.modules = sorted(set(self.modules) | set(acquired_modules))
+        self._module_configs = self._resolve_module_configs()
 
     async def _requeue_on_lock_conflict(
         self,
@@ -9376,6 +9465,9 @@ class TaskWorkflow:
             )
 
             self.metrics.execute_iterations += 1
+            await self._apply_scope_requests(
+                role=IMPLEMENTER.name, iteration=self.metrics.execute_iterations,
+            )
 
             # Check for escalations.  Plain blocking L1 (already-escalated-to-human)
             # issues from prior runs of this same task stay in the queue until a
@@ -10274,6 +10366,7 @@ class TaskWorkflow:
         return await self.briefing.build_implementer_prompt(
             plan, rebase_notice=rebase_notice,
             task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+            scope_drift=self._scope_drift_report,
         )
 
     async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
@@ -11081,6 +11174,7 @@ class TaskWorkflow:
                 return await self.briefing.build_debugger_prompt(
                     failure_report, self._live_plan(), task_id=self.task_id,
                     attempt_context=attempt_context,
+                    scope_drift=self._scope_drift_report,
                 )
 
             prior_causes.append(PriorAttemptCause(
@@ -11100,6 +11194,7 @@ class TaskWorkflow:
                 'summary': f'Debug fix for: {result.summary[:100]}',
                 'source': 'orchestrator',
             })
+            await self._apply_scope_requests(role=DEBUGGER.name, iteration=verify_attempt)
 
             # Check for escalations from debugger.  Same filter as the post-implementer
             # check — a stale plain blocking L1 from a prior run must not sink a

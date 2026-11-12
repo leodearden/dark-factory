@@ -110,6 +110,13 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # A writer's scope moving past its declared files, one row per boundary
+    # that had something to apply.  Payload: {reason, role, iteration,
+    # requested, acquired, contested: {path: holder}}.  The implement-phase
+    # reasons (implement_scope_expanded, implement_blast_radius_lock_conflict)
+    # live in orchestrator/src/orchestrator/scope_drift.py; task 4371 adds its
+    # own reason there.
+    scope_drift = 'scope_drift'
     # Declared-vs-landed at done, from
     # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.
     # One row per done-time reconcile of a MEASURED merge diff.  data:

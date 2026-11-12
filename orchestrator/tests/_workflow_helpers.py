@@ -501,13 +501,14 @@ class FakeBriefing:
         self, plan: dict, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
+        *, scope_drift=None,
     ) -> str:
         return 'Implement the plan'
 
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
-        *, attempt_context=None,
+        *, attempt_context=None, scope_drift=None,
     ) -> str:
         return f'Fix: {failures[:100]}'
 

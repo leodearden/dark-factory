@@ -28,6 +28,7 @@ from orchestrator.event_store import EventType
 from orchestrator.scope_drift import (
     IMPLEMENT_BLAST_RADIUS_LOCK_CONFLICT,
     IMPLEMENT_SCOPE_EXPANDED,
+    ScopeDriftReport,
     ScopeRequest,
 )
 from orchestrator.verify import VerifyResult
@@ -173,7 +174,7 @@ def _scope_drift_events(events: _RecordingEventStore) -> list[dict]:
     return [entry['data'] for (etype, entry) in events.events if etype == EventType.scope_drift]
 
 
-def _scope_drift_kwargs(builder: AsyncMock) -> list[object]:
+def _scope_drift_kwargs(builder: AsyncMock) -> list[ScopeDriftReport | None]:
     return [call.kwargs.get('scope_drift') for call in builder.await_args_list]
 
 
