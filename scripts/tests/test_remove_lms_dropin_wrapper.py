@@ -1571,3 +1571,56 @@ def test_host_bus_transport_errno_reads_only_line_ending_transport_errors(
 ) -> None:
     """Only a line ENDING in ': <strerror>' of a transport-class errno is a lost bus."""
     assert _host_bus_transport_errno(_completed(stdout=stdout, stderr=stderr)) == expected
+
+
+def test_failed_run_that_lost_the_host_bus_is_a_named_skip() -> None:
+    """A FAILED run carrying a transport errno skips, naming the errno and the full run."""
+    template = _unique_template()
+    result = _completed(
+        returncode=1,
+        stdout=f"    | Failed to reload daemon: {os.strerror(errno.ENOTCONN)}\n",
+        stderr="  FAIL: exit code is 0 on re-run -- expected '0', got '1'\n",
+    )
+
+    with pytest.raises(
+        pytest.skip.Exception,
+        match=rf"(?s){errno.errorcode[errno.ENOTCONN]}.*{re.escape(template)}",
+    ) as excinfo:
+        _skip_if_host_bus_dropped(result, template)
+
+    assert _selftest_detail(result, template) in str(excinfo.value)
+
+
+def test_failed_run_without_a_transport_errno_stays_red() -> None:
+    """A genuine check failure is not skipped, so _assert_selftest_passed still reports it."""
+    template = _unique_template()
+    result = _completed(
+        returncode=1,
+        stderr="  FAIL: WorkingDirectory now resolves to the repo root -- expected '/tmp/x', got ''\n",
+    )
+
+    assert _skip_if_host_bus_dropped(result, template) is None
+    with pytest.raises(AssertionError):
+        _assert_selftest_passed(result, template)
+
+
+def test_passing_run_is_never_turned_into_a_skip() -> None:
+    """A transport line on a run that still passed is noise, not a reason to skip."""
+    result = _completed(
+        returncode=0,
+        stdout="test_remove_lms_dropin: ALL CHECKS PASSED\n",
+        stderr=f"Failed to get properties: {os.strerror(errno.ENOTCONN)}\n",
+    )
+
+    assert _skip_if_host_bus_dropped(result, _unique_template()) is None
+
+
+def test_lost_host_bus_inside_the_script_reaches_the_gate_as_a_skip(tmp_path: Path) -> None:
+    """The transport line survives script -> .sh -> wrapper, the path the 11-11 red took."""
+    template = _unique_template()
+    result = _run_selftest_with_failing_script_reload(
+        tmp_path, template, os.strerror(errno.ENOTCONN)
+    )
+
+    with pytest.raises(pytest.skip.Exception, match=errno.errorcode[errno.ENOTCONN]):
+        _skip_if_host_bus_dropped(result, template)
