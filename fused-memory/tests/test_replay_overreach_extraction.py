@@ -20,6 +20,7 @@ from _fm_helpers import load_script_module
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.config import ModelSize
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.token_tracker import TokenUsageTracker
 from graphiti_core.prompts.models import Message
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
@@ -27,7 +28,11 @@ from pydantic import BaseModel
 
 from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
-from fused_memory.backends.llm_token_usage import AttributingTokenUsageTracker, LlmTokenUsage
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    LlmTokenUsage,
+    measure_llm_tokens,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
@@ -246,22 +251,124 @@ class TestTheResult:
         }
 
 
+class _RecordingSdk:
+    """A fake AsyncOpenAI: records the kwargs of every Responses and chat call it is sent."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.responses = SimpleNamespace(parse=self._parse)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _parse(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        return SimpleNamespace(
+            output_text=json.dumps({'answer': 'yes'}),
+            usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+        )
+
+    async def _create(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        raise AssertionError('a JSON-mode chat completion cannot carry the effort')
+
+
+class _Answer(BaseModel):
+    answer: str
+
+
+EFFORT_MAX_TOKENS = 4096
+
+
+def _effort_client(effort: str = 'low') -> tuple[Any, _RecordingSdk, OpenAIClient]:
+    """An OpenAIClient as build_llm_client builds one for O6_MODEL, wrapped at *effort*."""
+    sdk = _RecordingSdk()
+    built = OpenAIClient(
+        config=GraphitiLLMConfig(api_key='test', model=mod.O6_MODEL, small_model=mod.O6_MODEL, temperature=0.0),
+        client=sdk, max_tokens=EFFORT_MAX_TOKENS,
+    )
+    built.token_tracker = AttributingTokenUsageTracker()
+    return mod.ExplicitEffortOpenAIClient(built, effort), sdk, built
+
+
+async def _structured_call(client: Any, response_model: type[BaseModel] | None = _Answer) -> Any:
+    messages = [Message(role='system', content='extract'), Message(role='user', content='the record')]
+    return await client.generate_response(
+        messages, response_model=response_model, prompt_name='extract_nodes.extract_text',
+    )
+
+
+class TestTheExplicitEffortClient:
+    @pytest.mark.asyncio
+    async def test_it_sends_the_effort_and_no_other_sampling_control(self) -> None:
+        client, sdk, _ = _effort_client('low')
+        assert await _structured_call(client) == {'answer': 'yes'}
+        (sent,) = sdk.sent
+        assert 'temperature' not in sent and 'text' not in sent
+        assert sent['reasoning'] == {'effort': 'low'}
+        assert sent['model'] == mod.O6_MODEL
+        assert sent['max_output_tokens'] == client.max_tokens == EFFORT_MAX_TOKENS
+        assert set(sent) == {'model', 'input', 'max_output_tokens', 'text_format', 'reasoning'}
+
+    @pytest.mark.asyncio
+    async def test_it_keeps_the_built_clients_token_tracker_so_the_call_is_attributed(self) -> None:
+        client, _, built = _effort_client()
+        assert client.token_tracker is built.token_tracker
+        async with measure_llm_tokens(client) as measured:
+            await _structured_call(client)
+        assert measured.usage == LlmTokenUsage(input_tokens=11, output_tokens=7, llm_calls=1)
+
+    @pytest.mark.parametrize('effort', ['low', 'medium'])
+    def test_it_declares_the_effort_it_sends(self, effort: str) -> None:
+        client, _, _ = _effort_client(effort)
+        assert client.reasoning_effort == effort
+        assert mod.client_reasoning_effort(client) == effort
+
+    @pytest.mark.asyncio
+    async def test_a_json_mode_call_is_refused_before_anything_is_sent(self) -> None:
+        """A JSON-mode chat completion cannot carry reasoning.effort, so it is never sent without it."""
+        client, sdk, _ = _effort_client()
+        with pytest.raises(NotImplementedError, match='reasoning.effort'):
+            await _structured_call(client, response_model=None)
+        assert sdk.sent == []
+
+
 class TestBuildArmLlm:
+    def test_the_default_client_is_build_llm_clients_own_on_the_configured_model(
+        self, mock_config: FusedMemoryConfig,
+    ) -> None:
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm())
+        assert type(client) is OpenAIClient and client.model == mock_config.llm.model
+        assert not hasattr(client, 'reasoning_effort')
+        assert mod.client_reasoning_effort(client) is None
+
     def test_a_model_override_builds_that_model_and_leaves_the_config_alone(
         self, mock_config: FusedMemoryConfig,
     ) -> None:
         before = mock_config.llm.model
-        client = mod.build_arm_llm(mock_config, model='m-strong')
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm('m-strong'))
         assert client is not None and client.model == 'm-strong'
         assert mock_config.llm.model == before
 
-    def test_no_override_keeps_the_configured_model(self, mock_config: FusedMemoryConfig) -> None:
-        client = mod.build_arm_llm(mock_config, model=None)
-        assert client is not None and client.model == mock_config.llm.model
-
     def test_the_client_attributes_its_tokens(self, mock_config: FusedMemoryConfig) -> None:
-        client = mod.build_arm_llm(mock_config, model=None)
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm())
         assert client is not None and isinstance(client.token_tracker, AttributingTokenUsageTracker)
+
+    def test_a_set_effort_wraps_the_built_client_in_the_effort_client(self, mock_config: FusedMemoryConfig) -> None:
+        before = mock_config.llm.model
+        client = mod.build_arm_llm(mock_config, mod.ExtractionLlm(mod.O6_MODEL, 'medium'))
+        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert (client.model, client.small_model) == (mod.O6_MODEL, mod.O6_MODEL)
+        assert client.reasoning_effort == 'medium'
+        assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
+        assert mock_config.llm.model == before
+
+    def test_a_set_effort_on_a_chat_completions_only_client_class_is_refused(
+        self, mock_config: FusedMemoryConfig,
+    ) -> None:
+        generic = mock_config.model_copy(deep=True)
+        generic.llm.client_class = 'openai_generic'
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            mod.build_arm_llm(generic, mod.ExtractionLlm(mod.O6_MODEL, 'low'))
+        assert 'openai_generic' in str(raised.value) and 'low' in str(raised.value)
 
 
 # --------------------------------------------------------------------------- #
