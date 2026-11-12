@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 
 from aiohttp import ClientTimeout, web
 from aiohttp.client import ClientSession
@@ -178,7 +179,6 @@ def _translate_messages_response(body: dict) -> dict:
 
 # ── VllmBridge server ────────────────────────────────────────────────────────
 
-# Hop-by-hop headers that must not be forwarded
 _HOP_BY_HOP = frozenset(
     {
         'connection',
@@ -189,9 +189,15 @@ _HOP_BY_HOP = frozenset(
         'trailer',
         'transfer-encoding',
         'upgrade',
-        'content-length',
     }
 )
+# host: aiohttp derives it from the upstream URL; a forwarded loopback Host gets 421.
+# content-length: the bridge re-encodes request bodies.
+_NOT_FORWARDED = _HOP_BY_HOP | {'host', 'content-length'}
+
+
+def _upstream_request_headers(client_headers: Mapping[str, str]) -> dict[str, str]:
+    return {k: v for k, v in client_headers.items() if k.lower() not in _NOT_FORWARDED}
 
 
 class VllmBridge:
@@ -336,7 +342,7 @@ class VllmBridge:
         # Clamp max_tokens to avoid context-length overflow
         self._clamp_max_tokens(body)
 
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+        headers = _upstream_request_headers(request.headers)
         assert self._session is not None, 'bridge not started'
         async with self._session.post(
             self.upstream_url + '/v1/messages',
@@ -368,7 +374,7 @@ class VllmBridge:
         if query:
             upstream_url += '?' + query
 
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+        headers = _upstream_request_headers(request.headers)
         data = await request.read()
 
         assert self._session is not None, 'bridge not started'
