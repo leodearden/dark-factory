@@ -2657,6 +2657,24 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
     assert "1" in (summary + detail), "the escalation names the unverified count"
 
 
+def test_a_verify_stage_deferral_of_a_mined_run_persists_and_files_nothing(tmp_path):
+    kwargs = _mined_run_kwargs(tmp_path, commit=_make_fake_commit())
+    _override(kwargs, invoke=_make_fake_invoke(_capped_after_preflight_invoke()))
+
+    outcome = _deferred(mod.run_census(**kwargs))
+
+    assert outcome.stage is mod.CensusStage.VERIFY
+    assert kwargs["effects"].submit_fn.calls == []
+    assert kwargs["effects"].commit.calls == []
+    for path in (
+        kwargs["report_path"], kwargs["report_path"].with_suffix(".json"),
+        kwargs["codebook_path"], kwargs["census_state_path"],
+    ):
+        assert not path.exists(), path
+    [alarm] = kwargs["effects"].escalate_fn.calls
+    assert alarm["level"] == logging.WARNING
+
+
 # ---------------------------------------------------------------------------
 # step-19: RED — run_census() HAPPY path, full seam wiring + static routing
 # ---------------------------------------------------------------------------
@@ -9899,6 +9917,30 @@ def test_run_census_method_and_cost_note_count_the_reverify(tmp_path):
     assert f"{kwargs['config'].models.census_verify} verify=1," in record["cost_note"]
 
 
+def _reporting_probes(verify_fn, probes):
+    """*verify_fn* whose Nth call's result also reports spending ``probes[N]``
+    headroom probes."""
+    spent = iter(probes)
+
+    def reporting(clusters, *, model):
+        return {**verify_fn(clusters, model=model), "headroom_probes": next(spent)}
+
+    return reporting
+
+
+def test_run_census_counts_the_probes_its_reverify_call_reports(tmp_path):
+    kwargs = _outcome_kwargs(tmp_path, "gone")
+    preflight = 1
+    _override(kwargs, verify_fn=_reporting_probes(kwargs["effects"].verify_fn, (0, 3)))
+
+    _done(mod.run_census(**kwargs))
+
+    record = _run_record(kwargs)
+    assert record["dispositions"]["reverify"]["offered"] == 1
+    assert record["method"]["cost"]["probe_calls"] == preflight + 3
+    assert f"headroom-probe={preflight + 3}" in record["cost_note"]
+
+
 
 # ---------------------------------------------------------------------------
 # task 6404 step-19: RED — run_census, PRD §4.8 row 10 (outcome: cancelled),
@@ -11043,6 +11085,20 @@ def test_the_queue_offers_its_ranked_capped_clusters_and_a_verified_representati
     [payload] = kwargs["effects"].submit_fn.calls
     assert payload["metadata"]["x_finding_key"] == _ROW5_KEY
     assert record["method"]["cost"]["verify_calls"] == 10
+
+
+def test_run_census_counts_its_gates_and_the_probes_both_verify_calls_report(tmp_path):
+    verify_fn = _queue_verify_fn(verified_titles={_PAIR_A[1]})
+    kwargs = _queue_kwargs(tmp_path, verify_fn=_reporting_probes(verify_fn, (1, 2)))
+    preflight, stage_gate = 1, 1
+
+    _done(mod.run_census(**kwargs))
+
+    assert len(_queue_offers(verify_fn)) == 1
+    record = _run_record(kwargs)
+    assert record["method"]["cost"]["probe_calls"] == preflight + stage_gate + 1 + 2 == 5
+    assert "headroom-probe=5" in record["cost_note"]
+    assert "headroom-probe=5" in kwargs["report_path"].read_text(encoding="utf-8")
     assert record["method"]["extra"]["adjudicated"] == 11
     first = record["adjudication"]["processed"][0]
     assert (first["representative"], first["outcome"]) == (_PAIR_A_IDS[1], "verified")
