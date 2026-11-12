@@ -43,9 +43,3 @@ def measured_export(
             ),
         ],
     }
-
-
-def plan_tools_mcp() -> dict[str, Any]:
-    return {'mcpServers': {'plan-tools': {
-        'command': '/venv/bin/python', 'args': ['-m', 'plan_tools'],
-    }}}

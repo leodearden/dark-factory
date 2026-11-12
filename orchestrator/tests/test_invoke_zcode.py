@@ -20,7 +20,8 @@ from _operator_home_fixture import (
     OPERATOR_IGNORED_FILE,
     write_operator_home,
 )
-from _zcode_fixture import BASE_URL, measured_output, plan_tools_mcp
+from _plan_tools_mcp_fixture import plan_tools_mcp
+from _zcode_fixture import BASE_URL, measured_output
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch

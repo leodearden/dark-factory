@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _mimo_fixture import measured_export, plan_tools_mcp
+from _mimo_fixture import measured_export
 from _operator_home_fixture import OPERATOR_ENV_VARS, write_operator_home
+from _plan_tools_mcp_fixture import plan_tools_mcp
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents import sandbox_dispatch

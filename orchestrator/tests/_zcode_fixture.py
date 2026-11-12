@@ -31,9 +31,3 @@ def measured_output() -> dict[str, Any]:
         'eventCount': 12,
         'projection': {'status': 'completed', 'turnCount': 1},
     }
-
-
-def plan_tools_mcp() -> dict[str, Any]:
-    return {'mcpServers': {'plan-tools': {
-        'command': '/venv/bin/python', 'args': ['-m', 'plan_tools'],
-    }}}

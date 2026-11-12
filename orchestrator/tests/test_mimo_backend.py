@@ -12,7 +12,8 @@ import stat
 from pathlib import Path
 
 import pytest
-from _mimo_fixture import measured_export, plan_tools_mcp
+from _mimo_fixture import measured_export
+from _plan_tools_mcp_fixture import plan_tools_mcp
 from shared.cli_invoke import _SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
