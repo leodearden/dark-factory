@@ -5,29 +5,46 @@ The population is the write-triage soak's rated pairs: a ratings file keyed by
 fixtures here are synthetic and shaped like the soak's own two files: two
 projects of ten items, one of two, and six rows per ten-item project rated by
 a second rater, so the raters' own kappa is 0.8 on both binaries.
+
+A calibration run asks a :class:`FakeAdjudicator` about the rated texts, into
+a real ledger on ``tmp_path``, and escapes through a :class:`RecordingFiler`.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _link_heal_harness import (
+    FAKE_ADJUDICATOR_MODEL,
+    FAKE_PROMPT_SHA256,
+    Answer,
+    FakeAdjudicator,
+    RecordingFiler,
+)
 
+from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import MISFILE_VERDICTS, Verdict
 from fused_memory.maintenance.link_heal_calibration import (
     POOLED,
     Binary,
     CalibrationInputError,
     CalibrationItem,
+    CalibrationSettings,
     KappaBelowFloor,
     TooManyUnanswered,
     assess_calibration,
     binary_agreement,
     load_soak_population,
     rater_agreement,
+    run_calibration,
 )
+from fused_memory.maintenance.link_heal_executor import CALIBRATION_ANCHOR
+from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunKind, RunSource
+from fused_memory.maintenance.link_heal_store import text_sha256
 
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 RATINGS = FIXTURES / 'link_heal_calibration_ratings.jsonl'
@@ -320,3 +337,163 @@ class TestAssessCalibration:
         result = _assess((overruled, *population[1:]), verdicts)
 
         assert result.pooled.binaries[Binary.MISFILE].agreement.adjudicator_only == 1
+
+
+POPULATION_SHA = 'f' * 64
+SETTINGS = CalibrationSettings(margin=MARGIN, min_project_items=GATE_SIZE)
+
+
+@pytest.fixture
+def ledger(tmp_path: Path):
+    opened = LinkHealLedger(tmp_path / 'link_heal.db')
+    yield opened
+    opened.close()
+
+
+def _answering(population, overrides: dict[str, Answer] | None = None) -> FakeAdjudicator:
+    """A fake adjudicator answering each child text with its final verdict, unless overridden."""
+    answers: dict[str, Answer] = {item.child_text: item.final for item in population}
+    answers.update(overrides or {})
+    return FakeAdjudicator(answers.__getitem__)
+
+
+def _failing_alpha(population) -> dict[str, Answer]:
+    return {item.child_text: Verdict.EXTENDS for item in _misfiled_in(population, ALPHA)[:2]}
+
+
+async def _calibrate(population, adjudicate, ledger, tmp_path, filer=None):
+    return await run_calibration(
+        population,
+        adjudicate=adjudicate,
+        ledger=ledger,
+        settings=SETTINGS,
+        filer=filer if filer is not None else RecordingFiler(),
+        reports_dir=tmp_path / 'link-heal-reports',
+        population_sha256=POPULATION_SHA,
+    )
+
+
+class TestRunCalibration:
+    @pytest.mark.asyncio
+    async def test_it_is_a_finished_non_writing_calibration_run(self, ledger, tmp_path):
+        population = _population()
+
+        report = await _calibrate(population, _answering(population), ledger, tmp_path)
+
+        run = ledger.resolve_run(report.run_id)
+        assert run.source is RunSource.CALIBRATION
+        assert not run.writes
+        assert run.kind is RunKind.PLAN
+        assert run.finished_at is not None
+
+    @pytest.mark.asyncio
+    async def test_it_asks_about_the_rated_texts_only(self, ledger, tmp_path):
+        population = _population()
+        adjudicate = _answering(population)
+
+        await _calibrate(population, adjudicate, ledger, tmp_path)
+
+        assert sorted((pair.child_text, pair.parent_text) for pair in adjudicate.pairs) == sorted(
+            (item.child_text, item.parent_text) for item in population
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_answered_pair_is_ledgered_at_its_rated_texts(self, ledger, tmp_path):
+        population = _population()
+        unanswered = population[4]
+        adjudicate = _answering(
+            population, {unanswered.child_text: AdjudicationFailure.PARSE_FAILURE},
+        )
+
+        report = await _calibrate(population, adjudicate, ledger, tmp_path)
+
+        for item in population:
+            row = ledger.adjudication_at(
+                item.project, item.child_id, item.parent_id,
+                text_sha256(item.child_text), text_sha256(item.parent_text),
+            )
+            if item is unanswered:
+                assert row is None
+                continue
+            assert row is not None, item.key
+            assert row.run_id == report.run_id
+            assert row.record.verdict is item.final
+            assert row.record.reason == f'scripted {item.final}'
+            assert row.record.model == FAKE_ADJUDICATOR_MODEL
+            assert row.record.prompt_sha256 == FAKE_PROMPT_SHA256
+
+    @pytest.mark.asyncio
+    async def test_the_calibration_is_recorded_for_its_model_and_prompt(self, ledger, tmp_path):
+        population = _population()
+
+        report = await _calibrate(population, _answering(population), ledger, tmp_path)
+
+        row = ledger.latest_calibration(FAKE_ADJUDICATOR_MODEL, FAKE_PROMPT_SHA256)
+        assert row is not None
+        assert row.passed
+        assert row.run_id == report.run_id
+        assert row.population_sha256 == POPULATION_SHA
+        assert row.report['run_id'] == report.run_id
+        assert row.report['passed'] is True
+        assert ledger.latest_calibration('another-model', FAKE_PROMPT_SHA256) is None
+        assert ledger.latest_calibration(FAKE_ADJUDICATOR_MODEL, 'e' * 64) is None
+
+    @pytest.mark.asyncio
+    async def test_the_newest_calibration_wins(self, ledger, tmp_path):
+        population = _population()
+        await _calibrate(population, _answering(population), ledger, tmp_path)
+
+        failed = await _calibrate(
+            population, _answering(population, _failing_alpha(population)), ledger, tmp_path,
+        )
+
+        row = ledger.latest_calibration(FAKE_ADJUDICATOR_MODEL, FAKE_PROMPT_SHA256)
+        assert row is not None
+        assert (row.run_id, row.passed) == (failed.run_id, False)
+
+    @pytest.mark.asyncio
+    async def test_it_writes_a_json_and_a_markdown_report(self, ledger, tmp_path):
+        population = _population()
+
+        report = await _calibrate(population, _answering(population), ledger, tmp_path)
+
+        reports_dir = tmp_path / 'link-heal-reports'
+        stem = f'link-heal-calibration-{datetime.now(UTC).date().isoformat()}-{report.run_id[:8]}'
+        assert report.json_path == reports_dir / f'{stem}.json'
+        assert report.markdown_path == reports_dir / f'{stem}.md'
+        row = ledger.latest_calibration(FAKE_ADJUDICATOR_MODEL, FAKE_PROMPT_SHA256)
+        assert row is not None
+        assert json.loads(report.json_path.read_text(encoding='utf-8')) == row.report
+        markdown = report.markdown_path.read_text(encoding='utf-8')
+        for expected in (POOLED, ALPHA, BETA, GAMMA, 'misfile', 'contradiction', '0.700', 'PASSED'):
+            assert expected in markdown, expected
+        assert 'opus' in markdown
+
+    @pytest.mark.asyncio
+    async def test_a_passing_calibration_files_nothing(self, ledger, tmp_path):
+        population = _population()
+        filer = RecordingFiler()
+
+        report = await _calibrate(population, _answering(population), ledger, tmp_path, filer)
+
+        assert report.passed
+        assert filer.escapes == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_calibration_files_one_escape_naming_each_failure(
+        self, ledger, tmp_path,
+    ):
+        population = _population()
+        filer = RecordingFiler()
+
+        report = await _calibrate(
+            population, _answering(population, _failing_alpha(population)), ledger, tmp_path, filer,
+        )
+
+        assert not report.passed
+        [escape] = filer.escapes
+        assert escape.anchor == CALIBRATION_ANCHOR == 'link-heal-calibration'
+        [failure] = escape.detail['failures']
+        assert 'misfile' in failure and ALPHA in failure
+        assert escape.detail['report'] == str(report.markdown_path)
+        assert 'FAILED' in report.markdown_path.read_text(encoding='utf-8')
